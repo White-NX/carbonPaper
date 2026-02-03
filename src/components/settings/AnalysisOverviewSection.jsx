@@ -1,137 +1,29 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React from 'react';
 import { Activity, HardDrive, Image as ImageIcon, Database, RefreshCw } from 'lucide-react';
-import { getAnalysisOverview } from '../lib/analysis_api';
+import { buildLinePath, formatBytes, formatTimestamp } from './analysisUtils';
 
-const REFRESH_INTERVAL_MS = 30000;
-
-const formatBytes = (bytes) => {
-  if (bytes === null || bytes === undefined) return '--';
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / Math.pow(1024, index);
-  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[index]}`;
-};
-
-const formatTimestamp = (ms) => {
-  if (!ms) return '--';
-  return new Date(ms).toLocaleString();
-};
-
-const buildLinePath = (points) => {
-  if (!points || points.length === 0) return '';
-  const times = points.map((p) => p.timestamp_ms);
-  const values = points.map((p) => p.rss_bytes);
-  const minTime = Math.min(...times);
-  const maxTime = Math.max(...times);
-  const minVal = Math.min(...values);
-  const maxVal = Math.max(...values);
-  const spanTime = Math.max(maxTime - minTime, 1);
-  const spanVal = Math.max(maxVal - minVal, 1);
-
-  return points
-    .map((p, index) => {
-      const x = ((p.timestamp_ms - minTime) / spanTime) * 100;
-      const y = 100 - ((p.rss_bytes - minVal) / spanVal) * 100;
-      return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
-    })
-    .join(' ');
-};
-
-export function Analysis() {
-  const [memorySeries, setMemorySeries] = useState([]);
-  const [storage, setStorage] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState('');
-
-  const loadOverview = async (forceStorage = false) => {
-    try {
-      setError('');
-      const result = await getAnalysisOverview(forceStorage);
-      setMemorySeries(result?.memory || []);
-      setStorage(result?.storage || null);
-    } catch (err) {
-      setError(err?.message || 'Failed to load analysis data');
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  };
-
-  useEffect(() => {
-    loadOverview(false);
-    const timer = setInterval(() => {
-      loadOverview(false);
-    }, REFRESH_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, []);
-
-  const handleRefreshStorage = () => {
-    setRefreshing(true);
-    loadOverview(true);
-  };
-
-  const memoryStats = useMemo(() => {
-    if (!memorySeries.length) return null;
-    const values = memorySeries.map((point) => point.rss_bytes);
-    const total = values.reduce((sum, value) => sum + value, 0);
-    return {
-      latest: values[values.length - 1],
-      min: Math.min(...values),
-      max: Math.max(...values),
-      avg: Math.round(total / values.length),
-      lastUpdated: memorySeries[memorySeries.length - 1]?.timestamp_ms
-    };
-  }, [memorySeries]);
-
-  const storageSegments = useMemo(() => {
-    if (!storage) return [];
-    return [
-      {
-        key: 'models',
-        label: '模型',
-        bytes: storage.models_bytes,
-        icon: Activity,
-        color: 'bg-indigo-500/70'
-      },
-      {
-        key: 'images',
-        label: '图片',
-        bytes: storage.images_bytes,
-        icon: ImageIcon,
-        color: 'bg-sky-500/70'
-      },
-      {
-        key: 'database',
-        label: '数据库',
-        bytes: storage.database_bytes,
-        icon: Database,
-        color: 'bg-emerald-500/70'
-      },
-      {
-        key: 'other',
-        label: '程序关键依赖',
-        bytes: storage.other_bytes,
-        icon: HardDrive,
-        color: 'bg-amber-500/70'
-      }
-    ];
-  }, [storage]);
-
-  const totalStorage = storage?.total_bytes || 0;
-
+export default function AnalysisOverviewSection({
+  memorySeries,
+  memoryStats,
+  storageSegments,
+  totalStorage,
+  storage,
+  loading,
+  refreshing,
+  error,
+  onRefresh,
+}) {
   return (
-    <div className="flex flex-col w-full h-full p-8 gap-6 overflow-y-auto bg-ide-bg text-ide-text">
+    <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between shrink-0">
         <div className="space-y-1">
-          <h2 className="text-2xl font-semibold">Analysis</h2>
+          <h2 className="text-xl font-semibold">Analysis</h2>
           <p className="text-xs text-ide-muted">最近半小时内的 Python 子服务资源视图与本地存储占用。</p>
           <p className="text-xs text-ide-muted">此处显示的内存占用为未压缩内存，实际占用约为未压缩值的1/7</p>
         </div>
         <button
           type="button"
-          onClick={handleRefreshStorage}
+          onClick={onRefresh}
           disabled={refreshing}
           className="flex items-center gap-2 px-3 py-2 text-xs border border-ide-border rounded-lg bg-ide-panel hover:border-ide-accent hover:text-ide-accent transition-colors disabled:opacity-60"
         >
@@ -159,9 +51,7 @@ export function Analysis() {
                   <p className="text-[11px] text-ide-muted">最近 30 分钟</p>
                 </div>
               </div>
-              <div className="text-[11px] text-ide-muted">
-                更新: {memoryStats ? formatTimestamp(memoryStats.lastUpdated) : '--'}
-              </div>
+              <div className="text-[11px] text-ide-muted">更新: {memoryStats ? formatTimestamp(memoryStats.lastUpdated) : '--'}</div>
             </div>
 
             <div className="h-64 w-full rounded-xl border border-ide-border bg-ide-bg/70 p-4 relative">
@@ -215,9 +105,7 @@ export function Analysis() {
                 <p className="text-[11px] text-ide-muted">LocalAppData/CarbonPaper</p>
               </div>
             </div>
-            <div className="text-[11px] text-ide-muted">
-              缓存: {storage?.cached_at_ms ? formatTimestamp(storage.cached_at_ms) : '--'}
-            </div>
+            <div className="text-[11px] text-ide-muted">缓存: {storage?.cached_at_ms ? formatTimestamp(storage.cached_at_ms) : '--'}</div>
           </div>
 
           <div className="rounded-xl border border-ide-border bg-ide-bg/70 p-4 mb-4">

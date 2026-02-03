@@ -1,0 +1,243 @@
+import React, { useState } from 'react';
+import { X, Loader2, Trash2, AlertTriangle, Clock } from 'lucide-react';
+
+export default function CaptureFiltersSection({
+  filterSettings,
+  processInput,
+  titleInput,
+  onProcessInputChange,
+  onTitleInputChange,
+  onAddProcess,
+  onAddTitle,
+  onRemoveProcess,
+  onRemoveTitle,
+  onToggleProtected,
+  onSave,
+  filtersDirty,
+  savingFilters,
+  saveFiltersMessage,
+  onQuickDelete,
+  isDeleting,
+  deleteMessage,
+}) {
+  return (
+    <div className="space-y-8">
+      {/* Quick Delete Section */}
+      <QuickDeleteSection 
+        onDelete={onQuickDelete}
+        isDeleting={isDeleting}
+        deleteMessage={deleteMessage}
+      />
+
+      <div className="space-y-3">
+        <label className="text-sm font-semibold text-ide-accent px-1 block">Capture Filters</label>
+        <div className="p-4 bg-ide-bg border border-ide-border rounded-xl text-sm text-ide-muted space-y-3">
+          <div className="space-y-4">
+            <div>
+              <label className="block mb-2 font-semibold text-ide-text">按进程名称忽略</label>
+              <div className="flex flex-wrap gap-2 mb-3 min-h-[1.5rem]">
+                {(filterSettings.processes || []).map((p) => (
+                  <span
+                    key={p}
+                    className="inline-flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 bg-ide-panel border border-ide-border rounded-full text-xs text-ide-text group"
+                  >
+                    {p}
+                    <button onClick={() => onRemoveProcess(p)} className="p-0.5 rounded-full hover:bg-ide-hover text-ide-muted hover:text-red-400 transition-colors" title="移除">
+                      <X className="w-3 h-3" />
+                    </button>
+                  </span>
+                ))}
+                {(filterSettings.processes || []).length === 0 && <span className="text-xs text-ide-muted py-1 italic">暂无规则</span>}
+              </div>
+              <div className="flex gap-2">
+                <input
+                  className="flex-1 bg-ide-bg border border-ide-border rounded-lg px-3 py-2 text-xs text-ide-text focus:outline-none focus:border-ide-accent focus:ring-1 focus:ring-ide-accent placeholder:text-ide-muted/50"
+                  value={processInput}
+                  onChange={(e) => onProcessInputChange(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ',') {
+                      e.preventDefault();
+                      onAddProcess();
+                    }
+                  }}
+                  placeholder="chrome.exe, obs64.exe"
+                />
+                <button
+                  onClick={onAddProcess}
+                  disabled={!processInput.trim()}
+                  className="px-4 py-2 bg-ide-accent hover:bg-ide-accent/90 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  添加
+                </button>
+              </div>
+              <p className="text-xs text-ide-muted mt-2 ml-1">按进程可执行名匹配，自动转为小写。</p>
+            </div>
+
+            <div className="w-full h-px bg-ide-border/50" />
+
+            <div>
+              <label className="block mb-2 font-semibold text-ide-text">按窗口名关键词忽略</label>
+              <div className="flex flex-wrap gap-2 mb-3 min-h-[1.5rem]">
+                {(filterSettings.titles || []).map((t) => (
+                  <span
+                    key={t}
+                    className="inline-flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 bg-ide-panel border border-ide-border rounded-full text-xs text-ide-text group"
+                  >
+                    {t}
+                    <button onClick={() => onRemoveTitle(t)} className="p-0.5 rounded-full hover:bg-ide-hover text-ide-muted hover:text-red-400 transition-colors" title="移除">
+                      <X className="w-3 h-3" />
+                    </button>
+                  </span>
+                ))}
+                {(filterSettings.titles || []).length === 0 && <span className="text-xs text-ide-muted py-1 italic">暂无规则</span>}
+              </div>
+              <div className="flex gap-2">
+                <input
+                  className="flex-1 bg-ide-bg border border-ide-border rounded-lg px-3 py-2 text-xs text-ide-text focus:outline-none focus:border-ide-accent focus:ring-1 focus:ring-ide-accent placeholder:text-ide-muted/50"
+                  value={titleInput}
+                  onChange={(e) => onTitleInputChange(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ',') {
+                      e.preventDefault();
+                      onAddTitle();
+                    }
+                  }}
+                  placeholder="内部系统, 私人窗口"
+                />
+                <button
+                  onClick={onAddTitle}
+                  disabled={!titleInput.trim()}
+                  className="px-4 py-2 bg-ide-accent hover:bg-ide-accent/90 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  添加
+                </button>
+              </div>
+              <p className="text-xs text-ide-muted mt-2 ml-1">包含匹配，忽略大小写。</p>
+            </div>
+          </div>
+
+          <div className="w-full h-px bg-ide-border/50" />
+
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <label className="block mb-1 font-semibold text-ide-text">不捕获受保护的窗口</label>
+              <p className="text-xs text-ide-muted">关闭后，将尝试捕获设置了屏幕保护属性的窗口。</p>
+            </div>
+            <button
+              onClick={onToggleProtected}
+               className={`w-11 h-6 shrink-0 rounded-full transition-colors relative ${
+                filterSettings.ignoreProtected ? 'bg-ide-accent' : 'bg-ide-panel border border-ide-border'
+              }`}
+            >
+              <div
+                className="absolute top-1 w-4 h-4 rounded-full bg-white transition-transform shadow-sm"
+                style={{ left: filterSettings.ignoreProtected ? 'calc(100% - 1.25rem)' : '0.25rem' }}
+              />
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-3 pt-2">
+            <div className="text-xs text-ide-muted">{saveFiltersMessage}</div>
+            <button
+              onClick={onSave}
+              disabled={!filtersDirty || savingFilters}
+              className="flex items-center gap-2 px-4 py-2 bg-ide-accent hover:bg-ide-accent/90 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+            >
+              {savingFilters && <Loader2 className="w-3.5 h-3.5 animate-spin" />} 保存过滤规则
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Quick Delete Section Component
+function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
+  const [showConfirm, setShowConfirm] = useState(null);
+  const [deletingRange, setDeletingRange] = useState(null);
+
+  const deleteOptions = [
+    { id: '5min', label: '5 分钟', minutes: 5 },
+    { id: '30min', label: '30 分钟', minutes: 30 },
+    { id: '1hour', label: '1 小时', minutes: 60 },
+    { id: 'today', label: '今天', minutes: 'today' },
+  ];
+
+  const handleDeleteClick = (option) => {
+    setShowConfirm(option.id);
+  };
+
+  const handleConfirmDelete = async (option) => {
+    setDeletingRange(option.id);
+    try {
+      await onDelete(option.minutes);
+    } finally {
+      setDeletingRange(null);
+      setShowConfirm(null);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <label className="text-sm font-semibold text-ide-accent flex items-center gap-2 px-1">
+        <Clock className="w-4 h-4" />
+        快速删除记录
+      </label>
+      <div className="p-4 bg-ide-bg border border-ide-border rounded-xl text-sm text-ide-muted space-y-4">
+        <p className="text-xs text-ide-muted">快速删除指定时间范围内的所有截图和OCR记录。此操作不可撤销。</p>
+        
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {deleteOptions.map((option) => (
+            <div key={option.id} className="relative">
+              {showConfirm === option.id ? (
+                <div className="absolute inset-0 z-10 flex flex-col justify-center gap-2 p-2 bg-red-500 rounded-lg shadow-lg animate-in fade-in zoom-in duration-200">
+                  <div className="flex items-center justify-center gap-1 text-xs text-white font-medium">
+                    <AlertTriangle className="w-3 h-3" />
+                    <span>Confirm?</span>
+                  </div>
+                  <div className="flex gap-1">
+                    <button
+                      onClick={() => handleConfirmDelete(option)}
+                      disabled={deletingRange === option.id}
+                      className="flex-1 flex items-center justify-center py-1 bg-white text-red-600 hover:bg-red-50 rounded text-[10px] font-bold transition-colors disabled:opacity-80"
+                    >
+                      {deletingRange === option.id ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                      ) : (
+                        'YES'
+                      )}
+                    </button>
+                    <button
+                      onClick={() => setShowConfirm(null)}
+                      disabled={deletingRange === option.id}
+                      className="flex-1 py-1 bg-red-600 text-white hover:bg-red-700 rounded text-[10px] transition-colors disabled:opacity-80 border border-red-400"
+                    >
+                      NO
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  onClick={() => handleDeleteClick(option)}
+                  disabled={isDeleting}
+                  className="w-full flex items-center justify-center gap-2 px-3 py-3 bg-ide-panel hover:bg-red-500/10 hover:border-red-500/30 border border-ide-border rounded-lg text-xs font-medium transition-all hover:scale-[1.02] disabled:opacity-50 disabled:hover:scale-100 h-10"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  {option.label}内
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {deleteMessage && (
+          <div className={`text-xs flex items-center gap-2 ${deleteMessage.includes('成功') ? 'text-green-500' : 'text-red-500'}`}>
+            <div className={`w-1.5 h-1.5 rounded-full ${deleteMessage.includes('成功') ? 'bg-green-500' : 'bg-red-500'}`} />
+            {deleteMessage}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

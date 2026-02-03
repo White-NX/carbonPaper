@@ -172,3 +172,56 @@ export const updateMonitorFilters = async (filters) => {
         throw e;
     }
 };
+
+export const deleteScreenshot = async (screenshotId) => {
+    try {
+        const response = await invoke('execute_monitor_command', {
+            payload: {
+                command: 'delete_screenshot',
+                screenshot_id: screenshotId
+            }
+        });
+        if (response?.error) {
+            throw new Error(response.error);
+        }
+        return response;
+    } catch (e) {
+        console.error("Failed to delete screenshot", e);
+        throw e;
+    }
+};
+
+export const deleteRecordsByTimeRange = async (minutes, centerTimestamp = null) => {
+    try {
+        const now = centerTimestamp || Date.now();
+        let startTime, endTime;
+        
+        if (minutes === 'today') {
+            // Delete all records from today (start of day to now)
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            startTime = today.getTime();
+            endTime = Date.now();
+        } else {
+            // Delete records within the specified minutes
+            const rangeMs = minutes * 60 * 1000;
+            startTime = now - rangeMs;
+            endTime = now;
+        }
+        
+        const response = await invoke('execute_monitor_command', {
+            payload: {
+                command: 'delete_by_time_range',
+                start_time: startTime,
+                end_time: endTime
+            }
+        });
+        if (response?.error) {
+            throw new Error(response.error);
+        }
+        return response;
+    } catch (e) {
+        console.error("Failed to delete records by time range", e);
+        throw e;
+    }
+};

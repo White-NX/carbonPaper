@@ -55,7 +55,7 @@ export function Dialog({
           </button>
         </div>
 
-        <div className={cn("overflow-y-auto", contentClassName)}>
+        <div className={cn("min-h-0 flex-1 overflow-y-auto", contentClassName)}>
           {children}
         </div>
       </div>

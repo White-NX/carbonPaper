@@ -1,5 +1,5 @@
 import React from 'react';
-import { Layout, Search as SearchIcon, Info as InfoIcon, BarChart3 } from 'lucide-react';
+import { Layout, Search as SearchIcon } from 'lucide-react';
 
 export default function Tabs({ activeTab, setActiveTab }) {
   return (
@@ -19,22 +19,6 @@ export default function Tabs({ activeTab, setActiveTab }) {
       >
         <SearchIcon className="w-4 h-4" />
         <span>Advanced Search</span>
-      </button>
-      <button
-        type="button"
-        className={`ide-tab flex items-center gap-2 ${activeTab === 'analysis' ? 'ide-tab-active' : ''}`}
-        onClick={() => setActiveTab('analysis')}
-      >
-        <BarChart3 className="w-4 h-4" />
-        <span>Analysis</span>
-      </button>
-      <button
-        type="button"
-        className={`ide-tab flex items-center gap-2 ${activeTab === 'about' ? 'ide-tab-active' : ''}`}
-        onClick={() => setActiveTab('about')}
-      >
-        <InfoIcon className="w-4 h-4" />
-        <span>About</span>
       </button>
     </div>
   );

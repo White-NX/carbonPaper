@@ -1,14 +1,15 @@
 {
   "name": "carbonpaper",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "debug": "tauri dev"
+    "debug": "tauri dev",
+    "bump:version": "node scripts/bump-version.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.1",

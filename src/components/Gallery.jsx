@@ -382,7 +382,7 @@ InspectorOverlay.propTypes = {
   onBoxClick: PropTypes.func,
 };
 
-export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick }) => {
+export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick, maxHeight, className }) => {
   const containerRef = useRef(null);
   const imageRef = useRef(null);
   const [metrics, setMetrics] = useState(null);
@@ -442,16 +442,24 @@ export const InspectorImage = ({ item, overlayBoxes, blurred, onBoxClick }) => {
     );
   }
 
+  // If maxHeight is provided, use inline-flex layout for intrinsic sizing
+  // Otherwise use w-full h-full for filling parent container
+  const containerClass = maxHeight 
+    ? "relative overflow-hidden rounded border border-ide-border bg-black inline-flex items-center justify-center"
+    : "relative w-full h-full overflow-hidden rounded border border-ide-border bg-black flex items-center justify-center";
+
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-full overflow-hidden rounded border border-ide-border bg-black flex items-center justify-center"
+      className={cn(containerClass, className)}
+      style={maxHeight ? { maxHeight } : undefined}
     >
       <img
         ref={imageRef}
         src={item.imageUrl}
         alt={item.prompt || 'Generated result'}
         className={cn('max-w-full max-h-full object-contain transition', blurred && 'blur-xl')}
+        style={maxHeight ? { maxHeight } : undefined}
         onLoad={updateMetrics}
         loading="lazy"
       />
@@ -473,6 +481,8 @@ InspectorImage.propTypes = {
   overlayBoxes: PropTypes.array,
   blurred: PropTypes.bool,
   onBoxClick: PropTypes.func,
+  maxHeight: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
+  className: PropTypes.string,
 };
 
 const ActionButton = ({ icon: Icon, label, onClick, disabled, variant }) => (

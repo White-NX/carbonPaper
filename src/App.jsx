@@ -11,15 +11,13 @@ import Timeline from './components/Timeline';
 import { InspectorImage } from './components/Gallery';
 import { SearchBox } from './components/SearchBox';
 import { AdvancedSearch } from './components/AdvancedSearch';
-import { About } from './components/About';
-import SettingsDialog from './components/SettingsDialog';
+import SettingsDialog from './components/settings/SettingsDialog';
 import Mask from './components/Mask';
 import LeftSidebar from './components/LeftSidebar';
 import MainArea from './components/MainArea';
-import RightSidebar from './components/RightSidebar';
 import TopBar from './components/TopBar';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
-import { getScreenshotDetails, fetchImage } from './lib/monitor_api';
+import { getScreenshotDetails, fetchImage, deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 
 function App() {
   // Disable context menu for Tauri production feel
@@ -64,15 +62,48 @@ function App() {
   const backendStatusRef = useRef('unknown');
   const backendStartAtRef = useRef(null);
   const lastBackendErrorRef = useRef('');
-  const [activeTab, setActiveTab] = useState('preview'); // 'preview' | 'advanced-search' | 'About'
+  const [activeTab, setActiveTab] = useState('preview'); // 'preview' | 'advanced-search'
   const [searchMode, setSearchMode] = useState('ocr');
   const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
+  const [timelineRefreshKey, setTimelineRefreshKey] = useState(0);
 
   // debug 
   const [pythonVersion, setPythonVersion] = useState(null);
 
   // State to trigger timeline jumps
   const [timelineJump, setTimelineJump] = useState(null); // { time: number, ts: number }
+
+  const normalizeTimestampToMs = useCallback((value) => {
+    if (value === null || value === undefined || value === '') return null;
+
+    if (typeof value === 'number' && !Number.isNaN(value)) {
+      if (value > 1e12) return value;
+      if (value > 1e10) return value;
+      return value * 1000;
+    }
+
+    const raw = typeof value === 'string' ? value.trim() : String(value);
+    if (!raw) return null;
+
+    const numeric = Number(raw);
+    if (!Number.isNaN(numeric)) {
+      if (numeric > 1e12) return numeric;
+      if (numeric > 1e10) return numeric;
+      return numeric * 1000;
+    }
+
+    let iso = raw;
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)) {
+      iso = raw.replace(' ', 'T');
+    }
+    if (!/[zZ]|[+\-]\d{2}:\d{2}$/.test(iso)) {
+      iso = `${iso}Z`;
+    }
+    const parsed = new Date(iso);
+    if (!Number.isNaN(parsed.getTime())) return parsed.getTime();
+
+    return null;
+  }, []);
 
   useEffect(() => {
     if (!selectedEvent) {
@@ -374,7 +405,8 @@ function App() {
   const handleSearchSelect = (res) => {
     const screenshotId = res.screenshot_id !== undefined ? res.screenshot_id : (res.metadata?.screenshot_id);
     const imagePath = res.image_path || res.metadata?.image_path;
-    const timestamp = res.created_at || res.metadata?.created_at || new Date().toISOString();
+    const timestamp = res.screenshot_created_at || res.metadata?.screenshot_created_at || res.metadata?.created_at || res.created_at || new Date().toISOString();
+    const timestampMs = normalizeTimestampToMs(timestamp);
 
     if (screenshotId !== undefined || imagePath) {
       setSelectedEvent({
@@ -382,10 +414,12 @@ function App() {
         path: imagePath,
         appName: res.process_name || res.metadata?.process_name,
         windowTitle: res.window_title || res.metadata?.window_title,
-        timestamp: timestamp
+        timestamp: timestampMs ?? Date.now()
       });
       setHighlightedEventId(screenshotId || -1);
-      setTimelineJump({ time: new Date(timestamp).getTime(), ts: Date.now() });
+      if (timestampMs) {
+        setTimelineJump({ time: timestampMs, ts: Date.now() });
+      }
     }
     setActiveTab('preview');
   };
@@ -398,6 +432,9 @@ function App() {
 
   const onMinimize = () => getCurrentWindow().minimize();
   const onToggleMaximize = () => getCurrentWindow().toggleMaximize();
+  const bumpTimelineRefresh = useCallback(() => {
+    setTimelineRefreshKey((prev) => prev + 1);
+  }, []);
   return (
     <div
       className="flex flex-col h-screen w-screen bg-ide-bg text-ide-text overflow-hidden font-sans"
@@ -435,10 +472,11 @@ function App() {
         onClearHighlight={() => setHighlightedEventId(null)}
         jumpTimestamp={timelineJump}
         highlightedEventId={highlightedEventId}
+        refreshKey={timelineRefreshKey}
       />
 
       {/* Main Workspace Grid */}
-      <main className="flex-1 flex flex-col md:grid md:grid-cols-[250px_1fr_250px] overflow-hidden relative">
+      <main className="flex-1 flex flex-col md:grid md:grid-cols-[250px_1fr] overflow-hidden relative">
         <LeftSidebar selectedEvent={selectedEvent} selectedDetails={selectedDetails} />
 
         <MainArea
@@ -447,6 +485,7 @@ function App() {
           selectedImageSrc={selectedImageSrc}
           isLoadingDetails={isLoadingDetails}
           selectedEvent={selectedEvent}
+          selectedDetails={selectedDetails}
           lastError={lastError}
           ocrBoxes={ocrBoxes}
           advancedSearchParams={advancedSearchParams}
@@ -455,24 +494,51 @@ function App() {
           onAdvancedSelect={(res) => {
             const screenshotId = res.screenshot_id !== undefined ? res.screenshot_id : (res.metadata?.screenshot_id);
             const imagePath = res.image_path || res.metadata?.image_path;
-            const timestamp = res.created_at || res.metadata?.created_at || new Date().toISOString();
+            const timestamp = res.screenshot_created_at || res.metadata?.screenshot_created_at || res.metadata?.created_at || res.created_at || new Date().toISOString();
+            const timestampMs = normalizeTimestampToMs(timestamp);
             if (screenshotId !== undefined || imagePath) {
               setSelectedEvent({
                 id: screenshotId || -1,
                 path: imagePath,
                 appName: res.process_name || res.metadata?.process_name,
                 windowTitle: res.window_title || res.metadata?.window_title,
-                timestamp: timestamp
+                timestamp: timestampMs ?? Date.now()
               });
               setHighlightedEventId(screenshotId || -1);
-              setTimelineJump({ time: new Date(timestamp).getTime(), ts: Date.now() });
+              if (timestampMs) {
+                setTimelineJump({ time: timestampMs, ts: Date.now() });
+              }
             }
             setActiveTab('preview');
           }}
           onInspectorBoxClick={(box) => handleCopyText(box.label)}
+          onDeleteRecord={async (id) => {
+            try {
+              await deleteScreenshot(id);
+              setSelectedEvent(null);
+              setSelectedDetails(null);
+              setSelectedImageSrc(null);
+              bumpTimelineRefresh();
+            } catch (e) {
+              console.error('Failed to delete record', e);
+            }
+          }}
+          onDeleteNearbyRecords={async (timestamp, minutes) => {
+            try {
+              const ts = normalizeTimestampToMs(timestamp);
+              if (ts) {
+                await deleteRecordsByTimeRange(minutes, ts);
+              }
+              setSelectedEvent(null);
+              setSelectedDetails(null);
+              setSelectedImageSrc(null);
+              bumpTimelineRefresh();
+            } catch (e) {
+              console.error('Failed to delete nearby records', e);
+            }
+          }}
+          onCopyText={handleCopyText}
         />
-
-        <RightSidebar isLoadingDetails={isLoadingDetails} selectedDetails={selectedDetails} handleCopyText={handleCopyText} />
       </main>
 
       <NotificationToast
@@ -491,6 +557,7 @@ function App() {
         isOpen={showSettings}
         onClose={() => setShowSettings(false)}
         autoStartMonitor={autoStartMonitor}
+        onRecordsDeleted={bumpTimelineRefresh}
         onAutoStartMonitorChange={(next) => {
           setAutoStartMonitor(next);
           if (next) {

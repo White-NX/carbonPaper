@@ -336,6 +336,33 @@ def _handle_command(req: dict):
             return {'error': str(exc)}
         return {'status': 'success', 'processes': processes}
 
+    if cmd == 'delete_screenshot':
+        screenshot_id = req.get('screenshot_id')
+        if screenshot_id is None:
+            return {'error': 'screenshot_id is required'}
+        if not _ocr_worker:
+            return {'error': 'OCR worker not initialized'}
+        try:
+            deleted = _ocr_worker.db_handler.delete_screenshot(screenshot_id)
+            return {'status': 'success', 'deleted': deleted}
+        except Exception as exc:
+            return {'error': str(exc)}
+
+    if cmd == 'delete_by_time_range':
+        start_time = req.get('start_time')
+        end_time = req.get('end_time')
+        if start_time is None or end_time is None:
+            return {'error': 'start_time and end_time are required'}
+        if not _ocr_worker:
+            return {'error': 'OCR worker not initialized'}
+        try:
+            deleted_count = _ocr_worker.db_handler.delete_screenshots_by_time_range(
+                float(start_time), float(end_time)
+            )
+            return {'status': 'success', 'deleted_count': deleted_count}
+        except Exception as exc:
+            return {'error': str(exc)}
+
     return {'error': 'unknown command'}
 
 

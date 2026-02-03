@@ -94,28 +94,11 @@ const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showTex
     // Let's rely on the passed `width` prop which is the segment width.
 
     const processColor = getProcessColor(event.appName, event.windowTitle, prevAppName, prevWindowTitle);
-    const barHeight = 6; 
-    const arrowDepth = 8;
-
-    const barStyle = {
-        backgroundColor: processColor,
-        width: isSameActivityAsNext ? width + 1 : width, 
-        clipPath: isSameActivityAsNext 
-            ? 'none' 
-            : `polygon(0% 0%, calc(100% - ${arrowDepth}px) 0%, 100% 50%, calc(100% - ${arrowDepth}px) 100%, 0% 100%)`,
-    };
+    // barStyle removed - rendered via Canvas
 
     return (
         <>
-            {/* Process Info Bar Segment */}
-            <div 
-                className="absolute top-4 h-1.5 shadow-sm"
-                style={{ 
-                    left: x,
-                    ...barStyle,
-                    zIndex: isSameActivityAsNext ? 10 : 20 
-                }}
-            />
+            {/* Process Info Bar Segment - REMOVED, using Canvas in parent */}
 
             {/* Process Label/Icon - Only on start of sequence and when density allows */}
             {(showLabel && !isSameActivityAsPrev) && (
@@ -184,6 +167,7 @@ const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showTex
 
 const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedEventId }) => {
     const containerRef = useRef(null);
+    const canvasRef = useRef(null);
     const [width, setWidth] = useState(0);
     const [events, setEvents] = useState([]);
     
@@ -421,6 +405,102 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     const tickStepMs = useMemo(() => getTickStep(zoom), [zoom]);
     const showProcessText = tickStepMs < 900000; // Show names only when finer than 15 minutes to avoid text stacking
 
+    // Canvas drawing for the timeline activity bars
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas || !width) return;
+        
+        const dpr = window.devicePixelRatio || 1;
+        const rect = containerRef.current.getBoundingClientRect();
+        
+        // Ensure accurate scaling
+        if (canvas.width !== rect.width * dpr || canvas.height !== rect.height * dpr) {
+            canvas.width = rect.width * dpr;
+            canvas.height = rect.height * dpr;
+        }
+
+        const ctx = canvas.getContext('2d');
+        ctx.resetTransform(); // clear previous transforms
+        ctx.scale(dpr, dpr);
+        ctx.clearRect(0, 0, rect.width, rect.height);
+
+        if (events.length === 0) return;
+
+        const startTime = centerTime - (width / 2) / zoom;
+        const endTime = centerTime + (width / 2) / zoom;
+
+        // Binary search for visible range
+        // Find index where event.timestamp >= startTime
+        let startIndex = 0;
+        let low = 0, high = events.length - 1;
+        while (low <= high) {
+            const mid = Math.floor((low + high) / 2);
+            if (events[mid].timestamp < startTime) low = mid + 1;
+            else high = mid - 1;
+        }
+        startIndex = Math.max(0, low - 1); 
+
+        // Find index where event.timestamp > endTime
+        let endIndex = events.length;
+        low = 0; high = events.length - 1;
+        while (low <= high) {
+            const mid = Math.floor((low + high) / 2);
+            if (events[mid].timestamp <= endTime) low = mid + 1;
+            else high = mid - 1;
+        }
+        endIndex = Math.min(events.length, low + 1);
+
+        const getLocalX = (ts) => (width / 2) + ((ts - centerTime) * zoom);
+
+        for (let i = startIndex; i < endIndex; i++) {
+             const event = events[i];
+             const nextEvent = events[i+1]; // events[endIndex] might be undefined, handled safe
+             
+             const x = getLocalX(event.timestamp);
+             let segmentWidth = 100;
+             let nextX = x + 100;
+
+             if (nextEvent) {
+                  nextX = getLocalX(nextEvent.timestamp);
+                  segmentWidth = Math.max(0, nextX - x);
+             } else {
+                 // Last event: Arbitrary width or based on duration if known? 
+                 // Current logic assumes 100 or till next
+             }
+             
+             // Culling (extra check)
+             if (x > width || x + segmentWidth < 0) continue;
+
+             const currentActivityKey = getActivityKey(event.appName, event.windowTitle);
+             const nextActivityKey = nextEvent ? getActivityKey(nextEvent.appName, nextEvent.windowTitle) : null;
+             const isSameActivityAsNext = nextEvent && nextActivityKey === currentActivityKey;
+             
+             // Only calculate color for visible bars
+             const prevEvent = i > 0 ? events[i-1] : null;
+             const prevAppName = prevEvent?.appName;
+             const prevWindowTitle = prevEvent?.windowTitle;
+             
+             ctx.fillStyle = getProcessColor(event.appName, event.windowTitle, prevAppName, prevWindowTitle);
+             
+             const barTop = 16; 
+             const barHeight = 6; 
+             const arrowDepth = 8;
+             
+             if (isSameActivityAsNext) {
+                 ctx.fillRect(x, barTop, segmentWidth + 1, barHeight);
+             } else {
+                 ctx.beginPath();
+                 ctx.moveTo(x, barTop);
+                 ctx.lineTo(x + segmentWidth - arrowDepth, barTop);
+                 ctx.lineTo(x + segmentWidth, barTop + barHeight / 2);
+                 ctx.lineTo(x + segmentWidth - arrowDepth, barTop + barHeight);
+                 ctx.lineTo(x, barTop + barHeight);
+                 ctx.closePath();
+                 ctx.fill();
+             }
+        }
+    }, [events, centerTime, zoom, width]);
+
     const renderTicks = () => {
         if (!width) return null;
         
@@ -466,17 +546,44 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
             data-keep-selection="true"
         >
             {renderTicks()}
+            <canvas ref={canvasRef} className="absolute inset-0 z-0 pointer-events-none" />
 
             {width > 0 && (() => {
+                const startTime = centerTime - (width / 2) / zoom;
+                const endTime = centerTime + (width / 2) / zoom;
+                
+                // Binary Search for Visible Range Logic (Same as Canvas)
+                // Find index where event.timestamp >= startTime
+                let startIndex = 0;
+                let low = 0, high = events.length - 1;
+                while (low <= high) {
+                    const mid = Math.floor((low + high) / 2);
+                    if (events[mid].timestamp < startTime) low = mid + 1;
+                    else high = mid - 1;
+                }
+                startIndex = Math.max(0, low - 1); 
+
+                // Find index where event.timestamp > endTime
+                let endIndex = events.length;
+                low = 0; high = events.length - 1;
+                while (low <= high) {
+                    const mid = Math.floor((low + high) / 2);
+                    if (events[mid].timestamp <= endTime) low = mid + 1;
+                    else high = mid - 1;
+                }
+                endIndex = Math.min(events.length, low + 1);
+
                 let lastImageX = -9999;
                 let lastLabelX = -9999;
                 const MIN_IMAGE_GAP = 20;
-                // Minimum gap for labels: wider when showing text to prevent overlap
-                // At fine zoom (< 30s ticks), always show icons (gap = 0 for icon-only)
                 const isFineZoom = tickStepMs < 30000;
                 const MIN_LABEL_GAP = showProcessText ? 180 : (isFineZoom ? 0 : 30);
+                
+                const visibleNodes = [];
 
-                return events.map((event, index) => {
+                for (let index = startIndex; index < endIndex; index++) {
+                    const event = events[index];
+                    // We access original events array for neighbors to maintain continuity
                     const nextEvent = events[index + 1];
                     const prevEvent = index > 0 ? events[index - 1] : null;
                     const x = getXPosition(event.timestamp);
@@ -487,10 +594,10 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                         segmentWidth = Math.max(0, nextX - x);
                     }
 
-                    // Culling
-                    if (x + segmentWidth < -50 || x > width + 50) return null;
+                    // Strict Culling (should be duplicate of binary search mostly, but good for safety)
+                    if (x > width + 50) break; 
+                    if (x + segmentWidth < -50) continue;
 
-                    // Use activity key (appName + windowTitle) for determining same activity
                     const currentActivityKey = getActivityKey(event.appName, event.windowTitle);
                     const nextActivityKey = nextEvent ? getActivityKey(nextEvent.appName, nextEvent.windowTitle) : null;
                     const prevActivityKey = prevEvent ? getActivityKey(prevEvent.appName, prevEvent.windowTitle) : null;
@@ -508,7 +615,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                         }
                     }
 
-                    // Density check for labels - only show if enough gap from last label
+                    // Density check for labels
                     let showLabel = false;
                     if (!isSameActivityAsPrev) {
                         if (x - lastLabelX >= MIN_LABEL_GAP) {
@@ -518,20 +625,22 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                     }
 
                     const isHighlighted = highlightedEventId === event.id;
-
-                    // Ensure highlighted events are always shown (if they are within view bounds)
                     if (isHighlighted) {
                         showImage = true;
-                        // Maybe force label too if needed, but let's stick to image for now
                     }
 
-                    return (
+                    // Optimization: If nothing to render (no image, no label, bar is on canvas), skip component entirely
+                    if (!showImage && !(showLabel && !isSameActivityAsPrev)) {
+                        continue;
+                    }
+
+                    visibleNodes.push(
                         <TimelineEvent 
                             key={event.id}
                             event={event}
                             x={x}
                             width={segmentWidth}
-                            visible={true} // Already culled by map check? Actually map check excludes it from rendering completely.
+                            visible={true} 
                             showImage={showImage}
                             showText={showProcessText}
                             showLabel={showLabel}
@@ -543,7 +652,8 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                             isHighlighted={isHighlighted}
                         />
                     );
-                });
+                }
+                return visibleNodes;
             })()}
             
             <div className="absolute top-0 bottom-0 left-1/2 w-px bg-ide-accent opacity-50 pointer-events-none z-0"></div>

@@ -589,9 +589,72 @@ class OCRDatabaseHandler:
         """删除截图及其OCR结果"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            # First get the image path to delete the file
+            cursor.execute('SELECT image_path FROM screenshots WHERE id = ?', (screenshot_id,))
+            row = cursor.fetchone()
+            image_path = row['image_path'] if row else None
+            
+            # Delete from database
             cursor.execute('DELETE FROM screenshots WHERE id = ?', (screenshot_id,))
             conn.commit()
-            return cursor.rowcount > 0
+            deleted = cursor.rowcount > 0
+            
+            # Try to delete the image file
+            if deleted and image_path:
+                try:
+                    if os.path.exists(image_path):
+                        os.remove(image_path)
+                except Exception as e:
+                    print(f"Failed to delete image file {image_path}: {e}")
+            
+            return deleted
+    
+    def delete_screenshots_by_time_range(self, start_ts: float, end_ts: float) -> int:
+        """删除指定时间范围内的截图及其OCR结果
+        
+        Args:
+            start_ts: 开始时间戳 (毫秒)
+            end_ts: 结束时间戳 (毫秒)
+            
+        Returns:
+            删除的记录数
+        """
+        # Convert milliseconds to seconds for datetime
+        start_dt = datetime.utcfromtimestamp(start_ts / 1000.0)
+        end_dt = datetime.utcfromtimestamp(end_ts / 1000.0)
+        
+        deleted_count = 0
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # First get all image paths to delete files
+            cursor.execute('''
+                SELECT id, image_path FROM screenshots
+                WHERE created_at BETWEEN ? AND ?
+            ''', (start_dt, end_dt))
+            
+            rows = cursor.fetchall()
+            image_paths = [(row['id'], row['image_path']) for row in rows]
+            
+            # Delete from database
+            cursor.execute('''
+                DELETE FROM screenshots
+                WHERE created_at BETWEEN ? AND ?
+            ''', (start_dt, end_dt))
+            
+            deleted_count = cursor.rowcount
+            conn.commit()
+            
+            # Try to delete the image files
+            for screenshot_id, image_path in image_paths:
+                try:
+                    if image_path and os.path.exists(image_path):
+                        os.remove(image_path)
+                except Exception as e:
+                    print(f"Failed to delete image file {image_path}: {e}")
+        
+        return deleted_count
     
     def cleanup_old_data(self, days: int = 30) -> Tuple[int, int]:
         """清理指定天数之前的旧数据"""
