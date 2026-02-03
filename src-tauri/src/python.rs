@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use which::which;
 use winreg::enums::*;
 use winreg::RegKey;
 
@@ -48,7 +47,7 @@ impl fmt::Display for FindPythonError {
             FindPythonError::NoMatchingVersionFound => {
                 write!(
                     f,
-                    "Found Python installations, but none match version 3.12.*."
+                    "Found Python installations, but none match version 3.12.10."
                 )
             }
         }
@@ -72,13 +71,55 @@ impl From<io::Error> for FindPythonError {
     }
 }
 
-/// 从Windows注册表中专门搜索 Python 3.12.x 的安装。
+/// 从Windows注册表中专门搜索 Python 3.12.10 的安装。
 ///
 /// # Returns
 /// - `Ok(String)`: 如果找到一个有效的 `python.exe` 路径。
 /// - `Err(FindPythonError)`: 如果未找到，返回一个包含详细失败原因的错误。
+const REQUIRED_PYTHON_VERSION: &str = "3.12.10";
+
+fn probe_python_command(cmd: &str, args: &[&str]) -> Option<(String, String)> {
+    let mut cmd_proc = std::process::Command::new(cmd);
+    for arg in args {
+        cmd_proc.arg(arg);
+    }
+    cmd_proc.arg("-c").arg("import sys; print(sys.version.split()[0]); print(sys.executable)");
+    #[cfg(windows)]
+    {
+        cmd_proc.creation_flags(0x08000000);
+    }
+    let output = cmd_proc.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines().map(|l| l.trim()).filter(|l| !l.is_empty());
+    let version = lines.next()?.to_string();
+    let executable = lines.next()?.to_string();
+    Some((version, executable))
+}
+
+fn probe_python_executable(python_exe_path: &PathBuf) -> Option<String> {
+    let mut cmd_proc = std::process::Command::new(normalize_path_for_command(python_exe_path));
+    cmd_proc.arg("-c").arg("import sys; print(sys.version.split()[0])");
+    #[cfg(windows)]
+    {
+        cmd_proc.creation_flags(0x08000000);
+    }
+    let output = cmd_proc.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version == REQUIRED_PYTHON_VERSION {
+        Some(version)
+    } else {
+        None
+    }
+}
+
 fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
-    println!("Searching for Python 3.12.* in Windows Registry...");
+    println!("Searching for Python {} in Windows Registry...", REQUIRED_PYTHON_VERSION);
 
     let hives_to_check = [
         RegKey::predef(HKEY_CURRENT_USER),
@@ -100,12 +141,15 @@ fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
                             if let Ok(install_dir) = install_path_key.get_value::<String, _>("") {
                                 let python_exe_path = PathBuf::from(install_dir).join("python.exe");
                                 if python_exe_path.is_file() {
-                                    println!(
-                                        "Success! Verified python.exe exists at: {:?}",
-                                        python_exe_path
-                                    );
-                                    // 找到了，立即成功返回
-                                    return Ok(python_exe_path.display().to_string());
+                                    if probe_python_executable(&python_exe_path).is_some() {
+                                        println!(
+                                            "Success! Verified python.exe exists and matches {} at: {:?}",
+                                            REQUIRED_PYTHON_VERSION,
+                                            python_exe_path
+                                        );
+                                        // 找到了，立即成功返回
+                                        return Ok(python_exe_path.display().to_string());
+                                    }
                                 }
                             }
                         }
@@ -123,7 +167,7 @@ fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
     }
 }
 
-/// 判断系统是否能找到可用的 Python 解释器
+/// 判断系统是否能找到可用的 Python 解释器（要求 3.12.10）
 /// # Returns
 /// - `Ok(String)`: 返回找到的 Python 解释器路径
 /// - `Err(String)`: 如果未找到，返回错误信息
@@ -131,30 +175,14 @@ fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
 pub fn check_python_status() -> Result<String, String> {
     let possible_commands = ["python3", "python", "py"];
 
-    const _PYTHON_VERSION: &str = "Python 3.12.10";
-
     // Iterate through possible commands to find a usable Python interpreter
     for cmd in possible_commands {
-        let mut cmd_proc = std::process::Command::new(cmd);
-        if cmd == "py" {
-            cmd_proc.arg("-3.12");
-        }
-        cmd_proc.arg("--version");
-        #[cfg(windows)]
-        {
-            cmd_proc.creation_flags(0x08000000);
-        }
-        if let Ok(output) = cmd_proc.output() {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if output.status.success() && stdout.starts_with(_PYTHON_VERSION) {
-                match which(cmd) {
-                    Ok(path) => {
-                        let version = stdout;
-                        if version.starts_with(_PYTHON_VERSION) {
-                            return Ok(path.to_string_lossy().to_string());
-                        }
-                    }
-                    Err(_) => continue,
+        let args = if cmd == "py" { vec!["-3.12"] } else { vec![] };
+        if let Some((version, executable)) = probe_python_command(cmd, &args) {
+            if version == REQUIRED_PYTHON_VERSION {
+                let exe_path = PathBuf::from(&executable);
+                if exe_path.is_file() {
+                    return Ok(executable);
                 }
             }
         }
