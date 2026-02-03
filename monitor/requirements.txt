@@ -1,0 +1,18 @@
+--index-url https://mirrors.aliyun.com/pypi/simple/
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
+
+mss
+Pillow
+pywin32
+
+paddlepaddle==3.2.0
+paddleocr==3.3.0
+opencv-python
+
+transformers>=4.30.0
+torch
+chromadb>=0.4.0
+
+numpy<2.0.0
+psutil
+pywinauto

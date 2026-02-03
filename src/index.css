@@ -1,0 +1,109 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: 'Google Sans Flex', 'Inter', system-ui, sans-serif;
+  color: var(--ide-text);
+  background-color: var(--ide-bg);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+
+  /* Light theme (default) */
+  --ide-bg: #f7f9fc;
+  --ide-panel: #ffffff;
+  --ide-border: #d9dde7;
+  --ide-text: #1f2430;
+  --ide-muted: #6b7280;
+  --ide-accent: #2563eb;
+  --ide-active: #eef2f7;
+  --ide-hover: #e5eaf1;
+  --ide-error: #dc2626;
+  --ide-success: #16a34a;
+}
+
+.dark {
+  /* Dark theme overrides */
+  --ide-bg: #1e1e1e;
+  --ide-panel: #252526;
+  --ide-border: #333333;
+  --ide-text: #cccccc;
+  --ide-muted: #858585;
+  --ide-accent: #007acc;
+  --ide-active: #37373d;
+  --ide-hover: #2a2d2e;
+  --ide-error: #f14c4c;
+  --ide-success: #89d185;
+}
+
+body {
+  @apply font-sans bg-ide-bg text-ide-text overflow-hidden;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* Custom Scrollbar for IDE look */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-ide-bg;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-ide-active rounded-none border-2 border-ide-bg;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-ide-muted;
+}
+
+@layer components {
+  .ide-panel {
+    @apply bg-ide-panel border-r border-ide-border h-full flex flex-col;
+  }
+
+  .ide-header {
+    @apply h-9 flex items-center px-4 bg-ide-panel border-b border-ide-border text-xs font-bold uppercase tracking-wider text-ide-muted select-none;
+  }
+
+  .ide-input {
+    @apply bg-ide-bg border border-ide-border text-ide-text px-2 py-1 text-sm focus:outline-none focus:border-ide-accent placeholder-ide-muted placeholder-opacity-50 w-full;
+  }
+
+  .ide-button {
+    @apply px-3 py-1 bg-ide-active text-ide-text text-sm hover:bg-ide-hover border border-ide-border transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .ide-button-primary {
+    @apply px-3 py-1 bg-ide-accent text-white text-sm hover:bg-ide-accent hover:bg-opacity-90 border border-transparent transition-colors font-medium;
+  }
+
+  .ide-label {
+    @apply block text-xs text-ide-muted mb-1.5 font-medium;
+  }
+  
+  .ide-tab {
+    @apply px-4 py-2 text-sm text-ide-muted border-r border-ide-border cursor-pointer hover:bg-ide-bg hover:text-ide-text transition-colors;
+  }
+
+  .ide-tab-active {
+    @apply bg-ide-bg text-ide-text border-t-2 border-t-ide-accent;
+  }
+}
+
+/* 控制开关类描述文本的最大宽度并换行 */
+.toggle-desc {
+  max-width: 400px;
+  @apply break-words whitespace-normal;
+}
+
+
+::selection {
+  background: rgba(93, 224, 255, 0.35);
+  color: #050713;
+}
