@@ -310,9 +310,9 @@ pub async fn start_monitor(
             .env("PYTHONIOENCODING", "utf-8")
             .env("PROFILING_ENABLED", "1")
             .env("OMP_NUM_THREADS", "1")
-            .env("MKL_NUM_THREADS", "1")
-            .env("OPENBLAS_NUM_THREADS", "1")
-            .env("NUMPY_NUM_THREADS", "1") // 通过限制线程数，降低子服务对系统的影响
+            .env("MKL_NUM_THREADS", "2")
+            .env("OPENBLAS_NUM_THREADS", "2")
+            .env("NUMPY_NUM_THREADS", "2") // 通过限制线程数，降低子服务对系统的影响
             .env(
                 "TRACEMALLOC_SNAPSHOT_DIR",
                 "D:\\carbon_tracemalloc_snapshots",

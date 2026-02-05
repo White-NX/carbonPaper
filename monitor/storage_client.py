@@ -223,6 +223,55 @@ class StorageClient:
         
         print(f"[storage_client] Decryption failed: {response.get('error')}")
         return None
+
+    def decrypt_many_from_chromadb(self, encrypted_list: List[str]) -> List[Optional[str]]:
+        """
+        批量解密数据
+
+        Args:
+            encrypted_list: 加密字符串列表
+
+        Returns:
+            解密后的字符串列表（与输入顺序一致，失败项为 None）
+        """
+        if not encrypted_list:
+            return []
+
+        results: List[Optional[str]] = [None] * len(encrypted_list)
+        pending_indices = []
+        pending_values = []
+
+        for idx, enc in enumerate(encrypted_list):
+            if enc:
+                cached = self._cache_get(self._decrypt_cache, enc)
+                if cached is not None:
+                    results[idx] = cached
+                    continue
+            pending_indices.append(idx)
+            pending_values.append(enc)
+
+        if not pending_values:
+            return results
+
+        response = self._send_request({
+            'command': 'decrypt_many_from_chromadb',
+            'encrypted_list': pending_values
+        })
+
+        if response.get('status') == 'success':
+            data = response.get('data', {})
+            decrypted_list = data.get('decrypted_list')
+
+            if isinstance(decrypted_list, list) and len(decrypted_list) == len(pending_values):
+                for i, decrypted in enumerate(decrypted_list):
+                    idx = pending_indices[i]
+                    results[idx] = decrypted
+                    if decrypted is not None and pending_values[i]:
+                        self._cache_set(self._decrypt_cache, pending_values[i], decrypted)
+                return results
+
+        print(f"[storage_client] Batch decryption failed: {response.get('error')}")
+        return results
     
     def screenshot_exists(self, image_hash: str) -> bool:
         """

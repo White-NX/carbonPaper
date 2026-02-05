@@ -220,25 +220,82 @@ async fn storage_get_screenshot_details(
 #[tauri::command]
 async fn storage_delete_screenshot(
     state: tauri::State<'_, Arc<StorageState>>,
+    monitor_state: tauri::State<'_, MonitorState>,
     screenshot_id: i64,
 ) -> Result<serde_json::Value, String> {
+    let image_hash = match state.get_screenshot_by_id(screenshot_id)? {
+        Some(record) => Some(record.image_hash),
+        None => None,
+    };
+
     let deleted = state.delete_screenshot(screenshot_id)?;
+    let mut vector_deleted: Option<i64> = None;
+
+    if deleted {
+        if let Some(hash) = image_hash {
+            let payload = serde_json::json!({
+                "command": "delete_screenshot",
+                "screenshot_id": screenshot_id,
+                "image_hash": hash
+            });
+            match monitor::execute_monitor_command(monitor_state, payload).await {
+                Ok(resp) => {
+                    vector_deleted = resp.get("vector_deleted").and_then(|v| v.as_i64());
+                }
+                Err(e) => {
+                    eprintln!("[storage_delete_screenshot] Vector delete failed: {}", e);
+                }
+            }
+        }
+    }
     Ok(serde_json::json!({
         "status": "success",
-        "deleted": deleted
+        "deleted": deleted,
+        "vector_deleted": vector_deleted
     }))
 }
 
 #[tauri::command]
 async fn storage_delete_by_time_range(
     state: tauri::State<'_, Arc<StorageState>>,
+    monitor_state: tauri::State<'_, MonitorState>,
     start_time: f64,
     end_time: f64,
 ) -> Result<serde_json::Value, String> {
+    let start_ts = start_time / 1000.0;
+    let end_ts = end_time / 1000.0;
+    let image_hashes = match state.get_screenshots_by_time_range(start_ts, end_ts) {
+        Ok(records) => records.into_iter().map(|r| r.image_hash).collect::<Vec<_>>(),
+        Err(e) => {
+            eprintln!("[storage_delete_by_time_range] Failed to load hashes: {}", e);
+            Vec::new()
+        }
+    };
+
     let deleted_count = state.delete_screenshots_by_time_range(start_time, end_time)?;
+    let mut vector_deleted: Option<i64> = None;
+
+    if !image_hashes.is_empty() {
+        let payload = serde_json::json!({
+            "command": "delete_by_time_range",
+            "start_time": start_time,
+            "end_time": end_time,
+            "image_hashes": image_hashes
+        });
+
+        match monitor::execute_monitor_command(monitor_state, payload).await {
+            Ok(resp) => {
+                vector_deleted = resp.get("vector_deleted").and_then(|v| v.as_i64());
+            }
+            Err(e) => {
+                eprintln!("[storage_delete_by_time_range] Vector delete failed: {}", e);
+            }
+        }
+    }
     Ok(serde_json::json!({
         "status": "success",
-        "deleted_count": deleted_count
+        "deleted_count": deleted_count,
+        "vector_deleted": vector_deleted
     }))
 }
 

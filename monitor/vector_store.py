@@ -458,24 +458,63 @@ class VectorStore:
             # 检查是否是加密数据（以 ENC2:/ENC: 前缀标识）
             if text.startswith("ENC2:") or text.startswith("ENC:"):
                 decrypted = self.storage_client.decrypt_from_chromadb(text)
-                if decrypted:
+                if decrypted is not None:
                     return decrypted
         return text
+
+    def _decrypt_texts(self, texts: List[str]) -> List[str]:
+        """批量解密文本（保持输入顺序）"""
+        if not self.storage_client or not texts:
+            return texts
+
+        encrypted_values = []
+        encrypted_indices = []
+
+        for idx, text in enumerate(texts):
+            if isinstance(text, str) and (text.startswith("ENC2:") or text.startswith("ENC:")):
+                encrypted_indices.append(idx)
+                encrypted_values.append(text)
+
+        if not encrypted_values:
+            return texts
+
+        decrypt_many = getattr(self.storage_client, 'decrypt_many_from_chromadb', None)
+        if callable(decrypt_many):
+            decrypted_list = decrypt_many(encrypted_values)
+        else:
+            decrypted_list = [self.storage_client.decrypt_from_chromadb(v) for v in encrypted_values]
+
+        result = list(texts)
+        for i, idx in enumerate(encrypted_indices):
+            decrypted = decrypted_list[i] if i < len(decrypted_list) else None
+            if decrypted is not None:
+                result[idx] = decrypted
+
+        return result
     
     def _decrypt_metadata(self, meta: Dict[str, Any]) -> Dict[str, Any]:
         """解密元数据中的加密字段"""
         if not meta or not self.storage_client:
             return meta
         
-        decrypted = {}
+        decrypted = dict(meta)
         # 需要解密的字段
         encrypted_fields = {'image_path', 'window_title', 'process_name', 'app_name', 'url'}
-        
-        for k, v in meta.items():
-            if k in encrypted_fields and isinstance(v, str):
-                decrypted[k] = self._decrypt_text(v)
-            else:
-                decrypted[k] = v
+
+        batch_values = []
+        batch_keys = []
+        for k in encrypted_fields:
+            v = meta.get(k)
+            if isinstance(v, str) and (v.startswith("ENC2:") or v.startswith("ENC:")):
+                batch_keys.append(k)
+                batch_values.append(v)
+
+        if batch_values:
+            decrypted_values = self._decrypt_texts(batch_values)
+            for i, key in enumerate(batch_keys):
+                value = decrypted_values[i] if i < len(decrypted_values) else None
+                if value is not None:
+                    decrypted[key] = value
         
         return decrypted
     
@@ -485,18 +524,28 @@ class VectorStore:
             return result
         
         decrypted = result.copy()
-        
-        # 解密 image_path
-        if 'image_path' in decrypted and isinstance(decrypted['image_path'], str):
-            decrypted['image_path'] = self._decrypt_text(decrypted['image_path'])
-        
+
+        batch_targets = []
+        batch_keys = []
+
+        if isinstance(decrypted.get('image_path'), str):
+            batch_keys.append('image_path')
+            batch_targets.append(decrypted['image_path'])
+
+        if isinstance(decrypted.get('ocr_text'), str):
+            batch_keys.append('ocr_text')
+            batch_targets.append(decrypted['ocr_text'])
+
+        if batch_targets:
+            decrypted_values = self._decrypt_texts(batch_targets)
+            for i, key in enumerate(batch_keys):
+                value = decrypted_values[i] if i < len(decrypted_values) else None
+                if value is not None:
+                    decrypted[key] = value
+
         # 解密 metadata
-        if 'metadata' in decrypted and isinstance(decrypted['metadata'], dict):
+        if isinstance(decrypted.get('metadata'), dict):
             decrypted['metadata'] = self._decrypt_metadata(decrypted['metadata'])
-        
-        # 解密 ocr_text
-        if 'ocr_text' in decrypted and isinstance(decrypted['ocr_text'], str):
-            decrypted['ocr_text'] = self._decrypt_text(decrypted['ocr_text'])
         
         return decrypted
     

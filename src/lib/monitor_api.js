@@ -7,42 +7,133 @@ export { initAuthListeners, lockSession } from './auth_api';
 
 // Simple request queue to limit concurrent pipe connections
 class RequestQueue {
-    constructor(maxConcurrent = 3) {
+    constructor(maxConcurrent = 3, maxPending = 200) {
         this.maxConcurrent = maxConcurrent;
+        this.maxPending = maxPending;
         this.running = 0;
         this.queue = [];
+        this.pendingByKey = new Map();
+        this.runningByKey = new Map();
     }
 
-    async enqueue(fn) {
-        return new Promise((resolve, reject) => {
-            const task = async () => {
+    async enqueue(fn, options = {}) {
+        const { priority = 'normal', key = null, dedupe = true } = options;
+
+        if (dedupe && key !== null && key !== undefined) {
+            const existing = this.pendingByKey.get(key) || this.runningByKey.get(key);
+            if (existing) {
+                if (priority === 'high' && existing.priority !== 'high') {
+                    existing.priority = 'high';
+                    if (this.queue.includes(existing)) {
+                        this.queue = this.queue.filter((item) => item !== existing);
+                        this.queue.unshift(existing);
+                    }
+                }
+                return existing.promise;
+            }
+        }
+
+        let settled = false;
+        let resolveRef;
+        let rejectRef;
+        const promise = new Promise((resolve, reject) => {
+            resolveRef = resolve;
+            rejectRef = reject;
+        });
+
+        const safeResolve = (value) => {
+            if (settled) return;
+            settled = true;
+            resolveRef(value);
+        };
+        const safeReject = (error) => {
+            if (settled) return;
+            settled = true;
+            rejectRef(error);
+        };
+
+        const entry = {
+            key,
+            priority,
+            cancelled: false,
+            promise,
+            run: async () => {
+                if (entry.key !== null && entry.key !== undefined) {
+                    this.pendingByKey.delete(entry.key);
+                    this.runningByKey.set(entry.key, entry);
+                }
+                if (entry.cancelled) {
+                    safeReject(new Error('cancelled'));
+                    return;
+                }
                 try {
                     const result = await fn();
-                    resolve(result);
+                    safeResolve(result);
                 } catch (e) {
-                    reject(e);
+                    safeReject(e);
                 } finally {
                     this.running--;
+                    if (entry.key !== null && entry.key !== undefined) {
+                        this.runningByKey.delete(entry.key);
+                    }
                     this.processNext();
                 }
-            };
+            },
+            cancel: () => {
+                entry.cancelled = true;
+                if (entry.key !== null && entry.key !== undefined) {
+                    this.pendingByKey.delete(entry.key);
+                    this.runningByKey.delete(entry.key);
+                }
+                safeReject(new Error('cancelled'));
+            }
+        };
 
-            this.queue.push(task);
-            this.processNext();
-        });
+        if (this.queue.length >= this.maxPending) {
+            const dropped = priority === 'high' ? this.queue.pop() : this.queue.shift();
+            if (dropped) dropped.cancel();
+        }
+
+        if (priority === 'high') {
+            this.queue.unshift(entry);
+        } else {
+            this.queue.push(entry);
+        }
+        if (entry.key !== null && entry.key !== undefined) {
+            this.pendingByKey.set(entry.key, entry);
+        }
+        this.processNext();
+        return promise;
+    }
+
+    clearPending() {
+        this.queue.forEach((entry) => entry.cancel());
+        this.queue = [];
+        this.pendingByKey.clear();
+    }
+
+    cancelByKey(key) {
+        if (key === null || key === undefined) return false;
+        const entry = this.pendingByKey.get(key) || this.runningByKey.get(key);
+        if (!entry) return false;
+        this.queue = this.queue.filter((item) => item !== entry);
+        entry.cancel();
+        return true;
     }
 
     processNext() {
         while (this.running < this.maxConcurrent && this.queue.length > 0) {
             const task = this.queue.shift();
             this.running++;
-            task();
+            task.run();
         }
     }
 }
 
 // Global request queue for image fetching (limit concurrent requests)
-const imageQueue = new RequestQueue(3);
+const imageQueue = new RequestQueue(3, 100);
+// Timeline thumbnails should load in parallel to avoid long UI delays after pan/zoom
+const timelineImageQueue = new RequestQueue(20, 800);
 
 /**
  * 初始化凭据管理器 - 应在应用启动时调用
@@ -96,7 +187,41 @@ export const fetchImage = async (id, path = null) => {
             }
             return null;
         });
-    });
+    }, { priority: 'high' });
+};
+
+/**
+ * 时间线缩略图专用获取（低优先级，避免阻塞预览图）
+ */
+export const fetchTimelineImage = async (id, path = null, options = {}) => {
+    const { priority = 'normal', key = null } = options || {};
+    return timelineImageQueue.enqueue(async () => {
+        return withAuth(async () => {
+            try {
+                const response = await invoke('storage_get_image', { id, path });
+                if (response && response.status === 'success' && response.data) {
+                    return `data:${response.mime_type || 'image/png'};base64,${response.data}`;
+                }
+                return null;
+            } catch (err) {
+                const message = err?.toString?.() || String(err);
+                if (message.includes('Image not found')) {
+                    const notFound = new Error('not_found');
+                    notFound.code = 'not_found';
+                    throw notFound;
+                }
+                throw err;
+            }
+        });
+    }, { priority, key });
+};
+
+export const clearTimelineImageQueue = () => {
+    timelineImageQueue.clearPending();
+};
+
+export const cancelTimelineImageRequest = (key) => {
+    timelineImageQueue.cancelByKey(key);
 };
 
 /**

@@ -23,6 +23,28 @@ _storage_pipe = None  # 存储服务管道名
 # Cache for dynamically extracted icons by process name
 _dynamic_icon_cache = {}
 
+def _delete_vectors_by_hashes(image_hashes):
+    """Best-effort delete from vector store using image hashes."""
+    if not image_hashes:
+        return {"deleted": 0, "requested": 0, "skipped": True}
+
+    if not _ocr_worker or not _ocr_worker.enable_vector_store or not _ocr_worker.vector_store:
+        return {"deleted": 0, "requested": len(image_hashes), "skipped": True}
+
+    deleted = 0
+    for image_hash in image_hashes:
+        if not isinstance(image_hash, str) or not image_hash:
+            continue
+        try:
+            ok = _ocr_worker.vector_store.delete_image(f"memory://{image_hash}")
+            if ok:
+                deleted += 1
+        except Exception:
+            # Best-effort; ignore individual failures
+            continue
+
+    return {"deleted": deleted, "requested": len(image_hashes), "skipped": False}
+
 def get_data_dir():
     # 获取 Windows LocalAppData/CarbonPaper/data 路径
     local_appdata = os.environ.get('LOCALAPPDATA')
@@ -365,7 +387,16 @@ def _handle_command(req: dict):
             return {'error': 'OCR worker not initialized'}
         try:
             deleted = _ocr_worker.db_handler.delete_screenshot(screenshot_id)
-            return {'status': 'success', 'deleted': deleted}
+            image_hashes = []
+            image_hash = req.get('image_hash')
+            if isinstance(image_hash, str) and image_hash:
+                image_hashes.append(image_hash)
+            vector_info = _delete_vectors_by_hashes(image_hashes)
+            return {
+                'status': 'success',
+                'deleted': deleted,
+                'vector_deleted': vector_info.get('deleted', 0)
+            }
         except Exception as exc:
             return {'error': str(exc)}
 
@@ -380,7 +411,15 @@ def _handle_command(req: dict):
             deleted_count = _ocr_worker.db_handler.delete_screenshots_by_time_range(
                 float(start_time), float(end_time)
             )
-            return {'status': 'success', 'deleted_count': deleted_count}
+            image_hashes = req.get('image_hashes')
+            if not isinstance(image_hashes, list):
+                image_hashes = []
+            vector_info = _delete_vectors_by_hashes(image_hashes)
+            return {
+                'status': 'success',
+                'deleted_count': deleted_count,
+                'vector_deleted': vector_info.get('deleted', 0)
+            }
         except Exception as exc:
             return {'error': str(exc)}
 

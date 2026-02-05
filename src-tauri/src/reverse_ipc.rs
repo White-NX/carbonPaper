@@ -301,6 +301,30 @@ fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageRe
                 Err(e) => StorageResponse::error(&e),
             }
         }
+
+        "decrypt_many_from_chromadb" => {
+            let list_value = req.get("encrypted_list");
+            let mut decrypted_list: Vec<String> = Vec::new();
+            let mut error_count = 0;
+
+            if let Some(values) = list_value.and_then(|v| v.as_array()) {
+                for value in values {
+                    let encrypted = value.as_str().unwrap_or("");
+                    match storage.decrypt_from_chromadb(encrypted) {
+                        Ok(decrypted) => decrypted_list.push(decrypted),
+                        Err(_) => {
+                            error_count += 1;
+                            decrypted_list.push(encrypted.to_string());
+                        }
+                    }
+                }
+            }
+
+            StorageResponse::success(serde_json::json!({
+                "decrypted_list": decrypted_list,
+                "error_count": error_count
+            }))
+        }
         
         "screenshot_exists" => {
             let image_hash = req.get("image_hash").and_then(|h| h.as_str()).unwrap_or("");

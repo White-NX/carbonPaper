@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { getTimeline, fetchImage } from '../lib/monitor_api';
+import { getTimeline, fetchTimelineImage, clearTimelineImageQueue, cancelTimelineImageRequest } from '../lib/monitor_api';
 import { Locate, Play } from 'lucide-react';
 
 // Simple debounce
@@ -61,24 +61,99 @@ const getProcessColor = (processName, windowTitle = '', prevProcessName = null, 
     return `hsl(${hue}, 65%, 40%)`; 
 };
 
+const TIMELINE_IMAGE_CACHE_LIMIT = 800;
+const timelineImageCache = new Map();
+
+const getTimelineImageCacheKey = (event) => {
+    if (!event) return null;
+    return event.id ?? event.imagePath ?? null;
+};
+
+const setTimelineImageCache = (key, dataUrl) => {
+    if (key === null || key === undefined || !dataUrl) return;
+    if (!timelineImageCache.has(key) && timelineImageCache.size >= TIMELINE_IMAGE_CACHE_LIMIT) {
+        const oldestKey = timelineImageCache.keys().next().value;
+        timelineImageCache.delete(oldestKey);
+    }
+    timelineImageCache.set(key, dataUrl);
+};
+
 // Sub-component for individual events to handle lazy loading
-const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showText, showLabel, isSameActivityAsNext, isSameActivityAsPrev, prevAppName, prevWindowTitle, onClick, isHighlighted }) => {
+const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showText, showLabel, isSameActivityAsNext, isSameActivityAsPrev, prevAppName, prevWindowTitle, onClick, isHighlighted, imageEpoch }) => {
     const [imageUrl, setImageUrl] = useState(null);
     const [loading, setLoading] = useState(false);
+    const [retryToken, setRetryToken] = useState(0);
+    const requestIdRef = useRef(0);
+    const loadingRef = useRef(false);
+    const retryTimerRef = useRef(null);
+    const retryCountRef = useRef(0);
 
     useEffect(() => {
+        let cancelled = false;
+        const cacheKey = getTimelineImageCacheKey(event);
+        const scheduleRetry = (delayMs) => {
+            if (retryTimerRef.current) return;
+            retryTimerRef.current = setTimeout(() => {
+                retryTimerRef.current = null;
+                setRetryToken((value) => value + 1);
+            }, delayMs);
+        };
         // If highlighted, force load image even if density says no?
         // Actually density logic happens in parent. If parent says showImage=false, we don't render this block.
         // We should ensure parent sets showImage=true for highlighted events.
-        
-        if (visible && showImage && !imageUrl && !loading) {
-            setLoading(true);
-            fetchImage(event.id).then(data => {
-                if (data) setImageUrl(data);
-                setLoading(false);
-            });
+        if (!visible || !showImage) {
+            cancelTimelineImageRequest(cacheKey);
+            return () => {
+                cancelled = true;
+            };
         }
-    }, [visible, showImage, event.id, imageUrl, loading]);
+
+        if (visible && showImage) {
+            const cached = cacheKey ? timelineImageCache.get(cacheKey) : null;
+            if (cached && cached !== imageUrl) {
+                setImageUrl(cached);
+            } else if (!imageUrl && !loadingRef.current) {
+                loadingRef.current = true;
+                setLoading(true);
+                const requestId = requestIdRef.current + 1;
+                requestIdRef.current = requestId;
+                fetchTimelineImage(event.id, event.imagePath, { priority: 'high', key: cacheKey })
+                    .then((data) => {
+                        if (cancelled || requestIdRef.current !== requestId) return;
+                        if (data) {
+                            setTimelineImageCache(cacheKey, data);
+                            setImageUrl(data);
+                        }
+                        retryCountRef.current = 0;
+                    })
+                    .catch((err) => {
+                        if (cancelled || requestIdRef.current !== requestId) return;
+                        if (err?.code === 'not_found') {
+                            return;
+                        }
+                        if (visible && showImage && !imageUrl) {
+                            const nextRetry = Math.min(retryCountRef.current + 1, 5);
+                            retryCountRef.current = nextRetry;
+                            const delayMs = err?.message === 'cancelled' ? 200 : 400 * nextRetry;
+                            scheduleRetry(delayMs);
+                        }
+                    })
+                    .finally(() => {
+                        if (cancelled || requestIdRef.current !== requestId) return;
+                        loadingRef.current = false;
+                        setLoading(false);
+                    });
+            }
+        }
+        return () => {
+            cancelled = true;
+            loadingRef.current = false;
+            if (retryTimerRef.current) {
+                clearTimeout(retryTimerRef.current);
+                retryTimerRef.current = null;
+            }
+        };
+    }, [visible, showImage, event.id, event.imagePath, imageEpoch, imageUrl, retryToken]);
 
     const iconSrc = useMemo(() => {
         if (!event.processIcon) return null;
@@ -168,8 +243,10 @@ const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showTex
 const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedEventId, refreshKey }) => {
     const containerRef = useRef(null);
     const canvasRef = useRef(null);
+    const wheelIdleTimerRef = useRef(null);
     const [width, setWidth] = useState(0);
     const [events, setEvents] = useState([]);
+    const [imageEpoch, setImageEpoch] = useState(0);
     
     // View State
     const [centerTime, setCenterTime] = useState(Date.now());
@@ -208,6 +285,8 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
             setCenterTime(jumpTimestamp.time);
             // Auto-zoom to a clear level if we are too zoomed out
             setZoom(prev => Math.max(prev, 0.005)); 
+            clearTimelineImageQueue();
+            setImageEpoch(prev => prev + 1);
         }
     }, [jumpTimestamp]);
 
@@ -235,9 +314,19 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         setCenterTime(Date.now());
         setZoom(MAX_ZOOM); // Zoom to max (seconds view)
         setIsFollowingNow(true);
+        clearTimelineImageQueue();
+        setImageEpoch(prev => prev + 1);
     };
 
     // Raw fetch function
+    const getEventKey = useCallback((event) => {
+        if (!event) return null;
+        if (event.id !== null && event.id !== undefined) return event.id;
+        if (event.imagePath) return event.imagePath;
+        const ts = event.timestamp ?? 0;
+        return `${ts}-${event.appName || ''}-${event.windowTitle || ''}`;
+    }, []);
+
     const fetchEventsRaw = async (center, currentZoom, containerWidth) => {
         if (!containerWidth) return;
         
@@ -278,8 +367,9 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                 const seen = new Set();
                 const unique = [];
                 for (const e of combined) {
-                    if (!seen.has(e.id)) {
-                        seen.add(e.id);
+                    const key = getEventKey(e);
+                    if (!seen.has(key)) {
+                        seen.add(key);
                         unique.push(e);
                     }
                 }
@@ -300,6 +390,8 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     useEffect(() => {
         if (refreshKey === undefined) return;
         setEvents([]);
+        clearTimelineImageQueue();
+        setImageEpoch(prev => prev + 1);
         fetchEventsRaw(centerTime, zoom, width);
     }, [refreshKey]);
 
@@ -332,6 +424,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         setIsDragging(true);
         isDraggingRef.current = true;
         lastMouseXRef.current = e.clientX;
+        clearTimelineImageQueue();
     };
 
     const handleMouseMove = (e) => {
@@ -345,11 +438,13 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     const handleMouseUp = () => {
         setIsDragging(false);
         isDraggingRef.current = false;
+        setImageEpoch(prev => prev + 1);
     };
 
     const handleMouseLeave = () => {
         setIsDragging(false);
         isDraggingRef.current = false;
+        setImageEpoch(prev => prev + 1);
     };
 
     const handleBackgroundClick = useCallback((e) => {
@@ -363,6 +458,14 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     const handleWheel = (e) => {
         try { e.preventDefault(); } catch(err){} 
         setIsFollowingNow(false);
+        clearTimelineImageQueue();
+
+        if (wheelIdleTimerRef.current) {
+            clearTimeout(wheelIdleTimerRef.current);
+        }
+        wheelIdleTimerRef.current = setTimeout(() => {
+            setImageEpoch(prev => prev + 1);
+        }, 160);
 
         const rect = containerRef.current.getBoundingClientRect();
         const cursorX = e.clientX - rect.left;
@@ -607,12 +710,22 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                     else high = mid - 1;
                 }
                 endIndex = Math.min(events.length, low + 1);
-
                 let lastImageX = -9999;
                 let lastLabelX = -9999;
                 const MIN_IMAGE_GAP = 20;
                 const isFineZoom = tickStepMs < 30000;
                 const MIN_LABEL_GAP = showProcessText ? 180 : (isFineZoom ? 0 : 30);
+
+                // Sparse sampling on macro scales without changing the visual placement rules.
+                const visibleSpanMs = Math.max(1, endTime - startTime);
+                const macroScale = tickStepMs > 120000; // coarser than 2 min/tick
+                const maxImagesPerView = macroScale
+                    ? Math.max(14, Math.min(60, Math.floor(width / 60)))
+                    : null;
+                const sampleIntervalMs = macroScale && maxImagesPerView
+                    ? Math.max(tickStepMs * 1.5, Math.floor(visibleSpanMs / maxImagesPerView))
+                    : null;
+                const seenSampleBuckets = macroScale ? new Set() : null;
                 
                 const visibleNodes = [];
 
@@ -639,17 +752,26 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                     
                     const isSameActivityAsNext = nextEvent && nextActivityKey === currentActivityKey;
                     const isSameActivityAsPrev = prevEvent && prevActivityKey === currentActivityKey;
-
                     // Density check for images
                     let showImage = false;
                     const isZoomedEnough = zoom > 0.00001;
-                    if (isZoomedEnough) {
+                    let isSampled = true;
+                    let sampleBucket = null;
+                    if (macroScale && sampleIntervalMs) {
+                        sampleBucket = Math.floor(event.timestamp / sampleIntervalMs);
+                        if (seenSampleBuckets.has(sampleBucket)) {
+                            isSampled = false;
+                        }
+                    }
+                    if (isZoomedEnough && isSampled) {
                         if (x - lastImageX >= MIN_IMAGE_GAP) {
                             showImage = true;
                             lastImageX = x;
+                            if (sampleBucket !== null) {
+                                seenSampleBuckets.add(sampleBucket);
+                            }
                         }
                     }
-
                     // Density check for labels
                     let showLabel = false;
                     if (!isSameActivityAsPrev) {
@@ -669,9 +791,10 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                         continue;
                     }
 
+                    const eventKey = getEventKey(event) ?? `${event.timestamp}-${index}`;
                     visibleNodes.push(
                         <TimelineEvent 
-                            key={event.id}
+                            key={eventKey}
                             event={event}
                             x={x}
                             width={segmentWidth}
@@ -685,6 +808,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                             prevWindowTitle={prevEvent?.windowTitle}
                             onClick={onSelectEvent}
                             isHighlighted={isHighlighted}
+                            imageEpoch={imageEpoch}
                         />
                     );
                 }
