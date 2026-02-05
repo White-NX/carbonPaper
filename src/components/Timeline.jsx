@@ -165,7 +165,7 @@ const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showTex
     );
 });
 
-const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedEventId }) => {
+const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedEventId, refreshKey }) => {
     const containerRef = useRef(null);
     const canvasRef = useRef(null);
     const [width, setWidth] = useState(0);
@@ -184,7 +184,8 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     const [zoom, setZoom] = useState(0.001); 
 
     const [isDragging, setIsDragging] = useState(false);
-    const [lastMouseX, setLastMouseX] = useState(0);
+    const lastMouseXRef = useRef(0);
+    const isDraggingRef = useRef(false);
     const [isFollowingNow, setIsFollowingNow] = useState(false);
 
     // Initial width detection
@@ -246,14 +247,31 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         
         try {
             const records = await getTimeline(startTime, endTime);
-            const mapped = records.map(r => ({
-                id: r.id,
-                timestamp: parseInt(r.timestamp) * 1000, 
-                appName: r.process_name,
-                windowTitle: r.window_title,
-                processIcon: r.process_icon || null,
-                processPath: r.process_path || null,
-            }));
+            console.log('[Timeline] Raw records from API:', records);
+            const mapped = (records || [])
+                .filter(r => r.timestamp != null) // Filter out records without timestamp
+                .map(r => {
+                    let meta = null;
+                    if (r?.metadata) {
+                        try {
+                            meta = typeof r.metadata === 'string' ? JSON.parse(r.metadata) : r.metadata;
+                        } catch (e) {
+                            meta = null;
+                        }
+                    }
+
+                    return {
+                        id: r.id,
+                        timestamp: r.timestamp ? r.timestamp * 1000 : (r.created_at ? new Date(r.created_at).getTime() : 0),
+                        imagePath: r.image_path,
+                        appName: r.process_name,
+                        windowTitle: r.window_title,
+                        processIcon: r.process_icon || meta?.process_icon || null,
+                        processPath: r.process_path || meta?.process_path || null,
+                    };
+                })
+                .filter(e => !isNaN(e.timestamp)); // Filter out invalid timestamps
+            console.log('[Timeline] Mapped events:', mapped.length);
             
             setEvents(prev => {
                 const combined = [...mapped, ...prev];
@@ -265,16 +283,25 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                         unique.push(e);
                     }
                 }
-                return unique.sort((a, b) => a.timestamp - b.timestamp);
+                const sorted = unique.sort((a, b) => a.timestamp - b.timestamp);
+                console.log('[Timeline] Total unique events:', sorted.length);
+                return sorted;
             });
         } catch (err) {
-            console.error(err);
+            console.error('[Timeline] Fetch error:', err);
         }
     };
 
     // Create memoized debounced and throttled versions
     const fetchEventsDebounced = useMemo(() => simpleDebounce(fetchEventsRaw, 500), []);
     const fetchEventsThrottled = useMemo(() => simpleThrottle(fetchEventsRaw, 1000), []);
+
+    // One-shot refresh (e.g., after delete)
+    useEffect(() => {
+        if (refreshKey === undefined) return;
+        setEvents([]);
+        fetchEventsRaw(centerTime, zoom, width);
+    }, [refreshKey]);
 
     // Main interaction effect
     useEffect(() => {
@@ -303,23 +330,26 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     const handleMouseDown = (e) => {
         setIsFollowingNow(false);
         setIsDragging(true);
-        setLastMouseX(e.clientX);
+        isDraggingRef.current = true;
+        lastMouseXRef.current = e.clientX;
     };
 
     const handleMouseMove = (e) => {
-        if (!isDragging) return;
-        const deltaX = e.clientX - lastMouseX;
-        setLastMouseX(e.clientX);
+        if (!isDraggingRef.current) return;
+        const deltaX = e.clientX - lastMouseXRef.current;
+        lastMouseXRef.current = e.clientX;
         const deltaTime = deltaX / zoom; 
         setCenterTime(prev => prev - deltaTime);
     };
 
     const handleMouseUp = () => {
         setIsDragging(false);
+        isDraggingRef.current = false;
     };
 
     const handleMouseLeave = () => {
         setIsDragging(false);
+        isDraggingRef.current = false;
     };
 
     const handleBackgroundClick = useCallback((e) => {
@@ -412,6 +442,11 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         
         const dpr = window.devicePixelRatio || 1;
         const rect = containerRef.current.getBoundingClientRect();
+        // Keep CSS size in layout pixels to avoid visual scaling mismatch
+        if (canvas.style.width !== `${rect.width}px`) {
+            canvas.style.width = `${rect.width}px`;
+            canvas.style.height = `${rect.height}px`;
+        }
         
         // Ensure accurate scaling
         if (canvas.width !== rect.width * dpr || canvas.height !== rect.height * dpr) {

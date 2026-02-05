@@ -31,7 +31,7 @@ export default function AboutSection({ checking, upToDate, onCheckUpdate }) {
             <h1 className="text-2xl font-bold text-ide-text tracking-tight">CarbonPaper - 复写纸</h1>
             <div className="flex items-center gap-3">
                <span className="px-2 py-0.5 rounded bg-ide-panel border border-ide-border text-[10px] font-mono text-ide-muted">
-                v{APP_VERSION}
+                {APP_VERSION}
               </span>
             </div>
           </div>

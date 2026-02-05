@@ -48,10 +48,12 @@ function ResultPreview({ item, mode, onSelect, queryTokens }) {
     let active = true;
     const loadImage = async () => {
       if (!item) return;
-      const targetPath = item.image_path || item.metadata?.image_path;
-      if (!targetPath) return;
+      const screenshotId = item.screenshot_id ?? item.metadata?.screenshot_id;
+      const id = typeof screenshotId === 'number' && screenshotId > 0 ? screenshotId : null;
+      const targetPath = item.image_path || item.metadata?.image_path || item.path;
+      if (!id && !targetPath) return;
       setLoadingImage(true);
-      const dataUrl = await fetchImage(null, targetPath);
+      const dataUrl = await fetchImage(id, id ? null : targetPath);
       if (active) {
         setImageSrc(dataUrl);
         setLoadingImage(false);
@@ -96,7 +98,16 @@ function ResultPreview({ item, mode, onSelect, queryTokens }) {
   return (
     <button
       className="w-full text-left border-b border-ide-border hover:bg-ide-hover/40 transition-colors"
-      onClick={(event) => { event.stopPropagation(); onSelect(item); }}
+      onClick={(event) => { 
+        event.stopPropagation(); 
+        // Normalize the item to ensure 'path' field is set for App.jsx compatibility
+        const normalizedItem = {
+          ...item,
+          id: item.screenshot_id || item.id,
+          path: item.image_path || item.metadata?.image_path || item.path,
+        };
+        onSelect(normalizedItem); 
+      }}
     >
       <div className="flex gap-4 p-3">
         <div className="w-36 h-24 rounded border border-ide-border overflow-hidden bg-black flex items-center justify-center text-ide-muted text-xs">

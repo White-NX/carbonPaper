@@ -25,7 +25,7 @@ import { APP_VERSION } from '../lib/version';
 import { getAnalysisOverview } from '../lib/analysis_api';
 
 const defaultFilterSettings = {
-  processes: ['carbonpaper.exe'],
+  processes: ['carbonpaper.exe', 'credentialuibroker.exe'],
   titles: ['carbonpaper', 'pornhub'],
   ignoreProtected: true,
 };

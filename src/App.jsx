@@ -13,6 +13,7 @@ import { SearchBox } from './components/SearchBox';
 import { AdvancedSearch } from './components/AdvancedSearch';
 import SettingsDialog from './components/settings/SettingsDialog';
 import Mask from './components/Mask';
+import AuthMask from './components/AuthMask';
 import LeftSidebar from './components/LeftSidebar';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
@@ -50,6 +51,14 @@ function App() {
   });
   const [autoStartSuppressed, setAutoStartSuppressed] = useState(false);
 
+  // Windows Hello Authentication State
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authError, setAuthError] = useState(null);
+  const [sessionTimeout, setSessionTimeout] = useState(() => {
+    const saved = localStorage.getItem('sessionTimeout');
+    return saved ? parseInt(saved, 10) : 900; // 默认 15 分钟
+  });
+
   // Selected Timeline Event State
   const [selectedEvent, setSelectedEvent] = useState(null);
   const [selectedDetails, setSelectedDetails] = useState(null);
@@ -73,7 +82,8 @@ function App() {
   // State to trigger timeline jumps
   const [timelineJump, setTimelineJump] = useState(null); // { time: number, ts: number }
 
-  const normalizeTimestampToMs = useCallback((value) => {
+  const normalizeTimestampToMs = useCallback((value, options = {}) => {
+    const { assumeUtc = false } = options;
     if (value === null || value === undefined || value === '') return null;
 
     if (typeof value === 'number' && !Number.isNaN(value)) {
@@ -96,7 +106,7 @@ function App() {
     if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)) {
       iso = raw.replace(' ', 'T');
     }
-    if (!/[zZ]|[+\-]\d{2}:\d{2}$/.test(iso)) {
+    if (assumeUtc && !/[zZ]|[+\-]\d{2}:\d{2}$/.test(iso)) {
       iso = `${iso}Z`;
     }
     const parsed = new Date(iso);
@@ -122,7 +132,10 @@ function App() {
     const loadData = async () => {
       try {
         const targetId = selectedEvent.id === -1 ? null : selectedEvent.id;
-        const targetPath = selectedEvent.path;
+        // Support both 'path' and 'image_path' field names for compatibility
+        const targetPath = selectedEvent.path || selectedEvent.image_path;
+
+        console.log("Loading with targetId:", targetId, "targetPath:", targetPath);
 
         // First get details
         const det = await getScreenshotDetails(targetId, targetPath);
@@ -156,7 +169,10 @@ function App() {
   // PaddleOCR returns box as [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] (四个角点)
   // 需要计算包围盒的最小/最大 x、y 值
   const ocrBoxes = (selectedDetails?.ocr_results || []).map((item, index) => {
-    const points = item.box; // [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+    const points = item.box_coords || item.box; // 兼容两种字段名
+    if (!points || !Array.isArray(points) || points.length === 0) {
+      return null;
+    }
     const xs = points.map(p => p[0]);
     const ys = points.map(p => p[1]);
     const minX = Math.min(...xs);
@@ -177,7 +193,7 @@ function App() {
       },
       isSensitive: false
     };
-  });
+  }).filter(Boolean); // 过滤掉 null 值
 
   const handleCopyText = (text) => {
     navigator.clipboard.writeText(text);
@@ -254,6 +270,42 @@ function App() {
       timestamp: Date.now()
     });
   }, [pushNotification]);
+
+  // 检查 Windows Hello 认证状态
+  const checkAuthStatus = useCallback(async () => {
+    try {
+      const isValid = await invoke('credential_check_session');
+      setIsAuthenticated(isValid);
+    } catch (err) {
+      console.warn('Failed to check auth status:', err);
+      setIsAuthenticated(false);
+    }
+  }, []);
+
+  // 认证成功回调
+  const handleAuthSuccess = useCallback(() => {
+    setIsAuthenticated(true);
+    setAuthError(null);
+  }, []);
+
+  // 锁定会话回调
+  const handleLockSession = useCallback(() => {
+    setIsAuthenticated(false);
+  }, []);
+
+  useEffect(() => {
+    checkAuthStatus();
+    const interval = setInterval(checkAuthStatus, 10000);
+    return () => clearInterval(interval);
+  }, [checkAuthStatus]);
+
+  useEffect(() => {
+    const handleAuthRequired = () => {
+      setIsAuthenticated(false);
+    };
+    window.addEventListener('cp-auth-required', handleAuthRequired);
+    return () => window.removeEventListener('cp-auth-required', handleAuthRequired);
+  }, []);
 
   const handleStartBackend = async () => {
     setAutoStartSuppressed(false);
@@ -406,7 +458,8 @@ function App() {
     const screenshotId = res.screenshot_id !== undefined ? res.screenshot_id : (res.metadata?.screenshot_id);
     const imagePath = res.image_path || res.metadata?.image_path;
     const timestamp = res.screenshot_created_at || res.metadata?.screenshot_created_at || res.metadata?.created_at || res.created_at || new Date().toISOString();
-    const timestampMs = normalizeTimestampToMs(timestamp);
+    const isNl = res.similarity !== undefined || res.distance !== undefined || (res.metadata?.screenshot_id !== undefined && res.screenshot_id === undefined);
+    const timestampMs = normalizeTimestampToMs(timestamp, { assumeUtc: !isNl });
 
     if (screenshotId !== undefined || imagePath) {
       setSelectedEvent({
@@ -464,6 +517,13 @@ function App() {
         onRefreshPythonVersion={refreshPythonVersion}
       />
 
+      <AuthMask
+        isVisible={backendStatus === 'online' && pythonVersion && !isAuthenticated}
+        onAuthSuccess={handleAuthSuccess}
+        authError={authError}
+        setAuthError={setAuthError}
+      />
+
       <Timeline
         onSelectEvent={(evt) => {
           setSelectedEvent(evt);
@@ -495,7 +555,8 @@ function App() {
             const screenshotId = res.screenshot_id !== undefined ? res.screenshot_id : (res.metadata?.screenshot_id);
             const imagePath = res.image_path || res.metadata?.image_path;
             const timestamp = res.screenshot_created_at || res.metadata?.screenshot_created_at || res.metadata?.created_at || res.created_at || new Date().toISOString();
-            const timestampMs = normalizeTimestampToMs(timestamp);
+            const isNl = res.similarity !== undefined || res.distance !== undefined || (res.metadata?.screenshot_id !== undefined && res.screenshot_id === undefined);
+            const timestampMs = normalizeTimestampToMs(timestamp, { assumeUtc: !isNl });
             if (screenshotId !== undefined || imagePath) {
               setSelectedEvent({
                 id: screenshotId || -1,
@@ -566,6 +627,10 @@ function App() {
         }}
         onManualStartMonitor={() => setAutoStartSuppressed(false)}
         onManualStopMonitor={() => setAutoStartSuppressed(true)}
+        sessionTimeout={sessionTimeout}
+        onSessionTimeoutChange={setSessionTimeout}
+        isSessionValid={isAuthenticated}
+        onLockSession={handleLockSession}
       />
     </div>
   );

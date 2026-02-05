@@ -7,6 +7,7 @@ import { getAnalysisOverview } from '../../lib/analysis_api';
 import MonitorServiceSection from './MonitorServiceSection';
 import GeneralOptionsSection from './GeneralOptionsSection';
 import CaptureFiltersSection from './CaptureFiltersSection';
+import SecuritySection from './SecuritySection';
 import StorageManagementSection from './StorageManagementSection';
 import AboutSection from './AboutSection';
 import { defaultFilterSettings, formatInvokeError, normalizeList } from './filterUtils';
@@ -20,6 +21,10 @@ function SettingsDialog({
   onManualStartMonitor,
   onManualStopMonitor,
   onRecordsDeleted,
+  sessionTimeout,
+  onSessionTimeoutChange,
+  isSessionValid,
+  onLockSession,
 }) {
   const [activeTab, setActiveTab] = useState('general');
   const [lowResolutionAnalysis, setLowResolutionAnalysis] = useState(() => localStorage.getItem('lowResolutionAnalysis') === 'true');
@@ -416,29 +421,40 @@ function SettingsDialog({
           )}
 
           {activeTab === 'security' && (
-            <CaptureFiltersSection
-              filterSettings={filterSettings}
-              processInput={processInput}
-              titleInput={titleInput}
-              onProcessInputChange={setProcessInput}
-              onTitleInputChange={setTitleInput}
-              onAddProcess={addProcessTags}
-              onAddTitle={addTitleTags}
-              onRemoveProcess={removeProcessTag}
-              onRemoveTitle={removeTitleTag}
-              onToggleProtected={() => {
-                setFilterSettings((prev) => ({ ...prev, ignoreProtected: !prev.ignoreProtected }));
-                setFiltersDirty(true);
-                setSaveFiltersMessage('');
-              }}
-              onSave={handleSaveFilters}
-              filtersDirty={filtersDirty}
-              savingFilters={savingFilters}
-              saveFiltersMessage={saveFiltersMessage}
-              onQuickDelete={handleQuickDelete}
-              isDeleting={isDeleting}
-              deleteMessage={deleteMessage}
-            />
+            <div className="space-y-8">
+              {/* Windows Hello 安全设置 */}
+              <SecuritySection
+                sessionTimeout={sessionTimeout}
+                onSessionTimeoutChange={onSessionTimeoutChange}
+                isSessionValid={isSessionValid}
+                onLockSession={onLockSession}
+              />
+
+              {/* 捕获过滤器设置 */}
+              <CaptureFiltersSection
+                filterSettings={filterSettings}
+                processInput={processInput}
+                titleInput={titleInput}
+                onProcessInputChange={setProcessInput}
+                onTitleInputChange={setTitleInput}
+                onAddProcess={addProcessTags}
+                onAddTitle={addTitleTags}
+                onRemoveProcess={removeProcessTag}
+                onRemoveTitle={removeTitleTag}
+                onToggleProtected={() => {
+                  setFilterSettings((prev) => ({ ...prev, ignoreProtected: !prev.ignoreProtected }));
+                  setFiltersDirty(true);
+                  setSaveFiltersMessage('');
+                }}
+                onSave={handleSaveFilters}
+                filtersDirty={filtersDirty}
+                savingFilters={savingFilters}
+                saveFiltersMessage={saveFiltersMessage}
+                onQuickDelete={handleQuickDelete}
+                isDeleting={isDeleting}
+                deleteMessage={deleteMessage}
+              />
+            </div>
           )}
 
           {activeTab === 'analysis' && (

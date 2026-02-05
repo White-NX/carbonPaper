@@ -397,7 +397,8 @@ class VectorStore:
     def __init__(
         self, 
         collection_name: str = "screenshot_embeddings",
-        persist_directory: str = "./chroma_db"
+        persist_directory: str = "./chroma_db",
+        storage_client = None
     ):
         """
         初始化向量存储
@@ -405,12 +406,14 @@ class VectorStore:
         Args:
             collection_name: ChromaDB集合名称
             persist_directory: 持久化目录
+            storage_client: 存储客户端（用于加密明文数据）
         """
         import chromadb
         from chromadb.config import Settings
         
         self.persist_directory = persist_directory
         self.collection_name = collection_name
+        self.storage_client = storage_client  # 用于加密明文数据
         
         # 初始化ChromaDB客户端（持久化模式）
         self.client = chromadb.PersistentClient(
@@ -439,7 +442,63 @@ class VectorStore:
             abs_path = self.persist_directory
             path_exists = False
             path_list = []
-        print(f"[vector_store] Initialized VectorStore collection='{self.collection_name}' persist='{abs_path}' exists={path_exists} count={count} files={path_list}", flush=True)
+        print(f"[vector_store] Initialized VectorStore collection='{self.collection_name}' persist='{abs_path}' exists={path_exists} count={count} files={path_list} encrypted={storage_client is not None}", flush=True)
+    
+    def _encrypt_text(self, text: str) -> str:
+        """加密文本（如果有存储客户端）"""
+        if self.storage_client and text:
+            encrypted = self.storage_client.encrypt_for_chromadb(text)
+            if encrypted:
+                return encrypted
+        return text
+    
+    def _decrypt_text(self, text: str) -> str:
+        """解密文本（如果有存储客户端）"""
+        if self.storage_client and text:
+            # 检查是否是加密数据（以 ENC2:/ENC: 前缀标识）
+            if text.startswith("ENC2:") or text.startswith("ENC:"):
+                decrypted = self.storage_client.decrypt_from_chromadb(text)
+                if decrypted:
+                    return decrypted
+        return text
+    
+    def _decrypt_metadata(self, meta: Dict[str, Any]) -> Dict[str, Any]:
+        """解密元数据中的加密字段"""
+        if not meta or not self.storage_client:
+            return meta
+        
+        decrypted = {}
+        # 需要解密的字段
+        encrypted_fields = {'image_path', 'window_title', 'process_name', 'app_name', 'url'}
+        
+        for k, v in meta.items():
+            if k in encrypted_fields and isinstance(v, str):
+                decrypted[k] = self._decrypt_text(v)
+            else:
+                decrypted[k] = v
+        
+        return decrypted
+    
+    def _decrypt_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """解密单个搜索结果"""
+        if not result:
+            return result
+        
+        decrypted = result.copy()
+        
+        # 解密 image_path
+        if 'image_path' in decrypted and isinstance(decrypted['image_path'], str):
+            decrypted['image_path'] = self._decrypt_text(decrypted['image_path'])
+        
+        # 解密 metadata
+        if 'metadata' in decrypted and isinstance(decrypted['metadata'], dict):
+            decrypted['metadata'] = self._decrypt_metadata(decrypted['metadata'])
+        
+        # 解密 ocr_text
+        if 'ocr_text' in decrypted and isinstance(decrypted['ocr_text'], str):
+            decrypted['ocr_text'] = self._decrypt_text(decrypted['ocr_text'])
+        
+        return decrypted
     
     @staticmethod
     def _compute_id(image_path: str) -> str:
@@ -496,19 +555,29 @@ class VectorStore:
         
         # 准备元数据
         meta = {
-            'image_path': image_path,
+            'image_path': self._encrypt_text(image_path),  # 加密图片路径
             'added_at': str(np.datetime64('now'))
         }
         if metadata:
             # ChromaDB元数据只支持字符串、整数、浮点数
+            # 需要加密的敏感字段
+            sensitive_fields = {'window_title', 'process_name', 'app_name', 'url'}
             for k, v in metadata.items():
                 if isinstance(v, (str, int, float, bool)):
-                    meta[k] = v
+                    # 对敏感字段进行加密
+                    if k in sensitive_fields and isinstance(v, str):
+                        meta[k] = self._encrypt_text(v)
+                    else:
+                        meta[k] = v
                 else:
-                    meta[k] = str(v)
+                    str_val = str(v)
+                    if k in sensitive_fields:
+                        meta[k] = self._encrypt_text(str_val)
+                    else:
+                        meta[k] = str_val
         
-        # 准备文档（OCR文本作为可搜索的文档内容）
-        document = ocr_text if ocr_text else ""
+        # 准备文档（OCR文本作为可搜索的文档内容）- 加密
+        document = self._encrypt_text(ocr_text) if ocr_text else ""
         
         # 添加到集合
         try:
@@ -586,22 +655,32 @@ class VectorStore:
             image = data.get('image', image_path)
             embedding = self.vectorizer.encode_image(image)
             
-            # 准备元数据
+            # 准备元数据 - 加密敏感字段
             meta = {
-                'image_path': image_path,
+                'image_path': self._encrypt_text(image_path),
                 'added_at': str(np.datetime64('now'))
             }
             if 'metadata' in data and data['metadata']:
+                sensitive_fields = {'window_title', 'process_name', 'app_name', 'url'}
                 for k, v in data['metadata'].items():
                     if isinstance(v, (str, int, float, bool)):
-                        meta[k] = v
+                        if k in sensitive_fields and isinstance(v, str):
+                            meta[k] = self._encrypt_text(v)
+                        else:
+                            meta[k] = v
                     else:
-                        meta[k] = str(v)
+                        str_val = str(v)
+                        if k in sensitive_fields:
+                            meta[k] = self._encrypt_text(str_val)
+                        else:
+                            meta[k] = str_val
             
             ids.append(doc_id)
             embeddings.append(embedding.tolist())
             metadatas.append(meta)
-            documents.append(data.get('ocr_text', ''))
+            # 加密 OCR 文本
+            ocr_text = data.get('ocr_text', '')
+            documents.append(self._encrypt_text(ocr_text) if ocr_text else '')
         
         if embeddings:
             try:
@@ -741,7 +820,8 @@ class VectorStore:
                 'similarity': similarity
             })
         
-        return formatted_results
+        # 解密结果中的敏感数据
+        return [self._decrypt_result(r) for r in formatted_results]
     
     def search_by_image(
         self,
@@ -781,7 +861,8 @@ class VectorStore:
                     'similarity': 1 - results['distances'][0][i] if results['distances'] else None
                 })
         
-        return formatted_results
+        # 解密结果中的敏感数据
+        return [self._decrypt_result(r) for r in formatted_results]
     
     def search_by_ocr_text(
         self,
@@ -816,7 +897,8 @@ class VectorStore:
                     'distance': results['distances'][0][i] if results['distances'] else None
                 })
         
-        return formatted_results
+        # 解密结果中的敏感数据
+        return [self._decrypt_result(r) for r in formatted_results]
     
     def delete_image(self, image_path: str) -> bool:
         """删除图片"""

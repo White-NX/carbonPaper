@@ -122,7 +122,10 @@ fn compute_storage_stats() -> Result<StorageStats, String> {
 }
 
 fn get_cached_storage_stats(state: &AnalysisState, force: bool) -> Result<StorageStats, String> {
-    let mut cache_guard = state.storage_cache.lock().unwrap();
+    let mut cache_guard = state
+        .storage_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let is_valid = cache_guard
         .as_ref()
@@ -180,7 +183,10 @@ pub fn start_memory_sampler(app: AppHandle) {
                 if let Some(rss_bytes) = sample_python_memory(pid) {
                     let timestamp_ms = now_ms();
                     let analysis_state = app.state::<AnalysisState>();
-                    let mut history = analysis_state.memory_history.lock().unwrap();
+                    let mut history = analysis_state
+                        .memory_history
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     history.push_back(MemoryPoint {
                         timestamp_ms,
                         rss_bytes,
@@ -200,7 +206,10 @@ pub fn get_analysis_overview(
     force_storage: bool,
 ) -> Result<AnalysisOverview, String> {
     let memory = {
-        let history = state.memory_history.lock().unwrap();
+        let history = state
+            .memory_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         history.iter().cloned().collect::<Vec<_>>()
     };
 

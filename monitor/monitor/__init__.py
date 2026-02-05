@@ -16,6 +16,9 @@ import json
 
 _server = None
 _ocr_worker = None
+_auth_token = None  # 存储认证 token
+_last_seq_no = -1  # 最后一个处理的序列号
+_storage_pipe = None  # 存储服务管道名
 
 # Cache for dynamically extracted icons by process name
 _dynamic_icon_cache = {}
@@ -51,6 +54,24 @@ def _find_and_extract_icon(process_name: str):
 
 
 def _handle_command(req: dict):
+    """处理命令前验证认证信息"""
+    global _last_seq_no
+    
+    # 提取并验证认证信息
+    req_token = req.get('_auth_token')
+    req_seq_no = req.get('_seq_no')
+    
+    # 检查认证 token
+    if _auth_token and req_token != _auth_token:
+        return {'error': 'Authentication failed: Invalid token'}
+    
+    # 检查序列号（防止重放攻击）
+    if req_seq_no is not None:
+        if req_seq_no <= _last_seq_no:
+            return {'error': f'Authentication failed: Invalid sequence number (got {req_seq_no}, expected > {_last_seq_no})'}
+        _last_seq_no = req_seq_no
+    
+    # 处理实际命令
     cmd = (req.get('command') or '').lower()
     if cmd == 'pause':
         paused_event.set()
@@ -366,11 +387,22 @@ def _handle_command(req: dict):
     return {'error': 'unknown command'}
 
 
-def start(_debug, pipe_name: str = None):
+def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: str = None):
     """
     启动 capture 线程和命名管道服务器。
+    
+    Args:
+        _debug: 调试模式
+        pipe_name: 管道名（如果未提供则从环境变量获取或生成随机名称）
+        auth_token: 认证 token（用于验证 IPC 请求）
+        storage_pipe: 存储服务管道名（用于将截图和元数据发送到 Rust 存储服务）
     """
-    global _server, _ocr_worker
+    global _server, _ocr_worker, _auth_token, _last_seq_no, _storage_pipe
+
+    # 存储认证 token
+    _auth_token = auth_token
+    _last_seq_no = -1  # 重置序列号
+    _storage_pipe = storage_pipe
 
     if not pipe_name:
         pipe_name = os.environ.get('CARBON_MONITOR_PIPE')
@@ -410,12 +442,21 @@ def start(_debug, pipe_name: str = None):
     _ocr_worker = ScreenshotOCRWorker(
         screenshot_dir=os.path.join(get_data_dir(), 'screenshots'),
         db_path=os.path.join(get_data_dir(), 'ocr_data.db'),
-        vector_db_path=os.path.join(get_data_dir(), 'chroma_db')
+        vector_db_path=os.path.join(get_data_dir(), 'chroma_db'),
+        storage_pipe=storage_pipe  # 传递存储管道名
     )
     _ocr_worker.start(watch_dir=False) # 由 capture 回调触发，不需要轮询目录
 
-    # 设置截图回调
-    def on_screenshot(path, info):
+    # 设置截图回调 - 内存模式，不写入明文文件
+    def on_screenshot(image_bytes: bytes, image_pil, info: dict):
+        """
+        处理截图回调 - 纯内存模式
+        
+        Args:
+            image_bytes: JPEG 编码的图像字节
+            image_pil: PIL Image 对象（用于 OCR）
+            info: 截图元数据
+        """
         if _ocr_worker:
             metadata = info.get('metadata') or {}
             if not isinstance(metadata, dict):
@@ -428,8 +469,10 @@ def start(_debug, pipe_name: str = None):
                 else:
                     metadata.setdefault('monitor_raw', monitor_data)
 
-            _ocr_worker.add_task(
-                image_path=path,
+            # 使用内存模式处理截图，不经过磁盘
+            _ocr_worker.queue_image_from_memory(
+                image_bytes=image_bytes,
+                image_pil=image_pil,
                 window_title=info.get('window_title'),
                 process_name=info.get('process_name'),
                 metadata=metadata

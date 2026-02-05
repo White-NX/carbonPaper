@@ -14,6 +14,7 @@ from PIL import Image
 from ocr_engine import OCREngine, OCRVisualizer, get_ocr_engine
 from db_handler import OCRDatabaseHandler
 from vector_store import VectorStore
+from storage_client import StorageClient, get_storage_client, init_storage_client
 
 
 class ScreenshotOCRWorker:
@@ -27,7 +28,8 @@ class ScreenshotOCRWorker:
         enable_vector_store: bool = True,
         ocr_confidence_threshold: float = 0.5,
         save_visualizations: bool = False,
-        visualization_dir: str = "./visualizations"
+        visualization_dir: str = "./visualizations",
+        storage_pipe: str = None
     ):
         """
         初始化工作进程
@@ -40,6 +42,7 @@ class ScreenshotOCRWorker:
             ocr_confidence_threshold: OCR置信度阈值
             save_visualizations: 是否保存可视化结果
             visualization_dir: 可视化结果保存目录
+            storage_pipe: Rust 存储服务管道名
         """
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -49,6 +52,13 @@ class ScreenshotOCRWorker:
         self.visualization_dir = Path(visualization_dir)
         if save_visualizations:
             self.visualization_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 存储客户端（用于将数据发送到 Rust）
+        self.storage_pipe = storage_pipe
+        self.storage_client: Optional[StorageClient] = None
+        if storage_pipe:
+            self.storage_client = init_storage_client(storage_pipe)
+            print(f"存储客户端已初始化: {storage_pipe}")
         
         # 初始化组件
         print("初始化OCR引擎...")
@@ -61,6 +71,7 @@ class ScreenshotOCRWorker:
             traceback.print_exc()
             raise
         
+        # 数据库处理器（当没有存储客户端时使用本地数据库）
         print("初始化数据库处理器...")
         self.db_handler = OCRDatabaseHandler(db_path)
         
@@ -70,7 +81,8 @@ class ScreenshotOCRWorker:
             print("初始化向量存储...")
             self.vector_store = VectorStore(
                 collection_name="screenshots",
-                persist_directory=vector_db_path
+                persist_directory=vector_db_path,
+                storage_client=self.storage_client  # 传递存储客户端用于加密
             )
         
         if save_visualizations:
@@ -105,11 +117,161 @@ class ScreenshotOCRWorker:
         设置回调函数
         
         Args:
-            on_ocr_complete: OCR完成回调 (image_path, result)
-            on_error: 错误回调 (image_path, exception)
+            on_ocr_complete: OCR完成回调 (image_id, result)
+            on_error: 错误回调 (image_id, exception)
         """
         self._on_ocr_complete = on_ocr_complete
         self._on_error = on_error
+    
+    def _compute_bytes_hash(self, data: bytes) -> str:
+        """计算字节数据的哈希值"""
+        import hashlib
+        return hashlib.md5(data).hexdigest()
+    
+    def process_image_from_memory(
+        self,
+        image_bytes: bytes,
+        image_pil: Image.Image,
+        window_title: str = None,
+        process_name: str = None,
+        width: int = None,
+        height: int = None,
+        metadata: Dict = None
+    ) -> Dict[str, Any]:
+        """
+        处理内存中的图片数据（不涉及磁盘明文文件）
+        
+        Args:
+            image_bytes: JPEG 格式的图片字节数据
+            image_pil: PIL Image 对象（用于 OCR）
+            window_title: 窗口标题
+            process_name: 进程名
+            width: 图片宽度
+            height: 图片高度
+            metadata: 额外元数据
+            
+        Returns:
+            处理结果
+        """
+        image_hash = self._compute_bytes_hash(image_bytes)
+        
+        result = {
+            'image_hash': image_hash,
+            'success': False,
+            'ocr_results': [],
+            'db_result': None,
+            'vector_id': None,
+            'error': None
+        }
+        
+        try:
+            if width is None or height is None:
+                width, height = image_pil.size
+            
+            # OCR识别（使用 PIL Image）
+            print(f"[OCR] 开始识别: hash={image_hash[:8]}... size={width}x{height}")
+            ocr_results = self.ocr_engine.recognize(image_pil)
+            print(f"[OCR] 识别完成，得到 {len(ocr_results) if ocr_results else 0} 个原始结果")
+            
+            # 过滤低置信度结果
+            filtered_results = [
+                r for r in ocr_results 
+                if r['confidence'] >= self.ocr_confidence_threshold
+            ]
+            result['ocr_results'] = filtered_results
+            
+            # 合并OCR文本
+            ocr_text = ' '.join([r['text'] for r in filtered_results])
+            
+            # 发送到 Rust 加密存储（必须有存储客户端）
+            if self.storage_client:
+                try:
+                    # 格式化 OCR 结果
+                    ocr_for_storage = [
+                        {
+                            'text': r['text'],
+                            'confidence': r['confidence'],
+                            'box': r['box']
+                        }
+                        for r in filtered_results
+                    ]
+                    
+                    # 发送到 Rust 存储服务（会加密存储，永不写入明文到磁盘）
+                    storage_result = self.storage_client.save_screenshot(
+                        image_data=image_bytes,
+                        image_hash=image_hash,
+                        width=width,
+                        height=height,
+                        window_title=window_title,
+                        process_name=process_name,
+                        metadata=metadata,
+                        ocr_results=ocr_for_storage
+                    )
+                    
+                    if storage_result.get('status') == 'success':
+                        result['db_result'] = storage_result
+                        print(f"[storage_client] 截图已加密保存: {storage_result.get('image_path')}")
+                    elif storage_result.get('status') == 'duplicate':
+                        result['db_result'] = storage_result
+                        print(f"[storage_client] 截图已存在（跳过）: {image_hash[:8]}...")
+                    else:
+                        raise Exception(f"存储失败: {storage_result.get('error')}")
+                        
+                except Exception as e:
+                    print(f"[storage_client] 加密存储失败: {e}")
+                    result['error'] = str(e)
+                    raise  # 没有后备方案，直接失败（不保存明文）
+            else:
+                raise Exception("存储客户端未初始化，无法安全存储截图")
+            
+            # 保存到向量存储（用于语义搜索）
+            if self.enable_vector_store and self.vector_store:
+                screenshot_id_val = result['db_result'].get('screenshot_id') if result['db_result'] else None
+                try:
+                    import datetime
+                    created_at_value = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                    vector_id = self.vector_store.add_image(
+                        image_path=f"memory://{image_hash}",  # 虚拟路径标识
+                        image=image_pil,
+                        metadata={
+                            'window_title': window_title or '',
+                            'process_name': process_name or '',
+                            'width': width,
+                            'height': height,
+                            'text_count': len(filtered_results),
+                            'screenshot_id': screenshot_id_val if screenshot_id_val else -1,
+                            'created_at': created_at_value,
+                            'screenshot_created_at': created_at_value
+                        },
+                        ocr_text=ocr_text
+                    )
+                    print(f"[screenshot_worker] add_image returned vector_id={vector_id}")
+                    result['vector_id'] = vector_id
+                except Exception as e:
+                    print(f"[screenshot_worker] add_image raised exception: {e}")
+                    result['vector_id'] = None
+            
+            result['success'] = True
+            self.stats['processed_count'] += 1
+            self.stats['total_texts_found'] += len(filtered_results)
+            
+        except Exception as e:
+            result['error'] = str(e)
+            self.stats['failed_count'] += 1
+            if self._on_error:
+                self._on_error(image_hash, e)
+        
+        if result['success'] and self._on_ocr_complete:
+            self._on_ocr_complete(image_hash, result)
+        
+        return result
+    
+    def _compute_image_hash(self, image_path: str) -> str:
+        """计算图片文件的哈希值（用于兼容旧代码）"""
+        import hashlib
+        with open(image_path, 'rb') as f:
+            return hashlib.md5(f.read()).hexdigest()
     
     def process_image(
         self,
@@ -119,7 +281,7 @@ class ScreenshotOCRWorker:
         metadata: Dict = None
     ) -> Dict[str, Any]:
         """
-        处理单张图片
+        处理磁盘上的图片文件（兼容旧接口，但会尝试加密存储后删除原文件）
         
         Args:
             image_path: 图片路径
@@ -144,80 +306,31 @@ class ScreenshotOCRWorker:
             image = Image.open(image_path)
             width, height = image.size
             
-            # OCR识别
-            print(f"[OCR] 开始识别: {image_path}")
-            ocr_results = self.ocr_engine.recognize(image)
-            print(f"[OCR] 识别完成，得到 {len(ocr_results) if ocr_results else 0} 个原始结果")
+            # 读取图片数据
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
             
-            # 过滤低置信度结果
-            filtered_results = [
-                r for r in ocr_results 
-                if r['confidence'] >= self.ocr_confidence_threshold
-            ]
-            result['ocr_results'] = filtered_results
-            
-            # 合并OCR文本
-            ocr_text = ' '.join([r['text'] for r in filtered_results])
-            
-            # 保存到SQLite
-            db_result = self.db_handler.save_ocr_data(
-                image_path=image_path,
-                ocr_results=filtered_results,
-                width=width,
-                height=height,
+            # 使用内存处理方法
+            mem_result = self.process_image_from_memory(
+                image_bytes=image_bytes,
+                image_pil=image,
                 window_title=window_title,
                 process_name=process_name,
+                width=width,
+                height=height,
                 metadata=metadata
             )
-            result['db_result'] = db_result
             
-            # 保存到向量存储
-            if self.enable_vector_store and self.vector_store:
-                screenshot_id_val = db_result.get('screenshot_id') if db_result else None
+            result.update(mem_result)
+            result['image_path'] = image_path
+            
+            # 如果成功加密存储，删除原始明文文件
+            if mem_result.get('success') and os.path.exists(image_path):
                 try:
-                    created_at_value = None
-                    if screenshot_id_val:
-                        try:
-                            record = self.db_handler.get_screenshot_by_id(int(screenshot_id_val))
-                            if record and record.get('created_at'):
-                                created_at_value = record.get('created_at')
-                        except (ValueError, TypeError):
-                            created_at_value = None
-                    if not created_at_value:
-                        created_at_value = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-                    vector_id = self.vector_store.add_image(
-                        image_path=image_path,
-                        image=image,
-                        metadata={
-                            'window_title': window_title or '',
-                            'process_name': process_name or '',
-                            'width': width,
-                            'height': height,
-                            'text_count': len(filtered_results),
-                            'screenshot_id': screenshot_id_val if screenshot_id_val else -1,
-                            'created_at': created_at_value,
-                            'screenshot_created_at': created_at_value
-                        },
-                        ocr_text=ocr_text
-                    )
-                    print(f"[screenshot_worker] add_image returned vector_id={vector_id}")
-                    result['vector_id'] = vector_id
-                except Exception as e:
-                    print(f"[screenshot_worker] add_image raised exception: {e}")
-                    result['vector_id'] = None
-            
-            # 保存可视化结果
-            if self.save_visualizations and filtered_results:
-                vis_path = self.visualization_dir / f"vis_{Path(image_path).stem}.jpg"
-                self.visualizer.save_visualization(
-                    image, filtered_results, str(vis_path),
-                    show_confidence=True
-                )
-            
-            result['success'] = True
-            self.stats['processed_count'] += 1
-            self.stats['total_texts_found'] += len(filtered_results)
+                    os.remove(image_path)
+                    print(f"[screenshot_worker] 已删除原始明文文件: {image_path}")
+                except Exception as del_err:
+                    print(f"[screenshot_worker] 删除原始文件失败: {del_err}")
             
         except Exception as e:
             result['error'] = str(e)
@@ -225,23 +338,74 @@ class ScreenshotOCRWorker:
             if self._on_error:
                 self._on_error(image_path, e)
         
-        if result['success'] and self._on_ocr_complete:
-            self._on_ocr_complete(image_path, result)
-        
         return result
+    
+    def queue_image_from_memory(
+        self,
+        image_bytes: bytes,
+        image_pil: Image.Image,
+        window_title: str = None,
+        process_name: str = None,
+        width: int = None,
+        height: int = None,
+        metadata: Dict = None
+    ):
+        """
+        将内存中的图片添加到处理队列
+        
+        Args:
+            image_bytes: JPEG 格式的图片字节数据
+            image_pil: PIL Image 对象
+            window_title: 窗口标题
+            process_name: 进程名
+            width: 图片宽度
+            height: 图片高度
+            metadata: 额外元数据
+        """
+        self._task_queue.put({
+            'image_bytes': image_bytes,
+            'image_pil': image_pil,
+            'window_title': window_title,
+            'process_name': process_name,
+            'width': width,
+            'height': height,
+            'metadata': metadata,
+            '_from_memory': True  # 标记为内存数据
+        })
+    
+    def _save_to_local_db(
+        self,
+        image_path: str,
+        ocr_results: List[Dict],
+        width: int,
+        height: int,
+        window_title: str = None,
+        process_name: str = None,
+        metadata: Dict = None
+    ) -> Dict[str, Any]:
+        """保存到本地 SQLite 数据库"""
+        return self.db_handler.save_ocr_data(
+            image_path=image_path,
+            ocr_results=ocr_results,
+            width=width,
+            height=height,
+            window_title=window_title,
+            process_name=process_name,
+            metadata=metadata
+        )
     
     def _worker_loop(self, watch_dir: bool = True, interval: float = 5.0):
         """
         工作循环
         
         Args:
-            watch_dir: 是否监视目录中的新文件
+            watch_dir: 是否监视目录中的新文件（仅用于兼容旧数据）
             interval: 检查间隔（秒）
         """
         self.stats['start_time'] = datetime.datetime.now()
         processed_files = set()
         
-        print(f"截图OCR工作进程已启动，监视目录: {self.screenshot_dir}")
+        print(f"截图OCR工作进程已启动")
         
         while not self._stop_event.is_set():
             # 检查暂停
@@ -253,21 +417,46 @@ class ScreenshotOCRWorker:
             while not self._task_queue.empty():
                 try:
                     task = self._task_queue.get_nowait()
-                    print(f"[OCR Worker] 开始处理队列任务: {task.get('image_path', 'unknown')}")
-                    try:
-                        result = self.process_image(**task)
-                        if result.get('success'):
-                            print(f"[OCR Worker] 任务完成: 识别到 {len(result.get('ocr_results', []))} 个文本块")
-                        else:
-                            print(f"[OCR Worker] 任务失败: {result.get('error', 'unknown error')}")
-                    except Exception as proc_err:
-                        print(f"[OCR Worker] process_image 异常: {proc_err}")
-                        import traceback
-                        traceback.print_exc()
+                    
+                    # 检查是否是内存数据
+                    if task.get('_from_memory'):
+                        # 内存数据处理（不涉及磁盘文件）
+                        print(f"[OCR Worker] 开始处理内存数据任务")
+                        try:
+                            result = self.process_image_from_memory(
+                                image_bytes=task.get('image_bytes'),
+                                image_pil=task.get('image_pil'),
+                                window_title=task.get('window_title'),
+                                process_name=task.get('process_name'),
+                                width=task.get('width'),
+                                height=task.get('height'),
+                                metadata=task.get('metadata')
+                            )
+                            if result.get('success'):
+                                print(f"[OCR Worker] 任务完成: 识别到 {len(result.get('ocr_results', []))} 个文本块")
+                            else:
+                                print(f"[OCR Worker] 任务失败: {result.get('error', 'unknown error')}")
+                        except Exception as proc_err:
+                            print(f"[OCR Worker] process_image_from_memory 异常: {proc_err}")
+                            import traceback
+                            traceback.print_exc()
+                    else:
+                        # 旧的文件路径处理（兼容）
+                        print(f"[OCR Worker] 开始处理文件任务: {task.get('image_path', 'unknown')}")
+                        try:
+                            result = self.process_image(**task)
+                            if result.get('success'):
+                                print(f"[OCR Worker] 任务完成: 识别到 {len(result.get('ocr_results', []))} 个文本块")
+                            else:
+                                print(f"[OCR Worker] 任务失败: {result.get('error', 'unknown error')}")
+                        except Exception as proc_err:
+                            print(f"[OCR Worker] process_image 异常: {proc_err}")
+                            import traceback
+                            traceback.print_exc()
                 except queue.Empty:
                     break
             
-            # 监视目录中的新文件
+            # 监视目录中的新文件（仅用于处理旧的明文文件）
             if watch_dir:
                 try:
                     for file_path in self.screenshot_dir.glob("*.jpg"):
@@ -275,7 +464,7 @@ class ScreenshotOCRWorker:
                             # 等待文件写入完成
                             time.sleep(0.5)
                             
-                            print(f"发现新截图: {file_path}")
+                            print(f"发现旧的明文截图: {file_path}")
                             result = self.process_image(str(file_path))
                             
                             if result['success']:

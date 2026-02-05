@@ -159,11 +159,20 @@ paused_event = threading.Event()  # set 表示已暂停
 stop_event = threading.Event()  # set 表示已停止
 
 _worker: Optional[threading.Thread] = None
-_on_screenshot_captured: Optional[Callable[[str, dict], None]] = None
+# 回调签名: (image_bytes: bytes, image_pil: Image, info: dict) -> None
+_on_screenshot_captured: Optional[Callable[[bytes, Image.Image, dict], None]] = None
 _process_icon_cache: Dict[str, Optional[str]] = {}
 
 
-def set_screenshot_callback(callback: Callable[[str, dict], None]):
+def set_screenshot_callback(callback: Callable[[bytes, Image.Image, dict], None]):
+    """设置截图回调函数
+    
+    Args:
+        callback: 回调函数，接收三个参数：
+            - image_bytes: JPEG 格式的图片字节数据（用于发送到存储服务）
+            - image_pil: PIL Image 对象（用于 OCR 处理）
+            - info: 包含 window_title, process_name, metadata, width, height 的字典
+    """
     global _on_screenshot_captured
     _on_screenshot_captured = callback
 
@@ -588,19 +597,21 @@ def capture_loop(interval: int = INTERVAL):
                     if _is_redundant(current_hash, history_hashes):
                         pass
                     else:
-                        # 保存
                         ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        out_file = os.path.join(SCREENSHOT_DIR, f"shot_{ts_str}.jpg")
-
+                        
+                        # 将图片转换为内存中的 JPEG 字节数据（不写入磁盘）
+                        img_buffer = io.BytesIO()
                         img_pil.save(
-                            out_file,
+                            img_buffer,
                             format="JPEG",
                             quality=JPEG_QUALITY,
                             optimize=True,
                             progressive=True,
                         )
+                        img_bytes = img_buffer.getvalue()
+                        
                         print(
-                            f"[{ts_str}] 截图保存 ({scan_reason}): {out_file} - {captured_title}"
+                            f"[{ts_str}] 截图捕获 ({scan_reason}): {len(img_bytes)} bytes - {captured_title}"
                         )
 
                         # 更新历史
@@ -621,16 +632,20 @@ def capture_loop(interval: int = INTERVAL):
                             "dhash": current_hash,
                             "process_path": process_path,
                             "process_icon": process_icon,
+                            "timestamp": ts_str,
                         }
 
-                        # 回调
+                        # 回调 - 传递内存中的图片数据和 PIL Image 对象（用于 OCR）
                         if _on_screenshot_captured:
                             _on_screenshot_captured(
-                                out_file,
+                                img_bytes,  # 内存中的 JPEG 数据
+                                img_pil,    # PIL Image 对象（用于 OCR）
                                 {
                                     "window_title": captured_title,
                                     "process_name": process_name,
                                     "metadata": metadata,
+                                    "width": img_pil.width,
+                                    "height": img_pil.height,
                                 },
                             )
 

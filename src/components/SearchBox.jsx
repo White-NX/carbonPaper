@@ -80,8 +80,14 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             // Fallback to -1 or parse from image path hash if we really had to, but keeping it simple for now
         }
 
-        // Even if ID is missing (old records), we pass item so parent might handle it or show error
-        onSelectResult({ id: id, ...item });
+        // Normalize the path field - search results use 'image_path', but App.jsx expects 'path'
+        const normalizedItem = {
+            id: id,
+            ...item,
+            path: item.image_path || item.path, // Ensure 'path' is set
+        };
+        
+        onSelectResult(normalizedItem);
         setShowResults(false);
     };
 
@@ -194,15 +200,15 @@ function SearchResultItem({ item, mode, query, onClick }) {
     useEffect(() => {
         let active = true;
         const loadImg = async () => {
-            const path = item.image_path;
-            if (path) {
-                const src = await fetchImage(null, path);
-                if (active) setImgSrc(src);
-            }
+            const screenshotId = mode === 'nl' ? item.metadata?.screenshot_id : item.screenshot_id;
+            const id = typeof screenshotId === 'number' && screenshotId > 0 ? screenshotId : null;
+            const path = item.image_path || item.metadata?.image_path || item.path;
+            const src = await fetchImage(id, id ? null : path);
+            if (active) setImgSrc(src);
         };
         loadImg();
         return () => { active = false; };
-    }, [item]);
+    }, [item, mode]);
 
     // Highlighting logic for OCR
     const renderOCRText = () => {

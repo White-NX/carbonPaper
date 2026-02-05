@@ -1,4 +1,6 @@
 use crate::resource_utils::normalize_path_for_command;
+use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
+use crate::storage::StorageState;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
@@ -6,13 +8,32 @@ use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;
+use rand::Rng;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct MonitorState {
     pub process: Mutex<Option<Child>>,
+    pub pipe_name: Mutex<Option<String>>,
+    pub auth_token: Mutex<Option<String>>,
+    pub request_counter: AtomicU64,
+    /// 反向 IPC 服务器（用于接收 Python 的存储请求）
+    pub reverse_ipc: Mutex<Option<ReverseIpcServer>>,
+    /// 反向 IPC 管道名
+    pub reverse_pipe_name: Mutex<Option<String>>,
 }
 
-// 默认管道名，需与 monitor/monitor/ipc_pipe.py 保持一致
-const PIPE_NAME: &str = r"\\.\pipe\carbon_monitor_secure";
+impl MonitorState {
+    pub fn new() -> Self {
+        Self {
+            process: Mutex::new(None),
+            pipe_name: Mutex::new(None),
+            auth_token: Mutex::new(None),
+            request_counter: AtomicU64::new(0),
+            reverse_ipc: Mutex::new(None),
+            reverse_pipe_name: Mutex::new(None),
+        }
+    }
+}
 
 // 重试配置
 const MAX_RETRIES: u32 = 10;
@@ -26,12 +47,29 @@ use serde_json::Value;
 #[cfg(windows)]
 const ERROR_PIPE_BUSY: i32 = 231;
 
+// 生成随机的管道名和认证 token
+fn generate_random_pipe_name() -> String {
+    let mut rng = rand::thread_rng();
+    let random_suffix: String = (0..32)
+        .map(|_| format!("{:02x}", rng.gen::<u8>()))
+        .collect();
+    format!("carbon_monitor_{}", random_suffix)
+}
+
+fn generate_auth_token() -> String {
+    let mut rng = rand::thread_rng();
+    (0..64)
+        .map(|_| format!("{:02x}", rng.gen::<u8>()))
+        .collect()
+}
+
 // 内部函数：尝试连接到管道，支持重试
-async fn connect_to_pipe() -> Result<tokio::net::windows::named_pipe::NamedPipeClient, String> {
+async fn connect_to_pipe(pipe_name: &str) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, String> {
     let mut last_error = String::new();
+    let full_pipe_name = format!(r"\\.\pipe\{}", pipe_name);
 
     for attempt in 0..MAX_RETRIES {
-        match ClientOptions::new().open(PIPE_NAME) {
+        match ClientOptions::new().open(&full_pipe_name) {
             Ok(client) => return Ok(client),
             Err(e) => {
                 // Check if it's ERROR_PIPE_BUSY (231)
@@ -51,9 +89,20 @@ async fn connect_to_pipe() -> Result<tokio::net::windows::named_pipe::NamedPipeC
     Err(last_error)
 }
 
-// 内部函数：发送 IPC 请求 (通用)
-async fn send_ipc_request(req: Value) -> Result<Value, String> {
-    let mut client = connect_to_pipe().await?;
+// 内部函数：发送 IPC 请求 (通用) - 添加认证和序列号
+async fn send_ipc_request(
+    pipe_name: &str,
+    auth_token: &str,
+    seq_no: u64,
+    mut req: Value,
+) -> Result<Value, String> {
+    // 在请求中添加认证信息
+    if let Some(obj) = req.as_object_mut() {
+        obj.insert("_auth_token".to_string(), Value::String(auth_token.to_string()));
+        obj.insert("_seq_no".to_string(), Value::Number(seq_no.into()));
+    }
+
+    let mut client = connect_to_pipe(pipe_name).await?;
 
     let req_bytes = req.to_string().into_bytes();
     if let Err(e) = client.write_all(&req_bytes).await {
@@ -74,14 +123,57 @@ async fn send_ipc_request(req: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn execute_monitor_command(payload: Value) -> Result<Value, String> {
-    send_ipc_request(payload).await
+pub async fn execute_monitor_command(
+    state: State<'_, MonitorState>,
+    payload: Value,
+) -> Result<Value, String> {
+    let pipe_name = {
+        let guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+        match &*guard {
+            Some(name) => name.clone(),
+            None => return Err("Monitor not started".to_string()),
+        }
+    };
+
+    let auth_token = {
+        let guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
+        match &*guard {
+            Some(token) => token.clone(),
+            None => return Err("Monitor not authenticated".to_string()),
+        }
+    };
+
+    let seq_no = state.request_counter.fetch_add(1, Ordering::SeqCst);
+
+    send_ipc_request(&pipe_name, &auth_token, seq_no, payload).await
 }
 
 // 内部函数：发送仅包含 command 的 IPC 命令 (兼容旧接口)
-async fn send_ipc_command_internal(cmd: &str) -> Result<String, String> {
+async fn send_ipc_command_internal(
+    state: &State<'_, MonitorState>,
+    cmd: &str,
+) -> Result<String, String> {
     let req = serde_json::json!({ "command": cmd });
-    match send_ipc_request(req).await {
+
+    let pipe_name = {
+        let guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+        match &*guard {
+            Some(name) => name.clone(),
+            None => return Err("Monitor not started".to_string()),
+        }
+    };
+
+    let auth_token = {
+        let guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
+        match &*guard {
+            Some(token) => token.clone(),
+            None => return Err("Monitor not authenticated".to_string()),
+        }
+    };
+
+    let seq_no = state.request_counter.fetch_add(1, Ordering::SeqCst);
+
+    match send_ipc_request(&pipe_name, &auth_token, seq_no, req).await {
         Ok(v) => Ok(v.to_string()),
         Err(e) => Err(e),
     }
@@ -123,8 +215,12 @@ pub async fn start_monitor(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|e| format!("<failed to canonicalize script: {}>", e));
 
+    // 生成随机的管道名和认证 token（在外部作用域声明）
+    let pipe_name = generate_random_pipe_name();
+    let auth_token = generate_auth_token();
+
     let (python_executable_for_error, python_exists_for_error) = {
-        let mut process_guard = state.process.lock().unwrap();
+        let mut process_guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
 
         // 如果已经有进程句柄，先检查是否还在运行
         if let Some(child) = process_guard.as_mut() {
@@ -165,11 +261,34 @@ pub async fn start_monitor(
         };
 
         let python_exists = std::path::Path::new(&python_executable).exists();
-        let pipe_name = PIPE_NAME.to_string();
+
+        // 生成反向 IPC 管道名并启动服务器
+        let reverse_pipe_name = generate_reverse_pipe_name();
+        
+        // 启动反向 IPC 服务器（用于接收 Python 的存储请求）
+        {
+            let storage = app.state::<Arc<StorageState>>();
+            let storage_arc = (*storage).clone();
+            
+            let mut reverse_server = ReverseIpcServer::new(&reverse_pipe_name);
+            if let Err(e) = reverse_server.start(storage_arc) {
+                eprintln!("Failed to start reverse IPC server: {}", e);
+            }
+            
+            // 存储反向 IPC 服务器和管道名
+            {
+                let mut guard = state.reverse_ipc.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(reverse_server);
+            }
+            {
+                let mut guard = state.reverse_pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(reverse_pipe_name.clone());
+            }
+        }
 
         println!(
-            "Starting monitor using python: {} (exists: {}) | script: {} | script_abs: {} | cwd: {} | pipe: {}",
-            python_executable, python_exists, script_path, script_abs, cwd, pipe_name
+            "Starting monitor using python: {} (exists: {}) | script: {} | script_abs: {} | cwd: {} | pipe: {} | storage_pipe: {}",
+            python_executable, python_exists, script_path, script_abs, cwd, pipe_name, reverse_pipe_name
         );
 
         // 启动 Python 进程
@@ -178,10 +297,16 @@ pub async fn start_monitor(
 
         let mut cmd_proc = Command::new(&python_executable);
         // Pipe stdout/stderr so we can stream logs to the frontend
+        // 通过命令行参数传递管道名和认证 token（不使用环境变量）
         cmd_proc
             .arg("-u")
             .arg(&script_path)
-            .env("CARBON_MONITOR_PIPE", "carbon_monitor_secure") // @todo 此处的carbon_monitor_seruce应当是随机生成的。
+            .arg("--pipe-name")
+            .arg(&pipe_name)
+            .arg("--auth-token")
+            .arg(&auth_token)
+            .arg("--storage-pipe")
+            .arg(&reverse_pipe_name)
             .env("PYTHONIOENCODING", "utf-8")
             .env("PROFILING_ENABLED", "1")
             .env("OMP_NUM_THREADS", "1")
@@ -206,6 +331,18 @@ pub async fn start_monitor(
             .spawn()
             .map_err(|e| format!("Failed to start python: {}", e))?;
 
+        // 存储管道名和认证 token
+        {
+            let mut guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(pipe_name.clone());
+        }
+        {
+            let mut guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(auth_token);
+        }
+        // 重置请求计数器
+        state.request_counter.store(0, Ordering::SeqCst);
+
         // If process stdout/stderr were piped, spawn threads to read and forward lines to the frontend
         let app_clone = app.clone();
         let stdout_cache_clone = stdout_cache.clone();
@@ -215,7 +352,7 @@ pub async fn start_monitor(
                 for line in reader.lines() {
                     if let Ok(l) = line {
                         {
-                            let mut cache = stdout_cache_clone.lock().unwrap();
+                            let mut cache = stdout_cache_clone.lock().unwrap_or_else(|e| e.into_inner());
                             cache.push(l.clone());
                             if cache.len() > STARTUP_LOG_TAIL_LINES {
                                 let overflow = cache.len() - STARTUP_LOG_TAIL_LINES;
@@ -241,7 +378,7 @@ pub async fn start_monitor(
                 for line in reader.lines() {
                     if let Ok(l) = line {
                         {
-                            let mut cache = stderr_cache_clone.lock().unwrap();
+                            let mut cache = stderr_cache_clone.lock().unwrap_or_else(|e| e.into_inner());
                             cache.push(l.clone());
                             if cache.len() > STARTUP_LOG_TAIL_LINES {
                                 let overflow = cache.len() - STARTUP_LOG_TAIL_LINES;
@@ -270,7 +407,7 @@ pub async fn start_monitor(
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
             let state = app_clone.state::<MonitorState>();
-            let mut guard = state.process.lock().unwrap();
+            let mut guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(child) = guard.as_mut() {
                 match child.try_wait() {
                     Ok(Some(status)) => {
@@ -307,7 +444,7 @@ pub async fn start_monitor(
     let mut last_error: Option<String> = None;
     let started_at = tokio::time::Instant::now();
     while started_at.elapsed().as_millis() < STARTUP_MAX_WAIT_MS as u128 {
-        match connect_to_pipe().await {
+        match connect_to_pipe(&pipe_name).await {
             Ok(_) => {
                 // 管道可连接，说明服务已就绪
                 return Ok("Monitor started".into());
@@ -319,7 +456,7 @@ pub async fn start_monitor(
 
         // 检查进程是否已经退出
         {
-            let mut guard = state.process.lock().unwrap();
+            let mut guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(child) = guard.as_mut() {
                 match child.try_wait() {
                     Ok(Some(status)) => {
@@ -348,7 +485,7 @@ pub async fn start_monitor(
     }
 
     {
-        let mut guard = state.process.lock().unwrap();
+        let mut guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut child) = guard.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -356,7 +493,7 @@ pub async fn start_monitor(
     }
 
     let stderr_tail = {
-        let cache = stderr_cache.lock().unwrap();
+        let cache = stderr_cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.is_empty() {
             "<empty>".to_string()
         } else {
@@ -372,7 +509,7 @@ pub async fn start_monitor(
         script_abs,
         python_executable_for_error,
         python_exists_for_error,
-        PIPE_NAME,
+        pipe_name,
         stderr_tail
     ))
 }
@@ -380,10 +517,10 @@ pub async fn start_monitor(
 #[tauri::command]
 pub async fn stop_monitor(state: State<'_, MonitorState>) -> Result<String, String> {
     // 尝试通过 IPC 发送结束信号
-    let _ = send_ipc_command_internal("stop").await;
+    let _ = send_ipc_command_internal(&state, "stop").await;
 
     // 等待进程退出
-    let mut process_guard = state.process.lock().unwrap();
+    let mut process_guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut child) = process_guard.take() {
         // 给一点时间让它自己退出
         // 这里是同步阻塞，稍微不太好，但在 destroy 阶段通常可以接受
@@ -392,28 +529,51 @@ pub async fn stop_monitor(state: State<'_, MonitorState>) -> Result<String, Stri
         let _ = child.wait();
     }
 
+    // 停止反向 IPC 服务器
+    {
+        let mut guard = state.reverse_ipc.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref mut server) = *guard {
+            server.stop();
+        }
+        *guard = None;
+    }
+
+    // 清理状态
+    {
+        let mut guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    {
+        let mut guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    {
+        let mut guard = state.reverse_pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+
     Ok("Monitor stopped".into())
 }
 
 #[tauri::command]
-pub async fn pause_monitor() -> Result<String, String> {
-    send_ipc_command_internal("pause").await
+pub async fn pause_monitor(state: State<'_, MonitorState>) -> Result<String, String> {
+    send_ipc_command_internal(&state, "pause").await
 }
 
 #[tauri::command]
-pub async fn resume_monitor() -> Result<String, String> {
-    send_ipc_command_internal("resume").await
+pub async fn resume_monitor(state: State<'_, MonitorState>) -> Result<String, String> {
+    send_ipc_command_internal(&state, "resume").await
 }
 
 #[tauri::command]
 pub async fn get_monitor_status(state: State<'_, MonitorState>) -> Result<String, String> {
-    match send_ipc_command_internal("status").await {
+    match send_ipc_command_internal(&state, "status").await {
         Ok(status) => Ok(status),
         Err(e) => {
             // 如果进程未运行，则返回“stopped”而不是抛错，避免前端冷启动误报
             let mut running = false;
             {
-                let mut guard = state.process.lock().unwrap();
+                let mut guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(child) = guard.as_mut() {
                     match child.try_wait() {
                         Ok(Some(_)) => {
