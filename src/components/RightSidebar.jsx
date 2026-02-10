@@ -13,12 +13,17 @@ export default function RightSidebar({ isLoadingDetails, selectedDetails, handle
             {[1, 2, 3].map(i => <div key={i} className="h-4 bg-ide-panel animate-pulse rounded w-3/4"></div>)}
           </div>
         ) : (
-          <textarea
-            className="w-full h-full bg-ide-bg p-4 text-xs font-mono text-ide-text resize-none focus:outline-none leading-relaxed"
-            readOnly
-            value={selectedDetails?.ocr_results?.map(r => r.text).join('\n') || ''}
-            placeholder={selectedDetails ? "No text detected" : "Select an image to view OCR content"}
-          />
+          // 如果记录处于 pending 状态，显示斜体的占位文案
+          (selectedDetails?.record?.status === 'pending') ? (
+            <div className="w-full h-full flex items-center justify-center text-sm italic text-ide-muted p-4">OCR Processing…</div>
+          ) : (
+            <textarea
+              className="w-full h-full bg-ide-bg p-4 text-xs font-mono text-ide-text resize-none focus:outline-none leading-relaxed"
+              readOnly
+              value={selectedDetails?.ocr_results?.map(r => r.text).join('\n') || ''}
+              placeholder={selectedDetails ? "No text detected" : "Select an image to view OCR content"}
+            />
+          )
         )}
       </div>
       {selectedDetails?.ocr_results?.length > 0 && (

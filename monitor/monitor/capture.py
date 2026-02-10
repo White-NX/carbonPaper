@@ -570,10 +570,33 @@ def capture_loop(interval: int = INTERVAL):
         should_capture = False
         scan_reason = ""
 
-        # 3. 焦点切换触发
+        # 3. 焦点切换触发（仅在 OCR 队列未过载时）
         if hwnd != last_hwnd:
-            should_capture = True
-            scan_reason = f"focus_change"
+            # 动态导入以避免导入循环
+            try:
+                from monitor import _ocr_worker
+            except Exception:
+                _ocr_worker = None
+
+            # 从共享常量读取最大允许 pending 数量
+            try:
+                from monitor.constants import MAX_PENDING
+            except Exception:
+                MAX_PENDING = 1
+
+            pending = 0
+            try:
+                if _ocr_worker:
+                    pending = _ocr_worker.pending_count()
+            except Exception:
+                pending = 0
+
+            # 当队列中有多于 MAX_PENDING 张图片时，跳过焦点触发的截图
+            if pending > MAX_PENDING:
+                should_capture = False
+            else:
+                should_capture = True
+                scan_reason = f"focus_change"
 
         # 4. 时间间隔触发
         elif now - last_capture_time >= interval:

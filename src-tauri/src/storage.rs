@@ -303,6 +303,9 @@ impl StorageState {
         Self::add_column_if_missing(conn, "screenshots", "process_name_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "screenshots", "metadata_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "screenshots", "content_key_encrypted", "BLOB")?;
+        // Add status and committed_at for two-phase screenshot lifecycle
+        Self::add_column_if_missing(conn, "screenshots", "status", "TEXT")?;
+        Self::add_column_if_missing(conn, "screenshots", "committed_at", "TIMESTAMP")?;
 
         Self::add_column_if_missing(conn, "ocr_results", "text_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "ocr_results", "text_key_encrypted", "BLOB")?;
@@ -769,8 +772,6 @@ impl StorageState {
                         // 获取现有的 postings_blob
                         let existing_blob: Option<Vec<u8>> =
                             get_stmt.query_row(params![&token_hash], |row| row.get(0)).optional().map_err(|e| format!("Failed to query postings_blob: {}", e))?;
-                        let existing_len = existing_blob.as_ref().map(|b| b.len()).unwrap_or(0);
-
                         let mut bitmap = if let Some(blob) = existing_blob {
                             let rb = roaring::RoaringBitmap::deserialize_from(&blob[..])
                                 .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?;
@@ -808,6 +809,251 @@ impl StorageState {
             image_path: Some(image_path_str),
             added,
             skipped,
+        })
+    }
+
+    /// 临时保存（pending）截图：加密写文件并插入 screenshots 记录，状态为 'pending'
+    pub fn save_screenshot_temp(
+        &self,
+        request: &SaveScreenshotRequest,
+    ) -> Result<SaveScreenshotResponse, String> {
+        // 如果已存在则返回 duplicate
+        if self.screenshot_exists(&request.image_hash)? {
+            return Ok(SaveScreenshotResponse {
+                status: "duplicate".to_string(),
+                screenshot_id: None,
+                image_path: None,
+                added: 0,
+                skipped: 0,
+            });
+        }
+
+        // 解码图片
+        let image_data = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &request.image_data,
+        )
+        .map_err(|e| format!("Failed to decode image data: {}", e))?;
+
+        // 生成 row key 并加密图片
+        let mut row_key = vec![0u8; 32];
+        rand::thread_rng().fill_bytes(&mut row_key);
+
+        let encrypted_image = encrypt_with_master_key(&row_key, &image_data)
+            .map_err(|e| format!("Failed to encrypt image: {}", e))?;
+        let encrypted_row_key = encrypt_row_key_with_cng(&row_key)
+            .map_err(|e| format!("Failed to wrap image row key: {}", e))?;
+
+        // 使用 .pending 后缀标记临时文件
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
+        let filename = format!("screenshot_{}.png.enc.pending", timestamp);
+        let image_path = self.screenshot_dir.join(&filename);
+
+        std::fs::write(&image_path, &encrypted_image)
+            .map_err(|e| format!("Failed to save encrypted image file: {}", e))?;
+
+        let image_path_str = image_path.to_string_lossy().to_string();
+
+        let guard = self.get_connection()?;
+        let conn = guard.as_ref().unwrap();
+
+        let metadata_json = request
+            .metadata
+            .as_ref()
+            .map(|m| serde_json::to_string(m).ok())
+            .flatten();
+
+        let window_title_enc = match &request.window_title {
+            Some(value) => Some(
+                encrypt_with_master_key(&row_key, value.as_bytes())
+                    .map_err(|e| format!("Failed to encrypt window title: {}", e))?,
+            ),
+            None => None,
+        };
+        let process_name_enc = match &request.process_name {
+            Some(value) => Some(
+                encrypt_with_master_key(&row_key, value.as_bytes())
+                    .map_err(|e| format!("Failed to encrypt process name: {}", e))?,
+            ),
+            None => None,
+        };
+        let metadata_enc = match &metadata_json {
+            Some(value) => Some(
+                encrypt_with_master_key(&row_key, value.as_bytes())
+                    .map_err(|e| format!("Failed to encrypt metadata: {}", e))?,
+            ),
+            None => None,
+        };
+
+        Self::zeroize_bytes(&mut row_key);
+
+        conn.execute(
+            "INSERT INTO screenshots (
+                image_path, image_hash, width, height,
+                window_title, process_name, metadata,
+                window_title_enc, process_name_enc, metadata_enc,
+                content_key_encrypted, status
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                &image_path_str,
+                &request.image_hash,
+                request.width,
+                request.height,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                window_title_enc,
+                process_name_enc,
+                metadata_enc,
+                encrypted_row_key,
+                "pending",
+            ],
+        )
+        .map_err(|e| format!("Failed to insert screenshot: {}", e))?;
+
+        let screenshot_id = conn.last_insert_rowid();
+
+        Ok(SaveScreenshotResponse {
+            status: "success".to_string(),
+            screenshot_id: Some(screenshot_id),
+            image_path: Some(image_path_str),
+            added: 0,
+            skipped: 0,
+        })
+    }
+
+    /// Commit pending screenshot: attach OCR results, update index and mark as committed
+    pub fn commit_screenshot(
+        &self,
+        screenshot_id: i64,
+        ocr_results: Option<&Vec<OcrResultInput>>,
+    ) -> Result<SaveScreenshotResponse, String> {
+        let guard = self.get_connection()?;
+        let conn = guard.as_ref().unwrap();
+
+        // 查找截图记录
+        let rec: Option<(String, Option<Vec<u8>>)> = conn
+            .query_row(
+                "SELECT image_path, content_key_encrypted FROM screenshots WHERE id = ?",
+                params![screenshot_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to query screenshot: {}", e))?;
+
+        if rec.is_none() {
+            return Err("Screenshot not found".to_string());
+        }
+
+        let (image_path_str, _content_key_enc) = rec.unwrap();
+        let image_path = std::path::PathBuf::from(&image_path_str);
+
+        // 如果文件名以 .pending 结尾则重命名为正式名称，并更新数据库中的 image_path
+        let mut final_image_path_str = image_path_str.clone();
+        if let Some(fname) = image_path.file_name().and_then(|s| s.to_str()) {
+            if fname.ends_with(".pending") {
+                let new_name = fname.trim_end_matches(".pending");
+                let new_path = image_path.with_file_name(new_name);
+                if let Err(e) = std::fs::rename(&image_path, &new_path) {
+                    // 如果重命名失败，记录但继续尝试插入 OCR 结果
+                    eprintln!("Failed to rename pending image file: {}", e);
+                } else {
+                    final_image_path_str = new_path.to_string_lossy().to_string();
+                }
+            }
+        }
+
+        let mut added = 0;
+                    let skipped = 0;
+
+        // 插入 OCR 结果（如果有）
+        if let Some(results) = ocr_results {
+            for result in results {
+                let text_hash = Self::compute_hmac_hash(&result.text);
+                let (text_enc, text_key_encrypted) = self.encrypt_payload_with_row_key(result.text.as_bytes())?;
+
+                // TODO: 复制 save_screenshot 的去重逻辑与索引插入，简化实现：直接插入
+                conn.execute(
+                    "INSERT INTO ocr_results (
+                        screenshot_id, text, text_hash, text_enc, text_key_encrypted, confidence,
+                        box_x1, box_y1, box_x2, box_y2,
+                        box_x3, box_y3, box_x4, box_y4
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        screenshot_id,
+                        Option::<String>::None,
+                        &text_hash,
+                        text_enc,
+                        text_key_encrypted,
+                        result.confidence,
+                        result.box_coords[0][0], result.box_coords[0][1],
+                        result.box_coords[1][0], result.box_coords[1][1],
+                        result.box_coords[2][0], result.box_coords[2][1],
+                        result.box_coords[3][0], result.box_coords[3][1],
+                    ],
+                )
+                .map_err(|e| format!("Failed to insert OCR result: {}", e))?;
+
+                added += 1;
+            }
+
+        }
+
+        // 标记为 committed 并设置 committed_at，同时更新 image_path 为重命名后的路径
+        conn.execute(
+            "UPDATE screenshots SET image_path = ?, status = ?, committed_at = CURRENT_TIMESTAMP WHERE id = ?",
+            params![final_image_path_str, "committed", screenshot_id],
+        )
+        .map_err(|e| format!("Failed to mark screenshot committed: {}", e))?;
+
+        Ok(SaveScreenshotResponse {
+            status: "success".to_string(),
+            screenshot_id: Some(screenshot_id),
+            image_path: Some(final_image_path_str),
+            added,
+            skipped,
+        })
+    }
+
+    /// Abort pending screenshot: delete encrypted file and mark DB record as aborted
+    pub fn abort_screenshot(&self, screenshot_id: i64, _reason: Option<&str>) -> Result<SaveScreenshotResponse, String> {
+        let guard = self.get_connection()?;
+        let conn = guard.as_ref().unwrap();
+
+        let rec: Option<String> = conn
+            .query_row(
+                "SELECT image_path FROM screenshots WHERE id = ?",
+                params![screenshot_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to query screenshot: {}", e))?;
+
+        if rec.is_none() {
+            return Err("Screenshot not found".to_string());
+        }
+
+        let image_path_str = rec.unwrap();
+        let image_path = std::path::PathBuf::from(&image_path_str);
+
+        // 删除文件（容错）
+        if image_path.exists() {
+            let _ = std::fs::remove_file(&image_path);
+        }
+
+        // 标记为 aborted
+        conn.execute(
+            "UPDATE screenshots SET status = ? WHERE id = ?",
+            params!["aborted", screenshot_id],
+        )
+        .map_err(|e| format!("Failed to mark screenshot aborted: {}", e))?;
+
+        Ok(SaveScreenshotResponse {
+            status: "success".to_string(),
+            screenshot_id: Some(screenshot_id),
+            image_path: Some(image_path_str),
+            added: 0,
+            skipped: 0,
         })
     }
 
@@ -1422,32 +1668,32 @@ pub fn read_image_as_base64(path: &str) -> Result<(String, String), String> {
 
     let data = std::fs::read(path).map_err(|e| format!("Failed to read image file: {}", e))?;
 
-    // 检查是否是加密文件（.enc 扩展名）
-    let is_encrypted = path.extension().and_then(|e| e.to_str()) == Some("enc");
+    // 更稳健地检测是否为加密文件：文件名中包含 ".enc" 即视为加密（兼容 .enc.pending）
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let is_encrypted = fname.contains(".enc");
 
-    // 获取实际的 MIME 类型（从 .png.enc 中提取 .png）
-    let mime_type = if is_encrypted {
-        // 文件名格式：screenshot_xxx.png.enc，需要获取 .png 部分
-        let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if file_stem.ends_with(".png") {
-            "image/png"
-        } else if file_stem.ends_with(".jpg") || file_stem.ends_with(".jpeg") {
-            "image/jpeg"
-        } else if file_stem.ends_with(".gif") {
-            "image/gif"
-        } else if file_stem.ends_with(".webp") {
-            "image/webp"
+    // 获取实际的 MIME 类型：尝试从文件名（去掉 .enc/.pending 后缀）推断
+    let base_name = if is_encrypted {
+        // 例如：screenshot_xxx.png.enc 或 screenshot_xxx.png.enc.pending
+        if let Some(pos) = fname.find(".enc") {
+            &fname[..pos]
         } else {
-            "image/png"
+            fname
         }
     } else {
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("png") => "image/png",
-            Some("jpg") | Some("jpeg") => "image/jpeg",
-            Some("gif") => "image/gif",
-            Some("webp") => "image/webp",
-            _ => "image/png",
-        }
+        fname
+    };
+
+    let mime_type = if base_name.ends_with(".png") {
+        "image/png"
+    } else if base_name.ends_with(".jpg") || base_name.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if base_name.ends_with(".gif") {
+        "image/gif"
+    } else if base_name.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/png"
     };
 
     // 加密文件需要解密密钥，这里只能返回错误，需要使用带密钥的方法
@@ -1475,32 +1721,31 @@ pub fn read_encrypted_image_as_base64(
     }
 
     let data = std::fs::read(path).map_err(|e| format!("Failed to read image file: {}", e))?;
+    // 更稳健地检测是否为加密文件：文件名中包含 ".enc" 即视为加密（兼容 .enc.pending）
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let is_encrypted = fname.contains(".enc");
 
-    // 检查是否是加密文件（.enc 扩展名）
-    let is_encrypted = path.extension().and_then(|e| e.to_str()) == Some("enc");
-
-    // 获取实际的 MIME 类型
-    let mime_type = if is_encrypted {
-        let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if file_stem.ends_with(".png") {
-            "image/png"
-        } else if file_stem.ends_with(".jpg") || file_stem.ends_with(".jpeg") {
-            "image/jpeg"
-        } else if file_stem.ends_with(".gif") {
-            "image/gif"
-        } else if file_stem.ends_with(".webp") {
-            "image/webp"
+    // 获取实际的 MIME 类型：尝试从文件名（去掉 .enc/.pending 后缀）推断
+    let base_name = if is_encrypted {
+        if let Some(pos) = fname.find(".enc") {
+            &fname[..pos]
         } else {
-            "image/png"
+            fname
         }
     } else {
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("png") => "image/png",
-            Some("jpg") | Some("jpeg") => "image/jpeg",
-            Some("gif") => "image/gif",
-            Some("webp") => "image/webp",
-            _ => "image/png",
-        }
+        fname
+    };
+
+    let mime_type = if base_name.ends_with(".png") {
+        "image/png"
+    } else if base_name.ends_with(".jpg") || base_name.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if base_name.ends_with(".gif") {
+        "image/gif"
+    } else if base_name.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/png"
     };
 
     let image_data = if is_encrypted {

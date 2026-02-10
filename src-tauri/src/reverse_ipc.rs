@@ -2,10 +2,9 @@
 //!
 //! 该模块创建一个命名管道服务器，Python 子服务可以连接到该管道发送存储请求
 
-use crate::storage::{SaveScreenshotRequest, StorageState};
+use crate::storage::{SaveScreenshotRequest, StorageState, OcrResultInput};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc;
@@ -25,6 +24,29 @@ pub enum StorageCommand {
         process_name: Option<String>,
         metadata: Option<serde_json::Value>,
         ocr_results: Option<Vec<OcrResultInput>>,
+    },
+    /// 临时保存截图（pending），等待后续 commit/abort
+    #[serde(rename = "save_screenshot_temp")]
+    SaveScreenshotTemp {
+        image_data: String,
+        image_hash: String,
+        width: i32,
+        height: i32,
+        window_title: Option<String>,
+        process_name: Option<String>,
+        metadata: Option<serde_json::Value>,
+    },
+    /// 提交之前临时保存的截图并写入 OCR 结果
+    #[serde(rename = "commit_screenshot")]
+    CommitScreenshot {
+        screenshot_id: String,
+        ocr_results: Option<Vec<OcrResultInput>>,
+    },
+    /// 中止之前临时保存的截图（删除临时文件并回滚记录）
+    #[serde(rename = "abort_screenshot")]
+    AbortScreenshot {
+        screenshot_id: String,
+        reason: Option<String>,
     },
     /// 获取公钥
     #[serde(rename = "get_public_key")]
@@ -46,13 +68,7 @@ pub enum StorageCommand {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OcrResultInput {
-    pub text: String,
-    pub confidence: f64,
-    #[serde(rename = "box")]
-    pub box_coords: Vec<Vec<f64>>,
-}
+// Use OcrResultInput from crate::storage to keep a single canonical type
 
 /// 存储响应
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +349,78 @@ fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageRe
                 Ok(exists) => StorageResponse::success(serde_json::json!({
                     "exists": exists
                 })),
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
+        "save_screenshot_temp" => {
+            let request = match serde_json::from_value::<SaveScreenshotRequest>(req.clone()) {
+                Ok(r) => r,
+                Err(e) => return StorageResponse::error(&format!("Invalid request: {}", e)),
+            };
+
+            match storage.save_screenshot_temp(&request) {
+                Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
+        "commit_screenshot" => {
+            // Accept screenshot_id as number or string
+            let screenshot_id_val = req.get("screenshot_id").cloned();
+            let screenshot_id = match screenshot_id_val {
+                Some(v) => {
+                    if v.is_i64() {
+                        v.as_i64().unwrap_or(-1)
+                    } else if v.is_u64() {
+                        v.as_u64().map(|x| x as i64).unwrap_or(-1)
+                    } else if v.is_string() {
+                        v.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1)
+                    } else {
+                        -1
+                    }
+                }
+                None => -1,
+            };
+
+            if screenshot_id < 0 {
+                return StorageResponse::error("Invalid screenshot_id");
+            }
+
+            let ocr_results = req.get("ocr_results").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value::<OcrResultInput>(v.clone()).ok())
+                    .collect::<Vec<OcrResultInput>>()
+            });
+
+            match storage.commit_screenshot(screenshot_id, ocr_results.as_ref()) {
+                Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
+        "abort_screenshot" => {
+            let screenshot_id_val = req.get("screenshot_id").cloned();
+            let screenshot_id = match screenshot_id_val {
+                Some(v) => {
+                    if v.is_i64() {
+                        v.as_i64().unwrap_or(-1)
+                    } else if v.is_u64() {
+                        v.as_u64().map(|x| x as i64).unwrap_or(-1)
+                    } else if v.is_string() {
+                        v.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1)
+                    } else {
+                        -1
+                    }
+                }
+                None => -1,
+            };
+
+            if screenshot_id < 0 {
+                return StorageResponse::error("Invalid screenshot_id");
+            }
+
+            let reason = req.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+            match storage.abort_screenshot(screenshot_id, reason.as_deref()) {
+                Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
                 Err(e) => StorageResponse::error(&e),
             }
         }
