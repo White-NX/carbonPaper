@@ -139,7 +139,7 @@ class ScreenshotOCRWorker:
         metadata: Dict = None
     ) -> Dict[str, Any]:
         """
-        处理内存中的图片数据（不涉及磁盘明文文件）
+        处理内存中的图片数据
         
         Args:
             image_bytes: JPEG 格式的图片字节数据
@@ -183,7 +183,7 @@ class ScreenshotOCRWorker:
             # 合并OCR文本
             ocr_text = ' '.join([r['text'] for r in filtered_results])
             
-            # 发送到 Rust 加密存储（必须有存储客户端）
+            # 发送到 Rust 加密存储
             if self.storage_client:
                 try:
                     # 格式化 OCR 结果
@@ -196,7 +196,7 @@ class ScreenshotOCRWorker:
                         for r in filtered_results
                     ]
                     
-                    # 发送到 Rust 存储服务（会加密存储，永不写入明文到磁盘）
+                    # 发送到 Rust 存储服务
                     storage_result = self.storage_client.save_screenshot(
                         image_data=image_bytes,
                         image_hash=image_hash,
@@ -372,6 +372,32 @@ class ScreenshotOCRWorker:
             'metadata': metadata,
             '_from_memory': True  # 标记为内存数据
         })
+
+        if self._task_queue.qsize() > 10:
+            print(f"[screenshot_worker] WARNING: Task queue size is large: {self._task_queue.qsize()}, is OCR process overloaded?")
+            # 通过遍历队列中任务，累加 `image_bytes` 的长度来估算内存占用（线程安全）
+            total_bytes = 0
+            with self._task_queue.mutex:
+                queued_items = list(self._task_queue.queue)
+
+            for item in queued_items:
+                try:
+                    if isinstance(item, dict) and 'image_bytes' in item and isinstance(item['image_bytes'], (bytes, bytearray)):
+                        total_bytes += len(item['image_bytes'])
+                except Exception:
+                    # 忽略任何异常，继续估算其它项
+                    continue
+
+            def _fmt_bytes(n: int) -> str:
+                n = float(n)
+                for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                    if n < 1024.0:
+                        return f"{n:.1f}{unit}"
+                    n /= 1024.0
+                return f"{n:.1f}PB"
+
+            estimated_memory = total_bytes
+            print(f"[screenshot_worker] Estimated image memory usage: ~{_fmt_bytes(estimated_memory)} (queue items: {len(queued_items)})")
     
     def _save_to_local_db(
         self,

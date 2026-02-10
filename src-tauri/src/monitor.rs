@@ -1,15 +1,19 @@
 use crate::resource_utils::normalize_path_for_command;
 use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
 use crate::storage::StorageState;
+use rand::Rng;
 use std::path::Path;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;
-use rand::Rng;
-use std::sync::atomic::{AtomicU64, Ordering};
+
+use std::os::windows::io::AsRawHandle;
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::JobObjects::*;
 
 pub struct MonitorState {
     pub process: Mutex<Option<Child>>,
@@ -64,7 +68,9 @@ fn generate_auth_token() -> String {
 }
 
 // 内部函数：尝试连接到管道，支持重试
-async fn connect_to_pipe(pipe_name: &str) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, String> {
+async fn connect_to_pipe(
+    pipe_name: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, String> {
     let mut last_error = String::new();
     let full_pipe_name = format!(r"\\.\pipe\{}", pipe_name);
 
@@ -98,7 +104,10 @@ async fn send_ipc_request(
 ) -> Result<Value, String> {
     // 在请求中添加认证信息
     if let Some(obj) = req.as_object_mut() {
-        obj.insert("_auth_token".to_string(), Value::String(auth_token.to_string()));
+        obj.insert(
+            "_auth_token".to_string(),
+            Value::String(auth_token.to_string()),
+        );
         obj.insert("_seq_no".to_string(), Value::Number(seq_no.into()));
     }
 
@@ -264,24 +273,27 @@ pub async fn start_monitor(
 
         // 生成反向 IPC 管道名并启动服务器
         let reverse_pipe_name = generate_reverse_pipe_name();
-        
+
         // 启动反向 IPC 服务器（用于接收 Python 的存储请求）
         {
             let storage = app.state::<Arc<StorageState>>();
             let storage_arc = (*storage).clone();
-            
+
             let mut reverse_server = ReverseIpcServer::new(&reverse_pipe_name);
             if let Err(e) = reverse_server.start(storage_arc) {
                 eprintln!("Failed to start reverse IPC server: {}", e);
             }
-            
+
             // 存储反向 IPC 服务器和管道名
             {
                 let mut guard = state.reverse_ipc.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(reverse_server);
             }
             {
-                let mut guard = state.reverse_pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = state
+                    .reverse_pipe_name
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 *guard = Some(reverse_pipe_name.clone());
             }
         }
@@ -295,6 +307,39 @@ pub async fn start_monitor(
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
 
+        let job = unsafe {
+            // FUCK ONNX
+            // 通过限制python子服务CPU占用率，降低对系统的影响，同时保证RapidOCR的速度
+            let handle = CreateJobObjectW(None, None).expect("Failed to create job");
+
+            // 设置 CPU 限制
+            let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+            cpu_info.ControlFlags =
+                JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            cpu_info.Anonymous.CpuRate = 1500; // 15%
+
+            SetInformationJobObject(
+                handle,
+                JobObjectCpuRateControlInformation,
+                &cpu_info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            )
+            .expect("Failed to set CPU limit");
+
+            // 设置“父进程退出则子进程自杀”
+            let mut limit_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limit_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &limit_info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .expect("Failed to set Kill-on-Close limit");
+
+            handle
+        };
         let mut cmd_proc = Command::new(&python_executable);
         // Pipe stdout/stderr so we can stream logs to the frontend
         // 通过命令行参数传递管道名和认证 token（不使用环境变量）
@@ -309,10 +354,10 @@ pub async fn start_monitor(
             .arg(&reverse_pipe_name)
             .env("PYTHONIOENCODING", "utf-8")
             .env("PROFILING_ENABLED", "1")
-            .env("OMP_NUM_THREADS", "1")
-            .env("MKL_NUM_THREADS", "2")
-            .env("OPENBLAS_NUM_THREADS", "2")
-            .env("NUMPY_NUM_THREADS", "2") // 通过限制线程数，降低子服务对系统的影响
+            //.env("OMP_NUM_THREADS", "1")
+            //.env("MKL_NUM_THREADS", "1")
+            //.env("OPENBLAS_NUM_THREADS", "1")
+            //.env("NUMPY_NUM_THREADS", "1")
             .env(
                 "TRACEMALLOC_SNAPSHOT_DIR",
                 "D:\\carbon_tracemalloc_snapshots",
@@ -320,7 +365,6 @@ pub async fn start_monitor(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -330,7 +374,6 @@ pub async fn start_monitor(
         let mut child = cmd_proc
             .spawn()
             .map_err(|e| format!("Failed to start python: {}", e))?;
-
         // 存储管道名和认证 token
         {
             let mut guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
@@ -343,6 +386,12 @@ pub async fn start_monitor(
         // 重置请求计数器
         state.request_counter.store(0, Ordering::SeqCst);
 
+        // 将子进程加入 Job 对象，以便随主进程退出时自动清理以及限制CPU使用
+        unsafe {
+            let process_handle = HANDLE(child.as_raw_handle() as _);
+            AssignProcessToJobObject(job, process_handle).expect("Failed to assign process to job");
+        }
+
         // If process stdout/stderr were piped, spawn threads to read and forward lines to the frontend
         let app_clone = app.clone();
         let stdout_cache_clone = stdout_cache.clone();
@@ -352,7 +401,8 @@ pub async fn start_monitor(
                 for line in reader.lines() {
                     if let Ok(l) = line {
                         {
-                            let mut cache = stdout_cache_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut cache =
+                                stdout_cache_clone.lock().unwrap_or_else(|e| e.into_inner());
                             cache.push(l.clone());
                             if cache.len() > STARTUP_LOG_TAIL_LINES {
                                 let overflow = cache.len() - STARTUP_LOG_TAIL_LINES;
@@ -378,7 +428,8 @@ pub async fn start_monitor(
                 for line in reader.lines() {
                     if let Ok(l) = line {
                         {
-                            let mut cache = stderr_cache_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut cache =
+                                stderr_cache_clone.lock().unwrap_or_else(|e| e.into_inner());
                             cache.push(l.clone());
                             if cache.len() > STARTUP_LOG_TAIL_LINES {
                                 let overflow = cache.len() - STARTUP_LOG_TAIL_LINES;
@@ -417,10 +468,7 @@ pub async fn start_monitor(
                             .code()
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "unknown".to_string());
-                        let _ = app_clone.emit(
-                            "monitor-exited",
-                            serde_json::json!({"code": code}),
-                        );
+                        let _ = app_clone.emit("monitor-exited", serde_json::json!({"code": code}));
                         break;
                     }
                     Ok(None) => {}
@@ -465,10 +513,7 @@ pub async fn start_monitor(
                             .code()
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "unknown".to_string());
-                        return Err(format!(
-                            "Monitor exited during startup (code: {})",
-                            code
-                        ));
+                        return Err(format!("Monitor exited during startup (code: {})", code));
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -548,7 +593,10 @@ pub async fn stop_monitor(state: State<'_, MonitorState>) -> Result<String, Stri
         *guard = None;
     }
     {
-        let mut guard = state.reverse_pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = state
+            .reverse_pipe_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
 

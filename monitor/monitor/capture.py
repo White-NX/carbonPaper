@@ -584,7 +584,7 @@ def capture_loop(interval: int = INTERVAL):
             try:
 
                 if scan_reason == "focus_change":
-                    time.sleep(0.3)  # 等待窗口稳定
+                    time.sleep(0.5)  # 等待窗口稳定
 
                 img_pil, monitor, captured_title, captured_hwnd = (
                     _capture_window_image_data()
