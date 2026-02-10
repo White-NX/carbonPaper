@@ -874,11 +874,14 @@ class ScreenshotOCRService:
                                 metadata={'monitor': monitor},
                                 screenshot_id=screenshot_id
                             )
-                            # 删除本地明文文件
+                            # 删除本地明文文件（允许文件已不存在的情况静默忽略）
                             try:
                                 os.remove(out_file)
-                            except Exception:
+                            except FileNotFoundError:
+                                # 文件已被删除或不存在，不影响后续流程
                                 pass
+                            except OSError as e:
+                                print(f"[capture] 删除临时截图文件失败 {out_file}: {e}")
                         else:
                             # 回退到旧行为：将文件路径加入队列
                             print(f"[capture] save_screenshot_temp failed: {temp_res.get('error')}")
