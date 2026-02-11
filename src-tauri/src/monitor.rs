@@ -2,6 +2,7 @@ use crate::resource_utils::normalize_path_for_command;
 use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
 use crate::storage::StorageState;
 use rand::Rng;
+use std::ops::Deref;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;
 
 use std::os::windows::io::AsRawHandle;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::*;
 
 pub struct MonitorState {
@@ -24,6 +25,8 @@ pub struct MonitorState {
     pub reverse_ipc: Mutex<Option<ReverseIpcServer>>,
     /// 反向 IPC 管道名
     pub reverse_pipe_name: Mutex<Option<String>>,
+    /// Job Object handle - 用于管理子进程生命周期和资源限制
+    pub job_handle: Mutex<Option<JobHandle>>,
 }
 
 impl MonitorState {
@@ -35,9 +38,37 @@ impl MonitorState {
             request_counter: AtomicU64::new(0),
             reverse_ipc: Mutex::new(None),
             reverse_pipe_name: Mutex::new(None),
+            job_handle: Mutex::new(None),
         }
     }
 }
+
+pub struct JobHandle(HANDLE);
+
+impl JobHandle {
+    pub fn new(handle: HANDLE) -> Self {
+        Self(handle)
+    }
+}
+
+impl Deref for JobHandle {
+    type Target = HANDLE;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+unsafe impl Send for JobHandle {}
+unsafe impl Sync for JobHandle {}
 
 // 重试配置
 const MAX_RETRIES: u32 = 10;
@@ -188,6 +219,46 @@ async fn send_ipc_command_internal(
     }
 }
 
+fn create_job_object() -> Result<JobHandle, String> {
+    unsafe {
+        // 创建 Job Object
+        let handle = CreateJobObjectW(None, None)
+            .map_err(|e| format!("Failed to create job object: {:?}", e))?;
+
+        // 设置 CPU 限制
+        let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+        cpu_info.ControlFlags =
+            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        cpu_info.Anonymous.CpuRate = 1000; // 10%
+
+        if let Err(e) = SetInformationJobObject(
+            handle,
+            JobObjectCpuRateControlInformation,
+            &cpu_info as *const _ as *const _,
+            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+        ) {
+            let _ = CloseHandle(handle); // 确保清理资源
+            return Err(format!("Failed to set CPU limit: {:?}", e));
+        }
+
+        // 设置"父进程退出则子进程自杀"
+        let mut limit_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limit_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        if let Err(e) = SetInformationJobObject(
+            handle,
+            JobObjectExtendedLimitInformation,
+            &limit_info as *const _ as *const _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) {
+            let _ = CloseHandle(handle); // 确保清理资源
+            return Err(format!("Failed to set Kill-on-Close limit: {:?}", e));
+        }
+
+        Ok(JobHandle::new(handle))
+    }
+}
+
 #[tauri::command]
 pub async fn start_monitor(
     state: State<'_, MonitorState>,
@@ -307,39 +378,8 @@ pub async fn start_monitor(
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
 
-        let job = unsafe {
-            // FUCK ONNX
-            // 通过限制python子服务CPU占用率，降低对系统的影响，同时保证RapidOCR的速度
-            let handle = CreateJobObjectW(None, None).expect("Failed to create job");
+        let job = create_job_object().map_err(|e| format!("Failed to create Job Object: {}", e))?;
 
-            // 设置 CPU 限制
-            let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
-            cpu_info.ControlFlags =
-                JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-            cpu_info.Anonymous.CpuRate = 1500; // 15%
-
-            SetInformationJobObject(
-                handle,
-                JobObjectCpuRateControlInformation,
-                &cpu_info as *const _ as *const _,
-                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
-            )
-            .expect("Failed to set CPU limit");
-
-            // 设置“父进程退出则子进程自杀”
-            let mut limit_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limit_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
-            SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &limit_info as *const _ as *const _,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-            .expect("Failed to set Kill-on-Close limit");
-
-            handle
-        };
         let mut cmd_proc = Command::new(&python_executable);
         // Pipe stdout/stderr so we can stream logs to the frontend
         // 通过命令行参数传递管道名和认证 token（不使用环境变量）
@@ -374,6 +414,14 @@ pub async fn start_monitor(
         let mut child = cmd_proc
             .spawn()
             .map_err(|e| format!("Failed to start python: {}", e))?;
+
+        // 将子进程加入 Job 对象，以便随主进程退出时自动清理以及限制CPU使用
+        unsafe {
+            let process_handle = HANDLE(child.as_raw_handle() as _);
+            AssignProcessToJobObject(*job, process_handle)
+                .expect("Failed to assign process to job");
+        }
+
         // 存储管道名和认证 token
         {
             let mut guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
@@ -383,14 +431,14 @@ pub async fn start_monitor(
             let mut guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(auth_token);
         }
+        // 存储 Job handle 到 state 中（这样在停止时可以正确关闭）
+        {
+            let mut guard = state.job_handle.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(job);
+        }
+
         // 重置请求计数器
         state.request_counter.store(0, Ordering::SeqCst);
-
-        // 将子进程加入 Job 对象，以便随主进程退出时自动清理以及限制CPU使用
-        unsafe {
-            let process_handle = HANDLE(child.as_raw_handle() as _);
-            AssignProcessToJobObject(job, process_handle).expect("Failed to assign process to job");
-        }
 
         // If process stdout/stderr were piped, spawn threads to read and forward lines to the frontend
         let app_clone = app.clone();
@@ -590,6 +638,14 @@ pub async fn stop_monitor(state: State<'_, MonitorState>) -> Result<String, Stri
     }
     {
         let mut guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    {
+        let mut guard = state.reverse_ipc.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    {
+        let mut guard = state.reverse_pipe_name.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
     {

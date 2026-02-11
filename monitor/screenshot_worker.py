@@ -1,6 +1,7 @@
 """
 截图OCR工作进程模块 - 长时运行的截图处理和OCR识别
 """
+import hashlib
 import os
 import time
 import datetime
@@ -95,6 +96,9 @@ class ScreenshotOCRWorker:
         
         # 任务队列（用于异步处理）
         self._task_queue: queue.Queue = queue.Queue()
+        # 当前正在处理（in-flight）的任务计数与锁
+        self._in_flight: int = 0
+        self._in_flight_lock = threading.Lock()
         
         # 回调函数
         self._on_ocr_complete: Optional[Callable] = None
@@ -228,7 +232,17 @@ class ScreenshotOCRWorker:
                             result['db_result'] = commit_result
                             print(f"[storage_client] 截图已提交并写入 OCR: id={screenshot_id}")
                         else:
-                            raise Exception(f"commit failed: {commit_result.get('error')}")
+                            # 尝试中止 pending 状态以清理 .pending 文件
+                            reason = f"commit failed: {commit_result.get('error')}"
+                            try:
+                                abort_res = self.storage_client.abort_screenshot(
+                                    screenshot_id=screenshot_id,
+                                    reason=reason
+                                )
+                                print(f"[storage_client] abort_screenshot called for id={screenshot_id}: {abort_res}")
+                            except Exception as abort_exc:
+                                print(f"[storage_client] abort_screenshot exception for id={screenshot_id}: {abort_exc}")
+                            raise Exception(reason)
                     else:
                         # 兼容旧行为：直接保存（同步）
                         storage_result = self.storage_client.save_screenshot(
@@ -252,6 +266,22 @@ class ScreenshotOCRWorker:
                             raise Exception(f"存储失败: {storage_result.get('error')}")
                         
                 except Exception as e:
+                    # 当提交或存储抛异常时，若之前已临时保存 screenshot_id，应主动中止以清理 pending 文件
+                    try:
+                        if screenshot_id:
+                            reason = str(e)
+                            try:
+                                abort_res = self.storage_client.abort_screenshot(
+                                    screenshot_id=screenshot_id,
+                                    reason=reason
+                                )
+                                print(f"[storage_client] abort_screenshot called for id={screenshot_id}: {abort_res}")
+                            except Exception as abort_exc:
+                                print(f"[storage_client] abort_screenshot exception for id={screenshot_id}: {abort_exc}")
+                    except Exception:
+                        # 忽略 abort 本身的任何异常，继续抛原始错误
+                        pass
+
                     print(f"[storage_client] 加密存储失败: {e}")
                     result['error'] = str(e)
                     raise  # 没有后备方案，直接失败（不保存明文）
@@ -306,9 +336,17 @@ class ScreenshotOCRWorker:
         返回当前队列中待处理（pending）任务数量。
         """
         try:
-            return self._task_queue.qsize()
+            qsize = self._task_queue.qsize()
         except Exception:
-            return 0
+            qsize = 0
+
+        try:
+            with self._in_flight_lock:
+                in_flight = int(self._in_flight)
+        except Exception:
+            in_flight = 0
+
+        return qsize + in_flight
     
     def _compute_image_hash(self, image_path: str) -> str:
         """计算图片文件的哈希值（用于兼容旧代码）"""
@@ -488,43 +526,63 @@ class ScreenshotOCRWorker:
             while not self._task_queue.empty():
                 try:
                     task = self._task_queue.get_nowait()
-                    
-                    # 检查是否是内存数据
-                    if task.get('_from_memory'):
-                        # 内存数据处理（不涉及磁盘文件）
-                        print(f"[OCR Worker] 开始处理内存数据任务")
+
+                    # 标记为 in-flight
+                    try:
+                        with self._in_flight_lock:
+                            self._in_flight += 1
+                    except Exception:
+                        # 若锁不可用则忽略，但仍继续处理
+                        pass
+
+                    try:
+                        # 检查是否是内存数据
+                        if task.get('_from_memory'):
+                            # 内存数据处理（不涉及磁盘文件）
+                            print(f"[OCR Worker] 开始处理内存数据任务")
+                            try:
+                                result = self.process_image_from_memory(
+                                    image_bytes=task.get('image_bytes'),
+                                    image_pil=task.get('image_pil'),
+                                    window_title=task.get('window_title'),
+                                    process_name=task.get('process_name'),
+                                    width=task.get('width'),
+                                    height=task.get('height'),
+                                    metadata=task.get('metadata'),
+                                    screenshot_id=task.get('screenshot_id')
+                                )
+                                if result.get('success'):
+                                    print(f"[OCR Worker] 任务完成: 识别到 {len(result.get('ocr_results', []))} 个文本块")
+                                else:
+                                    print(f"[OCR Worker] 任务失败: {result.get('error', 'unknown error')}")
+                            except Exception as proc_err:
+                                print(f"[OCR Worker] process_image_from_memory 异常: {proc_err}")
+                                import traceback
+                                traceback.print_exc()
+                        else:
+                            # 旧的文件路径处理（兼容）
+                            print(f"[OCR Worker] 开始处理文件任务: {task.get('image_path', 'unknown')}")
+                            try:
+                                result = self.process_image(**task)
+                                if result.get('success'):
+                                    print(f"[OCR Worker] 任务完成: 识别到 {len(result.get('ocr_results', []))} 个文本块")
+                                else:
+                                    print(f"[OCR Worker] 任务失败: {result.get('error', 'unknown error')}")
+                            except Exception as proc_err:
+                                print(f"[OCR Worker] process_image 异常: {proc_err}")
+                                import traceback
+                                traceback.print_exc()
+                    finally:
+                        # 取消 in-flight 标记（确保在任何情况下都能减少计数）
                         try:
-                            result = self.process_image_from_memory(
-                                image_bytes=task.get('image_bytes'),
-                                image_pil=task.get('image_pil'),
-                                window_title=task.get('window_title'),
-                                process_name=task.get('process_name'),
-                                width=task.get('width'),
-                                height=task.get('height'),
-                                metadata=task.get('metadata'),
-                                screenshot_id=task.get('screenshot_id')
-                            )
-                            if result.get('success'):
-                                print(f"[OCR Worker] 任务完成: 识别到 {len(result.get('ocr_results', []))} 个文本块")
-                            else:
-                                print(f"[OCR Worker] 任务失败: {result.get('error', 'unknown error')}")
-                        except Exception as proc_err:
-                            print(f"[OCR Worker] process_image_from_memory 异常: {proc_err}")
-                            import traceback
-                            traceback.print_exc()
-                    else:
-                        # 旧的文件路径处理（兼容）
-                        print(f"[OCR Worker] 开始处理文件任务: {task.get('image_path', 'unknown')}")
-                        try:
-                            result = self.process_image(**task)
-                            if result.get('success'):
-                                print(f"[OCR Worker] 任务完成: 识别到 {len(result.get('ocr_results', []))} 个文本块")
-                            else:
-                                print(f"[OCR Worker] 任务失败: {result.get('error', 'unknown error')}")
-                        except Exception as proc_err:
-                            print(f"[OCR Worker] process_image 异常: {proc_err}")
-                            import traceback
-                            traceback.print_exc()
+                            with self._in_flight_lock:
+                                # 防止负数
+                                if self._in_flight > 0:
+                                    self._in_flight -= 1
+                                else:
+                                    self._in_flight = 0
+                        except Exception:
+                            pass
                 except queue.Empty:
                     break
             
@@ -798,13 +856,12 @@ class ScreenshotOCRService:
     
     def _capture_loop(self):
         """截图循环"""
-        from monitor.capture import capture_focused_window
+        from monitor.capture import capture_focused_window_memory
         
         print(f"截图循环已启动，间隔 {self.capture_interval} 秒")
         
         while not self._capture_stop_event.is_set():
             ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            out_file = os.path.join(self.screenshot_dir, f'shot_{ts}.jpg')
             # 如果队列中已有未处理的任务，则跳过截图以避免积压
             try:
                 MAX_PENDING = 1
@@ -824,89 +881,66 @@ class ScreenshotOCRService:
                     import win32gui
                     hwnd = win32gui.GetForegroundWindow()
                     window_title = win32gui.GetWindowText(hwnd)
-                except:
+                except Exception:
                     window_title = None
-                
-                monitor = capture_focused_window(out_file)
-                print(f"[{ts}] 截图已保存: {out_file}")
 
-                # 若存在存储客户端，则先进行临时加密保存，再将内存图片入队 OCR
+                # 强制使用内存捕获 + 内存直传。当 storage_client 不可用时，直接抛错并放弃（不写盘、不回退）。
                 try:
                     storage_client = getattr(self.ocr_worker, 'storage_client', None)
                 except Exception:
                     storage_client = None
 
-                if storage_client:
-                    try:
-                        # 读取文件到内存
-                        with open(out_file, 'rb') as f:
-                            img_bytes = f.read()
-                        img_pil = Image.open(out_file)
-                        width, height = img_pil.size
+                if not storage_client:
+                    raise RuntimeError("Storage client not initialized; refusing to write plaintext screenshots to disk")
 
-                        image_hash = None
-                        try:
-                            import hashlib
-                            image_hash = hashlib.md5(img_bytes).hexdigest()
-                        except Exception:
-                            image_hash = None
+                # 捕获到内存（bytes + PIL.Image）
+                img_bytes, img_pil, monitor, _title = capture_focused_window_memory()
+                # prefer window_title from capture if available
+                if _title and _title != "Capture Failed":
+                    window_title = _title
 
-                        temp_res = storage_client.save_screenshot_temp(
-                            image_data=img_bytes,
-                            image_hash=image_hash or '',
-                            width=width,
-                            height=height,
-                            window_title=window_title,
-                            process_name=None,
-                            metadata={'monitor': monitor}
-                        )
+                if not img_bytes or img_pil is None:
+                    raise RuntimeError("Capture failed: no image data")
 
-                        if temp_res.get('status') == 'success' or temp_res.get('screenshot_id'):
-                            screenshot_id = temp_res.get('screenshot_id') or temp_res.get('id')
-                            # 将图片以内存方式加入 OCR 队列
-                            self.ocr_worker.queue_image_from_memory(
-                                image_bytes=img_bytes,
-                                image_pil=img_pil,
-                                window_title=window_title,
-                                process_name=None,
-                                width=width,
-                                height=height,
-                                metadata={'monitor': monitor},
-                                screenshot_id=screenshot_id
-                            )
-                            # 删除本地明文文件
-                            try:
-                                os.remove(out_file)
-                            except Exception:
-                                pass
-                        else:
-                            # 回退到旧行为：将文件路径加入队列
-                            print(f"[capture] save_screenshot_temp failed: {temp_res.get('error')}")
-                            self.ocr_worker.add_task(
-                                image_path=out_file,
-                                window_title=window_title,
-                                metadata={'monitor': monitor}
-                            )
-                    except Exception as e:
-                        print(f"[capture] 临时保存或入队失败，回退为文件队列: {e}")
-                        self.ocr_worker.add_task(
-                            image_path=out_file,
-                            window_title=window_title,
-                            metadata={'monitor': monitor}
-                        )
-                else:
-                    # 添加到OCR处理队列（无存储客户端时采用旧流程）
-                    self.ocr_worker.add_task(
-                        image_path=out_file,
+                width, height = img_pil.size
+
+                image_hash = None
+                try:
+                    image_hash = hashlib.md5(img_bytes).hexdigest()
+                except Exception:
+                    image_hash = ''
+
+                temp_res = storage_client.save_screenshot_temp(
+                    image_data=img_bytes,
+                    image_hash=image_hash or '',
+                    width=width,
+                    height=height,
+                    window_title=window_title,
+                    process_name=None,
+                    metadata={'monitor': monitor}
+                )
+
+                if temp_res.get('status') == 'success' or temp_res.get('screenshot_id'):
+                    screenshot_id = temp_res.get('screenshot_id') or temp_res.get('id')
+                    # 将图片以内存方式加入 OCR 队列
+                    self.ocr_worker.queue_image_from_memory(
+                        image_bytes=img_bytes,
+                        image_pil=img_pil,
                         window_title=window_title,
-                        metadata={'monitor': monitor}
+                        process_name=None,
+                        width=width,
+                        height=height,
+                        metadata={'monitor': monitor},
+                        screenshot_id=screenshot_id
                     )
-                
+                else:
+                    raise RuntimeError(f"save_screenshot_temp failed: {temp_res.get('error')}")
             except Exception as e:
                 print(f"[{ts}] 截图失败: {e}")
-            
+                raise
+
+            # 等待下一次检查
             self._capture_stop_event.wait(self.capture_interval)
-        
         print("截图循环已停止")
     
     def start(self):

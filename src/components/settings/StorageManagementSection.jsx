@@ -280,9 +280,9 @@ export default function StorageManagementSection({
       {storageLimit === 'unlimited' && retentionPeriod === 'permanent' && (
         <div className="flex items-start gap-3 px-4 py-3 rounded-lg border border-amber-500/40 bg-amber-500/10">
           <AlertTriangle className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
-          <div className="text-xs text-amber-200">
-            <p className="font-medium mb-1">存储空间提醒</p>
-            <p className="text-amber-200/80">
+          <div className="text-xs text-yellow-600 dark:text-yellow-500">
+            <p className="font-medium mb-1">警告</p>
+            <p>
               当前设置为不限制存储空间且永久保留，快照文件可能会占用大量磁盘空间。
               建议设置合理的存储上限或保留时间。
             </p>

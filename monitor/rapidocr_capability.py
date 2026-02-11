@@ -3,7 +3,7 @@ RapidOCR to PaddleOCR 3.3 Compatibility Layer
 """
 
 from rapidocr_onnxruntime import RapidOCR
-from typing import Union, List, Tuple, Optional
+from typing import Union, List, Optional
 import numpy as np
 from PIL import Image
 

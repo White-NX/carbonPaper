@@ -348,7 +348,7 @@ function SettingsDialog({
       { key: 'models', label: '模型', bytes: storage.models_bytes, icon: Activity, color: 'bg-indigo-500/70' },
       { key: 'images', label: '图片', bytes: storage.images_bytes, icon: ImageIcon, color: 'bg-sky-500/70' },
       { key: 'database', label: '数据库', bytes: storage.database_bytes, icon: Database, color: 'bg-emerald-500/70' },
-      { key: 'other', label: '程序关键依赖', bytes: storage.other_bytes, icon: HardDrive, color: 'bg-amber-500/70' },
+      { key: 'other', label: '程序依赖', bytes: storage.other_bytes, icon: HardDrive, color: 'bg-amber-500/70' },
     ];
   }, [storage]);
 

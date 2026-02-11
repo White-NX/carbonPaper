@@ -96,7 +96,7 @@ fn compute_storage_stats() -> Result<StorageStats, String> {
 
     let screenshots_dir = data_dir.join("screenshots");
     let chroma_dir = data_dir.join("chroma_db");
-    let ocr_db = data_dir.join("ocr_data.db");
+    let ocr_db = data_dir.join("screenshots.db");
 
     let total_bytes = if root.exists() { directory_size(&root) } else { 0 };
     let models_bytes = if models_dir.exists() { directory_size(&models_dir) } else { 0 };
@@ -121,8 +121,8 @@ fn compute_storage_stats() -> Result<StorageStats, String> {
     })
 }
 
-fn get_cached_storage_stats(state: &AnalysisState, force: bool) -> Result<StorageStats, String> {
-    let mut cache_guard = state
+fn get_cached_storage_stats(state: &AnalysisState) -> Option<StorageStats> {
+    let cache_guard = state
         .storage_cache
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -132,21 +132,11 @@ fn get_cached_storage_stats(state: &AnalysisState, force: bool) -> Result<Storag
         .map(|cache| cache.cached_at.elapsed() < STORAGE_CACHE_TTL)
         .unwrap_or(false);
 
-    if !force {
-        if let Some(cache) = cache_guard.as_ref() {
-            if is_valid {
-                return Ok(cache.stats.clone());
-            }
-        }
+    if is_valid {
+        return cache_guard.as_ref().map(|c| c.stats.clone());
     }
 
-    let stats = compute_storage_stats()?;
-    *cache_guard = Some(StorageCache {
-        cached_at: Instant::now(),
-        stats: stats.clone(),
-    });
-
-    Ok(stats)
+    None
 }
 
 fn sample_python_memory(pid: u32) -> Option<u64> {
@@ -201,7 +191,7 @@ pub fn start_memory_sampler(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn get_analysis_overview(
+pub async fn get_analysis_overview(
     state: State<'_, AnalysisState>,
     force_storage: bool,
 ) -> Result<AnalysisOverview, String> {
@@ -213,7 +203,29 @@ pub fn get_analysis_overview(
         history.iter().cloned().collect::<Vec<_>>()
     };
 
-    let storage = get_cached_storage_stats(&state, force_storage)?;
+    // If not forcing, try to return cached stats quickly.
+    if !force_storage {
+        if let Some(stats) = get_cached_storage_stats(&state) {
+            return Ok(AnalysisOverview { memory, storage: stats });
+        }
+    }
 
-    Ok(AnalysisOverview { memory, storage })
+    // Perform expensive storage computation on a blocking thread.
+    let stats = tokio::task::spawn_blocking(|| compute_storage_stats())
+        .await
+        .map_err(|e| format!("Storage task join error: {}", e))??;
+
+    // Update cache under lock.
+    {
+        let mut cache_guard = state
+            .storage_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache_guard = Some(StorageCache {
+            cached_at: Instant::now(),
+            stats: stats.clone(),
+        });
+    }
+
+    Ok(AnalysisOverview { memory, storage: stats })
 }

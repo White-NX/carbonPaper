@@ -111,7 +111,7 @@ export function Analysis() {
       },
       {
         key: 'other',
-        label: '程序关键依赖',
+        label: '程序依赖',
         bytes: storage.other_bytes,
         icon: HardDrive,
         color: 'bg-amber-500/70'

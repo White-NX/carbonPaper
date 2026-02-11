@@ -385,11 +385,39 @@ fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageRe
                 return StorageResponse::error("Invalid screenshot_id");
             }
 
-            let ocr_results = req.get("ocr_results").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|v| serde_json::from_value::<OcrResultInput>(v.clone()).ok())
-                    .collect::<Vec<OcrResultInput>>()
-            });
+            // Parse ocr_results strictly: fail the whole request if any entry is invalid
+            // If parsing fails, ensure we abort the pending screenshot to avoid leaking .pending files
+            let ocr_results = match req.get("ocr_results") {
+                Some(v) => {
+                    let arr = match v.as_array() {
+                        Some(arr) => arr,
+                        None => {
+                            let msg = "ocr_results must be an array when provided";
+                            if let Err(e) = storage.abort_screenshot(screenshot_id, Some(msg)) {
+                                eprintln!("Failed to abort screenshot {}: {}", screenshot_id, e);
+                            }
+                            return StorageResponse::error(msg);
+                        }
+                    };
+
+                    let mut results = Vec::with_capacity(arr.len());
+                    for (idx, item) in arr.iter().enumerate() {
+                        match serde_json::from_value::<OcrResultInput>(item.clone()) {
+                            Ok(parsed) => results.push(parsed),
+                            Err(e) => {
+                                let msg = format!("Invalid ocr_results[{}]: {}", idx, e);
+                                if let Err(abort_err) = storage.abort_screenshot(screenshot_id, Some(&msg)) {
+                                    eprintln!("Failed to abort screenshot {}: {}", screenshot_id, abort_err);
+                                }
+                                return StorageResponse::error(&msg);
+                            }
+                        }
+                    }
+
+                    Some(results)
+                }
+                None => None,
+            };
 
             match storage.commit_screenshot(screenshot_id, ocr_results.as_ref()) {
                 Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),

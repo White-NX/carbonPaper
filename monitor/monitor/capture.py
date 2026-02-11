@@ -374,6 +374,35 @@ def capture_focused_window(save_path: str):
         return monitor, "Capture Failed"
 
 
+def capture_focused_window_memory() -> Tuple[Optional[bytes], Optional[Image.Image], dict, str]:
+    """
+    捕获当前焦点窗口并返回 JPEG bytes、PIL Image、monitor dict 与 window_title。
+
+    图片将以 JPEG 格式压缩存储在内存中。
+
+    返回: (image_bytes, image_pil, monitor, window_title)
+    如果捕获失败，返回 (None, None, monitor, "Capture Failed")
+    """
+    img_pil, monitor, window_title, _ = _capture_window_image_data()
+    if img_pil:
+        try:
+            buffer = io.BytesIO()
+            img_pil.save(
+                buffer,
+                format="JPEG",
+                quality=JPEG_QUALITY,
+                optimize=True,
+                progressive=True,
+            )
+            image_bytes = buffer.getvalue()
+            return image_bytes, img_pil, monitor, window_title
+        except Exception:
+            return None, None, monitor, "Capture Failed"
+    else:
+        monitor = {"left": 0, "top": 0, "width": 0, "height": 0}
+        return None, None, monitor, "Capture Failed"
+
+
 # --- Similarity and Filtering Logic ---
 
 
