@@ -332,6 +332,26 @@ async fn storage_get_public_key(
     Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key))
 }
 
+// ==================== 存储策略（policy）命令 ====================
+
+#[tauri::command]
+async fn storage_set_policy(
+    state: tauri::State<'_, Arc<StorageState>>,
+    policy: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    state
+        .save_policy(&policy)
+        .map_err(|e| format!("Failed to save policy: {}", e))?;
+    Ok(policy)
+}
+
+#[tauri::command]
+async fn storage_get_policy(
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<serde_json::Value, String> {
+    state.load_policy().map_err(|e| format!("Failed to load policy: {}", e))
+}
+
 #[tauri::command]
 async fn storage_encrypt_for_chromadb(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -373,6 +393,42 @@ async fn storage_migrate_plaintext(
     check_auth_required(&credential_state)?;
     
     state.migrate_plaintext_screenshots()
+}
+
+/// 新：整体迁移 data 目录（copy + remove 实现将在 storage.rs 中完成）
+#[tauri::command]
+async fn storage_migrate_data_dir(
+    state: tauri::State<'_, Arc<StorageState>>,
+    app_handle: tauri::AppHandle,
+    target: String,
+    migrate_data_files: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    // 调用 storage impl 的阻塞迁移方法，使用 spawn_blocking 避免阻塞 async runtime
+    let state_clone = state.inner().clone();
+    let app = app_handle.clone();
+    let t = target.clone();
+    let should_migrate = migrate_data_files.unwrap_or(true);
+    let join_handle = tauri::async_runtime::spawn_blocking(move || {
+        state_clone.migrate_data_dir_blocking(app, t, should_migrate)
+    });
+
+    match join_handle.await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("Migration task join failed: {:?}", e)),
+    }
+}
+
+/// 取消正在进行的迁移
+#[tauri::command]
+async fn storage_migration_cancel(
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<serde_json::Value, String> {
+    let in_progress = state.request_migration_cancel();
+    Ok(serde_json::json!({
+        "status": if in_progress { "cancel_requested" } else { "idle" },
+        "in_progress": in_progress
+    }))
 }
 
 /// 删除所有明文截图文件（不迁移，直接删除）
@@ -481,11 +537,26 @@ async fn credential_set_foreground(
 }
 
 fn get_data_dir() -> std::path::PathBuf {
+    // 优先读取持久化的配置文件（%LOCALAPPDATA%/CarbonPaper/config.json）的 data_dir 字段
     let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
         dirs::data_local_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| ".".to_string())
     });
+
+    let cfg_path = std::path::PathBuf::from(&local_appdata).join("CarbonPaper").join("config.json");
+    if cfg_path.exists() {
+        if let Ok(s) = std::fs::read_to_string(&cfg_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(dd) = v.get("data_dir") {
+                    if let Some(dds) = dd.as_str() {
+                        return std::path::PathBuf::from(dds);
+                    }
+                }
+            }
+        }
+    }
+
     std::path::PathBuf::from(local_appdata).join("CarbonPaper").join("data")
 }
 
@@ -583,7 +654,7 @@ pub fn run() {
             monitor::resume_monitor,
             monitor::get_monitor_status,
             monitor::execute_monitor_command,
-            // 新增存储相关命令
+            // 存储相关命令
             storage_get_timeline,
             storage_search,
             storage_get_image,
@@ -592,12 +663,17 @@ pub fn run() {
             storage_delete_by_time_range,
             storage_list_processes,
             storage_save_screenshot,
+            storage_set_policy,
+            storage_get_policy,
             storage_get_public_key,
             storage_encrypt_for_chromadb,
             storage_decrypt_from_chromadb,
+            analysis::get_analysis_overview,
             // 数据迁移命令
             storage_list_plaintext_files,
             storage_migrate_plaintext,
+            storage_migrate_data_dir,
+            storage_migration_cancel,
             storage_delete_plaintext,
             // 凭证管理相关命令
             credential_initialize,
@@ -605,7 +681,6 @@ pub fn run() {
             credential_check_session,
             credential_lock_session,
             credential_set_foreground,
-            analysis::get_analysis_overview,
             get_autostart_status,
             set_autostart,
             python::check_python_status,

@@ -84,7 +84,6 @@ export default function SecuritySection({
       {/* PIN 暂存时间设置 */}
       <div className="space-y-3">
         <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
-          <Clock className="w-4 h-4" />
           解锁有效期
         </label>
         

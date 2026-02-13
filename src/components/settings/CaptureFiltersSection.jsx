@@ -181,7 +181,6 @@ function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
   return (
     <div className="space-y-3">
       <label className="text-sm font-semibold text-ide-accent flex items-center gap-2 px-1">
-        <Clock className="w-4 h-4" />
         快速删除记录
       </label>
       <div className="p-4 bg-ide-bg border border-ide-border rounded-xl text-sm text-ide-muted space-y-4">

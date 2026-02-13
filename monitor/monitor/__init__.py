@@ -46,7 +46,11 @@ def _delete_vectors_by_hashes(image_hashes):
     return {"deleted": deleted, "requested": len(image_hashes), "skipped": False}
 
 def get_data_dir():
-    # 获取 Windows LocalAppData/CarbonPaper/data 路径
+    # 优先使用环境变量（由 Rust 在启动子进程时传入），回退到 LocalAppData
+    env_dir = os.environ.get('CARBONPAPER_DATA_DIR')
+    if env_dir:
+        return env_dir
+
     local_appdata = os.environ.get('LOCALAPPDATA')
     if not local_appdata:
         raise RuntimeError('LOCALAPPDATA 环境变量未设置')

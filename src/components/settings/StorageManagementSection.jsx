@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { HardDrive, RefreshCw, Clock, Database, Image as ImageIcon, Activity, Trash2, AlertTriangle } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
+import { listen } from '@tauri-apps/api/event';
+import { Dialog } from '../Dialog';
+import MigrationProgressDialog from './MigrationProgressDialog';
+import { HardDrive, RefreshCw, Clock, Database, Image as ImageIcon, Activity, FolderOpen, AlertTriangle } from 'lucide-react';
 import { formatBytes, formatTimestamp } from './analysisUtils';
 
 // Storage Ring Chart Component
@@ -82,9 +87,9 @@ function StorageRingChart({ totalDiskUsed, totalDiskSize, appUsedBytes, loading 
 }
 
 // Storage option selector component
-function StorageOptionSelect({ label, value, options, onChange, icon: Icon, description }) {
+function StorageOptionSelect({ label, value, options, onChange, icon: Icon, description, className = '' }) {
   return (
-    <div className="bg-ide-bg/70 border border-ide-border rounded-xl p-4">
+    <div className={`bg-ide-bg/70 border border-ide-border rounded-xl p-4 ${className}`}>
       <div className="flex items-center gap-3 mb-3">
         {Icon && (
           <div className="p-2 rounded-lg bg-ide-panel border border-ide-border">
@@ -111,6 +116,50 @@ function StorageOptionSelect({ label, value, options, onChange, icon: Icon, desc
   );
 }
 
+function StoragePathOption({
+  label,
+  value,
+  onChangePath,
+  icon: Icon,
+  description,
+  error,
+  disabled,
+  className = '',
+}) {
+  return (
+    <div className={`bg-ide-bg/70 border border-ide-border rounded-xl p-4 ${className}`}>
+      <div className="flex items-center gap-3 mb-3">
+        {Icon && (
+          <div className="p-2 rounded-lg bg-ide-panel border border-ide-border">
+            <Icon className="w-4 h-4" />
+          </div>
+        )}
+        <div className="flex-1">
+          <div className="font-medium text-sm">{label}</div>
+          {description && <div className="text-xs text-ide-muted mt-0.5">{description}</div>}
+        </div>
+      </div>
+      <div className="flex items-center gap-2">
+        <input
+          type="text"
+          disabled
+          value={value || '--'}
+          className="flex-1 bg-ide-panel border border-ide-border rounded-lg px-3 py-2 text-sm text-ide-muted truncate disabled:opacity-100 disabled:cursor-not-allowed"
+        />
+        <button
+          type="button"
+          onClick={onChangePath}
+          disabled={disabled}
+          className="shrink-0 px-3 py-2 text-xs border border-ide-border rounded-lg bg-ide-panel hover:border-ide-accent hover:text-ide-accent transition-colors disabled:opacity-60"
+        >
+          {disabled ? '处理中...' : '修改'}
+        </button>
+      </div>
+      {error && <div className="mt-2 text-xs text-red-400">{error}</div>}
+    </div>
+  );
+}
+
 export default function StorageManagementSection({
   storageSegments,
   totalStorage,
@@ -129,14 +178,54 @@ export default function StorageManagementSection({
     return localStorage.getItem('snapshotRetentionPeriod') || 'permanent';
   });
 
+  // Migration state
+  const [isMigrating, setIsMigrating] = useState(false);
+  const [migrationProgress, setMigrationProgress] = useState({ total_files: 0, copied_files: 0, current_file: '' });
+  const [migrationError, setMigrationError] = useState('');
+  const [isUpdatingStoragePath, setIsUpdatingStoragePath] = useState(false);
+  const [isMigrationChoiceDialogOpen, setIsMigrationChoiceDialogOpen] = useState(false);
+  const [pendingTargetPath, setPendingTargetPath] = useState('');
+
   // Save settings to localStorage
   useEffect(() => {
     localStorage.setItem('snapshotStorageLimit', storageLimit);
+    // try to persist to backend; if backend not available, fall back to localStorage
+    (async () => {
+      try {
+        await invoke('storage_set_policy', { policy: { storage_limit: storageLimit, retention_period: retentionPeriod } });
+      } catch (e) {
+        // backend may be unavailable in dev; ignore and rely on localStorage
+      }
+    })();
   }, [storageLimit]);
 
   useEffect(() => {
     localStorage.setItem('snapshotRetentionPeriod', retentionPeriod);
+    // persist to backend as well
+    (async () => {
+      try {
+        await invoke('storage_set_policy', { policy: { storage_limit: storageLimit, retention_period: retentionPeriod } });
+      } catch (e) {
+        // ignore
+      }
+    })();
   }, [retentionPeriod]);
+
+  // On mount try to read policy from backend and sync UI
+  useEffect(() => {
+    (async () => {
+      try {
+        const resp = await invoke('storage_get_policy');
+        if (resp && typeof resp === 'object') {
+          const backendPolicy = resp;
+          if (backendPolicy.storage_limit) setStorageLimit(String(backendPolicy.storage_limit));
+          if (backendPolicy.retention_period) setRetentionPeriod(String(backendPolicy.retention_period));
+        }
+      } catch (e) {
+        // backend not available — keep localStorage values
+      }
+    })();
+  }, []);
 
   // Storage limit options
   const storageLimitOptions = [
@@ -170,6 +259,108 @@ export default function StorageManagementSection({
       usedSize: 320 * 1024 * 1024 * 1024,   // 320GB placeholder
     };
   }, [storage]);
+
+  const currentStoragePath = storage?.root_path || 'LocalAppData/CarbonPaper';
+
+  const executeStoragePathChange = async (targetPath, shouldMigrateData) => {
+    let unlistenProgress = null;
+    let unlistenError = null;
+    let shouldRestartMonitor = true;
+
+    try {
+      if (!targetPath) return;
+
+      setMigrationError('');
+      setIsUpdatingStoragePath(true);
+      try {
+        const monitorStatusRaw = await invoke('get_monitor_status');
+        const monitorStatus = typeof monitorStatusRaw === 'string' ? JSON.parse(monitorStatusRaw) : monitorStatusRaw;
+        shouldRestartMonitor = !monitorStatus?.stopped;
+      } catch (_) {
+        shouldRestartMonitor = true;
+      }
+
+      if (shouldRestartMonitor) {
+        await invoke('stop_monitor');
+      }
+
+      if (shouldMigrateData) {
+        setIsMigrating(true);
+        setMigrationProgress({ total_files: 0, copied_files: 0, current_file: '' });
+
+        unlistenProgress = await listen('storage-migration-progress', (evt) => {
+          const p = evt.payload;
+          setMigrationProgress(p);
+        });
+
+        unlistenError = await listen('storage-migration-error', (evt) => {
+          setMigrationError(evt.payload?.message || '迁移出错');
+        });
+      }
+
+      await invoke('storage_migrate_data_dir', {
+        target: targetPath,
+        migrateDataFiles: shouldMigrateData,
+      });
+
+      if (shouldMigrateData) {
+        setMigrationProgress((s) => ({ ...s, current_file: '完成' }));
+        await new Promise((resolve) => setTimeout(resolve, 600));
+      }
+
+      onRefresh?.();
+    } catch (e) {
+      console.error('change storage path failed', e);
+      setMigrationError(String(e));
+    } finally {
+      if (unlistenProgress) {
+        try { await unlistenProgress(); } catch (_) {}
+      }
+      if (unlistenError) {
+        try { await unlistenError(); } catch (_) {}
+      }
+
+      setIsMigrating(false);
+      setIsUpdatingStoragePath(false);
+      if (shouldRestartMonitor) {
+        try { await invoke('start_monitor'); } catch (_) {}
+      }
+    }
+  };
+
+  const handleChangeStoragePath = async () => {
+    try {
+      const selected = await open({ directory: true });
+      if (!selected) return;
+
+      const targetPath = Array.isArray(selected) ? selected[0] : selected;
+      if (!targetPath) return;
+
+      const normalizedCurrent = currentStoragePath.replace(/[\\/]+$/, '');
+      const normalizedTarget = targetPath.replace(/[\\/]+$/, '');
+      if (normalizedCurrent && normalizedCurrent === normalizedTarget) {
+        return;
+      }
+
+      setPendingTargetPath(targetPath);
+      setIsMigrationChoiceDialogOpen(true);
+    } catch (e) {
+      console.error('select storage path failed', e);
+      setMigrationError(String(e));
+    }
+  };
+
+  const handleCancelMigrationChoice = () => {
+    setIsMigrationChoiceDialogOpen(false);
+    setPendingTargetPath('');
+  };
+
+  const handleApplyStoragePath = async (shouldMigrateData) => {
+    const targetPath = pendingTargetPath;
+    setIsMigrationChoiceDialogOpen(false);
+    setPendingTargetPath('');
+    await executeStoragePathChange(targetPath, shouldMigrateData);
+  };
 
   return (
     <div className="flex flex-col gap-6">
@@ -257,6 +448,17 @@ export default function StorageManagementSection({
 
       {/* Storage Settings */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <StoragePathOption
+          className="md:col-span-2"
+          label="存储位置"
+          description="选择快照和数据库的存储目录。"
+          value={currentStoragePath}
+          onChangePath={handleChangeStoragePath}
+          icon={FolderOpen}
+          error={migrationError}
+          disabled={isUpdatingStoragePath || isMigrating}
+        />
+
         <StorageOptionSelect
           label="快照存储空间上限"
           description="超出后将自动删除最旧的快照"
@@ -289,6 +491,54 @@ export default function StorageManagementSection({
           </div>
         </div>
       )}
+      {/* Migration progress dialog */}
+      <MigrationProgressDialog
+        isOpen={isMigrating}
+        onClose={() => { /* prevent closing while migrating */ }}
+        progress={migrationProgress}
+        error={migrationError}
+      />
+      <Dialog
+        isOpen={isMigrationChoiceDialogOpen}
+        onClose={handleCancelMigrationChoice}
+        title="修改存储位置"
+        maxWidth="max-w-md"
+      >
+        <div className="p-4 space-y-3">
+          <div className="text-sm text-ide-text">已选择新的存储目录：</div>
+          <div className="px-3 py-2 rounded-lg border border-ide-border bg-ide-panel text-xs text-ide-muted break-all">
+            {pendingTargetPath || '--'}
+          </div>
+          <p className="text-xs text-ide-muted">
+            是否将现有数据文件迁移到新目录？
+          </p>
+          <div className="flex items-center justify-end gap-2 pt-2">
+            <button
+              type="button"
+              onClick={handleCancelMigrationChoice}
+              className="px-3 py-1.5 text-xs border border-ide-border rounded-lg bg-ide-panel hover:border-ide-accent hover:text-ide-accent transition-colors"
+            >
+              取消迁移
+            </button>
+            <button
+              type="button"
+              onClick={() => handleApplyStoragePath(false)}
+              className="px-3 py-1.5 text-xs border border-ide-border rounded-lg bg-ide-panel hover:border-ide-accent hover:text-ide-accent transition-colors"
+            >
+              仅修改路径
+            </button>
+            <button
+              type="button"
+              onClick={() => handleApplyStoragePath(true)}
+              className="px-3 py-1.5 text-xs rounded-lg bg-ide-accent hover:bg-ide-accent/90 text-white transition-colors"
+            >
+              迁移并修改
+            </button>
+          </div>
+        </div>
+      </Dialog>
+
     </div>
   );
 }
+
