@@ -1,8 +1,8 @@
 //! 存储管理模块 - SQLCipher 加密数据库和截图文件管理
 //!
 //! 该模块提供：
-//! 1. 加密的 SQLite 数据库存储（使用 SQLCipher）
-//! 2. 截图文件的存储和检索
+//! 1. 加密SQLite 数据库存储（使用 SQLCipher）
+//! 2. 截图文件的存储和管理
 //! 3. OCR 数据的存储和搜索
 
 use crate::credential_manager::{
@@ -17,23 +17,51 @@ use once_cell::sync::Lazy;
 use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::collections::HashSet;
-// removed unused import: std::hash::Hash
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tauri::AppHandle;
+use tauri::Emitter;
+use walkdir::WalkDir;
+use serde_json::json;
 
-/// 存储管理器状态
+struct MigrationRunGuard<'a> {
+    in_progress: &'a AtomicBool,
+    cancel_requested: &'a AtomicBool,
+}
+
+impl<'a> MigrationRunGuard<'a> {
+    fn new(in_progress: &'a AtomicBool, cancel_requested: &'a AtomicBool) -> Self {
+        Self {
+            in_progress,
+            cancel_requested,
+        }
+    }
+}
+
+impl Drop for MigrationRunGuard<'_> {
+    fn drop(&mut self) {
+        self.in_progress.store(false, Ordering::SeqCst);
+        self.cancel_requested.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 存储管理器状
 pub struct StorageState {
-    /// 数据库连接
+    /// 数据库连
     db: Mutex<Option<Connection>>,
     /// 数据目录
-    pub data_dir: PathBuf,
+    pub data_dir: Mutex<PathBuf>,
     /// 截图目录
-    pub screenshot_dir: PathBuf,
-    /// 凭证管理器状态引用
+    pub screenshot_dir: Mutex<PathBuf>,
+    /// 凭证管理器状态引
     credential_state: Arc<CredentialManagerState>,
     /// 是否已初始化
     initialized: Mutex<bool>,
+    migration_cancel_requested: AtomicBool,
+    migration_in_progress: AtomicBool,
 }
 
 /// 截图记录
@@ -80,7 +108,7 @@ pub struct SearchResult {
 /// 存储保存请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveScreenshotRequest {
-    pub image_data: String, // Base64 编码的图片数据
+    pub image_data: String, // Base64 编码的图片数
     pub image_hash: String,
     pub width: i32,
     pub height: i32,
@@ -114,14 +142,322 @@ impl StorageState {
 
         Self {
             db: Mutex::new(None),
-            data_dir,
-            screenshot_dir,
+            data_dir: Mutex::new(data_dir),
+            screenshot_dir: Mutex::new(screenshot_dir),
             credential_state,
             initialized: Mutex::new(false),
+            migration_cancel_requested: AtomicBool::new(false),
+            migration_in_progress: AtomicBool::new(false),
         }
     }
 
-    /// 初始化存储（创建目录和数据库）
+    /// 安全关闭存储，释放数据库连接和其他句
+    pub fn request_migration_cancel(&self) -> bool {
+        self.migration_cancel_requested.store(true, Ordering::SeqCst);
+        self.migration_in_progress.load(Ordering::SeqCst)
+    }
+
+    fn is_migration_cancel_requested(&self) -> bool {
+        self.migration_cancel_requested.load(Ordering::SeqCst)
+    }
+
+    fn rollback_partial_migration(copied_files: &[PathBuf], created_dirs: &mut Vec<PathBuf>) {
+        for file in copied_files.iter().rev() {
+            let _ = std::fs::remove_file(file);
+        }
+
+        created_dirs.sort();
+        created_dirs.dedup();
+        created_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        for dir in created_dirs.iter() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+
+    fn restore_source_and_reinitialize(
+        &self,
+        app_handle: &AppHandle,
+        src: &PathBuf,
+        message: String,
+        cancelled: bool,
+    ) -> Result<serde_json::Value, String> {
+        {
+            let mut data_guard = self.data_dir.lock().unwrap();
+            *data_guard = src.clone();
+            let mut ss_guard = self.screenshot_dir.lock().unwrap();
+            *ss_guard = src.join("screenshots");
+        }
+
+        if let Err(e) = self.initialize() {
+            let msg = format!("{}; failed to reinitialize source storage: {}", message, e);
+            let _ = app_handle.emit(
+                "storage-migration-error",
+                json!({ "message": msg.clone(), "recoverable": false, "cancelled": cancelled }),
+            );
+            return Err(msg);
+        }
+
+        let _ = app_handle.emit(
+            "storage-migration-error",
+            json!({ "message": message.clone(), "recoverable": true, "cancelled": cancelled }),
+        );
+
+        Err(message)
+    }
+
+    pub fn shutdown(&self) -> Result<(), String> {
+        // take and drop connection
+        let mut db_guard = self.db.lock().map_err(|e| format!("lock error: {}", e))?;
+        if db_guard.is_some() {
+            *db_guard = None;
+        }
+        let mut init = self.initialized.lock().map_err(|e| format!("lock error: {}", e))?;
+        *init = false;
+        Ok(())
+    }
+
+    /// 更新 data 目录。可选执行完整迁移（copy + remove），并过 app_handle 发出进度事件    /// 返回 JSON 对象 { target: String, migrated: bool }
+    pub fn migrate_data_dir_blocking(
+        &self,
+        app_handle: AppHandle,
+        target: String,
+        migrate_data_files: bool,
+    ) -> Result<serde_json::Value, String> {
+        if self.migration_in_progress.swap(true, Ordering::SeqCst) {
+            return Err("A storage migration is already in progress".to_string());
+        }
+        self.migration_cancel_requested.store(false, Ordering::SeqCst);
+        let _migration_guard =
+            MigrationRunGuard::new(&self.migration_in_progress, &self.migration_cancel_requested);
+
+        let src = self.data_dir.lock().unwrap().clone();
+        let dst = PathBuf::from(&target);
+        let mut copied_files: Vec<PathBuf> = Vec::new();
+        let mut created_dirs: Vec<PathBuf> = Vec::new();
+        let mut source_removed = false;
+
+        if let Err(e) = self.shutdown() {
+            let _ = app_handle.emit(
+                "storage-migration-error",
+                json!({ "message": format!("Failed to shutdown storage: {}", e), "recoverable": false }),
+            );
+            return Err(format!("Failed to shutdown storage: {}", e));
+        }
+
+        if self.is_migration_cancel_requested() {
+            return self.restore_source_and_reinitialize(
+                &app_handle,
+                &src,
+                "Migration cancelled by user".to_string(),
+                true,
+            );
+        }
+
+        if let Some(parent) = dst.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                let msg = format!("Failed to create target parent dirs: {}", e);
+                let _ = app_handle.emit(
+                    "storage-migration-error",
+                    json!({ "message": msg.clone(), "recoverable": false }),
+                );
+                return self.restore_source_and_reinitialize(&app_handle, &src, msg, false);
+            }
+        }
+
+        let should_migrate_files = migrate_data_files && src != dst;
+
+        if should_migrate_files {
+            let mut total_files: usize = 0;
+            for entry in WalkDir::new(&src).into_iter().filter_map(|e| e.ok()) {
+                if entry.file_type().is_file() {
+                    total_files += 1;
+                }
+            }
+
+            if total_files == 0 {
+                let existed = dst.exists();
+                if let Err(e) = std::fs::create_dir_all(&dst) {
+                    let msg = format!("Failed to create target dir: {}", e);
+                    let _ = app_handle.emit(
+                        "storage-migration-error",
+                        json!({ "message": msg.clone(), "recoverable": false }),
+                    );
+                    return self.restore_source_and_reinitialize(&app_handle, &src, msg, false);
+                }
+                if !existed {
+                    created_dirs.push(dst.clone());
+                }
+            }
+
+            let mut copied: usize = 0;
+
+            for entry in WalkDir::new(&src).into_iter().filter_map(|e| e.ok()) {
+                if self.is_migration_cancel_requested() {
+                    Self::rollback_partial_migration(&copied_files, &mut created_dirs);
+                    return self.restore_source_and_reinitialize(
+                        &app_handle,
+                        &src,
+                        "Migration cancelled by user".to_string(),
+                        true,
+                    );
+                }
+
+                let rel_path = match entry.path().strip_prefix(&src) {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) => continue,
+                };
+                let target_path = dst.join(&rel_path);
+
+                if entry.file_type().is_dir() {
+                    let existed = target_path.exists();
+                    if let Err(e) = std::fs::create_dir_all(&target_path) {
+                        let msg = format!("Failed to create dir {}: {}", target_path.display(), e);
+                        Self::rollback_partial_migration(&copied_files, &mut created_dirs);
+                        let _ = app_handle.emit(
+                            "storage-migration-error",
+                            json!({ "message": msg.clone(), "recoverable": false }),
+                        );
+                        return self.restore_source_and_reinitialize(&app_handle, &src, msg, false);
+                    }
+                    if !existed {
+                        created_dirs.push(target_path.clone());
+                    }
+                    continue;
+                }
+
+                if let Some(parent) = target_path.parent() {
+                    let existed = parent.exists();
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        let msg = format!(
+                            "Failed to create parent for file {}: {}",
+                            target_path.display(),
+                            e
+                        );
+                        Self::rollback_partial_migration(&copied_files, &mut created_dirs);
+                        let _ = app_handle.emit(
+                            "storage-migration-error",
+                            json!({ "message": msg.clone(), "recoverable": false }),
+                        );
+                        return self.restore_source_and_reinitialize(&app_handle, &src, msg, false);
+                    }
+                    if !existed {
+                        created_dirs.push(parent.to_path_buf());
+                    }
+                }
+
+                match std::fs::copy(entry.path(), &target_path) {
+                    Ok(_) => {
+                        copied += 1;
+                        copied_files.push(target_path.clone());
+                        let _ = app_handle.emit(
+                            "storage-migration-progress",
+                            json!({
+                                "total_files": total_files,
+                                "copied_files": copied,
+                                "current_file": entry.path().to_string_lossy()
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to copy {}: {}", entry.path().display(), e);
+                        Self::rollback_partial_migration(&copied_files, &mut created_dirs);
+                        let _ = app_handle.emit(
+                            "storage-migration-error",
+                            json!({ "message": msg.clone(), "recoverable": false }),
+                        );
+                        return self.restore_source_and_reinitialize(&app_handle, &src, msg, false);
+                    }
+                }
+            }
+
+            if self.is_migration_cancel_requested() {
+                Self::rollback_partial_migration(&copied_files, &mut created_dirs);
+                return self.restore_source_and_reinitialize(
+                    &app_handle,
+                    &src,
+                    "Migration cancelled by user".to_string(),
+                    true,
+                );
+            }
+
+            if let Err(e) = std::fs::remove_dir_all(&src) {
+                let msg = format!("Failed to remove source dir {}: {}", src.display(), e);
+                let _ = app_handle.emit(
+                    "storage-migration-error",
+                    json!({ "message": msg.clone(), "recoverable": false }),
+                );
+                return Err(msg);
+            }
+            source_removed = true;
+        } else {
+            let existed = dst.exists();
+            if let Err(e) = std::fs::create_dir_all(&dst) {
+                let msg = format!("Failed to create target dir: {}", e);
+                let _ = app_handle.emit(
+                    "storage-migration-error",
+                    json!({ "message": msg.clone(), "recoverable": false }),
+                );
+                return self.restore_source_and_reinitialize(&app_handle, &src, msg, false);
+            }
+            if !existed {
+                created_dirs.push(dst.clone());
+            }
+        }
+
+        if self.is_migration_cancel_requested() && !source_removed {
+            Self::rollback_partial_migration(&copied_files, &mut created_dirs);
+            return self.restore_source_and_reinitialize(
+                &app_handle,
+                &src,
+                "Migration cancelled by user".to_string(),
+                true,
+            );
+        }
+
+        let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+        let cfg_path = PathBuf::from(local_appdata).join("CarbonPaper").join("config.json");
+        if let Some(parent) = cfg_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let cfg = json!({ "data_dir": target });
+        if let Err(e) = std::fs::write(
+            &cfg_path,
+            serde_json::to_string_pretty(&cfg).unwrap_or_default(),
+        ) {
+            let msg = format!("Failed to write config file {}: {}", cfg_path.display(), e);
+            let _ = app_handle.emit(
+                "storage-migration-error",
+                json!({ "message": msg.clone(), "recoverable": false }),
+            );
+            return Err(msg);
+        }
+
+        {
+            let mut data_guard = self.data_dir.lock().unwrap();
+            *data_guard = dst.clone();
+            let mut ss_guard = self.screenshot_dir.lock().unwrap();
+            *ss_guard = dst.join("screenshots");
+        }
+
+        if let Err(e) = self.initialize() {
+            let msg = format!("Failed to reinitialize storage after migration: {}", e);
+            let _ = app_handle.emit(
+                "storage-migration-error",
+                json!({ "message": msg.clone(), "recoverable": false }),
+            );
+            return Err(msg);
+        }
+
+        let _ = app_handle.emit(
+            "storage-migration-done",
+            json!({ "target": target, "migrated": should_migrate_files }),
+        );
+
+        Ok(json!({ "target": dst.to_string_lossy(), "migrated": should_migrate_files }))
+    }
+
+    /// 初始化存储（创建目录和数据库
     pub fn initialize(&self) -> Result<(), String> {
         let mut initialized = self.initialized.lock().unwrap();
         if *initialized {
@@ -129,23 +465,26 @@ impl StorageState {
         }
 
         // 创建目录
-        std::fs::create_dir_all(&self.data_dir)
+        let data_dir = self.data_dir.lock().unwrap().clone();
+        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+
+        std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data directory: {}", e))?;
-        std::fs::create_dir_all(&self.screenshot_dir)
+        std::fs::create_dir_all(&screenshot_dir)
             .map_err(|e| format!("Failed to create screenshot directory: {}", e))?;
 
-        // 使用公钥派生弱数据库密钥（无需用户认证）
+        // 使用公钥派生弱数据库密钥（无霢用户认证
         let public_key = get_cached_public_key(&self.credential_state)
             .or_else(|| load_public_key_from_file(&self.credential_state).ok())
             .ok_or_else(|| "Public key not initialized".to_string())?;
         let db_key = derive_db_key_from_public_key(&public_key);
 
-        // 打开 SQLCipher 加密数据库
-        let db_path = self.data_dir.join("screenshots.db");
+        // 打开 SQLCipher 加密数据
+        let db_path = data_dir.join("screenshots.db");
         let conn =
             Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
-        // 设置 SQLCipher 密钥（使用 hex 格式）
+        // 设置 SQLCipher 密钥（使hex 格式
         let key_hex = hex::encode(&db_key);
         conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key_hex))
             .map_err(|e| format!("Failed to set database key: {}", e))?;
@@ -159,8 +498,8 @@ impl StorageState {
 
         *self.db.lock().unwrap() = Some(conn);
 
-        // 初始化盲三元组位图索引表到主数据库（取代原来的测试数据库）
-        // init_tables() 已包含 blind_bitmap_index 的表创建
+        // 初始化盲三元组位图索引表到主数据库（取代原来的测试数据库
+        // init_tables() 已包blind_bitmap_index 的表创建
 
         *initialized = true;
 
@@ -169,16 +508,41 @@ impl StorageState {
         Ok(())
     }
 
-    fn init_blind_triple_index_db(&self, _conn: &Connection) -> Result<(), String> {
-        // 该逻辑已合并进 init_tables()，保留空实现以兼容历史调用（若有）
-        Ok(())
+    /// 将存储策略写入应用目录下storage_policy.json
+    pub fn save_policy(&self, policy: &JsonValue) -> Result<(), String> {
+        // policy file placed at <data_dir_parent>/storage_policy.json
+        let mut cfg_dir = self.data_dir.lock().unwrap().clone();
+        if let Some(parent) = cfg_dir.parent() {
+            cfg_dir = parent.to_path_buf();
+        }
+        let policy_path = cfg_dir.join("storage_policy.json");
+
+        let s = serde_json::to_string_pretty(policy).map_err(|e| format!("serde json error: {}", e))?;
+        std::fs::write(&policy_path, s).map_err(|e| format!("failed to write policy file: {}", e))
     }
 
-    /// 初始化数据库表结构
+    /// 从应用目录读storage_policy.json，如果不存在返回空对
+    pub fn load_policy(&self) -> Result<JsonValue, String> {
+        let mut cfg_dir = self.data_dir.lock().unwrap().clone();
+        if let Some(parent) = cfg_dir.parent() {
+            cfg_dir = parent.to_path_buf();
+        }
+        let policy_path = cfg_dir.join("storage_policy.json");
+
+        if !policy_path.exists() {
+            return Ok(serde_json::json!({}));
+        }
+
+        let content = std::fs::read_to_string(&policy_path).map_err(|e| format!("failed to read policy file: {}", e))?;
+        let v: JsonValue = serde_json::from_str(&content).map_err(|e| format!("failed to parse policy json: {}", e))?;
+        Ok(v)
+    }
+
+    /// 初始化数据库表结
     fn init_tables(&self, conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
             r#"
-            -- 截图记录表
+            -- 截图记录
             CREATE TABLE IF NOT EXISTS screenshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 image_path TEXT NOT NULL,
@@ -196,7 +560,7 @@ impl StorageState {
                 content_key_encrypted BLOB
             );
             
-            -- OCR 结果表
+            -- OCR 结果
             CREATE TABLE IF NOT EXISTS ocr_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 screenshot_id INTEGER NOT NULL,
@@ -213,7 +577,7 @@ impl StorageState {
                 FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
             );
 
-            -- 盲三元组位图索引表（使用 RoaringBitmap 存储 postings）
+            -- 盲三元组位图索引表（使用 RoaringBitmap 存储 postings
             CREATE TABLE IF NOT EXISTS blind_bitmap_index (
                 token_hash TEXT PRIMARY KEY,
                 postings_blob BLOB NOT NULL
@@ -288,16 +652,14 @@ impl StorageState {
         Ok(guard)
     }
 
-    // 已移除测试数据库。历史函数 get_test_connection 被删除。
-
-    /// 计算数据的 MD5 哈希
+    /// 计算数据 MD5 哈希
     fn compute_hash(data: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         let result = Sha256::digest(data);
         hex::encode(result)
     }
 
-    /// HMAC 用于盲索引（安全折中，内置 Key）
+    /// HMAC 用于盲索引
     fn compute_hmac_hash(text: &str) -> String {
         type HmacSha256 = Hmac<sha2::Sha256>;
         const HMAC_KEY: &[u8] = b"CarbonPaper-Search-HMAC-Key-v1";
@@ -326,8 +688,8 @@ impl StorageState {
                 continue;
             }
 
-            // 过滤掉纯标点符号或特殊字符（虽然上面的 trim 处理了一部分，但以防万一）
-            // 检查是否包含至少一个有效字符 (CJK 或 字母数字)
+            // 过滤掉纯标点符号或特殊字符（虽然上面trim 处理了一部分，但以防万一
+            // 棢查是否包含至少一个有效字(CJK 字母数字)
             let has_valid_char = normalized
                 .chars()
                 .any(|c| c.is_ascii_alphanumeric() || Self::is_cjk(c));
@@ -336,7 +698,7 @@ impl StorageState {
                 continue;
             }
 
-            //    过滤掉单字符的英文/数字 (如 "a", "1")，保留单字符的中文 (如 "税") 视需求而定
+            //    过滤掉单字符的英数字 ("a", "1")，保留单字符的中(") 视需求定
             //    这里演示：如果是 ASCII 且长度为 1，则丢弃
             if normalized.len() == 1 && normalized.chars().next().unwrap().is_ascii() {
                 continue;
@@ -349,11 +711,11 @@ impl StorageState {
         unique_tokens.into_iter().collect()
     }
 
-    /// 二元组分词
+    /// 二元组分
     fn bigram_tokenize(text: &str) -> HashSet<String> {
         let chars: Vec<char> = text.chars().collect();
         if chars.len() < 2 {
-            return HashSet::new(); // 忽略过短的文本
+            return HashSet::new(); // 忽略过短的文
         }
 
         chars.windows(2).map(|w| w.iter().collect()).collect()
@@ -411,7 +773,7 @@ impl StorageState {
         Ok(decrypted)
     }
 
-    /// 为 ChromaDB 加密文本（公开 API）
+    /// ChromaDB 加密文本
     pub fn encrypt_for_chromadb(&self, text: &str) -> Result<String, String> {
         if text.is_empty() {
             return Ok(text.to_string());
@@ -426,7 +788,7 @@ impl StorageState {
         Ok(format!("ENC2:{}", payload.to_string()))
     }
 
-    /// 解密来自 ChromaDB 的文本（公开 API）
+    /// 解密来自 ChromaDB 的文本
     pub fn decrypt_from_chromadb(&self, encrypted: &str) -> Result<String, String> {
         if encrypted.is_empty()
             || (!encrypted.starts_with("ENC2:") && !encrypted.starts_with("ENC:"))
@@ -435,7 +797,7 @@ impl StorageState {
         }
 
         if encrypted.starts_with("ENC:") {
-            // 兼容旧格式：直接返回错误提示需要迁移
+            // 如果是奇怪的旧格式，直接返回错误提示
             return Err(
                 "Legacy ENC format is no longer supported. Please migrate data.".to_string(),
             );
@@ -464,14 +826,14 @@ impl StorageState {
         String::from_utf8(decrypted).map_err(|e| format!("Invalid UTF-8 in decrypted data: {}", e))
     }
 
-    /// 获取公钥（兼容旧 IPC/接口）
+    /// 获取公钥（兼容旧 IPC/接口
     pub fn get_public_key(&self) -> Result<Vec<u8>, String> {
         get_cached_public_key(&self.credential_state)
             .or_else(|| load_public_key_from_file(&self.credential_state).ok())
             .ok_or_else(|| "Public key not initialized".to_string())
     }
 
-    /// 检查截图是否已存在
+    /// 棢查截图是否已存在
     pub fn screenshot_exists(&self, image_hash: &str) -> Result<bool, String> {
         let mut guard = self.get_connection()?;
         let conn = guard.as_mut().unwrap();
@@ -487,7 +849,7 @@ impl StorageState {
         Ok(count > 0)
     }
 
-    /// 保存截图（包括 OCR 结果）
+    /// 保存截图和 OCR 结果
     pub fn save_screenshot(
         &self,
         request: &SaveScreenshotRequest,
@@ -514,7 +876,7 @@ impl StorageState {
         )
         .map_err(|e| format!("Failed to decode image data: {}", e))?;
 
-        // 生成截图级 RowKey（用于图片与元数据加密）
+        // 生成截图RowKey（用于图片与元数据加密）
         let mut row_key = vec![0u8; 32];
         rand::thread_rng().fill_bytes(&mut row_key);
 
@@ -527,7 +889,8 @@ impl StorageState {
         // 生成文件名（使用 .enc 扩展名标识加密文件）
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("screenshot_{}.png.enc", timestamp);
-        let image_path = self.screenshot_dir.join(&filename);
+        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let image_path = screenshot_dir.join(&filename);
 
         // 保存加密后的图片文件
         std::fs::write(&image_path, &encrypted_image)
@@ -535,7 +898,7 @@ impl StorageState {
 
         let image_path_str = image_path.to_string_lossy().to_string();
 
-        // 保存到数据库（SQLCipher 整库加密）
+        // 保存到数据库（SQLCipher 整库加密
         let mut guard = self.get_connection()?;
         let conn = guard.as_mut().unwrap();
 
@@ -684,7 +1047,7 @@ impl StorageState {
                         put_stmt.execute(params![&token_hash, &serialized_blob]).map_err(|e| format!("Failed to update blind bitmap index: {}", e))?;
                     }
 
-                    // 释放对 transaction 的借用
+                    // 释放 transaction 资源
                     drop(put_stmt);
                     drop(get_stmt);
 
@@ -728,7 +1091,7 @@ impl StorageState {
         )
         .map_err(|e| format!("Failed to decode image data: {}", e))?;
 
-        // 生成 row key 并加密图片
+        // 生成 row key 并加密图
         let mut row_key = vec![0u8; 32];
         rand::thread_rng().fill_bytes(&mut row_key);
 
@@ -740,7 +1103,8 @@ impl StorageState {
         // 使用 .pending 后缀标记临时文件
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("screenshot_{}.png.enc.pending", timestamp);
-        let image_path = self.screenshot_dir.join(&filename);
+        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let image_path = screenshot_dir.join(&filename);
 
         std::fs::write(&image_path, &encrypted_image)
             .map_err(|e| format!("Failed to save encrypted image file: {}", e))?;
@@ -848,7 +1212,7 @@ impl StorageState {
                 let new_name = fname.trim_end_matches(".pending");
                 let new_path = image_path.with_file_name(new_name);
                 if let Err(e) = std::fs::rename(&image_path, &new_path) {
-                    // 如果重命名失败，记录但继续尝试插入 OCR 结果
+                    // 如果重命名失败，记录但继续尝试插OCR 结果
                     eprintln!("Failed to rename pending image file: {}", e);
                 } else {
                     final_image_path_str = new_path.to_string_lossy().to_string();
@@ -859,7 +1223,7 @@ impl StorageState {
         let mut added = 0;
                     let skipped = 0;
 
-        // 插入 OCR 结果（如果有），并更新盲三元组位图索引
+        // 插入 OCR 结果（如果有），并更新盲三元组位图索
         if let Some(results) = ocr_results {
             for result in results {
                 let text_hash = Self::compute_hmac_hash(&result.text);
@@ -932,7 +1296,7 @@ impl StorageState {
             }
         }
 
-        // 标记为 committed 并设置 committed_at，同时更新 image_path 为重命名后的路径
+        // 标记 committed 并设 committed_at，同时更改 image_path 为重命名后的路径
         conn.execute(
             "UPDATE screenshots SET image_path = ?, status = ?, committed_at = CURRENT_TIMESTAMP WHERE id = ?",
             params![final_image_path_str, "committed", screenshot_id],
@@ -969,12 +1333,11 @@ impl StorageState {
         let image_path_str = rec.unwrap();
         let image_path = std::path::PathBuf::from(&image_path_str);
 
-        // 删除文件（容错）
         if image_path.exists() {
             let _ = std::fs::remove_file(&image_path);
         }
 
-        // 标记为 aborted
+        // 标记 aborted
         conn.execute(
             "UPDATE screenshots SET status = ? WHERE id = ?",
             params!["aborted", screenshot_id],
@@ -999,7 +1362,7 @@ impl StorageState {
         let mut guard = self.get_connection()?;
         let conn = guard.as_mut().unwrap();
 
-        // 转换时间戳（秒）为 UTC 时间的日期时间字符串
+        // 转换时间戳（秒）UTC 时间的日期时间字符串
         // SQLite CURRENT_TIMESTAMP 存储的是 UTC 时间
         let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -1008,8 +1371,8 @@ impl StorageState {
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
 
-        // 使用直接 SQL（参数绑定在 SQLCipher 中可能有问题）
-        // 注意：start_dt 和 end_dt 是我们生成的固定格式字符串，不存在 SQL 注入风险
+        // 使用直接 SQL（参数绑定在 SQLCipher 中可能有问题
+        // start_dt end_dt 是我们生成的固定格式字符串，不存在 SQL 注入风险
         let sql = format!(
             "SELECT id, image_path, image_hash, width, height,
                     window_title, process_name, metadata,
@@ -1104,21 +1467,21 @@ impl StorageState {
         let mut guard = self.get_connection()?;
         let conn = guard.as_mut().unwrap();
 
-        // 使用盲三元组位图索引进行搜索。如果 query 为空则退化为按时间倒序的全文扫描（带时间/进程过滤）
+        // 使用盲三元组位图索引进行搜索。如果 query 为空则化为按时间序的全文扫描（带时间进程过滤）
         let triple_tokens: Vec<String> = if query.is_empty() {
             Vec::new()
         } else {
             Self::bigram_tokenize(query).into_iter().collect()
         };
 
-        // 如果没有三元组 token，则尝试对短查询使用基于词元的位图回退索引；
-        // 若词元也为空则退化为简单的 SQL 查询（按时间排序）
+        // 如果没有三元token，则尝试对短查询使用基于词元的位图索引
+        // 若词元也为空则化为简单的 SQL 查询（按时间排序）
         if triple_tokens.is_empty() {
             if !query.is_empty() {
-                // 使用分词（短查询策略）
+                // 使用分词（短查询策略
                 let tokens = Self::tokenize_text(query);
                 if !tokens.is_empty() {
-                    // 从 blind_bitmap_index 获取 postings 并交集
+                    // blind_bitmap_index 获取 postings 并交
                     let mut bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
                     for token in &tokens {
                         let token_hash = Self::compute_hmac_hash(token);
@@ -1168,7 +1531,7 @@ impl StorageState {
                         return Ok(vec![]);
                     }
 
-                    // 构建 SQL 查询这些 ocr_result ids（复用后续解密/后处理逻辑）
+                    // 构建 SQL 查询这些 ocr_result ids（复用后续解后处理辑
                     let placeholders: Vec<&str> = page_ids.iter().map(|_| "?").collect();
                     let sql = format!(
                         "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
@@ -1519,7 +1882,7 @@ impl StorageState {
                     .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?;
                 bitmaps.push(rb);
             } else {
-                // 某个 token 没有 posting => 无匹配
+                // 某个 token 没有 posting => 无匹
                 return Ok(vec![]);
             }
         }
@@ -1540,7 +1903,7 @@ impl StorageState {
         }
 
         let mut ids: Vec<i64> = intersection.into_iter().map(|v| v as i64).collect();
-        // 按 id 降序（近似时间倒序）
+        // id 降序（近似时间序列）
         ids.sort_unstable_by(|a, b| b.cmp(a));
 
         // 分页
@@ -1807,7 +2170,7 @@ impl StorageState {
         }
     }
 
-    /// 获取截图的 OCR 结果
+    /// 获取截图 OCR 结果
     pub fn get_screenshot_ocr_results(&self, screenshot_id: i64) -> Result<Vec<OcrResult>, String> {
         let guard = self.get_connection()?;
         let conn = guard.as_ref().unwrap();
@@ -1982,7 +2345,7 @@ impl StorageState {
         Ok(results)
     }
 
-    /// 读取加密图片文件并返回 Base64 编码
+    /// 读取加密图片文件并返Base64 编码
     pub fn read_image(&self, path: &str) -> Result<(String, String), String> {
         let guard = self.get_connection()?;
         let conn = guard.as_ref().unwrap();
@@ -2006,7 +2369,7 @@ impl StorageState {
     }
 }
 
-/// 读取图片文件并返回 Base64 编码（支持加密文件）
+/// 读取图片文件并返Base64 编码（支持加密文件）
 #[allow(dead_code)]
 pub fn read_image_as_base64(path: &str) -> Result<(String, String), String> {
     let path = Path::new(path);
@@ -2017,13 +2380,13 @@ pub fn read_image_as_base64(path: &str) -> Result<(String, String), String> {
 
     let data = std::fs::read(path).map_err(|e| format!("Failed to read image file: {}", e))?;
 
-    // 更稳健地检测是否为加密文件：文件名中包含 ".enc" 即视为加密（兼容 .enc.pending）
+    // 更稳健地棢测是否为加密文件：文件名中包".enc" 即视为加密（兼容 .enc.pending
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let is_encrypted = fname.contains(".enc");
 
-    // 获取实际的 MIME 类型：尝试从文件名（去掉 .enc/.pending 后缀）推断
+    // 获取实际MIME 类型：尝试从文件名（去掉 .enc/.pending 后缀）推
     let base_name = if is_encrypted {
-        // 例如：screenshot_xxx.png.enc 或 screenshot_xxx.png.enc.pending
+        // 例如：screenshot_xxx.png.enc screenshot_xxx.png.enc.pending
         if let Some(pos) = fname.find(".enc") {
             &fname[..pos]
         } else {
@@ -2045,7 +2408,7 @@ pub fn read_image_as_base64(path: &str) -> Result<(String, String), String> {
         "image/png"
     };
 
-    // 加密文件需要解密密钥，这里只能返回错误，需要使用带密钥的方法
+    // 加密文件需要解密密钥，这里只能返回错误，需要使用带密钥的方
     if is_encrypted {
         return Err(
             "Encrypted image requires decryption key. Use read_encrypted_image_as_base64 instead."
@@ -2058,7 +2421,7 @@ pub fn read_image_as_base64(path: &str) -> Result<(String, String), String> {
     Ok((base64_data, mime_type.to_string()))
 }
 
-/// 读取加密图片文件并返回 Base64 编码（带解密）
+/// 读取加密图片文件并返 Base64 编码（带解密）
 pub fn read_encrypted_image_as_base64(
     path: &str,
     row_key: &[u8],
@@ -2070,11 +2433,11 @@ pub fn read_encrypted_image_as_base64(
     }
 
     let data = std::fs::read(path).map_err(|e| format!("Failed to read image file: {}", e))?;
-    // 更稳健地检测是否为加密文件：文件名中包含 ".enc" 即视为加密（兼容 .enc.pending）
+    // 更稳健地检测是否为加密文件：文件名中包含".enc" 即视为加密（兼容 .enc.pending）
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let is_encrypted = fname.contains(".enc");
 
-    // 获取实际的 MIME 类型：尝试从文件名（去掉 .enc/.pending 后缀）推断
+    // 获取实际MIME 类型：尝试从文件名（去掉 .enc/.pending 后缀）推断
     let base_name = if is_encrypted {
         if let Some(pos) = fname.find(".enc") {
             &fname[..pos]
@@ -2121,11 +2484,11 @@ pub struct MigrationResult {
 }
 
 impl StorageState {
-    /// 扫描并加密所有明文截图文件
-    /// 这会：
-    /// 1. 扫描 screenshots 目录中的所有非 .enc 文件
+    /// 扫描并加密所有明文截图文
+    /// 这会
+    /// 1. 扫描 screenshots 目录中的扢有非 .enc 文件
     /// 2. 加密每个文件并保存为 .enc 格式
-    /// 3. 更新数据库中的路径
+    /// 3. 更新数据库中的路
     /// 4. 删除原始明文文件
     pub fn migrate_plaintext_screenshots(&self) -> Result<MigrationResult, String> {
         let mut result = MigrationResult {
@@ -2136,7 +2499,8 @@ impl StorageState {
         };
 
         // 扫描 screenshots 目录
-        let entries = std::fs::read_dir(&self.screenshot_dir)
+        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let entries = std::fs::read_dir(&screenshot_dir)
             .map_err(|e| format!("Failed to read screenshot directory: {}", e))?;
 
         let plaintext_files: Vec<_> = entries
@@ -2160,7 +2524,7 @@ impl StorageState {
 
             match self.encrypt_single_file(&path) {
                 Ok((new_path, encrypted_key)) => {
-                    // 更新数据库中的路径
+                    // 更新数据库中的截图路径
                     if let Err(e) =
                         self.update_screenshot_path(&path_str, &new_path, &encrypted_key)
                     {
@@ -2212,7 +2576,8 @@ impl StorageState {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
         let new_file_name = format!("{}.enc", file_name);
-        let new_path = self.screenshot_dir.join(&new_file_name);
+        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let new_path = screenshot_dir.join(&new_file_name);
 
         // 保存加密文件
         std::fs::write(&new_path, &encrypted)
@@ -2242,7 +2607,8 @@ impl StorageState {
 
     /// 列出所有明文（未加密）的截图文件
     pub fn list_plaintext_screenshots(&self) -> Result<Vec<String>, String> {
-        let entries = std::fs::read_dir(&self.screenshot_dir)
+        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let entries = std::fs::read_dir(&screenshot_dir)
             .map_err(|e| format!("Failed to read screenshot directory: {}", e))?;
 
         let files: Vec<String> = entries
@@ -2261,7 +2627,7 @@ impl StorageState {
         Ok(files)
     }
 
-    /// 安全删除所有明文截图文件（不迁移，直接删除）
+    /// 安全删除所有明文截图文件（不迁移，直接删除
     pub fn delete_plaintext_screenshots(&self) -> Result<usize, String> {
         let files = self.list_plaintext_screenshots()?;
         let mut deleted = 0;

@@ -393,11 +393,15 @@ pub async fn start_monitor(
             .arg("--storage-pipe")
             .arg(&reverse_pipe_name)
             .env("PYTHONIOENCODING", "utf-8")
-            .env("PROFILING_ENABLED", "1")
-            //.env("OMP_NUM_THREADS", "1")
-            //.env("MKL_NUM_THREADS", "1")
-            //.env("OPENBLAS_NUM_THREADS", "1")
-            //.env("NUMPY_NUM_THREADS", "1")
+            .env("PROFILING_ENABLED", "1");
+
+        // 将当前 storage.data_dir 传给子进程，确保 Python 在启动时使用正确的 data 目录
+        if let Some(storage_state) = app.try_state::<Arc<StorageState>>() {
+            let dd = storage_state.data_dir.lock().unwrap().to_string_lossy().to_string();
+            cmd_proc.env("CARBONPAPER_DATA_DIR", dd);
+        }
+
+        cmd_proc
             .env(
                 "TRACEMALLOC_SNAPSHOT_DIR",
                 "D:\\carbon_tracemalloc_snapshots",
