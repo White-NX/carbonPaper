@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "debug": "tauri dev",
-    "bump:version": "node scripts/bump-version.mjs"
+    "bump:version": "node scripts/bump-version.mjs",
+    "pack:portable": "node scripts/pack-portable.mjs",
+    "tauri:build": "tauri build && node scripts/pack-portable.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.1",

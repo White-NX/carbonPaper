@@ -1,9 +1,9 @@
-use crate::resource_utils::normalize_path_for_command;
+use crate::resource_utils::{find_existing_file_in_resources, normalize_path_for_command};
 use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
 use crate::storage::StorageState;
 use rand::Rng;
 use std::ops::Deref;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -271,24 +271,35 @@ pub async fn start_monitor(
         .unwrap_or_else(|e| format!("<failed to get cwd: {}>", e));
     let stdout_cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    // 寻找 python 脚本路径，支持多种可能的工作目录
-    let possible_paths = [
-        "monitor/main.py",    // 如果 CWD 是项目根目录
-        "../monitor/main.py", // 如果 CWD 是 src-tauri (开发模式)
-    ];
+    // 寻找 python 脚本路径，按优先级尝试多种方式
+    let script_path = {
+        let mut candidates: Vec<PathBuf> = Vec::new();
 
-    let script_path = possible_paths
-        .iter()
-        .find(|p| Path::new(p).exists())
-        .map(|s| s.to_string());
+        // 1. 基于可执行文件所在目录查找（生产环境 + 开机自启动）
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                candidates.push(exe_dir.join("monitor").join("main.py"));
+            }
+        }
 
-    let script_path = match script_path {
-        Some(p) => p,
-        None => {
-            return Err(format!(
-                "Could not find monitor/main.py. CWD: {}. Tried: {:?}",
-                cwd, possible_paths
-            ));
+        // 2. 基于 Tauri 资源目录查找（生产环境）
+        if let Some(res_path) = find_existing_file_in_resources(&app, "monitor/main.py") {
+            candidates.push(res_path);
+        }
+
+        // 3. 基于 CWD 的相对路径（开发模式）
+        candidates.push(PathBuf::from("monitor/main.py"));       // CWD 是项目根目录
+        candidates.push(PathBuf::from("../monitor/main.py"));    // CWD 是 src-tauri
+
+        match candidates.iter().find(|p| p.exists()) {
+            Some(p) => normalize_path_for_command(p),
+            None => {
+                let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+                return Err(format!(
+                    "Could not find monitor/main.py. CWD: {}. Tried: {:?}",
+                    cwd, tried
+                ));
+            }
         }
     };
 
