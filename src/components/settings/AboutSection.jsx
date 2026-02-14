@@ -47,26 +47,6 @@ export default function AboutSection({ checking, upToDate, onCheckUpdate }) {
                 复写纸（carbonpaper）是一款开源的屏幕文字捕捉与智能检索工具，旨在帮助用户高效地记录和查找屏幕上的文字内容。
                 通过集成本地的OCR技术和语义搜索算法，复写纸能够实时捕捉屏幕文字，并将其转换为可搜索的文本数据。
               </p>
-              <div className="flex items-center gap-2 text-xs text-yellow-600 dark:text-yellow-500 bg-yellow-500/10 p-2 rounded border border-yellow-500/20">
-                    <span>⚠️</span>
-                    <p>该项目目前处于早期开发技术性验证阶段。仅少量分发。如遇到问题，请直接联系作者。</p>
-              </div>
-            </div>
-
-            {/* Privacy */}
-            <div className="p-4 bg-ide-panel/30 border border-ide-border/50 rounded-xl text-sm text-ide-muted space-y-3">
-                <h3 className="font-semibold text-ide-text text-base">隐私与安全</h3>
-                <h4 className="font-medium text-ide-text text-xs uppercase tracking-wider opacity-70">本地处理</h4>
-                <p>
-                  所有处理均在您的设备本地进行。OCR、向量嵌入和数据库存储均为100%离线。您的数据在未经授权的前提下不会离开设备。
-                </p>
-                <div className="w-full h-px bg-ide-border/50 my-2" />
-                <h4 className="font-medium text-ide-text text-xs uppercase tracking-wider opacity-70">遥测数据</h4>
-                 <p>
-                    应用会收集一些基本的诊断遥测数据（日志、性能指标等），均为匿名收集，
-                    <span className="font-semibold text-ide-text mx-1">绝对不包含任何个人身份信息和OCR的内容数据。</span>
-                    您可以在设置中关闭此功能。
-                 </p>
             </div>
             
             {/* Updates, Contributors & Github Link - Stacked or Grid inside column */}
@@ -123,19 +103,6 @@ export default function AboutSection({ checking, upToDate, onCheckUpdate }) {
               </div>
             </a>
           </section>
-
-           <section>
-              <h3 className="text-base font-semibold text-ide-text mb-3">存在的问题</h3>
-              <div className="p-4 bg-ide-panel/30 border border-ide-border/50 rounded-xl text-sm text-ide-muted">
-                 <ul className="list-disc list-inside space-y-1 pl-1 marker:text-ide-muted/50 text-xs">
-                    <li>OCR识别准确率有待提升（低分辨率方案）。</li>
-                    <li>启动python子服务效率不高。</li>
-                    <li>自然语言搜索结果可能不准确。</li>
-                    <li>焦点在不可截取窗口时，时间轴显示可能滞后。</li>
-                    <li>暂不支持删除单条历史记录。</li>
-                 </ul>
-              </div>
-            </section>
         </div>
       </div>
     </div>

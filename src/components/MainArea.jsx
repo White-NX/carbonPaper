@@ -22,12 +22,17 @@ function OcrContentPanel({ selectedDetails, onClose, onCopyText }) {
         </button>
       </div>
       <div className="flex-1 overflow-hidden">
-        <textarea
-          className="w-full h-full bg-ide-bg p-3 text-xs font-mono text-ide-text resize-none focus:outline-none leading-relaxed"
-          readOnly
-          value={ocrText}
-          placeholder={selectedDetails ? "No text detected" : "Select an image to view OCR content"}
-        />
+        {/* 当 record.status 为 pending 时显示斜体文案 */}
+        {selectedDetails?.record?.status === 'pending' ? (
+          <div className="w-full h-full flex items-center justify-center text-sm italic text-ide-muted p-3">OCR Processing…</div>
+        ) : (
+          <textarea
+            className="w-full h-full bg-ide-bg p-3 text-xs font-mono text-ide-text resize-none focus:outline-none leading-relaxed"
+            readOnly
+            value={ocrText}
+            placeholder={selectedDetails ? "No text detected" : "Select an image to view OCR content"}
+          />
+        )}
       </div>
       {selectedDetails?.ocr_results?.length > 0 && (
         <div className="p-2 border-t border-ide-border bg-ide-panel shrink-0 flex justify-end">

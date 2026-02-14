@@ -3,6 +3,7 @@ mod analysis;
 mod credential_manager;
 mod monitor;
 mod python;
+mod registry_config;
 mod resource_utils;
 mod model_management;
 mod reverse_ipc;
@@ -332,6 +333,26 @@ async fn storage_get_public_key(
     Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key))
 }
 
+// ==================== 存储策略（policy）命令 ====================
+
+#[tauri::command]
+async fn storage_set_policy(
+    state: tauri::State<'_, Arc<StorageState>>,
+    policy: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    state
+        .save_policy(&policy)
+        .map_err(|e| format!("Failed to save policy: {}", e))?;
+    Ok(policy)
+}
+
+#[tauri::command]
+async fn storage_get_policy(
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<serde_json::Value, String> {
+    state.load_policy().map_err(|e| format!("Failed to load policy: {}", e))
+}
+
 #[tauri::command]
 async fn storage_encrypt_for_chromadb(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -375,6 +396,42 @@ async fn storage_migrate_plaintext(
     state.migrate_plaintext_screenshots()
 }
 
+/// 新：整体迁移 data 目录（copy + remove 实现将在 storage.rs 中完成）
+#[tauri::command]
+async fn storage_migrate_data_dir(
+    state: tauri::State<'_, Arc<StorageState>>,
+    app_handle: tauri::AppHandle,
+    target: String,
+    migrate_data_files: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    // 调用 storage impl 的阻塞迁移方法，使用 spawn_blocking 避免阻塞 async runtime
+    let state_clone = state.inner().clone();
+    let app = app_handle.clone();
+    let t = target.clone();
+    let should_migrate = migrate_data_files.unwrap_or(true);
+    let join_handle = tauri::async_runtime::spawn_blocking(move || {
+        state_clone.migrate_data_dir_blocking(app, t, should_migrate)
+    });
+
+    match join_handle.await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(format!("Migration task join failed: {:?}", e)),
+    }
+}
+
+/// 取消正在进行的迁移
+#[tauri::command]
+async fn storage_migration_cancel(
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<serde_json::Value, String> {
+    let in_progress = state.request_migration_cancel();
+    Ok(serde_json::json!({
+        "status": if in_progress { "cancel_requested" } else { "idle" },
+        "in_progress": in_progress
+    }))
+}
+
 /// 删除所有明文截图文件（不迁移，直接删除）
 /// 需要认证
 #[tauri::command]
@@ -392,6 +449,45 @@ async fn storage_delete_plaintext(
     }))
 }
 
+// ==================== 高级配置命令 ====================
+
+#[tauri::command]
+fn get_advanced_config() -> Result<serde_json::Value, String> {
+    let cpu_limit_enabled = registry_config::get_bool("cpu_limit_enabled").unwrap_or(true);
+    let cpu_limit_percent = registry_config::get_u32("cpu_limit_percent").unwrap_or(10);
+    let capture_on_ocr_busy = registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
+    let ocr_queue_limit_enabled = registry_config::get_bool("ocr_queue_limit_enabled").unwrap_or(true);
+    let ocr_queue_max_size = registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
+
+    Ok(serde_json::json!({
+        "cpu_limit_enabled": cpu_limit_enabled,
+        "cpu_limit_percent": cpu_limit_percent,
+        "capture_on_ocr_busy": capture_on_ocr_busy,
+        "ocr_queue_limit_enabled": ocr_queue_limit_enabled,
+        "ocr_queue_max_size": ocr_queue_max_size,
+    }))
+}
+
+#[tauri::command]
+fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
+    if let Some(v) = config.get("cpu_limit_enabled").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("cpu_limit_enabled", v)?;
+    }
+    if let Some(v) = config.get("cpu_limit_percent").and_then(|v| v.as_u64()) {
+        registry_config::set_u32("cpu_limit_percent", v as u32)?;
+    }
+    if let Some(v) = config.get("capture_on_ocr_busy").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("capture_on_ocr_busy", v)?;
+    }
+    if let Some(v) = config.get("ocr_queue_limit_enabled").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("ocr_queue_limit_enabled", v)?;
+    }
+    if let Some(v) = config.get("ocr_queue_max_size").and_then(|v| v.as_u64()) {
+        registry_config::set_u32("ocr_queue_max_size", v as u32)?;
+    }
+    Ok(())
+}
+
 // ==================== 凭证管理相关命令 ====================
 
 #[tauri::command]
@@ -401,26 +497,29 @@ async fn credential_initialize(
 ) -> Result<String, String> {
     #[cfg(windows)]
     {
-        // 创建或获取凭证
-        let public_key = credential_manager::create_or_get_credential(&credential_state)
-            .await
-            .map_err(|e| format!("Failed to initialize credentials: {}", e))?;
+        // 尝试从文件加载公钥（已有安装，不触发任何弹窗）
+        // load_public_key_from_file 内部会自动缓存公钥
+        match credential_manager::load_public_key_from_file(&credential_state) {
+            Ok(_) => {}
+            Err(_) => {
+                // 公钥文件不存在 → 首次安装，需要通过 KeyCredentialManager 创建
+                let pk = credential_manager::create_or_get_credential(&credential_state)
+                    .await
+                    .map_err(|e| format!("Failed to initialize credentials: {}", e))?;
 
-        // 通过 Windows Hello 解锁/创建主密钥
-        credential_manager::ensure_master_key_ready(&credential_state)
-            .await
-            .map_err(|e| format!("Failed to unlock master key: {}", e))?;
+                credential_manager::save_public_key_to_file(&credential_state, &pk)
+                    .map_err(|e| format!("Failed to save public key: {}", e))?;
+            }
+        };
 
-        // 认证成功，更新会话时间
-        credential_state.update_auth_time();
-        
-        // 保存公钥到文件
-        credential_manager::save_public_key_to_file(&credential_state, &public_key)
-            .map_err(|e| format!("Failed to save public key: {}", e))?;
-        
+        // 仅在首次使用时生成主密钥（不触发任何弹窗）
+        // 已有主密钥文件时跳过，解锁由 credential_verify_user 负责
+        credential_manager::ensure_master_key_created(&credential_state)
+            .map_err(|e| format!("Failed to create master key: {}", e))?;
+
         // 初始化存储
         storage_state.initialize()?;
-        
+
         Ok("Credentials initialized successfully".to_string())
     }
     
@@ -436,9 +535,9 @@ async fn credential_verify_user(
 ) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        // 通过 Windows Hello 解锁主密钥
-        credential_manager::ensure_master_key_ready(&state)
-            .await
+        // 始终强制执行 CNG 私钥解密操作，触发"Windows 安全中心"对话框
+        // 不使用缓存，确保每次解锁都需要用户输入凭据
+        credential_manager::force_verify_and_unlock_master_key(&state)
             .map_err(|e| format!("Verification failed: {}", e))?;
 
         // 认证成功，更新会话时间
@@ -446,7 +545,7 @@ async fn credential_verify_user(
 
         Ok(true)
     }
-    
+
     #[cfg(not(windows))]
     {
         Err("Windows Hello is only available on Windows".to_string())
@@ -480,12 +579,56 @@ async fn credential_set_foreground(
     Ok(())
 }
 
+/// 设置会话超时时间（秒），并尝试持久化到注册表
+#[tauri::command]
+async fn credential_set_session_timeout(
+    state: tauri::State<'_, Arc<CredentialManagerState>>,
+    timeout: i64,
+) -> Result<(), String> {
+    state.set_session_timeout(timeout);
+    // 尝试写入注册表作为持久化机制
+    if let Err(e) = crate::registry_config::set_string("session_timeout_secs", &timeout.to_string()) {
+        eprintln!("[lib] Failed to persist session_timeout_secs: {}", e);
+        // 不要因为持久化失败而使设置失败——仍将会话超时应用于内存状态
+    }
+    Ok(())
+}
+
+/// 获取当前会话超时时间（秒）
+#[tauri::command]
+async fn credential_get_session_timeout(
+    state: tauri::State<'_, Arc<CredentialManagerState>>,
+) -> Result<i64, String> {
+    Ok(state.get_session_timeout())
+}
+
 fn get_data_dir() -> std::path::PathBuf {
+    // 优先从注册表读取 data_dir（HKCU\Software\CarbonPaper）
+    if let Some(dir) = registry_config::get_string("data_dir") {
+        return std::path::PathBuf::from(dir);
+    }
+
+    // 兼容旧版：尝试从 config.json 迁移到注册表
     let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
         dirs::data_local_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| ".".to_string())
     });
+
+    let cfg_path = std::path::PathBuf::from(&local_appdata).join("CarbonPaper").join("config.json");
+    if cfg_path.exists() {
+        if let Ok(s) = std::fs::read_to_string(&cfg_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(dd) = v.get("data_dir").and_then(|d| d.as_str()) {
+                    // 写入注册表并删除旧配置文件
+                    let _ = registry_config::set_string("data_dir", dd);
+                    let _ = std::fs::remove_file(&cfg_path);
+                    return std::path::PathBuf::from(dd);
+                }
+            }
+        }
+    }
+
     std::path::PathBuf::from(local_appdata).join("CarbonPaper").join("data")
 }
 
@@ -583,7 +726,7 @@ pub fn run() {
             monitor::resume_monitor,
             monitor::get_monitor_status,
             monitor::execute_monitor_command,
-            // 新增存储相关命令
+            // 存储相关命令
             storage_get_timeline,
             storage_search,
             storage_get_image,
@@ -592,12 +735,20 @@ pub fn run() {
             storage_delete_by_time_range,
             storage_list_processes,
             storage_save_screenshot,
+            storage_set_policy,
+            storage_get_policy,
             storage_get_public_key,
             storage_encrypt_for_chromadb,
             storage_decrypt_from_chromadb,
+            analysis::get_analysis_overview,
+            // 高级配置命令
+            get_advanced_config,
+            set_advanced_config,
             // 数据迁移命令
             storage_list_plaintext_files,
             storage_migrate_plaintext,
+            storage_migrate_data_dir,
+            storage_migration_cancel,
             storage_delete_plaintext,
             // 凭证管理相关命令
             credential_initialize,
@@ -605,7 +756,8 @@ pub fn run() {
             credential_check_session,
             credential_lock_session,
             credential_set_foreground,
-            analysis::get_analysis_overview,
+            credential_set_session_timeout,
+            credential_get_session_timeout,
             get_autostart_status,
             set_autostart,
             python::check_python_status,
@@ -632,4 +784,44 @@ pub fn run() {
 
 pub fn run_silent_install() {
     python::run_silent_install();
+}
+
+/// 子进程入口：执行 CNG 解密并将结果输出到 stdout
+/// 协议：
+///   成功: exit 0, stdout = hex(master_key)
+///   失败: exit 1, stderr = 错误信息
+///   用户取消: exit 2, stderr = "UserCancelled"
+pub fn run_cng_unlock(key_file_path: &str) {
+    use std::process::exit;
+
+    let file_data = match std::fs::read(key_file_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read master key file: {}", e);
+            exit(1);
+        }
+    };
+
+    let ciphertext = match credential_manager::decode_master_key_file(&file_data) {
+        Ok(ct) => ct,
+        Err(e) => {
+            eprintln!("Failed to decode master key file: {}", e);
+            exit(1);
+        }
+    };
+
+    match credential_manager::decrypt_master_key_with_cng(&ciphertext) {
+        Ok(master_key) => {
+            print!("{}", hex::encode(&master_key));
+            exit(0);
+        }
+        Err(credential_manager::CredentialError::UserCancelled) => {
+            eprintln!("UserCancelled");
+            exit(2);
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            exit(1);
+        }
+    }
 }

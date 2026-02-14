@@ -68,7 +68,7 @@ body {
   }
 
   .ide-header {
-    @apply h-9 flex items-center px-4 bg-ide-panel border-b border-ide-border text-xs font-bold uppercase tracking-wider text-ide-muted select-none;
+    @apply h-10 flex items-center px-4 bg-ide-panel border-b border-ide-border text-xs font-bold uppercase tracking-wider text-ide-muted select-none;
   }
 
   .ide-input {

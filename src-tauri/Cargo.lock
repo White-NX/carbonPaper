@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "carbonpaper"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -573,6 +573,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.5",
  "reqwest 0.11.27",
+ "roaring",
  "runas",
  "rusqlite",
  "serde",
@@ -4185,6 +4186,16 @@ name = "rle-decode-fast"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
+
+[[package]]
+name = "roaring"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ba9ce64a8f45d7fc86358410bb1a82e8c987504c0d4900e9141d69a9f26c885"
+dependencies = [
+ "bytemuck",
+ "byteorder",
+]
 
 [[package]]
 name = "runas"

@@ -17,6 +17,7 @@ except Exception:
     paddle = None
 
 from paddleocr import PaddleOCR
+from rapidocr_capability import PaddleOCR as RapidPaddleOCR
 
 
 def _get_ppocr_base_dir() -> str:
@@ -153,9 +154,10 @@ class OCREngine:
             try:
                 init_params['ocr_version'] = ocr_version
                 init_params['cpu_threads'] = 1
-                self.ocr = PaddleOCR(**init_params)
+                # self.ocr = PaddleOCR(**init_params)
+                self.ocr = RapidPaddleOCR(**init_params)
             except Exception as e:
-                print(f"使用 {ocr_version} 初始化失败: {e}")
+                print(f"使用 {ocr_version} 初始化 RapidOCR 失败: {e}")
                 # 旧版本兼容逻辑已移除，直接重试不带 ocr_version 参数（如果不是版本原因可能还是会失败）
                 # 但通常如果是参数错误，上面第一次就已经报了。这里保留一个回退尝试（例如 OCR version 不存在）
                 if 'ocr_version' in init_params:
@@ -219,13 +221,13 @@ class OCREngine:
         # 使用推理锁，防止并发导致重复创建或竞态
         with self._inference_lock:
             try:
-                print(f"[OCR Engine] 调用 PaddleOCR.ocr()，图像尺寸: {image_np.shape if hasattr(image_np, 'shape') else 'unknown'}")
+                print(f"[OCR Engine] 调用 PaddleOCR.predict()，图像尺寸: {image_np.shape if hasattr(image_np, 'shape') else 'unknown'}")
                 # PaddleOCR 3.x 不再支持在 ocr() 调用时传入 cls 参数
                 # 角度分类器在初始化时通过 use_angle_cls 控制
-                result = self.ocr.ocr(image_np)
-                print(f"[OCR Engine] PaddleOCR.ocr() 返回: {type(result)}, 长度: {len(result) if result else 'None'}")
+                result = self.ocr.predict(image_np)
+                print(f"[OCR Engine] PaddleOCR.predict() 返回: {type(result)}, 长度: {len(result) if result else 'None'}")
             except Exception as ocr_err:
-                print(f"[OCR Engine] PaddleOCR.ocr() 异常: {ocr_err}")
+                print(f"[OCR Engine] PaddleOCR.predict() 异常: {ocr_err}")
                 import traceback
                 traceback.print_exc()
                 return []
@@ -247,7 +249,7 @@ class OCREngine:
         ocr_results = []
         page_result = result[0]
         
-        # PaddleOCR 3.x 返回字典格式
+        # PaddleOCR 3.x 以及 RapidOCR 兼容层返回字典格式
         if isinstance(page_result, dict):
             rec_texts = page_result.get('rec_texts', [])
             rec_scores = page_result.get('rec_scores', [])
@@ -312,7 +314,7 @@ class OCREngine:
         else:
             print(f"[OCR Engine] 未知的 page_result 格式: {type(page_result)}")
         
-        print(f"[OCR Engine] 解析完成，得到 {len(ocr_results)} 个文本块")
+        print(f"[OCR Engine] 解析完成，得到 {len(ocr_results)} 个文本块，OCR任务用时 {self.ocr.get_last_elapse()[2]:.3f} 秒")
 
         # 尝试清理临时对象与 GPU 缓存（如果使用 GPU）
         try:

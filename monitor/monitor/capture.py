@@ -55,6 +55,17 @@ USER_EXCLUDED_PROCESSES = set()
 USER_EXCLUDED_TITLES = set()
 IGNORE_PROTECTED_WINDOWS = True
 
+# 高级配置：OCR 队列行为
+_capture_on_ocr_busy = False  # True = OCR 队列有任务时仍截图（仅在超过 max 时跳过焦点触发的）
+_ocr_queue_max_size = 1  # 替代 MAX_PENDING，限制 OCR 队列大小
+
+
+def update_advanced_capture_config(capture_on_ocr_busy: bool, ocr_queue_max_size: int):
+    """更新高级截图配置（由 IPC 命令调用，即时生效）"""
+    global _capture_on_ocr_busy, _ocr_queue_max_size
+    _capture_on_ocr_busy = capture_on_ocr_busy
+    _ocr_queue_max_size = max(1, ocr_queue_max_size)
+
 FILTER_SETTINGS_PATH = os.path.join(get_data_dir(), "monitor_filters.json")
 
 
@@ -374,6 +385,35 @@ def capture_focused_window(save_path: str):
         return monitor, "Capture Failed"
 
 
+def capture_focused_window_memory() -> Tuple[Optional[bytes], Optional[Image.Image], dict, str]:
+    """
+    捕获当前焦点窗口并返回 JPEG bytes、PIL Image、monitor dict 与 window_title。
+
+    图片将以 JPEG 格式压缩存储在内存中。
+
+    返回: (image_bytes, image_pil, monitor, window_title)
+    如果捕获失败，返回 (None, None, monitor, "Capture Failed")
+    """
+    img_pil, monitor, window_title, _ = _capture_window_image_data()
+    if img_pil:
+        try:
+            buffer = io.BytesIO()
+            img_pil.save(
+                buffer,
+                format="JPEG",
+                quality=JPEG_QUALITY,
+                optimize=True,
+                progressive=True,
+            )
+            image_bytes = buffer.getvalue()
+            return image_bytes, img_pil, monitor, window_title
+        except Exception:
+            return None, None, monitor, "Capture Failed"
+    else:
+        monitor = {"left": 0, "top": 0, "width": 0, "height": 0}
+        return None, None, monitor, "Capture Failed"
+
+
 # --- Similarity and Filtering Logic ---
 
 
@@ -570,21 +610,52 @@ def capture_loop(interval: int = INTERVAL):
         should_capture = False
         scan_reason = ""
 
-        # 3. 焦点切换触发
+        # 3. 焦点切换或间隔触发时，检查 OCR 队列状态
+        # 动态导入以避免导入循环
+        try:
+            from monitor import _ocr_worker
+        except Exception:
+            _ocr_worker = None
+
+        pending = 0
+        try:
+            if _ocr_worker:
+                pending = _ocr_worker.pending_count()
+        except Exception:
+            pending = 0
+
         if hwnd != last_hwnd:
-            should_capture = True
-            scan_reason = f"focus_change"
+            # 焦点切换触发
+            if not _capture_on_ocr_busy:
+                # 保守模式：队列有任何任务时跳过截图
+                if pending > 0:
+                    should_capture = False
+                else:
+                    should_capture = True
+                    scan_reason = "focus_change"
+            else:
+                # 宽松模式：仅在队列超过最大大小时跳过
+                if pending > _ocr_queue_max_size:
+                    should_capture = False
+                else:
+                    should_capture = True
+                    scan_reason = "focus_change"
 
         # 4. 时间间隔触发
         elif now - last_capture_time >= interval:
-            should_capture = True
-            scan_reason = "interval"
+            if not _capture_on_ocr_busy and pending > 0:
+                should_capture = False
+            elif pending > _ocr_queue_max_size:
+                should_capture = False
+            else:
+                should_capture = True
+                scan_reason = "interval"
 
         if should_capture:
             try:
 
                 if scan_reason == "focus_change":
-                    time.sleep(0.3)  # 等待窗口稳定
+                    time.sleep(0.5)  # 等待窗口稳定
 
                 img_pil, monitor, captured_title, captured_hwnd = (
                     _capture_window_image_data()

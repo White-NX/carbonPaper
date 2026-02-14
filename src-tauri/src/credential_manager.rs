@@ -99,6 +99,19 @@ pub struct CredentialManagerState {
 
 impl CredentialManagerState {
     pub fn new(app_name: &str, data_dir: PathBuf) -> Self {
+        // 默认值
+        let default = DEFAULT_SESSION_TIMEOUT_SECS as i64;
+        let mut initial_timeout = default;
+
+        // 尝试从注册表读取持久化的超时（以秒为单位）
+        if let Some(s) = crate::registry_config::get_string("session_timeout_secs") {
+            if let Ok(parsed) = s.parse::<i64>() {
+                initial_timeout = parsed;
+            } else {
+                eprintln!("[credential_manager] Failed to parse session_timeout_secs from registry: {}", s);
+            }
+        }
+
         Self {
             app_name: app_name.to_string(),
             cached_db_key: Mutex::new(None),
@@ -107,7 +120,7 @@ impl CredentialManagerState {
             data_dir,
             last_auth_time: Mutex::new(None),
             app_in_foreground: Mutex::new(true),
-            session_timeout_secs: Mutex::new(DEFAULT_SESSION_TIMEOUT_SECS as i64),
+            session_timeout_secs: Mutex::new(initial_timeout),
         }
     }
     
@@ -479,6 +492,82 @@ mod windows_impl {
         Ok(())
     }
 
+    /// 强制验证用户身份并解锁主密钥
+    ///
+    /// 策略：
+    /// - 冷启动（master key 未缓存）：主进程内直接 CNG 解密
+    ///   → 一次弹窗，且主进程 CNG PIN 缓存生效，后续 row key 解密无需再弹
+    /// - 锁定后解锁（master key 已缓存）：spawn 子进程执行 CNG 解密
+    ///   → 子进程无 PIN 缓存，强制弹窗；主进程 CNG 缓存仍在，row key 解密无额外弹窗
+    pub fn force_verify_and_unlock_master_key(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
+        let key_file = state.data_dir.join(MASTER_KEY_FILE_NAME);
+        if !key_file.exists() {
+            return Err(CredentialError::KeyNotFound);
+        }
+
+        let already_cached = get_cached_master_key(state).is_some();
+
+        let master_key = if already_cached {
+            // 锁定后解锁：主进程 CNG 已缓存不会弹窗，用子进程强制验证
+            verify_via_subprocess(&key_file)?
+        } else {
+            // 冷启动：主进程内直接解密，让 CNG PIN 缓存留在主进程中
+            let file_data = std::fs::read(&key_file)
+                .map_err(|e| CredentialError::SystemError(format!("Failed to read master key file: {}", e)))?;
+            let ciphertext = decode_master_key_file(&file_data)?;
+            decrypt_master_key_with_cng(&ciphertext)?
+        };
+
+        {
+            let mut cached = state.cached_master_key.lock().unwrap();
+            *cached = Some(master_key.clone());
+        }
+
+        Ok(master_key)
+    }
+
+    /// 通过独立子进程执行 CNG 解密，绕过主进程的 PIN 缓存
+    fn verify_via_subprocess(key_file: &std::path::Path) -> Result<Vec<u8>, CredentialError> {
+        let exe_path = std::env::current_exe()
+            .map_err(|e| CredentialError::SystemError(format!("Failed to get current exe: {}", e)))?;
+
+        let output = std::process::Command::new(&exe_path)
+            .arg("--cng-unlock")
+            .arg(key_file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| CredentialError::SystemError(format!("Failed to spawn CNG unlock process: {}", e)))?
+            .wait_with_output()
+            .map_err(|e| CredentialError::SystemError(format!("Failed to wait for CNG unlock process: {}", e)))?;
+
+        match output.status.code() {
+            Some(0) => {
+                let hex_str = String::from_utf8_lossy(&output.stdout);
+                let master_key = hex::decode(hex_str.trim())
+                    .map_err(|e| CredentialError::CryptoError(format!("Invalid hex from subprocess: {}", e)))?;
+
+                if master_key.len() != MASTER_KEY_LEN {
+                    return Err(CredentialError::CryptoError(format!(
+                        "Unexpected master key length: {} (expected {})",
+                        master_key.len(),
+                        MASTER_KEY_LEN
+                    )));
+                }
+
+                Ok(master_key)
+            }
+            Some(2) => Err(CredentialError::UserCancelled),
+            _ => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(CredentialError::SystemError(format!(
+                    "CNG unlock subprocess failed: {}",
+                    stderr.trim()
+                )))
+            }
+        }
+    }
+
     /// 通过 Windows Hello 解锁并缓存主密钥
     pub async fn unlock_master_key(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
         if let Some(key) = get_cached_master_key(state) {
@@ -513,6 +602,45 @@ pub async fn create_or_get_credential(
     _state: &CredentialManagerState,
 ) -> Result<Vec<u8>, CredentialError> {
     Err(CredentialError::SystemError("Windows Hello is only available on Windows".to_string()))
+}
+
+/// 仅在首次使用时生成主密钥（不触发 Windows Hello）
+/// 如果主密钥已存在（缓存或文件），不做任何操作
+/// 用于 credential_initialize，避免冷启动时触发两次 Windows Hello
+#[cfg(windows)]
+pub fn ensure_master_key_created(state: &CredentialManagerState) -> Result<(), CredentialError> {
+    // 已缓存，无需操作
+    if get_cached_master_key(state).is_some() {
+        return Ok(());
+    }
+
+    let key_file = state.data_dir.join(MASTER_KEY_FILE_NAME);
+    if key_file.exists() {
+        // 主密钥文件已存在，稍后由 credential_verify_user 解锁
+        return Ok(());
+    }
+
+    // 首次使用：生成新主密钥并用 CNG 公钥封装（不弹窗）
+    let mut master_key = vec![0u8; MASTER_KEY_LEN];
+    rand::thread_rng().fill_bytes(&mut master_key);
+
+    let ciphertext = encrypt_master_key_with_cng(&master_key)?;
+    let file_data = encode_master_key_file(&ciphertext);
+
+    if let Some(parent) = key_file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CredentialError::SystemError(format!("Failed to create directory: {}", e)))?;
+    }
+
+    std::fs::write(&key_file, file_data)
+        .map_err(|e| CredentialError::SystemError(format!("Failed to save master key: {}", e)))?;
+
+    {
+        let mut cached = state.cached_master_key.lock().unwrap();
+        *cached = Some(master_key.clone());
+    }
+
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -773,7 +901,7 @@ pub fn encrypt_row_key_with_cng(row_key: &[u8]) -> Result<Vec<u8>, CredentialErr
 }
 
 #[cfg(windows)]
-fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+pub fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
     use windows::Win32::Security::Cryptography::{
         NCryptDecrypt, NCryptFreeObject, NCRYPT_PAD_PKCS1_FLAG, NCRYPT_HANDLE,
     };
@@ -830,7 +958,7 @@ fn encode_master_key_file(ciphertext: &[u8]) -> Vec<u8> {
     data
 }
 
-fn decode_master_key_file(data: &[u8]) -> Result<Vec<u8>, CredentialError> {
+pub fn decode_master_key_file(data: &[u8]) -> Result<Vec<u8>, CredentialError> {
     if data.len() <= MASTER_KEY_FILE_MAGIC.len() {
         return Err(CredentialError::CryptoError("Invalid master key file".to_string()));
     }

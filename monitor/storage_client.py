@@ -345,6 +345,82 @@ class StorageClient:
             'error': response.get('error', 'Unknown error')
         }
 
+    def save_screenshot_temp(
+        self,
+        image_data: bytes,
+        image_hash: str,
+        width: int,
+        height: int,
+        window_title: Optional[str] = None,
+        process_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        将截图临时保存（加密并标记为 pending），返回一个 screenshot_id 用于后续 commit/abort。
+        """
+        import base64
+
+        request = {
+            'command': 'save_screenshot_temp',
+            'image_data': base64.b64encode(image_data).decode('utf-8'),
+            'image_hash': image_hash,
+            'width': width,
+            'height': height,
+            'window_title': window_title,
+            'process_name': process_name,
+            'metadata': metadata
+        }
+
+        response = self._send_request(request)
+
+        if response.get('status') == 'success':
+            return response.get('data', {})
+
+        return {
+            'status': 'error',
+            'error': response.get('error', 'Unknown error')
+        }
+
+    def commit_screenshot(self, screenshot_id: str, ocr_results: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+        """
+        提交之前临时保存的截图并写入 OCR 结果与索引。
+        """
+        request = {
+            'command': 'commit_screenshot',
+            'screenshot_id': screenshot_id,
+            'ocr_results': ocr_results
+        }
+
+        response = self._send_request(request)
+
+        if response.get('status') == 'success':
+            return response.get('data', {})
+
+        return {
+            'status': 'error',
+            'error': response.get('error', 'Unknown error')
+        }
+
+    def abort_screenshot(self, screenshot_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        """
+        中止之前临时保存的截图（删除临时文件并回滚记录）。
+        """
+        request = {
+            'command': 'abort_screenshot',
+            'screenshot_id': screenshot_id,
+            'reason': reason
+        }
+
+        response = self._send_request(request)
+
+        if response.get('status') == 'success':
+            return response.get('data', {})
+
+        return {
+            'status': 'error',
+            'error': response.get('error', 'Unknown error')
+        }
+
 
 # 全局存储客户端实例
 _storage_client: Optional[StorageClient] = None
