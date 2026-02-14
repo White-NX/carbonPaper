@@ -219,26 +219,28 @@ async fn send_ipc_command_internal(
     }
 }
 
-fn create_job_object() -> Result<JobHandle, String> {
+fn create_job_object(cpu_limit_enabled: bool, cpu_limit_percent: u32) -> Result<JobHandle, String> {
     unsafe {
         // 创建 Job Object
         let handle = CreateJobObjectW(None, None)
             .map_err(|e| format!("Failed to create job object: {:?}", e))?;
 
-        // 设置 CPU 限制
-        let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
-        cpu_info.ControlFlags =
-            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-        cpu_info.Anonymous.CpuRate = 1000; // 10%
+        // 设置 CPU 限制（仅在启用时）
+        if cpu_limit_enabled && cpu_limit_percent > 0 {
+            let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+            cpu_info.ControlFlags =
+                JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            cpu_info.Anonymous.CpuRate = cpu_limit_percent * 100; // percent * 100 = per-ten-thousand
 
-        if let Err(e) = SetInformationJobObject(
-            handle,
-            JobObjectCpuRateControlInformation,
-            &cpu_info as *const _ as *const _,
-            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
-        ) {
-            let _ = CloseHandle(handle); // 确保清理资源
-            return Err(format!("Failed to set CPU limit: {:?}", e));
+            if let Err(e) = SetInformationJobObject(
+                handle,
+                JobObjectCpuRateControlInformation,
+                &cpu_info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            ) {
+                let _ = CloseHandle(handle); // 确保清理资源
+                return Err(format!("Failed to set CPU limit: {:?}", e));
+            }
         }
 
         // 设置"父进程退出则子进程自杀"
@@ -378,7 +380,12 @@ pub async fn start_monitor(
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
 
-        let job = create_job_object().map_err(|e| format!("Failed to create Job Object: {}", e))?;
+        let job = {
+            let cpu_limit_enabled = crate::registry_config::get_bool("cpu_limit_enabled").unwrap_or(true);
+            let cpu_limit_percent = crate::registry_config::get_u32("cpu_limit_percent").unwrap_or(10);
+            create_job_object(cpu_limit_enabled, cpu_limit_percent)
+                .map_err(|e| format!("Failed to create Job Object: {}", e))?
+        };
 
         let mut cmd_proc = Command::new(&python_executable);
         // Pipe stdout/stderr so we can stream logs to the frontend

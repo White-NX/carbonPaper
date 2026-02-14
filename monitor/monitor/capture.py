@@ -55,6 +55,17 @@ USER_EXCLUDED_PROCESSES = set()
 USER_EXCLUDED_TITLES = set()
 IGNORE_PROTECTED_WINDOWS = True
 
+# 高级配置：OCR 队列行为
+_capture_on_ocr_busy = False  # True = OCR 队列有任务时仍截图（仅在超过 max 时跳过焦点触发的）
+_ocr_queue_max_size = 1  # 替代 MAX_PENDING，限制 OCR 队列大小
+
+
+def update_advanced_capture_config(capture_on_ocr_busy: bool, ocr_queue_max_size: int):
+    """更新高级截图配置（由 IPC 命令调用，即时生效）"""
+    global _capture_on_ocr_busy, _ocr_queue_max_size
+    _capture_on_ocr_busy = capture_on_ocr_busy
+    _ocr_queue_max_size = max(1, ocr_queue_max_size)
+
 FILTER_SETTINGS_PATH = os.path.join(get_data_dir(), "monitor_filters.json")
 
 
@@ -599,38 +610,46 @@ def capture_loop(interval: int = INTERVAL):
         should_capture = False
         scan_reason = ""
 
-        # 3. 焦点切换触发（仅在 OCR 队列未过载时）
-        if hwnd != last_hwnd:
-            # 动态导入以避免导入循环
-            try:
-                from monitor import _ocr_worker
-            except Exception:
-                _ocr_worker = None
+        # 3. 焦点切换或间隔触发时，检查 OCR 队列状态
+        # 动态导入以避免导入循环
+        try:
+            from monitor import _ocr_worker
+        except Exception:
+            _ocr_worker = None
 
-            # 从共享常量读取最大允许 pending 数量
-            try:
-                from monitor.constants import MAX_PENDING
-            except Exception:
-                MAX_PENDING = 1
-
+        pending = 0
+        try:
+            if _ocr_worker:
+                pending = _ocr_worker.pending_count()
+        except Exception:
             pending = 0
-            try:
-                if _ocr_worker:
-                    pending = _ocr_worker.pending_count()
-            except Exception:
-                pending = 0
 
-            # 当队列中有多于 MAX_PENDING 张图片时，跳过焦点触发的截图
-            if pending > MAX_PENDING:
-                should_capture = False
+        if hwnd != last_hwnd:
+            # 焦点切换触发
+            if not _capture_on_ocr_busy:
+                # 保守模式：队列有任何任务时跳过截图
+                if pending > 0:
+                    should_capture = False
+                else:
+                    should_capture = True
+                    scan_reason = "focus_change"
             else:
-                should_capture = True
-                scan_reason = f"focus_change"
+                # 宽松模式：仅在队列超过最大大小时跳过
+                if pending > _ocr_queue_max_size:
+                    should_capture = False
+                else:
+                    should_capture = True
+                    scan_reason = "focus_change"
 
         # 4. 时间间隔触发
         elif now - last_capture_time >= interval:
-            should_capture = True
-            scan_reason = "interval"
+            if not _capture_on_ocr_busy and pending > 0:
+                should_capture = False
+            elif pending > _ocr_queue_max_size:
+                should_capture = False
+            else:
+                should_capture = True
+                scan_reason = "interval"
 
         if should_capture:
             try:

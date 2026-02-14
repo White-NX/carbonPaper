@@ -451,7 +451,7 @@ export default function StorageManagementSection({
         <StoragePathOption
           className="md:col-span-2"
           label="存储位置"
-          description="选择快照和数据库的存储目录。"
+          description="选择和迁移快照和数据库的存储目录"
           value={currentStoragePath}
           onChangePath={handleChangeStoragePath}
           icon={FolderOpen}

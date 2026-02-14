@@ -36,3 +36,6 @@ venv/
 monitor/chroma_db/
 monitor/screenshots/
 monitor/monitor_pipe_name.txt
+
+# Artificial Intelligence
+CLAUDE.md

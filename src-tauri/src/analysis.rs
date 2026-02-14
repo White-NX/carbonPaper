@@ -1,9 +1,10 @@
 use crate::monitor::MonitorState;
 use crate::resource_utils::file_in_local_appdata;
+use crate::storage::StorageState;
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 use walkdir::WalkDir;
@@ -85,20 +86,18 @@ fn file_size(path: &Path) -> u64 {
     path.metadata().map(|m| m.len()).unwrap_or(0)
 }
 
-fn compute_storage_stats() -> Result<StorageStats, String> {
-    let root = file_in_local_appdata()
-        .ok_or_else(|| "Unable to resolve LOCALAPPDATA/CarbonPaper".to_string())?;
+fn compute_storage_stats(data_dir: PathBuf) -> Result<StorageStats, String> {
+    let root_path = data_dir.to_string_lossy().to_string();
 
-    let root_path = root.to_string_lossy().to_string();
-
-    let data_dir = root.join("data");
-    let models_dir = root.join("models");
+    // models 目录始终位于 %LOCALAPPDATA%/CarbonPaper/models
+    let models_dir = file_in_local_appdata()
+        .map(|p| p.join("models"))
+        .unwrap_or_else(|| data_dir.join("models"));
 
     let screenshots_dir = data_dir.join("screenshots");
     let chroma_dir = data_dir.join("chroma_db");
     let ocr_db = data_dir.join("screenshots.db");
 
-    let total_bytes = if root.exists() { directory_size(&root) } else { 0 };
     let models_bytes = if models_dir.exists() { directory_size(&models_dir) } else { 0 };
     let images_bytes = if screenshots_dir.exists() { directory_size(&screenshots_dir) } else { 0 };
     let database_bytes = {
@@ -106,7 +105,9 @@ fn compute_storage_stats() -> Result<StorageStats, String> {
         let ocr_size = if ocr_db.exists() { file_size(&ocr_db) } else { 0 };
         chroma_size + ocr_size
     };
+    let data_dir_bytes = if data_dir.exists() { directory_size(&data_dir) } else { 0 };
 
+    let total_bytes = data_dir_bytes.saturating_add(models_bytes);
     let accounted = models_bytes.saturating_add(images_bytes).saturating_add(database_bytes);
     let other_bytes = total_bytes.saturating_sub(accounted);
 
@@ -193,6 +194,7 @@ pub fn start_memory_sampler(app: AppHandle) {
 #[tauri::command]
 pub async fn get_analysis_overview(
     state: State<'_, AnalysisState>,
+    storage_state: State<'_, Arc<StorageState>>,
     force_storage: bool,
 ) -> Result<AnalysisOverview, String> {
     let memory = {
@@ -210,8 +212,11 @@ pub async fn get_analysis_overview(
         }
     }
 
+    // 从 StorageState 获取实际的 data_dir
+    let data_dir = storage_state.data_dir.lock().unwrap().clone();
+
     // Perform expensive storage computation on a blocking thread.
-    let stats = tokio::task::spawn_blocking(|| compute_storage_stats())
+    let stats = tokio::task::spawn_blocking(move || compute_storage_stats(data_dir))
         .await
         .map_err(|e| format!("Storage task join error: {}", e))??;
 

@@ -72,10 +72,10 @@ export default function SecuritySection({
           </div>
           <div className="flex-1 min-w-0">
             <h3 className="text-sm font-semibold text-ide-text flex items-center gap-2">
-              数据受到 Windows KSP 保护
+              数据受到 Windows CNG 保护
             </h3>
             <p className="text-xs text-ide-muted mt-1 leading-relaxed">
-              您的快照数据已使用 Windows KSP 管理的凭据加密。只有通过您的授权才能访问数据。
+              您的快照数据已使用 Windows CNG 管理的凭据加密。只有通过您的授权才能访问数据。
             </p>
           </div>
         </div>

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Settings as SettingsIcon, Shield, Info, Activity, Image as ImageIcon, Database, HardDrive } from 'lucide-react';
+import { Settings as SettingsIcon, Shield, Info, Activity, Image as ImageIcon, Database, HardDrive, Wrench } from 'lucide-react';
 import { Dialog } from '../Dialog';
 import { updateMonitorFilters, deleteRecordsByTimeRange } from '../../lib/monitor_api';
 import { getAnalysisOverview } from '../../lib/analysis_api';
@@ -10,6 +10,7 @@ import CaptureFiltersSection from './CaptureFiltersSection';
 import SecuritySection from './SecuritySection';
 import StorageManagementSection from './StorageManagementSection';
 import AboutSection from './AboutSection';
+import AdvancedSection from './AdvancedSection';
 import { defaultFilterSettings, formatInvokeError, normalizeList } from './filterUtils';
 import { REFRESH_INTERVAL_MS } from './analysisUtils';
 
@@ -365,6 +366,7 @@ function SettingsDialog({
   const tabs = [
     { id: 'general', label: '通用', icon: SettingsIcon },
     { id: 'security', label: '安全', icon: Shield },
+    { id: 'advanced', label: '高级', icon: Wrench },
     { id: 'analysis', label: '存储管理', icon: HardDrive },
     { id: 'about', label: '关于', icon: Info },
   ];
@@ -455,6 +457,10 @@ function SettingsDialog({
                 deleteMessage={deleteMessage}
               />
             </div>
+          )}
+
+          {activeTab === 'advanced' && (
+            <AdvancedSection monitorStatus={monitorStatus} />
           )}
 
           {activeTab === 'analysis' && (

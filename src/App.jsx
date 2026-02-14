@@ -299,6 +299,38 @@ function App() {
     return () => clearInterval(interval);
   }, [checkAuthStatus]);
 
+  // 启动时从后端读取持久化的 session timeout；如果后端不存在则尝试将 localStorage 的值迁移到后端
+  useEffect(() => {
+    let mounted = true;
+    const syncSessionTimeout = async () => {
+      try {
+        const res = await invoke('credential_get_session_timeout');
+        const backendTimeout = Number(res);
+        if (!Number.isNaN(backendTimeout) && mounted) {
+          setSessionTimeout(backendTimeout);
+          try {
+            localStorage.setItem('sessionTimeout', String(backendTimeout));
+          } catch {}
+        }
+      } catch (err) {
+        // 后端不可用或命令缺失：尝试从 localStorage 迁移到后端（若有）
+        const saved = localStorage.getItem('sessionTimeout');
+        if (saved) {
+          const v = parseInt(saved, 10);
+          if (!Number.isNaN(v)) {
+            try {
+              await invoke('credential_set_session_timeout', { timeout: v });
+            } catch (e) {
+              console.warn('Failed to migrate session timeout to backend', e);
+            }
+          }
+        }
+      }
+    };
+    syncSessionTimeout();
+    return () => { mounted = false; };
+  }, []);
+
   useEffect(() => {
     const handleAuthRequired = () => {
       setIsAuthenticated(false);

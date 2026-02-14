@@ -7,6 +7,7 @@ from .capture import (
     update_exclusion_settings,
     get_exclusion_settings,
     _get_process_icon_base64,
+    update_advanced_capture_config,
 )
 from .ipc_pipe import start_pipe_server
 import os
@@ -426,6 +427,16 @@ def _handle_command(req: dict):
             }
         except Exception as exc:
             return {'error': str(exc)}
+
+    if cmd == 'update_advanced_config':
+        capture_on_ocr_busy = bool(req.get('capture_on_ocr_busy', False))
+        ocr_queue_max_size = int(req.get('ocr_queue_max_size', 1))
+        update_advanced_capture_config(capture_on_ocr_busy, ocr_queue_max_size)
+        return {
+            'status': 'success',
+            'capture_on_ocr_busy': capture_on_ocr_busy,
+            'ocr_queue_max_size': ocr_queue_max_size,
+        }
 
     return {'error': 'unknown command'}
 

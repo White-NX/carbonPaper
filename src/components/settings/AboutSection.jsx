@@ -47,10 +47,6 @@ export default function AboutSection({ checking, upToDate, onCheckUpdate }) {
                 复写纸（carbonpaper）是一款开源的屏幕文字捕捉与智能检索工具，旨在帮助用户高效地记录和查找屏幕上的文字内容。
                 通过集成本地的OCR技术和语义搜索算法，复写纸能够实时捕捉屏幕文字，并将其转换为可搜索的文本数据。
               </p>
-              <div className="flex items-center gap-2 text-xs text-yellow-600 dark:text-yellow-500 bg-yellow-500/10 p-2 rounded border border-yellow-500/20">
-                    <span>⚠️</span>
-                    <p>该项目目前处于早期开发技术性验证阶段。仅少量分发。如遇到问题，请直接联系作者。</p>
-              </div>
             </div>
             
             {/* Updates, Contributors & Github Link - Stacked or Grid inside column */}

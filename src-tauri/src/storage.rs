@@ -151,6 +151,27 @@ impl StorageState {
         }
     }
 
+    /// Convert an absolute image path to a relative path (relative to data_dir).
+    /// Uses forward slashes for consistency across platforms.
+    fn to_relative_image_path(&self, abs_path: &Path) -> String {
+        let data_dir = self.data_dir.lock().unwrap().clone();
+        match abs_path.strip_prefix(&data_dir) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => abs_path.to_string_lossy().replace('\\', "/"),
+        }
+    }
+
+    /// Resolve a (possibly relative) image path to an absolute PathBuf.
+    /// If the path is already absolute, return it as-is for backward compatibility.
+    fn resolve_image_path(&self, rel_path: &str) -> PathBuf {
+        let p = Path::new(rel_path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.data_dir.lock().unwrap().join(rel_path)
+        }
+    }
+
     /// 安全关闭存储，释放数据库连接和其他句
     pub fn request_migration_cancel(&self) -> bool {
         self.migration_cancel_requested.store(true, Ordering::SeqCst);
@@ -217,6 +238,11 @@ impl StorageState {
     }
 
     /// 更新 data 目录。可选执行完整迁移（copy + remove），并过 app_handle 发出进度事件    /// 返回 JSON 对象 { target: String, migrated: bool }
+    /// 规范化路径用于安全比较（解析符号链接、`.`、`..` 等）
+    fn canonicalize_for_compare(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    }
+
     pub fn migrate_data_dir_blocking(
         &self,
         app_handle: AppHandle,
@@ -231,7 +257,38 @@ impl StorageState {
             MigrationRunGuard::new(&self.migration_in_progress, &self.migration_cancel_requested);
 
         let src = self.data_dir.lock().unwrap().clone();
-        let dst = PathBuf::from(&target);
+        // 用户选择的是存储根目录，实际 data_dir 始终在其下的 data 子目录
+        let dst = PathBuf::from(&target).join("data");
+
+        // ---- 路径安全校验 ----
+        let src_canon = Self::canonicalize_for_compare(&src);
+        // dst 可能还不存在，对其已存在的祖先做规范化后再拼接剩余部分
+        let dst_canon = {
+            let mut existing = dst.clone();
+            let mut tail_parts: Vec<std::ffi::OsString> = Vec::new();
+            while !existing.exists() {
+                if let Some(name) = existing.file_name() {
+                    tail_parts.push(name.to_os_string());
+                    existing = existing.parent().unwrap_or(&existing).to_path_buf();
+                } else {
+                    break;
+                }
+            }
+            let mut canon = Self::canonicalize_for_compare(&existing);
+            for part in tail_parts.into_iter().rev() {
+                canon = canon.join(part);
+            }
+            canon
+        };
+
+        // 禁止 dst 是 src 的子目录（remove_dir_all(src) 会把刚复制的文件一并删除）
+        if dst_canon.starts_with(&src_canon) && dst_canon != src_canon {
+            return Err(format!(
+                "目标路径 ({}) 位于当前数据目录 ({}) 内部，无法迁移",
+                dst.display(), src.display()
+            ));
+        }
+
         let mut copied_files: Vec<PathBuf> = Vec::new();
         let mut created_dirs: Vec<PathBuf> = Vec::new();
         let mut source_removed = false;
@@ -414,18 +471,10 @@ impl StorageState {
             );
         }
 
-        let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-        let cfg_path = PathBuf::from(local_appdata).join("CarbonPaper").join("config.json");
-        if let Some(parent) = cfg_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        let cfg = json!({ "data_dir": target });
-        if let Err(e) = std::fs::write(
-            &cfg_path,
-            serde_json::to_string_pretty(&cfg).unwrap_or_default(),
-        ) {
-            let msg = format!("Failed to write config file {}: {}", cfg_path.display(), e);
+        // 将新的 data_dir 持久化到注册表
+        let dst_str = dst.to_string_lossy().to_string();
+        if let Err(e) = crate::registry_config::set_string("data_dir", &dst_str) {
+            let msg = format!("Failed to persist data_dir to registry: {}", e);
             let _ = app_handle.emit(
                 "storage-migration-error",
                 json!({ "message": msg.clone(), "recoverable": false }),
@@ -451,7 +500,7 @@ impl StorageState {
 
         let _ = app_handle.emit(
             "storage-migration-done",
-            json!({ "target": target, "migrated": should_migrate_files }),
+            json!({ "target": dst.to_string_lossy(), "migrated": should_migrate_files }),
         );
 
         Ok(json!({ "target": dst.to_string_lossy(), "migrated": should_migrate_files }))
@@ -896,7 +945,7 @@ impl StorageState {
         std::fs::write(&image_path, &encrypted_image)
             .map_err(|e| format!("Failed to save encrypted image file: {}", e))?;
 
-        let image_path_str = image_path.to_string_lossy().to_string();
+        let image_path_str = self.to_relative_image_path(&image_path);
 
         // 保存到数据库（SQLCipher 整库加密
         let mut guard = self.get_connection()?;
@@ -1109,7 +1158,7 @@ impl StorageState {
         std::fs::write(&image_path, &encrypted_image)
             .map_err(|e| format!("Failed to save encrypted image file: {}", e))?;
 
-        let image_path_str = image_path.to_string_lossy().to_string();
+        let image_path_str = self.to_relative_image_path(&image_path);
 
         let mut guard = self.get_connection()?;
         let conn = guard.as_mut().unwrap();
@@ -1203,7 +1252,7 @@ impl StorageState {
         }
 
         let (image_path_str, _content_key_enc) = rec.unwrap();
-        let image_path = std::path::PathBuf::from(&image_path_str);
+        let image_path = self.resolve_image_path(&image_path_str);
 
         // 如果文件名以 .pending 结尾则重命名为正式名称，并更新数据库中的 image_path
         let mut final_image_path_str = image_path_str.clone();
@@ -1215,7 +1264,7 @@ impl StorageState {
                     // 如果重命名失败，记录但继续尝试插OCR 结果
                     eprintln!("Failed to rename pending image file: {}", e);
                 } else {
-                    final_image_path_str = new_path.to_string_lossy().to_string();
+                    final_image_path_str = self.to_relative_image_path(&new_path);
                 }
             }
         }
@@ -2240,7 +2289,8 @@ impl StorageState {
         // 尝试删除图片文件
         if deleted > 0 {
             if let Some(path) = image_path {
-                let _ = std::fs::remove_file(&path);
+                let abs_path = self.resolve_image_path(&path);
+                let _ = std::fs::remove_file(&abs_path);
             }
         }
 
@@ -2285,7 +2335,8 @@ impl StorageState {
 
         // 尝试删除图片文件
         for path in paths {
-            let _ = std::fs::remove_file(&path);
+            let abs_path = self.resolve_image_path(&path);
+            let _ = std::fs::remove_file(&abs_path);
         }
 
         Ok(deleted as i32)
@@ -2363,7 +2414,9 @@ impl StorageState {
             .and_then(|enc| decrypt_row_key_with_cng(enc).ok())
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
-        let result = read_encrypted_image_as_base64(path, &row_key);
+        let abs_path = self.resolve_image_path(path);
+        let abs_path_str = abs_path.to_string_lossy().to_string();
+        let result = read_encrypted_image_as_base64(&abs_path_str, &row_key);
         Self::zeroize_bytes(&mut row_key);
         result
     }
@@ -2520,7 +2573,7 @@ impl StorageState {
 
         for entry in plaintext_files {
             let path = entry.path();
-            let path_str = path.to_string_lossy().to_string();
+            let path_str = self.to_relative_image_path(&path);
 
             match self.encrypt_single_file(&path) {
                 Ok((new_path, encrypted_key)) => {
@@ -2583,7 +2636,7 @@ impl StorageState {
         std::fs::write(&new_path, &encrypted)
             .map_err(|e| format!("Failed to write encrypted file: {}", e))?;
 
-        Ok((new_path.to_string_lossy().to_string(), encrypted_key))
+        Ok((self.to_relative_image_path(&new_path), encrypted_key))
     }
 
     /// 更新数据库中的截图路径
