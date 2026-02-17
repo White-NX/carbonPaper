@@ -402,6 +402,10 @@ fn perform_install_python_venv(
 
     let venv_dir = get_venv_dir(app);
 
+    // Track whether the venv was freshly created (not pre-existing/packaged)
+    // so we can roll it back on pip failure for a clean retry.
+    let mut freshly_created_venv = false;
+
     // 检查是否为打包好的虚拟环境
     if venv_dir.exists() && venv_dir.join("Scripts").join("python.exe").exists() {
         writeln!(
@@ -470,10 +474,17 @@ fn perform_install_python_venv(
             "venv".to_string(),
             normalize_path_for_command(&venv_dir),
         ];
-        let status = run_elevated_hidden_cmd(python_cmd, &venv_args).map_err(|e| {
+
+        let mut venv_cmd = Command::new(python_cmd);
+        venv_cmd.args(&venv_args);
+        #[cfg(windows)]
+        {
+            venv_cmd.creation_flags(0x08000000);
+        }
+        let status = venv_cmd.status().map_err(|e| {
             writeln!(
                 log_file.lock().unwrap(),
-                "Failed to spawn elevated process: {}",
+                "Failed to spawn venv process: {}",
                 e
             )
             .ok();
@@ -485,10 +496,10 @@ fn perform_install_python_venv(
 
         writeln!(
             log_file.lock().unwrap(),
-            "Elevated venv command exit status: {:?}",
+            "Venv command exit status: {:?}",
             status
         )?;
-        let _ = app.emit("install-log", json!({"source":"installer","line": format!("Elevated venv command exit status: {:?}", status)}));
+        let _ = app.emit("install-log", json!({"source":"installer","line": format!("Venv command exit status: {:?}", status)}));
 
         if !status.success() {
             let exit_code = status
@@ -521,6 +532,7 @@ fn perform_install_python_venv(
             "perform_install_python_venv: virtualenv created at {:?}, python={}",
             venv_dir, python_cmd
         );
+        freshly_created_venv = true;
         if let Ok(mut f) = log_file.lock() {
             let _ = f.flush();
         }
@@ -705,6 +717,22 @@ fn perform_install_python_venv(
                     "ERROR: pip install failed with exit code {}.",
                     exit_code
                 );
+            }
+        }
+        // Rollback: remove freshly created venv so retries start clean
+        if freshly_created_venv && venv_dir.exists() {
+            if let Ok(arc_file) = log_file.lock() {
+                if let Ok(mut f) = arc_file.as_ref().lock() {
+                    let _ = writeln!(&mut *f, "Rolling back: removing freshly created venv at {:?}", venv_dir);
+                }
+            }
+            let _ = app_for_threads.emit("install-log", json!({"source":"installer","line": format!("Rolling back: removing freshly created venv at {:?}", venv_dir)}));
+            if let Err(e) = fs::remove_dir_all(&venv_dir) {
+                if let Ok(arc_file) = log_file.lock() {
+                    if let Ok(mut f) = arc_file.as_ref().lock() {
+                        let _ = writeln!(&mut *f, "Warning: failed to remove venv during rollback: {}", e);
+                    }
+                }
             }
         }
         return Err(io::Error::new(

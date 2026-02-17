@@ -19,18 +19,6 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-#[cfg(windows)]
-#[allow(unused_imports)]
-use windows::{
-    core::HSTRING,
-    Security::Credentials::{
-        KeyCredentialCreationOption, KeyCredentialManager, KeyCredentialRetrievalResult,
-        KeyCredentialStatus,
-    },
-    Security::Cryptography::Core::CryptographicPublicKeyBlobType,
-    Security::Cryptography::CryptographicBuffer,
-    Storage::Streams::IBuffer,
-};
 
 /// 凭证管理器错误类型
 #[derive(Debug)]
@@ -79,8 +67,6 @@ const CNG_PROVIDER_NAME: &str = "Microsoft Software Key Storage Provider";
 
 /// 凭证管理器状态
 pub struct CredentialManagerState {
-    /// 应用名称（用于 KeyCredentialManager）
-    app_name: String,
     /// 缓存的加密密钥（用于 SQLCipher）
     cached_db_key: Mutex<Option<Vec<u8>>>,
     /// 缓存的公钥（用于加密新数据）
@@ -98,7 +84,7 @@ pub struct CredentialManagerState {
 }
 
 impl CredentialManagerState {
-    pub fn new(app_name: &str, data_dir: PathBuf) -> Self {
+    pub fn new(data_dir: PathBuf) -> Self {
         // 默认值
         let default = DEFAULT_SESSION_TIMEOUT_SECS as i64;
         let mut initial_timeout = default;
@@ -113,7 +99,6 @@ impl CredentialManagerState {
         }
 
         Self {
-            app_name: app_name.to_string(),
             cached_db_key: Mutex::new(None),
             cached_public_key: Mutex::new(None),
             cached_master_key: Mutex::new(None),
@@ -213,11 +198,6 @@ impl CredentialManagerState {
         }
     }
     
-    /// 获取应用名称
-    #[allow(dead_code)]
-    pub fn app_name(&self) -> &str {
-        &self.app_name
-    }
 }
 
 /// 使用主密钥加密数据（AES-GCM）
@@ -306,20 +286,61 @@ pub fn db_key_to_hex(key: &[u8]) -> String {
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
-    
-    /// 检查 Windows Hello 是否可用
-    pub async fn is_windows_hello_available() -> Result<bool, CredentialError> {
-        let result = KeyCredentialManager::IsSupportedAsync()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to check Windows Hello: {}", e)))?
-            .get()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get result: {}", e)))?;
-        
-        Ok(result)
+
+    /// 从 CNG RSA 密钥导出公钥（不触发任何 UI 弹窗）
+    pub fn export_cng_public_key() -> Result<Vec<u8>, CredentialError> {
+        use windows::Win32::Security::Cryptography::{
+            NCryptExportKey, NCryptFreeObject, NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE,
+        };
+        use windows::core::HSTRING;
+
+        let key = open_or_create_cng_key()?;
+
+        let blob_type = HSTRING::from("RSAPUBLICBLOB");
+        let blob_pcwstr = windows::core::PCWSTR::from_raw(blob_type.as_ptr());
+
+        // 第一次调用获取输出大小
+        let mut out_len: u32 = 0;
+        unsafe {
+            NCryptExportKey(
+                key,
+                NCRYPT_KEY_HANDLE::default(),
+                blob_pcwstr,
+                None,
+                None,
+                &mut out_len,
+                NCRYPT_FLAGS(0),
+            )
+        }
+        .map_err(|e| {
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+            CredentialError::SystemError(format!("NCryptExportKey size failed: {}", e))
+        })?;
+
+        let mut output = vec![0u8; out_len as usize];
+        unsafe {
+            NCryptExportKey(
+                key,
+                NCRYPT_KEY_HANDLE::default(),
+                blob_pcwstr,
+                None,
+                Some(output.as_mut_slice()),
+                &mut out_len,
+                NCRYPT_FLAGS(0),
+            )
+        }
+        .map_err(|e| {
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+            CredentialError::SystemError(format!("NCryptExportKey failed: {}", e))
+        })?;
+
+        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+        output.truncate(out_len as usize);
+        Ok(output)
     }
-    
-    /// 创建或获取凭证密钥
-    /// 如果密钥已存在，返回现有密钥；否则创建新密钥
-    pub async fn create_or_get_credential(
+
+    /// 导出或获取缓存的公钥（同步，不触发任何 UI 弹窗）
+    pub fn export_or_get_public_key(
         state: &CredentialManagerState,
     ) -> Result<Vec<u8>, CredentialError> {
         // 首先检查是否有缓存的公钥
@@ -329,167 +350,17 @@ mod windows_impl {
                 return Ok(key.clone());
             }
         }
-        
-        // 检查 Windows Hello 是否可用
-        if !is_windows_hello_available().await? {
-            return Err(CredentialError::WindowsHelloNotAvailable);
-        }
-        
-        let app_name = HSTRING::from(&state.app_name);
-        
-        // 尝试获取现有密钥
-        let result: KeyCredentialRetrievalResult = KeyCredentialManager::OpenAsync(&app_name)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to open credential: {}", e)))?
-            .get()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get credential: {}", e)))?;
-        
-        let status = result.Status()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get status: {}", e)))?;
-        
-        let credential = match status {
-            KeyCredentialStatus::Success => {
-                result.Credential()
-                    .map_err(|e| CredentialError::SystemError(format!("Failed to get credential object: {}", e)))?
-            }
-            KeyCredentialStatus::NotFound => {
-                // 密钥不存在，创建新密钥
-                let create_result = KeyCredentialManager::RequestCreateAsync(
-                    &app_name,
-                    KeyCredentialCreationOption::ReplaceExisting,
-                )
-                .map_err(|e| CredentialError::SystemError(format!("Failed to create credential: {}", e)))?
-                .get()
-                .map_err(|e| CredentialError::SystemError(format!("Failed to get create result: {}", e)))?;
-                
-                let create_status = create_result.Status()
-                    .map_err(|e| CredentialError::SystemError(format!("Failed to get create status: {}", e)))?;
-                
-                match create_status {
-                    KeyCredentialStatus::Success => {
-                        create_result.Credential()
-                            .map_err(|e| CredentialError::SystemError(format!("Failed to get new credential: {}", e)))?
-                    }
-                    KeyCredentialStatus::UserCanceled => {
-                        return Err(CredentialError::UserCancelled);
-                    }
-                    _ => {
-                        return Err(CredentialError::SystemError(format!(
-                            "Failed to create credential: {:?}",
-                            create_status
-                        )));
-                    }
-                }
-            }
-            KeyCredentialStatus::UserCanceled => {
-                return Err(CredentialError::UserCancelled);
-            }
-            _ => {
-                return Err(CredentialError::SystemError(format!(
-                    "Unexpected credential status: {:?}",
-                    status
-                )));
-            }
-        };
-        
-        // 获取公钥
-        let public_key_buffer: IBuffer = credential
-            .RetrievePublicKeyWithBlobType(CryptographicPublicKeyBlobType::X509SubjectPublicKeyInfo)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get public key: {}", e)))?;
-        
-        // 转换为字节数组
-        let length = public_key_buffer.Length()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get buffer length: {}", e)))? as usize;
-        
-        let mut public_key = vec![0u8; length];
-        
-        let data_reader = windows::Storage::Streams::DataReader::FromBuffer(&public_key_buffer)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to create data reader: {}", e)))?;
-        
-        data_reader.ReadBytes(&mut public_key)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to read bytes: {}", e)))?;
-        
+
+        // 从 CNG 导出公钥
+        let public_key = export_cng_public_key()?;
+
         // 缓存公钥
         {
             let mut cached = state.cached_public_key.lock().unwrap();
             *cached = Some(public_key.clone());
         }
-        
+
         Ok(public_key)
-    }
-    
-    /// 请求用户通过 Windows Hello 认证以获取私钥签名
-    /// 这用于验证用户身份
-    #[allow(dead_code)]
-    pub async fn request_user_verification(
-        state: &CredentialManagerState,
-    ) -> Result<bool, CredentialError> {
-        let app_name = HSTRING::from(&state.app_name);
-
-        let result = KeyCredentialManager::OpenAsync(&app_name)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to open credential: {}", e)))?
-            .get()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get credential: {}", e)))?;
-
-        let status = result.Status()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get status: {}", e)))?;
-
-        if status != KeyCredentialStatus::Success {
-            return Err(CredentialError::KeyNotFound);
-        }
-
-        let credential = result.Credential()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get credential: {}", e)))?;
-
-        let challenge_buffer = CryptographicBuffer::CreateFromByteArray(b"CarbonPaper-Auth-Challenge")
-            .map_err(|e| CredentialError::SystemError(format!("Failed to create challenge: {}", e)))?;
-
-        let sign_result = credential.RequestSignAsync(&challenge_buffer)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to request sign: {}", e)))?
-            .get()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get sign result: {}", e)))?;
-
-        let sign_status = sign_result.Status()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get sign status: {}", e)))?;
-
-        match sign_status {
-            KeyCredentialStatus::Success => Ok(true),
-            KeyCredentialStatus::UserCanceled => Err(CredentialError::UserCancelled),
-            _ => Err(CredentialError::SystemError(format!(
-                "Sign failed: {:?}",
-                sign_status
-            ))),
-        }
-    }
-    
-    /// 删除凭证密钥
-    #[allow(dead_code)]
-    pub async fn delete_credential(state: &CredentialManagerState) -> Result<(), CredentialError> {
-        let app_name = HSTRING::from(&state.app_name);
-        
-        KeyCredentialManager::DeleteAsync(&app_name)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to delete credential: {}", e)))?
-            .get()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to complete deletion: {}", e)))?;
-        
-        // 清除缓存
-        {
-            let mut cached = state.cached_public_key.lock().unwrap();
-            *cached = None;
-        }
-        {
-            let mut cached_db = state.cached_db_key.lock().unwrap();
-            *cached_db = None;
-        }
-        {
-            let mut cached_master = state.cached_master_key.lock().unwrap();
-            *cached_master = None;
-        }
-
-        // 删除本地主密钥文件
-        let key_file = state.data_dir.join(MASTER_KEY_FILE_NAME);
-        let _ = std::fs::remove_file(&key_file);
-        
-        Ok(())
     }
 
     /// 强制验证用户身份并解锁主密钥
@@ -598,10 +469,10 @@ mod windows_impl {
 pub use windows_impl::*;
 
 #[cfg(not(windows))]
-pub async fn create_or_get_credential(
+pub fn export_or_get_public_key(
     _state: &CredentialManagerState,
 ) -> Result<Vec<u8>, CredentialError> {
-    Err(CredentialError::SystemError("Windows Hello is only available on Windows".to_string()))
+    Err(CredentialError::SystemError("CNG is only available on Windows".to_string()))
 }
 
 /// 仅在首次使用时生成主密钥（不触发 Windows Hello）

@@ -39,3 +39,9 @@ monitor/monitor_pipe_name.txt
 
 # Artificial Intelligence
 CLAUDE.md
+.claude/
+
+# Secrets & Signing Keys
+~/.tauri/
+*.key
+*.key.pub

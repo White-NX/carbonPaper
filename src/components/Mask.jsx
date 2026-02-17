@@ -1,5 +1,5 @@
 import React from 'react';
-import { WifiOff, Loader2, Play, Route, PackageOpen, Shield, ShieldEllipsis } from 'lucide-react';
+import { WifiOff, Loader2, Play, Route, PackageOpen, Shield, ShieldEllipsis, RotateCcw } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -480,7 +480,25 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
             />
           </div>
           {depsError ? (
-            <div className="mt-3 text-xs text-rose-400">安装失败完蛋了喵</div>
+            <div className="mt-3 flex items-center gap-3">
+              <span className="text-xs text-rose-400">安装失败完蛋了喵</span>
+              <button
+                onClick={() => {
+                  setDepsError(null);
+                  setDepsInstallLog([]);
+                  setDepsInstallSuccess(false);
+                  window.__cp_install_started = false;
+                  installStartedRef.current = false;
+                  // Re-trigger the installation effect by toggling step away and back
+                  setVenvInstallStep(null);
+                  setTimeout(() => setVenvInstallStep(2), 0);
+                }}
+                className="flex items-center gap-1 px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs transition-colors"
+              >
+                <RotateCcw className="w-3 h-3" />
+                重试
+              </button>
+            </div>
           ) : (
             <div className="mt-3 text-xs text-ide-muted">安装正在正常进行中</div>
           )}

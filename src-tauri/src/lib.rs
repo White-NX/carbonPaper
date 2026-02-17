@@ -502,9 +502,8 @@ async fn credential_initialize(
         match credential_manager::load_public_key_from_file(&credential_state) {
             Ok(_) => {}
             Err(_) => {
-                // 公钥文件不存在 → 首次安装，需要通过 KeyCredentialManager 创建
-                let pk = credential_manager::create_or_get_credential(&credential_state)
-                    .await
+                // 公钥文件不存在 → 首次安装，从 CNG 导出公钥
+                let pk = credential_manager::export_or_get_public_key(&credential_state)
                     .map_err(|e| format!("Failed to initialize credentials: {}", e))?;
 
                 credential_manager::save_public_key_to_file(&credential_state, &pk)
@@ -636,13 +635,14 @@ fn get_data_dir() -> std::path::PathBuf {
 pub fn run() {
     // 创建凭证管理器状态
     let data_dir = get_data_dir();
-    let credential_state = Arc::new(CredentialManagerState::new("CarbonPaper", data_dir.clone()));
+    let credential_state = Arc::new(CredentialManagerState::new(data_dir.clone()));
     let storage_state = Arc::new(StorageState::new(data_dir.clone(), credential_state.clone()));
     
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(MonitorState::new())
         .manage(AnalysisState::default())
         .manage(credential_state)
@@ -660,7 +660,6 @@ pub fn run() {
             
             // 初始化凭据管理器（加载公钥或首次创建）
             let credential_state = app.state::<Arc<CredentialManagerState>>();
-            let cred_state_clone = credential_state.inner().clone();
 
             // 公钥用于弱数据库加密与行级封装
             let public_key_ready = match credential_manager::load_public_key_from_file(&credential_state) {
@@ -669,32 +668,18 @@ pub fn run() {
                     true
                 }
                 Err(credential_manager::CredentialError::KeyNotFound) => {
-                    println!("[lib] Public key file missing, creating credential (this may show Windows Hello prompt)...");
+                    println!("[lib] Public key file missing, exporting from CNG...");
 
-                    // 使用 tokio::runtime::Handle 而非 block_on 来避免嵌套运行时问题
-                    let handle = tauri::async_runtime::handle();
-                    let result = std::thread::spawn(move || {
-                        handle.block_on(async {
-                            credential_manager::create_or_get_credential(&cred_state_clone).await
-                        })
-                    })
-                    .join();
-
-                    match result {
-                        Ok(Ok(public_key)) => {
-                            println!("[lib] Credential ready, public key length: {}", public_key.len());
-                            let save_state = credential_state.inner().clone();
-                            if let Err(e) = credential_manager::save_public_key_to_file(&save_state, &public_key) {
+                    match credential_manager::export_or_get_public_key(&credential_state) {
+                        Ok(public_key) => {
+                            println!("[lib] CNG public key exported, length: {}", public_key.len());
+                            if let Err(e) = credential_manager::save_public_key_to_file(&credential_state, &public_key) {
                                 eprintln!("[lib] Failed to save public key: {}", e);
                             }
                             true
                         }
-                        Ok(Err(e)) => {
-                            eprintln!("[lib] Failed to create credential: {:?}", e);
-                            false
-                        }
-                        Err(_) => {
-                            eprintln!("[lib] Credential creation thread panicked");
+                        Err(e) => {
+                            eprintln!("[lib] Failed to export CNG public key: {:?}", e);
                             false
                         }
                     }
