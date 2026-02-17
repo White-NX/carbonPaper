@@ -1,8 +1,94 @@
 import React from 'react';
-import { Github, User, CheckCircle2, RefreshCw } from 'lucide-react';
+import { Github, User, CheckCircle2, Download, AlertCircle, RefreshCw } from 'lucide-react';
 import { APP_VERSION } from '../../lib/version';
 
-export default function AboutSection({ checking, upToDate, onCheckUpdate }) {
+export default function AboutSection({
+  checking,
+  upToDate,
+  onCheckUpdate,
+  updateInfo,
+  updateError,
+  downloading,
+  downloadProgress,
+  onDownloadUpdate,
+}) {
+  const progressPercent =
+    downloading && downloadProgress.contentLength > 0
+      ? Math.round((downloadProgress.downloaded / downloadProgress.contentLength) * 100)
+      : 0;
+
+  const renderUpdateButton = () => {
+    if (downloading) {
+      return (
+        <div className="w-full space-y-1.5">
+          <div className="w-full h-2 bg-ide-bg rounded-full overflow-hidden">
+            <div
+              className="h-full bg-ide-accent rounded-full transition-all duration-300"
+              style={{ width: `${progressPercent}%` }}
+            />
+          </div>
+          <div className="text-[10px] text-ide-muted text-center">
+            {progressPercent}%
+          </div>
+        </div>
+      );
+    }
+
+    if (updateInfo) {
+      return (
+        <div className="w-full space-y-1.5">
+          <div className="text-xs text-ide-accent font-medium text-center">
+            v{updateInfo.version} available
+          </div>
+          <button
+            onClick={onDownloadUpdate}
+            className="w-full py-1.5 rounded text-xs font-medium transition-all flex items-center justify-center gap-2 bg-ide-accent text-white hover:opacity-90"
+          >
+            <Download className="w-3 h-3" /> Download & Install
+          </button>
+        </div>
+      );
+    }
+
+    if (updateError) {
+      return (
+        <div className="w-full space-y-1.5">
+          <div className="flex items-center gap-1 text-[10px] text-red-400 justify-center">
+            <AlertCircle className="w-3 h-3" />
+            <span className="truncate max-w-[180px]">{updateError}</span>
+          </div>
+          <button
+            onClick={onCheckUpdate}
+            className="w-full py-1.5 rounded text-xs font-medium transition-all flex items-center justify-center gap-2 bg-ide-text text-ide-bg hover:opacity-90"
+          >
+            <RefreshCw className="w-3 h-3" /> Retry
+          </button>
+        </div>
+      );
+    }
+
+    if (upToDate) {
+      return (
+        <button
+          disabled
+          className="w-full py-1.5 rounded text-xs font-medium transition-all flex items-center justify-center gap-2 bg-green-500/10 text-green-500 border border-green-500/20 cursor-default"
+        >
+          <CheckCircle2 className="w-3 h-3" /> Latest
+        </button>
+      );
+    }
+
+    return (
+      <button
+        onClick={onCheckUpdate}
+        disabled={checking}
+        className="w-full py-1.5 rounded text-xs font-medium transition-all flex items-center justify-center gap-2 bg-ide-text text-ide-bg hover:opacity-90"
+      >
+        {checking ? 'Checking...' : 'Check Now'}
+      </button>
+    );
+  };
+
   return (
     <div className="w-full h-full overflow-y-auto pr-2 text-ide-text select-none custom-scrollbar">
       <div className="flex flex-col gap-6 max-w-2xl mx-auto pb-8 pt-2">
@@ -48,7 +134,7 @@ export default function AboutSection({ checking, upToDate, onCheckUpdate }) {
                 通过集成本地的OCR技术和语义搜索算法，复写纸能够实时捕捉屏幕文字，并将其转换为可搜索的文本数据。
               </p>
             </div>
-            
+
             {/* Updates, Contributors & Github Link - Stacked or Grid inside column */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                <div className="bg-ide-panel/50 border border-ide-border rounded-xl p-4 backdrop-blur-sm flex flex-col justify-between">
@@ -56,17 +142,7 @@ export default function AboutSection({ checking, upToDate, onCheckUpdate }) {
                     <h3 className="font-semibold text-ide-text text-sm">Updates</h3>
                     <div className="text-[10px] text-ide-muted font-mono">{APP_VERSION}</div>
                  </div>
-                 <button 
-                  onClick={onCheckUpdate}
-                  disabled={checking || upToDate}
-                  className={`w-full py-1.5 rounded text-xs font-medium transition-all flex items-center justify-center gap-2 ${
-                    upToDate
-                      ? 'bg-green-500/10 text-green-500 border border-green-500/20 cursor-default'
-                      : 'bg-ide-text text-ide-bg hover:opacity-90'
-                  }`}
-                >
-                  {checking ? 'Checking...' : upToDate ? <><CheckCircle2 className="w-3 h-3" /> Latest</> : 'Check Now'}
-                </button>
+                 {renderUpdateButton()}
                </div>
 
                <div className="bg-ide-panel/50 border border-ide-border rounded-xl p-4 backdrop-blur-sm flex flex-col justify-between">

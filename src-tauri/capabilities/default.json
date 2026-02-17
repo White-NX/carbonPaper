@@ -20,6 +20,7 @@
     "core:window:allow-show",
     "core:window:allow-start-dragging",
     "core:window:allow-is-maximized",
-    "dialog:default"
+    "dialog:default",
+    "updater:default"
   ]
 }

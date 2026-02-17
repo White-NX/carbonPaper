@@ -19,6 +19,7 @@ import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
 import { getScreenshotDetails, fetchImage, deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
+import { checkForUpdate } from './lib/update_api';
 
 function App() {
   // Disable context menu for Tauri production feel
@@ -484,6 +485,27 @@ function App() {
   useEffect(() => {
     refreshPythonVersion();
   }, [refreshPythonVersion]);
+
+  // Startup update check — delayed 5s, silent on failure
+  useEffect(() => {
+    const timer = setTimeout(async () => {
+      try {
+        const result = await checkForUpdate();
+        if (result.available) {
+          pushNotification({
+            id: `update-${Date.now()}`,
+            type: 'info',
+            title: '发现新版本',
+            message: `新版本 v${result.version} 已发布，前往 设置 > 关于 下载更新`,
+            timestamp: Date.now(),
+          });
+        }
+      } catch {
+        // Network failure — silently ignore
+      }
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [pushNotification]);
 
   // Header handlers
   const handleSearchSelect = (res) => {

@@ -13,6 +13,7 @@ import AboutSection from './AboutSection';
 import AdvancedSection from './AdvancedSection';
 import { defaultFilterSettings, formatInvokeError, normalizeList } from './filterUtils';
 import { REFRESH_INTERVAL_MS } from './analysisUtils';
+import { checkForUpdate, downloadAndInstallUpdate } from '../../lib/update_api';
 
 function SettingsDialog({
   isOpen,
@@ -65,6 +66,10 @@ function SettingsDialog({
   const [analysisError, setAnalysisError] = useState('');
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [upToDate, setUpToDate] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState(null); // { version, body, update }
+  const [updateError, setUpdateError] = useState('');
+  const [downloading, setDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState({ downloaded: 0, contentLength: 0 });
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteMessage, setDeleteMessage] = useState('');
 
@@ -355,12 +360,38 @@ function SettingsDialog({
 
   const totalStorage = storage?.total_bytes || 0;
 
-  const handleCheckUpdate = () => {
+  const handleCheckUpdate = async () => {
     setCheckingUpdate(true);
-    setTimeout(() => {
+    setUpToDate(false);
+    setUpdateInfo(null);
+    setUpdateError('');
+    try {
+      const result = await checkForUpdate();
+      if (result.available) {
+        setUpdateInfo({ version: result.version, body: result.body, update: result.update });
+      } else {
+        setUpToDate(true);
+      }
+    } catch (err) {
+      setUpdateError(err?.message || String(err));
+    } finally {
       setCheckingUpdate(false);
-      setUpToDate(true);
-    }, 1500);
+    }
+  };
+
+  const handleDownloadUpdate = async () => {
+    if (!updateInfo?.update) return;
+    setDownloading(true);
+    setDownloadProgress({ downloaded: 0, contentLength: 0 });
+    try {
+      await downloadAndInstallUpdate(updateInfo.update, (progress) => {
+        setDownloadProgress(progress);
+      });
+    } catch (err) {
+      setUpdateError(err?.message || String(err));
+    } finally {
+      setDownloading(false);
+    }
   };
 
   const tabs = [
@@ -476,7 +507,16 @@ function SettingsDialog({
           )}
 
           {activeTab === 'about' && (
-            <AboutSection checking={checkingUpdate} upToDate={upToDate} onCheckUpdate={handleCheckUpdate} />
+            <AboutSection
+              checking={checkingUpdate}
+              upToDate={upToDate}
+              onCheckUpdate={handleCheckUpdate}
+              updateInfo={updateInfo}
+              updateError={updateError}
+              downloading={downloading}
+              downloadProgress={downloadProgress}
+              onDownloadUpdate={handleDownloadUpdate}
+            />
           )}
         </div>
       </div>
