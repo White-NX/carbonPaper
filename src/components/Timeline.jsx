@@ -264,6 +264,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     const lastMouseXRef = useRef(0);
     const isDraggingRef = useRef(false);
     const [isFollowingNow, setIsFollowingNow] = useState(false);
+    const fetchEpochRef = useRef(0);
 
     // Initial width detection
     useEffect(() => {
@@ -329,13 +330,15 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
 
     const fetchEventsRaw = async (center, currentZoom, containerWidth) => {
         if (!containerWidth) return;
-        
+
+        const epoch = ++fetchEpochRef.current;
         const timeSpan = containerWidth / currentZoom;
-        const startTime = center - (timeSpan / 2) - (timeSpan * 0.5); 
+        const startTime = center - (timeSpan / 2) - (timeSpan * 0.5);
         const endTime = center + (timeSpan / 2) + (timeSpan * 0.5);
-        
+
         try {
             const records = await getTimeline(startTime, endTime);
+            if (fetchEpochRef.current !== epoch) return; // stale response, discard
             console.log('[Timeline] Raw records from API:', records);
             const mapped = (records || [])
                 .filter(r => r.timestamp != null) // Filter out records without timestamp

@@ -6,10 +6,13 @@
 """
 import os
 import gc
+import logging
 import numpy as np
 from typing import Optional, List, Tuple, Dict, Any
 from PIL import Image, ImageDraw, ImageFont
 import threading
+
+logger = logging.getLogger(__name__)
 
 try:
     import paddle
@@ -78,7 +81,7 @@ class OCREngine:
         if getattr(self, '_initialized', False):
             return
 
-        print(f"正在初始化 PaddleOCR (使用 {ocr_version})...")
+        logger.info("正在初始化 PaddleOCR (使用 %s)...", ocr_version)
 
         # 记录是否使用 GPU，以便推理后清理 GPU 缓存
         self._use_gpu = bool(use_gpu)
@@ -101,7 +104,7 @@ class OCREngine:
                     "FLAGS_use_pinned_memory": False,
                 })
             except Exception as e:
-                print(f"Warning: Failed to set paddle device to {device}: {e}")
+                logger.warning("Failed to set paddle device to %s: %s", device, e)
         
         # 如果未指定模型目录，默认使用 PP-OCRv5 mobile，并让 PaddleOCR 自行下载
         if not (det_model_dir and rec_model_dir and cls_model_dir):
@@ -109,7 +112,7 @@ class OCREngine:
             os.makedirs(ppocr_root, exist_ok=True)
             normalized_size = str(model_size).strip().lower()
             if normalized_size not in {"mobile", "server"}:
-                print(f"Warning: 未知的 model_size={model_size}，回退为 mobile")
+                logger.warning("未知的 model_size=%s，回退为 mobile", model_size)
                 normalized_size = "mobile"
 
             # 强制使用 PP-OCRv5 mobile 模型名称，避免默认回落到 server
@@ -134,17 +137,17 @@ class OCREngine:
         if det_model_dir and os.path.exists(det_model_dir):
             init_params['det_model_dir'] = det_model_dir
         elif det_model_dir:
-            print(f"Warning: det_model_dir 不存在，将使用默认下载路径: {det_model_dir}")
+            logger.warning("det_model_dir 不存在，将使用默认下载路径: %s", det_model_dir)
 
         if rec_model_dir and os.path.exists(rec_model_dir):
             init_params['rec_model_dir'] = rec_model_dir
         elif rec_model_dir:
-            print(f"Warning: rec_model_dir 不存在，将使用默认下载路径: {rec_model_dir}")
+            logger.warning("rec_model_dir 不存在，将使用默认下载路径: %s", rec_model_dir)
 
         if cls_model_dir and os.path.exists(cls_model_dir):
             init_params['cls_model_dir'] = cls_model_dir
         elif cls_model_dir:
-            print(f"Warning: cls_model_dir 不存在，将禁用方向分类器: {cls_model_dir}")
+            logger.warning("cls_model_dir 不存在，将禁用方向分类器: %s", cls_model_dir)
             init_params['use_angle_cls'] = False
             
         # 使用锁确保并发下只会初始化一次
@@ -157,7 +160,7 @@ class OCREngine:
                 # self.ocr = PaddleOCR(**init_params)
                 self.ocr = RapidPaddleOCR(**init_params)
             except Exception as e:
-                print(f"使用 {ocr_version} 初始化 RapidOCR 失败: {e}")
+                logger.error("使用 %s 初始化 RapidOCR 失败: %s", ocr_version, e)
                 # 旧版本兼容逻辑已移除，直接重试不带 ocr_version 参数（如果不是版本原因可能还是会失败）
                 # 但通常如果是参数错误，上面第一次就已经报了。这里保留一个回退尝试（例如 OCR version 不存在）
                 if 'ocr_version' in init_params:
@@ -166,11 +169,11 @@ class OCREngine:
                     init_params['cpu_threads'] = 1
                     self.ocr = PaddleOCR(**init_params)
                 except Exception as e2:
-                    print(f"重试初始化失败: {e2}")
+                    logger.error("重试初始化失败: %s", e2)
                     raise e2
 
             self._initialized = True
-            print("PaddleOCR 初始化完成")
+            logger.info("PaddleOCR 初始化完成")
 
     def close(self) -> None:
         """显式释放 PaddleOCR 实例并尝试清理 GPU/内存缓存。
@@ -221,15 +224,13 @@ class OCREngine:
         # 使用推理锁，防止并发导致重复创建或竞态
         with self._inference_lock:
             try:
-                print(f"[OCR Engine] 调用 PaddleOCR.predict()，图像尺寸: {image_np.shape if hasattr(image_np, 'shape') else 'unknown'}")
+                logger.info("[OCR Engine] 调用 PaddleOCR.predict()，图像尺寸: %s", image_np.shape if hasattr(image_np, 'shape') else 'unknown')
                 # PaddleOCR 3.x 不再支持在 ocr() 调用时传入 cls 参数
                 # 角度分类器在初始化时通过 use_angle_cls 控制
                 result = self.ocr.predict(image_np)
-                print(f"[OCR Engine] PaddleOCR.predict() 返回: {type(result)}, 长度: {len(result) if result else 'None'}")
+                logger.info("[OCR Engine] PaddleOCR.predict() 返回: %s, 长度: %s", type(result), len(result) if result else 'None')
             except Exception as ocr_err:
-                print(f"[OCR Engine] PaddleOCR.predict() 异常: {ocr_err}")
-                import traceback
-                traceback.print_exc()
+                logger.exception("[OCR Engine] PaddleOCR.predict() 异常: %s", ocr_err)
                 return []
 
         if not result or result[0] is None:
@@ -260,7 +261,7 @@ class OCREngine:
             # 调试：打印第一个框的格式
             if len(dt_polys) > 0:
                 sample = dt_polys[0]
-                print(f"[OCR Engine] dt_polys 样例格式: type={type(sample)}, shape={getattr(sample, 'shape', None)}, len={len(sample) if hasattr(sample, '__len__') else 'N/A'}")
+                logger.info("[OCR Engine] dt_polys 样例格式: type=%s, shape=%s, len=%s", type(sample), getattr(sample, 'shape', None), len(sample) if hasattr(sample, '__len__') else 'N/A')
             
             for i, text in enumerate(rec_texts):
                 coords = dt_polys[i] if i < len(dt_polys) else []
@@ -285,7 +286,7 @@ class OCREngine:
                         # 已经是正确格式
                         pass
                     else:
-                        print(f"[OCR Engine] 未知的坐标格式: {coords}")
+                        logger.warning("[OCR Engine] 未知的坐标格式: %s", coords)
                         coords = [[0,0], [0,0], [0,0], [0,0]]
                 
                 ocr_results.append({
@@ -309,12 +310,12 @@ class OCREngine:
                             'confidence': confidence
                         })
                 except Exception as parse_err:
-                    print(f"[OCR Engine] 解析 OCR 结果行失败: {parse_err}")
+                    logger.error("[OCR Engine] 解析 OCR 结果行失败: %s", parse_err)
                     continue
         else:
-            print(f"[OCR Engine] 未知的 page_result 格式: {type(page_result)}")
+            logger.warning("[OCR Engine] 未知的 page_result 格式: %s", type(page_result))
         
-        print(f"[OCR Engine] 解析完成，得到 {len(ocr_results)} 个文本块，OCR任务用时 {self.ocr.get_last_elapse()[2]:.3f} 秒")
+        logger.info("[OCR Engine] 解析完成，得到 %d 个文本块，OCR任务用时 %.3f 秒", len(ocr_results), self.ocr.get_last_elapse()[2])
 
         # 尝试清理临时对象与 GPU 缓存（如果使用 GPU）
         try:
@@ -377,10 +378,10 @@ class OCRVisualizer:
                 except:
                     continue
             
-            print("警告: 无法加载字体，使用默认字体")
+            logger.warning("无法加载字体，使用默认字体")
             return ImageFont.load_default()
         except Exception as e:
-            print(f"加载字体失败: {e}")
+            logger.error("加载字体失败: %s", e)
             return ImageFont.load_default()
     
     def draw_results(
@@ -434,7 +435,7 @@ class OCRVisualizer:
         """保存可视化结果到文件"""
         result_image = self.draw_results(image, ocr_results, **kwargs)
         result_image.save(output_path)
-        print(f"可视化结果已保存至 {output_path}")
+        logger.info("可视化结果已保存至 %s", output_path)
 
 
 # 便捷函数

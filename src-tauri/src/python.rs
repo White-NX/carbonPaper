@@ -119,7 +119,7 @@ fn probe_python_executable(python_exe_path: &PathBuf) -> Option<String> {
 }
 
 fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
-    println!("Searching for Python {} in Windows Registry...", REQUIRED_PYTHON_VERSION);
+    tracing::info!("Searching for Python {} in Windows Registry...", REQUIRED_PYTHON_VERSION);
 
     let hives_to_check = [
         RegKey::predef(HKEY_CURRENT_USER),
@@ -134,7 +134,7 @@ fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
 
             for version_key_name in python_core_key.enum_keys().filter_map(Result::ok) {
                 if version_key_name.starts_with("3.12") {
-                    println!("Found a potential 3.12 key: '{}'", version_key_name);
+                    tracing::info!("Found a potential 3.12 key: '{}'", version_key_name);
 
                     if let Ok(version_key) = python_core_key.open_subkey(&version_key_name) {
                         if let Ok(install_path_key) = version_key.open_subkey("InstallPath") {
@@ -142,8 +142,8 @@ fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
                                 let python_exe_path = PathBuf::from(install_dir).join("python.exe");
                                 if python_exe_path.is_file() {
                                     if probe_python_executable(&python_exe_path).is_some() {
-                                        println!(
-                                            "Success! Verified python.exe exists and matches {} at: {:?}",
+                                        tracing::info!(
+                                            "Verified python.exe matches {} at: {:?}",
                                             REQUIRED_PYTHON_VERSION,
                                             python_exe_path
                                         );
@@ -390,12 +390,12 @@ fn perform_install_python_venv(
     app: &AppHandle,
     python_path: Option<&str>,
 ) -> io::Result<()> {
-    println!("The function is running!");
+    tracing::info!("perform_install_python_venv started");
     let _ = app.emit(
         "install-log",
         json!({"source":"installer","line":"perform_install_python_venv started"}),
     );
-    println!(
+    tracing::info!(
         "perform_install_python_venv: start; python_path={:?}",
         python_path
     );
@@ -414,7 +414,7 @@ fn perform_install_python_venv(
             venv_dir
         )?;
         let _ = app.emit("install-log", json!({"source":"installer","line": format!("Found packaged virtual env at: {:?}", venv_dir)}));
-        println!(
+        tracing::info!(
             "perform_install_python_venv: using packaged venv at {:?}",
             venv_dir
         );
@@ -426,7 +426,7 @@ fn perform_install_python_venv(
             python_path
         )?;
         let _ = app.emit("install-log", json!({"source":"installer","line": format!("Creating virtual environment at: {:?} by using {:?}", venv_dir, python_path)}));
-        println!(
+        tracing::info!(
             "perform_install_python_venv: creating venv at {:?} with python {:?}",
             venv_dir, python_path
         );
@@ -453,7 +453,7 @@ fn perform_install_python_venv(
                 venv_dir
             )?;
             let _ = app.emit("install-log", json!({"source":"installer","line": format!("Removed existing venv at {:?}", venv_dir)}));
-            println!(
+            tracing::info!(
                 "perform_install_python_venv: removed existing venv at {:?}",
                 venv_dir
             );
@@ -467,7 +467,7 @@ fn perform_install_python_venv(
             python_cmd
         )?;
         let _ = app.emit("install-log", json!({"source":"installer","line": format!("Using python executable: {}", python_cmd)}));
-        println!("perform_install_python_venv: python_cmd = {}", python_cmd);
+        tracing::info!("perform_install_python_venv: python_cmd = {}", python_cmd);
 
         let venv_args = vec![
             "-m".to_string(),
@@ -528,7 +528,7 @@ fn perform_install_python_venv(
             python_cmd
         )?;
         let _ = app.emit("install-log", json!({"source":"installer","line": format!("Virtual environment created at: {:?} using {}", venv_dir, python_cmd)}));
-        println!(
+        tracing::info!(
             "perform_install_python_venv: virtualenv created at {:?}, python={}",
             venv_dir, python_cmd
         );
@@ -543,7 +543,7 @@ fn perform_install_python_venv(
         writeln!(&mut *f, "Using virtual env at: {:?}", venv_dir)?;
         writeln!(&mut *f, "Installing required packages...")?;
     }
-    println!("perform_install_python_venv: using venv at {:?}", venv_dir);
+    tracing::info!("perform_install_python_venv: using venv at {:?}", venv_dir);
 
     let python_exec = venv_dir.join("Scripts").join("python.exe");
     let pip_exec = venv_dir.join("Scripts").join("pip.exe");
@@ -574,7 +574,7 @@ fn perform_install_python_venv(
         )?;
         writeln!(&mut *f, "Installing required packages (non-elevated)...")?;
     }
-    println!(
+    tracing::info!(
         "perform_install_python_venv: running pip via {} -m pip",
         python_exec_cmd
     );
@@ -601,7 +601,7 @@ fn perform_install_python_venv(
     let mut child = cmd_proc.spawn().map_err(|e| {
         let mut f = log_file.lock().unwrap();
         writeln!(&mut *f, "Failed to spawn pip process: {}", e).ok();
-        println!(
+        tracing::error!(
             "perform_install_python_venv: failed to spawn pip process: {}",
             e
         );

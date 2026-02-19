@@ -14,6 +14,9 @@ import os
 import uuid
 import base64
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 _server = None
 _ocr_worker = None
@@ -81,9 +84,21 @@ def _find_and_extract_icon(process_name: str):
 
 
 def _handle_command(req: dict):
-    """处理命令前验证认证信息"""
+    """处理命令前验证认证信息 (with diagnostic timing)"""
+    import time as _time
+    _t0 = _time.perf_counter()
+    result = _handle_command_impl(req)
+    elapsed = _time.perf_counter() - _t0
+    cmd = (req.get('command') or '?').lower() if isinstance(req, dict) else '?'
+    if elapsed > 5.0:
+        logger.warning('[DIAG:CMD-PY] command=%s took %.3fs', cmd, elapsed)
+    return result
+
+
+def _handle_command_impl(req: dict):
+    """处理命令的实际逻辑"""
     global _last_seq_no
-    
+
     # 提取并验证认证信息
     req_token = req.get('_auth_token')
     req_seq_no = req.get('_seq_no')
@@ -472,7 +487,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
             with open('monitor_pipe_name.txt', 'w', encoding='utf-8') as f:
                 f.write(pipe_name)
         except Exception as e:
-            print('注意到调试模式已经开启，但是无法写入调试管道名文件:', e)
+            logger.warning('注意到调试模式已经开启，但是无法写入调试管道名文件: %s', e)
 
     # 如果父进程传入了继承句柄优先使用它（更安全）
     handle_val = os.environ.get('CARBON_MONITOR_PIPE_HANDLE')
@@ -482,7 +497,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
             from .ipc_pipe import start_inherited_handle_server
             _server = start_inherited_handle_server(handler=_handle_command, handle_value=handle_int)
         except Exception as e:
-            print('无法使用继承句柄启动 IPC 服务器，回退到命名管道:', e)
+            logger.error('无法使用继承句柄启动 IPC 服务器，回退到命名管道: %s', e)
 
     # start IPC server if not started by handle
     if _server is None:
@@ -492,7 +507,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     from screenshot_worker import ScreenshotOCRWorker
 
     # 初始化并启动 OCR 工作进程
-    print("正在启动 OCR 工作进程...")
+    logger.info("正在启动 OCR 工作进程...")
     _ocr_worker = ScreenshotOCRWorker(
         screenshot_dir=os.path.join(get_data_dir(), 'screenshots'),
         db_path=os.path.join(get_data_dir(), 'ocr_data.db'),

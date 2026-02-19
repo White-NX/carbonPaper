@@ -1,2 +1,2 @@
 // Central app version constant for frontend components
-export const APP_VERSION = 'v0.4.2 Alpha T.V.';
+export const APP_VERSION = 'v0.4.4 Alpha T.V.';

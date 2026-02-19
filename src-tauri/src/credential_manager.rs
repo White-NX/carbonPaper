@@ -94,7 +94,7 @@ impl CredentialManagerState {
             if let Ok(parsed) = s.parse::<i64>() {
                 initial_timeout = parsed;
             } else {
-                eprintln!("[credential_manager] Failed to parse session_timeout_secs from registry: {}", s);
+                tracing::error!("Failed to parse session_timeout_secs from registry: {}", s);
             }
         }
 

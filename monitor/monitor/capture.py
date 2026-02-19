@@ -10,7 +10,10 @@ from typing import Optional, Callable, Tuple, Any, Dict
 from mss import mss
 from PIL import Image
 
+import logging
 import ctypes
+
+logger = logging.getLogger(__name__)
 
 try:
     import win32gui
@@ -110,7 +113,7 @@ def _persist_exclusion_settings():
             json.dump(payload, tmp_file, ensure_ascii=True, indent=2)
         os.replace(tmp_path, FILTER_SETTINGS_PATH)
     except Exception as exc:
-        print(f"Failed to persist capture filters: {exc}")
+        logger.error("Failed to persist capture filters: %s", exc)
 
 
 def _load_exclusion_settings():
@@ -129,12 +132,12 @@ def _load_exclusion_settings():
                     _apply_exclusion_settings(data)
                     _persist_exclusion_settings()
             except Exception as exc:
-                print(f"Failed to load bundled capture filters: {exc}")
+                logger.error("Failed to load bundled capture filters: %s", exc)
         return
     except json.JSONDecodeError as exc:
-        print(f"Capture filter settings file is invalid JSON: {exc}")
+        logger.error("Capture filter settings file is invalid JSON: %s", exc)
     except Exception as exc:
-        print(f"Failed to load capture filters: {exc}")
+        logger.error("Failed to load capture filters: %s", exc)
 
 
 def update_exclusion_settings(processes=None, titles=None, ignore_protected=None):
@@ -576,8 +579,8 @@ def _is_redundant(current_hash: int, history: list, threshold: int = 10) -> bool
 
 
 def capture_loop(interval: int = INTERVAL):
-    print(f"智能截图循环已启动，基础间隔 {interval} 秒。")
-    print(f"忽略关键词: {EXCLUSION_KEYWORDS}")
+    logger.info("智能截图循环已启动，基础间隔 %d 秒。", interval)
+    logger.info("忽略关键词: %s", EXCLUSION_KEYWORDS)
 
     last_hwnd = None
     last_capture_time = 0
@@ -681,8 +684,9 @@ def capture_loop(interval: int = INTERVAL):
                         )
                         img_bytes = img_buffer.getvalue()
                         
-                        print(
-                            f"[{ts_str}] 截图捕获 ({scan_reason}): {len(img_bytes)} bytes - {captured_title}"
+                        logger.info(
+                            "[%s] 截图捕获 (%s): %d bytes - %s",
+                            ts_str, scan_reason, len(img_bytes), captured_title
                         )
 
                         # 更新历史
@@ -724,7 +728,7 @@ def capture_loop(interval: int = INTERVAL):
                     last_hwnd = captured_hwnd
 
             except Exception as e:
-                print(f"截图处理异常: {e}")
+                logger.error("截图处理异常: %s", e)
 
         # 快速轮询
         time.sleep(polling_rate)

@@ -7,9 +7,12 @@ import time
 import datetime
 import threading
 import queue
+import logging
 from typing import Optional, Callable, Dict, Any, List
 from pathlib import Path
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 # 导入相关模块
 from ocr_engine import OCREngine, OCRVisualizer, get_ocr_engine
@@ -59,27 +62,27 @@ class ScreenshotOCRWorker:
         self.storage_client: Optional[StorageClient] = None
         if storage_pipe:
             self.storage_client = init_storage_client(storage_pipe)
-            print(f"存储客户端已初始化: {storage_pipe}")
+            logger.info("存储客户端已初始化: %s", storage_pipe)
         
         # 初始化组件
-        print("初始化OCR引擎...")
+        logger.info("初始化OCR引擎...")
         try:
             self.ocr_engine = get_ocr_engine()
-            print("OCR引擎实例已获取")
+            logger.info("OCR引擎实例已获取")
         except Exception as e:
-            print(f"OCR引擎初始化失败: {e}")
+            logger.error("OCR引擎初始化失败: %s", e)
             import traceback
-            traceback.print_exc()
+            logger.exception("OCR引擎初始化异常")
             raise
         
         # 数据库处理器（当没有存储客户端时使用本地数据库）
-        print("初始化数据库处理器...")
+        logger.info("初始化数据库处理器...")
         self.db_handler = OCRDatabaseHandler(db_path)
         
         self.enable_vector_store = enable_vector_store
         self.vector_store: Optional[VectorStore] = None
         if enable_vector_store:
-            print("初始化向量存储...")
+            logger.info("初始化向量存储...")
             self.vector_store = VectorStore(
                 collection_name="screenshots",
                 persist_directory=vector_db_path,
@@ -186,16 +189,16 @@ class ScreenshotOCRWorker:
                     )
                     if temp_res.get('status') == 'success' or temp_res.get('screenshot_id'):
                         screenshot_id = temp_res.get('screenshot_id') or temp_res.get('id')
-                        print(f"[storage_client] 临时保存截图成功 id={screenshot_id}")
+                        logger.info("[storage_client] 临时保存截图成功 id=%s", screenshot_id)
                     else:
-                        print(f"[storage_client] save_screenshot_temp failed: {temp_res.get('error')}")
+                        logger.error("[storage_client] save_screenshot_temp failed: %s", temp_res.get('error'))
                 except Exception as e:
-                    print(f"[storage_client] save_screenshot_temp exception: {e}")
+                    logger.error("[storage_client] save_screenshot_temp exception: %s", e)
             
             # OCR识别（使用 PIL Image）
-            print(f"[OCR] 开始识别: hash={image_hash[:8]}... size={width}x{height}")
+            logger.info("[OCR] 开始识别: hash=%s... size=%dx%d", image_hash[:8], width, height)
             ocr_results = self.ocr_engine.recognize(image_pil)
-            print(f"[OCR] 识别完成，得到 {len(ocr_results) if ocr_results else 0} 个原始结果")
+            logger.info("[OCR] 识别完成，得到 %d 个原始结果", len(ocr_results) if ocr_results else 0)
             
             # 过滤低置信度结果
             filtered_results = [
@@ -230,7 +233,7 @@ class ScreenshotOCRWorker:
                         if commit_result.get('status') == 'success' or commit_result.get('status') is None:
                             # 返回中采用与旧接口兼容的字段名
                             result['db_result'] = commit_result
-                            print(f"[storage_client] 截图已提交并写入 OCR: id={screenshot_id}")
+                            logger.info("[storage_client] 截图已提交并写入 OCR: id=%s", screenshot_id)
                         else:
                             # 尝试中止 pending 状态以清理 .pending 文件
                             reason = f"commit failed: {commit_result.get('error')}"
@@ -239,9 +242,9 @@ class ScreenshotOCRWorker:
                                     screenshot_id=screenshot_id,
                                     reason=reason
                                 )
-                                print(f"[storage_client] abort_screenshot called for id={screenshot_id}: {abort_res}")
+                                logger.info("[storage_client] abort_screenshot called for id=%s: %s", screenshot_id, abort_res)
                             except Exception as abort_exc:
-                                print(f"[storage_client] abort_screenshot exception for id={screenshot_id}: {abort_exc}")
+                                logger.error("[storage_client] abort_screenshot exception for id=%s: %s", screenshot_id, abort_exc)
                             raise Exception(reason)
                     else:
                         # 兼容旧行为：直接保存（同步）
@@ -258,10 +261,10 @@ class ScreenshotOCRWorker:
 
                         if storage_result.get('status') == 'success':
                             result['db_result'] = storage_result
-                            print(f"[storage_client] 截图已加密保存: {storage_result.get('image_path')}")
+                            logger.info("[storage_client] 截图已加密保存: %s", storage_result.get('image_path'))
                         elif storage_result.get('status') == 'duplicate':
                             result['db_result'] = storage_result
-                            print(f"[storage_client] 截图已存在（跳过）: {image_hash[:8]}...")
+                            logger.info("[storage_client] 截图已存在（跳过）: %s...", image_hash[:8])
                         else:
                             raise Exception(f"存储失败: {storage_result.get('error')}")
                         
@@ -275,14 +278,14 @@ class ScreenshotOCRWorker:
                                     screenshot_id=screenshot_id,
                                     reason=reason
                                 )
-                                print(f"[storage_client] abort_screenshot called for id={screenshot_id}: {abort_res}")
+                                logger.info("[storage_client] abort_screenshot called for id=%s: %s", screenshot_id, abort_res)
                             except Exception as abort_exc:
-                                print(f"[storage_client] abort_screenshot exception for id={screenshot_id}: {abort_exc}")
+                                logger.error("[storage_client] abort_screenshot exception for id=%s: %s", screenshot_id, abort_exc)
                     except Exception:
                         # 忽略 abort 本身的任何异常，继续抛原始错误
                         pass
 
-                    print(f"[storage_client] 加密存储失败: {e}")
+                    logger.error("[storage_client] 加密存储失败: %s", e)
                     result['error'] = str(e)
                     raise  # 没有后备方案，直接失败（不保存明文）
             else:
@@ -310,10 +313,10 @@ class ScreenshotOCRWorker:
                         },
                         ocr_text=ocr_text
                     )
-                    print(f"[screenshot_worker] add_image returned vector_id={vector_id}")
+                    logger.info("[screenshot_worker] add_image returned vector_id=%s", vector_id)
                     result['vector_id'] = vector_id
                 except Exception as e:
-                    print(f"[screenshot_worker] add_image raised exception: {e}")
+                    logger.error("[screenshot_worker] add_image raised exception: %s", e)
                     result['vector_id'] = None
             
             result['success'] = True
@@ -409,9 +412,9 @@ class ScreenshotOCRWorker:
             if mem_result.get('success') and os.path.exists(image_path):
                 try:
                     os.remove(image_path)
-                    print(f"[screenshot_worker] 已删除原始明文文件: {image_path}")
+                    logger.info("[screenshot_worker] 已删除原始明文文件: %s", image_path)
                 except Exception as del_err:
-                    print(f"[screenshot_worker] 删除原始文件失败: {del_err}")
+                    logger.error("[screenshot_worker] 删除原始文件失败: %s", del_err)
             
         except Exception as e:
             result['error'] = str(e)
@@ -457,7 +460,7 @@ class ScreenshotOCRWorker:
         })
 
         if self._task_queue.qsize() > 10:
-            print(f"[screenshot_worker] WARNING: Task queue size is large: {self._task_queue.qsize()}, is OCR process overloaded?")
+            logger.warning("[screenshot_worker] Task queue size is large: %d, is OCR process overloaded?", self._task_queue.qsize())
             # 通过遍历队列中任务，累加 `image_bytes` 的长度来估算内存占用（线程安全）
             total_bytes = 0
             with self._task_queue.mutex:
@@ -480,7 +483,7 @@ class ScreenshotOCRWorker:
                 return f"{n:.1f}PB"
 
             estimated_memory = total_bytes
-            print(f"[screenshot_worker] Estimated image memory usage: ~{_fmt_bytes(estimated_memory)} (queue items: {len(queued_items)})")
+            logger.warning("[screenshot_worker] Estimated image memory usage: ~%s (queue items: %d)", _fmt_bytes(estimated_memory), len(queued_items))
     
     def _save_to_local_db(
         self,
@@ -514,7 +517,7 @@ class ScreenshotOCRWorker:
         self.stats['start_time'] = datetime.datetime.now()
         processed_files = set()
         
-        print(f"截图OCR工作进程已启动")
+        logger.info("截图OCR工作进程已启动")
         
         while not self._stop_event.is_set():
             # 检查暂停
@@ -539,7 +542,7 @@ class ScreenshotOCRWorker:
                         # 检查是否是内存数据
                         if task.get('_from_memory'):
                             # 内存数据处理（不涉及磁盘文件）
-                            print(f"[OCR Worker] 开始处理内存数据任务")
+                            logger.info("[OCR Worker] 开始处理内存数据任务")
                             try:
                                 result = self.process_image_from_memory(
                                     image_bytes=task.get('image_bytes'),
@@ -552,26 +555,22 @@ class ScreenshotOCRWorker:
                                     screenshot_id=task.get('screenshot_id')
                                 )
                                 if result.get('success'):
-                                    print(f"[OCR Worker] 任务完成: 识别到 {len(result.get('ocr_results', []))} 个文本块")
+                                    logger.info("[OCR Worker] 任务完成: 识别到 %d 个文本块", len(result.get('ocr_results', [])))
                                 else:
-                                    print(f"[OCR Worker] 任务失败: {result.get('error', 'unknown error')}")
+                                    logger.error("[OCR Worker] 任务失败: %s", result.get('error', 'unknown error'))
                             except Exception as proc_err:
-                                print(f"[OCR Worker] process_image_from_memory 异常: {proc_err}")
-                                import traceback
-                                traceback.print_exc()
+                                logger.exception("[OCR Worker] process_image_from_memory 异常: %s", proc_err)
                         else:
                             # 旧的文件路径处理（兼容）
-                            print(f"[OCR Worker] 开始处理文件任务: {task.get('image_path', 'unknown')}")
+                            logger.info("[OCR Worker] 开始处理文件任务: %s", task.get('image_path', 'unknown'))
                             try:
                                 result = self.process_image(**task)
                                 if result.get('success'):
-                                    print(f"[OCR Worker] 任务完成: 识别到 {len(result.get('ocr_results', []))} 个文本块")
+                                    logger.info("[OCR Worker] 任务完成: 识别到 %d 个文本块", len(result.get('ocr_results', [])))
                                 else:
-                                    print(f"[OCR Worker] 任务失败: {result.get('error', 'unknown error')}")
+                                    logger.error("[OCR Worker] 任务失败: %s", result.get('error', 'unknown error'))
                             except Exception as proc_err:
-                                print(f"[OCR Worker] process_image 异常: {proc_err}")
-                                import traceback
-                                traceback.print_exc()
+                                logger.exception("[OCR Worker] process_image 异常: %s", proc_err)
                     finally:
                         # 取消 in-flight 标记（确保在任何情况下都能减少计数）
                         try:
@@ -594,13 +593,13 @@ class ScreenshotOCRWorker:
                             # 等待文件写入完成
                             time.sleep(0.5)
                             
-                            print(f"发现旧的明文截图: {file_path}")
+                            logger.info("发现旧的明文截图: %s", file_path)
                             result = self.process_image(str(file_path))
-                            
+
                             if result['success']:
-                                print(f"处理完成: 识别到 {len(result['ocr_results'])} 个文本块")
+                                logger.info("处理完成: 识别到 %d 个文本块", len(result['ocr_results']))
                             else:
-                                print(f"处理失败: {result['error']}")
+                                logger.error("处理失败: %s", result['error'])
                             
                             processed_files.add(str(file_path))
                     
@@ -608,23 +607,23 @@ class ScreenshotOCRWorker:
                     for file_path in self.screenshot_dir.glob("*.png"):
                         if str(file_path) not in processed_files:
                             time.sleep(0.5)
-                            print(f"发现新截图: {file_path}")
+                            logger.info("发现新截图: %s", file_path)
                             result = self.process_image(str(file_path))
-                            
+
                             if result['success']:
-                                print(f"处理完成: 识别到 {len(result['ocr_results'])} 个文本块")
+                                logger.info("处理完成: 识别到 %d 个文本块", len(result['ocr_results']))
                             else:
-                                print(f"处理失败: {result['error']}")
+                                logger.error("处理失败: %s", result['error'])
                             
                             processed_files.add(str(file_path))
                             
                 except Exception as e:
-                    print(f"监视目录时出错: {e}")
+                    logger.error("监视目录时出错: %s", e)
             
             # 等待下一次检查
             self._stop_event.wait(interval)
         
-        print("截图OCR工作进程已停止")
+        logger.info("截图OCR工作进程已停止")
     
     def start(self, watch_dir: bool = True, interval: float = 5.0):
         """
@@ -635,7 +634,7 @@ class ScreenshotOCRWorker:
             interval: 检查间隔（秒）
         """
         if self._worker_thread and self._worker_thread.is_alive():
-            print("工作进程已在运行")
+            logger.warning("工作进程已在运行")
             return
         
         self._stop_event.clear()
@@ -657,12 +656,12 @@ class ScreenshotOCRWorker:
     def pause(self):
         """暂停工作进程"""
         self._pause_event.set()
-        print("工作进程已暂停")
+        logger.info("工作进程已暂停")
     
     def resume(self):
         """恢复工作进程"""
         self._pause_event.clear()
-        print("工作进程已恢复")
+        logger.info("工作进程已恢复")
     
     def add_task(
         self,
@@ -680,14 +679,14 @@ class ScreenshotOCRWorker:
             process_name: 进程名
             metadata: 额外元数据
         """
-        print(f"[OCR Worker] 添加任务到队列: {image_path}")
+        logger.info("[OCR Worker] 添加任务到队列: %s", image_path)
         self._task_queue.put({
             'image_path': image_path,
             'window_title': window_title,
             'process_name': process_name,
             'metadata': metadata
         })
-        print(f"[OCR Worker] 当前队列大小: {self._task_queue.qsize()}")
+        logger.info("[OCR Worker] 当前队列大小: %d", self._task_queue.qsize())
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
@@ -801,20 +800,20 @@ class ScreenshotOCRWorker:
     
     def process_existing_screenshots(self):
         """处理目录中已存在的所有截图"""
-        print(f"处理 {self.screenshot_dir} 中的现有截图...")
-        
+        logger.info("处理 %s 中的现有截图...", self.screenshot_dir)
+
         count = 0
         for ext in ['*.jpg', '*.png', '*.jpeg']:
             for file_path in self.screenshot_dir.glob(ext):
-                print(f"处理: {file_path}")
+                logger.info("处理: %s", file_path)
                 result = self.process_image(str(file_path))
                 if result['success']:
                     count += 1
-                    print(f"  -> 识别到 {len(result['ocr_results'])} 个文本块")
+                    logger.info("  -> 识别到 %d 个文本块", len(result['ocr_results']))
                 else:
-                    print(f"  -> 失败: {result['error']}")
-        
-        print(f"处理完成，共处理 {count} 张图片")
+                    logger.error("  -> 失败: %s", result['error'])
+
+        logger.info("处理完成，共处理 %d 张图片", count)
         return count
 
 
@@ -858,7 +857,7 @@ class ScreenshotOCRService:
         """截图循环"""
         from monitor.capture import capture_focused_window_memory
         
-        print(f"截图循环已启动，间隔 {self.capture_interval} 秒")
+        logger.info("截图循环已启动，间隔 %s 秒", self.capture_interval)
         
         while not self._capture_stop_event.is_set():
             ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -868,7 +867,7 @@ class ScreenshotOCRService:
                 if hasattr(self, 'ocr_worker') and self.ocr_worker is not None:
                     pending = self.ocr_worker.pending_count()
                     if pending >= MAX_PENDING:
-                        print(f"[capture] Skipping capture because pending OCR tasks = {pending}")
+                        logger.info("[capture] Skipping capture because pending OCR tasks = %d", pending)
                         self._capture_stop_event.wait(self.capture_interval)
                         continue
             except Exception:
@@ -936,12 +935,12 @@ class ScreenshotOCRService:
                 else:
                     raise RuntimeError(f"save_screenshot_temp failed: {temp_res.get('error')}")
             except Exception as e:
-                print(f"[{ts}] 截图失败: {e}")
+                logger.error("[%s] 截图失败: %s", ts, e)
                 raise
 
             # 等待下一次检查
             self._capture_stop_event.wait(self.capture_interval)
-        print("截图循环已停止")
+        logger.info("截图循环已停止")
     
     def start(self):
         """启动服务（截图 + OCR）"""
@@ -956,7 +955,7 @@ class ScreenshotOCRService:
         )
         self._capture_thread.start()
         
-        print("截图OCR服务已启动")
+        logger.info("截图OCR服务已启动")
     
     def stop(self):
         """停止服务"""
@@ -966,7 +965,7 @@ class ScreenshotOCRService:
         if self._capture_thread:
             self._capture_thread.join(timeout=5.0)
         
-        print("截图OCR服务已停止")
+        logger.info("截图OCR服务已停止")
     
     def get_stats(self):
         """获取统计信息"""
@@ -997,7 +996,7 @@ if __name__ == "__main__":
         worker.process_existing_screenshots()
     
     # 启动监视
-    print("启动截图监视...")
+    logger.info("启动截图监视...")
     worker.start(watch_dir=True, interval=args.interval)
     
     # 保持运行
@@ -1007,7 +1006,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n正在停止...")
         worker.stop()
-        
+
         # 打印统计信息
         stats = worker.get_stats()
         print(f"\n统计信息:")

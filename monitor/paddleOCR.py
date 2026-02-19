@@ -1,8 +1,11 @@
 from paddleocr import PaddleOCR
 import cv2
 import os
+import logging
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+logger = logging.getLogger(__name__)
 
 def draw_ocr_custom(image, boxes, txts, scores, font_path='C:/Windows/Fonts/simhei.ttf'):
     """
@@ -28,10 +31,10 @@ def draw_ocr_custom(image, boxes, txts, scores, font_path='C:/Windows/Fonts/simh
                      continue
              
              if not found:
-                 print(f"警告: 字体文件可能无法加载，尝试默认")
+                 logger.warning("字体文件可能无法加载，尝试默认")
                  font = ImageFont.load_default()
     except Exception as e:
-        print(f"加载字体失败: {e}")
+        logger.error("加载字体失败: %s", e)
         font = ImageFont.load_default()
 
     for (box, txt, score) in zip(boxes, txts, scores):
@@ -53,7 +56,7 @@ except ImportError:
 # ...
 
 # 1. 初始化模型
-print("正在初始化 PaddleOCR (使用 PP-OCRv5)...")
+logger.info("正在初始化 PaddleOCR (使用 PP-OCRv5)...")
 # use_angle_cls=True: 启用方向分类器
 # lang="ch": 设置语言为中文
 # use_gpu=False: 强制使用CPU (通过 paddle.device.set_device 设置)
@@ -66,33 +69,33 @@ if paddle:
 try:
     ocr = PaddleOCR(use_angle_cls=True, lang="ch", ocr_version='PP-OCRv5')
 except Exception as e:
-    print(f"初始化失败: {e}")
-    print("尝试不指定 ocr_version (默认使用最新版)...")
+    logger.error("初始化失败: %s", e)
+    logger.info("尝试不指定 ocr_version (默认使用最新版)...")
     ocr = PaddleOCR(use_angle_cls=True, lang="ch")
 
 # 2. 读取图片
 image_path = "focused_window.jpg"
 if not os.path.exists(image_path):
-    print(f"错误: 找不到文件 {image_path}")
+    logger.error("错误: 找不到文件 %s", image_path)
     # 生成测试图片
-    print("生成测试图片...")
+    logger.info("生成测试图片...")
     img = np.zeros((200, 600, 3), dtype=np.uint8)
     cv2.putText(img, 'PaddleOCR Test', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 2)
     cv2.imwrite(image_path, img)
 
 # 3. 进行预测
-print("开始进行OCR识别...")
+logger.info("开始进行OCR识别...")
 result = ocr.ocr(image_path, cls=True)
 
 # 4. 打印结果
 if not result or result[0] is None:
-    print("未检测到任何文本。")
+    logger.info("未检测到任何文本。")
 else:
     ocr_result = result[0]
-    print(f"检测到的文本行数: {len(ocr_result)}")
+    logger.info("检测到的文本行数: %d", len(ocr_result))
     for i in range(min(5, len(ocr_result))):
         coords, (text, confidence) = ocr_result[i]
-        print(f"Text {i}: {text} (Confidence: {confidence:.4f})")
+        logger.info("Text %d: %s (Confidence: %.4f)", i, text, confidence)
 
     # 5. 可视化并保存结果
     try:
@@ -103,6 +106,6 @@ else:
         
         im_show = draw_ocr_custom(image, boxes, txts, scores)
         im_show.save('visualized_result.jpg')
-        print("可视化结果已保存至 visualized_result.jpg")
+        logger.info("可视化结果已保存至 visualized_result.jpg")
     except Exception as e:
-        print(f"可视化保存失败: {e}")
+        logger.error("可视化保存失败: %s", e)
