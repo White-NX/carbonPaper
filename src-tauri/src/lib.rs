@@ -9,6 +9,7 @@ mod resource_utils;
 mod model_management;
 mod reverse_ipc;
 mod storage;
+mod updater;
 
 use autostart::{get_autostart_status, set_autostart};
 use analysis::AnalysisState;
@@ -16,6 +17,7 @@ use credential_manager::CredentialManagerState;
 use monitor::MonitorState;
 use storage::StorageState;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Emitter;
@@ -27,6 +29,12 @@ const MENU_ID_RESUME: &str = "resume";
 const MENU_ID_RESTART: &str = "restart";
 const MENU_ID_QUIT: &str = "quit";
 
+static IS_UPDATING: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+fn set_updating_flag(updating: bool) {
+    IS_UPDATING.store(updating, Ordering::Relaxed);
+}
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let app_handle = app.handle().clone();
 
@@ -646,16 +654,18 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(MonitorState::new())
         .manage(AnalysisState::default())
+        .manage(updater::UpdaterState::new())
         .manage(credential_state)
         .manage(storage_state)
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
-                let _ = window.app_handle().emit("app-hidden", ());
+                if !IS_UPDATING.load(Ordering::Relaxed) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    let _ = window.app_handle().emit("app-hidden", ());
+                }
             }
         })
         .setup({
@@ -712,6 +722,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             close_process,
+            set_updating_flag,
             monitor::start_monitor,
             monitor::stop_monitor,
             monitor::pause_monitor,
@@ -757,6 +768,11 @@ pub fn run() {
             python::request_install_python,
             python::install_python_venv,
             model_management::download_model,
+            // Updater commands
+            updater::updater_check,
+            updater::updater_download,
+            updater::updater_extract,
+            updater::updater_apply,
         ]);
 
     #[cfg(desktop)]

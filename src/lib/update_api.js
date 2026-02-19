@@ -1,47 +1,48 @@
-import { check } from '@tauri-apps/plugin-updater';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 /**
  * Check for available updates from GitHub Releases.
- * @returns {{ available: boolean, version?: string, body?: string, update?: object }}
+ * @returns {{ available: boolean, version?: string, body?: string }}
  */
 export async function checkForUpdate() {
-  const update = await check();
-  if (update) {
+  const result = await invoke('updater_check');
+  if (result.available) {
     return {
       available: true,
-      version: update.version,
-      body: update.body,
-      update,
+      version: result.version,
+      body: result.notes,
     };
   }
   return { available: false };
 }
 
 /**
- * Download and install the update.
- * @param {object} update - The update object returned from checkForUpdate().update
+ * Download, extract, and apply the update.
  * @param {function} [onProgress] - Progress callback ({ downloaded, contentLength })
  */
-export async function downloadAndInstallUpdate(update, onProgress) {
-  let downloaded = 0;
-  let contentLength = 0;
+export async function downloadAndInstallUpdate(onProgress) {
+  // Listen for download progress events
+  const unlisten = onProgress
+    ? await listen('updater-download-progress', (event) => {
+        onProgress({
+          downloaded: event.payload.downloaded,
+          contentLength: event.payload.content_length,
+        });
+      })
+    : null;
 
-  await update.downloadAndInstall((event) => {
-    switch (event.event) {
-      case 'Started':
-        contentLength = event.data.contentLength || 0;
-        break;
-      case 'Progress':
-        downloaded += event.data.chunkLength;
-        if (onProgress) {
-          onProgress({ downloaded, contentLength });
-        }
-        break;
-      case 'Finished':
-        if (onProgress) {
-          onProgress({ downloaded: contentLength, contentLength });
-        }
-        break;
+  try {
+    await invoke('updater_download');
+
+    // Signal 100% before extract phase
+    if (onProgress) {
+      onProgress({ downloaded: 1, contentLength: 1 });
     }
-  });
+
+    await invoke('updater_extract');
+    await invoke('updater_apply');
+  } finally {
+    if (unlisten) unlisten();
+  }
 }

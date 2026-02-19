@@ -66,7 +66,7 @@ function SettingsDialog({
   const [analysisError, setAnalysisError] = useState('');
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [upToDate, setUpToDate] = useState(false);
-  const [updateInfo, setUpdateInfo] = useState(null); // { version, body, update }
+  const [updateInfo, setUpdateInfo] = useState(null); // { version, body }
   const [updateError, setUpdateError] = useState('');
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState({ downloaded: 0, contentLength: 0 });
@@ -368,7 +368,7 @@ function SettingsDialog({
     try {
       const result = await checkForUpdate();
       if (result.available) {
-        setUpdateInfo({ version: result.version, body: result.body, update: result.update });
+        setUpdateInfo({ version: result.version, body: result.body });
       } else {
         setUpToDate(true);
       }
@@ -380,11 +380,11 @@ function SettingsDialog({
   };
 
   const handleDownloadUpdate = async () => {
-    if (!updateInfo?.update) return;
+    if (!updateInfo) return;
     setDownloading(true);
     setDownloadProgress({ downloaded: 0, contentLength: 0 });
     try {
-      await downloadAndInstallUpdate(updateInfo.update, (progress) => {
+      await downloadAndInstallUpdate((progress) => {
         setDownloadProgress(progress);
       });
     } catch (err) {
