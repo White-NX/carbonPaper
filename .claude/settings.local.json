@@ -5,7 +5,8 @@
       "Bash(cargo check:*)",
       "Bash(cargo build:*)",
       "Bash(pushd:*)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "WebSearch"
     ]
   }
 }

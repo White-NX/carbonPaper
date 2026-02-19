@@ -35,11 +35,24 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'CarbonPaper ${{ github.ref_name }}'
           releaseBody: 'See the assets to download and install this version.'
           releaseDraft: true
           prerelease: false
+
+      - name: Build portable zip
+        run: npm run pack:portable
+
+      - name: Generate latest.json
+        run: node scripts/generate-latest-json.mjs ${{ github.ref_name }}
+
+      - name: Upload portable zip and latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $zipFile = "src-tauri/target/release/bundle/nsis/carbonpaper_${version}_x64_portable.zip"
+          $latestJson = "src-tauri/target/release/bundle/nsis/latest.json"
+          gh release upload ${{ github.ref_name }} $zipFile $latestJson --clobber
