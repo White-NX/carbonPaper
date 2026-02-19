@@ -105,12 +105,23 @@ async fn connect_to_pipe(
     let mut last_error = String::new();
     let full_pipe_name = format!(r"\\.\pipe\{}", pipe_name);
 
+    let start = std::time::Instant::now();
     for attempt in 0..MAX_RETRIES {
         match ClientOptions::new().open(&full_pipe_name) {
-            Ok(client) => return Ok(client),
+            Ok(client) => {
+                if attempt > 0 && start.elapsed().as_secs() >= 5 {
+                    tracing::warn!("[DIAG:PIPE] Connected after {} retries, {:?} elapsed", attempt, start.elapsed());
+                }
+                return Ok(client);
+            }
             Err(e) => {
                 // Check if it's ERROR_PIPE_BUSY (231)
                 let is_pipe_busy = e.raw_os_error() == Some(ERROR_PIPE_BUSY);
+
+                if start.elapsed().as_secs() >= 5 {
+                    tracing::warn!("[DIAG:PIPE] Attempt {}/{} failed: {} (elapsed {:?})",
+                        attempt + 1, MAX_RETRIES, e, start.elapsed());
+                }
 
                 if is_pipe_busy && attempt < MAX_RETRIES - 1 {
                     // Wait and retry
@@ -123,6 +134,7 @@ async fn connect_to_pipe(
         }
     }
 
+    tracing::warn!("[DIAG:PIPE] All {} retries failed after {:?}", MAX_RETRIES, start.elapsed());
     Err(last_error)
 }
 
@@ -365,7 +377,7 @@ pub async fn start_monitor(
 
             let mut reverse_server = ReverseIpcServer::new(&reverse_pipe_name);
             if let Err(e) = reverse_server.start(storage_arc) {
-                eprintln!("Failed to start reverse IPC server: {}", e);
+                tracing::error!("Failed to start reverse IPC server: {}", e);
             }
 
             // 存储反向 IPC 服务器和管道名
@@ -382,8 +394,8 @@ pub async fn start_monitor(
             }
         }
 
-        println!(
-            "Starting monitor using python: {} (exists: {}) | script: {} | script_abs: {} | cwd: {} | pipe: {} | storage_pipe: {}",
+        tracing::info!(
+            "Starting monitor: python={} (exists={}) script={} script_abs={} cwd={} pipe={} storage_pipe={}",
             python_executable, python_exists, script_path, script_abs, cwd, pipe_name, reverse_pipe_name
         );
 
@@ -480,7 +492,7 @@ pub async fn start_monitor(
                             }
                         }
                         // Print to console as well as emit to frontend, so logs are visible in terminal
-                        println!("monitor stdout: {}", l);
+                        tracing::info!(target: "monitor.stdout", "{}", l);
                         let _ = app_clone.emit(
                             "monitor-log",
                             serde_json::json!({"source":"stdout","line": l}),
@@ -507,7 +519,7 @@ pub async fn start_monitor(
                             }
                         }
                         // Print errors to stderr and also emit to frontend
-                        eprintln!("monitor stderr: {}", l);
+                        tracing::warn!(target: "monitor.stderr", "{}", l);
                         let _ = app_clone.emit(
                             "monitor-log",
                             serde_json::json!({"source":"stderr","line": l}),

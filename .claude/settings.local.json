@@ -4,7 +4,8 @@
       "Bash(python:*)",
       "Bash(cargo check:*)",
       "Bash(cargo build:*)",
-      "Bash(pushd:*)"
+      "Bash(pushd:*)",
+      "Bash(dir:*)"
     ]
   }
 }

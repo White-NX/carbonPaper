@@ -160,13 +160,17 @@ export const verifyUser = async () => {
  * 获取时间线数据 - 直接从 Rust 存储层获取
  * 需要认证才能访问
  */
-export const getTimeline = async (startTime, endTime) => {
+export const getTimeline = async (startTime, endTime, maxRecords = null) => {
     return withAuth(async () => {
         // 使用新的 Rust 存储命令
-        const records = await invoke('storage_get_timeline', {
+        const params = {
             startTime: startTime,
             endTime: endTime
-        });
+        };
+        if (maxRecords !== null) {
+            params.maxRecords = maxRecords;
+        }
+        const records = await invoke('storage_get_timeline', params);
         console.log('[Timeline] Fetched records:', records?.length || 0, 'range:', new Date(startTime).toLocaleString(), '-', new Date(endTime).toLocaleString());
         return records || [];
     });

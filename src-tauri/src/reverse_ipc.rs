@@ -133,7 +133,7 @@ impl ReverseIpcServer {
                     {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("Failed to create pipe server: {}", e);
+                            tracing::error!("Failed to create pipe server: {}", e);
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                             continue;
                         }
@@ -142,12 +142,12 @@ impl ReverseIpcServer {
                     // 等待客户端连接或关闭信号
                     tokio::select! {
                         _ = shutdown_rx.recv() => {
-                            println!("Reverse IPC server shutting down");
+                            tracing::info!("Reverse IPC server shutting down");
                             break;
                         }
                         result = server.connect() => {
                             if let Err(e) = result {
-                                eprintln!("Client connection failed: {}", e);
+                                tracing::error!("Client connection failed: {}", e);
                                 continue;
                             }
                             
@@ -191,7 +191,7 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>) 
     
     loop {
         if start_time.elapsed() > read_timeout {
-            eprintln!("Read timeout after {} bytes", buf.len());
+            tracing::warn!("Read timeout after {} bytes", buf.len());
             break;
         }
         
@@ -222,7 +222,7 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>) 
                 }
                 // 限制最大数据量为 16MB
                 if buf.len() > 16 * 1024 * 1024 {
-                    eprintln!("Request too large: {} bytes", buf.len());
+                    tracing::error!("Request too large: {} bytes", buf.len());
                     let response = StorageResponse::error("Request too large (max 16MB)");
                     let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
                     let _ = server.write_all(&response_bytes).await;
@@ -233,7 +233,7 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>) 
                 // 检查是否是 "管道已结束" 错误（正常情况，客户端已发送完数据）
                 let is_pipe_ended = e.raw_os_error() == Some(109); // ERROR_BROKEN_PIPE
                 if !is_pipe_ended {
-                    eprintln!("Read error: {}", e);
+                    tracing::error!("Read error: {}", e);
                 }
                 break;
             }
@@ -259,15 +259,16 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>) 
     // 发送响应
     let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
     if let Err(e) = server.write_all(&response_bytes).await {
-        eprintln!("Write error: {}", e);
+        tracing::error!("Write error: {}", e);
     }
 }
 
 /// 处理存储请求
 fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageResponse {
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
-    
-    match command {
+    let diag_start = std::time::Instant::now();
+
+    let response = match command {
         "save_screenshot" => {
             // 解析保存截图请求
             let request = match serde_json::from_value::<SaveScreenshotRequest>(req.clone()) {
@@ -394,7 +395,7 @@ fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageRe
                         None => {
                             let msg = "ocr_results must be an array when provided";
                             if let Err(e) = storage.abort_screenshot(screenshot_id, Some(msg)) {
-                                eprintln!("Failed to abort screenshot {}: {}", screenshot_id, e);
+                                tracing::error!("Failed to abort screenshot {}: {}", screenshot_id, e);
                             }
                             return StorageResponse::error(msg);
                         }
@@ -407,7 +408,7 @@ fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageRe
                             Err(e) => {
                                 let msg = format!("Invalid ocr_results[{}]: {}", idx, e);
                                 if let Err(abort_err) = storage.abort_screenshot(screenshot_id, Some(&msg)) {
-                                    eprintln!("Failed to abort screenshot {}: {}", screenshot_id, abort_err);
+                                    tracing::error!("Failed to abort screenshot {}: {}", screenshot_id, abort_err);
                                 }
                                 return StorageResponse::error(&msg);
                             }
@@ -454,7 +455,12 @@ fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageRe
         }
         
         _ => StorageResponse::error(&format!("Unknown command: {}", command)),
+    };
+
+    if diag_start.elapsed().as_secs() >= 5 {
+        tracing::warn!("[DIAG:RIPC] command='{}' completed in {:?}", command, diag_start.elapsed());
     }
+    response
 }
 
 /// 生成反向 IPC 管道名

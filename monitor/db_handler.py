@@ -4,10 +4,13 @@
 import sqlite3
 import json
 import hashlib
+import logging
 import os
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from contextlib import contextmanager
+
+logger = logging.getLogger(__name__)
 
 
 class OCRDatabaseHandler:
@@ -605,7 +608,7 @@ class OCRDatabaseHandler:
                     if os.path.exists(image_path):
                         os.remove(image_path)
                 except Exception as e:
-                    print(f"Failed to delete image file {image_path}: {e}")
+                    logger.error("Failed to delete image file %s: %s", image_path, e)
             
             return deleted
     
@@ -652,7 +655,7 @@ class OCRDatabaseHandler:
                     if image_path and os.path.exists(image_path):
                         os.remove(image_path)
                 except Exception as e:
-                    print(f"Failed to delete image file {image_path}: {e}")
+                    logger.error("Failed to delete image file %s: %s", image_path, e)
         
         return deleted_count
     

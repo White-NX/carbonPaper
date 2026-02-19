@@ -1,6 +1,7 @@
 mod autostart;
 mod analysis;
 mod credential_manager;
+mod logging;
 mod monitor;
 mod python;
 mod registry_config;
@@ -115,15 +116,16 @@ async fn storage_get_timeline(
     state: tauri::State<'_, Arc<StorageState>>,
     start_time: f64,
     end_time: f64,
+    max_records: Option<i64>,
 ) -> Result<Vec<storage::ScreenshotRecord>, String> {
     // 检查认证状态
     check_auth_required(&credential_state)?;
-    
+
     // 如果传入的是毫秒级时间戳，转换为秒
     let start_ts = if start_time > 10_000_000_000.0 { start_time / 1000.0 } else { start_time };
     let end_ts = if end_time > 10_000_000_000.0 { end_time / 1000.0 } else { end_time };
-    
-    state.get_screenshots_by_time_range(start_ts, end_ts)
+
+    state.get_screenshots_by_time_range_limited(start_ts, end_ts, max_records.or(Some(500)))
 }
 
 #[tauri::command]
@@ -162,24 +164,24 @@ async fn storage_get_image(
     // 检查认证状态
     check_auth_required(&credential_state)?;
     
-    println!("[storage_get_image] id={:?}, path={:?}", id, path);
-    
+    tracing::debug!("id={:?}, path={:?}", id, path);
+
     let image_path = if let Some(id) = id {
         let record = state.get_screenshot_by_id(id)?;
-        println!("[storage_get_image] Found record: {:?}", record.as_ref().map(|r| &r.image_path));
+        tracing::debug!("Found record: {:?}", record.as_ref().map(|r| &r.image_path));
         record.map(|r| r.image_path)
     } else {
         path
     };
-    
-    println!("[storage_get_image] Final image_path={:?}", image_path);
-    
+
+    tracing::debug!("Final image_path={:?}", image_path);
+
     match image_path {
         Some(path) => {
             // 使用 StorageManager::read_image 读取加密图片
             match state.read_image(&path) {
                 Ok((data, mime_type)) => {
-                    println!("[storage_get_image] Successfully read image, mime={}", mime_type);
+                    tracing::debug!("Successfully read image, mime={}", mime_type);
                     Ok(serde_json::json!({
                         "status": "success",
                         "data": data,
@@ -187,13 +189,13 @@ async fn storage_get_image(
                     }))
                 }
                 Err(e) => {
-                    println!("[storage_get_image] Failed to read image: {}", e);
+                    tracing::error!("Failed to read image: {}", e);
                     Err(e)
                 }
             }
         }
         None => {
-            println!("[storage_get_image] Image not found - no path available");
+            tracing::warn!("Image not found - no path available");
             Err("Image not found".to_string())
         }
     }
@@ -244,7 +246,7 @@ async fn storage_delete_screenshot(
                     vector_deleted = resp.get("vector_deleted").and_then(|v| v.as_i64());
                 }
                 Err(e) => {
-                    eprintln!("[storage_delete_screenshot] Vector delete failed: {}", e);
+                    tracing::error!("Vector delete failed: {}", e);
                 }
             }
         }
@@ -268,7 +270,7 @@ async fn storage_delete_by_time_range(
     let image_hashes = match state.get_screenshots_by_time_range(start_ts, end_ts) {
         Ok(records) => records.into_iter().map(|r| r.image_hash).collect::<Vec<_>>(),
         Err(e) => {
-            eprintln!("[storage_delete_by_time_range] Failed to load hashes: {}", e);
+            tracing::error!("Failed to load hashes: {}", e);
             Vec::new()
         }
     };
@@ -289,7 +291,7 @@ async fn storage_delete_by_time_range(
                 vector_deleted = resp.get("vector_deleted").and_then(|v| v.as_i64());
             }
             Err(e) => {
-                eprintln!("[storage_delete_by_time_range] Vector delete failed: {}", e);
+                tracing::error!("Vector delete failed: {}", e);
             }
         }
     }
@@ -587,7 +589,7 @@ async fn credential_set_session_timeout(
     state.set_session_timeout(timeout);
     // 尝试写入注册表作为持久化机制
     if let Err(e) = crate::registry_config::set_string("session_timeout_secs", &timeout.to_string()) {
-        eprintln!("[lib] Failed to persist session_timeout_secs: {}", e);
+        tracing::error!("Failed to persist session_timeout_secs: {}", e);
         // 不要因为持久化失败而使设置失败——仍将会话超时应用于内存状态
     }
     Ok(())
@@ -635,6 +637,8 @@ fn get_data_dir() -> std::path::PathBuf {
 pub fn run() {
     // 创建凭证管理器状态
     let data_dir = get_data_dir();
+    let _log_guard = logging::init_logging(&data_dir);  // 最早初始化日志系统
+
     let credential_state = Arc::new(CredentialManagerState::new(data_dir.clone()));
     let storage_state = Arc::new(StorageState::new(data_dir.clone(), credential_state.clone()));
     
@@ -654,9 +658,12 @@ pub fn run() {
                 let _ = window.app_handle().emit("app-hidden", ());
             }
         })
-        .setup(|app| {
+        .setup({
+            let data_dir = data_dir.clone();
+            move |app| {
             build_tray(app)?;
             analysis::start_memory_sampler(app.handle().clone());
+            logging::spawn_maintenance_task(data_dir.clone());
             
             // 初始化凭据管理器（加载公钥或首次创建）
             let credential_state = app.state::<Arc<CredentialManagerState>>();
@@ -664,28 +671,28 @@ pub fn run() {
             // 公钥用于弱数据库加密与行级封装
             let public_key_ready = match credential_manager::load_public_key_from_file(&credential_state) {
                 Ok(public_key) => {
-                    println!("[lib] Public key loaded from file, length: {}", public_key.len());
+                    tracing::info!("Public key loaded from file, length: {}", public_key.len());
                     true
                 }
                 Err(credential_manager::CredentialError::KeyNotFound) => {
-                    println!("[lib] Public key file missing, exporting from CNG...");
+                    tracing::info!("Public key file missing, exporting from CNG...");
 
                     match credential_manager::export_or_get_public_key(&credential_state) {
                         Ok(public_key) => {
-                            println!("[lib] CNG public key exported, length: {}", public_key.len());
+                            tracing::info!("CNG public key exported, length: {}", public_key.len());
                             if let Err(e) = credential_manager::save_public_key_to_file(&credential_state, &public_key) {
-                                eprintln!("[lib] Failed to save public key: {}", e);
+                                tracing::error!("Failed to save public key: {}", e);
                             }
                             true
                         }
                         Err(e) => {
-                            eprintln!("[lib] Failed to export CNG public key: {:?}", e);
+                            tracing::error!("Failed to export CNG public key: {:?}", e);
                             false
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[lib] Failed to load public key: {:?}", e);
+                    tracing::error!("Failed to load public key: {:?}", e);
                     false
                 }
             };
@@ -694,14 +701,14 @@ pub fn run() {
             let storage = app.state::<Arc<StorageState>>();
             if public_key_ready {
                 if let Err(e) = storage.initialize() {
-                    eprintln!("Failed to initialize storage: {}", e);
+                    tracing::error!("Failed to initialize storage: {}", e);
                 }
             } else {
-                eprintln!("[lib] Storage initialization deferred: public key unavailable");
+                tracing::error!("Storage initialization deferred: public key unavailable");
             }
             
             Ok(())
-        })
+        }})
         .invoke_handler(tauri::generate_handler![
             greet,
             close_process,

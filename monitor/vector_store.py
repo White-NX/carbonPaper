@@ -4,9 +4,12 @@
 """
 import os
 import hashlib
+import logging
 from typing import List, Dict, Any, Optional, Union
 from PIL import Image
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # 延迟导入，避免启动时加载过慢
 _clip_instance = None
@@ -30,7 +33,7 @@ class ChineseCLIPSingleton:
         if self._initialized:
             return
             
-        print("正在加载 Chinese-CLIP 模型 (常驻内存)...")
+        logger.info("正在加载 Chinese-CLIP 模型 (常驻内存)...")
 
         model_name = os.environ.get('MODEL_PATH', None)
         if not model_name:
@@ -52,9 +55,9 @@ class ChineseCLIPSingleton:
             )
             self._model.eval()
             self._initialized = True
-            print("Chinese-CLIP 模型加载完成")
+            logger.info("Chinese-CLIP 模型加载完成")
         except Exception as e:
-            print(f"Chinese-CLIP 模型加载失败: {e}")
+            logger.error("Chinese-CLIP 模型加载失败: %s", e)
             raise
             
     def get_components(self):
@@ -170,20 +173,20 @@ class ImageVectorizer:
                                     continue
 
                             if found is not None:
-                                print(f"[vector_store] using alternative projection '{found_name}' for pooled dim {Dp}", flush=True)
+                                logger.info("[vector_store] using alternative projection '%s' for pooled dim %s", found_name, Dp)
                                 try:
                                     image_features = found(pooled)
                                 except Exception as e:
-                                    print(f"[vector_store] alternative projection call failed: {e}", flush=True)
+                                    logger.error("[vector_store] alternative projection call failed: %s", e)
                                     raise
                             else:
-                                print(f"[vector_store] projection expected_in={expected_in} != pooled_dim={Dp}; no compatible projection found, skipping projection", flush=True)
+                                logger.warning("[vector_store] projection expected_in=%s != pooled_dim=%s; no compatible projection found, skipping projection", expected_in, Dp)
                                 image_features = pooled
                         else:
                             try:
                                 image_features = proj(pooled)
                             except Exception as e:
-                                print(f"[vector_store] projection module call failed: {e}", flush=True)
+                                logger.error("[vector_store] projection module call failed: %s", e)
                                 raise
                     else:
                         # proj is likely a Parameter/Tensor - handle multiplication with correct orientation
@@ -204,7 +207,7 @@ class ImageVectorizer:
                             else:
                                 raise RuntimeError(f"Unsupported projection tensor ndim={w.ndim}")
                         except Exception as e:
-                            print(f"[vector_store] projection tensor multiply failed: {e}", flush=True)
+                            logger.error("[vector_store] projection tensor multiply failed: %s", e)
                             raise
                 else:
                     image_features = pooled
@@ -232,7 +235,7 @@ class ImageVectorizer:
             preview = text if len(text) <= 200 else text[:200] + "..."
         except Exception:
             preview = "<unprintable>"
-        print(f"[vector_store] encode_text called. preview={preview} len={len(text) if hasattr(text,'__len__') else 'unknown'}")
+        logger.info("[vector_store] encode_text called. preview=%s len=%s", preview, len(text) if hasattr(text,'__len__') else 'unknown')
 
         inputs = self.processor(text=[text], return_tensors="pt", padding=True)
 
@@ -260,7 +263,7 @@ class ImageVectorizer:
             norm = None
             preview_vals = "<unavailable>"
 
-        print(f"[vector_store] encode_text -> embedding shape={arr.shape} norm={norm} preview={preview_vals}")
+        logger.info("[vector_store] encode_text -> embedding shape=%s norm=%s preview=%s", arr.shape, norm, preview_vals)
         return arr
     
     def encode_images_batch(self, images: List[Union[str, Image.Image]]) -> np.ndarray:
@@ -332,16 +335,16 @@ class ImageVectorizer:
                                     continue
 
                             if found is not None:
-                                print(f"[vector_store] using alternative projection '{found_name}' for pooled dim {Dp}", flush=True)
+                                logger.info("[vector_store] using alternative projection '%s' for pooled dim %s", found_name, Dp)
                                 image_features = found(pooled)
                             else:
-                                print(f"[vector_store] projection expected_in={expected_in} != pooled_dim={Dp}; no compatible projection found, skipping projection", flush=True)
+                                logger.warning("[vector_store] projection expected_in=%s != pooled_dim=%s; no compatible projection found, skipping projection", expected_in, Dp)
                                 image_features = pooled
                         else:
                             try:
                                 image_features = proj(pooled)
                             except Exception as e:
-                                print(f"[vector_store] projection module call failed: {e}", flush=True)
+                                logger.error("[vector_store] projection module call failed: %s", e)
                                 raise
                     else:
                         try:
@@ -359,7 +362,7 @@ class ImageVectorizer:
                             else:
                                 raise RuntimeError(f"Unsupported projection tensor ndim={w.ndim}")
                         except Exception as e:
-                            print(f"[vector_store] projection tensor multiply failed: {e}", flush=True)
+                            logger.error("[vector_store] projection tensor multiply failed: %s", e)
                             raise
                 else:
                     image_features = pooled
@@ -442,7 +445,7 @@ class VectorStore:
             abs_path = self.persist_directory
             path_exists = False
             path_list = []
-        print(f"[vector_store] Initialized VectorStore collection='{self.collection_name}' persist='{abs_path}' exists={path_exists} count={count} files={path_list} encrypted={storage_client is not None}", flush=True)
+        logger.info("[vector_store] Initialized VectorStore collection='%s' persist='%s' exists=%s count=%s files=%s encrypted=%s", self.collection_name, abs_path, path_exists, count, path_list, storage_client is not None)
     
     def _encrypt_text(self, text: str) -> str:
         """加密文本（如果有存储客户端）"""
@@ -575,7 +578,7 @@ class VectorStore:
         """
         doc_id = self._compute_id(image_path)
 
-        print(f"[vector_store] add_image called image_path={image_path} doc_id={doc_id}")
+        logger.info("[vector_store] add_image called image_path=%s doc_id=%s", image_path, doc_id)
 
         # 检查是否已存在
         try:
@@ -585,14 +588,14 @@ class VectorStore:
                 existing_ids = existing.get('ids') if isinstance(existing, dict) else None
             except Exception:
                 existing_ids = None
-            print(f"[vector_store] collection.get(ids=[...]) returned type={type(existing)} ids_preview={existing_ids}", flush=True)
+            logger.info("[vector_store] collection.get(ids=[...]) returned type=%s ids_preview=%s", type(existing), existing_ids)
         except Exception as e:
             # Some Chroma versions may not accept ids in get; fallback to None
             existing = None
-            print(f"[vector_store] collection.get(ids=[doc_id]) raised: {e}", flush=True)
+            logger.info("[vector_store] collection.get(ids=[doc_id]) raised: %s", e)
 
         if existing and existing.get('ids'):
-            print(f"[vector_store] add_image skipped, already exists: {doc_id}", flush=True)
+            logger.info("[vector_store] add_image skipped, already exists: %s", doc_id)
             return doc_id
 
         # 编码图片
@@ -600,7 +603,7 @@ class VectorStore:
             image = image_path
 
         embedding = self.vectorizer.encode_image(image)
-        print(f"[vector_store] add_image -> embedding len={len(embedding)}", flush=True)
+        logger.info("[vector_store] add_image -> embedding len=%d", len(embedding))
         
         # 准备元数据
         meta = {
@@ -635,8 +638,8 @@ class VectorStore:
                 before = self.collection.count()
             except Exception:
                 before = None
-            print(f"[vector_store] before add count={before}", flush=True)
-            print(f"[vector_store] attempting add id={doc_id} embeddings_len={len(embedding)} document_len={len(document) if document else 0}", flush=True)
+            logger.info("[vector_store] before add count=%s", before)
+            logger.info("[vector_store] attempting add id=%s embeddings_len=%d document_len=%d", doc_id, len(embedding), len(document) if document else 0)
 
             self.collection.add(
                 ids=[doc_id],
@@ -650,17 +653,17 @@ class VectorStore:
                 persist_fn = getattr(self.client, 'persist', None)
                 if callable(persist_fn):
                     persist_fn()
-                    print("[vector_store] client.persist() called", flush=True)
+                    logger.info("[vector_store] client.persist() called")
             except Exception as e:
-                print(f"[vector_store] client.persist() call failed: {e}", flush=True)
+                logger.error("[vector_store] client.persist() call failed: %s", e)
 
             try:
                 after = self.collection.count()
             except Exception:
                 after = None
-            print(f"[vector_store] add_image success id={doc_id} before={before} after={after}", flush=True)
+            logger.info("[vector_store] add_image success id=%s before=%s after=%s", doc_id, before, after)
         except Exception as e:
-            print(f"[vector_store] add_image failed id={doc_id} error={e}", flush=True)
+            logger.error("[vector_store] add_image failed id=%s error=%s", doc_id, e)
 
         return doc_id
     
@@ -689,14 +692,14 @@ class VectorStore:
         for data in image_data:
             image_path = data['image_path']
             doc_id = self._compute_id(image_path)
-            print(f"[vector_store] add_images_batch processing {image_path} -> {doc_id}")
+            logger.info("[vector_store] add_images_batch processing %s -> %s", image_path, doc_id)
             # 检查是否已存在
             try:
                 existing = self.collection.get(ids=[doc_id])
             except Exception:
                 existing = None
             if existing and existing.get('ids'):
-                print(f"[vector_store] add_images_batch skipped existing {doc_id}")
+                logger.info("[vector_store] add_images_batch skipped existing %s", doc_id)
                 ids.append(doc_id)
                 continue
             
@@ -747,9 +750,9 @@ class VectorStore:
                     persist_fn = getattr(self.client, 'persist', None)
                     if callable(persist_fn):
                         persist_fn()
-                        print("[vector_store] client.persist() called (batch)", flush=True)
+                        logger.info("[vector_store] client.persist() called (batch)")
                 except Exception as e:
-                    print(f"[vector_store] client.persist() call failed (batch): {e}", flush=True)
+                    logger.error("[vector_store] client.persist() call failed (batch): %s", e)
                 try:
                     after = self.collection.count()
                 except Exception:
@@ -762,9 +765,9 @@ class VectorStore:
                     abs_path = self.persist_directory
                     path_exists = False
                     path_list = []
-                print(f"[vector_store] add_images_batch added {len(ids)} items before={before} after={after} persist_path={abs_path} exists={path_exists} files={path_list}", flush=True)
+                logger.info("[vector_store] add_images_batch added %d items before=%s after=%s persist_path=%s exists=%s files=%s", len(ids), before, after, abs_path, path_exists, path_list)
             except Exception as e:
-                print(f"[vector_store] add_images_batch failed: {e}", flush=True)
+                logger.error("[vector_store] add_images_batch failed: %s", e)
             
 
         return ids
@@ -791,14 +794,14 @@ class VectorStore:
             qpreview = query if len(query) <= 200 else query[:200] + "..."
         except Exception:
             qpreview = "<unprintable>"
-        print(f"[vector_store] search_by_text called. query_preview={qpreview} n_results={n_results} min_similarity={min_similarity}")
+        logger.info("[vector_store] search_by_text called. query_preview=%s n_results=%d min_similarity=%s", qpreview, n_results, min_similarity)
 
         # 将查询文本编码为向量
         query_embedding = self.vectorizer.encode_text(query)
         try:
-            print(f"[vector_store] query_embedding shape={query_embedding.shape} dtype={query_embedding.dtype} norm={float(np.linalg.norm(query_embedding))}")
+            logger.info("[vector_store] query_embedding shape=%s dtype=%s norm=%s", query_embedding.shape, query_embedding.dtype, float(np.linalg.norm(query_embedding)))
         except Exception:
-            print("[vector_store] query_embedding diagnostic unavailable")
+            logger.info("[vector_store] query_embedding diagnostic unavailable")
 
         # 在ChromaDB中搜索
         try:
@@ -808,12 +811,12 @@ class VectorStore:
                 include=['metadatas', 'documents', 'distances']
             )
         except Exception as e:
-            print(f"[vector_store] collection.query failed: {e}")
+            logger.error("[vector_store] collection.query failed: %s", e)
             raise
         
         # 格式化结果
         # Diagnostic: inspect raw results
-        print(f"[vector_store] raw query results keys={list(results.keys()) if isinstance(results, dict) else '<not-dict>'}")
+        logger.info("[vector_store] raw query results keys=%s", list(results.keys()) if isinstance(results, dict) else '<not-dict>')
         try:
             ids_list = results['ids'][0] if results and results['ids'] else []
             distances_list = results['distances'][0] if results and results['distances'] else []
@@ -823,7 +826,7 @@ class VectorStore:
             distances_list = []
             docs_list = []
 
-        print(f"[vector_store] query returned {len(ids_list)} candidates")
+        logger.info("[vector_store] query returned %d candidates", len(ids_list))
 
         formatted_results = []
         if len(ids_list) == 0:
@@ -832,15 +835,15 @@ class VectorStore:
                 total = self.collection.count()
             except Exception:
                 total = None
-            print(f"[vector_store] collection.count()={total}")
+            logger.info("[vector_store] collection.count()=%s", total)
             try:
                 sample = self.collection.get(include=['ids', 'metadatas', 'documents', 'distances'])
-                print(f"[vector_store] collection.get() sample keys={list(sample.keys()) if isinstance(sample, dict) else '<not-dict>'}")
+                logger.info("[vector_store] collection.get() sample keys=%s", list(sample.keys()) if isinstance(sample, dict) else '<not-dict>')
                 # print up to 5 sample ids
                 sample_ids = sample.get('ids', [])[:5] if isinstance(sample, dict) else []
-                print(f"[vector_store] sample ids (<=5)={sample_ids}")
+                logger.info("[vector_store] sample ids (<=5)=%s", sample_ids)
             except Exception as e:
-                print(f"[vector_store] failed to get sample from collection: {e}")
+                logger.error("[vector_store] failed to get sample from collection: %s", e)
 
         for i, doc_id in enumerate(ids_list):
             distance = distances_list[i] if i < len(distances_list) else 1.0
@@ -853,11 +856,11 @@ class VectorStore:
             except Exception:
                 meta = {}
                 ocr = None
-            print(f"[vector_store] candidate i={i} id={doc_id} similarity={similarity:.4f} distance={distance} image_path={meta.get('image_path') if isinstance(meta, dict) else meta}")
+            logger.info("[vector_store] candidate i=%d id=%s similarity=%.4f distance=%s image_path=%s", i, doc_id, similarity, distance, meta.get('image_path') if isinstance(meta, dict) else meta)
 
             # 过滤低置信度结果
             if similarity < min_similarity:
-                print(f"[vector_store] candidate id={doc_id} filtered out by min_similarity")
+                logger.info("[vector_store] candidate id=%s filtered out by min_similarity", doc_id)
                 continue
 
             formatted_results.append({

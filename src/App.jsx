@@ -361,8 +361,13 @@ function App() {
   };
 
   const checkBackendStatus = useCallback(async () => {
+    const t0 = performance.now();
     try {
       const resString = await invoke('get_monitor_status');
+      const elapsed = performance.now() - t0;
+      if (elapsed > 5000) {
+        console.warn(`[DIAG:STATUS] get_monitor_status took ${elapsed.toFixed(0)}ms`);
+      }
       let res = null;
       try {
         res = JSON.parse(resString);
@@ -385,6 +390,10 @@ function App() {
       lastBackendErrorRef.current = '';
       backendStartAtRef.current = null;
     } catch (err) {
+      const elapsed = performance.now() - t0;
+      if (elapsed > 5000) {
+        console.warn(`[DIAG:STATUS] get_monitor_status FAILED after ${elapsed.toFixed(0)}ms:`, err);
+      }
       // When we are waiting for startup, keep waiting unless start failed explicitly.
       if (backendStatusRef.current === 'waiting') {
         const startAt = backendStartAtRef.current;

@@ -136,6 +136,95 @@ pub struct SaveScreenshotResponse {
     pub skipped: i32,
 }
 
+/// Raw row data extracted from DB without decryption (for releasing mutex early)
+struct RawScreenshotRow {
+    id: i64,
+    image_path: String,
+    image_hash: String,
+    width: Option<i32>,
+    height: Option<i32>,
+    window_title_plain: Option<String>,
+    process_name_plain: Option<String>,
+    metadata_plain: Option<String>,
+    window_title_enc: Option<Vec<u8>>,
+    process_name_enc: Option<Vec<u8>>,
+    metadata_enc: Option<Vec<u8>>,
+    content_key_enc: Option<Vec<u8>>,
+    timestamp: Option<i64>,
+    created_at: String,
+}
+
+impl RawScreenshotRow {
+    /// Decrypt encrypted fields and produce a ScreenshotRecord.
+    /// CNG decryption happens here, outside of the DB mutex.
+    fn into_record(self) -> ScreenshotRecord {
+        let mut row_key = self
+            .content_key_enc
+            .as_ref()
+            .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+
+        let window_title = match (self.window_title_enc.as_ref(), row_key.as_ref()) {
+            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                .ok()
+                .and_then(|v| String::from_utf8(v).ok()),
+            _ => self.window_title_plain,
+        };
+        let process_name = match (self.process_name_enc.as_ref(), row_key.as_ref()) {
+            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                .ok()
+                .and_then(|v| String::from_utf8(v).ok()),
+            _ => self.process_name_plain,
+        };
+        let metadata = match (self.metadata_enc.as_ref(), row_key.as_ref()) {
+            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                .ok()
+                .and_then(|v| String::from_utf8(v).ok()),
+            _ => self.metadata_plain,
+        };
+
+        if let Some(ref mut key) = row_key {
+            StorageState::zeroize_bytes(key);
+        }
+
+        ScreenshotRecord {
+            id: self.id,
+            image_path: self.image_path,
+            image_hash: self.image_hash,
+            width: self.width,
+            height: self.height,
+            window_title,
+            process_name,
+            timestamp: self.timestamp,
+            metadata,
+            created_at: self.created_at,
+        }
+    }
+
+    /// Extract raw data from a rusqlite Row without any decryption.
+    /// Column order must match the standard SELECT used in get_screenshots_by_time_range / get_screenshot_by_id.
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let timestamp_str: Option<String> = row.get(12)?;
+        let timestamp = timestamp_str.and_then(|s| s.parse::<i64>().ok());
+
+        Ok(RawScreenshotRow {
+            id: row.get(0)?,
+            image_path: row.get(1)?,
+            image_hash: row.get(2)?,
+            width: row.get(3)?,
+            height: row.get(4)?,
+            window_title_plain: row.get(5)?,
+            process_name_plain: row.get(6)?,
+            metadata_plain: row.get(7)?,
+            window_title_enc: row.get(8)?,
+            process_name_enc: row.get(9)?,
+            metadata_enc: row.get(10)?,
+            content_key_enc: row.get(11)?,
+            timestamp,
+            created_at: row.get(13)?,
+        })
+    }
+}
+
 impl StorageState {
     pub fn new(data_dir: PathBuf, credential_state: Arc<CredentialManagerState>) -> Self {
         let screenshot_dir = data_dir.join("screenshots");
@@ -552,7 +641,7 @@ impl StorageState {
 
         *initialized = true;
 
-        println!("[storage] SQLCipher weakly encrypted database initialized");
+        tracing::info!("SQLCipher weakly encrypted database initialized");
 
         Ok(())
     }
@@ -694,7 +783,12 @@ impl StorageState {
 
     /// 获取数据库连接
     fn get_connection(&self) -> Result<std::sync::MutexGuard<'_, Option<Connection>>, String> {
+        let wait_start = std::time::Instant::now();
         let guard = self.db.lock().unwrap();
+        let wait_dur = wait_start.elapsed();
+        if wait_dur.as_secs() >= 5 {
+            tracing::warn!("[DIAG:DB] Mutex wait took {:?}", wait_dur);
+        }
         if guard.is_none() {
             return Err("Database not initialized".to_string());
         }
@@ -1262,7 +1356,7 @@ impl StorageState {
                 let new_path = image_path.with_file_name(new_name);
                 if let Err(e) = std::fs::rename(&image_path, &new_path) {
                     // 如果重命名失败，记录但继续尝试插OCR 结果
-                    eprintln!("Failed to rename pending image file: {}", e);
+                    tracing::error!("Failed to rename pending image file: {}", e);
                 } else {
                     final_image_path_str = self.to_relative_image_path(&new_path);
                 }
@@ -1408,97 +1502,72 @@ impl StorageState {
         start_ts: f64,
         end_ts: f64,
     ) -> Result<Vec<ScreenshotRecord>, String> {
-        let mut guard = self.get_connection()?;
-        let conn = guard.as_mut().unwrap();
+        self.get_screenshots_by_time_range_limited(start_ts, end_ts, None)
+    }
 
-        // 转换时间戳（秒）UTC 时间的日期时间字符串
-        // SQLite CURRENT_TIMESTAMP 存储的是 UTC 时间
-        let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_default();
-        let end_dt = DateTime::<Utc>::from_timestamp(end_ts as i64, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_default();
+    pub fn get_screenshots_by_time_range_limited(
+        &self,
+        start_ts: f64,
+        end_ts: f64,
+        max_records: Option<i64>,
+    ) -> Result<Vec<ScreenshotRecord>, String> {
+        let diag_start = std::time::Instant::now();
 
-        // 使用直接 SQL（参数绑定在 SQLCipher 中可能有问题
-        // start_dt end_dt 是我们生成的固定格式字符串，不存在 SQL 注入风险
-        let sql = format!(
-            "SELECT id, image_path, image_hash, width, height,
-                    window_title, process_name, metadata,
-                    window_title_enc, process_name_enc, metadata_enc,
-                    content_key_encrypted,
-                    strftime('%s', created_at) as timestamp, created_at
-             FROM screenshots
-             WHERE created_at BETWEEN '{}' AND '{}'
-             ORDER BY created_at ASC",
-            start_dt, end_dt
-        );
+        // Phase 1: Hold mutex only for SQL query, extract raw data without decryption
+        let raw_rows = {
+            let mut guard = self.get_connection()?;
+            let conn = guard.as_mut().unwrap();
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+            let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            let end_dt = DateTime::<Utc>::from_timestamp(end_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
 
-        let records: Vec<ScreenshotRecord> = stmt
-            .query_map([], |row| {
-                // timestamp 列是 strftime 返回的文本，需要解析为 i64
-                let timestamp_str: Option<String> = row.get(12)?;
-                let timestamp = timestamp_str.and_then(|s| s.parse::<i64>().ok());
+            let limit_clause = match max_records {
+                Some(n) => format!(" LIMIT {}", n),
+                None => String::new(),
+            };
 
-                let window_title_plain: Option<String> = row.get(5)?;
-                let process_name_plain: Option<String> = row.get(6)?;
-                let metadata_plain: Option<String> = row.get(7)?;
+            let sql = format!(
+                "SELECT id, image_path, image_hash, width, height,
+                        window_title, process_name, metadata,
+                        window_title_enc, process_name_enc, metadata_enc,
+                        content_key_encrypted,
+                        strftime('%s', created_at) as timestamp, created_at
+                 FROM screenshots
+                 WHERE created_at BETWEEN '{}' AND '{}'
+                 ORDER BY created_at ASC{}",
+                start_dt, end_dt, limit_clause
+            );
 
-                let window_title_enc: Option<Vec<u8>> = row.get(8)?;
-                let process_name_enc: Option<Vec<u8>> = row.get(9)?;
-                let metadata_enc: Option<Vec<u8>> = row.get(10)?;
-                let content_key_enc: Option<Vec<u8>> = row.get(11)?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
-                let mut row_key = content_key_enc
-                    .as_ref()
-                    .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+            let rows: Vec<RawScreenshotRow> = stmt
+                .query_map([], |row| RawScreenshotRow::from_row(row))
+                .map_err(|e| format!("Failed to execute query: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
 
-                let window_title = match (window_title_enc.as_ref(), row_key.as_ref()) {
-                    (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                        .ok()
-                        .and_then(|v| String::from_utf8(v).ok()),
-                    _ => window_title_plain,
-                };
-                let process_name = match (process_name_enc.as_ref(), row_key.as_ref()) {
-                    (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                        .ok()
-                        .and_then(|v| String::from_utf8(v).ok()),
-                    _ => process_name_plain,
-                };
-                let metadata = match (metadata_enc.as_ref(), row_key.as_ref()) {
-                    (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                        .ok()
-                        .and_then(|v| String::from_utf8(v).ok()),
-                    _ => metadata_plain,
-                };
+            rows
+            // guard is dropped here, mutex released
+        };
 
-                if let Some(ref mut key) = row_key {
-                    Self::zeroize_bytes(key);
-                }
+        let query_elapsed = diag_start.elapsed();
 
-                Ok(ScreenshotRecord {
-                    id: row.get(0)?,
-                    image_path: row.get(1)?,
-                    image_hash: row.get(2)?,
-                    width: row.get(3)?,
-                    height: row.get(4)?,
-                    window_title,
-                    process_name,
-                    timestamp,
-                    metadata,
-                    created_at: row.get(13)?,
-                })
-            })
-            .map_err(|e| format!("Failed to execute query: {}", e))?
-            .enumerate()
-            .filter_map(|(_, r)| r.ok())
+        // Phase 2: Decrypt outside mutex
+        let records: Vec<ScreenshotRecord> = raw_rows
+            .into_iter()
+            .map(|raw| raw.into_record())
             .collect();
 
-        // SQLCipher 整库加密，数据自动解密
+        if diag_start.elapsed().as_secs() >= 5 {
+            tracing::warn!("[DIAG:DB] get_screenshots_by_time_range({} ~ {}) returned {} records, query {:?}, total {:?}",
+                start_ts, end_ts, records.len(), query_elapsed, diag_start.elapsed());
+        }
         Ok(records)
     }
 
@@ -2129,93 +2198,50 @@ impl StorageState {
 
     /// 获取截图详情
     pub fn get_screenshot_by_id(&self, id: i64) -> Result<Option<ScreenshotRecord>, String> {
-        let guard = self.get_connection()?;
-        let conn = guard.as_ref().unwrap();
+        tracing::debug!("get_screenshot_by_id called with id={}", id);
 
-        println!("[Storage] get_screenshot_by_id called with id={}", id);
+        // Phase 1: Hold mutex only for SQL query, extract raw data
+        let raw_row = {
+            let guard = self.get_connection()?;
+            let conn = guard.as_ref().unwrap();
 
-        // 使用直接 SQL（SQLCipher 参数绑定可能有问题）
-        let sql = format!(
-            "SELECT id, image_path, image_hash, width, height,
-                    window_title, process_name, metadata,
-                    window_title_enc, process_name_enc, metadata_enc,
-                    content_key_encrypted,
-                    strftime('%s', created_at) as timestamp, created_at
-             FROM screenshots WHERE id = {}",
-            id
-        );
+            let sql = format!(
+                "SELECT id, image_path, image_hash, width, height,
+                        window_title, process_name, metadata,
+                        window_title_enc, process_name_enc, metadata_enc,
+                        content_key_encrypted,
+                        strftime('%s', created_at) as timestamp, created_at
+                 FROM screenshots WHERE id = {}",
+                id
+            );
 
-        let result = conn.query_row(&sql, [], |row| {
-            // timestamp 列是 strftime 返回的文本，需要解析为 i64
-            let timestamp_str: Option<String> = row.get(7)?;
-            let timestamp = timestamp_str.and_then(|s| s.parse::<i64>().ok());
+            let result = conn.query_row(&sql, [], |row| RawScreenshotRow::from_row(row));
 
-            let window_title_plain: Option<String> = row.get(5)?;
-            let process_name_plain: Option<String> = row.get(6)?;
-            let metadata_plain: Option<String> = row.get(7)?;
-
-            let window_title_enc: Option<Vec<u8>> = row.get(8)?;
-            let process_name_enc: Option<Vec<u8>> = row.get(9)?;
-            let metadata_enc: Option<Vec<u8>> = row.get(10)?;
-            let content_key_enc: Option<Vec<u8>> = row.get(11)?;
-
-            let mut row_key = content_key_enc
-                .as_ref()
-                .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
-
-            let window_title = match (window_title_enc.as_ref(), row_key.as_ref()) {
-                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                    .ok()
-                    .and_then(|v| String::from_utf8(v).ok()),
-                _ => window_title_plain,
-            };
-            let process_name = match (process_name_enc.as_ref(), row_key.as_ref()) {
-                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                    .ok()
-                    .and_then(|v| String::from_utf8(v).ok()),
-                _ => process_name_plain,
-            };
-            let metadata = match (metadata_enc.as_ref(), row_key.as_ref()) {
-                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                    .ok()
-                    .and_then(|v| String::from_utf8(v).ok()),
-                _ => metadata_plain,
-            };
-
-            if let Some(ref mut key) = row_key {
-                Self::zeroize_bytes(key);
+            match result {
+                Ok(raw) => Some(raw),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    tracing::debug!("No record found for id={}", id);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    tracing::error!("Query error for id={}: {}", id, e);
+                    return Err(format!("Failed to get screenshot: {}", e));
+                }
             }
+            // guard dropped here, mutex released
+        };
 
-            Ok(ScreenshotRecord {
-                id: row.get(0)?,
-                image_path: row.get(1)?,
-                image_hash: row.get(2)?,
-                width: row.get(3)?,
-                height: row.get(4)?,
-                window_title,
-                process_name,
-                timestamp,
-                metadata,
-                created_at: row.get(13)?,
-            })
-        });
-
-        match result {
-            Ok(record) => {
-                println!(
-                    "[Storage] Found record id={}, image_path={}",
+        // Phase 2: Decrypt outside mutex
+        match raw_row {
+            Some(raw) => {
+                let record = raw.into_record();
+                tracing::debug!(
+                    "Found record id={}, image_path={}",
                     record.id, record.image_path
                 );
                 Ok(Some(record))
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                println!("[Storage] No record found for id={}", id);
-                Ok(None)
-            }
-            Err(e) => {
-                println!("[Storage] Query error for id={}: {}", id, e);
-                Err(format!("Failed to get screenshot: {}", e))
-            }
+            None => Ok(None),
         }
     }
 
@@ -2398,26 +2424,40 @@ impl StorageState {
 
     /// 读取加密图片文件并返Base64 编码
     pub fn read_image(&self, path: &str) -> Result<(String, String), String> {
-        let guard = self.get_connection()?;
-        let conn = guard.as_ref().unwrap();
+        let diag_start = std::time::Instant::now();
 
-        let key_enc: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT content_key_encrypted FROM screenshots WHERE image_path = ?",
-                [path],
-                |row| row.get(0),
-            )
-            .ok();
+        // Phase 1: Hold mutex only for DB query to get the encrypted key
+        let (key_enc, abs_path) = {
+            let guard = self.get_connection()?;
+            let conn = guard.as_ref().unwrap();
 
+            let key: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT content_key_encrypted FROM screenshots WHERE image_path = ?",
+                    [path],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            let resolved = self.resolve_image_path(path);
+            (key, resolved)
+            // guard dropped here, mutex released
+        };
+
+        let query_elapsed = diag_start.elapsed();
+
+        // Phase 2: CNG decrypt + file read + AES decrypt + base64 — all outside mutex
         let mut row_key = key_enc
             .as_ref()
             .and_then(|enc| decrypt_row_key_with_cng(enc).ok())
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
-        let abs_path = self.resolve_image_path(path);
         let abs_path_str = abs_path.to_string_lossy().to_string();
         let result = read_encrypted_image_as_base64(&abs_path_str, &row_key);
         Self::zeroize_bytes(&mut row_key);
+        if diag_start.elapsed().as_secs() >= 5 {
+            tracing::warn!("[DIAG:DB] read_image({}) query {:?}, total {:?}", path, query_elapsed, diag_start.elapsed());
+        }
         result
     }
 }
@@ -2593,7 +2633,7 @@ impl StorageState {
                             .push(format!("Failed to delete {}: {}", path_str, e));
                     } else {
                         result.migrated += 1;
-                        println!("[storage] Migrated: {} -> {}", path_str, new_path);
+                        tracing::info!("Migrated: {} -> {}", path_str, new_path);
                     }
                 }
                 Err(e) => {
@@ -2687,7 +2727,7 @@ impl StorageState {
 
         for file in &files {
             if let Err(e) = std::fs::remove_file(file) {
-                eprintln!("Failed to delete {}: {}", file, e);
+                tracing::error!("Failed to delete {}: {}", file, e);
             } else {
                 deleted += 1;
             }

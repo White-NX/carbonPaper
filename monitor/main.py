@@ -7,6 +7,12 @@ try:
 except ImportError:
     pass
 
+from logging_config import setup_logging
+setup_logging()
+
+import logging
+logger = logging.getLogger(__name__)
+
 from monitor import start, stop, stop_event
 import argparse
 
@@ -21,20 +27,20 @@ def main():
 
   # 确保管道名和认证 token 都已提供
   if not args.pipe_name or not args.auth_token:
-    print('错误: 必须提供 --pipe-name 和 --auth-token 参数')
+    logger.error('必须提供 --pipe-name 和 --auth-token 参数')
     return 1
 
-  print(f'启动监控服务: pipe={args.pipe_name}, token={args.auth_token[:16]}..., storage_pipe={args.storage_pipe}')
+  logger.info(f'启动监控服务: pipe={args.pipe_name}, token={args.auth_token[:16]}..., storage_pipe={args.storage_pipe}')
 
   # 初始化存储客户端（如果提供了存储管道名）
   if args.storage_pipe:
     from storage_client import init_storage_client
     storage_client = init_storage_client(args.storage_pipe)
-    print(f'存储客户端已初始化: {args.storage_pipe}')
+    logger.info(f'存储客户端已初始化: {args.storage_pipe}')
 
   # 启动模块（包含截图线程与命名管道 IPC 服务器）
   start(_debug=False, pipe_name=args.pipe_name, auth_token=args.auth_token, storage_pipe=args.storage_pipe)
-  
+
   # 主线程仅等待，直到外部通过 IPC 或 Ctrl+C 停止
   try:
     while not stop_event.is_set():

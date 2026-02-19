@@ -1,7 +1,10 @@
 import threading
 import json
 import datetime
+import logging
 import pywintypes
+
+logger = logging.getLogger(__name__)
 import win32pipe
 import win32file
 import win32con
@@ -112,7 +115,7 @@ class _InheritedPipeServer:
                 pass
 
         except Exception as e:
-            print('Inherited pipe serve error:', e)
+            logger.error('Inherited pipe serve error: %s', e)
         finally:
             try:
                 win32file.CloseHandle(self.handle)
@@ -140,6 +143,8 @@ class _NamedPipeServer:
 
     def _client_handler(self, handle):
         """Handle a single client connection in a separate thread"""
+        import time as _time
+        _t0 = _time.perf_counter()
         try:
             # 读取请求（假设一次性发送完整 JSON）
             try:
@@ -157,6 +162,11 @@ class _NamedPipeServer:
             except Exception as e:
                 resp = {'error': str(e)}
 
+            _t1 = _time.perf_counter()
+            _cmd = req.get('command', '?') if isinstance(req, dict) else '?'
+            if (_t1 - _t0) > 5.0:
+                logger.warning('[DIAG:PIPE-PY] handler command=%s took %.3fs', _cmd, _t1 - _t0)
+
             out = json.dumps(resp, default=_json_default).encode('utf-8')
             try:
                 win32file.WriteFile(handle, out)
@@ -173,8 +183,10 @@ class _NamedPipeServer:
                     pass
 
     def _serve_loop(self):
+        import time as _time
         while not self._stop.is_set():
             try:
+                _t0 = _time.perf_counter()
                 handle = win32pipe.CreateNamedPipe(
                     self.pipe_name,
                     win32pipe.PIPE_ACCESS_DUPLEX,
@@ -185,8 +197,11 @@ class _NamedPipeServer:
                     0,
                     self.security_attrs,
                 )
+                _t1 = _time.perf_counter()
+                if (_t1 - _t0) > 5.0:
+                    logger.warning('[DIAG:PIPE-PY] CreateNamedPipe took %.3fs (GIL contention?)', _t1 - _t0)
             except Exception as e:
-                print('创建命名管道失败:', e)
+                logger.error('创建命名管道失败: %s', e)
                 # Sleep a bit to avoid hot loop on error
                 import time
                 time.sleep(1)
@@ -200,6 +215,10 @@ class _NamedPipeServer:
                     if e.winerror != 535:
                         win32file.CloseHandle(handle)
                         raise
+
+                _t2 = _time.perf_counter()
+                if (_t2 - _t1) > 5.0:
+                    logger.warning('[DIAG:PIPE-PY] Client connected (waited %.3fs since CreateNamedPipe)', _t2 - _t1)
 
                 # Spawn thread to handle this connection
                 t = threading.Thread(target=self._client_handler, args=(handle,))

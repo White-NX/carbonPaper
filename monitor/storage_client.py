@@ -3,8 +3,11 @@
 """
 import json
 import time
+import logging
 import threading
 from collections import OrderedDict
+
+logger = logging.getLogger(__name__)
 import win32file
 import win32pipe
 import pywintypes
@@ -161,7 +164,7 @@ class StorageClient:
                 self._public_key = base64.b64decode(public_key_b64)
                 return self._public_key
         
-        print(f"[storage_client] Failed to get public key: {response.get('error')}")
+        logger.error("[storage_client] Failed to get public key: %s", response.get('error'))
         return None
     
     def encrypt_for_chromadb(self, plaintext: str) -> Optional[str]:
@@ -191,7 +194,7 @@ class StorageClient:
                 self._cache_set(self._encrypt_cache, plaintext, encrypted)
             return encrypted
         
-        print(f"[storage_client] Encryption failed: {response.get('error')}")
+        logger.error("[storage_client] Encryption failed: %s", response.get('error'))
         return None
     
     def decrypt_from_chromadb(self, encrypted: str) -> Optional[str]:
@@ -221,7 +224,7 @@ class StorageClient:
                 self._cache_set(self._decrypt_cache, encrypted, decrypted)
             return decrypted
         
-        print(f"[storage_client] Decryption failed: {response.get('error')}")
+        logger.error("[storage_client] Decryption failed: %s", response.get('error'))
         return None
 
     def decrypt_many_from_chromadb(self, encrypted_list: List[str]) -> List[Optional[str]]:
@@ -270,7 +273,7 @@ class StorageClient:
                         self._cache_set(self._decrypt_cache, pending_values[i], decrypted)
                 return results
 
-        print(f"[storage_client] Batch decryption failed: {response.get('error')}")
+        logger.error("[storage_client] Batch decryption failed: %s", response.get('error'))
         return results
     
     def screenshot_exists(self, image_hash: str) -> bool:
