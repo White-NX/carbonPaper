@@ -1,8 +1,7 @@
-"""OCR引擎模块 - PaddleOCR 初始化和识别功能
+"""OCR引擎模块 - RapidOCR 初始化和识别功能
 
 修复说明:
-- 确保 PaddleOCR 实例为单例且线程安全，避免重复初始化导致内存增长。
-- 在推理后显式触发 Paddle CUDA 缓存清理与 GC，以释放临时内存。
+- 确保 OCR 实例为单例且线程安全，避免重复初始化导致内存增长。
 """
 import os
 import gc
@@ -14,12 +13,6 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-try:
-    import paddle
-except Exception:
-    paddle = None
-
-from paddleocr import PaddleOCR
 from rapidocr_capability import PaddleOCR as RapidPaddleOCR
 
 
@@ -40,7 +33,7 @@ def _get_ppocr_base_dir() -> str:
 
 
 class OCREngine:
-    """PaddleOCR 引擎封装类（线程安全单例）"""
+    """OCR 引擎封装类（线程安全单例）"""
 
     _instance: Optional['OCREngine'] = None
     _init_lock = threading.Lock()
@@ -58,6 +51,7 @@ class OCREngine:
         use_angle_cls: bool = False,
         lang: str = "ch",
         use_gpu: bool = False,
+        use_dml: bool = False,
         ocr_version: str = 'PP-OCRv5',
         model_size: str = "mobile",
         det_model_dir: Optional[str] = None,
@@ -65,12 +59,13 @@ class OCREngine:
         cls_model_dir: Optional[str] = None,
     ):
         """
-        初始化PaddleOCR引擎
-        
+        初始化OCR引擎
+
         Args:
             use_angle_cls: 是否启用方向分类器
             lang: 语言设置，默认中文
-            use_gpu: 是否使用GPU
+            use_gpu: 是否使用GPU（兼容参数）
+            use_dml: 是否使用 DirectML 加速
             ocr_version: OCR模型版本
             model_size: 模型尺寸，"mobile" 或 "server"，默认 mobile
             det_model_dir: 检测模型目录（可选）
@@ -81,10 +76,11 @@ class OCREngine:
         if getattr(self, '_initialized', False):
             return
 
-        logger.info("正在初始化 PaddleOCR (使用 %s)...", ocr_version)
+        logger.info("正在初始化 OCR (使用 %s, DirectML=%s)...", ocr_version, use_dml)
 
-        # 记录是否使用 GPU，以便推理后清理 GPU 缓存
+        # 记录是否使用 GPU
         self._use_gpu = bool(use_gpu)
+        self._use_dml = bool(use_dml)
 
         init_params = {
             'use_angle_cls': use_angle_cls,
@@ -93,18 +89,6 @@ class OCREngine:
             'use_doc_orientation_classify': False,
             'use_doc_unwarping': False,
         }
-
-        # 设置设备 (PaddleOCR 3.x+ 不再通过 init 参数支持 use_gpu)
-        if paddle is not None:
-            try:
-                device = 'gpu' if use_gpu else 'cpu'
-                paddle.device.set_device(device)
-                paddle.set_flags({
-                    "FLAGS_fraction_of_cpu_memory_to_use": 0.5,
-                    "FLAGS_use_pinned_memory": False,
-                })
-            except Exception as e:
-                logger.warning("Failed to set paddle device to %s: %s", device, e)
         
         # 如果未指定模型目录，默认使用 PP-OCRv5 mobile，并让 PaddleOCR 自行下载
         if not (det_model_dir and rec_model_dir and cls_model_dir):
@@ -157,42 +141,30 @@ class OCREngine:
             try:
                 init_params['ocr_version'] = ocr_version
                 init_params['cpu_threads'] = 1
-                # self.ocr = PaddleOCR(**init_params)
+                init_params['use_dml'] = self._use_dml
                 self.ocr = RapidPaddleOCR(**init_params)
             except Exception as e:
                 logger.error("使用 %s 初始化 RapidOCR 失败: %s", ocr_version, e)
-                # 旧版本兼容逻辑已移除，直接重试不带 ocr_version 参数（如果不是版本原因可能还是会失败）
-                # 但通常如果是参数错误，上面第一次就已经报了。这里保留一个回退尝试（例如 OCR version 不存在）
                 if 'ocr_version' in init_params:
                      del init_params['ocr_version']
                 try:
                     init_params['cpu_threads'] = 1
-                    self.ocr = PaddleOCR(**init_params)
+                    self.ocr = RapidPaddleOCR(**init_params)
                 except Exception as e2:
                     logger.error("重试初始化失败: %s", e2)
                     raise e2
 
             self._initialized = True
-            logger.info("PaddleOCR 初始化完成")
+            logger.info("OCR 初始化完成 (DirectML=%s)", self._use_dml)
 
     def close(self) -> None:
-        """显式释放 PaddleOCR 实例并尝试清理 GPU/内存缓存。
+        """显式释放 OCR 实例并清理内存。
 
         调用后再次使用需要重新创建实例。
         """
         try:
             if getattr(self, 'ocr', None) is not None:
                 del self.ocr
-        except Exception:
-            pass
-
-        # 尝试清理 Paddle GPU 缓存
-        try:
-            if paddle is not None and self._use_gpu:
-                try:
-                    paddle.device.cuda.empty_cache()
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -239,11 +211,6 @@ class OCREngine:
                 del result
             except Exception:
                 pass
-            if paddle is not None and self._use_gpu:
-                try:
-                    paddle.device.cuda.empty_cache()
-                except Exception:
-                    pass
             gc.collect()
             return []
 
@@ -317,16 +284,11 @@ class OCREngine:
         
         logger.info("[OCR Engine] 解析完成，得到 %d 个文本块，OCR任务用时 %.3f 秒", len(ocr_results), self.ocr.get_last_elapse()[2])
 
-        # 尝试清理临时对象与 GPU 缓存（如果使用 GPU）
+        # 清理临时对象
         try:
             del result
         except Exception:
             pass
-        if paddle is not None and self._use_gpu:
-            try:
-                paddle.device.cuda.empty_cache()
-            except Exception:
-                pass
         gc.collect()
 
         return ocr_results
@@ -441,6 +403,8 @@ class OCRVisualizer:
 # 便捷函数
 def get_ocr_engine(**kwargs) -> OCREngine:
     """获取OCR引擎实例（单例）"""
+    if 'use_dml' not in kwargs:
+        kwargs['use_dml'] = os.environ.get('CARBONPAPER_USE_DML', '').strip() == '1'
     return OCREngine(**kwargs)
 
 

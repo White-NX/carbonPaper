@@ -6,7 +6,10 @@
       "Bash(cargo build:*)",
       "Bash(pushd:*)",
       "Bash(dir:*)",
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:rapidai.github.io)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:pypi.org)"
     ]
   }
 }

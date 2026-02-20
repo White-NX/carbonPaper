@@ -747,6 +747,66 @@ fn perform_install_python_venv(
     if let Ok(arc_file) = log_file.lock() {
         if let Ok(mut f) = arc_file.as_ref().lock() {
             let _ = writeln!(&mut *f, "Required packages installed successfully.");
+            let _ = f.flush();
+        }
+    }
+
+    // onnxruntime and onnxruntime-directml cannot coexist; otherwise, DmlExecutionProvider will be lost.
+    // Other dependencies (such as chromadb) may have indirectly installed onnxruntime; 
+    // they need to be uninstalled and then onnxruntime-directml reinstalled.
+    {
+        if let Ok(arc_file) = log_file.lock() {
+            if let Ok(mut f) = arc_file.as_ref().lock() {
+                let _ = writeln!(&mut *f, "Fixing onnxruntime/onnxruntime-directml conflict...");
+                let _ = f.flush();
+            }
+        }
+        let _ = app_for_threads.emit("install-log", json!({"source":"installer","line": "Fixing onnxruntime/onnxruntime-directml conflict..."}));
+
+        // Step 1: uninstall onnxruntime (non-directml)
+        let mut uninstall_cmd = Command::new(&python_exec_cmd);
+        uninstall_cmd
+            .arg("-m").arg("pip").arg("uninstall").arg("onnxruntime").arg("-y");
+        #[cfg(windows)]
+        {
+            uninstall_cmd.creation_flags(0x08000000);
+        }
+        let _ = uninstall_cmd.output();
+
+        // Step 2: force-reinstall onnxruntime-directml (no-deps to avoid pulling onnxruntime back)
+        let mut reinstall_cmd = Command::new(&python_exec_cmd);
+        reinstall_cmd
+            .arg("-m").arg("pip").arg("install")
+            .arg("onnxruntime-directml==1.24.2")
+            .arg("--force-reinstall").arg("--no-deps")
+            .arg("-i").arg("https://mirrors.aliyun.com/pypi/simple/");
+        #[cfg(windows)]
+        {
+            reinstall_cmd.creation_flags(0x08000000);
+        }
+        match reinstall_cmd.output() {
+            Ok(output) => {
+                let msg = String::from_utf8_lossy(&output.stdout);
+                if let Ok(arc_file) = log_file.lock() {
+                    if let Ok(mut f) = arc_file.as_ref().lock() {
+                        let _ = writeln!(&mut *f, "onnxruntime-directml reinstall: {}", msg);
+                        let _ = f.flush();
+                    }
+                }
+            }
+            Err(e) => {
+                if let Ok(arc_file) = log_file.lock() {
+                    if let Ok(mut f) = arc_file.as_ref().lock() {
+                        let _ = writeln!(&mut *f, "Warning: failed to reinstall onnxruntime-directml: {}", e);
+                        let _ = f.flush();
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(arc_file) = log_file.lock() {
+        if let Ok(mut f) = arc_file.as_ref().lock() {
             let _ = writeln!(
                 &mut *f,
                 "Virtual environment and dependencies installed successfully at: {:?}",

@@ -468,6 +468,7 @@ fn get_advanced_config() -> Result<serde_json::Value, String> {
     let capture_on_ocr_busy = registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
     let ocr_queue_limit_enabled = registry_config::get_bool("ocr_queue_limit_enabled").unwrap_or(true);
     let ocr_queue_max_size = registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
+    let use_dml = registry_config::get_bool("use_dml").unwrap_or(false);
 
     Ok(serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
@@ -475,6 +476,7 @@ fn get_advanced_config() -> Result<serde_json::Value, String> {
         "capture_on_ocr_busy": capture_on_ocr_busy,
         "ocr_queue_limit_enabled": ocr_queue_limit_enabled,
         "ocr_queue_max_size": ocr_queue_max_size,
+        "use_dml": use_dml,
     }))
 }
 
@@ -494,6 +496,9 @@ fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     }
     if let Some(v) = config.get("ocr_queue_max_size").and_then(|v| v.as_u64()) {
         registry_config::set_u32("ocr_queue_max_size", v as u32)?;
+    }
+    if let Some(v) = config.get("use_dml").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("use_dml", v)?;
     }
     Ok(())
 }

@@ -1,6 +1,6 @@
 """入口：仅作为程序接入点，其他逻辑在 `monitor` 包中实现。"""
 
-# [CRITICAL] 必须在导入任何其他涉及 DLL 的库（如 paddleocr, cv2）之前导入 torch
+# [CRITICAL] 必须在导入任何其他涉及 DLL 的库（如 cv2）之前导入 torch
 # 否则会出现 WinError 127 (shm.dll dependency missing)
 try:
     import torch

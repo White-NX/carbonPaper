@@ -471,7 +471,8 @@ pub async fn start_monitor(
             python_executable, python_exists, script_path, script_abs, cwd, pipe_name, reverse_pipe_name
         );
 
-        // 启动 Python 进程
+        // Start the Python process with stdout/stderr piped, 
+        // and pass the pipe name and auth token as command line arguments (instead of environment variables)
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
 
@@ -486,7 +487,6 @@ pub async fn start_monitor(
 
         let mut cmd_proc = Command::new(&python_executable);
         // Pipe stdout/stderr so we can stream logs to the frontend
-        // 通过命令行参数传递管道名和认证 token（不使用环境变量）
         cmd_proc
             .arg("-u")
             .arg(&script_path)
@@ -499,7 +499,7 @@ pub async fn start_monitor(
             .env("PYTHONIOENCODING", "utf-8")
             .env("PROFILING_ENABLED", "1");
 
-        // 将当前 storage.data_dir 传给子进程，确保 Python 在启动时使用正确的 data 目录
+        // Pass the current storage.data_dir to the child process to ensure that Python uses the correct data directory at startup.
         if let Some(storage_state) = app.try_state::<Arc<StorageState>>() {
             let dd = storage_state
                 .data_dir
@@ -508,6 +508,11 @@ pub async fn start_monitor(
                 .to_string_lossy()
                 .to_string();
             cmd_proc.env("CARBONPAPER_DATA_DIR", dd);
+        }
+
+        // Pass DirectML configuration
+        if crate::registry_config::get_bool("use_dml").unwrap_or(false) {
+            cmd_proc.env("CARBONPAPER_USE_DML", "1");
         }
 
         cmd_proc

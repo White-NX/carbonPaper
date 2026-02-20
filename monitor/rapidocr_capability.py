@@ -2,7 +2,7 @@
 RapidOCR to PaddleOCR 3.3 Compatibility Layer
 """
 
-from rapidocr_onnxruntime import RapidOCR
+from rapidocr import RapidOCR
 from typing import Union, List, Optional
 import numpy as np
 from PIL import Image
@@ -16,7 +16,8 @@ class PaddleOCR:
     - use_angle_cls: 是否使用方向分类器
     - lang: 语言（'ch', 'en'等，但RapidOCR主要支持中英文）
     - show_log: 是否显示日志
-    - use_gpu: GPU加速
+    - use_gpu: GPU加速（兼容参数）
+    - use_dml: 是否使用 DirectML 加速
     - cpu_threads: CPU线程数（不知道实际上有没有作用的参数）
     - use_doc_orientation_classify: 文档方向分类（兼容）
     - use_doc_unwarping: 文档去畸变（兼容）
@@ -30,6 +31,7 @@ class PaddleOCR:
         use_angle_cls: bool = True,
         lang: str = "ch",
         use_gpu: bool = False,
+        use_dml: bool = False,
         show_log: bool = False,
         cpu_threads: int = 2,
         use_doc_orientation_classify: bool = False,
@@ -44,18 +46,20 @@ class PaddleOCR:
         Args:
             use_angle_cls: 是否使用文字方向分类
             lang: 语言类型（兼容参数，实际由RapidOCR处理）
-            use_gpu: 是否使用GPU（RapidOCR-ONNX不支持，会忽略）
+            use_gpu: 是否使用GPU（兼容参数）
+            use_dml: 是否使用 DirectML 加速（需要 onnxruntime-directml）
             show_log: 是否显示日志
             cpu_threads: CPU线程数（不知道为什么在主程序中被使用了，之后会移除）
             TODO: 移除 cpu_threads 参数
         """
-        if use_gpu and show_log:
-            print(
-                "[WARNING] RapidOCR did not support GPU acceleration in ONNX version. Ignoring use_gpu=True."
-            )
-
         # 初始化RapidOCR引擎
-        self.engine = RapidOCR(use_angle_cls=use_angle_cls, print_verbose=show_log)
+        params = {
+            "Global.use_cls": use_angle_cls,
+            "Global.log_level": "DEBUG" if show_log else "WARNING",
+        }
+        if use_dml:
+            params["EngineConfig.onnxruntime.use_dml"] = True
+        self.engine = RapidOCR(params=params)
 
         self.lang = lang
         self.show_log = show_log
@@ -104,21 +108,22 @@ class PaddleOCR:
             - text: str, 识别的文本
             - score: float, 置信度(0-1)
         """
-        # 调用RapidOCR
-        result, elapse = self.engine(img)
-        self._last_elapse = elapse
+        # 调用RapidOCR（新版返回 RapidOCROutput 对象）
+        result = self.engine(img)
+        self._last_elapse = result.elapse
+        self._last_elapse_list = result.elapse_list
 
         # 转换为PaddleOCR 3.3格式
-        if result is None or len(result) == 0:
+        if result.boxes is None or len(result.boxes) == 0:
             # 空结果：返回 [[]]
             return [[]]
 
-        # 转换格式：RapidOCR [box, text, score] -> PaddleOCR [box, (text, score)]
+        # 转换格式：RapidOCROutput -> PaddleOCR [box, (text, score)]
         paddle_format = []
-        for item in result:
-            box = item[0]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-            text = item[1]  # str
-            score = item[2]  # float
+        for i in range(len(result.txts)):
+            box = result.boxes[i].tolist() if hasattr(result.boxes[i], 'tolist') else result.boxes[i]
+            text = result.txts[i]
+            score = result.scores[i]
 
             # 组装成PaddleOCR格式
             paddle_format.append([box, (text, score)])
@@ -126,11 +131,13 @@ class PaddleOCR:
         # 外层再包一层列表（模拟多页结果）
         return [paddle_format]
 
-    def get_last_elapse(self) -> float:
+    def get_last_elapse(self):
         """
-        获取上次OCR耗时（秒）
-        这是额外添加的方法，PaddleOCR原生不支持
+        获取上次OCR耗时
+        返回 (det_time, cls_time, rec_time) 元组或总耗时
         """
+        if hasattr(self, '_last_elapse_list') and self._last_elapse_list:
+            return self._last_elapse_list
         return self._last_elapse
 
     def __call__(self, img, **kwargs):
