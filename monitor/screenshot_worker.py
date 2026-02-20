@@ -734,6 +734,9 @@ class ScreenshotOCRWorker:
         end_time: Optional[float] = None
     ) -> list:
         """使用自然语言搜索图片"""
+        import time as _time
+        _t_total = _time.perf_counter()
+
         if not self.vector_store:
             raise RuntimeError("向量存储未启用")
 
@@ -742,7 +745,9 @@ class ScreenshotOCRWorker:
         buffer_multiplier = 2
         fetch_count = max(target_count * buffer_multiplier, target_count + 20)
 
+        _t0 = _time.perf_counter()
         raw_results = self.vector_store.search_by_text(query, n_results=fetch_count)
+        _t_vector_search = _time.perf_counter() - _t0
 
         filtered: List[Dict[str, Any]] = []
         normalized_processes = None
@@ -760,6 +765,8 @@ class ScreenshotOCRWorker:
         start_ts = float(start_time) if start_time is not None else None
         end_ts = float(end_time) if end_time is not None else None
 
+        _t0 = _time.perf_counter()
+        _db_query_count = 0
         for item in raw_results:
             metadata = item.get('metadata') or {}
             process_name = (metadata.get('process_name') or '').strip()
@@ -776,6 +783,7 @@ class ScreenshotOCRWorker:
             try:
                 if screenshot_id and int(screenshot_id) >= 0:
                     record = self.db_handler.get_screenshot_by_id(int(screenshot_id))
+                    _db_query_count += 1
             except (ValueError, TypeError):
                 record = None
 
@@ -790,9 +798,19 @@ class ScreenshotOCRWorker:
                 continue
 
             filtered.append(item)
+        _t_filter = _time.perf_counter() - _t0
 
         # 应用偏移与限制
-        return filtered[int(offset): int(offset) + int(n_results)]
+        result = filtered[int(offset): int(offset) + int(n_results)]
+
+        logger.warning(
+            "[DIAG:search_nl] vector_search=%.3fs filter=%.3fs "
+            "db_queries=%d raw=%d filtered=%d returned=%d total=%.3fs",
+            _t_vector_search, _t_filter,
+            _db_query_count, len(raw_results), len(filtered), len(result),
+            _time.perf_counter() - _t_total
+        )
+        return result
 
     def list_processes(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """返回数据库中的进程列表"""

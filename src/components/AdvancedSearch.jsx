@@ -3,6 +3,7 @@ import { Search, SlidersHorizontal, Filter, CalendarRange, X, Loader2, RefreshCw
 import { searchScreenshots, fetchImage, listProcesses } from '../lib/monitor_api';
 
 const PAGE_SIZE = 40;
+const NL_PAGE_SIZE = 100;
 
 function useDebouncedValue(value, delay = 300) {
   const [debounced, setDebounced] = useState(value);
@@ -144,6 +145,74 @@ function ResultPreview({ item, mode, onSelect, queryTokens }) {
             </div>
           )}
         </div>
+      </div>
+    </button>
+  );
+}
+
+function ThumbnailCard({ item, onSelect }) {
+  const [imageSrc, setImageSrc] = useState(null);
+  const [loadingImage, setLoadingImage] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const loadImage = async () => {
+      if (!item) return;
+      const screenshotId = item.screenshot_id ?? item.metadata?.screenshot_id;
+      const id = typeof screenshotId === 'number' && screenshotId > 0 ? screenshotId : null;
+      const targetPath = item.image_path || item.metadata?.image_path || item.path;
+      if (!id && !targetPath) return;
+      setLoadingImage(true);
+      const dataUrl = await fetchImage(id, id ? null : targetPath);
+      if (active) {
+        setImageSrc(dataUrl);
+        setLoadingImage(false);
+      }
+    };
+    loadImage();
+    return () => { active = false; };
+  }, [item]);
+
+  const processName = item.metadata?.process_name;
+  const similarity = item.similarity;
+
+  const normalizedItem = {
+    ...item,
+    id: item.screenshot_id || item.id,
+    path: item.image_path || item.metadata?.image_path || item.path,
+  };
+
+  return (
+    <button
+      className="group relative aspect-video overflow-hidden rounded border
+                 border-ide-border bg-ide-panel hover:border-ide-accent/70
+                 transition focus-visible:outline-none focus-visible:ring-2
+                 focus-visible:ring-ide-accent/60"
+      onClick={(event) => {
+        event.stopPropagation();
+        onSelect(normalizedItem);
+      }}
+    >
+      {imageSrc ? (
+        <img src={imageSrc} className="h-full w-full object-cover" loading="lazy" />
+      ) : loadingImage ? (
+        <div className="flex h-full w-full items-center justify-center">
+          <Loader2 className="w-4 h-4 animate-spin text-ide-muted" />
+        </div>
+      ) : (
+        <div className="flex h-full w-full items-center justify-center bg-ide-bg text-ide-muted text-xs">
+          No Image
+        </div>
+      )}
+      <div className="pointer-events-none absolute inset-0 flex flex-col justify-end
+                      bg-gradient-to-t from-black/60 to-transparent opacity-0
+                      transition group-hover:opacity-100 p-2">
+        <span className="text-xs text-white font-semibold truncate">{processName || 'Unknown'}</span>
+        {similarity !== undefined && (
+          <span className="text-[10px] text-white/80">
+            Similarity: {similarity.toFixed(2)}
+          </span>
+        )}
       </div>
     </button>
   );
@@ -324,8 +393,9 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
 
     setLoading(true);
     offsetRef.current = 0;
+    const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
     const fetched = await searchScreenshots(normalizedQuery, mode, {
-      limit: PAGE_SIZE,
+      limit: pageSize,
       offset: 0,
       processNames: selectedProcesses,
       startTime: computeTimestamp(startDate),
@@ -333,7 +403,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
       fuzzy: mode !== 'nl'
     });
     setResults(fetched);
-    setHasMore(fetched.length === PAGE_SIZE);
+    setHasMore(fetched.length === pageSize);
     offsetRef.current = fetched.length;
     setLoading(false);
   }, [active, debouncedQuery, mode, selectedProcesses, startDate, endDate, computeTimestamp]);
@@ -352,8 +422,9 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMore || loading) return;
     setLoadingMore(true);
+    const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
     const fetched = await searchScreenshots(debouncedQuery.trim(), mode, {
-      limit: PAGE_SIZE,
+      limit: pageSize,
       offset: offsetRef.current,
       processNames: selectedProcesses,
       startTime: computeTimestamp(startDate),
@@ -361,7 +432,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
       fuzzy: mode !== 'nl'
     });
     setResults((prev) => [...prev, ...fetched]);
-    setHasMore(fetched.length === PAGE_SIZE);
+    setHasMore(fetched.length === pageSize);
     offsetRef.current += fetched.length;
     setLoadingMore(false);
   }, [debouncedQuery, mode, selectedProcesses, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading]);
@@ -494,18 +565,30 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
             )}
           </div>
         )}
-        <ul className="divide-y divide-ide-border">
-          {results.map((item, index) => (
-            <li key={`${item.id || item.image_path || index}-${index}`}>
-              <ResultPreview
+        {mode === 'nl' ? (
+          <div className="grid grid-cols-2 gap-2 p-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+            {results.map((item, index) => (
+              <ThumbnailCard
+                key={`${item.id || item.image_path || index}-${index}`}
                 item={item}
-                mode={mode}
-                queryTokens={queryTokens}
                 onSelect={(payload) => onSelectResult?.(payload)}
               />
-            </li>
-          ))}
-        </ul>
+            ))}
+          </div>
+        ) : (
+          <ul className="divide-y divide-ide-border">
+            {results.map((item, index) => (
+              <li key={`${item.id || item.image_path || index}-${index}`}>
+                <ResultPreview
+                  item={item}
+                  mode={mode}
+                  queryTokens={queryTokens}
+                  onSelect={(payload) => onSelectResult?.(payload)}
+                />
+              </li>
+            ))}
+          </ul>
+        )}
         <div ref={sentinelRef} className="py-4 flex items-center justify-center text-ide-muted text-xs">
           {loadingMore && (
             <>

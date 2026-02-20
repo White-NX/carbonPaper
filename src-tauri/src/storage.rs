@@ -1,7 +1,7 @@
-//! 存储管理模块 - SQLCipher 加密数据库和截图文件管理
+//! Storage Management Module - SQLCipher Encrypted SQLite Database and File Storage
 //!
-//! 该模块提供：
-//! 1. 加密SQLite 数据库存储（使用 SQLCipher）
+//! This module provides:
+//! 1. 加密 SQLite 数据库存储（使用 SQLCipher）
 //! 2. 截图文件的存储和管理
 //! 3. OCR 数据的存储和搜索
 
@@ -48,23 +48,22 @@ impl Drop for MigrationRunGuard<'_> {
     }
 }
 
-/// 存储管理器状
+/// StorageState manages the encrypted database connection, data directory paths, and migration state. 
+/// It provides methods for initializing storage, saving/loading screenshots and OCR results, and migrating the data directory.
 pub struct StorageState {
-    /// 数据库连
+    /// Database connection
     db: Mutex<Option<Connection>>,
-    /// 数据目录
+    /// Data directory (contains database, screenshots, logs, etc.)
     pub data_dir: Mutex<PathBuf>,
-    /// 截图目录
     pub screenshot_dir: Mutex<PathBuf>,
-    /// 凭证管理器状态引
+    /// credential manager state for encryption key management
     credential_state: Arc<CredentialManagerState>,
-    /// 是否已初始化
     initialized: Mutex<bool>,
     migration_cancel_requested: AtomicBool,
     migration_in_progress: AtomicBool,
 }
 
-/// 截图记录
+/// Screenshot record representing a row in the screenshots table, with decrypted fields. This is the main struct used for returning screenshot data to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenshotRecord {
     pub id: i64,
@@ -79,7 +78,7 @@ pub struct ScreenshotRecord {
     pub timestamp: Option<i64>,
 }
 
-/// OCR 结果记录
+/// OcrResult representing a row in the ocr_results table, with decrypted fields. This is used for returning OCR data to the frontend and for search results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OcrResult {
     pub id: i64,
@@ -90,7 +89,7 @@ pub struct OcrResult {
     pub created_at: String,
 }
 
-/// 搜索结果
+/// SeacrhResult representing the combined data from screenshots and ocr_results for search results returned to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub id: i64,
@@ -105,10 +104,10 @@ pub struct SearchResult {
     pub screenshot_created_at: String,
 }
 
-/// 存储保存请求
+/// The input for saving a screenshot, containing all necessary data and metadata. The image data is expected to be Base64 encoded to allow passing through JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveScreenshotRequest {
-    pub image_data: String, // Base64 编码的图片数
+    pub image_data: String, // Base64 encoded image data
     pub image_hash: String,
     pub width: i32,
     pub height: i32,
@@ -126,7 +125,7 @@ pub struct OcrResultInput {
     pub box_coords: Vec<Vec<f64>>,
 }
 
-/// 存储响应
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveScreenshotResponse {
     pub status: String,
@@ -137,6 +136,9 @@ pub struct SaveScreenshotResponse {
 }
 
 /// Raw row data extracted from DB without decryption (for releasing mutex early)
+/// 
+/// The `_plain` fields are for backward compatibility with old unencrypted records, 
+/// it will be ignored if the corresponding `_enc` fields are present and can be decrypted successfully.
 struct RawScreenshotRow {
     id: i64,
     image_path: String,
@@ -261,7 +263,7 @@ impl StorageState {
         }
     }
 
-    /// 安全关闭存储，释放数据库连接和其他句
+    /// Request cancellation of an ongoing migration. 
     pub fn request_migration_cancel(&self) -> bool {
         self.migration_cancel_requested.store(true, Ordering::SeqCst);
         self.migration_in_progress.load(Ordering::SeqCst)
@@ -326,7 +328,10 @@ impl StorageState {
         Ok(())
     }
 
-    /// 更新 data 目录。可选执行完整迁移（copy + remove），并过 app_handle 发出进度事件    /// 返回 JSON 对象 { target: String, migrated: bool }
+    /// 更新 data 目录。可选执行完整迁移（copy + remove），并过 app_handle 发出进度事件    
+    /// 
+    /// 返回 JSON 对象 { target: String, migrated: bool }
+    /// 
     /// 规范化路径用于安全比较（解析符号链接、`.`、`..` 等）
     fn canonicalize_for_compare(p: &Path) -> PathBuf {
         std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
@@ -611,7 +616,7 @@ impl StorageState {
         std::fs::create_dir_all(&screenshot_dir)
             .map_err(|e| format!("Failed to create screenshot directory: {}", e))?;
 
-        // 使用公钥派生弱数据库密钥（无霢用户认证
+        // 使用公钥派生弱数据库密钥（无需用户认证
         let public_key = get_cached_public_key(&self.credential_state)
             .or_else(|| load_public_key_from_file(&self.credential_state).ok())
             .ok_or_else(|| "Public key not initialized".to_string())?;
@@ -795,13 +800,6 @@ impl StorageState {
         Ok(guard)
     }
 
-    /// 计算数据 MD5 哈希
-    fn compute_hash(data: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let result = Sha256::digest(data);
-        hex::encode(result)
-    }
-
     /// HMAC 用于盲索引
     fn compute_hmac_hash(text: &str) -> String {
         type HmacSha256 = Hmac<sha2::Sha256>;
@@ -858,7 +856,7 @@ impl StorageState {
     fn bigram_tokenize(text: &str) -> HashSet<String> {
         let chars: Vec<char> = text.chars().collect();
         if chars.len() < 2 {
-            return HashSet::new(); // 忽略过短的文
+            return HashSet::new(); // ignore texts too short for bigrams
         }
 
         chars.windows(2).map(|w| w.iter().collect()).collect()
@@ -879,6 +877,7 @@ impl StorageState {
         )
     }
 
+    /// Zeroize sensitive data in memory to reduce risk of leakage.
     fn zeroize_bytes(bytes: &mut [u8]) {
         use std::sync::atomic::{compiler_fence, Ordering};
         for b in bytes.iter_mut() {
@@ -1132,7 +1131,7 @@ impl StorageState {
                         continue;
                     }
 
-                    // 插入 OCR 结果（文本保留明文用于搜索）
+                    // Insert new OCR result, with encrypted text and blind index update in a transaction
                     conn.execute(
                         "INSERT INTO ocr_results (
                             screenshot_id, text, text_hash, text_enc, text_key_encrypted, confidence,
