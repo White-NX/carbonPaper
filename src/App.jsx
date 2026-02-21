@@ -77,8 +77,13 @@ function App() {
   const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
   const [timelineRefreshKey, setTimelineRefreshKey] = useState(0);
 
-  // debug 
+  // debug
   const [pythonVersion, setPythonVersion] = useState(null);
+
+  // Dependency sync state
+  const [depsNeedUpdate, setDepsNeedUpdate] = useState(false);
+  const [depsSyncing, setDepsSyncing] = useState(false);
+  const [depsCheckDone, setDepsCheckDone] = useState(false);
 
   // State to trigger timeline jumps
   const [timelineJump, setTimelineJump] = useState(null); // { time: number, ts: number }
@@ -476,18 +481,38 @@ function App() {
     if (!autoStartMonitor) return;
     if (autoStartSuppressed) return;
     if (!pythonVersion) return;
+    if (!depsCheckDone) return;
+    if (depsNeedUpdate || depsSyncing) return;
     if (backendStatus === 'offline' && backendStatusRef.current !== 'waiting') {
       handleStartBackend();
     }
-  }, [autoStartMonitor, autoStartSuppressed, backendStatus, pythonVersion, handleStartBackend]);
+  }, [autoStartMonitor, autoStartSuppressed, backendStatus, pythonVersion, handleStartBackend, depsNeedUpdate, depsSyncing, depsCheckDone]);
 
   // debug: print out python version
   const refreshPythonVersion = useCallback(async () => {
     try {
       const version = await invoke('check_python_venv');
       setPythonVersion(version);
+
+      // Check if dependencies need syncing after an update
+      if (version) {
+        try {
+          const result = await invoke('check_deps_freshness');
+          if (result?.needs_update) {
+            console.log('Deps need update, reason:', result.reason);
+            setDepsNeedUpdate(true);
+          } else {
+            setDepsNeedUpdate(false);
+          }
+        } catch (err) {
+          console.warn('Failed to check deps freshness:', err);
+          setDepsNeedUpdate(false);
+        }
+      }
     } catch (error) {
       console.error('Error fetching Python version:', error);
+    } finally {
+      setDepsCheckDone(true);
     }
   }, []);
 
@@ -551,9 +576,22 @@ function App() {
   const bumpTimelineRefresh = useCallback(() => {
     setTimelineRefreshKey((prev) => prev + 1);
   }, []);
+
+  const handleDepsSync = useCallback(async () => {
+    setDepsSyncing(true);
+    try {
+      await invoke('sync_python_deps');
+      setDepsNeedUpdate(false);
+    } catch (err) {
+      throw err;
+    } finally {
+      setDepsSyncing(false);
+    }
+  }, []);
   return (
     <div
-      className="flex flex-col h-screen w-screen bg-ide-bg text-ide-text overflow-hidden font-sans"
+      data-tauri-drag-region
+      className="h-screen w-screen text-ide-text overflow-hidden font-sans topbar-acrylic flex flex-col"
       onClickCapture={handleGlobalClick}
     >
       <TopBar
@@ -572,12 +610,16 @@ function App() {
         onSearchModeChange={setSearchMode}
       />
 
+      <div className={`flex-1 min-h-0 flex flex-col overflow-hidden relative ${isMaximized ? '' : 'mx-[3px] mb-[3px] rounded-md'}`}>
       <Mask
         backendStatus={backendStatus}
         pythonVersion={pythonVersion}
         backendError={backendError}
         handleStartBackend={handleStartBackend}
         onRefreshPythonVersion={refreshPythonVersion}
+        depsNeedUpdate={depsNeedUpdate}
+        depsSyncing={depsSyncing}
+        onDepsSync={handleDepsSync}
       />
 
       <AuthMask
@@ -599,7 +641,7 @@ function App() {
       />
 
       {/* Main Workspace Grid */}
-      <main className="flex-1 flex flex-col md:grid md:grid-cols-[250px_1fr] overflow-hidden relative">
+      <main className="flex-1 flex flex-col md:grid md:grid-cols-[250px_1fr] overflow-hidden relative bg-ide-bg">
         <LeftSidebar selectedEvent={selectedEvent} selectedDetails={selectedDetails} />
 
         <MainArea
@@ -664,6 +706,7 @@ function App() {
           onCopyText={handleCopyText}
         />
       </main>
+      </div>
 
       <NotificationToast
         notifications={notifications.slice(0, 3)}

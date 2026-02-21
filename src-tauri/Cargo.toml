@@ -52,6 +52,7 @@ roaring = "0.11.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 flate2 = "1"
+window-vibrancy = "0.5"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

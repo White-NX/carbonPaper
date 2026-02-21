@@ -7,7 +7,7 @@
 :root {
   font-family: 'Google Sans Flex', 'Inter', system-ui, sans-serif;
   color: var(--ide-text);
-  background-color: var(--ide-bg);
+  background-color: transparent;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 
@@ -38,8 +38,12 @@
   --ide-success: #89d185;
 }
 
+html, body {
+  background: transparent !important;
+}
+
 body {
-  @apply font-sans bg-ide-bg text-ide-text overflow-hidden;
+  @apply font-sans text-ide-text overflow-hidden;
   height: 100vh;
   width: 100vw;
 }
@@ -100,6 +104,17 @@ body {
 .toggle-desc {
   max-width: 400px;
   @apply break-words whitespace-normal;
+}
+
+/* 顶栏亚克力磨砂效果 */
+.topbar-acrylic {
+  background-color: rgba(255, 255, 255, 0.65);
+  backdrop-filter: blur(12px) saturate(180%);
+  -webkit-backdrop-filter: blur(12px) saturate(180%);
+}
+
+.dark .topbar-acrylic {
+  background-color: rgba(37, 37, 38, 0.65);
 }
 
 

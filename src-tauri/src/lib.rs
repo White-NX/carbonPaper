@@ -22,6 +22,7 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Emitter;
 use tauri::Manager;
+use window_vibrancy::apply_acrylic;
 
 const MENU_ID_OPEN: &str = "open";
 const MENU_ID_PAUSE: &str = "pause";
@@ -677,6 +678,12 @@ pub fn run() {
             let data_dir = data_dir.clone();
             move |app| {
             build_tray(app)?;
+
+            // 应用亚克力磨砂透明效果
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
+            }
+
             analysis::start_memory_sampler(app.handle().clone());
             logging::spawn_maintenance_task(data_dir.clone());
             
@@ -772,6 +779,8 @@ pub fn run() {
             python::check_python_venv,
             python::request_install_python,
             python::install_python_venv,
+            python::check_deps_freshness,
+            python::sync_python_deps,
             model_management::download_model,
             // Updater commands
             updater::updater_check,

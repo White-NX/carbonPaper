@@ -1,14 +1,15 @@
 import React, { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Shield, ShieldCheck, Clock, Info, ChevronDown, AlertTriangle } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
-// PIN 暂存时间选项（单位：秒）
-const SESSION_TIMEOUT_OPTIONS = [
-  { value: 300, label: '5 分钟', description: '较高安全性' },
-  { value: 900, label: '15 分钟', description: '推荐' },
-  { value: 3600, label: '1 小时', description: '方便使用' },
-  { value: 86400, label: '1 天', description: '较低安全性' },
-  { value: -1, label: '直到关闭', description: '不推荐', warning: true },
+// 会话超时选项的固定值; 标签/描述由 i18n 在组件内生成
+const SESSION_TIMEOUT_VALUES = [
+  { value: 300, key: '5m' },
+  { value: 900, key: '15m' },
+  { value: 3600, key: '1h' },
+  { value: 86400, key: '1d' },
+  { value: -1, key: 'until_close', warning: true },
 ];
 
 /**
@@ -21,12 +22,20 @@ export default function SecuritySection({
   isSessionValid,
   onLockSession,
 }) {
+  const { t } = useTranslation();
   const [showTimeoutDropdown, setShowTimeoutDropdown] = useState(false);
   const [isLocking, setIsLocking] = useState(false);
 
+  // 构建本地化的超时选项
+  const SESSION_TIMEOUT_OPTIONS = SESSION_TIMEOUT_VALUES.map((opt) => ({
+    value: opt.value,
+    label: t(`settings.security.session.options.${opt.key}.label`),
+    description: t(`settings.security.session.options.${opt.key}.description`),
+    warning: Boolean(opt.warning),
+  }));
+
   // 获取当前选中的超时选项
-  const currentOption = SESSION_TIMEOUT_OPTIONS.find(opt => opt.value === sessionTimeout) 
-    || SESSION_TIMEOUT_OPTIONS[1]; // 默认 15 分钟
+  const currentOption = SESSION_TIMEOUT_OPTIONS.find((opt) => opt.value === sessionTimeout) || SESSION_TIMEOUT_OPTIONS[1]; // 默认 15 分钟
 
   const handleTimeoutChange = async (value) => {
     setShowTimeoutDropdown(false);
@@ -71,11 +80,11 @@ export default function SecuritySection({
             <ShieldCheck className="w-5 h-5 text-blue-400" />
           </div>
           <div className="flex-1 min-w-0">
-            <h3 className="text-sm font-semibold text-ide-text flex items-center gap-2">
-              数据受到 Windows CNG 保护
+              <h3 className="text-sm font-semibold text-ide-text flex items-center gap-2">
+              {t('settings.security.protection.title')}
             </h3>
             <p className="text-xs text-ide-muted mt-1 leading-relaxed">
-              您的快照数据已使用 Windows CNG 管理的凭据加密。只有通过您的授权才能访问数据。
+              {t('settings.security.protection.description')}
             </p>
           </div>
         </div>
@@ -84,16 +93,14 @@ export default function SecuritySection({
       {/* PIN 暂存时间设置 */}
       <div className="space-y-3">
         <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
-          解锁有效期
+          {t('settings.security.unlock_label')}
         </label>
         
         <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1 min-w-0">
-              <p className="text-sm text-ide-text font-medium">自动锁定时间</p>
-              <p className="text-xs text-ide-muted mt-1">
-                设置在用户无操作多长时间后自动锁定并需要重新验证
-              </p>
+              <p className="text-sm text-ide-text font-medium">{t('settings.security.session.title')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.security.session.description')}</p>
             </div>
             
             {/* 下拉选择器 */}
@@ -148,7 +155,7 @@ export default function SecuritySection({
             <div className="flex items-center gap-2">
               <div className={`w-2 h-2 rounded-full ${isSessionValid ? 'bg-green-400' : 'bg-red-400'}`} />
               <span className="text-xs text-ide-muted">
-                当前会话：{isSessionValid ? '已解锁' : '已锁定'}
+                {t('settings.security.session.current.label')} {isSessionValid ? t('settings.security.session.current.unlocked') : t('settings.security.session.current.locked')}
               </span>
             </div>
             
@@ -158,7 +165,7 @@ export default function SecuritySection({
                 disabled={isLocking}
                 className="px-3 py-1.5 text-xs text-ide-muted hover:text-ide-text hover:bg-ide-hover rounded-lg transition-colors disabled:opacity-50"
               >
-                {isLocking ? '锁定中...' : '立即锁定'}
+                {isLocking ? t('settings.security.session.locking') : t('settings.security.session.lock_now')}
               </button>
             )}
           </div>

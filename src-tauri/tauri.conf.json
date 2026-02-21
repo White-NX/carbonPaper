@@ -15,7 +15,8 @@
         "title": "carbonpaper",
         "width": 1300,
         "height": 750,
-        "decorations": false
+        "decorations": false,
+        "transparent": true
       }
     ],
     "security": {

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { X, Loader2, Trash2, AlertTriangle, Clock } from 'lucide-react';
 
 export default function CaptureFiltersSection({
@@ -20,6 +21,14 @@ export default function CaptureFiltersSection({
   isDeleting,
   deleteMessage,
 }) {
+  const { t } = useTranslation();
+  const deleteOptions = [
+    { id: '5min', minutes: 5, key: '5min' },
+    { id: '30min', minutes: 30, key: '30min' },
+    { id: '1hour', minutes: 60, key: '1hour' },
+    { id: 'today', minutes: 'today', key: 'today' },
+  ].map((opt) => ({ ...opt, label: t(`settings.captureFilters.quickDelete.options.${opt.key}`) }));
+
   return (
     <div className="space-y-8">
       {/* Quick Delete Section */}
@@ -30,11 +39,11 @@ export default function CaptureFiltersSection({
       />
 
       <div className="space-y-3">
-        <label className="text-sm font-semibold text-ide-accent px-1 block">Capture Filters</label>
+        <label className="text-sm font-semibold text-ide-accent px-1 block">{t('settings.captureFilters.title')}</label>
         <div className="p-4 bg-ide-bg border border-ide-border rounded-xl text-sm text-ide-muted space-y-3">
           <div className="space-y-4">
             <div>
-              <label className="block mb-2 font-semibold text-ide-text">按进程名称忽略</label>
+              <label className="block mb-2 font-semibold text-ide-text">{t('settings.captureFilters.processes.label')}</label>
               <div className="flex flex-wrap gap-2 mb-3 min-h-[1.5rem]">
                 {(filterSettings.processes || []).map((p) => (
                   <span
@@ -42,12 +51,12 @@ export default function CaptureFiltersSection({
                     className="inline-flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 bg-ide-panel border border-ide-border rounded-full text-xs text-ide-text group"
                   >
                     {p}
-                    <button onClick={() => onRemoveProcess(p)} className="p-0.5 rounded-full hover:bg-ide-hover text-ide-muted hover:text-red-400 transition-colors" title="移除">
+                    <button onClick={() => onRemoveProcess(p)} className="p-0.5 rounded-full hover:bg-ide-hover text-ide-muted hover:text-red-400 transition-colors" title={t('settings.captureFilters.remove')}>
                       <X className="w-3 h-3" />
                     </button>
                   </span>
                 ))}
-                {(filterSettings.processes || []).length === 0 && <span className="text-xs text-ide-muted py-1 italic">暂无规则</span>}
+                {(filterSettings.processes || []).length === 0 && <span className="text-xs text-ide-muted py-1 italic">{t('settings.captureFilters.empty')}</span>}
               </div>
               <div className="flex gap-2">
                 <input
@@ -60,36 +69,36 @@ export default function CaptureFiltersSection({
                       onAddProcess();
                     }
                   }}
-                  placeholder="chrome.exe, obs64.exe"
+                  placeholder={t('settings.captureFilters.processes.placeholder')}
                 />
                 <button
                   onClick={onAddProcess}
                   disabled={!processInput.trim()}
                   className="px-4 py-2 bg-ide-accent hover:bg-ide-accent/90 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  添加
+                  {t('settings.captureFilters.add')}
                 </button>
               </div>
-              <p className="text-xs text-ide-muted mt-2 ml-1">按进程可执行名匹配，自动转为小写。</p>
+              <p className="text-xs text-ide-muted mt-2 ml-1">{t('settings.captureFilters.processes.hint')}</p>
             </div>
 
             <div className="w-full h-px bg-ide-border/50" />
 
             <div>
-              <label className="block mb-2 font-semibold text-ide-text">按窗口名关键词忽略</label>
+              <label className="block mb-2 font-semibold text-ide-text">{t('settings.captureFilters.titles.label')}</label>
               <div className="flex flex-wrap gap-2 mb-3 min-h-[1.5rem]">
-                {(filterSettings.titles || []).map((t) => (
+                {(filterSettings.titles || []).map((title) => (
                   <span
-                    key={t}
+                    key={title}
                     className="inline-flex items-center gap-1.5 pl-2.5 pr-1.5 py-1 bg-ide-panel border border-ide-border rounded-full text-xs text-ide-text group"
                   >
-                    {t}
-                    <button onClick={() => onRemoveTitle(t)} className="p-0.5 rounded-full hover:bg-ide-hover text-ide-muted hover:text-red-400 transition-colors" title="移除">
+                    {title}
+                    <button onClick={() => onRemoveTitle(title)} className="p-0.5 rounded-full hover:bg-ide-hover text-ide-muted hover:text-red-400 transition-colors" title={t('settings.captureFilters.remove')}>
                       <X className="w-3 h-3" />
                     </button>
                   </span>
                 ))}
-                {(filterSettings.titles || []).length === 0 && <span className="text-xs text-ide-muted py-1 italic">暂无规则</span>}
+                {(filterSettings.titles || []).length === 0 && <span className="text-xs text-ide-muted py-1 italic">{t('settings.captureFilters.empty')}</span>}
               </div>
               <div className="flex gap-2">
                 <input
@@ -102,17 +111,17 @@ export default function CaptureFiltersSection({
                       onAddTitle();
                     }
                   }}
-                  placeholder="内部系统, 私人窗口"
+                  placeholder={t('settings.captureFilters.titles.placeholder')}
                 />
                 <button
                   onClick={onAddTitle}
                   disabled={!titleInput.trim()}
                   className="px-4 py-2 bg-ide-accent hover:bg-ide-accent/90 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  添加
+                  {t('settings.captureFilters.add')}
                 </button>
               </div>
-              <p className="text-xs text-ide-muted mt-2 ml-1">包含匹配，忽略大小写。</p>
+              <p className="text-xs text-ide-muted mt-2 ml-1">{t('settings.captureFilters.titles.hint')}</p>
             </div>
           </div>
 
@@ -120,8 +129,8 @@ export default function CaptureFiltersSection({
 
           <div className="flex items-center justify-between gap-4">
             <div>
-              <label className="block mb-1 font-semibold text-ide-text">不捕获受保护的窗口</label>
-              <p className="text-xs text-ide-muted">关闭后，将尝试捕获设置了屏幕保护属性的窗口。</p>
+              <label className="block mb-1 font-semibold text-ide-text">{t('settings.captureFilters.ignoreProtected.label')}</label>
+              <p className="text-xs text-ide-muted">{t('settings.captureFilters.ignoreProtected.description')}</p>
             </div>
             <button
               onClick={onToggleProtected}
@@ -154,15 +163,16 @@ export default function CaptureFiltersSection({
 
 // Quick Delete Section Component
 function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
+  const { t } = useTranslation();
   const [showConfirm, setShowConfirm] = useState(null);
   const [deletingRange, setDeletingRange] = useState(null);
 
-  const deleteOptions = [
-    { id: '5min', label: '5 分钟', minutes: 5 },
-    { id: '30min', label: '30 分钟', minutes: 30 },
-    { id: '1hour', label: '1 小时', minutes: 60 },
-    { id: 'today', label: '今天', minutes: 'today' },
-  ];
+  const deleteOptionsLocal = [
+    { id: '5min', minutes: 5, key: '5min' },
+    { id: '30min', minutes: 30, key: '30min' },
+    { id: '1hour', minutes: 60, key: '1hour' },
+    { id: 'today', minutes: 'today', key: 'today' },
+  ].map((opt) => ({ ...opt, label: t(`settings.captureFilters.quickDelete.options.${opt.key}`) }));
 
   const handleDeleteClick = (option) => {
     setShowConfirm(option.id);
@@ -181,19 +191,19 @@ function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
   return (
     <div className="space-y-3">
       <label className="text-sm font-semibold text-ide-accent flex items-center gap-2 px-1">
-        快速删除记录
+        {t('settings.captureFilters.quickDelete.title')}
       </label>
       <div className="p-4 bg-ide-bg border border-ide-border rounded-xl text-sm text-ide-muted space-y-4">
-        <p className="text-xs text-ide-muted">快速删除指定时间范围内的所有截图和OCR记录。此操作不可撤销。</p>
+        <p className="text-xs text-ide-muted">{t('settings.captureFilters.quickDelete.description')}</p>
         
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {deleteOptions.map((option) => (
+          {deleteOptionsLocal.map((option) => (
             <div key={option.id} className="relative">
               {showConfirm === option.id ? (
                 <div className="absolute inset-0 z-10 flex flex-col justify-center gap-2 p-2 bg-red-500 rounded-lg shadow-lg animate-in fade-in zoom-in duration-200">
                   <div className="flex items-center justify-center gap-1 text-xs text-white font-medium">
                     <AlertTriangle className="w-3 h-3" />
-                    <span>Confirm?</span>
+                    <span>{t('settings.captureFilters.quickDelete.confirmTitle')}</span>
                   </div>
                   <div className="flex gap-1">
                     <button
@@ -204,7 +214,7 @@ function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
                       {deletingRange === option.id ? (
                         <Loader2 className="w-3 h-3 animate-spin" />
                       ) : (
-                        'YES'
+                        t('settings.captureFilters.quickDelete.yes')
                       )}
                     </button>
                     <button
@@ -212,7 +222,7 @@ function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
                       disabled={deletingRange === option.id}
                       className="flex-1 py-1 bg-red-600 text-white hover:bg-red-700 rounded text-[10px] transition-colors disabled:opacity-80 border border-red-400"
                     >
-                      NO
+                      {t('settings.captureFilters.quickDelete.no')}
                     </button>
                   </div>
                 </div>
@@ -223,7 +233,7 @@ function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
                   className="w-full flex items-center justify-center gap-2 px-3 py-3 bg-ide-panel hover:bg-red-500/10 hover:border-red-500/30 border border-ide-border rounded-lg text-xs font-medium transition-all hover:scale-[1.02] disabled:opacity-50 disabled:hover:scale-100 h-10"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
-                  {option.label}内
+                  {t('settings.captureFilters.quickDelete.button', { label: option.label })}
                 </button>
               )}
             </div>

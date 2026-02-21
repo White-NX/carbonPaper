@@ -9,7 +9,8 @@
       "WebSearch",
       "WebFetch(domain:rapidai.github.io)",
       "WebFetch(domain:deepwiki.com)",
-      "WebFetch(domain:pypi.org)"
+      "WebFetch(domain:pypi.org)",
+      "Bash(npx vite build)"
     ]
   }
 }

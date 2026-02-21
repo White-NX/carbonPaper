@@ -602,8 +602,19 @@ pub async fn start_monitor(
                                 cache.drain(0..overflow);
                             }
                         }
-                        // Print errors to stderr and also emit to frontend
-                        tracing::warn!(target: "monitor.stderr", "{}", l);
+                        // Parse Python log level from format "[LEVEL] ..." and use matching tracing macro
+                        if l.starts_with("[DEBUG]") {
+                            tracing::debug!(target: "monitor.stderr", "{}", l);
+                        } else if l.starts_with("[INFO]") {
+                            tracing::info!(target: "monitor.stderr", "{}", l);
+                        } else if l.starts_with("[ERROR]") || l.starts_with("[CRITICAL]") {
+                            tracing::error!(target: "monitor.stderr", "{}", l);
+                        } else if l.starts_with("[WARNING]") {
+                            tracing::warn!(target: "monitor.stderr", "{}", l);
+                        } else {
+                            // Unrecognized format (e.g. raw Python tracebacks) — default to warn
+                            tracing::warn!(target: "monitor.stderr", "{}", l);
+                        }
                         let _ = app_clone.emit(
                             "monitor-log",
                             serde_json::json!({"source":"stderr","line": l}),

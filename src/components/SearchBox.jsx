@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Image as ImageIcon, Type, Loader2, X, ChevronDown } from 'lucide-react';
 import { searchScreenshots, fetchImage } from '../lib/monitor_api';
 
@@ -17,6 +18,7 @@ function useDebounce(value, delay) {
 }
 
 export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange }) {
+    const { t } = useTranslation();
     const [query, setQuery] = useState('');
     const [localMode, setLocalMode] = useState('ocr'); // 'ocr' | 'nl'
     const [showModeMenu, setShowModeMenu] = useState(false);
@@ -103,14 +105,14 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 <button
                     className="p-2 text-ide-muted hover:text-ide-text transition-colors"
                     onClick={() => { userInteractionRef.current = true; setMode(mode === 'ocr' ? 'nl' : 'ocr'); }}
-                    title={mode === 'ocr' ? "Switch to Natural Language Search" : "Switch to OCR Search"}
+                    title={mode === 'ocr' ? t('search.switchToNL') : t('search.switchToOCR')}
                 >
                     {mode === 'ocr' ? <Type size={16} /> : <ImageIcon size={16} />}
                 </button>
                 <button
                     className="p-2 pl-0 text-ide-muted hover:text-ide-text transition-colors"
                     onClick={(e) => { e.stopPropagation(); setShowModeMenu(!showModeMenu); }}
-                    title="Select Search Mode"
+                    title={t('search.selectMode')}
                 >
                     <ChevronDown size={14} />
                 </button>
@@ -122,8 +124,8 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                         >
                             <div className="mt-1 text-ide-accent"><Type size={18} /></div>
                             <div>
-                                <div className="text-sm font-bold text-ide-text">OCR 关键词搜索模式</div>
-                                <div className="text-xs text-ide-muted leading-relaxed">通过识别屏幕截图中的文字进行精确匹配搜索</div>
+                                <div className="text-sm font-bold text-ide-text">{t('search.mode.ocr.title')}</div>
+                                <div className="text-xs text-ide-muted leading-relaxed">{t('search.mode.ocr.description')}</div>
                             </div>
                         </button>
                         <button
@@ -132,8 +134,8 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                         >
                             <div className="mt-1 text-ide-success"><ImageIcon size={18} /></div>
                             <div>
-                                <div className="text-sm font-bold text-ide-text">自然语言搜索模式</div>
-                                <div className="text-xs text-ide-muted leading-relaxed">描述图片画面内容、场景或物体进行语义模糊搜索</div>
+                                <div className="text-sm font-bold text-ide-text">{t('search.mode.nl.title')}</div>
+                                <div className="text-xs text-ide-muted leading-relaxed">{t('search.mode.nl.description')}</div>
                             </div>
                         </button>
                     </div>
@@ -144,7 +146,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 ref={inputRef}
                 type="text"
                 className="bg-transparent border-none outline-none text-ide-text text-sm w-full h-9 px-3 placeholder-ide-muted"
-                placeholder={mode === 'ocr' ? "Search text in screenshots..." : "Describe image content..."}
+                placeholder={mode === 'ocr' ? t('search.placeholder.ocr') : t('search.placeholder.nl')}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onFocus={() => setShowResults(true)}
@@ -182,10 +184,10 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                                     onClick={() => handleSelect(item)}
                                 />
                             ))
-                        ) : loading ? (
-                            <div className="p-4 text-center text-ide-muted text-sm">Loading...</div>
-                        ) : (
-                            <div className="p-4 text-center text-ide-muted text-sm">No Contents</div>
+                            ) : loading ? (
+                                <div className="p-4 text-center text-ide-muted text-sm">{t('search.loading')}</div>
+                            ) : (
+                                <div className="p-4 text-center text-ide-muted text-sm">{t('search.noContents')}</div>
                         )}
                     </div>
                 </div>

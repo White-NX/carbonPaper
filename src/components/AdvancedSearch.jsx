@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Search, SlidersHorizontal, Filter, CalendarRange, X, Loader2, RefreshCw, Type, Image as ImageIcon } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import { searchScreenshots, fetchImage, listProcesses } from '../lib/monitor_api';
 
 const PAGE_SIZE = 40;
@@ -42,6 +43,7 @@ function highlightMatches(text, tokens) {
 }
 
 function ResultPreview({ item, mode, onSelect, queryTokens }) {
+  const { t } = useTranslation();
   const [imageSrc, setImageSrc] = useState(null);
   const [loadingImage, setLoadingImage] = useState(false);
 
@@ -116,12 +118,12 @@ function ResultPreview({ item, mode, onSelect, queryTokens }) {
           {!loadingImage && imageSrc && (
             <img src={imageSrc} alt="Preview" className="w-full h-full object-cover" />
           )}
-          {!loadingImage && !imageSrc && <span>No Image</span>}
+          {!loadingImage && !imageSrc && <span>{t('advancedSearch.no_image')}</span>}
         </div>
         <div className="flex-1 min-w-0 space-y-2">
           <div className="flex items-center justify-between gap-4">
             <span className="text-sm font-semibold text-blue-300 truncate">
-              {processName || 'Unknown Process'}
+              {processName || t('advancedSearch.unknown')}
             </span>
             {formattedTimestamp && (
               <span className="text-[11px] text-ide-muted whitespace-nowrap">
@@ -137,7 +139,7 @@ function ResultPreview({ item, mode, onSelect, queryTokens }) {
           <div className="text-xs leading-relaxed break-words">
             {normalizedText
               ? highlightMatches(normalizedText, queryTokens)
-              : <span className="italic text-ide-muted">No OCR text</span>}
+              : <span className="italic text-ide-muted">{t('advancedSearch.no_ocr_text')}</span>}
           </div>
           {mode === 'nl' && item.similarity !== undefined && (
             <div className="text-[10px] text-ide-muted">
@@ -151,6 +153,7 @@ function ResultPreview({ item, mode, onSelect, queryTokens }) {
 }
 
 function ThumbnailCard({ item, onSelect }) {
+  const { t } = useTranslation();
   const [imageSrc, setImageSrc] = useState(null);
   const [loadingImage, setLoadingImage] = useState(false);
 
@@ -201,16 +204,16 @@ function ThumbnailCard({ item, onSelect }) {
         </div>
       ) : (
         <div className="flex h-full w-full items-center justify-center bg-ide-bg text-ide-muted text-xs">
-          No Image
+          {t('advancedSearch.no_image')}
         </div>
       )}
       <div className="pointer-events-none absolute inset-0 flex flex-col justify-end
                       bg-gradient-to-t from-black/60 to-transparent opacity-0
                       transition group-hover:opacity-100 p-2">
-        <span className="text-xs text-white font-semibold truncate">{processName || 'Unknown'}</span>
+        <span className="text-xs text-white font-semibold truncate">{processName || t('advancedSearch.unknown')}</span>
         {similarity !== undefined && (
-          <span className="text-[10px] text-white/80">
-            Similarity: {similarity.toFixed(2)}
+            <span className="text-[10px] text-white/80">
+            {t('advancedSearch.similarity', { score: similarity.toFixed(2) })}
           </span>
         )}
       </div>
@@ -219,6 +222,7 @@ function ThumbnailCard({ item, onSelect }) {
 }
 
 function ProcessFilter({ processes, selected, onChange }) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
 
@@ -248,18 +252,18 @@ function ProcessFilter({ processes, selected, onChange }) {
         type="button"
       >
         <Filter className="w-3.5 h-3.5" />
-        {selected.length > 0 ? `${selected.length} Processes` : 'All Processes'}
+        {selected.length > 0 ? t('advancedSearch.processes.count', { count: selected.length }) : t('advancedSearch.processes.all')}
       </button>
       {open && (
         <div className="absolute z-30 mt-2 min-w-[220px] max-h-60 overflow-y-auto bg-ide-panel border border-ide-border rounded shadow-lg p-2 space-y-1">
           <div className="flex items-center justify-between text-[11px] text-ide-muted mb-1">
-            <span>Select Processes</span>
+            <span>{t('advancedSearch.processes.select')}</span>
             {selected.length > 0 && (
-              <button className="text-blue-300" onClick={() => onChange([])}>Clear</button>
+              <button className="text-blue-300" onClick={() => onChange([])}>{t('advancedSearch.processes.clear')}</button>
             )}
           </div>
           {processes.length === 0 && (
-            <div className="text-xs text-ide-muted px-2 py-3">No process data</div>
+            <div className="text-xs text-ide-muted px-2 py-3">{t('advancedSearch.processes.no_data')}</div>
           )}
           {processes.map((entry) => {
             const value = entry.process_name;
@@ -304,18 +308,14 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
   const sentinelRef = useRef(null);
   const lastParamsRef = useRef({ query: '', mode: 'ocr' });
 
+  const { t } = useTranslation();
+
   const debouncedQuery = useDebouncedValue(query, 400);
 
-  const rotatingMessages = useMemo(() => [
-    "此程序目前只是一个玩具！",
-    "迷迭香真的很可爱！",
-    "使用LLM的搜索会在将来加入！",
-    "洁尔佩塔——我的洁尔佩塔！",
-    "阿米娅你听我解释，我真的没有偏向佩丽卡！"
-  ], []);
+  const rotatingMessages = useMemo(() => t('advancedSearch.rotating', { returnObjects: true }) || [], [t]);
 
   const [rotatingMessage, setRotatingMessage] = useState(() => {
-    return rotatingMessages[Math.floor(Math.random() * rotatingMessages.length)];
+    return rotatingMessages.length > 0 ? rotatingMessages[Math.floor(Math.random() * rotatingMessages.length)] : '';
   });
 
   useEffect(() => {
@@ -477,16 +477,16 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
           <div className="flex items-center bg-ide-bg border border-ide-border rounded-md overflow-hidden">
             <div className="flex items-center gap-2 px-3 border-r border-ide-border text-ide-muted text-xs uppercase">
               <Search className="w-3.5 h-3.5" />
-              Advanced
+              {t('advancedSearch.title')}
             </div>
             <input
               type="text"
               className="bg-transparent text-sm px-3 py-1.5 focus:outline-none min-w-[220px]"
-              placeholder={mode === 'ocr' ? 'Search OCR text...' : 'Describe image content...'}
+              placeholder={mode === 'ocr' ? t('advancedSearch.search.placeholder_ocr') : t('advancedSearch.search.placeholder_nl')}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
-            <button type="submit" className="px-3 text-xs text-blue-300 hover:text-blue-200">Go</button>
+            <button type="submit" className="px-3 text-xs text-blue-300 hover:text-blue-200">{t('advancedSearch.search.go')}</button>
             {query && (
               <button type="button" className="px-2 text-ide-muted hover:text-ide-text" onClick={() => setQuery('')}>
                 <X className="w-3.5 h-3.5" />
@@ -499,14 +499,14 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
               className={`flex items-center gap-1 px-3 py-1.5 text-xs rounded border ${mode === 'ocr' ? 'border-blue-400 text-blue-300 bg-blue-400/10' : 'border-ide-border text-ide-muted hover:bg-ide-hover/30'}`}
               onClick={() => handleModeChange('ocr')}
             >
-              <Type className="w-3.5 h-3.5" /> OCR 模式
+              <Type className="w-3.5 h-3.5" /> {t('advancedSearch.modes.ocr')}
             </button>
             <button
               type="button"
               className={`flex items-center gap-1 px-3 py-1.5 text-xs rounded border ${mode === 'nl' ? 'border-green-400 text-green-300 bg-green-400/10' : 'border-ide-border text-ide-muted hover:bg-ide-hover/30'}`}
               onClick={() => handleModeChange('nl')}
             >
-              <ImageIcon className="w-3.5 h-3.5" /> 自然语言
+              <ImageIcon className="w-3.5 h-3.5" /> {t('advancedSearch.modes.nl')}
             </button>
           </div>
           <ProcessFilter processes={processOptions} selected={selectedProcesses} onChange={setSelectedProcesses} />
@@ -544,7 +544,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
         {loading && (
           <div className="flex items-center justify-center py-8 text-ide-muted gap-2">
             <Loader2 className="w-4 h-4 animate-spin" />
-            <span className="text-sm">Searching...</span>
+            <span className="text-sm">{t('advancedSearch.search.searching')}</span>
           </div>
         )}
         {!loading && results.length === 0 && (
@@ -552,15 +552,15 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
             {(!query.trim() && selectedProcesses.length === 0 && !startDate && !endDate) ? (
               <>
                 <Search className="w-5 h-5" />
-                <span>Enter a keyword or choose filters to begin.</span>
-                <span className="text-xs">Press Enter in the top search bar to jump here quickly.</span>
-                <span className="text-xs">你知道吗：{rotatingMessage}</span>
+                <span>{t('advancedSearch.search.enter_keyword')}</span>
+                <span className="text-xs">{t('advancedSearch.search.press_enter')}</span>
+                <span className="text-xs">{t('advancedSearch.search.did_you_know', { msg: rotatingMessage })}</span>
               </>
             ) : (
               <>
                 <SlidersHorizontal className="w-5 h-5" />
-                <span>No matching results</span>
-                <span className="text-xs">Adjust filters or try different keywords.</span>
+                <span>{t('advancedSearch.search.no_results')}</span>
+                <span className="text-xs">{t('advancedSearch.search.adjust')}</span>
               </>
             )}
           </div>
@@ -593,11 +593,11 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
           {loadingMore && (
             <>
               <Loader2 className="w-4 h-4 animate-spin mr-2" />
-              Loading more results...
+              {t('advancedSearch.loading_more')}
             </>
           )}
-          {!loadingMore && hasMore && <span>Scroll to load more…</span>}
-          {!loadingMore && !hasMore && results.length > 0 && <span>No more results</span>}
+          {!loadingMore && hasMore && <span>{t('advancedSearch.scroll_load')}</span>}
+          {!loadingMore && !hasMore && results.length > 0 && <span>{t('advancedSearch.no_more')}</span>}
         </div>
       </div>
     </div>
