@@ -52,6 +52,7 @@ class OCREngine:
         lang: str = "ch",
         use_gpu: bool = False,
         use_dml: bool = False,
+        dml_device_id: Optional[int] = None,
         ocr_version: str = 'PP-OCRv5',
         model_size: str = "mobile",
         det_model_dir: Optional[str] = None,
@@ -66,6 +67,7 @@ class OCREngine:
             lang: 语言设置，默认中文
             use_gpu: 是否使用GPU（兼容参数）
             use_dml: 是否使用 DirectML 加速
+            dml_device_id: DirectML 设备 ID（默认 None 表示使用默认 GPU）
             ocr_version: OCR模型版本
             model_size: 模型尺寸，"mobile" 或 "server"，默认 mobile
             det_model_dir: 检测模型目录（可选）
@@ -81,6 +83,7 @@ class OCREngine:
         # 记录是否使用 GPU
         self._use_gpu = bool(use_gpu)
         self._use_dml = bool(use_dml)
+        self._dml_device_id = dml_device_id
 
         init_params = {
             'use_angle_cls': use_angle_cls,
@@ -142,6 +145,8 @@ class OCREngine:
                 init_params['ocr_version'] = ocr_version
                 init_params['cpu_threads'] = 1
                 init_params['use_dml'] = self._use_dml
+                if self._dml_device_id is not None:
+                    init_params['dml_device_id'] = self._dml_device_id
                 self.ocr = RapidPaddleOCR(**init_params)
             except Exception as e:
                 logger.error("使用 %s 初始化 RapidOCR 失败: %s", ocr_version, e)
@@ -405,6 +410,13 @@ def get_ocr_engine(**kwargs) -> OCREngine:
     """获取OCR引擎实例（单例）"""
     if 'use_dml' not in kwargs:
         kwargs['use_dml'] = os.environ.get('CARBONPAPER_USE_DML', '').strip() == '1'
+    if 'dml_device_id' not in kwargs:
+        device_id_str = os.environ.get('CARBONPAPER_DML_DEVICE_ID', '').strip()
+        if device_id_str:
+            try:
+                kwargs['dml_device_id'] = int(device_id_str)
+            except ValueError:
+                pass
     return OCREngine(**kwargs)
 
 

@@ -1,19 +1,22 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap } from 'lucide-react';
+import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap, Monitor } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
 const CPU_PERCENT_OPTIONS = [5, 10, 15, 20, 30, 50];
 const OCR_QUEUE_SIZE_OPTIONS = [1, 2, 3, 5, 10];
 
-export default function AdvancedSection({ monitorStatus }) {
+export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
   const { t } = useTranslation();
   const [config, setConfig] = useState(null);
   const [loading, setLoading] = useState(true);
   const [cpuDropdownOpen, setCpuDropdownOpen] = useState(false);
   const [queueDropdownOpen, setQueueDropdownOpen] = useState(false);
+  const [gpuDropdownOpen, setGpuDropdownOpen] = useState(false);
   const [cpuChanged, setCpuChanged] = useState(false);
   const [dmlChanged, setDmlChanged] = useState(false);
+  const [gpus, setGpus] = useState([]);
+  const [gpuLoading, setGpuLoading] = useState(false);
 
   const loadConfig = async () => {
     try {
@@ -29,6 +32,33 @@ export default function AdvancedSection({ monitorStatus }) {
   useEffect(() => {
     loadConfig();
   }, []);
+
+  // Load GPU list when DML is enabled
+  useEffect(() => {
+    if (config?.use_dml) {
+      loadGpus();
+    }
+  }, [config?.use_dml]);
+
+  const loadGpus = async () => {
+    setGpuLoading(true);
+    try {
+      const result = await invoke('enumerate_gpus');
+      const gpuList = result || [];
+      setGpus(gpuList);
+      // if current dml_device_id is not in the new gpu list, reset to first gpu or null
+      if (config && gpuList.length > 0 && !gpuList.some((g) => g.id === config.dml_device_id)) {
+        const fallbackId = gpuList[0].id;
+        const newConfig = { ...config, dml_device_id: fallbackId };
+        await saveConfig(newConfig);
+      }
+    } catch (err) {
+      console.error('Failed to enumerate GPUs:', err);
+      setGpus([]);
+    } finally {
+      setGpuLoading(false);
+    }
+  };
 
   const saveConfig = async (newConfig) => {
     setConfig(newConfig);
@@ -84,17 +114,25 @@ export default function AdvancedSection({ monitorStatus }) {
     await syncOcrConfigToMonitor(newConfig);
   };
 
+  const handleGpuChange = async (deviceId) => {
+    setGpuDropdownOpen(false);
+    const newConfig = { ...config, dml_device_id: deviceId };
+    await saveConfig(newConfig);
+    setDmlChanged(true);
+  };
+
   // Close dropdowns on outside click
   useEffect(() => {
     const handler = () => {
       setCpuDropdownOpen(false);
       setQueueDropdownOpen(false);
+      setGpuDropdownOpen(false);
     };
-    if (cpuDropdownOpen || queueDropdownOpen) {
+    if (cpuDropdownOpen || queueDropdownOpen || gpuDropdownOpen) {
       document.addEventListener('click', handler);
       return () => document.removeEventListener('click', handler);
     }
-  }, [cpuDropdownOpen, queueDropdownOpen]);
+  }, [cpuDropdownOpen, queueDropdownOpen, gpuDropdownOpen]);
 
   if (loading || !config) {
     return (
@@ -103,6 +141,8 @@ export default function AdvancedSection({ monitorStatus }) {
       </div>
     );
   }
+
+  const selectedGpu = gpus.find((g) => g.id === config.dml_device_id) || gpus[0];
 
   return (
     <div className="space-y-6">
@@ -180,7 +220,15 @@ export default function AdvancedSection({ monitorStatus }) {
           {cpuChanged && (
             <div className="flex items-center gap-2 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg">
               <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-              <p className="text-xs text-amber-300/90">{t('settings.advanced.cpu.changed_notice')}</p>
+              <p className="text-xs text-amber-300/90 flex-1">{t('settings.advanced.cpu.changed_notice')}</p>
+              {monitorStatus === 'running' && onRestartMonitor && (
+                <button
+                  onClick={() => { onRestartMonitor(); setCpuChanged(false); }}
+                  className="text-xs text-amber-300 hover:text-amber-200 underline shrink-0 transition-colors"
+                >
+                  {t('settings.advanced.quick_restart')}
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -289,6 +337,7 @@ export default function AdvancedSection({ monitorStatus }) {
             <div className="flex-1 min-w-0">
               <p className="text-sm text-ide-text font-medium">{t('settings.advanced.dml.label')}</p>
               <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.dml.description')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.dml.notice')}</p>
             </div>
             <button
               onClick={() => handleToggle('use_dml')}
@@ -302,10 +351,69 @@ export default function AdvancedSection({ monitorStatus }) {
             </button>
           </div>
 
+          {config.use_dml && (
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-2">
+                <Monitor className="w-4 h-4 text-ide-muted" />
+                <p className="text-sm text-ide-muted">{t('settings.advanced.dml.gpu_select')}</p>
+              </div>
+              <div className="relative">
+                {gpuLoading ? (
+                  <p className="text-xs text-ide-muted px-4 py-2">{t('settings.advanced.dml.gpu_loading')}</p>
+                ) : gpus.length === 0 ? (
+                  <p className="text-xs text-ide-muted px-4 py-2">{t('settings.advanced.dml.gpu_none')}</p>
+                ) : (
+                  <>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setGpuDropdownOpen(!gpuDropdownOpen);
+                      }}
+                      className="flex items-center gap-2 px-4 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm text-ide-text hover:bg-ide-hover transition-colors min-w-[180px] max-w-[280px]"
+                    >
+                      <span className="flex-1 text-left truncate">{selectedGpu?.name || `GPU ${config.dml_device_id}`}</span>
+                      <ChevronDown
+                        className={`w-4 h-4 text-ide-muted transition-transform shrink-0 ${gpuDropdownOpen ? 'rotate-180' : ''}`}
+                      />
+                    </button>
+                    {gpuDropdownOpen && (
+                      <div
+                        className="absolute right-0 top-full mt-2 w-72 bg-ide-panel border border-ide-border rounded-xl shadow-xl z-50 overflow-hidden"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {gpus.map((gpu) => (
+                          <button
+                            key={gpu.id}
+                            onClick={() => handleGpuChange(gpu.id)}
+                            className={`w-full px-4 py-2.5 text-left hover:bg-ide-hover transition-colors flex items-center justify-between gap-2 ${gpu.id === config.dml_device_id ? 'bg-ide-accent/10' : ''
+                              }`}
+                          >
+                            <span className="text-sm text-ide-text truncate">{gpu.name}</span>
+                            {gpu.id === config.dml_device_id && (
+                              <div className="w-2 h-2 rounded-full bg-ide-accent shrink-0" />
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
           {dmlChanged && (
             <div className="flex items-center gap-2 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg">
               <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-              <p className="text-xs text-amber-300/90">{t('settings.advanced.dml.changed_notice')}</p>
+              <p className="text-xs text-amber-300/90 flex-1">{t('settings.advanced.dml.changed_notice')}</p>
+              {monitorStatus === 'running' && onRestartMonitor && (
+                <button
+                  onClick={() => { onRestartMonitor(); setDmlChanged(false); }}
+                  className="text-xs text-amber-300 hover:text-amber-200 underline shrink-0 transition-colors"
+                >
+                  {t('settings.advanced.quick_restart')}
+                </button>
+              )}
             </div>
           )}
         </div>

@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Play, Pause, Square as StopSquare, Loader2 } from 'lucide-react';
+import { Play, Pause, Square as StopSquare, Loader2, RotateCw } from 'lucide-react';
 
 export default function MonitorServiceSection({
   monitorStatus,
@@ -8,6 +8,7 @@ export default function MonitorServiceSection({
   onStop,
   onPause,
   onResume,
+  onRestart,
   autoStartMonitor,
   onAutoStartMonitorChange,
   autoLaunchEnabled,
@@ -79,6 +80,13 @@ export default function MonitorServiceSection({
                   title={t('settings.general.monitor.stop')}
                 >
                   <StopSquare className="w-4 h-4 fill-current" />
+                </button>
+                <button
+                  onClick={onRestart}
+                  className="p-2 bg-ide-panel hover:bg-ide-hover border border-ide-border rounded-lg text-blue-400 transition-colors"
+                  title={t('settings.general.monitor.restart')}
+                >
+                  <RotateCw className="w-4 h-4" />
                 </button>
               </>
             )}

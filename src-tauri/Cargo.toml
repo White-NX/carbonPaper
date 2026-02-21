@@ -1,6 +1,6 @@
 [package]
 name = "carbonpaper"
-version = "0.5.0"
+version = "0.5.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -65,6 +65,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_Security_Cryptography",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Performance",
 ] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

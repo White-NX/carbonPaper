@@ -6,6 +6,63 @@ from rapidocr import RapidOCR
 from typing import Union, List, Optional
 import numpy as np
 from PIL import Image
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _patch_ort_dml_device_id(device_id: int):
+    """
+    Before RapidOCR creates a session, monkey-patch onnxruntime.InferenceSession
+    so that it injects the specified device_id when adding a DmlExecutionProvider.
+
+    RapidOCR internally passes the 'DmlExecutionProvider' string directly to the providers list,
+    but does not support custom provider options, so it can only intercept at a lower level.
+    """
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        logger.warning("onnxruntime not available, cannot patch DML device_id")
+        return
+
+    if getattr(ort.InferenceSession, "_dml_device_patched", False):
+        return  # 已经 patch 过
+
+    _original_init = ort.InferenceSession.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        providers = kwargs.get("providers", None)
+        if not providers and len(args) >= 2:
+            # providers 可能作为位置参数传入 (path_or_bytes, providers, ...)
+            # InferenceSession(path, providers=...) 或 InferenceSession(path, sess_options, providers)
+            pass  # 只处理 kwargs 形式，位置参数较少见
+
+        if providers:
+            new_providers = []
+            for p in providers:
+                if isinstance(p, str) and p == "DmlExecutionProvider":
+                    new_providers.append(
+                        ("DmlExecutionProvider", {"device_id": device_id})
+                    )
+                elif (
+                    isinstance(p, tuple)
+                    and len(p) >= 1
+                    and p[0] == "DmlExecutionProvider"
+                ):
+                    opts = dict(p[1]) if len(p) > 1 and p[1] else {}
+                    opts["device_id"] = device_id
+                    new_providers.append(("DmlExecutionProvider", opts))
+                else:
+                    new_providers.append(p)
+            kwargs["providers"] = new_providers
+
+        _original_init(self, *args, **kwargs)
+
+    ort.InferenceSession.__init__ = _patched_init
+    ort.InferenceSession._dml_device_patched = True
+    logger.info(
+        "Patched onnxruntime.InferenceSession to use DML device_id=%d", device_id
+    )
 
 
 class PaddleOCR:
@@ -32,6 +89,7 @@ class PaddleOCR:
         lang: str = "ch",
         use_gpu: bool = False,
         use_dml: bool = False,
+        dml_device_id: Optional[int] = None,
         show_log: bool = False,
         cpu_threads: int = 2,
         use_doc_orientation_classify: bool = False,
@@ -48,15 +106,20 @@ class PaddleOCR:
             lang: 语言类型（兼容参数，实际由RapidOCR处理）
             use_gpu: 是否使用GPU（兼容参数）
             use_dml: 是否使用 DirectML 加速（需要 onnxruntime-directml）
+            dml_device_id: DirectML 设备 ID（默认 None 表示使用默认 GPU）
             show_log: 是否显示日志
             cpu_threads: CPU线程数（不知道为什么在主程序中被使用了，之后会移除）
             TODO: 移除 cpu_threads 参数
         """
-        # 初始化RapidOCR引擎
         params = {
             "Global.use_cls": use_angle_cls,
             "Global.log_level": "DEBUG" if show_log else "WARNING",
         }
+
+        # If a DML device_id is specified, patch onnxruntime before creating the engine.
+        if use_dml and dml_device_id is not None:
+            _patch_ort_dml_device_id(dml_device_id)
+
         if use_dml:
             params["EngineConfig.onnxruntime.use_dml"] = True
         self.engine = RapidOCR(params=params)
@@ -121,7 +184,11 @@ class PaddleOCR:
         # 转换格式：RapidOCROutput -> PaddleOCR [box, (text, score)]
         paddle_format = []
         for i in range(len(result.txts)):
-            box = result.boxes[i].tolist() if hasattr(result.boxes[i], 'tolist') else result.boxes[i]
+            box = (
+                result.boxes[i].tolist()
+                if hasattr(result.boxes[i], "tolist")
+                else result.boxes[i]
+            )
             text = result.txts[i]
             score = result.scores[i]
 
@@ -136,7 +203,7 @@ class PaddleOCR:
         获取上次OCR耗时
         返回 (det_time, cls_time, rec_time) 元组或总耗时
         """
-        if hasattr(self, '_last_elapse_list') and self._last_elapse_list:
+        if hasattr(self, "_last_elapse_list") and self._last_elapse_list:
             return self._last_elapse_list
         return self._last_elapse
 

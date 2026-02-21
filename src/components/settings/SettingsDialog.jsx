@@ -231,6 +231,21 @@ function SettingsDialog({
     }
   };
 
+  const handleRestartMonitor = async () => {
+    setMonitorStatus('loading');
+    monitorStatusRef.current = 'loading';
+    try {
+      await invoke('stop_monitor');
+      setMonitorStatus('waiting');
+      monitorStatusRef.current = 'waiting';
+      await invoke('start_monitor');
+      await checkMonitorStatus();
+    } catch (e) {
+      console.error('Failed to restart monitor', e);
+      await checkMonitorStatus();
+    }
+  };
+
   const handlePauseMonitor = async () => {
     try {
       await invoke('pause_monitor');
@@ -441,6 +456,7 @@ function SettingsDialog({
                 onStop={handleStopMonitor}
                 onPause={handlePauseMonitor}
                 onResume={handleResumeMonitor}
+                onRestart={handleRestartMonitor}
                 autoStartMonitor={autoStartMonitor}
                 onAutoStartMonitorChange={onAutoStartMonitorChange}
                 autoLaunchEnabled={autoLaunchEnabled}
@@ -500,7 +516,7 @@ function SettingsDialog({
           )}
 
           {activeTab === 'advanced' && (
-            <AdvancedSection monitorStatus={monitorStatus} />
+            <AdvancedSection monitorStatus={monitorStatus} onRestartMonitor={handleRestartMonitor} />
           )}
 
           {activeTab === 'analysis' && (
