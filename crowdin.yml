@@ -1,4 +1,4 @@
-project_id_env: 874044
+project_id: 874044
 api_token_env: CROWDIN_PERSONAL_TOKEN
 
 files:
