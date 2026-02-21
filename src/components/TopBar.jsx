@@ -21,7 +21,7 @@ export default function TopBar({
 }) {
   const { t } = useTranslation();
   return (
-    <header data-tauri-drag-region className="h-12 flex items-center justify-between px-4 shrink-0 select-none">
+    <header data-tauri-drag-region className="h-11 flex items-center justify-between px-4 shrink-0 select-none">
       <div className="flex items-center gap-4 pointer-events-none">
         <div className="flex items-center gap-2 text-ide-accent">
           <Terminal className="w-5 h-5" />

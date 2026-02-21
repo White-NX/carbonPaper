@@ -145,7 +145,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             <input
                 ref={inputRef}
                 type="text"
-                className="bg-transparent border-none outline-none text-ide-text text-sm w-full h-9 px-3 placeholder-ide-muted"
+                className="bg-transparent border-none outline-none text-ide-text text-sm w-full h-8 px-3 placeholder-ide-muted"
                 placeholder={mode === 'ocr' ? t('search.placeholder.ocr') : t('search.placeholder.nl')}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
@@ -224,11 +224,17 @@ function SearchResultItem({ item, mode, query, onClick }) {
         // Simple highlight for OCR keywords
         if (!query) return <span className="text-ide-muted font-light">{text}</span>;
 
-        const parts = text.split(new RegExp(`(${query})`, 'gi'));
+        // 按空格拆分为多个关键词，逐一转义后用 | 连接
+        const tokens = query.trim().split(/\s+/).filter(Boolean);
+        const escaped = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        const pattern = new RegExp(`(${escaped.join('|')})`, 'gi');
+        const lowered = tokens.map(t => t.toLowerCase());
+        const parts = text.split(pattern);
+
         return (
             <span className="text-ide-muted font-light">
                 {parts.map((part, i) =>
-                    part.toLowerCase() === query.toLowerCase()
+                    lowered.some(t => part.toLowerCase() === t)
                         ? <b key={i} className="text-ide-accent font-bold">{part}</b>
                         : part
                 )}

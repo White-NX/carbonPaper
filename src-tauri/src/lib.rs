@@ -460,8 +460,6 @@ async fn storage_delete_plaintext(
     }))
 }
 
-// ==================== 高级配置命令 ====================
-
 #[tauri::command]
 fn get_advanced_config() -> Result<serde_json::Value, String> {
     let cpu_limit_enabled = registry_config::get_bool("cpu_limit_enabled").unwrap_or(true);
@@ -469,7 +467,7 @@ fn get_advanced_config() -> Result<serde_json::Value, String> {
     let capture_on_ocr_busy = registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
     let ocr_queue_limit_enabled = registry_config::get_bool("ocr_queue_limit_enabled").unwrap_or(true);
     let ocr_queue_max_size = registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
-    let use_dml = registry_config::get_bool("use_dml").unwrap_or(false);
+    let use_dml = registry_config::get_bool("use_dml").unwrap_or(true);
 
     Ok(serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
@@ -503,8 +501,6 @@ fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     }
     Ok(())
 }
-
-// ==================== 凭证管理相关命令 ====================
 
 #[tauri::command]
 async fn credential_initialize(

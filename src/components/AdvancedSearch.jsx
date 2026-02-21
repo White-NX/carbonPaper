@@ -333,6 +333,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
   }, [rotatingMessages]);
 
   useEffect(() => {
+    if (!active) return;
     let mounted = true;
     (async () => {
       const data = await listProcesses();
@@ -341,7 +342,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [active]);
 
   const handleModeChange = useCallback((nextMode) => {
     setMode(nextMode);
