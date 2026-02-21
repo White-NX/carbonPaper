@@ -32,20 +32,29 @@ CarbonPaper（本程序） 具有以下功能：
 - 除经用户允许，任何数据将不会离开用户的计算机。
 - 支持 OCR 关键词搜索所见文本，同时也支持使用自然语言的图片特征搜索快照。
 - 经由时间线快速预览快照。
-- 不需要 Copilot+ 验证，相关服务全部通过 CPU 而非 NPU 以低占用的方式进行。
+- 不需要 Copilot+ 验证，相关服务通过 DirectML 使用 CPU，GPU 甚至 NPU 进行推理。
 
 ## Requirements
 
-OS: Windows 10 1809 or later (of course)
+OS: Windows 10 1903 Build 18362 (suggest), Windows 10 1809 or later (minimum, DirectML disabled)
 
 Architecture: x64
 
-Internet Access: Yes **（init）**
+Internet Access: Yes
+
+Graphics Card: (Suggested, *optinal*)
+| 制造商 | 最早支持型号 | 发布日期 |
+| --- | --- | --- |
+| 🟢NVIDIA | GeForce GTX 480  | 2010/3/26 |
+| 🔴 AMD  | Radeon HD 7970  | 2011/12/22  |
+| 🔵 Intel | Intel HD Graphics 4600 | 2013/5/27 |
+
 
 ## API
 未来的 CarbonPaper 会提供开放API的功能，以允许用户使用 AI 进行快照的增删改查
 
 ## Main open source libs used
 
-- 文本OCR：[RapidOCR-onnxruntime](https://github.com/RapidAI/RapidOCR)
+- 文本OCR：[RapidOCR](https://github.com/RapidAI/RapidOCR)
 - 向量数据库：[ChromaDB](https://github.com/chroma-core/chroma)
+- UI：[Tauri](https://github.com/tauri-apps/tauri)
