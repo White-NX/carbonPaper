@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use winreg::enums::*;
 use winreg::RegKey;
 
@@ -19,6 +19,7 @@ use crate::resource_utils::{
     get_log_path,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tauri::AppHandle;
 use tauri::Emitter;
 #[derive(Debug)]
@@ -747,6 +748,66 @@ fn perform_install_python_venv(
     if let Ok(arc_file) = log_file.lock() {
         if let Ok(mut f) = arc_file.as_ref().lock() {
             let _ = writeln!(&mut *f, "Required packages installed successfully.");
+            let _ = f.flush();
+        }
+    }
+
+    // onnxruntime and onnxruntime-directml cannot coexist; otherwise, DmlExecutionProvider will be lost.
+    // Other dependencies (such as chromadb) may have indirectly installed onnxruntime; 
+    // they need to be uninstalled and then onnxruntime-directml reinstalled.
+    {
+        if let Ok(arc_file) = log_file.lock() {
+            if let Ok(mut f) = arc_file.as_ref().lock() {
+                let _ = writeln!(&mut *f, "Fixing onnxruntime/onnxruntime-directml conflict...");
+                let _ = f.flush();
+            }
+        }
+        let _ = app_for_threads.emit("install-log", json!({"source":"installer","line": "Fixing onnxruntime/onnxruntime-directml conflict..."}));
+
+        // Step 1: uninstall onnxruntime (non-directml)
+        let mut uninstall_cmd = Command::new(&python_exec_cmd);
+        uninstall_cmd
+            .arg("-m").arg("pip").arg("uninstall").arg("onnxruntime").arg("-y");
+        #[cfg(windows)]
+        {
+            uninstall_cmd.creation_flags(0x08000000);
+        }
+        let _ = uninstall_cmd.output();
+
+        // Step 2: force-reinstall onnxruntime-directml (no-deps to avoid pulling onnxruntime back)
+        let mut reinstall_cmd = Command::new(&python_exec_cmd);
+        reinstall_cmd
+            .arg("-m").arg("pip").arg("install")
+            .arg("onnxruntime-directml==1.24.2")
+            .arg("--force-reinstall").arg("--no-deps")
+            .arg("-i").arg("https://mirrors.aliyun.com/pypi/simple/");
+        #[cfg(windows)]
+        {
+            reinstall_cmd.creation_flags(0x08000000);
+        }
+        match reinstall_cmd.output() {
+            Ok(output) => {
+                let msg = String::from_utf8_lossy(&output.stdout);
+                if let Ok(arc_file) = log_file.lock() {
+                    if let Ok(mut f) = arc_file.as_ref().lock() {
+                        let _ = writeln!(&mut *f, "onnxruntime-directml reinstall: {}", msg);
+                        let _ = f.flush();
+                    }
+                }
+            }
+            Err(e) => {
+                if let Ok(arc_file) = log_file.lock() {
+                    if let Ok(mut f) = arc_file.as_ref().lock() {
+                        let _ = writeln!(&mut *f, "Warning: failed to reinstall onnxruntime-directml: {}", e);
+                        let _ = f.flush();
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(arc_file) = log_file.lock() {
+        if let Ok(mut f) = arc_file.as_ref().lock() {
             let _ = writeln!(
                 &mut *f,
                 "Virtual environment and dependencies installed successfully at: {:?}",
@@ -756,6 +817,13 @@ fn perform_install_python_venv(
         }
     }
     let _ = app_for_threads.emit("install-log", json!({"source":"installer","line": format!("Virtual environment and dependencies installed successfully at: {:?}", venv_dir)}));
+
+    // Write requirements hash so future dependency freshness checks can detect changes
+    if let Ok(hash) = compute_requirements_hash(&requirements_path) {
+        if let Err(e) = write_requirements_hash(&venv_dir, &hash) {
+            tracing::warn!("Failed to write requirements hash: {}", e);
+        }
+    }
 
     Ok(())
 }
@@ -832,4 +900,184 @@ pub fn run_silent_install() {
         std::process::exit(1);
     }
     std::process::exit(0);
+}
+
+// ==================== Requirements hash utilities ====================
+
+const REQUIREMENTS_HASH_FILE: &str = ".requirements_hash";
+
+fn compute_requirements_hash(path: &Path) -> io::Result<String> {
+    let data = fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn read_stored_requirements_hash(venv_dir: &Path) -> Option<String> {
+    let hash_path = venv_dir.join(REQUIREMENTS_HASH_FILE);
+    fs::read_to_string(&hash_path).ok().map(|s| s.trim().to_string())
+}
+
+fn write_requirements_hash(venv_dir: &Path, hash: &str) -> io::Result<()> {
+    let hash_path = venv_dir.join(REQUIREMENTS_HASH_FILE);
+    fs::write(&hash_path, hash)
+}
+
+// ==================== Dependency freshness check ====================
+
+#[tauri::command]
+pub fn check_deps_freshness(app: AppHandle) -> Result<serde_json::Value, String> {
+    let venv_dir = get_venv_dir(&app);
+    if !venv_dir.exists() || !venv_dir.join("Scripts").join("python.exe").exists() {
+        return Ok(json!({ "needs_update": false, "reason": "no_venv" }));
+    }
+
+    let requirements_path = file_in_resources(&app, "monitor/requirements.txt")
+        .unwrap_or_else(|| PathBuf::from("monitor/requirements.txt"));
+    if !requirements_path.exists() {
+        return Ok(json!({ "needs_update": false, "reason": "no_requirements_file" }));
+    }
+
+    let current_hash = compute_requirements_hash(&requirements_path)
+        .map_err(|e| format!("Failed to hash requirements.txt: {}", e))?;
+
+    match read_stored_requirements_hash(&venv_dir) {
+        Some(stored_hash) => {
+            if stored_hash == current_hash {
+                Ok(json!({ "needs_update": false, "reason": "hashes_match" }))
+            } else {
+                tracing::info!(
+                    "Requirements hash mismatch: stored={}, current={}",
+                    stored_hash, current_hash
+                );
+                Ok(json!({ "needs_update": true, "reason": "hash_mismatch" }))
+            }
+        }
+        None => {
+            tracing::info!("No stored requirements hash found, deps sync needed");
+            Ok(json!({ "needs_update": true, "reason": "no_stored_hash" }))
+        }
+    }
+}
+
+// ==================== Dependency sync command ====================
+
+#[tauri::command]
+pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
+    let venv_dir = get_venv_dir(&app);
+    let python_exec = venv_dir.join("Scripts").join("python.exe");
+    if !python_exec.is_file() {
+        return Err("Virtual environment python.exe not found".into());
+    }
+    let python_exec_cmd = normalize_path_for_command(&python_exec);
+
+    let requirements_path = file_in_resources(&app, "monitor/requirements.txt")
+        .unwrap_or_else(|| PathBuf::from("monitor/requirements.txt"));
+    if !requirements_path.exists() {
+        return Err("requirements.txt not found".into());
+    }
+
+    let app_for_emit = app.clone();
+
+    // Run pip install -r requirements.txt with streaming output
+    let mut cmd_proc = Command::new(&python_exec_cmd);
+    cmd_proc
+        .arg("-u")
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("-r")
+        .arg(normalize_path_for_command(&requirements_path))
+        .arg("--progress-bar")
+        .arg("off")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        cmd_proc.creation_flags(0x08000000);
+    }
+
+    let mut child = cmd_proc.spawn().map_err(|e| format!("Failed to spawn pip: {}", e))?;
+
+    let stdout = child.stdout.take().expect("failed to capture stdout");
+    let stderr = child.stderr.take().expect("failed to capture stderr");
+
+    let app_clone_stdout = app_for_emit.clone();
+    let stdout_handle = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line_res in reader.lines() {
+            if let Ok(line) = line_res {
+                let _ = app_clone_stdout.emit("install-log", json!({"source":"pip","line": line}));
+            }
+        }
+    });
+
+    let app_clone_stderr = app_for_emit.clone();
+    let stderr_handle = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line_res in reader.lines() {
+            if let Ok(line) = line_res {
+                let _ = app_clone_stderr.emit("install-log", json!({"source":"pip","line": line}));
+            }
+        }
+    });
+
+    let status = child.wait().map_err(|e| format!("Failed waiting for pip: {}", e))?;
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
+    if !status.success() {
+        let exit_code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+        return Err(format!("pip install failed (exit code {})", exit_code));
+    }
+
+    let _ = app_for_emit.emit("install-log", json!({"source":"installer","line": "Fixing onnxruntime/onnxruntime-directml conflict..."}));
+
+    // ONNX runtime conflict resolution
+    {
+        let mut uninstall_cmd = Command::new(&python_exec_cmd);
+        uninstall_cmd
+            .arg("-m").arg("pip").arg("uninstall").arg("onnxruntime").arg("-y");
+        #[cfg(windows)]
+        {
+            uninstall_cmd.creation_flags(0x08000000);
+        }
+        let _ = uninstall_cmd.output();
+
+        let mut reinstall_cmd = Command::new(&python_exec_cmd);
+        reinstall_cmd
+            .arg("-m").arg("pip").arg("install")
+            .arg("onnxruntime-directml==1.24.2")
+            .arg("--force-reinstall").arg("--no-deps")
+            .arg("-i").arg("https://mirrors.aliyun.com/pypi/simple/");
+        #[cfg(windows)]
+        {
+            reinstall_cmd.creation_flags(0x08000000);
+        }
+        match reinstall_cmd.output() {
+            Ok(output) => {
+                let msg = String::from_utf8_lossy(&output.stdout);
+                tracing::info!("onnxruntime-directml reinstall: {}", msg);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reinstall onnxruntime-directml: {}", e);
+            }
+        }
+    }
+
+    // Write updated hash on success
+    match compute_requirements_hash(&requirements_path) {
+        Ok(hash) => {
+            if let Err(e) = write_requirements_hash(&venv_dir, &hash) {
+                tracing::warn!("Failed to write requirements hash after sync: {}", e);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to compute requirements hash after sync: {}", e);
+        }
+    }
+
+    let _ = app_for_emit.emit("install-log", json!({"source":"installer","line": "Dependency sync completed successfully."}));
+    Ok("Dependencies synced successfully.".into())
 }

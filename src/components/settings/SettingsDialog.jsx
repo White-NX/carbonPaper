@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
-import { Settings as SettingsIcon, Shield, Info, Activity, Image as ImageIcon, Database, HardDrive, Wrench } from 'lucide-react';
+import { Settings as SettingsIcon, Shield, Info, Activity, Image as ImageIcon, Database, HardDrive, Wrench, Languages } from 'lucide-react';
 import { Dialog } from '../Dialog';
 import { updateMonitorFilters, deleteRecordsByTimeRange } from '../../lib/monitor_api';
 import { getAnalysisOverview } from '../../lib/analysis_api';
@@ -11,6 +12,7 @@ import SecuritySection from './SecuritySection';
 import StorageManagementSection from './StorageManagementSection';
 import AboutSection from './AboutSection';
 import AdvancedSection from './AdvancedSection';
+import LanguageSection from './LanguageSection';
 import { defaultFilterSettings, formatInvokeError, normalizeList } from './filterUtils';
 import { REFRESH_INTERVAL_MS } from './analysisUtils';
 import { checkForUpdate, downloadAndInstallUpdate } from '../../lib/update_api';
@@ -168,14 +170,14 @@ function SettingsDialog({
     try {
       const result = await deleteRecordsByTimeRange(minutes);
       if (result.error) {
-        setDeleteMessage(`删除失败: ${result.error}`);
+        setDeleteMessage(t('settings.delete.failure', { error: result.error }));
       } else {
         const count = result.deleted_count || 0;
-        setDeleteMessage(`成功删除 ${count} 条记录`);
+        setDeleteMessage(t('settings.delete.success', { count }));
         onRecordsDeleted?.();
       }
     } catch (e) {
-      setDeleteMessage(`删除失败: ${e?.message || e}`);
+      setDeleteMessage(t('settings.delete.failure', { error: e?.message || e }));
     } finally {
       setIsDeleting(false);
     }
@@ -193,13 +195,13 @@ function SettingsDialog({
     const result = await syncFiltersToMonitor(nextFilters);
     setSavingFilters(false);
     if (result.ok) {
-      setSaveFiltersMessage('已保存并同步到监控服务');
+      setSaveFiltersMessage(t('settings.save_filters.synced'));
     } else if (result.reason === 'not_running') {
-      setSaveFiltersMessage('已保存到本地，监控服务未启动，启动后会自动同步');
+      setSaveFiltersMessage(t('settings.save_filters.saved_local_not_running'));
     } else if (result.reason === 'unsupported') {
-      setSaveFiltersMessage('已保存到本地，但当前运行的监控进程不支持过滤命令，请重启监控服务');
+      setSaveFiltersMessage(t('settings.save_filters.saved_local_unsupported'));
     } else {
-      setSaveFiltersMessage(`已保存到本地，同步失败：${result.error?.message || result.error || '未知错误'}`);
+      setSaveFiltersMessage(t('settings.save_filters.saved_local_sync_failed', { error: result.error?.message || result.error || 'Unknown error' }));
     }
   };
 
@@ -254,7 +256,7 @@ function SettingsDialog({
       const enabled = await invoke('get_autostart_status');
       setAutoLaunchEnabled(Boolean(enabled));
     } catch (e) {
-      setAutoLaunchMessage(e?.message || '读取开机自启动状态失败');
+      setAutoLaunchMessage(e?.message || t('settings.autolaunch.read_error'));
       setAutoLaunchEnabled(null);
     } finally {
       setAutoLaunchLoading(false);
@@ -268,9 +270,9 @@ function SettingsDialog({
       const next = !(autoLaunchEnabled ?? false);
       const result = await invoke('set_autostart', { enabled: next });
       setAutoLaunchEnabled(Boolean(result));
-      setAutoLaunchMessage(Boolean(result) ? '已写入开机启动项' : '已移除开机启动项');
+      setAutoLaunchMessage(Boolean(result) ? t('settings.autolaunch.enabled') : t('settings.autolaunch.disabled'));
     } catch (e) {
-      setAutoLaunchMessage(`操作失败：${formatInvokeError(e)}`);
+      setAutoLaunchMessage(t('settings.autolaunch.action_failed', { error: formatInvokeError(e) }));
     } finally {
       setAutoLaunchLoading(false);
     }
@@ -287,7 +289,7 @@ function SettingsDialog({
         setMemorySeries(result?.memory || []);
         setStorage(result?.storage || null);
       } catch (err) {
-        setAnalysisError(err?.message || 'Failed to load analysis data');
+        setAnalysisError(err?.message || t('settings.analysis.load_failed', { error: '' }));
       } finally {
         setAnalysisLoading(false);
         setAnalysisRefreshing(false);
@@ -348,13 +350,15 @@ function SettingsDialog({
     return () => clearInterval(timer);
   }, [isOpen, activeTab, loadAnalysisOverview]);
 
+  const { t } = useTranslation();
+
   const storageSegments = useMemo(() => {
     if (!storage) return [];
     return [
-      { key: 'models', label: '模型', bytes: storage.models_bytes, icon: Activity, color: 'bg-indigo-500/70' },
-      { key: 'images', label: '图片', bytes: storage.images_bytes, icon: ImageIcon, color: 'bg-sky-500/70' },
-      { key: 'database', label: '数据库', bytes: storage.database_bytes, icon: Database, color: 'bg-emerald-500/70' },
-      { key: 'other', label: '程序依赖', bytes: storage.other_bytes, icon: HardDrive, color: 'bg-amber-500/70' },
+      { key: 'models', label: t('settings.storage.models'), bytes: storage.models_bytes, icon: Activity, color: 'bg-indigo-500/70' },
+      { key: 'images', label: t('settings.storage.images'), bytes: storage.images_bytes, icon: ImageIcon, color: 'bg-sky-500/70' },
+      { key: 'database', label: t('settings.storage.database'), bytes: storage.database_bytes, icon: Database, color: 'bg-emerald-500/70' },
+      { key: 'other', label: t('settings.storage.other'), bytes: storage.other_bytes, icon: HardDrive, color: 'bg-amber-500/70' },
     ];
   }, [storage]);
 
@@ -395,18 +399,19 @@ function SettingsDialog({
   };
 
   const tabs = [
-    { id: 'general', label: '通用', icon: SettingsIcon },
-    { id: 'security', label: '安全', icon: Shield },
-    { id: 'advanced', label: '高级', icon: Wrench },
-    { id: 'analysis', label: '存储管理', icon: HardDrive },
-    { id: 'about', label: '关于', icon: Info },
+    { id: 'general', label: t('settings.tabs.general'), icon: SettingsIcon },
+    { id: 'language', label: t('settings.tabs.language'), icon: Languages },
+    { id: 'security', label: t('settings.tabs.security'), icon: Shield },
+    { id: 'advanced', label: t('settings.tabs.advanced'), icon: Wrench },
+    { id: 'analysis', label: t('settings.tabs.analysis'), icon: HardDrive },
+    { id: 'about', label: t('settings.tabs.about'), icon: Info },
   ];
 
   return (
     <Dialog
       isOpen={isOpen}
       onClose={onClose}
-      title="设置"
+      title={t('settings.title')}
       maxWidth="max-w-3xl"
       className="h-[550px]"
       contentClassName="flex flex-col"
@@ -451,6 +456,10 @@ function SettingsDialog({
                 onToggleTelemetry={() => setSendTelemetryDiagnostics((v) => !v)}
               />
             </div>
+          )}
+
+          {activeTab === 'language' && (
+            <LanguageSection />
           )}
 
           {activeTab === 'security' && (

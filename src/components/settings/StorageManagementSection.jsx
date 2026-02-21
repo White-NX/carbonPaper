@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { listen } from '@tauri-apps/api/event';
@@ -21,6 +22,8 @@ function StorageRingChart({ totalDiskUsed, totalDiskSize, appUsedBytes, loading 
   // Calculate stroke dash offsets
   const diskStrokeDashoffset = circumference - (diskUsagePercent / 100) * circumference;
   const appStrokeDashoffset = circumference - (appUsagePercent / 100) * circumference;
+
+  const { t } = useTranslation();
 
   return (
     <div className="relative flex items-center justify-center">
@@ -78,7 +81,7 @@ function StorageRingChart({ totalDiskUsed, totalDiskSize, appUsedBytes, loading 
         ) : (
           <>
             <span className="text-2xl font-bold">{formatBytes(appUsedBytes)}</span>
-            <span className="text-xs text-ide-muted">程序占用</span>
+            <span className="text-xs text-ide-muted">{t('settings.storageManagement.overview.program_used')}</span>
           </>
         )}
       </div>
@@ -126,6 +129,7 @@ function StoragePathOption({
   disabled,
   className = '',
 }) {
+  const { t } = useTranslation();
   return (
     <div className={`bg-ide-bg/70 border border-ide-border rounded-xl p-4 ${className}`}>
       <div className="flex items-center gap-3 mb-3">
@@ -152,7 +156,7 @@ function StoragePathOption({
           disabled={disabled}
           className="shrink-0 px-3 py-2 text-xs border border-ide-border rounded-lg bg-ide-panel hover:border-ide-accent hover:text-ide-accent transition-colors disabled:opacity-60"
         >
-          {disabled ? '处理中...' : '修改'}
+          {disabled ? t('settings.storageManagement.storagePath.changing') : t('settings.storageManagement.storagePath.label')}
         </button>
       </div>
       {error && <div className="mt-2 text-xs text-red-400">{error}</div>}
@@ -177,6 +181,8 @@ export default function StorageManagementSection({
   const [retentionPeriod, setRetentionPeriod] = useState(() => {
     return localStorage.getItem('snapshotRetentionPeriod') || 'permanent';
   });
+
+  const { t } = useTranslation();
 
   // Migration state
   const [isMigrating, setIsMigrating] = useState(false);
@@ -229,20 +235,20 @@ export default function StorageManagementSection({
 
   // Storage limit options
   const storageLimitOptions = [
-    { value: '10', label: '10 GB' },
-    { value: '20', label: '20 GB' },
-    { value: '50', label: '50 GB' },
-    { value: '120', label: '120 GB' },
-    { value: 'unlimited', label: '不限制' },
+    { value: '10', label: t('settings.storageManagement.storageLimit.options.10') },
+    { value: '20', label: t('settings.storageManagement.storageLimit.options.20') },
+    { value: '50', label: t('settings.storageManagement.storageLimit.options.50') },
+    { value: '120', label: t('settings.storageManagement.storageLimit.options.120') },
+    { value: 'unlimited', label: t('settings.storageManagement.storageLimit.options.unlimited') },
   ];
 
   // Retention period options
   const retentionOptions = [
-    { value: '1month', label: '1 个月' },
-    { value: '6months', label: '6 个月' },
-    { value: '1year', label: '1 年' },
-    { value: '2years', label: '2 年' },
-    { value: 'permanent', label: '永久' },
+    { value: '1month', label: t('settings.storageManagement.retention.options.1month') },
+    { value: '6months', label: t('settings.storageManagement.retention.options.6months') },
+    { value: '1year', label: t('settings.storageManagement.retention.options.1year') },
+    { value: '2years', label: t('settings.storageManagement.retention.options.2years') },
+    { value: 'permanent', label: t('settings.storageManagement.retention.options.permanent') },
   ];
 
   // Mock disk info - in real implementation this would come from backend
@@ -294,7 +300,7 @@ export default function StorageManagementSection({
         });
 
         unlistenError = await listen('storage-migration-error', (evt) => {
-          setMigrationError(evt.payload?.message || '迁移出错');
+          setMigrationError(evt.payload?.message || t('settings.storageManagement.migration.error_default'));
         });
       }
 
@@ -366,8 +372,8 @@ export default function StorageManagementSection({
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between shrink-0">
         <div className="space-y-1">
-          <h2 className="text-xl font-semibold">存储管理</h2>
-          <p className="text-xs text-ide-muted">管理快照存储空间与数据保留策略</p>
+          <h2 className="text-xl font-semibold">{t('settings.storageManagement.title')}</h2>
+          <p className="text-xs text-ide-muted">{t('settings.storageManagement.description')}</p>
         </div>
         <button
           type="button"
@@ -376,7 +382,7 @@ export default function StorageManagementSection({
           className="flex items-center gap-2 px-3 py-2 text-xs border border-ide-border rounded-lg bg-ide-panel hover:border-ide-accent hover:text-ide-accent transition-colors disabled:opacity-60"
         >
           <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-          刷新
+          {t('settings.storageManagement.refresh')}
         </button>
       </div>
 
@@ -393,8 +399,8 @@ export default function StorageManagementSection({
             <HardDrive className="w-4 h-4" />
           </div>
           <div>
-            <h3 className="font-semibold">存储空间概览</h3>
-            <p className="text-[11px] text-ide-muted">{storage?.root_path || 'LocalAppData/CarbonPaper'}</p>
+            <h3 className="font-semibold">{t('settings.storageManagement.overview.title')}</h3>
+            <p className="text-[11px] text-ide-muted">{storage?.root_path || t('settings.storageManagement.overview.path', { path: 'LocalAppData/CarbonPaper' })}</p>
           </div>
         </div>
 
@@ -412,18 +418,18 @@ export default function StorageManagementSection({
           {/* Legend and Stats */}
           <div className="flex-1 space-y-4">
             {/* Legend */}
-            <div className="space-y-2">
-              <div className="flex items-center gap-3">
-                <div className="w-3 h-3 rounded-full bg-gradient-to-r from-purple-500 to-purple-400" />
-                <span className="text-sm text-ide-muted">硬盘总占用</span>
-                <span className="text-sm font-medium ml-auto">{formatBytes(diskInfo.usedSize)}</span>
-              </div>
-              <div className="flex items-center gap-3">
-                <div className="w-3 h-3 rounded-full bg-gradient-to-r from-blue-500 to-blue-400" />
-                <span className="text-sm text-ide-muted">程序占用</span>
-                <span className="text-sm font-medium ml-auto">{formatBytes(totalStorage)}</span>
-              </div>
-            </div>
+                <div className="space-y-2">
+                  <div className="flex items-center gap-3">
+                    <div className="w-3 h-3 rounded-full bg-gradient-to-r from-purple-500 to-purple-400" />
+                    <span className="text-sm text-ide-muted">{t('settings.storageManagement.overview.disk_used')}</span>
+                    <span className="text-sm font-medium ml-auto">{formatBytes(diskInfo.usedSize)}</span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <div className="w-3 h-3 rounded-full bg-gradient-to-r from-blue-500 to-blue-400" />
+                    <span className="text-sm text-ide-muted">{t('settings.storageManagement.overview.program_used')}</span>
+                    <span className="text-sm font-medium ml-auto">{formatBytes(totalStorage)}</span>
+                  </div>
+                </div>
 
             {/* Detailed breakdown */}
             <div className="grid grid-cols-2 gap-2 pt-2 border-t border-ide-border/50">
@@ -440,7 +446,7 @@ export default function StorageManagementSection({
             </div>
 
             <div className="text-[11px] text-ide-muted pt-2">
-              更新时间: {storage?.cached_at_ms ? formatTimestamp(storage.cached_at_ms) : '--'}
+              {t('settings.storageManagement.last_updated', { time: storage?.cached_at_ms ? formatTimestamp(storage.cached_at_ms) : '--' })}
             </div>
           </div>
         </div>
@@ -450,8 +456,8 @@ export default function StorageManagementSection({
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <StoragePathOption
           className="md:col-span-2"
-          label="存储位置"
-          description="选择和迁移快照和数据库的存储目录"
+          label={t('settings.storageManagement.storagePath.label')}
+          description={t('settings.storageManagement.storagePath.description')}
           value={currentStoragePath}
           onChangePath={handleChangeStoragePath}
           icon={FolderOpen}
@@ -460,8 +466,8 @@ export default function StorageManagementSection({
         />
 
         <StorageOptionSelect
-          label="快照存储空间上限"
-          description="超出后将自动删除最旧的快照"
+          label={t('settings.storageManagement.storageLimit.label')}
+          description={t('settings.storageManagement.storageLimit.description')}
           value={storageLimit}
           onChange={setStorageLimit}
           options={storageLimitOptions}
@@ -469,8 +475,8 @@ export default function StorageManagementSection({
         />
         
         <StorageOptionSelect
-          label="快照保留时间"
-          description="超过保留时间的快照将被自动清理"
+          label={t('settings.storageManagement.retention.label')}
+          description={t('settings.storageManagement.retention.description')}
           value={retentionPeriod}
           onChange={setRetentionPeriod}
           options={retentionOptions}
@@ -483,11 +489,8 @@ export default function StorageManagementSection({
         <div className="flex items-start gap-3 px-4 py-3 rounded-lg border border-amber-500/40 bg-amber-500/10">
           <AlertTriangle className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
           <div className="text-xs text-yellow-600 dark:text-yellow-500">
-            <p className="font-medium mb-1">警告</p>
-            <p>
-              当前设置为不限制存储空间且永久保留，快照文件可能会占用大量磁盘空间。
-              建议设置合理的存储上限或保留时间。
-            </p>
+            <p className="font-medium mb-1">{t('settings.storageManagement.warning.title')}</p>
+            <p>{t('settings.storageManagement.warning.message')}</p>
           </div>
         </div>
       )}
@@ -501,38 +504,36 @@ export default function StorageManagementSection({
       <Dialog
         isOpen={isMigrationChoiceDialogOpen}
         onClose={handleCancelMigrationChoice}
-        title="修改存储位置"
+        title={t('settings.storageManagement.storagePath.changeTitle')}
         maxWidth="max-w-md"
       >
         <div className="p-4 space-y-3">
-          <div className="text-sm text-ide-text">已选择新的存储目录：</div>
+          <div className="text-sm text-ide-text">{t('settings.storageManagement.storagePath.selectedPath')}</div>
           <div className="px-3 py-2 rounded-lg border border-ide-border bg-ide-panel text-xs text-ide-muted break-all">
             {pendingTargetPath || '--'}
           </div>
-          <p className="text-xs text-ide-muted">
-            是否将现有数据文件迁移到新目录？
-          </p>
+          <p className="text-xs text-ide-muted">{t('settings.storageManagement.storagePath.migrateQuestion')}</p>
           <div className="flex items-center justify-end gap-2 pt-2">
             <button
               type="button"
               onClick={handleCancelMigrationChoice}
               className="px-3 py-1.5 text-xs border border-ide-border rounded-lg bg-ide-panel hover:border-ide-accent hover:text-ide-accent transition-colors"
             >
-              取消迁移
+              {t('settings.storageManagement.storagePath.cancel')}
             </button>
             <button
               type="button"
               onClick={() => handleApplyStoragePath(false)}
               className="px-3 py-1.5 text-xs border border-ide-border rounded-lg bg-ide-panel hover:border-ide-accent hover:text-ide-accent transition-colors"
             >
-              仅修改路径
+              {t('settings.storageManagement.storagePath.applyPath')}
             </button>
             <button
               type="button"
               onClick={() => handleApplyStoragePath(true)}
               className="px-3 py-1.5 text-xs rounded-lg bg-ide-accent hover:bg-ide-accent/90 text-white transition-colors"
             >
-              迁移并修改
+              {t('settings.storageManagement.storagePath.migrateAndApply')}
             </button>
           </div>
         </div>

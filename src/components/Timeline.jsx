@@ -178,14 +178,14 @@ const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showTex
             {/* Process Label/Icon - Only on start of sequence and when density allows */}
             {(showLabel && !isSameActivityAsPrev) && (
                 <div 
-                    className="absolute top-0 flex items-center gap-1.5 text-xs z-20 pl-1 -translate-y-1"
+                    className="absolute top-0 flex items-center gap-1.5 text-xs z-20 pl-1 -translate-y-0.5"
                     style={{ left: x, color: processColor }}
                 >
                     {iconSrc ? (
                         <img
                             src={iconSrc}
                             alt={event.appName || 'app'}
-                            className="w-5 h-5 rounded-sm shadow-sm border border-current object-cover"
+                            className="w-4 h-4 rounded-sm shadow-sm object-cover"
                         />
                     ) : (
                         <span className="text-sm bg-ide-panel rounded-full w-5 h-5 flex items-center justify-center shadow-sm border border-current text-[10px] overflow-hidden">

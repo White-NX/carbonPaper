@@ -1,5 +1,6 @@
 import React from 'react';
 import { Moon, Sun, Settings, Bell, Terminal, Minus, Square, X, Copy } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import { SearchBox } from './SearchBox';
 import { APP_VERSION } from '../lib/version';
 
@@ -18,8 +19,9 @@ export default function TopBar({
   searchMode,
   onSearchModeChange
 }) {
+  const { t } = useTranslation();
   return (
-    <header data-tauri-drag-region className="h-12 border-b border-ide-border flex items-center justify-between px-4 shrink-0 select-none bg-ide-panel">
+    <header data-tauri-drag-region className="h-11 flex items-center justify-between px-4 shrink-0 select-none">
       <div className="flex items-center gap-4 pointer-events-none">
         <div className="flex items-center gap-2 text-ide-accent">
           <Terminal className="w-5 h-5" />
@@ -41,7 +43,7 @@ export default function TopBar({
         <button
           onClick={() => setShowSettings(true)}
           className="p-2 hover:bg-ide-hover rounded-md text-ide-muted hover:text-ide-text"
-          title="Settings"
+          title={t('topbar.settings')}
         >
           <Settings className="w-4 h-4" />
         </button>
@@ -66,7 +68,7 @@ export default function TopBar({
         <button onClick={onToggleMaximize} className="p-2 hover:bg-ide-hover rounded-md text-ide-muted hover:text-ide-text">
           {isMaximized ? <Copy className="w-4 h-4 rotate-180" /> : <Square className="w-4 h-4" />}
         </button>
-        <button onClick={onHideToTray} className="p-2 flex items-center justify-center hover:bg-red-500 hover:text-white rounded-md text-ide-muted transition-colors ml-1" title="隐藏到托盘">
+        <button onClick={onHideToTray} className="p-2 flex items-center justify-center hover:bg-red-500 hover:text-white rounded-md text-ide-muted transition-colors ml-1" title={t('topbar.hideToTray')}>
           <X className="w-5 h-5" />
         </button>
       </div>

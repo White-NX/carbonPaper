@@ -22,6 +22,7 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Emitter;
 use tauri::Manager;
+use window_vibrancy::apply_acrylic;
 
 const MENU_ID_OPEN: &str = "open";
 const MENU_ID_PAUSE: &str = "pause";
@@ -459,8 +460,6 @@ async fn storage_delete_plaintext(
     }))
 }
 
-// ==================== 高级配置命令 ====================
-
 #[tauri::command]
 fn get_advanced_config() -> Result<serde_json::Value, String> {
     let cpu_limit_enabled = registry_config::get_bool("cpu_limit_enabled").unwrap_or(true);
@@ -468,6 +467,7 @@ fn get_advanced_config() -> Result<serde_json::Value, String> {
     let capture_on_ocr_busy = registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
     let ocr_queue_limit_enabled = registry_config::get_bool("ocr_queue_limit_enabled").unwrap_or(true);
     let ocr_queue_max_size = registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
+    let use_dml = registry_config::get_bool("use_dml").unwrap_or(true);
 
     Ok(serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
@@ -475,6 +475,7 @@ fn get_advanced_config() -> Result<serde_json::Value, String> {
         "capture_on_ocr_busy": capture_on_ocr_busy,
         "ocr_queue_limit_enabled": ocr_queue_limit_enabled,
         "ocr_queue_max_size": ocr_queue_max_size,
+        "use_dml": use_dml,
     }))
 }
 
@@ -495,10 +496,11 @@ fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     if let Some(v) = config.get("ocr_queue_max_size").and_then(|v| v.as_u64()) {
         registry_config::set_u32("ocr_queue_max_size", v as u32)?;
     }
+    if let Some(v) = config.get("use_dml").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("use_dml", v)?;
+    }
     Ok(())
 }
-
-// ==================== 凭证管理相关命令 ====================
 
 #[tauri::command]
 async fn credential_initialize(
@@ -672,6 +674,12 @@ pub fn run() {
             let data_dir = data_dir.clone();
             move |app| {
             build_tray(app)?;
+
+            // 应用亚克力磨砂透明效果
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
+            }
+
             analysis::start_memory_sampler(app.handle().clone());
             logging::spawn_maintenance_task(data_dir.clone());
             
@@ -767,6 +775,8 @@ pub fn run() {
             python::check_python_venv,
             python::request_install_python,
             python::install_python_venv,
+            python::check_deps_freshness,
+            python::sync_python_deps,
             model_management::download_model,
             // Updater commands
             updater::updater_check,

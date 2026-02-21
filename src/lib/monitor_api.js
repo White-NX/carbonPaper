@@ -282,16 +282,10 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
 
 export const listProcesses = async () => {
     try {
-        const response = await invoke('execute_monitor_command', {
-            payload: {
-                command: 'list_processes'
-            }
+        return await withAuth(async () => {
+            const processes = await invoke('storage_list_processes');
+            return processes || [];
         });
-        if (response.error) {
-            console.error('List processes error:', response.error);
-            return [];
-        }
-        return response.processes || [];
     } catch (e) {
         console.error('Failed to list processes', e);
         return [];

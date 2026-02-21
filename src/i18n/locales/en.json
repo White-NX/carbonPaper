@@ -1,0 +1,411 @@
+{
+  "settings": {
+    "general": {
+      "title": "General Options",
+      "language": {
+        "label": "Language",
+        "description": "Select display language for the interface."
+      },
+      "telemetry": {
+        "label": "Allow sending telemetry diagnostic data",
+        "description": "Allow program to upload error logs that do not contain privacy data to the telemetry server."
+      }
+      ,
+      "monitor": {
+        "title": "Monitor Service",
+        "status": "Status: {{status}}",
+        "status_label": "Status:",
+        "description": "Control the background screenshot & OCR service.",
+        "starting": "Starting...",
+        "start": "Start Service",
+        "resume": "Resume",
+        "pause": "Pause",
+        "stop": "Stop",
+        "autoStart": {
+          "label": "Auto-start Subservice",
+          "description": "When enabled the app will attempt to launch the Python subservice on startup.",
+          "tooltip": "Automatically start screenshot/OCR background on app launch"
+        },
+        "autoLaunch": {
+          "label": "Auto Launch at Startup",
+          "description": "Writes to HKLM; administrative confirmation may be required.",
+          "reading": "Reading autostart status...",
+          "enabledMessage": "Enabled: CarbonPaper will start on system startup",
+          "disabledMessage": "Disabled: Will not start with system",
+          "enable": "Enable Auto Launch",
+          "disable": "Disable Auto Launch"
+        }
+      }
+    },
+    "title": "Settings",
+    "tabs": {
+      "general": "General",
+      "language": "Language",
+      "security": "Security",
+      "advanced": "Advanced",
+      "analysis": "Storage",
+      "about": "About"
+    },
+    "security": {
+      "protection": {
+        "title": "Protected by Windows CNG",
+        "description": "Your snapshot data is encrypted using credentials managed by Windows CNG. Only authorized access can decrypt it."
+      },
+      "unlock_label": "Unlock Duration",
+      "session": {
+        "title": "Auto-lock timeout",
+        "description": "Set how long of inactivity before automatic lock requiring re-authentication.",
+        "options": {
+          "5m": { "label": "5 minutes", "description": "Higher security" },
+          "15m": { "label": "15 minutes", "description": "Recommended" },
+          "1h": { "label": "1 hour", "description": "Convenient" },
+          "1d": { "label": "1 day", "description": "Lower security" },
+          "until_close": { "label": "Until closed", "description": "Not recommended", "warning": true }
+        },
+        "current": {
+          "unlocked": "Unlocked",
+          "locked": "Locked",
+          "label": "Current session:"
+        },
+        "lock_now": "Lock now",
+        "locking": "Locking..."
+      }
+    },
+    "advanced": {
+      "loading": "Loading...",
+      "warning": "These settings may affect monitor service performance and system stability. Adjust carefully.",
+      "cpu": {
+        "title": "Python subprocess CPU limits",
+        "label": "Limit CPU usage",
+        "description": "Limit CPU resources used for OCR and embeddings to avoid impacting system performance",
+        "percent_label": "CPU limit percent",
+        "changed_notice": "CPU limit changes take effect when the monitor service restarts"
+      },
+      "ocr": {
+        "title": "OCR processing queue",
+        "pause_label": "Pause captures when OCR queue has work",
+        "pause_desc": "When enabled, pauses captures while there are unprocessed OCR tasks to reduce resource usage",
+        "queue_limit_label": "Limit OCR task queue size",
+        "queue_limit_desc": "Pause captures until queue is drained when above this size",
+        "max_queue_label": "Max queue size",
+        "info": "OCR queue settings take effect immediately without restarting the monitor service"
+      },
+      "dml": {
+        "title": "OCR inference acceleration",
+        "label": "Use DirectML for inference",
+        "description": "When enabled, uses GPU for OCR inference acceleration; requires DirectX 12 compatible GPU",
+        "changed_notice": "DirectML changes take effect when the monitor service restarts"
+      }
+    },
+    "storageManagement": {
+      "title": "Storage Management",
+      "description": "Manage snapshot storage space and data retention policy",
+      "refresh": "Refresh",
+      "overview": {
+        "title": "Storage Overview",
+        "program_used": "App usage",
+        "disk_used": "Disk usage",
+        "path": "{{path}}"
+      },
+      "last_updated": "Updated: {{time}}",
+      "storagePath": {
+        "label": "Storage Location",
+        "description": "Select and migrate the directory used for snapshots and database",
+        "changing": "Processing...",
+        "changeTitle": "Change storage location",
+        "selectedPath": "Selected new storage directory:",
+        "migrateQuestion": "Migrate existing data files to the new directory?",
+        "cancel": "Cancel migration",
+        "applyPath": "Apply path only",
+        "migrateAndApply": "Migrate and apply"
+      },
+      "storageLimit": {
+        "label": "Snapshot storage limit",
+        "description": "Old snapshots will be deleted automatically when exceeded",
+        "options": {
+          "10": "10 GB",
+          "20": "20 GB",
+          "50": "50 GB",
+          "120": "120 GB",
+          "unlimited": "Unlimited"
+        }
+      },
+      "retention": {
+        "label": "Snapshot retention period",
+        "description": "Snapshots older than this period will be pruned",
+        "options": {
+          "1month": "1 month",
+          "6months": "6 months",
+          "1year": "1 year",
+          "2years": "2 years",
+          "permanent": "Permanent"
+        }
+      },
+      "warning": {
+        "title": "Warning",
+        "message": "Current settings allow unlimited storage and permanent retention; snapshots may consume large disk space. Consider setting reasonable limits or retention."
+      }
+      ,
+      "migration": {
+        "dialog_title": "Migrate data directory",
+        "error_default": "Migration failed",
+        "copying": "Copying files: {{copied}}/{{total}}",
+        "current_file": "Current file: {{file}}",
+        "cancel": "Cancel"
+      }
+    },
+    "storage": {
+      "models": "Models",
+      "images": "Images",
+      "database": "Database",
+      "other": "Dependencies"
+    },
+    "captureFilters": {
+      "title": "Capture Filters",
+      "processes": {
+        "label": "Ignore by process name",
+        "placeholder": "chrome.exe, obs64.exe",
+        "hint": "Matches by executable name, automatically lowercased."
+      },
+      "titles": {
+        "label": "Ignore by window title keywords",
+        "placeholder": "Internal System, Private Window",
+        "hint": "Substring match, case-insensitive."
+      },
+      "empty": "No rules",
+      "add": "Add",
+      "remove": "Remove",
+      "ignoreProtected": {
+        "label": "Do not capture protected windows",
+        "description": "When disabled, attempts to capture windows that have screen-protected attributes."
+      },
+      "save": "Save filters",
+      "quickDelete": {
+        "title": "Quick Delete Records",
+        "description": "Quickly delete all screenshots and OCR records within the specified range. This action cannot be undone.",
+        "options": {
+          "5min": "5 minutes",
+          "30min": "30 minutes",
+          "1hour": "1 hour",
+          "today": "Today"
+        },
+        "button": "{{label}} within",
+        "confirmTitle": "Confirm?",
+        "yes": "YES",
+        "no": "NO"
+      }
+    },
+    "delete": {
+      "failure": ""
+    },
+    "save_filters": {
+      "synced": "",
+      "saved_local_not_running": "",
+      "saved_local_unsupported": "",
+      "saved_local_sync_failed": ""
+    },
+    "autolaunch": {
+      "read_error": "",
+      "enabled": "",
+      "disabled": "",
+      "action_failed": ""
+    },
+    "analysis": {
+      "load_failed": ""
+    }
+  },
+  "topbar": {
+    "settings": "Settings",
+    "hideToTray": "Hide to tray"
+  },
+  "delete": {
+    "failure": "Delete failed: {{error}}",
+    "success": "Successfully deleted {{count}} records"
+  },
+  "save_filters": {
+    "synced": "Saved and synced to monitor service",
+    "saved_local_not_running": "Saved locally; monitor service not running, will sync when started",
+    "saved_local_unsupported": "Saved locally, but current monitor process does not support filter commands. Please restart monitor service",
+    "saved_local_sync_failed": "Saved locally; sync failed: {{error}}"
+  },
+  "autolaunch": {
+    "read_error": "Failed to read autostart status",
+    "enabled": "Added to startup",
+    "disabled": "Removed from startup",
+    "action_failed": "Operation failed: {{error}}"
+  },
+  "analysis": {
+    "load_failed": "Failed to load analysis data: {{error}}"
+  },
+  "search": {
+    "switchToNL": "Switch to Natural Language Search",
+    "switchToOCR": "Switch to OCR Search",
+    "selectMode": "Select Search Mode",
+    "mode": {
+      "ocr": {
+        "title": "OCR Keyword Search",
+        "description": "Search by matching text recognized in screenshots"
+      },
+      "nl": {
+        "title": "Natural Language Search",
+        "description": "Describe the image content, scene or objects for semantic fuzzy search"
+      }
+    },
+    "placeholder": {
+      "ocr": "Search text in screenshots...",
+      "nl": "Describe image content..."
+    },
+    "loading": "Loading...",
+    "noContents": "No Contents",
+    "noTextContent": "No text content",
+    "unknownProcess": "Unknown Process",
+    "matchScore": "Match Score"
+  },
+  "sidebar": {
+    "details": {
+      "title": "Details"
+    },
+    "labels": {
+      "process": "Process",
+      "window": "Window",
+      "time": "Time"
+    },
+    "empty": "Select an event from the timeline to view details."
+  }
+  ,
+  "authMask": {
+    "title": "Windows Hello verification required",
+    "description": "Carbon Paper uses Windows Hello to encrypt your screenshots and OCR data. Please unlock using PIN, fingerprint, or face recognition.",
+    "authenticating": "Authenticating...",
+    "unlock_button": "Unlock with Windows Hello",
+    "encrypted_label": "Data is encrypted",
+    "errors": {
+      "verify_failed": "Verification failed, please try again",
+      "cancelled": "You cancelled verification",
+      "not_available": "Windows Hello is not available; enable it in system settings",
+      "initializing": "Initializing security credentials...",
+      "init_failed": "Initialization failed: {{error}}",
+      "generic_failed": "Verification failed: {{error}}"
+    }
+  }
+  ,
+  "advancedSearch": {
+    "title": "Advanced",
+    "search": {
+      "placeholder_ocr": "Search OCR text...",
+      "placeholder_nl": "Describe image content...",
+      "go": "Go",
+      "searching": "Searching...",
+      "enter_keyword": "Enter a keyword or choose filters to begin.",
+      "press_enter": "Press Enter in the top search bar to jump here quickly.",
+      "did_you_know": "Did you know: {{msg}}",
+      "no_results": "No matching results",
+      "adjust": "Adjust filters or try different keywords."
+    },
+    "modes": {
+      "ocr": "OCR Mode",
+      "nl": "Natural Language"
+    },
+    "processes": {
+      "all": "All Processes",
+      "label": "Processes",
+      "select": "Select Processes",
+      "clear": "Clear",
+      "no_data": "No process data",
+      "count": "{{count}} Processes"
+    },
+    "filters": {
+      "reset": "Reset"
+    },
+    "nl_notice": "Results obtained using natural language image search may not be accurate.",
+    "no_image": "No Image",
+    "unknown": "Unknown",
+    "no_ocr_text": "No OCR text",
+    "similarity": "Similarity: {{score}}",
+    "loading_more": "Loading more results...",
+    "scroll_load": "Scroll to load more…",
+    "no_more": "No more results",
+    "rotating": [
+      "This app is currently a toy!",
+      "Rosmontis is really cute!",
+      "LLM-powered search will be added in the future!",
+      "btw, I play arknights",
+      "Amiya, hear me out, I really didn't favor Pelica..."
+    ]
+  }
+  ,
+  "mask": {
+    "debug": {
+      "label": "DEBUG",
+      "none": "(none)",
+      "online": "Online (hide mask)",
+      "offline": "Backend: Offline",
+      "waiting": "Backend: Waiting",
+      "venv1": "Venv: Step 1",
+      "venv2": "Venv: Step 2",
+      "venv3": "Venv: Step 3",
+      "nopython": "First-run (no python)"
+    },
+    "backend_shutdown": {
+      "title": "Backend python services shutdown",
+      "description": "Please enable the backend services to continue using the application."
+    },
+    "start": {
+      "starting": "Starting...",
+      "start_service": "Start OCR Service",
+      "waiting": "Waiting for IPC to come up..."
+    },
+    "venv": {
+      "step1": {
+        "title": "Install Python v{{version}}",
+        "subtitle": "Step 1 / 3 — choose or install system Python"
+      },
+      "pythonPath": {
+        "label": "Python executable path",
+        "placeholder": "e.g.: C:\\Python310\\python.exe or paste custom path"
+      },
+      "choose": "Choose",
+      "auto_install": {
+        "log_start": "Starting automated Python install...",
+        "success": "Installation succeeded.",
+        "finished": "Auto-install process finished."
+      },
+      "discovered_label": "Discovered Python versions (you may select one)",
+      "unsupported": "Not supported",
+      "not_found": "No Python discovered",
+      "note": "Not sure what Python is? We can auto-install it. After install the app will exit and must be restarted.",
+      "auto_install": { "installing": "Installing...", "button": "Auto-install Python" },
+      "install_logs": "Install logs",
+      "install_failed": "Installation failed: {{error}}",
+      "next": "Next",
+      "step2": {
+        "title": "Install required dependencies",
+        "subtitle": "Step 2 / 3 — create venv and install requirements and model files",
+        "disk_note": "This will download ~1.7GB of model files; actual time depends on network and device performance.",
+        "log_start": "Starting venv creation and dependency installation...",
+        "using_python": "Using Python path: {{path}}",
+        "using_python_default": "(not specified, will use default)",
+        "download_models": "Downloading model files...",
+        "deps_complete": "All dependencies installed.",
+        "install_logs": "Install logs",
+        "install_failed": "Installation failed",
+        "deps_failed": "Failed: {{error}}",
+        "retry": "Retry",
+        "running": "Installation in progress",
+        "complete": "Complete"
+      }
+    },
+    "first_run": {
+      "title": "First-time setup required",
+      "description": "The application needs to install essential environment",
+      "install_button": "Install Environment"
+    },
+    "deps_update": {
+      "title": "Updating Dependencies",
+      "subtitle": "Dependency changes detected, syncing automatically...",
+      "syncing": "Syncing dependencies...",
+      "failed": "Dependency update failed: {{error}}",
+      "retry": "Retry"
+    }
+  }
+}

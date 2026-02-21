@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { Play, Pause, Square as StopSquare, Loader2 } from 'lucide-react';
 
 export default function MonitorServiceSection({
@@ -14,14 +15,15 @@ export default function MonitorServiceSection({
   autoLaunchMessage,
   onToggleAutoLaunch,
 }) {
+  const { t } = useTranslation();
   return (
     <div className="space-y-3">
-      <label className="text-sm font-semibold text-ide-accent px-1 block">Monitor Service</label>
+      <label className="text-sm font-semibold text-ide-accent px-1 block">{t('settings.general.monitor.title')}</label>
       <div className="p-4 bg-ide-bg border border-ide-border rounded-xl text-sm text-ide-muted space-y-3">
         <div className="flex items-center justify-between gap-4">
           <div>
             <label className="block mb-1 font-semibold text-ide-text">
-              Status:{' '}
+              {t('settings.general.monitor.status_label')}{' '}
               <span
                 className={`${
                   monitorStatus === 'running'
@@ -36,7 +38,7 @@ export default function MonitorServiceSection({
                 {monitorStatus.toUpperCase()}
               </span>
             </label>
-            <p className="text-xs text-ide-muted">Control the background screenshot & OCR service.</p>
+            <p className="text-xs text-ide-muted">{t('settings.general.monitor.description')}</p>
           </div>
           <div className="flex gap-2 shrink-0">
             {monitorStatus === 'stopped' || monitorStatus === 'waiting' ? (
@@ -50,7 +52,7 @@ export default function MonitorServiceSection({
                 ) : (
                   <Play className="w-3.5 h-3.5 fill-current" />
                 )}
-                {monitorStatus === 'waiting' ? 'Starting...' : 'Start Service'}
+                {monitorStatus === 'waiting' ? t('settings.general.monitor.starting') : t('settings.general.monitor.start')}
               </button>
             ) : (
               <>
@@ -58,7 +60,7 @@ export default function MonitorServiceSection({
                   <button
                     onClick={onResume}
                     className="p-2 bg-ide-panel hover:bg-ide-hover border border-ide-border rounded-lg text-green-500 transition-colors"
-                    title="Resume"
+                    title={t('settings.general.monitor.resume')}
                   >
                     <Play className="w-4 h-4 fill-current" />
                   </button>
@@ -66,7 +68,7 @@ export default function MonitorServiceSection({
                   <button
                     onClick={onPause}
                     className="p-2 bg-ide-panel hover:bg-ide-hover border border-ide-border rounded-lg text-yellow-500 transition-colors"
-                    title="Pause"
+                    title={t('settings.general.monitor.pause')}
                   >
                     <Pause className="w-4 h-4 fill-current" />
                   </button>
@@ -74,7 +76,7 @@ export default function MonitorServiceSection({
                 <button
                   onClick={onStop}
                   className="p-2 bg-ide-panel hover:bg-ide-hover border border-ide-border rounded-lg text-red-500 transition-colors"
-                  title="Stop"
+                  title={t('settings.general.monitor.stop')}
                 >
                   <StopSquare className="w-4 h-4 fill-current" />
                 </button>
@@ -87,15 +89,15 @@ export default function MonitorServiceSection({
 
         <div className="flex items-center justify-between gap-4">
             <div>
-              <label className="block mb-1 font-semibold text-ide-text">启动时自动子服务</label>
-              <p className="text-xs text-ide-muted">开启后应用启动时会自动尝试拉起 Python 子服务。</p>
+              <label className="block mb-1 font-semibold text-ide-text">{t('settings.general.monitor.autoStart.label')}</label>
+              <p className="text-xs text-ide-muted">{t('settings.general.monitor.autoStart.description')}</p>
             </div>
             <button
               onClick={() => onAutoStartMonitorChange?.(!autoStartMonitor)}
               className={`w-11 h-6 shrink-0 rounded-full transition-colors relative ${
                 autoStartMonitor ? 'bg-ide-accent' : 'bg-ide-panel border border-ide-border'
               }`}
-              title="应用启动后自动运行截图/OCR后台"
+              title={t('settings.general.monitor.autoStart.tooltip')}
             >
               <div
                 className="absolute top-1 w-4 h-4 rounded-full bg-white transition-transform shadow-sm"
@@ -106,15 +108,15 @@ export default function MonitorServiceSection({
 
         <div className="flex items-center justify-between gap-4">
             <div className="flex-1">
-              <label className="block mb-1 font-semibold text-ide-text">开机自启动</label>
-              <p className="text-xs text-ide-muted mb-1">写入注册表 HKLM，需管理员确认。</p>
+              <label className="block mb-1 font-semibold text-ide-text">{t('settings.general.monitor.autoLaunch.label')}</label>
+              <p className="text-xs text-ide-muted mb-1">{t('settings.general.monitor.autoLaunch.description')}</p>
               <p className="text-xs text-ide-muted/80">
                 {autoLaunchMessage ||
                   (autoLaunchEnabled === null
-                    ? '正在读取开机自启动状态...'
+                    ? t('settings.general.monitor.autoLaunch.reading')
                     : autoLaunchEnabled
-                      ? '已开启：电脑开机后自动启动 CarbonPaper'
-                      : '未开启：不会随系统启动')}
+                      ? t('settings.general.monitor.autoLaunch.enabledMessage')
+                      : t('settings.general.monitor.autoLaunch.disabledMessage'))}
               </p>
             </div>
             <button
@@ -125,7 +127,7 @@ export default function MonitorServiceSection({
               } disabled:opacity-50`}
             >
               {autoLaunchLoading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-              {autoLaunchEnabled ? '关闭开机自启' : '开启开机自启'}
+              {autoLaunchEnabled ? t('settings.general.monitor.autoLaunch.disable') : t('settings.general.monitor.autoLaunch.enable')}
             </button>
           </div>
       </div>

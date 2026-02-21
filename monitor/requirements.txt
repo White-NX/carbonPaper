@@ -1,14 +1,11 @@
 --index-url https://mirrors.aliyun.com/pypi/simple/
---extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
 
 mss
 Pillow
 pywin32
 
-paddlepaddle==3.2.0
-paddleocr==3.3.0
-onnxruntime==1.23.2
-rapidocr-onnxruntime==1.4.4
+rapidocr==3.6.0
+onnxruntime-directml==1.24.2
 opencv-python
 
 transformers>=4.30.0

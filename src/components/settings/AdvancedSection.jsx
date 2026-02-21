@@ -1,16 +1,19 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
 const CPU_PERCENT_OPTIONS = [5, 10, 15, 20, 30, 50];
 const OCR_QUEUE_SIZE_OPTIONS = [1, 2, 3, 5, 10];
 
 export default function AdvancedSection({ monitorStatus }) {
+  const { t } = useTranslation();
   const [config, setConfig] = useState(null);
   const [loading, setLoading] = useState(true);
   const [cpuDropdownOpen, setCpuDropdownOpen] = useState(false);
   const [queueDropdownOpen, setQueueDropdownOpen] = useState(false);
   const [cpuChanged, setCpuChanged] = useState(false);
+  const [dmlChanged, setDmlChanged] = useState(false);
 
   const loadConfig = async () => {
     try {
@@ -59,6 +62,9 @@ export default function AdvancedSection({ monitorStatus }) {
     if (key === 'cpu_limit_enabled') {
       setCpuChanged(true);
     }
+    if (key === 'use_dml') {
+      setDmlChanged(true);
+    }
     if (key === 'capture_on_ocr_busy' || key === 'ocr_queue_limit_enabled') {
       await syncOcrConfigToMonitor(newConfig);
     }
@@ -93,7 +99,7 @@ export default function AdvancedSection({ monitorStatus }) {
   if (loading || !config) {
     return (
       <div className="flex items-center justify-center py-12 text-ide-muted text-sm">
-        加载中...
+        {t('settings.advanced.loading')}
       </div>
     );
   }
@@ -103,25 +109,21 @@ export default function AdvancedSection({ monitorStatus }) {
 
       <div className="flex items-center gap-2 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg">
         <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-        <p className="text-xs text-amber-300/90">
-          这些设置可能会影响监控服务的性能和稳定性，甚至影响操作系统整体性能。请谨慎调整。
-        </p>
+        <p className="text-xs text-amber-300/90">{t('settings.advanced.warning')}</p>
       </div>
 
       {/* CPU 限制 */}
       <div className="space-y-3">
         <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
           <Cpu className="w-4 h-4" />
-          Python 子进程 CPU 限制
+          {t('settings.advanced.cpu.title')}
         </label>
 
         <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1 min-w-0">
-              <p className="text-sm text-ide-text font-medium">限制 CPU 占用率</p>
-              <p className="text-xs text-ide-muted mt-1">
-                限制 OCR 和向量化处理使用的 CPU 资源，避免影响系统性能
-              </p>
+              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.cpu.label')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.cpu.description')}</p>
             </div>
             <button
               onClick={() => handleToggle('cpu_limit_enabled')}
@@ -137,7 +139,7 @@ export default function AdvancedSection({ monitorStatus }) {
 
           {config.cpu_limit_enabled && (
             <div className="flex items-center justify-between gap-4">
-              <p className="text-sm text-ide-muted">CPU 限制百分比</p>
+              <p className="text-sm text-ide-muted">{t('settings.advanced.cpu.percent_label')}</p>
               <div className="relative">
                 <button
                   onClick={(e) => {
@@ -178,9 +180,7 @@ export default function AdvancedSection({ monitorStatus }) {
           {cpuChanged && (
             <div className="flex items-center gap-2 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg">
               <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-              <p className="text-xs text-amber-300/90">
-                CPU 限制更改将在下次启动监控服务时生效
-              </p>
+              <p className="text-xs text-amber-300/90">{t('settings.advanced.cpu.changed_notice')}</p>
             </div>
           )}
         </div>
@@ -190,17 +190,15 @@ export default function AdvancedSection({ monitorStatus }) {
       <div className="space-y-3">
         <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
           <ListOrdered className="w-4 h-4" />
-          OCR 处理队列
+          {t('settings.advanced.ocr.title')}
         </label>
 
         <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
           {/* 截图暂停开关 */}
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1 min-w-0">
-              <p className="text-sm text-ide-text font-medium">OCR 队列有任务时暂停截图</p>
-              <p className="text-xs text-ide-muted mt-1">
-                开启后，当 OCR 队列中有未处理任务时将暂停截图，减少资源占用
-              </p>
+              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.ocr.pause_label')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.ocr.pause_desc')}</p>
             </div>
             <button
               onClick={() => handleToggle('capture_on_ocr_busy')}
@@ -217,10 +215,8 @@ export default function AdvancedSection({ monitorStatus }) {
           {/* 队列大小限制 */}
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1 min-w-0">
-              <p className="text-sm text-ide-text font-medium">限制 OCR 任务队列大小</p>
-              <p className="text-xs text-ide-muted mt-1">
-                超过此大小时，暂停所有截图直到队列消化
-              </p>
+              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.ocr.queue_limit_label')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.ocr.queue_limit_desc')}</p>
             </div>
             <button
               onClick={() => handleToggle('ocr_queue_limit_enabled')}
@@ -236,7 +232,7 @@ export default function AdvancedSection({ monitorStatus }) {
 
           {config.ocr_queue_limit_enabled && (
             <div className="flex items-center justify-between gap-4">
-              <p className="text-sm text-ide-muted">最大队列大小</p>
+              <p className="text-sm text-ide-muted">{t('settings.advanced.ocr.max_queue_label')}</p>
               <div className="relative">
                 <button
                   onClick={(e) => {
@@ -277,10 +273,41 @@ export default function AdvancedSection({ monitorStatus }) {
           {/* 信息提示 */}
           <div className="flex items-start gap-2 p-2.5 bg-ide-panel/50 border border-ide-border/30 rounded-lg">
             <Info className="w-4 h-4 text-ide-muted shrink-0 mt-0.5" />
-            <p className="text-xs text-ide-muted leading-relaxed">
-              OCR 队列设置会即时生效，无需重启监控服务
-            </p>
+            <p className="text-xs text-ide-muted leading-relaxed">{t('settings.advanced.ocr.info')}</p>
           </div>
+        </div>
+      </div>
+      {/* DirectML 推理加速 */}
+      <div className="space-y-3">
+        <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
+          <Zap className="w-4 h-4" />
+          {t('settings.advanced.dml.title')}
+        </label>
+
+        <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1 min-w-0">
+              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.dml.label')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.dml.description')}</p>
+            </div>
+            <button
+              onClick={() => handleToggle('use_dml')}
+              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${config.use_dml ? 'bg-ide-accent' : 'bg-ide-border'
+                }`}
+            >
+              <div
+                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.use_dml ? 'translate-x-5' : 'translate-x-0.5'
+                  }`}
+              />
+            </button>
+          </div>
+
+          {dmlChanged && (
+            <div className="flex items-center gap-2 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+              <p className="text-xs text-amber-300/90">{t('settings.advanced.dml.changed_notice')}</p>
+            </div>
+          )}
         </div>
       </div>
     </div>

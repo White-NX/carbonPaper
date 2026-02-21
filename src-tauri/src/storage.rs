@@ -1,7 +1,7 @@
-//! 存储管理模块 - SQLCipher 加密数据库和截图文件管理
+//! Storage Management Module - SQLCipher Encrypted SQLite Database and File Storage
 //!
-//! 该模块提供：
-//! 1. 加密SQLite 数据库存储（使用 SQLCipher）
+//! This module provides:
+//! 1. 加密 SQLite 数据库存储（使用 SQLCipher）
 //! 2. 截图文件的存储和管理
 //! 3. OCR 数据的存储和搜索
 
@@ -48,23 +48,22 @@ impl Drop for MigrationRunGuard<'_> {
     }
 }
 
-/// 存储管理器状
+/// StorageState manages the encrypted database connection, data directory paths, and migration state. 
+/// It provides methods for initializing storage, saving/loading screenshots and OCR results, and migrating the data directory.
 pub struct StorageState {
-    /// 数据库连
+    /// Database connection
     db: Mutex<Option<Connection>>,
-    /// 数据目录
+    /// Data directory (contains database, screenshots, logs, etc.)
     pub data_dir: Mutex<PathBuf>,
-    /// 截图目录
     pub screenshot_dir: Mutex<PathBuf>,
-    /// 凭证管理器状态引
+    /// credential manager state for encryption key management
     credential_state: Arc<CredentialManagerState>,
-    /// 是否已初始化
     initialized: Mutex<bool>,
     migration_cancel_requested: AtomicBool,
     migration_in_progress: AtomicBool,
 }
 
-/// 截图记录
+/// Screenshot record representing a row in the screenshots table, with decrypted fields. This is the main struct used for returning screenshot data to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenshotRecord {
     pub id: i64,
@@ -79,7 +78,7 @@ pub struct ScreenshotRecord {
     pub timestamp: Option<i64>,
 }
 
-/// OCR 结果记录
+/// OcrResult representing a row in the ocr_results table, with decrypted fields. This is used for returning OCR data to the frontend and for search results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OcrResult {
     pub id: i64,
@@ -90,7 +89,7 @@ pub struct OcrResult {
     pub created_at: String,
 }
 
-/// 搜索结果
+/// SeacrhResult representing the combined data from screenshots and ocr_results for search results returned to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub id: i64,
@@ -105,10 +104,10 @@ pub struct SearchResult {
     pub screenshot_created_at: String,
 }
 
-/// 存储保存请求
+/// The input for saving a screenshot, containing all necessary data and metadata. The image data is expected to be Base64 encoded to allow passing through JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveScreenshotRequest {
-    pub image_data: String, // Base64 编码的图片数
+    pub image_data: String, // Base64 encoded image data
     pub image_hash: String,
     pub width: i32,
     pub height: i32,
@@ -126,7 +125,7 @@ pub struct OcrResultInput {
     pub box_coords: Vec<Vec<f64>>,
 }
 
-/// 存储响应
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveScreenshotResponse {
     pub status: String,
@@ -137,6 +136,9 @@ pub struct SaveScreenshotResponse {
 }
 
 /// Raw row data extracted from DB without decryption (for releasing mutex early)
+/// 
+/// The `_plain` fields are for backward compatibility with old unencrypted records, 
+/// it will be ignored if the corresponding `_enc` fields are present and can be decrypted successfully.
 struct RawScreenshotRow {
     id: i64,
     image_path: String,
@@ -261,7 +263,7 @@ impl StorageState {
         }
     }
 
-    /// 安全关闭存储，释放数据库连接和其他句
+    /// Request cancellation of an ongoing migration. 
     pub fn request_migration_cancel(&self) -> bool {
         self.migration_cancel_requested.store(true, Ordering::SeqCst);
         self.migration_in_progress.load(Ordering::SeqCst)
@@ -326,7 +328,10 @@ impl StorageState {
         Ok(())
     }
 
-    /// 更新 data 目录。可选执行完整迁移（copy + remove），并过 app_handle 发出进度事件    /// 返回 JSON 对象 { target: String, migrated: bool }
+    /// 更新 data 目录。可选执行完整迁移（copy + remove），并过 app_handle 发出进度事件    
+    /// 
+    /// 返回 JSON 对象 { target: String, migrated: bool }
+    /// 
     /// 规范化路径用于安全比较（解析符号链接、`.`、`..` 等）
     fn canonicalize_for_compare(p: &Path) -> PathBuf {
         std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
@@ -611,7 +616,7 @@ impl StorageState {
         std::fs::create_dir_all(&screenshot_dir)
             .map_err(|e| format!("Failed to create screenshot directory: {}", e))?;
 
-        // 使用公钥派生弱数据库密钥（无霢用户认证
+        // 使用公钥派生弱数据库密钥（无需用户认证
         let public_key = get_cached_public_key(&self.credential_state)
             .or_else(|| load_public_key_from_file(&self.credential_state).ok())
             .ok_or_else(|| "Public key not initialized".to_string())?;
@@ -795,13 +800,6 @@ impl StorageState {
         Ok(guard)
     }
 
-    /// 计算数据 MD5 哈希
-    fn compute_hash(data: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let result = Sha256::digest(data);
-        hex::encode(result)
-    }
-
     /// HMAC 用于盲索引
     fn compute_hmac_hash(text: &str) -> String {
         type HmacSha256 = Hmac<sha2::Sha256>;
@@ -858,7 +856,7 @@ impl StorageState {
     fn bigram_tokenize(text: &str) -> HashSet<String> {
         let chars: Vec<char> = text.chars().collect();
         if chars.len() < 2 {
-            return HashSet::new(); // 忽略过短的文
+            return HashSet::new(); // ignore texts too short for bigrams
         }
 
         chars.windows(2).map(|w| w.iter().collect()).collect()
@@ -879,6 +877,7 @@ impl StorageState {
         )
     }
 
+    /// Zeroize sensitive data in memory to reduce risk of leakage.
     fn zeroize_bytes(bytes: &mut [u8]) {
         use std::sync::atomic::{compiler_fence, Ordering};
         for b in bytes.iter_mut() {
@@ -1132,7 +1131,7 @@ impl StorageState {
                         continue;
                     }
 
-                    // 插入 OCR 结果（文本保留明文用于搜索）
+                    // Insert new OCR result, with encrypted text and blind index update in a transaction
                     conn.execute(
                         "INSERT INTO ocr_results (
                             screenshot_id, text, text_hash, text_enc, text_key_encrypted, confidence,
@@ -1586,52 +1585,123 @@ impl StorageState {
         let conn = guard.as_mut().unwrap();
 
         // 使用盲三元组位图索引进行搜索。如果 query 为空则化为按时间序的全文扫描（带时间进程过滤）
-        let triple_tokens: Vec<String> = if query.is_empty() {
-            Vec::new()
-        } else {
-            Self::bigram_tokenize(query).into_iter().collect()
-        };
+        // 按空白拆分关键词，每个关键词独立计算 bigram，避免跨关键词产生含空格的无效 bigram
+        let keywords: Vec<&str> = query.split_whitespace().collect();
+        let per_keyword_bigrams: Vec<HashSet<String>> = keywords.iter()
+            .map(|kw| Self::bigram_tokenize(kw))
+            .filter(|set| !set.is_empty())
+            .collect();
 
         // 如果没有三元token，则尝试对短查询使用基于词元的位图索引
         // 若词元也为空则化为简单的 SQL 查询（按时间排序）
-        if triple_tokens.is_empty() {
+        if per_keyword_bigrams.is_empty() {
             if !query.is_empty() {
-                // 使用分词（短查询策略
-                let tokens = Self::tokenize_text(query);
-                if !tokens.is_empty() {
-                    // blind_bitmap_index 获取 postings 并交
-                    let mut bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
-                    for token in &tokens {
-                        let token_hash = Self::compute_hmac_hash(token);
-                        let blob: Option<Vec<u8>> = conn
-                            .query_row(
-                                "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?",
-                                params![&token_hash],
-                                |row| row.get(0),
-                            )
-                            .optional()
-                            .map_err(|e| format!("Failed to query bitmap: {}", e))?;
+                // 使用分词（短查询策略），对每个关键词分别分词
+                let per_keyword_tokens: Vec<Vec<String>> = keywords
+                    .iter()
+                    .map(|kw| Self::tokenize_text(kw))
+                    .filter(|tokens| !tokens.is_empty())
+                    .collect();
 
-                        if let Some(b) = blob {
-                            let rb = roaring::RoaringBitmap::deserialize_from(&b[..])
-                                .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?;
-                            bitmaps.push(rb);
-                        } else {
-                            // 某个 token 没有 posting => 无匹配
+                if !per_keyword_tokens.is_empty() {
+                    // 每个关键词的 token 集合 -> 对应的 OCR ID bitmap
+                    let mut keyword_bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
+
+                    for kw_tokens in &per_keyword_tokens {
+                        let mut bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
+                        for token in kw_tokens {
+                            let token_hash = Self::compute_hmac_hash(token);
+                            let blob: Option<Vec<u8>> = conn
+                                .query_row(
+                                    "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?",
+                                    params![&token_hash],
+                                    |row| row.get(0),
+                                )
+                                .optional()
+                                .map_err(|e| format!("Failed to query bitmap: {}", e))?;
+
+                            if let Some(b) = blob {
+                                let rb = roaring::RoaringBitmap::deserialize_from(&b[..])
+                                    .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?;
+                                bitmaps.push(rb);
+                            } else {
+                                bitmaps.clear();
+                                break;
+                            }
+                        }
+
+                        if bitmaps.is_empty() {
                             return Ok(vec![]);
                         }
+
+                        let mut iter = bitmaps.into_iter();
+                        let mut kw_intersection = iter.next().unwrap();
+                        for bm in iter {
+                            kw_intersection &= &bm;
+                        }
+                        keyword_bitmaps.push(kw_intersection);
                     }
 
-                    // 交集
-                    let mut iter = bitmaps.into_iter();
-                    let mut intersection = if let Some(first) = iter.next() {
-                        first
+                    // 多关键词时在 screenshot 级别交集
+                    let is_multi_keyword = keyword_bitmaps.len() > 1;
+                    let intersection = if is_multi_keyword {
+                        let mut per_kw_screenshot_ids: Vec<std::collections::HashSet<i64>> =
+                            Vec::new();
+
+                        for kw_bitmap in &keyword_bitmaps {
+                            let ocr_ids: Vec<i64> =
+                                kw_bitmap.iter().map(|v| v as i64).collect();
+                            if ocr_ids.is_empty() {
+                                return Ok(vec![]);
+                            }
+
+                            let mut screenshot_ids = std::collections::HashSet::new();
+                            for chunk in ocr_ids.chunks(500) {
+                                let placeholders =
+                                    chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
+                                let sql = format!(
+                                    "SELECT DISTINCT screenshot_id FROM ocr_results WHERE id IN ({})",
+                                    placeholders
+                                );
+                                let params: Vec<&dyn rusqlite::ToSql> = chunk
+                                    .iter()
+                                    .map(|id| id as &dyn rusqlite::ToSql)
+                                    .collect();
+                                let mut stmt = conn.prepare(&sql).map_err(|e| {
+                                    format!("Failed to prepare screenshot resolve: {}", e)
+                                })?;
+                                let rows = stmt
+                                    .query_map(params.as_slice(), |row| row.get::<_, i64>(0))
+                                    .map_err(|e| {
+                                        format!("Failed to resolve screenshot ids: {}", e)
+                                    })?;
+                                for row in rows.filter_map(|r| r.ok()) {
+                                    screenshot_ids.insert(row);
+                                }
+                            }
+                            per_kw_screenshot_ids.push(screenshot_ids);
+                        }
+
+                        let mut iter = per_kw_screenshot_ids.into_iter();
+                        let mut matching = iter.next().unwrap();
+                        for s in iter {
+                            matching.retain(|id| s.contains(id));
+                        }
+
+                        if matching.is_empty() {
+                            return Ok(vec![]);
+                        }
+
+                        // 转换为 RoaringBitmap 格式以便后续统一处理
+                        let mut rb = roaring::RoaringBitmap::new();
+                        for sid in matching {
+                            rb.insert(sid as u32);
+                        }
+                        rb
                     } else {
-                        roaring::RoaringBitmap::new()
+                        // 单关键词：直接用 OCR 级别交集
+                        keyword_bitmaps.into_iter().next().unwrap()
                     };
-                    for bm in iter {
-                        intersection &= &bm;
-                    }
 
                     if intersection.is_empty() {
                         return Ok(vec![]);
@@ -1649,20 +1719,38 @@ impl StorageState {
                         return Ok(vec![]);
                     }
 
-                    // 构建 SQL 查询这些 ocr_result ids（复用后续解后处理辑
+                    // 构建 SQL 查询
                     let placeholders: Vec<&str> = page_ids.iter().map(|_| "?").collect();
-                    let sql = format!(
-                        "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
-                                r.box_x1, r.box_y1, r.box_x2, r.box_y2,
-                                r.box_x3, r.box_y3, r.box_x4, r.box_y4,
-                                s.image_path, s.window_title_enc, s.process_name_enc,
-                                s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at
-                         FROM ocr_results r
-                         JOIN screenshots s ON r.screenshot_id = s.id
-                         WHERE r.id IN ({})
-                         ORDER BY s.created_at DESC, r.id DESC",
-                        placeholders.join(",")
-                    );
+                    let sql = if is_multi_keyword {
+                        // 多关键词: page_ids 是 screenshot_id，每个 screenshot 取一条代表性 OCR 结果
+                        format!(
+                            "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
+                                    r.box_x1, r.box_y1, r.box_x2, r.box_y2,
+                                    r.box_x3, r.box_y3, r.box_x4, r.box_y4,
+                                    s.image_path, s.window_title_enc, s.process_name_enc,
+                                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at
+                             FROM ocr_results r
+                             JOIN screenshots s ON r.screenshot_id = s.id
+                             WHERE s.id IN ({})
+                               AND r.id = (SELECT MAX(r2.id) FROM ocr_results r2 WHERE r2.screenshot_id = s.id)
+                             ORDER BY s.created_at DESC",
+                            placeholders.join(",")
+                        )
+                    } else {
+                        // 单关键词: page_ids 是 ocr_result id
+                        format!(
+                            "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
+                                    r.box_x1, r.box_y1, r.box_x2, r.box_y2,
+                                    r.box_x3, r.box_y3, r.box_x4, r.box_y4,
+                                    s.image_path, s.window_title_enc, s.process_name_enc,
+                                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at
+                             FROM ocr_results r
+                             JOIN screenshots s ON r.screenshot_id = s.id
+                             WHERE r.id IN ({})
+                             ORDER BY s.created_at DESC, r.id DESC",
+                            placeholders.join(",")
+                        )
+                    };
 
                     let param_refs: Vec<&dyn rusqlite::ToSql> = page_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
                     let mut stmt = conn.prepare(&sql).map_err(|e| format!("Failed to prepare query: {}", e))?;
@@ -1982,37 +2070,293 @@ impl StorageState {
             return Ok(filtered);
         }
 
-        // 有三元组 tokens：从 blind_bitmap_index 获取 postings 并交集
-        let mut bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
-        for token in &triple_tokens {
-            let token_hash = Self::compute_hmac_hash(token);
-            let blob: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?",
-                    params![&token_hash],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| format!("Failed to query bitmap: {}", e))?;
+        // 有 bigram tokens：对每个关键词的 bigram 集合分别交集，再跨关键词交集
+        let mut keyword_bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
+        for kw_bigrams in &per_keyword_bigrams {
+            let mut bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
+            for token in kw_bigrams {
+                let token_hash = Self::compute_hmac_hash(token);
+                let blob: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?",
+                        params![&token_hash],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| format!("Failed to query bitmap: {}", e))?;
 
-            if let Some(b) = blob {
-                let rb = roaring::RoaringBitmap::deserialize_from(&b[..])
-                    .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?;
-                bitmaps.push(rb);
-            } else {
-                // 某个 token 没有 posting => 无匹
+                if let Some(b) = blob {
+                    let rb = roaring::RoaringBitmap::deserialize_from(&b[..])
+                        .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?;
+                    bitmaps.push(rb);
+                } else {
+                    // 该关键词的某个 bigram 没有 posting => 该关键词无匹配
+                    bitmaps.clear();
+                    break;
+                }
+            }
+
+            if bitmaps.is_empty() {
+                // 该关键词无匹配 => 整体无匹配
                 return Ok(vec![]);
             }
+
+            // 关键词内部 bigram 交集
+            let mut iter = bitmaps.into_iter();
+            let mut kw_intersection = iter.next().unwrap();
+            for bm in iter {
+                kw_intersection &= &bm;
+            }
+            keyword_bitmaps.push(kw_intersection);
         }
 
-        // 交集
-        let mut iter = bitmaps.into_iter();
-        let mut intersection = if let Some(first) = iter.next() {
+        // 跨关键词交集
+        let is_multi_keyword = keyword_bitmaps.len() > 1;
+
+        if is_multi_keyword {
+            // 多关键词：在 screenshot 级别做交集（不同关键词可能出现在同一截图的不同文本框中）
+            let mut per_kw_screenshot_ids: Vec<std::collections::HashSet<i64>> = Vec::new();
+
+            for kw_bitmap in &keyword_bitmaps {
+                let ocr_ids: Vec<i64> = kw_bitmap.iter().map(|v| v as i64).collect();
+                if ocr_ids.is_empty() {
+                    return Ok(vec![]);
+                }
+
+                let mut screenshot_ids = std::collections::HashSet::new();
+                for chunk in ocr_ids.chunks(500) {
+                    let placeholders = chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
+                    let sql = format!(
+                        "SELECT DISTINCT screenshot_id FROM ocr_results WHERE id IN ({})",
+                        placeholders
+                    );
+                    let params: Vec<&dyn rusqlite::ToSql> =
+                        chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                    let mut stmt = conn
+                        .prepare(&sql)
+                        .map_err(|e| format!("Failed to prepare screenshot resolve: {}", e))?;
+                    let rows = stmt
+                        .query_map(params.as_slice(), |row| row.get::<_, i64>(0))
+                        .map_err(|e| format!("Failed to resolve screenshot ids: {}", e))?;
+                    for row in rows.filter_map(|r| r.ok()) {
+                        screenshot_ids.insert(row);
+                    }
+                }
+                per_kw_screenshot_ids.push(screenshot_ids);
+            }
+
+            // 对 screenshot_id 取交集
+            let mut iter = per_kw_screenshot_ids.into_iter();
+            let mut matching_screenshots: std::collections::HashSet<i64> = iter.next().unwrap();
+            for s in iter {
+                matching_screenshots.retain(|id| s.contains(id));
+            }
+
+            if matching_screenshots.is_empty() {
+                return Ok(vec![]);
+            }
+
+            let mut screenshot_ids_vec: Vec<i64> = matching_screenshots.into_iter().collect();
+            screenshot_ids_vec.sort_unstable_by(|a, b| b.cmp(a));
+
+            // 分页（按 screenshot 分页）
+            let start = offset as usize;
+            let end = std::cmp::min(screenshot_ids_vec.len(), (offset + limit) as usize);
+            let page_screenshot_ids = if start < end {
+                screenshot_ids_vec[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            if page_screenshot_ids.is_empty() {
+                return Ok(vec![]);
+            }
+
+            // 每个 screenshot 取一条代表性 OCR 结果
+            let placeholders = page_screenshot_ids
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<&str>>()
+                .join(",");
+            let sql = format!(
+                "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
+                        r.box_x1, r.box_y1, r.box_x2, r.box_y2,
+                        r.box_x3, r.box_y3, r.box_x4, r.box_y4,
+                        s.image_path, s.window_title_enc, s.process_name_enc,
+                        s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at
+                 FROM ocr_results r
+                 JOIN screenshots s ON r.screenshot_id = s.id
+                 WHERE s.id IN ({})
+                   AND r.id = (SELECT MAX(r2.id) FROM ocr_results r2 WHERE r2.screenshot_id = s.id)
+                 ORDER BY s.created_at DESC",
+                placeholders
+            );
+
+            let param_refs: Vec<&dyn rusqlite::ToSql> = page_screenshot_ids
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
+
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+            let mut screenshot_key_cache: std::collections::HashMap<i64, Vec<u8>> =
+                std::collections::HashMap::new();
+
+            let results: Vec<SearchResult> = stmt
+                .query_map(param_refs.as_slice(), |row| {
+                    let screenshot_id: i64 = row.get(1)?;
+                    let text_enc: Option<Vec<u8>> = row.get(2)?;
+                    let text_key_enc: Option<Vec<u8>> = row.get(3)?;
+                    let window_title_enc: Option<Vec<u8>> = row.get(14)?;
+                    let process_name_enc: Option<Vec<u8>> = row.get(15)?;
+                    let screenshot_key_enc: Option<Vec<u8>> = row.get(16)?;
+
+                    Ok((
+                        screenshot_id,
+                        row.get::<_, i64>(0)?,
+                        text_enc,
+                        text_key_enc,
+                        row.get::<_, f64>(4)?,
+                        vec![
+                            vec![row.get::<_, f64>(5)?, row.get::<_, f64>(6)?],
+                            vec![row.get::<_, f64>(7)?, row.get::<_, f64>(8)?],
+                            vec![row.get::<_, f64>(9)?, row.get::<_, f64>(10)?],
+                            vec![row.get::<_, f64>(11)?, row.get::<_, f64>(12)?],
+                        ],
+                        row.get::<_, String>(13)?,
+                        window_title_enc,
+                        process_name_enc,
+                        screenshot_key_enc,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, String>(18)?,
+                    ))
+                })
+                .map_err(|e| format!("Failed to execute search query: {}", e))?
+                .filter_map(|r| r.ok())
+                .filter_map(
+                    |(
+                        screenshot_id,
+                        id,
+                        text_enc,
+                        text_key_enc,
+                        confidence,
+                        box_coords,
+                        image_path,
+                        window_title_enc,
+                        process_name_enc,
+                        screenshot_key_enc,
+                        created_at,
+                        screenshot_created_at,
+                    )| {
+                        let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
+                            (Some(data), Some(key)) => self
+                                .decrypt_payload_with_row_key(data, key)
+                                .ok()
+                                .and_then(|v| String::from_utf8(v).ok()),
+                            _ => None,
+                        };
+
+                        let screenshot_key = match screenshot_key_cache.get(&screenshot_id) {
+                            Some(key) => Some(key.clone()),
+                            None => match screenshot_key_enc.as_ref() {
+                                Some(enc) => {
+                                    let key = decrypt_row_key_with_cng(enc).ok();
+                                    if let Some(ref k) = key {
+                                        screenshot_key_cache.insert(screenshot_id, k.clone());
+                                    }
+                                    key
+                                }
+                                None => None,
+                            },
+                        };
+
+                        let window_title =
+                            match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
+                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                                    .ok()
+                                    .and_then(|v| String::from_utf8(v).ok()),
+                                _ => None,
+                            };
+                        let process_name =
+                            match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
+                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                                    .ok()
+                                    .and_then(|v| String::from_utf8(v).ok()),
+                                _ => None,
+                            };
+
+                        Some(SearchResult {
+                            id,
+                            screenshot_id,
+                            text: text.unwrap_or_default(),
+                            confidence,
+                            box_coords,
+                            image_path,
+                            window_title,
+                            process_name,
+                            created_at,
+                            screenshot_created_at,
+                        })
+                    },
+                )
+                .collect();
+
+            for (_, mut key) in screenshot_key_cache.into_iter() {
+                Self::zeroize_bytes(&mut key);
+            }
+
+            // 后处理：进程名和时间过滤
+            let filtered: Vec<SearchResult> = results
+                .into_iter()
+                .filter(|r| {
+                    if let Some(ref names) = process_names {
+                        if !names.is_empty() {
+                            if let Some(p) = &r.process_name {
+                                if !names.contains(p) {
+                                    return false;
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
+                    }
+                    if let Some(s) = start_time {
+                        if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(
+                            &r.screenshot_created_at,
+                            "%Y-%m-%d %H:%M:%S",
+                        ) {
+                            if (nd.and_utc().timestamp() as f64) < s {
+                                return false;
+                            }
+                        }
+                    }
+                    if let Some(e) = end_time {
+                        if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(
+                            &r.screenshot_created_at,
+                            "%Y-%m-%d %H:%M:%S",
+                        ) {
+                            if (nd.and_utc().timestamp() as f64) > e {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
+                .collect();
+
+            return Ok(filtered);
+        }
+
+        // 单关键词：保持原有的 OCR 级别交集
+        let mut kw_iter = keyword_bitmaps.into_iter();
+        let mut intersection = if let Some(first) = kw_iter.next() {
             first
         } else {
             roaring::RoaringBitmap::new()
         };
-        for bm in iter {
+        for bm in kw_iter {
             intersection &= &bm;
         }
 

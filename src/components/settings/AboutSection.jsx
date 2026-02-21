@@ -1,5 +1,6 @@
 import React from 'react';
 import { Github, User, CheckCircle2, Download, AlertCircle, RefreshCw } from 'lucide-react';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { APP_VERSION } from '../../lib/version';
 
 export default function AboutSection({
@@ -116,7 +117,7 @@ export default function AboutSection({
           <div className="flex flex-col items-start gap-1">
             <h1 className="text-2xl font-bold text-ide-text tracking-tight">CarbonPaper - 复写纸</h1>
             <div className="flex items-center gap-3">
-               <span className="px-2 py-0.5 rounded bg-ide-panel border border-ide-border text-[10px] font-mono text-ide-muted">
+              <span className="px-2 py-0.5 rounded bg-ide-panel border border-ide-border text-[10px] font-mono text-ide-muted">
                 {APP_VERSION}
               </span>
             </div>
@@ -126,48 +127,25 @@ export default function AboutSection({
         {/* Content Layout - Single Column */}
         <div className="flex flex-col gap-6">
           <section className="space-y-4">
-             {/* Description */}
+            {/* Description */}
             <div className="p-4 bg-ide-panel/30 border border-ide-border/50 rounded-xl text-sm leading-relaxed text-ide-muted space-y-4">
-              <h3 className="font-semibold text-ide-text text-base">关于项目</h3>
               <p>
-                复写纸（carbonpaper）是一款开源的屏幕文字捕捉与智能检索工具，旨在帮助用户高效地记录和查找屏幕上的文字内容。
-                通过集成本地的OCR技术和语义搜索算法，复写纸能够实时捕捉屏幕文字，并将其转换为可搜索的文本数据。
+                This program is under GPL-3.0 Licence.
+              </p>
+              <p>
+                Built by White-NX with ❤️.
               </p>
             </div>
 
-            {/* Updates, Contributors & Github Link - Stacked or Grid inside column */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-               <div className="bg-ide-panel/50 border border-ide-border rounded-xl p-4 backdrop-blur-sm flex flex-col justify-between">
-                 <div className="flex items-center justify-between mb-2">
-                    <h3 className="font-semibold text-ide-text text-sm">Updates</h3>
-                    <div className="text-[10px] text-ide-muted font-mono">{APP_VERSION}</div>
-                 </div>
-                 {renderUpdateButton()}
-               </div>
-
-               <div className="bg-ide-panel/50 border border-ide-border rounded-xl p-4 backdrop-blur-sm flex flex-col justify-between">
-                <div className="flex items-center gap-2 mb-2">
-                  <h3 className="font-semibold text-ide-text text-sm">Contributors</h3>
-                </div>
-                <div className="flex items-center justify-between">
-                   <div className="flex -space-x-2">
-                    {[1, 2, 3].map((i) => (
-                      <div
-                        key={i}
-                        className="w-6 h-6 rounded-full bg-ide-bg border border-ide-border flex items-center justify-center text-ide-muted text-[10px]"
-                      >
-                        <User className="w-3 h-3" />
-                      </div>
-                    ))}
-                  </div>
-                   <button className="px-2 py-1 rounded-full bg-ide-bg border border-dashed border-ide-border text-[10px] text-ide-muted hover:text-ide-text hover:border-ide-accent hover:bg-ide-accent/5 transition-all">
-                    + Join
-                  </button>
-                </div>
+            <div className="bg-ide-panel/50 border border-ide-border rounded-xl p-4 backdrop-blur-sm flex flex-col justify-between">
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="font-semibold text-ide-text text-sm">Updates</h3>
+                <div className="text-[10px] text-ide-muted font-mono">{APP_VERSION}</div>
               </div>
+              {renderUpdateButton()}
             </div>
 
-            <a href="https://github.com/White-NX/carbonPaper" target="_blank" rel="noreferrer" className="block">
+            <div onClick={() => openUrl('https://github.com/White-NX/carbonPaper')} className="block">
               <div className="relative group overflow-hidden bg-gradient-to-br from-indigo-500/10 to-ide-panel border border-indigo-500/20 rounded-xl p-4 cursor-pointer transition-all hover:shadow-lg hover:border-indigo-500/40">
                 <div className="relative z-10 flex items-center justify-between">
                   <div>
@@ -177,7 +155,7 @@ export default function AboutSection({
                   <Github className="w-5 h-5 text-ide-muted group-hover:text-indigo-400 transition-colors" />
                 </div>
               </div>
-            </a>
+            </div>
           </section>
         </div>
       </div>

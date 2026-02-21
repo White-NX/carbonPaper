@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Shield, ShieldCheck, Loader2, KeyRound } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -12,6 +13,7 @@ export default function AuthMask({
   authError,
   setAuthError 
 }) {
+  const { t } = useTranslation();
   const [isAuthenticating, setIsAuthenticating] = useState(false);
 
   const handleUnlock = async () => {
@@ -28,19 +30,19 @@ export default function AuthMask({
       if (result) {
         onAuthSuccess?.();
       } else {
-        setAuthError('验证失败，请重试');
+        setAuthError(t('authMask.errors.verify_failed'));
       }
     } catch (err) {
       console.error('Authentication error:', err);
       const message = err?.message || String(err);
       
       if (message.includes('UserCancelled') || message.includes('User cancelled')) {
-        setAuthError('您取消了验证');
+        setAuthError(t('authMask.errors.cancelled'));
       } else if (message.includes('WindowsHelloNotAvailable')) {
-        setAuthError('Windows Hello 不可用，请在系统设置中启用');
+        setAuthError(t('authMask.errors.not_available'));
       } else if (message.includes('KeyNotFound')) {
         // 首次使用，需要创建凭据
-        setAuthError('正在初始化安全凭据...');
+        setAuthError(t('authMask.errors.initializing'));
         try {
           await invoke('credential_initialize');
           const retryResult = await invoke('credential_verify_user');
@@ -49,10 +51,10 @@ export default function AuthMask({
             return;
           }
         } catch (retryErr) {
-          setAuthError('初始化失败：' + (retryErr?.message || String(retryErr)));
+          setAuthError(t('authMask.errors.init_failed', { error: retryErr?.message || String(retryErr) }));
         }
       } else {
-        setAuthError('验证失败：' + message);
+        setAuthError(t('authMask.errors.generic_failed', { error: message }));
       }
     } finally {
       setIsAuthenticating(false);
@@ -62,17 +64,14 @@ export default function AuthMask({
   if (!isVisible) return null;
 
   return (
-    <div className="absolute top-12 inset-x-0 bottom-0 z-50 flex flex-col items-center justify-center bg-ide-bg/80 backdrop-blur-sm text-ide-muted">
+    <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-ide-bg/80 backdrop-blur-sm text-ide-muted">
       <div className="w-full max-w-md bg-ide-panel border border-ide-border rounded-xl p-6 shadow-2xl text-center">
         <div className="mx-auto w-14 h-14 rounded-xl bg-ide-bg border border-ide-border flex items-center justify-center mb-4">
           <Shield className="w-7 h-7 text-ide-accent" />
         </div>
 
-        <h2 className="text-lg font-semibold text-ide-text">需要 Windows Hello 验证</h2>
-        <p className="text-sm text-ide-muted mt-2 leading-relaxed">
-          Carbon Paper 使用 Windows Hello 加密您的屏幕截图和 OCR 数据，
-          请通过 PIN、指纹或面部识别来解锁。
-        </p>
+        <h2 className="text-lg font-semibold text-ide-text">{t('authMask.title')}</h2>
+        <p className="text-sm text-ide-muted mt-2 leading-relaxed">{t('authMask.description')}</p>
 
         <button
           onClick={handleUnlock}
@@ -82,12 +81,12 @@ export default function AuthMask({
           {isAuthenticating ? (
             <>
               <Loader2 className="w-4 h-4 animate-spin" />
-              <span>正在验证...</span>
+              <span>{t('authMask.authenticating')}</span>
             </>
           ) : (
             <>
               <KeyRound className="w-4 h-4" />
-              <span>使用 Windows Hello 解锁</span>
+              <span>{t('authMask.unlock_button')}</span>
             </>
           )}
         </button>
@@ -100,7 +99,7 @@ export default function AuthMask({
 
         <div className="mt-4 flex items-center justify-center gap-2 text-xs text-ide-muted/70">
           <ShieldCheck className="w-4 h-4" />
-          <span>数据已被加密</span>
+          <span>{t('authMask.encrypted_label')}</span>
         </div>
       </div>
     </div>

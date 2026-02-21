@@ -5,6 +5,7 @@
 import os
 import hashlib
 import logging
+import time as _time
 from typing import List, Dict, Any, Optional, Union
 from PIL import Image
 import numpy as np
@@ -180,7 +181,7 @@ class ImageVectorizer:
                                     logger.error("[vector_store] alternative projection call failed: %s", e)
                                     raise
                             else:
-                                logger.warning("[vector_store] projection expected_in=%s != pooled_dim=%s; no compatible projection found, skipping projection", expected_in, Dp)
+                                # logger.warning("[vector_store] projection expected_in=%s != pooled_dim=%s; no compatible projection found, skipping projection", expected_in, Dp)
                                 image_features = pooled
                         else:
                             try:
@@ -220,28 +221,25 @@ class ImageVectorizer:
     def encode_text(self, text: str) -> np.ndarray:
         """
         将文本编码为向量
-        
+
         Args:
             text: 要编码的文本
-            
+
         Returns:
             文本特征向量 (归一化后)
         """
+        _t_total = _time.perf_counter()
         self._ensure_initialized()
         import torch
 
-        # Diagnostic output: show that encode_text was called and a safe preview of input
-        try:
-            preview = text if len(text) <= 200 else text[:200] + "..."
-        except Exception:
-            preview = "<unprintable>"
-        logger.info("[vector_store] encode_text called. preview=%s len=%s", preview, len(text) if hasattr(text,'__len__') else 'unknown')
-
+        _t0 = _time.perf_counter()
         inputs = self.processor(text=[text], return_tensors="pt", padding=True)
 
         # Filter out None values and move tensors to model device
         inputs = {k: v.to(self.model.device) for k, v in inputs.items() if v is not None}
+        _t_tokenize = _time.perf_counter() - _t0
 
+        _t0 = _time.perf_counter()
         with torch.no_grad():
             text_outputs = self.model.text_model(**inputs)
 
@@ -253,17 +251,17 @@ class ImageVectorizer:
             text_features = self.model.text_projection(pooled_output)
             # normalize
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        _t_inference = _time.perf_counter() - _t0
 
         arr = text_features.cpu().numpy().flatten()
-        # Diagnostic: print embedding norm and some values
-        try:
-            norm = float(np.linalg.norm(arr))
-            preview_vals = np.array2string(arr[:6], precision=4, separator=',')
-        except Exception:
-            norm = None
-            preview_vals = "<unavailable>"
 
-        logger.info("[vector_store] encode_text -> embedding shape=%s norm=%s preview=%s", arr.shape, norm, preview_vals)
+        _elapsed = _time.perf_counter() - _t_total
+        _log_fn = logger.warning if _elapsed > 10 else logger.info
+        _log_fn(
+            "[DIAG:encode_text] tokenize=%.3fs inference=%.3fs total=%.3fs device=%s",
+            _t_tokenize, _t_inference, _elapsed,
+            self.model.device
+        )
         return arr
     
     def encode_images_batch(self, images: List[Union[str, Image.Image]]) -> np.ndarray:
@@ -338,7 +336,7 @@ class ImageVectorizer:
                                 logger.info("[vector_store] using alternative projection '%s' for pooled dim %s", found_name, Dp)
                                 image_features = found(pooled)
                             else:
-                                logger.warning("[vector_store] projection expected_in=%s != pooled_dim=%s; no compatible projection found, skipping projection", expected_in, Dp)
+                                # logger.warning("[vector_store] projection expected_in=%s != pooled_dim=%s; no compatible projection found, skipping projection", expected_in, Dp)
                                 image_features = pooled
                         else:
                             try:
@@ -525,7 +523,7 @@ class VectorStore:
         """解密单个搜索结果"""
         if not result:
             return result
-        
+
         decrypted = result.copy()
 
         batch_targets = []
@@ -546,11 +544,73 @@ class VectorStore:
                 if value is not None:
                     decrypted[key] = value
 
-        # 解密 metadata
+        # decrypt metadata
         if isinstance(decrypted.get('metadata'), dict):
             decrypted['metadata'] = self._decrypt_metadata(decrypted['metadata'])
-        
+
         return decrypted
+
+    def _decrypt_results_batch(self, results: List[Dict]) -> List[Dict]:
+        """批量解密多条搜索结果（单次 IPC 调用）"""
+        if not results or not self.storage_client:
+            return results
+
+        # Collect all encrypted values from top-level and metadata fields
+        encrypted_to_index: Dict[str, int] = {}
+        all_unique: List[str] = []
+
+        # top-leve
+        top_level_fields = ('image_path', 'ocr_text')
+        # fields in metadata that may contain encrypted values
+        meta_fields = ('image_path', 'window_title', 'process_name', 'app_name', 'url')
+
+        def _collect(value: Any):
+            if isinstance(value, str) and (value.startswith("ENC2:") or value.startswith("ENC:")):
+                if value not in encrypted_to_index:
+                    encrypted_to_index[value] = len(all_unique)
+                    all_unique.append(value)
+
+        for r in results:
+            for key in top_level_fields:
+                _collect(r.get(key))
+            meta = r.get('metadata')
+            if isinstance(meta, dict):
+                for key in meta_fields:
+                    _collect(meta.get(key))
+
+        if not all_unique:
+            return results
+
+        # single batch decryption
+        decrypted_list = self._decrypt_texts(all_unique)
+        decrypt_map: Dict[str, str] = {}
+        for i, enc_val in enumerate(all_unique):
+            dec_val = decrypted_list[i] if i < len(decrypted_list) else None
+            if dec_val is not None:
+                decrypt_map[enc_val] = dec_val
+
+        def _resolve(value: Any) -> Any:
+            if isinstance(value, str) and value in decrypt_map:
+                return decrypt_map[value]
+            return value
+
+        # backfill decrypted values into results
+        out = []
+        for r in results:
+            d = r.copy()
+            for key in top_level_fields:
+                if key in d:
+                    d[key] = _resolve(d[key])
+            meta = d.get('metadata')
+            if isinstance(meta, dict):
+                new_meta = dict(meta)
+                for key in meta_fields:
+                    if key in new_meta:
+                        new_meta[key] = _resolve(new_meta[key])
+                d['metadata'] = new_meta
+            out.append(d)
+
+        return out
     
     @staticmethod
     def _compute_id(image_path: str) -> str:
@@ -780,30 +840,24 @@ class VectorStore:
     ) -> List[Dict[str, Any]]:
         """
         使用自然语言搜索图片
-        
+
         Args:
             query: 搜索查询文本
             n_results: 返回结果数量
             min_similarity: 最小相似度阈值 (0-1)
-            
+
         Returns:
             搜索结果列表
         """
-        # Diagnostic: log query and parameters
-        try:
-            qpreview = query if len(query) <= 200 else query[:200] + "..."
-        except Exception:
-            qpreview = "<unprintable>"
-        logger.info("[vector_store] search_by_text called. query_preview=%s n_results=%d min_similarity=%s", qpreview, n_results, min_similarity)
+        _t_total = _time.perf_counter()
 
         # 将查询文本编码为向量
+        _t0 = _time.perf_counter()
         query_embedding = self.vectorizer.encode_text(query)
-        try:
-            logger.info("[vector_store] query_embedding shape=%s dtype=%s norm=%s", query_embedding.shape, query_embedding.dtype, float(np.linalg.norm(query_embedding)))
-        except Exception:
-            logger.info("[vector_store] query_embedding diagnostic unavailable")
+        _t_encode = _time.perf_counter() - _t0
 
         # 在ChromaDB中搜索
+        _t0 = _time.perf_counter()
         try:
             results = self.collection.query(
                 query_embeddings=[query_embedding.tolist()],
@@ -813,10 +867,9 @@ class VectorStore:
         except Exception as e:
             logger.error("[vector_store] collection.query failed: %s", e)
             raise
-        
+        _t_chromadb = _time.perf_counter() - _t0
+
         # 格式化结果
-        # Diagnostic: inspect raw results
-        logger.info("[vector_store] raw query results keys=%s", list(results.keys()) if isinstance(results, dict) else '<not-dict>')
         try:
             ids_list = results['ids'][0] if results and results['ids'] else []
             distances_list = results['distances'][0] if results and results['distances'] else []
@@ -826,41 +879,20 @@ class VectorStore:
             distances_list = []
             docs_list = []
 
-        logger.info("[vector_store] query returned %d candidates", len(ids_list))
-
         formatted_results = []
-        if len(ids_list) == 0:
-            # Additional diagnostics when no candidates returned
-            try:
-                total = self.collection.count()
-            except Exception:
-                total = None
-            logger.info("[vector_store] collection.count()=%s", total)
-            try:
-                sample = self.collection.get(include=['ids', 'metadatas', 'documents', 'distances'])
-                logger.info("[vector_store] collection.get() sample keys=%s", list(sample.keys()) if isinstance(sample, dict) else '<not-dict>')
-                # print up to 5 sample ids
-                sample_ids = sample.get('ids', [])[:5] if isinstance(sample, dict) else []
-                logger.info("[vector_store] sample ids (<=5)=%s", sample_ids)
-            except Exception as e:
-                logger.error("[vector_store] failed to get sample from collection: %s", e)
-
         for i, doc_id in enumerate(ids_list):
             distance = distances_list[i] if i < len(distances_list) else 1.0
             similarity = 1 - distance
 
-            # Diagnostic per-candidate
             try:
                 meta = results['metadatas'][0][i]
                 ocr = docs_list[i] if i < len(docs_list) else None
             except Exception:
                 meta = {}
                 ocr = None
-            logger.info("[vector_store] candidate i=%d id=%s similarity=%.4f distance=%s image_path=%s", i, doc_id, similarity, distance, meta.get('image_path') if isinstance(meta, dict) else meta)
 
             # 过滤低置信度结果
             if similarity < min_similarity:
-                logger.info("[vector_store] candidate id=%s filtered out by min_similarity", doc_id)
                 continue
 
             formatted_results.append({
@@ -871,10 +903,23 @@ class VectorStore:
                 'distance': distance,
                 'similarity': similarity
             })
-        
+
         # 解密结果中的敏感数据
-        return [self._decrypt_result(r) for r in formatted_results]
-    
+        _t0 = _time.perf_counter()
+        decrypted = self._decrypt_results_batch(formatted_results)
+        _t_decrypt = _time.perf_counter() - _t0
+
+        _elapsed_total = _time.perf_counter() - _t_total
+        _log_fn = logger.warning if _elapsed_total > 10 else logger.info
+        _log_fn(
+            "[DIAG:search_by_text] encode=%.3fs chromadb=%.3fs decrypt=%.3fs "
+            "candidates=%d filtered=%d total=%.3fs",
+            _t_encode, _t_chromadb, _t_decrypt,
+            len(ids_list), len(formatted_results),
+            _elapsed_total
+        )
+        return decrypted
+
     def search_by_image(
         self,
         image: Union[str, Image.Image, np.ndarray],
@@ -914,8 +959,8 @@ class VectorStore:
                 })
         
         # 解密结果中的敏感数据
-        return [self._decrypt_result(r) for r in formatted_results]
-    
+        return self._decrypt_results_batch(formatted_results)
+
     def search_by_ocr_text(
         self,
         query: str,
@@ -950,8 +995,8 @@ class VectorStore:
                 })
         
         # 解密结果中的敏感数据
-        return [self._decrypt_result(r) for r in formatted_results]
-    
+        return self._decrypt_results_batch(formatted_results)
+
     def delete_image(self, image_path: str) -> bool:
         """删除图片"""
         doc_id = self._compute_id(image_path)

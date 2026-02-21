@@ -110,7 +110,11 @@ async fn connect_to_pipe(
         match ClientOptions::new().open(&full_pipe_name) {
             Ok(client) => {
                 if attempt > 0 && start.elapsed().as_secs() >= 5 {
-                    tracing::warn!("[DIAG:PIPE] Connected after {} retries, {:?} elapsed", attempt, start.elapsed());
+                    tracing::warn!(
+                        "[DIAG:PIPE] Connected after {} retries, {:?} elapsed",
+                        attempt,
+                        start.elapsed()
+                    );
                 }
                 return Ok(client);
             }
@@ -119,8 +123,13 @@ async fn connect_to_pipe(
                 let is_pipe_busy = e.raw_os_error() == Some(ERROR_PIPE_BUSY);
 
                 if start.elapsed().as_secs() >= 5 {
-                    tracing::warn!("[DIAG:PIPE] Attempt {}/{} failed: {} (elapsed {:?})",
-                        attempt + 1, MAX_RETRIES, e, start.elapsed());
+                    tracing::warn!(
+                        "[DIAG:PIPE] Attempt {}/{} failed: {} (elapsed {:?})",
+                        attempt + 1,
+                        MAX_RETRIES,
+                        e,
+                        start.elapsed()
+                    );
                 }
 
                 if is_pipe_busy && attempt < MAX_RETRIES - 1 {
@@ -134,7 +143,11 @@ async fn connect_to_pipe(
         }
     }
 
-    tracing::warn!("[DIAG:PIPE] All {} retries failed after {:?}", MAX_RETRIES, start.elapsed());
+    tracing::warn!(
+        "[DIAG:PIPE] All {} retries failed after {:?}",
+        MAX_RETRIES,
+        start.elapsed()
+    );
     Err(last_error)
 }
 
@@ -174,6 +187,43 @@ async fn send_ipc_request(
     }
 }
 
+/// 动态设置 Job Object 的 CPU 限制
+fn set_job_cpu_limit(handle: HANDLE, enabled: bool, percent: u32) -> Result<(), String> {
+    unsafe {
+        let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+        if enabled && percent > 0 {
+            cpu_info.ControlFlags =
+                JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            cpu_info.Anonymous.CpuRate = percent * 100;
+        }
+        // ControlFlags = 0 means disabled
+        SetInformationJobObject(
+            handle,
+            JobObjectCpuRateControlInformation,
+            &cpu_info as *const _ as *const _,
+            std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+        )
+        .map_err(|e| format!("Failed to set CPU limit: {:?}", e))?;
+        Ok(())
+    }
+}
+
+/// RAII guard：在 drop 时自动恢复 Job Object 的 CPU 限制
+struct CpuLimitGuard {
+    job_handle_raw: isize, // 存储原始值，避免 HANDLE (*mut c_void) 导致 !Send
+}
+
+unsafe impl Send for CpuLimitGuard {}
+
+impl Drop for CpuLimitGuard {
+    fn drop(&mut self) {
+        let handle = HANDLE(self.job_handle_raw as *mut std::ffi::c_void);
+        let enabled = crate::registry_config::get_bool("cpu_limit_enabled").unwrap_or(true);
+        let percent = crate::registry_config::get_u32("cpu_limit_percent").unwrap_or(10);
+        let _ = set_job_cpu_limit(handle, enabled, percent);
+    }
+}
+
 #[tauri::command]
 pub async fn execute_monitor_command(
     state: State<'_, MonitorState>,
@@ -196,6 +246,27 @@ pub async fn execute_monitor_command(
     };
 
     let seq_no = state.request_counter.fetch_add(1, Ordering::SeqCst);
+
+    let command = payload
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let needs_full_cpu = command == "search_nl";
+
+    // 用 RAII guard 确保即使 future 被取消也能恢复 CPU 限制
+    let _cpu_guard = if needs_full_cpu {
+        let guard = state.job_handle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref job) = *guard {
+            let _ = set_job_cpu_limit(**job, false, 0);
+            Some(CpuLimitGuard {
+                job_handle_raw: (**job).0 as isize,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     send_ipc_request(&pipe_name, &auth_token, seq_no, payload).await
 }
@@ -300,13 +371,14 @@ pub async fn start_monitor(
         }
 
         // 3. 基于 CWD 的相对路径（开发模式）
-        candidates.push(PathBuf::from("monitor/main.py"));       // CWD 是项目根目录
-        candidates.push(PathBuf::from("../monitor/main.py"));    // CWD 是 src-tauri
+        candidates.push(PathBuf::from("monitor/main.py")); // CWD 是项目根目录
+        candidates.push(PathBuf::from("../monitor/main.py")); // CWD 是 src-tauri
 
         match candidates.iter().find(|p| p.exists()) {
             Some(p) => normalize_path_for_command(p),
             None => {
-                let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+                let tried: Vec<String> =
+                    candidates.iter().map(|p| p.display().to_string()).collect();
                 return Err(format!(
                     "Could not find monitor/main.py. CWD: {}. Tried: {:?}",
                     cwd, tried
@@ -399,20 +471,22 @@ pub async fn start_monitor(
             python_executable, python_exists, script_path, script_abs, cwd, pipe_name, reverse_pipe_name
         );
 
-        // 启动 Python 进程
+        // Start the Python process with stdout/stderr piped, 
+        // and pass the pipe name and auth token as command line arguments (instead of environment variables)
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
 
         let job = {
-            let cpu_limit_enabled = crate::registry_config::get_bool("cpu_limit_enabled").unwrap_or(true);
-            let cpu_limit_percent = crate::registry_config::get_u32("cpu_limit_percent").unwrap_or(10);
+            let cpu_limit_enabled =
+                crate::registry_config::get_bool("cpu_limit_enabled").unwrap_or(true);
+            let cpu_limit_percent =
+                crate::registry_config::get_u32("cpu_limit_percent").unwrap_or(10);
             create_job_object(cpu_limit_enabled, cpu_limit_percent)
                 .map_err(|e| format!("Failed to create Job Object: {}", e))?
         };
 
         let mut cmd_proc = Command::new(&python_executable);
         // Pipe stdout/stderr so we can stream logs to the frontend
-        // 通过命令行参数传递管道名和认证 token（不使用环境变量）
         cmd_proc
             .arg("-u")
             .arg(&script_path)
@@ -425,10 +499,20 @@ pub async fn start_monitor(
             .env("PYTHONIOENCODING", "utf-8")
             .env("PROFILING_ENABLED", "1");
 
-        // 将当前 storage.data_dir 传给子进程，确保 Python 在启动时使用正确的 data 目录
+        // Pass the current storage.data_dir to the child process to ensure that Python uses the correct data directory at startup.
         if let Some(storage_state) = app.try_state::<Arc<StorageState>>() {
-            let dd = storage_state.data_dir.lock().unwrap().to_string_lossy().to_string();
+            let dd = storage_state
+                .data_dir
+                .lock()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
             cmd_proc.env("CARBONPAPER_DATA_DIR", dd);
+        }
+
+        // Pass DirectML configuration
+        if crate::registry_config::get_bool("use_dml").unwrap_or(false) {
+            cmd_proc.env("CARBONPAPER_USE_DML", "1");
         }
 
         cmd_proc
@@ -518,8 +602,19 @@ pub async fn start_monitor(
                                 cache.drain(0..overflow);
                             }
                         }
-                        // Print errors to stderr and also emit to frontend
-                        tracing::warn!(target: "monitor.stderr", "{}", l);
+                        // Parse Python log level from format "[LEVEL] ..." and use matching tracing macro
+                        if l.starts_with("[DEBUG]") {
+                            tracing::debug!(target: "monitor.stderr", "{}", l);
+                        } else if l.starts_with("[INFO]") {
+                            tracing::info!(target: "monitor.stderr", "{}", l);
+                        } else if l.starts_with("[ERROR]") || l.starts_with("[CRITICAL]") {
+                            tracing::error!(target: "monitor.stderr", "{}", l);
+                        } else if l.starts_with("[WARNING]") {
+                            tracing::warn!(target: "monitor.stderr", "{}", l);
+                        } else {
+                            // Unrecognized format (e.g. raw Python tracebacks) — default to warn
+                            tracing::warn!(target: "monitor.stderr", "{}", l);
+                        }
                         let _ = app_clone.emit(
                             "monitor-log",
                             serde_json::json!({"source":"stderr","line": l}),
@@ -679,7 +774,10 @@ pub async fn stop_monitor(state: State<'_, MonitorState>) -> Result<String, Stri
         *guard = None;
     }
     {
-        let mut guard = state.reverse_pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = state
+            .reverse_pipe_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
     {
