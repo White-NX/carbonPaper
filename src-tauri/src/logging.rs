@@ -177,12 +177,8 @@ pub fn init_logging(data_dir: &Path) -> DailyRotatingWriter {
 
     let writer = DailyRotatingWriter::new(logs_root);
 
-    // 默认日志级别：release=INFO, debug=DEBUG
-    let default_level = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "info"
-    };
+    // 默认日志级别：INFO（可通过 RUST_LOG 环境变量覆盖）
+    let default_level = "info";
 
     let env_filter_file = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_level));

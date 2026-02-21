@@ -14,6 +14,7 @@ import { AdvancedSearch } from './components/AdvancedSearch';
 import SettingsDialog from './components/settings/SettingsDialog';
 import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
+import DmlSetupWizard from './components/DmlSetupWizard';
 import LeftSidebar from './components/LeftSidebar';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
@@ -55,6 +56,7 @@ function App() {
   // Windows Hello Authentication State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authError, setAuthError] = useState(null);
+  const [showDmlSetup, setShowDmlSetup] = useState(false);
   const [sessionTimeout, setSessionTimeout] = useState(() => {
     const saved = localStorage.getItem('sessionTimeout');
     return saved ? parseInt(saved, 10) : 900; // 默认 15 分钟
@@ -294,9 +296,42 @@ function App() {
     setAuthError(null);
   }, []);
 
+  // Check if DML setup wizard should be shown after auth
+  useEffect(() => {
+    if (backendStatus !== 'online' || !isAuthenticated) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const needed = await invoke('check_dml_setup_needed');
+        if (!cancelled && needed) {
+          setShowDmlSetup(true);
+        }
+      } catch (err) {
+        console.warn('Failed to check DML setup status:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [backendStatus, isAuthenticated]);
+
   // 锁定会话回调
   const handleLockSession = useCallback(() => {
     setIsAuthenticated(false);
+  }, []);
+
+  // DML setup wizard Callback
+  const handleDmlSetupComplete = useCallback(async () => {
+    setShowDmlSetup(false);
+    // If monitor is running, restart to apply new settings
+    try {
+      const resString = await invoke('get_monitor_status');
+      const res = JSON.parse(resString);
+      if (res && !res.stopped) {
+        await invoke('stop_monitor');
+        await invoke('start_monitor');
+      }
+    } catch {
+      // ignore — monitor may not be running
+    }
   }, []);
 
   useEffect(() => {
@@ -627,6 +662,11 @@ function App() {
         onAuthSuccess={handleAuthSuccess}
         authError={authError}
         setAuthError={setAuthError}
+      />
+
+      <DmlSetupWizard
+        isVisible={backendStatus === 'online' && isAuthenticated && showDmlSetup}
+        onComplete={handleDmlSetupComplete}
       />
 
       <Timeline

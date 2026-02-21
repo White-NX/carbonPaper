@@ -5,7 +5,7 @@ use rand::Rng;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
@@ -15,6 +15,9 @@ use tokio::net::windows::named_pipe::ClientOptions;
 use std::os::windows::io::AsRawHandle;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::*;
+use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::System::Performance::*;
+use windows::core::Interface;
 
 pub struct MonitorState {
     pub process: Mutex<Option<Child>>,
@@ -27,6 +30,12 @@ pub struct MonitorState {
     pub reverse_pipe_name: Mutex<Option<String>>,
     /// Job Object handle - 用于管理子进程生命周期和资源限制
     pub job_handle: Mutex<Option<JobHandle>>,
+    /// 游戏模式：DML 是否被临时关闭
+    pub game_mode_dml_suppressed: AtomicBool,
+    /// 游戏模式：因频繁切换而永久关闭 DML（直到程序重启）
+    pub game_mode_permanently_suppressed: AtomicBool,
+    /// 游戏模式：监控任务句柄
+    pub game_mode_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 impl MonitorState {
@@ -39,6 +48,9 @@ impl MonitorState {
             reverse_ipc: Mutex::new(None),
             reverse_pipe_name: Mutex::new(None),
             job_handle: Mutex::new(None),
+            game_mode_dml_suppressed: AtomicBool::new(false),
+            game_mode_permanently_suppressed: AtomicBool::new(false),
+            game_mode_task: Mutex::new(None),
         }
     }
 }
@@ -512,7 +524,29 @@ pub async fn start_monitor(
 
         // Pass DirectML configuration
         if crate::registry_config::get_bool("use_dml").unwrap_or(false) {
-            cmd_proc.env("CARBONPAPER_USE_DML", "1");
+            // 检查游戏模式是否抑制了 DML（临时或永久）
+            let suppressed = state.game_mode_dml_suppressed.load(Ordering::SeqCst)
+                || state.game_mode_permanently_suppressed.load(Ordering::SeqCst);
+            if !suppressed {
+                // 先枚举可用 GPU，如果完全没有可用显卡则跳过 DML
+                let gpus = enumerate_gpus_internal().unwrap_or_default();
+                if gpus.is_empty() {
+                    tracing::warn!("No compatible GPU detected, skipping DirectML (falling back to CPU)");
+                } else {
+                    cmd_proc.env("CARBONPAPER_USE_DML", "1");
+                    let mut device_id = crate::registry_config::get_u32("dml_device_id").unwrap_or(0);
+                    // 校验 device_id 是否仍然有效，无效则回退到第一张可用卡
+                    if !gpus.iter().any(|g| g.get("id").and_then(|v| v.as_u64()) == Some(device_id as u64)) {
+                        let fallback_id = gpus[0].get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        tracing::warn!("DML device_id {} no longer exists, falling back to {}", device_id, fallback_id);
+                        device_id = fallback_id;
+                        let _ = crate::registry_config::set_u32("dml_device_id", device_id);
+                    }
+                    cmd_proc.env("CARBONPAPER_DML_DEVICE_ID", device_id.to_string());
+                }
+            } else {
+                tracing::info!("Game mode: DML suppressed, starting Python without DML");
+            }
         }
 
         cmd_proc
@@ -837,4 +871,259 @@ pub async fn get_monitor_status(state: State<'_, MonitorState>) -> Result<String
             Err(e)
         }
     }
+}
+
+// ==================== GPU 枚举与游戏模式 ====================
+
+/// 枚举系统中的 GPU 设备（排除软件渲染器）
+pub fn enumerate_gpus_internal() -> Result<Vec<serde_json::Value>, String> {
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()
+            .map_err(|e| format!("Failed to create DXGI factory: {:?}", e))?;
+
+        let mut gpus = Vec::new();
+        let mut i: u32 = 0;
+        loop {
+            match factory.EnumAdapters1(i) {
+                Ok(adapter) => {
+                    let desc = adapter
+                        .GetDesc1()
+                        .map_err(|e| format!("Failed to get adapter desc: {:?}", e))?;
+                    // 排除软件渲染器
+                    if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
+                        let name = String::from_utf16_lossy(
+                            &desc.Description[..desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len())],
+                        );
+                        gpus.push(serde_json::json!({
+                            "id": i,
+                            "name": name.trim().to_string(),
+                        }));
+                    }
+                    i += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(gpus)
+    }
+}
+
+#[tauri::command]
+pub fn enumerate_gpus() -> Result<Vec<serde_json::Value>, String> {
+    enumerate_gpus_internal()
+}
+
+/// 查询指定 GPU 的系统级显存占用率（使用 Windows Performance Counter，与任务管理器一致）
+fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()
+            .map_err(|e| format!("Failed to create DXGI factory: {:?}", e))?;
+
+        let adapter: IDXGIAdapter1 = factory
+            .EnumAdapters1(device_id)
+            .map_err(|e| format!("Failed to enum adapter {}: {:?}", device_id, e))?;
+
+        let desc = adapter
+            .GetDesc1()
+            .map_err(|e| format!("Failed to get adapter desc: {:?}", e))?;
+
+        let total_vram = desc.DedicatedVideoMemory;
+        if total_vram == 0 {
+            return Ok(0.0);
+        }
+
+        // 使用 LUID 构造 Performance Counter 路径
+        let luid = desc.AdapterLuid;
+        let counter_path = format!(
+            "\\GPU Adapter Memory(luid_0x{:08X}_0x{:08X}_phys_0)\\Dedicated Usage",
+            luid.HighPart as u32, luid.LowPart
+        );
+        let counter_path_w: Vec<u16> = counter_path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // PDH 查询
+        let mut query = 0isize;
+        let status = PdhOpenQueryW(None, 0, &mut query);
+        if status != 0 {
+            return Err(format!("PdhOpenQuery failed: 0x{:08X}", status));
+        }
+
+        let mut counter = 0isize;
+        let status = PdhAddEnglishCounterW(
+            query,
+            windows::core::PCWSTR(counter_path_w.as_ptr()),
+            0,
+            &mut counter,
+        );
+        if status != 0 {
+            PdhCloseQuery(query);
+            return Err(format!(
+                "PdhAddEnglishCounter failed for '{}': 0x{:08X}",
+                counter_path, status
+            ));
+        }
+
+        // 需要收集两次数据，第一次建立基线
+        let status = PdhCollectQueryData(query);
+        if status != 0 {
+            PdhCloseQuery(query);
+            return Err(format!("PdhCollectQueryData failed: 0x{:08X}", status));
+        }
+
+        let mut value = PDH_FMT_COUNTERVALUE::default();
+        let status = PdhGetFormattedCounterValue(
+            counter,
+            PDH_FMT_LARGE,
+            None,
+            &mut value,
+        );
+        PdhCloseQuery(query);
+
+        if status != 0 {
+            return Err(format!(
+                "PdhGetFormattedCounterValue failed: 0x{:08X}",
+                status
+            ));
+        }
+
+        let dedicated_usage = value.Anonymous.largeValue as u64;
+        let ratio = dedicated_usage as f64 / total_vram as f64;
+        Ok(ratio.clamp(0.0, 1.0))
+    }
+}
+
+/// 启动游戏模式 GPU 监控循环
+pub fn start_game_mode_monitor(app: AppHandle) {
+    let monitor_state = app.state::<MonitorState>();
+
+    // 停止已有的监控任务
+    {
+        let mut guard = monitor_state.game_mode_task.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+    }
+
+    tracing::info!("Game mode: starting GPU memory monitor (polling every 10s, checking GPU 0)");
+
+    let app_clone = app.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        // 始终监控 GPU 0（主显卡/游戏显卡）
+        const MONITOR_DEVICE_ID: u32 = 0;
+        // 频繁切换计数：记录最近的触发时间戳
+        let mut trigger_timestamps: Vec<std::time::Instant> = Vec::new();
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+            // 检查 DML 是否仍然启用
+            if !crate::registry_config::get_bool("use_dml").unwrap_or(false) {
+                continue;
+            }
+
+            let state = app_clone.state::<MonitorState>();
+
+            // 如果已经被永久关闭，不再轮询
+            if state.game_mode_permanently_suppressed.load(Ordering::SeqCst) {
+                continue;
+            }
+
+            let usage = match query_gpu_memory_usage(MONITOR_DEVICE_ID) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!("Game mode: failed to query GPU 0 memory: {}", e);
+                    continue;
+                }
+            };
+
+            let currently_suppressed = state.game_mode_dml_suppressed.load(Ordering::SeqCst);
+            tracing::debug!("Game mode: GPU 0 memory usage {:.1}%, DML suppressed: {}", usage * 100.0, currently_suppressed);
+
+            if !currently_suppressed && usage >= 0.50 {
+                // 记录触发时间，检查频率限制
+                let now = std::time::Instant::now();
+                trigger_timestamps.retain(|t| now.duration_since(*t).as_secs() < 60);
+                trigger_timestamps.push(now);
+
+                if trigger_timestamps.len() >= 3 {
+                    // 1 分钟内触发 3 次以上，永久关闭 DML 直到程序重启
+                    tracing::warn!(
+                        "Game mode: triggered {} times in 60s, permanently disabling DML until app restart",
+                        trigger_timestamps.len()
+                    );
+                    state.game_mode_dml_suppressed.store(true, Ordering::SeqCst);
+                    state.game_mode_permanently_suppressed.store(true, Ordering::SeqCst);
+                    let _ = app_clone.emit("game-mode-status", serde_json::json!({
+                        "active": true,
+                        "usage": usage,
+                        "permanent": true,
+                    }));
+
+                    // 重启 Python（不带 DML）
+                    let _ = stop_monitor(app_clone.state::<MonitorState>()).await;
+                    let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
+                    continue;
+                }
+
+                tracing::info!("Game mode: GPU 0 memory usage {:.1}% >= 50%, suppressing DML", usage * 100.0);
+                state.game_mode_dml_suppressed.store(true, Ordering::SeqCst);
+                let _ = app_clone.emit("game-mode-status", serde_json::json!({"active": true, "usage": usage}));
+
+                // 重启 Python（不带 DML）
+                let _ = stop_monitor(app_clone.state::<MonitorState>()).await;
+                let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
+            } else if currently_suppressed && usage <= 0.40 {
+                // 记录触发时间（恢复也计入）
+                let now = std::time::Instant::now();
+                trigger_timestamps.retain(|t| now.duration_since(*t).as_secs() < 60);
+                trigger_timestamps.push(now);
+
+                if trigger_timestamps.len() >= 3 {
+                    tracing::warn!(
+                        "Game mode: triggered {} times in 60s, permanently disabling DML until app restart",
+                        trigger_timestamps.len()
+                    );
+                    state.game_mode_permanently_suppressed.store(true, Ordering::SeqCst);
+                    let _ = app_clone.emit("game-mode-status", serde_json::json!({
+                        "active": true,
+                        "usage": usage,
+                        "permanent": true,
+                    }));
+                    // DML 已经被抑制，不需要再重启
+                    continue;
+                }
+
+                tracing::info!("Game mode: GPU 0 memory usage {:.1}% <= 40%, restoring DML", usage * 100.0);
+                state.game_mode_dml_suppressed.store(false, Ordering::SeqCst);
+                let _ = app_clone.emit("game-mode-status", serde_json::json!({"active": false, "usage": usage}));
+
+                // 重启 Python（恢复 DML）
+                let _ = stop_monitor(app_clone.state::<MonitorState>()).await;
+                let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
+            }
+        }
+    });
+
+    let mut guard = monitor_state.game_mode_task.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(handle);
+}
+
+/// 停止游戏模式监控
+pub fn stop_game_mode_monitor(app: &AppHandle) {
+    let monitor_state = app.state::<MonitorState>();
+
+    let mut guard = monitor_state.game_mode_task.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard.take() {
+        handle.abort();
+    }
+
+    // 重置所有游戏模式状态
+    monitor_state.game_mode_permanently_suppressed.store(false, Ordering::SeqCst);
+    let was_suppressed = monitor_state.game_mode_dml_suppressed.swap(false, Ordering::SeqCst);
+    if was_suppressed {
+        let _ = app.emit("game-mode-status", serde_json::json!({"active": false, "usage": 0.0}));
+    }
+    tracing::info!("Game mode: monitor stopped");
 }

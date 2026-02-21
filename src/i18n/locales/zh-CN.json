@@ -9,6 +9,14 @@
       "telemetry": {
         "label": "允许发送遥测诊断数据",
         "description": "允许程序将不包含隐私数据的错误日志上传至遥测服务器。"
+      },
+      "gameMode": {
+        "label": "游戏模式",
+        "description": "检测到 GPU 高负载时自动关闭 DirectML，降低对游戏性能的影响。如果你有多张显卡，建议在高级 > OCR 推理加速中选择性能较差或闲置的显卡进行OCR推理，并关闭游戏模式以获得更稳定的OCR性能。",
+        "requires_dml": "需要先启用 DirectML 加速",
+        "active": "已激活：DirectML 已临时关闭",
+        "inactive": "GPU 负载正常",
+        "permanent": "DirectML 已关闭（频繁切换，将在重启后恢复）"
       }
       ,
       "monitor": {
@@ -21,6 +29,7 @@
         "resume": "继续",
         "pause": "暂停",
         "stop": "停止",
+        "restart": "重启",
         "autoStart": {
           "label": "启动时自动子服务",
           "description": "开启后应用启动时会自动尝试拉起 Python 子服务。",
@@ -74,6 +83,7 @@
     "advanced": {
       "loading": "加载中...",
       "warning": "这些设置可能会影响监控服务的性能和稳定性，甚至影响操作系统整体性能。请谨慎调整。",
+      "quick_restart": "快速重启",
       "cpu": {
         "title": "Python 子进程 CPU 限制",
         "label": "限制 CPU 占用率",
@@ -93,8 +103,12 @@
       "dml": {
         "title": "OCR 推理加速",
         "label": "使用 DirectML 进行推理",
-        "description": "启用后将使用 GPU 进行 OCR 推理加速，需要 DirectX 12 兼容的显卡",
-        "changed_notice": "DirectML 设置将在下次启动监控服务时生效"
+        "description": "启用后将使用 GPU 进行 OCR 推理加速，需要 DirectX 12 兼容的显卡。",
+        "notice": "注意：启用 DirectML 可能会显著影响游戏性能。",
+        "changed_notice": "DirectML 设置将在下次启动监控服务时生效",
+        "gpu_select": "选择 GPU 设备",
+        "gpu_loading": "正在检测 GPU...",
+        "gpu_none": "未检测到兼容的 GPU"
       }
     },
     "storageManagement": {
@@ -271,6 +285,27 @@
       "time": "时间"
     },
     "empty": "从时间线中选择一个事件以查看详情。"
+  }
+  ,
+  "dmlSetup": {
+    "title": "DirectML GPU 加速",
+    "subtitle": "新版本支持使用 GPU 加速 OCR 文字识别",
+    "detected_gpus": "检测到的 GPU",
+    "no_gpu": "未检测到兼容的 GPU，将使用 CPU 进行推理。",
+    "no_gpu_note": "你可以稍后在 设置 > 高级 中更改此选项。",
+    "single_gpu_recommend": "推荐启用 DirectML 加速以提升 OCR 识别速度，同时开启游戏模式保护游戏体验。",
+    "multi_gpu_recommend": "推荐使用集成显卡进行 OCR 推理，将独立显卡留给游戏和主力应用。",
+    "enable_dml": "启用 DirectML 加速",
+    "enable_game_mode": "启用游戏模式",
+    "game_mode_hint": "GPU 高负载时自动暂停加速",
+    "game_mode_multi_gpu_note": "多显卡模式下选择集显进行 OCR 时，不建议启用游戏模式。除非两张显卡在运行任务时均有可能不闲置。",
+    "tag_integrated": "集显",
+    "tag_discrete": "独显",
+    "tag_recommended": "推荐",
+    "apply": "应用推荐设置",
+    "skip": "跳过",
+    "acknowledge": "了解",
+    "loading": "正在检测 GPU..."
   }
   ,
   "authMask": {

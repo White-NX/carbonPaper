@@ -9,6 +9,14 @@
       "telemetry": {
         "label": "Allow sending telemetry diagnostic data",
         "description": "Allow program to upload error logs that do not contain privacy data to the telemetry server."
+      },
+      "gameMode": {
+        "label": "Game Mode",
+        "description": "Automatically disable DirectML when high GPU load is detected to reduce impact on game performance",
+        "requires_dml": "Requires DirectML acceleration to be enabled first",
+        "active": "Active: DirectML temporarily disabled",
+        "inactive": "GPU load normal",
+        "permanent": "DirectML disabled (too many switches, will restore on restart)"
       }
       ,
       "monitor": {
@@ -21,6 +29,7 @@
         "resume": "Resume",
         "pause": "Pause",
         "stop": "Stop",
+        "restart": "Restart",
         "autoStart": {
           "label": "Auto-start Subservice",
           "description": "When enabled the app will attempt to launch the Python subservice on startup.",
@@ -74,6 +83,7 @@
     "advanced": {
       "loading": "Loading...",
       "warning": "These settings may affect monitor service performance and system stability. Adjust carefully.",
+      "quick_restart": "Quick Restart",
       "cpu": {
         "title": "Python subprocess CPU limits",
         "label": "Limit CPU usage",
@@ -94,7 +104,10 @@
         "title": "OCR inference acceleration",
         "label": "Use DirectML for inference",
         "description": "When enabled, uses GPU for OCR inference acceleration; requires DirectX 12 compatible GPU",
-        "changed_notice": "DirectML changes take effect when the monitor service restarts"
+        "changed_notice": "DirectML changes take effect when the monitor service restarts",
+        "gpu_select": "Select GPU device",
+        "gpu_loading": "Detecting GPUs...",
+        "gpu_none": "No compatible GPU detected"
       }
     },
     "storageManagement": {
@@ -271,6 +284,27 @@
       "time": "Time"
     },
     "empty": "Select an event from the timeline to view details."
+  }
+  ,
+  "dmlSetup": {
+    "title": "DirectML GPU Acceleration",
+    "subtitle": "This version supports GPU-accelerated OCR text recognition",
+    "detected_gpus": "Detected GPUs",
+    "no_gpu": "No compatible GPU detected. CPU inference will be used.",
+    "no_gpu_note": "You can change this later in Settings > Advanced.",
+    "single_gpu_recommend": "We recommend enabling DirectML acceleration for faster OCR, with Game Mode to protect gaming performance.",
+    "multi_gpu_recommend": "We recommend using the integrated GPU for OCR, leaving the discrete GPU free for games and primary applications.",
+    "enable_dml": "Enable DirectML Acceleration",
+    "enable_game_mode": "Enable Game Mode",
+    "game_mode_hint": "Automatically pauses acceleration under high GPU load",
+    "game_mode_multi_gpu_note": "Game Mode is not recommended when using an integrated GPU for OCR in a multi-GPU setup, unless both GPUs may be under load simultaneously.",
+    "tag_integrated": "Integrated",
+    "tag_discrete": "Discrete",
+    "tag_recommended": "Recommended",
+    "apply": "Apply Recommended Settings",
+    "skip": "Skip",
+    "acknowledge": "Got it",
+    "loading": "Detecting GPUs..."
   }
   ,
   "authMask": {

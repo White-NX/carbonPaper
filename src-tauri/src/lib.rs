@@ -467,7 +467,9 @@ fn get_advanced_config() -> Result<serde_json::Value, String> {
     let capture_on_ocr_busy = registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
     let ocr_queue_limit_enabled = registry_config::get_bool("ocr_queue_limit_enabled").unwrap_or(true);
     let ocr_queue_max_size = registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
-    let use_dml = registry_config::get_bool("use_dml").unwrap_or(true);
+    let use_dml = registry_config::get_bool("use_dml").unwrap_or(false);
+    let dml_device_id = registry_config::get_u32("dml_device_id").unwrap_or(0);
+    let game_mode_enabled = registry_config::get_bool("game_mode_enabled").unwrap_or(true);
 
     Ok(serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
@@ -476,6 +478,8 @@ fn get_advanced_config() -> Result<serde_json::Value, String> {
         "ocr_queue_limit_enabled": ocr_queue_limit_enabled,
         "ocr_queue_max_size": ocr_queue_max_size,
         "use_dml": use_dml,
+        "dml_device_id": dml_device_id,
+        "game_mode_enabled": game_mode_enabled,
     }))
 }
 
@@ -498,6 +502,12 @@ fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     }
     if let Some(v) = config.get("use_dml").and_then(|v| v.as_bool()) {
         registry_config::set_bool("use_dml", v)?;
+    }
+    if let Some(v) = config.get("dml_device_id").and_then(|v| v.as_u64()) {
+        registry_config::set_u32("dml_device_id", v as u32)?;
+    }
+    if let Some(v) = config.get("game_mode_enabled").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("game_mode_enabled", v)?;
     }
     Ok(())
 }
@@ -613,6 +623,50 @@ async fn credential_get_session_timeout(
     Ok(state.get_session_timeout())
 }
 
+#[tauri::command]
+async fn toggle_game_mode(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    registry_config::set_bool("game_mode_enabled", enabled)?;
+    if enabled {
+        monitor::start_game_mode_monitor(app);
+    } else {
+        monitor::stop_game_mode_monitor(&app);
+        // 如果 DML 被抑制了，需要重启 Python 恢复 DML
+        let state = app.state::<MonitorState>();
+        let was_suppressed = state.game_mode_dml_suppressed.load(std::sync::atomic::Ordering::SeqCst);
+        if was_suppressed {
+            let _ = monitor::stop_monitor(app.state::<MonitorState>()).await;
+            let _ = monitor::start_monitor(app.state::<MonitorState>(), app.clone()).await;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn check_dml_setup_needed() -> Result<bool, String> {
+    Ok(!registry_config::get_bool("dml_setup_done").unwrap_or(false))
+}
+
+#[tauri::command]
+fn mark_dml_setup_done() -> Result<(), String> {
+    registry_config::set_bool("dml_setup_done", true)
+}
+
+#[tauri::command]
+fn get_game_mode_status(
+    app: tauri::AppHandle,
+) -> serde_json::Value {
+    let state = app.state::<MonitorState>();
+    let active = state.game_mode_dml_suppressed.load(std::sync::atomic::Ordering::SeqCst);
+    let permanent = state.game_mode_permanently_suppressed.load(std::sync::atomic::Ordering::SeqCst);
+    serde_json::json!({
+        "active": active,
+        "permanent": permanent,
+    })
+}
+
 fn get_data_dir() -> std::path::PathBuf {
     // 优先从注册表读取 data_dir（HKCU\Software\CarbonPaper）
     if let Some(dir) = registry_config::get_string("data_dir") {
@@ -724,7 +778,15 @@ pub fn run() {
             } else {
                 tracing::error!("Storage initialization deferred: public key unavailable");
             }
-            
+
+            // 如果游戏模式已启用且 DML 已启用，启动 GPU 监控
+            if registry_config::get_bool("game_mode_enabled").unwrap_or(false)
+                && registry_config::get_bool("use_dml").unwrap_or(false)
+            {
+                tracing::info!("Restoring game mode monitor on startup");
+                monitor::start_game_mode_monitor(app.handle().clone());
+            }
+
             Ok(())
         }})
         .invoke_handler(tauri::generate_handler![
@@ -755,6 +817,11 @@ pub fn run() {
             // 高级配置命令
             get_advanced_config,
             set_advanced_config,
+            monitor::enumerate_gpus,
+            toggle_game_mode,
+            get_game_mode_status,
+            check_dml_setup_needed,
+            mark_dml_setup_done,
             // 数据迁移命令
             storage_list_plaintext_files,
             storage_migrate_plaintext,
