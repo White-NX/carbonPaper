@@ -8,6 +8,9 @@
   <a href="./README.en.md">English</a> |
   <strong>中文</strong> |
 </p>
+
+[![Release](https://github.com/White-NX/carbonPaper/actions/workflows/release.yml/badge.svg)](https://github.com/White-NX/carbonPaper/actions/workflows/release.yml)
+
 </div>
 
 ## Description
