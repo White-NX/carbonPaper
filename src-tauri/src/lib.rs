@@ -774,6 +774,12 @@ pub fn run() {
             if public_key_ready {
                 if let Err(e) = storage.initialize() {
                     tracing::error!("Failed to initialize storage: {}", e);
+                } else {
+                    // Start background migration to backfill plaintext process_name
+                    let storage_clone = storage.inner().clone();
+                    std::thread::spawn(move || {
+                        StorageState::backfill_plaintext_process_names(storage_clone);
+                    });
                 }
             } else {
                 tracing::error!("Storage initialization deferred: public key unavailable");

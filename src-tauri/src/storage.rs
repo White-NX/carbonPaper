@@ -61,6 +61,8 @@ pub struct StorageState {
     initialized: Mutex<bool>,
     migration_cancel_requested: AtomicBool,
     migration_in_progress: AtomicBool,
+    /// Diagnostic: tracks which operation currently holds the DB mutex
+    lock_holder: Mutex<&'static str>,
 }
 
 /// Screenshot record representing a row in the screenshots table, with decrypted fields. This is the main struct used for returning screenshot data to the frontend.
@@ -239,6 +241,7 @@ impl StorageState {
             initialized: Mutex::new(false),
             migration_cancel_requested: AtomicBool::new(false),
             migration_in_progress: AtomicBool::new(false),
+            lock_holder: Mutex::new(""),
         }
     }
 
@@ -602,6 +605,7 @@ impl StorageState {
 
     /// 初始化存储（创建目录和数据库
     pub fn initialize(&self) -> Result<(), String> {
+        let init_start = std::time::Instant::now();
         let mut initialized = self.initialized.lock().unwrap();
         if *initialized {
             return Ok(());
@@ -616,18 +620,23 @@ impl StorageState {
         std::fs::create_dir_all(&screenshot_dir)
             .map_err(|e| format!("Failed to create screenshot directory: {}", e))?;
 
+        let t0 = std::time::Instant::now();
         // 使用公钥派生弱数据库密钥（无需用户认证
         let public_key = get_cached_public_key(&self.credential_state)
             .or_else(|| load_public_key_from_file(&self.credential_state).ok())
             .ok_or_else(|| "Public key not initialized".to_string())?;
         let db_key = derive_db_key_from_public_key(&public_key);
+        let key_derive_dur = t0.elapsed();
 
         // 打开 SQLCipher 加密数据
+        let t1 = std::time::Instant::now();
         let db_path = data_dir.join("screenshots.db");
         let conn =
             Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
+        let open_dur = t1.elapsed();
 
         // 设置 SQLCipher 密钥（使hex 格式
+        let t2 = std::time::Instant::now();
         let key_hex = hex::encode(&db_key);
         conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key_hex))
             .map_err(|e| format!("Failed to set database key: {}", e))?;
@@ -635,9 +644,12 @@ impl StorageState {
         // 验证密钥是否正确
         conn.execute_batch("SELECT count(*) FROM sqlite_master;")
             .map_err(|e| format!("Database key verification failed: {}", e))?;
+        let pragma_dur = t2.elapsed();
 
         // 初始化表结构
+        let t3 = std::time::Instant::now();
         self.init_tables(&conn)?;
+        let tables_dur = t3.elapsed();
 
         *self.db.lock().unwrap() = Some(conn);
 
@@ -646,7 +658,10 @@ impl StorageState {
 
         *initialized = true;
 
-        tracing::info!("SQLCipher weakly encrypted database initialized");
+        tracing::info!(
+            "[DIAG:INIT] SQLCipher initialized in {:?} (key_derive={:?}, db_open={:?}, pragma={:?}, init_tables={:?})",
+            init_start.elapsed(), key_derive_dur, open_dur, pragma_dur, tables_dur
+        );
 
         Ok(())
     }
@@ -786,13 +801,21 @@ impl StorageState {
         Ok(())
     }
 
-    /// 获取数据库连接
-    fn get_connection(&self) -> Result<std::sync::MutexGuard<'_, Option<Connection>>, String> {
+    /// 获取数据库连接（带调用者标识，用于诊断日志）
+    fn get_connection_named(&self, caller: &'static str) -> Result<std::sync::MutexGuard<'_, Option<Connection>>, String> {
         let wait_start = std::time::Instant::now();
+        let current_holder = self.lock_holder.lock().ok().map(|g| *g).unwrap_or("?");
         let guard = self.db.lock().unwrap();
         let wait_dur = wait_start.elapsed();
-        if wait_dur.as_secs() >= 5 {
-            tracing::warn!("[DIAG:DB] Mutex wait took {:?}", wait_dur);
+        // Update lock holder to current caller
+        if let Ok(mut h) = self.lock_holder.lock() {
+            *h = caller;
+        }
+        if wait_dur.as_secs() >= 10 {
+            tracing::warn!(
+                "[DIAG:DB] Mutex wait took {:?} for '{}' (was held by '{}')",
+                wait_dur, caller, current_holder
+            );
         }
         if guard.is_none() {
             return Err("Database not initialized".to_string());
@@ -977,7 +1000,7 @@ impl StorageState {
 
     /// 棢查截图是否已存在
     pub fn screenshot_exists(&self, image_hash: &str) -> Result<bool, String> {
-        let mut guard = self.get_connection()?;
+        let mut guard = self.get_connection_named("screenshot_exists")?;
         let conn = guard.as_mut().unwrap();
 
         let count: i64 = conn
@@ -1041,7 +1064,7 @@ impl StorageState {
         let image_path_str = self.to_relative_image_path(&image_path);
 
         // 保存到数据库（SQLCipher 整库加密
-        let mut guard = self.get_connection()?;
+        let mut guard = self.get_connection_named("save_screenshot")?;
         let conn = guard.as_mut().unwrap();
 
         let metadata_json = request
@@ -1086,7 +1109,7 @@ impl StorageState {
                 request.width,
                 request.height,
                 Option::<String>::None,
-                Option::<String>::None,
+                request.process_name.clone(), // plaintext for fast aggregation
                 Option::<String>::None,
                 window_title_enc,
                 process_name_enc,
@@ -1215,6 +1238,8 @@ impl StorageState {
         &self,
         request: &SaveScreenshotRequest,
     ) -> Result<SaveScreenshotResponse, String> {
+        let fn_start = std::time::Instant::now();
+
         // 如果已存在则返回 duplicate
         if self.screenshot_exists(&request.image_hash)? {
             return Ok(SaveScreenshotResponse {
@@ -1225,15 +1250,19 @@ impl StorageState {
                 skipped: 0,
             });
         }
+        let exists_dur = fn_start.elapsed();
 
         // 解码图片
+        let t0 = std::time::Instant::now();
         let image_data = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             &request.image_data,
         )
         .map_err(|e| format!("Failed to decode image data: {}", e))?;
+        let decode_dur = t0.elapsed();
 
         // 生成 row key 并加密图
+        let t1 = std::time::Instant::now();
         let mut row_key = vec![0u8; 32];
         rand::thread_rng().fill_bytes(&mut row_key);
 
@@ -1241,8 +1270,10 @@ impl StorageState {
             .map_err(|e| format!("Failed to encrypt image: {}", e))?;
         let encrypted_row_key = encrypt_row_key_with_cng(&row_key)
             .map_err(|e| format!("Failed to wrap image row key: {}", e))?;
+        let img_encrypt_dur = t1.elapsed();
 
         // 使用 .pending 后缀标记临时文件
+        let t2 = std::time::Instant::now();
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("screenshot_{}.png.enc.pending", timestamp);
         let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
@@ -1250,12 +1281,15 @@ impl StorageState {
 
         std::fs::write(&image_path, &encrypted_image)
             .map_err(|e| format!("Failed to save encrypted image file: {}", e))?;
+        let file_write_dur = t2.elapsed();
 
         let image_path_str = self.to_relative_image_path(&image_path);
 
-        let mut guard = self.get_connection()?;
+        let mut guard = self.get_connection_named("save_screenshot_temp")?;
         let conn = guard.as_mut().unwrap();
+        let mutex_wait_dur = fn_start.elapsed() - exists_dur - decode_dur - img_encrypt_dur - file_write_dur;
 
+        let t3 = std::time::Instant::now();
         let metadata_json = request
             .metadata
             .as_ref()
@@ -1299,7 +1333,7 @@ impl StorageState {
                 request.width,
                 request.height,
                 Option::<String>::None,
-                Option::<String>::None,
+                request.process_name.clone(), // plaintext for fast aggregation
                 Option::<String>::None,
                 window_title_enc,
                 process_name_enc,
@@ -1311,6 +1345,19 @@ impl StorageState {
         .map_err(|e| format!("Failed to insert screenshot: {}", e))?;
 
         let screenshot_id = conn.last_insert_rowid();
+        let in_lock_dur = t3.elapsed();
+
+        // Clear lock holder on drop
+        if let Ok(mut h) = self.lock_holder.lock() { *h = ""; }
+        drop(guard);
+
+        let total_dur = fn_start.elapsed();
+        if total_dur.as_millis() >= 500 {
+            tracing::warn!(
+                "[DIAG:DB] save_screenshot_temp id={} total={:?} (exists_check={:?}, b64_decode={:?}, img_encrypt={:?}, file_write={:?}, mutex_wait~={:?}, in_lock={:?})",
+                screenshot_id, total_dur, exists_dur, decode_dur, img_encrypt_dur, file_write_dur, mutex_wait_dur, in_lock_dur
+            );
+        }
 
         Ok(SaveScreenshotResponse {
             status: "success".to_string(),
@@ -1327,8 +1374,12 @@ impl StorageState {
         screenshot_id: i64,
         ocr_results: Option<&Vec<OcrResultInput>>,
     ) -> Result<SaveScreenshotResponse, String> {
-        let mut guard = self.get_connection()?;
+        let fn_start = std::time::Instant::now();
+        let ocr_count = ocr_results.map(|v| v.len()).unwrap_or(0);
+
+        let mut guard = self.get_connection_named("commit_screenshot")?;
         let conn = guard.as_mut().unwrap();
+        let mutex_wait_dur = fn_start.elapsed();
 
         // 查找截图记录
         let rec: Option<(String, Option<Vec<u8>>)> = conn
@@ -1341,6 +1392,7 @@ impl StorageState {
             .map_err(|e| format!("Failed to query screenshot: {}", e))?;
 
         if rec.is_none() {
+            if let Ok(mut h) = self.lock_holder.lock() { *h = ""; }
             return Err("Screenshot not found".to_string());
         }
 
@@ -1365,13 +1417,21 @@ impl StorageState {
         let mut added = 0;
                     let skipped = 0;
 
+        // Timing accumulators for OCR processing
+        let mut total_encrypt_dur = std::time::Duration::ZERO;
+        let mut total_db_insert_dur = std::time::Duration::ZERO;
+        let mut total_bitmap_dur = std::time::Duration::ZERO;
+
         // 插入 OCR 结果（如果有），并更新盲三元组位图索
         if let Some(results) = ocr_results {
             for result in results {
+                let te0 = std::time::Instant::now();
                 let text_hash = Self::compute_hmac_hash(&result.text);
                 let (text_enc, text_key_encrypted) = self.encrypt_payload_with_row_key(result.text.as_bytes())?;
+                total_encrypt_dur += te0.elapsed();
 
                 // 插入 OCR 结果
+                let td0 = std::time::Instant::now();
                 conn.execute(
                     "INSERT INTO ocr_results (
                         screenshot_id, text, text_hash, text_enc, text_key_encrypted, confidence,
@@ -1392,7 +1452,9 @@ impl StorageState {
                     ],
                 )
                 .map_err(|e| format!("Failed to insert OCR result: {}", e))?;
+                total_db_insert_dur += td0.elapsed();
 
+                let tb0 = std::time::Instant::now();
                 let ocr_id = conn.last_insert_rowid();
                 let triple_tokens = Self::bigram_tokenize(&result.text);
                 let tx = conn
@@ -1433,6 +1495,7 @@ impl StorageState {
 
                 tx.commit()
                     .map_err(|e| format!("Failed to commit bitmap index: {}", e))?;
+                total_bitmap_dur += tb0.elapsed();
 
                 added += 1;
             }
@@ -1445,6 +1508,18 @@ impl StorageState {
         )
         .map_err(|e| format!("Failed to mark screenshot committed: {}", e))?;
 
+        // Clear lock holder on drop
+        if let Ok(mut h) = self.lock_holder.lock() { *h = ""; }
+        drop(guard);
+
+        let total_dur = fn_start.elapsed();
+        if total_dur.as_millis() >= 500 {
+            tracing::warn!(
+                "[DIAG:DB] commit_screenshot id={} ocr_count={} total={:?} (mutex_wait={:?}, encrypt={:?}, db_insert={:?}, bitmap={:?})",
+                screenshot_id, ocr_count, total_dur, mutex_wait_dur, total_encrypt_dur, total_db_insert_dur, total_bitmap_dur
+            );
+        }
+
         Ok(SaveScreenshotResponse {
             status: "success".to_string(),
             screenshot_id: Some(screenshot_id),
@@ -1456,7 +1531,7 @@ impl StorageState {
 
     /// Abort pending screenshot: delete encrypted file and mark DB record as aborted
     pub fn abort_screenshot(&self, screenshot_id: i64, _reason: Option<&str>) -> Result<SaveScreenshotResponse, String> {
-        let mut guard = self.get_connection()?;
+        let mut guard = self.get_connection_named("abort_screenshot")?;
         let conn = guard.as_mut().unwrap();
 
         let rec: Option<String> = conn
@@ -1514,7 +1589,7 @@ impl StorageState {
 
         // Phase 1: Hold mutex only for SQL query, extract raw data without decryption
         let raw_rows = {
-            let mut guard = self.get_connection()?;
+            let mut guard = self.get_connection_named("get_screenshots_by_time_range")?;
             let conn = guard.as_mut().unwrap();
 
             let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
@@ -1581,7 +1656,7 @@ impl StorageState {
         start_time: Option<f64>,
         end_time: Option<f64>,
     ) -> Result<Vec<SearchResult>, String> {
-        let mut guard = self.get_connection()?;
+        let mut guard = self.get_connection_named("search_text")?;
         let conn = guard.as_mut().unwrap();
 
         // 使用盲三元组位图索引进行搜索。如果 query 为空则化为按时间序的全文扫描（带时间进程过滤）
@@ -2546,7 +2621,7 @@ impl StorageState {
 
         // Phase 1: Hold mutex only for SQL query, extract raw data
         let raw_row = {
-            let guard = self.get_connection()?;
+            let guard = self.get_connection_named("get_screenshot_by_id")?;
             let conn = guard.as_ref().unwrap();
 
             let sql = format!(
@@ -2591,7 +2666,7 @@ impl StorageState {
 
     /// 获取截图 OCR 结果
     pub fn get_screenshot_ocr_results(&self, screenshot_id: i64) -> Result<Vec<OcrResult>, String> {
-        let guard = self.get_connection()?;
+        let guard = self.get_connection_named("get_screenshot_ocr_results")?;
         let conn = guard.as_ref().unwrap();
 
         let mut stmt = conn
@@ -2639,7 +2714,7 @@ impl StorageState {
 
     /// 删除截图
     pub fn delete_screenshot(&self, id: i64) -> Result<bool, String> {
-        let guard = self.get_connection()?;
+        let guard = self.get_connection_named("delete_screenshot")?;
         let conn = guard.as_ref().unwrap();
 
         // 先获取图片路径
@@ -2673,7 +2748,7 @@ impl StorageState {
         start_ts: f64,
         end_ts: f64,
     ) -> Result<i32, String> {
-        let guard = self.get_connection()?;
+        let guard = self.get_connection_named("delete_screenshots_by_time_range")?;
         let conn = guard.as_ref().unwrap();
 
         // 转换时间戳（毫秒）为 SQLite 日期时间
@@ -2712,50 +2787,75 @@ impl StorageState {
         Ok(deleted as i32)
     }
 
-    /// 列出不同的进程名
+    /// 列出不同的进程名（两阶段：SQL聚合 + 离线解密旧记录）
     pub fn list_distinct_processes(&self) -> Result<Vec<(String, i64)>, String> {
-        let guard = self.get_connection()?;
-        let conn = guard.as_ref().unwrap();
+        let fn_start = std::time::Instant::now();
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT process_name, process_name_enc, content_key_encrypted
-                 FROM screenshots",
-            )
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+        // Phase 1: SQL aggregation + extract encrypted-only rows (hold mutex)
+        let (mut counts, encrypted_rows): (
+            std::collections::HashMap<String, i64>,
+            Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>,
+        ) = {
+            let guard = self.get_connection_named("list_distinct_processes")?;
+            let conn = guard.as_ref().unwrap();
 
-        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            // Fast path: aggregate plaintext process_name via SQL
+            let mut counts = std::collections::HashMap::new();
+            let mut stmt = conn.prepare(
+                "SELECT process_name, COUNT(*) FROM screenshots
+                 WHERE process_name IS NOT NULL AND process_name != ''
+                 GROUP BY process_name"
+            ).map_err(|e| format!("Failed to prepare query: {}", e))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            }).map_err(|e| format!("Failed to execute query: {}", e))?;
+            for row in rows.filter_map(|r| r.ok()) {
+                counts.insert(row.0, row.1);
+            }
 
-        let rows = stmt
-            .query_map([], |row| {
-                let process_plain: Option<String> = row.get(0)?;
-                let process_enc: Option<Vec<u8>> = row.get(1)?;
-                let key_enc: Option<Vec<u8>> = row.get(2)?;
-                Ok((process_plain, process_enc, key_enc))
-            })
-            .map_err(|e| format!("Failed to execute query: {}", e))?;
+            // Slow path: collect encrypted-only rows for offline decryption
+            let mut enc_stmt = conn.prepare(
+                "SELECT process_name_enc, content_key_encrypted FROM screenshots
+                 WHERE process_name IS NULL AND process_name_enc IS NOT NULL"
+            ).map_err(|e| format!("Failed to prepare enc query: {}", e))?;
+            let enc_rows: Vec<_> = enc_stmt.query_map([], |row| {
+                Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            }).map_err(|e| format!("Failed to execute enc query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
 
-        for row in rows.filter_map(|r| r.ok()) {
-            let (process_plain, process_enc, key_enc) = row;
-            let mut row_key = key_enc
-                .as_ref()
-                .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
-            let process_name = match (process_enc.as_ref(), row_key.as_ref()) {
-                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                    .ok()
-                    .and_then(|v| String::from_utf8(v).ok()),
-                _ => process_plain,
-            };
+            (counts, enc_rows)
+            // guard dropped — mutex released
+        };
+        let query_dur = fn_start.elapsed();
 
-            if let Some(name) = process_name {
-                if !name.trim().is_empty() {
-                    *counts.entry(name).or_insert(0) += 1;
+        // Phase 2: Decrypt old records outside mutex (only if user has authenticated)
+        let session_valid = self.credential_state.is_session_valid();
+        let skipped_encrypted = !session_valid && !encrypted_rows.is_empty();
+        if session_valid {
+            for (process_enc, key_enc) in &encrypted_rows {
+                let mut row_key = key_enc.as_ref()
+                    .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+                let process_name = match (process_enc.as_ref(), row_key.as_ref()) {
+                    (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                        .ok()
+                        .and_then(|v| String::from_utf8(v).ok()),
+                    _ => None,
+                };
+                if let Some(name) = process_name {
+                    if !name.trim().is_empty() {
+                        *counts.entry(name).or_insert(0) += 1;
+                    }
+                }
+                if let Some(ref mut key) = row_key {
+                    Self::zeroize_bytes(key);
                 }
             }
-
-            if let Some(ref mut key) = row_key {
-                Self::zeroize_bytes(key);
-            }
+        } else if skipped_encrypted {
+            tracing::info!(
+                "[DIAG:DB] list_distinct_processes: skipped {} encrypted rows (session not valid, waiting for user auth)",
+                encrypted_rows.len()
+            );
         }
 
         let mut results: Vec<(String, i64)> = counts.into_iter().collect();
@@ -2763,6 +2863,15 @@ impl StorageState {
             b.1.cmp(&a.1)
                 .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
         });
+
+        let total_dur = fn_start.elapsed();
+        if total_dur.as_millis() >= 500 || !encrypted_rows.is_empty() {
+            tracing::info!(
+                "[DIAG:DB] list_distinct_processes total={:?} (query={:?}, decrypt={:?}, plaintext_groups={}, encrypted_rows={})",
+                total_dur, query_dur, total_dur - query_dur, results.len(), encrypted_rows.len()
+            );
+        }
+
         Ok(results)
     }
 
@@ -2772,7 +2881,7 @@ impl StorageState {
 
         // Phase 1: Hold mutex only for DB query to get the encrypted key
         let (key_enc, abs_path) = {
-            let guard = self.get_connection()?;
+            let guard = self.get_connection_named("read_image")?;
             let conn = guard.as_ref().unwrap();
 
             let key: Option<Vec<u8>> = conn
@@ -3030,7 +3139,7 @@ impl StorageState {
         new_path: &str,
         encrypted_key: &[u8],
     ) -> Result<(), String> {
-        let guard = self.get_connection()?;
+        let guard = self.get_connection_named("update_screenshot_path")?;
         let conn = guard.as_ref().unwrap();
 
         conn.execute(
@@ -3062,6 +3171,148 @@ impl StorageState {
             .collect();
 
         Ok(files)
+    }
+
+    /// 后台迁移：逐批解密旧记录并回填明文 process_name
+    /// Waits for user authentication before starting CNG decryption.
+    pub fn backfill_plaintext_process_names(storage: Arc<Self>) {
+        // Wait for user to authenticate before attempting CNG decryption
+        tracing::info!("[BACKFILL] waiting for user authentication before starting migration...");
+        loop {
+            if storage.credential_state.is_session_valid() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        tracing::info!("[BACKFILL] user authenticated, starting migration");
+
+        let migrate_start = std::time::Instant::now();
+        let mut total_updated = 0u64;
+        let mut batch_num = 0u64;
+
+        loop {
+            batch_num += 1;
+
+            // Re-check auth: if session expired, pause until user re-authenticates
+            if !storage.credential_state.is_session_valid() {
+                tracing::info!("[BACKFILL] session expired at batch #{}, pausing...", batch_num);
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if storage.credential_state.is_session_valid() {
+                        tracing::info!("[BACKFILL] session restored, resuming migration");
+                        break;
+                    }
+                }
+            }
+
+            // Phase 1: extract a batch of encrypted-only rows (hold mutex)
+            let batch: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> = match storage
+                .get_connection_named("backfill_process_names")
+            {
+                Ok(guard) => {
+                    let conn = guard.as_ref().unwrap();
+                    let mut stmt = match conn.prepare(
+                        "SELECT id, process_name_enc, content_key_encrypted FROM screenshots
+                         WHERE process_name IS NULL AND process_name_enc IS NOT NULL
+                         LIMIT 100",
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("[BACKFILL] Failed to prepare query: {}", e);
+                            break;
+                        }
+                    };
+                    let rows = match stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<Vec<u8>>>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                        ))
+                    }) {
+                        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                        Err(e) => {
+                            tracing::error!("[BACKFILL] Failed to execute query: {}", e);
+                            break;
+                        }
+                    };
+                    rows
+                    // guard dropped — mutex released
+                }
+                Err(e) => {
+                    tracing::error!("[BACKFILL] Failed to get connection: {}", e);
+                    break;
+                }
+            };
+
+            if batch.is_empty() {
+                break;
+            }
+
+            // Phase 2: decrypt outside mutex
+            let mut decrypted: Vec<(i64, String)> = Vec::new();
+            for (id, process_enc, key_enc) in &batch {
+                let mut row_key = key_enc
+                    .as_ref()
+                    .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+                let name = match (process_enc.as_ref(), row_key.as_ref()) {
+                    (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                        .ok()
+                        .and_then(|v| String::from_utf8(v).ok()),
+                    _ => None,
+                };
+                if let Some(ref mut key) = row_key {
+                    Self::zeroize_bytes(key);
+                }
+                if let Some(n) = name {
+                    decrypted.push((*id, n));
+                }
+            }
+
+            // Phase 3: write back plaintext (hold mutex)
+            if !decrypted.is_empty() {
+                match storage.get_connection_named("backfill_process_names_update") {
+                    Ok(guard) => {
+                        let conn = guard.as_ref().unwrap();
+                        for (id, name) in &decrypted {
+                            if let Err(e) = conn.execute(
+                                "UPDATE screenshots SET process_name = ? WHERE id = ?",
+                                params![name, id],
+                            ) {
+                                tracing::error!(
+                                    "[BACKFILL] Failed to update id={}: {}",
+                                    id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("[BACKFILL] Failed to get connection for update: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            total_updated += decrypted.len() as u64;
+            tracing::info!(
+                "[BACKFILL] batch #{}: decrypted {}/{} rows (cumulative: {})",
+                batch_num,
+                decrypted.len(),
+                batch.len(),
+                total_updated
+            );
+
+            // Yield to let normal queries acquire the mutex
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let total_dur = migrate_start.elapsed();
+        tracing::info!(
+            "[BACKFILL] completed: {} rows backfilled in {:?} ({} batches)",
+            total_updated,
+            total_dur,
+            batch_num
+        );
     }
 
     /// 安全删除所有明文截图文件（不迁移，直接删除

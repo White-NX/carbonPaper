@@ -105,6 +105,7 @@
         "label": "Use DirectML for inference",
         "description": "When enabled, uses GPU for OCR inference acceleration; requires DirectX 12 compatible GPU",
         "changed_notice": "DirectML changes take effect when the monitor service restarts",
+        "notice": "Note: Running DirectML on the primary GPU may impact gaming performance.",
         "gpu_select": "Select GPU device",
         "gpu_loading": "Detecting GPUs...",
         "gpu_none": "No compatible GPU detected"
