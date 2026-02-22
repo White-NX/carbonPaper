@@ -479,6 +479,7 @@ class OCRDatabaseHandler:
 
     def list_distinct_processes(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """列出数据库中的进程名及数量"""
+        """@deprecated Python Subservice will never manage database content"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             sql = (

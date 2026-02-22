@@ -8,7 +8,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification';
 import Timeline from './components/Timeline';
-import { InspectorImage } from './components/Gallery';
+import { InspectorImage } from './components/InspectorImage';
 import { SearchBox } from './components/SearchBox';
 import { AdvancedSearch } from './components/AdvancedSearch';
 import SettingsDialog from './components/settings/SettingsDialog';

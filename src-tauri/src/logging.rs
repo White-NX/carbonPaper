@@ -161,10 +161,11 @@ impl<'a> MakeWriter<'a> for DailyRotatingWriter {
     }
 }
 
-/// 初始化全局日志系统。返回的 guard 必须在 `run()` 中持有直到程序结束。
+/// Initialize logging system with two layers: file output (without ANSI colors) 
+/// and stderr output (with ANSI colors for development).
 ///
-/// - Layer 1: 文件输出（无 ANSI 颜色）
-/// - Layer 2: stderr 输出（调试用）
+/// - Layer 1: File output (no ANSI colors, for production)
+/// - Layer 2: stderr output (with ANSI colors, for development)
 pub fn init_logging(data_dir: &Path) -> DailyRotatingWriter {
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::SubscriberExt;
@@ -177,7 +178,7 @@ pub fn init_logging(data_dir: &Path) -> DailyRotatingWriter {
 
     let writer = DailyRotatingWriter::new(logs_root);
 
-    // 默认日志级别：INFO（可通过 RUST_LOG 环境变量覆盖）
+    // Default to "info" level if RUST_LOG is not set or invalid
     let default_level = "info";
 
     let env_filter_file = EnvFilter::try_from_default_env()

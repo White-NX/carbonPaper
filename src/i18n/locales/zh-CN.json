@@ -104,7 +104,7 @@
         "title": "OCR 推理加速",
         "label": "使用 DirectML 进行推理",
         "description": "启用后将使用 GPU 进行 OCR 推理加速，需要 DirectX 12 兼容的显卡。",
-        "notice": "注意：启用 DirectML 可能会显著影响游戏性能。",
+        "notice": "注意：在主要 GPU 上运行 DirectML 可能会影响游戏性能。",
         "changed_notice": "DirectML 设置将在下次启动监控服务时生效",
         "gpu_select": "选择 GPU 设备",
         "gpu_loading": "正在检测 GPU...",

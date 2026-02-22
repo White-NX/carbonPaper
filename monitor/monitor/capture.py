@@ -685,8 +685,8 @@ def capture_loop(interval: int = INTERVAL):
                         img_bytes = img_buffer.getvalue()
                         
                         logger.info(
-                            "[%s] 截图捕获 (%s): %d bytes - %s",
-                            ts_str, scan_reason, len(img_bytes), captured_title
+                            "[%s] Captured (%s): %d bytes - %s",
+                            ts_str, scan_reason, len(img_bytes), base64.b64encode(img_bytes[:16]).decode("utf-8")  # 前16字节的简短哈希
                         )
 
                         # 更新历史

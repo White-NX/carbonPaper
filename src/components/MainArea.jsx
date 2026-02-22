@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import Tabs from './Tabs';
 import { AdvancedSearch } from './AdvancedSearch';
-import { InspectorImage } from './Gallery';
+import { InspectorImage } from './InspectorImage';
 import { Loader2, Copy, X } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import PreviewActionBar from './PreviewActionBar';

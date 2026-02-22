@@ -457,7 +457,7 @@ fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageRe
         _ => StorageResponse::error(&format!("Unknown command: {}", command)),
     };
 
-    if diag_start.elapsed().as_secs() >= 5 {
+    if diag_start.elapsed().as_secs() >= 10 {
         tracing::warn!("[DIAG:RIPC] command='{}' completed in {:?}", command, diag_start.elapsed());
     }
     response

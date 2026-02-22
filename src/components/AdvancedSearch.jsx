@@ -307,6 +307,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
   const observerRef = useRef(null);
   const sentinelRef = useRef(null);
   const lastParamsRef = useRef({ query: '', mode: 'ocr' });
+  const searchIdRef = useRef(0);
 
   const { t } = useTranslation();
 
@@ -345,9 +346,16 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
   }, [active]);
 
   const handleModeChange = useCallback((nextMode) => {
+    if (nextMode === mode) return;
+    searchIdRef.current += 1;
+    setResults([]);
+    setHasMore(false);
+    setLoading(false);
+    setLoadingMore(false);
+    offsetRef.current = 0;
     setMode(nextMode);
     onSearchModeChange?.(nextMode);
-  }, [onSearchModeChange]);
+  }, [onSearchModeChange, mode]);
 
   useEffect(() => {
     if (searchMode === undefined || searchMode === mode) return;
@@ -386,13 +394,18 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     const normalizedQuery = debouncedQuery.trim();
     const hasFilters = selectedProcesses.length > 0 || startDate || endDate;
     if (!normalizedQuery && !hasFilters) {
+      searchIdRef.current += 1;
       setResults([]);
       setHasMore(false);
+      setLoading(false);
+      setLoadingMore(false);
       offsetRef.current = 0;
       return;
     }
 
+    const currentSearchId = ++searchIdRef.current;
     setLoading(true);
+    setLoadingMore(false);
     offsetRef.current = 0;
     const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
     const fetched = await searchScreenshots(normalizedQuery, mode, {
@@ -403,6 +416,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
       endTime: computeTimestamp(endDate),
       fuzzy: mode !== 'nl'
     });
+    if (searchIdRef.current !== currentSearchId) return;
     setResults(fetched);
     setHasMore(fetched.length === pageSize);
     offsetRef.current = fetched.length;
@@ -422,6 +436,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMore || loading) return;
+    const currentSearchId = searchIdRef.current;
     setLoadingMore(true);
     const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
     const fetched = await searchScreenshots(debouncedQuery.trim(), mode, {
@@ -432,6 +447,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
       endTime: computeTimestamp(endDate),
       fuzzy: mode !== 'nl'
     });
+    if (searchIdRef.current !== currentSearchId) return;
     setResults((prev) => [...prev, ...fetched]);
     setHasMore(fetched.length === pageSize);
     offsetRef.current += fetched.length;
