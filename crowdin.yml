@@ -4,3 +4,6 @@ api_token_env: CROWDIN_PERSONAL_TOKEN
 files:
   - source: /src/i18n/locales/zh-CN.json
     translation: /src/i18n/locales/%locale%.json
+    languages_mapping:
+      locale:
+        en-US: en
