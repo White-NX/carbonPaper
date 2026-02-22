@@ -17,8 +17,7 @@
         "active": "已激活：DirectML 已临时关闭",
         "inactive": "GPU 负载正常",
         "permanent": "DirectML 已关闭（频繁切换，将在重启后恢复）"
-      }
-      ,
+      },
       "monitor": {
         "title": "监控服务",
         "status": "状态：{{status}}",
@@ -65,11 +64,27 @@
         "title": "自动锁定时间",
         "description": "设置在用户无操作多长时间后自动锁定并需要重新验证",
         "options": {
-          "5m": { "label": "5 分钟", "description": "较高安全性" },
-          "15m": { "label": "15 分钟", "description": "推荐" },
-          "1h": { "label": "1 小时", "description": "方便使用" },
-          "1d": { "label": "1 天", "description": "较低安全性" },
-          "until_close": { "label": "直到关闭", "description": "不推荐", "warning": true }
+          "5m": {
+            "label": "5 分钟",
+            "description": "较高安全性"
+          },
+          "15m": {
+            "label": "15 分钟",
+            "description": "推荐"
+          },
+          "1h": {
+            "label": "1 小时",
+            "description": "方便使用"
+          },
+          "1d": {
+            "label": "1 天",
+            "description": "较低安全性"
+          },
+          "until_close": {
+            "label": "直到关闭",
+            "description": "不推荐",
+            "warning": true
+          }
         },
         "current": {
           "unlocked": "已解锁",
@@ -158,8 +173,7 @@
       "warning": {
         "title": "警告",
         "message": "当前设置为不限制存储空间且永久保留，快照文件可能会占用大量磁盘空间。建议设置合理的存储上限或保留时间。"
-      }
-      ,
+      },
       "migration": {
         "dialog_title": "迁移 data 目录",
         "error_default": "迁移出错",
@@ -285,8 +299,7 @@
       "time": "时间"
     },
     "empty": "从时间线中选择一个事件以查看详情。"
-  }
-  ,
+  },
   "dmlSetup": {
     "title": "DirectML GPU 加速",
     "subtitle": "新版本支持使用 GPU 加速 OCR 文字识别",
@@ -306,8 +319,7 @@
     "skip": "跳过",
     "acknowledge": "了解",
     "loading": "正在检测 GPU..."
-  }
-  ,
+  },
   "authMask": {
     "title": "需要 Windows Hello 验证",
     "description": "Carbon Paper 使用 Windows Hello 加密您的屏幕截图和 OCR 数据，请通过 PIN、指纹或面部识别来解锁。",
@@ -322,8 +334,7 @@
       "init_failed": "初始化失败：{{error}}",
       "generic_failed": "验证失败：{{error}}"
     }
-  }
-  ,
+  },
   "advancedSearch": {
     "title": "ADVANCED",
     "search": {
@@ -367,8 +378,7 @@
       "我是皱皮",
       "阿米娅你听我解释，我真的没有偏向佩丽卡！"
     ]
-  }
-  ,
+  },
   "mask": {
     "debug": {
       "label": "调试",
@@ -401,15 +411,13 @@
       },
       "choose": "选择",
       "auto_install": {
-        "log_start": "正在自动安装 Python...",
-        "success": "安装成功。",
-        "finished": "自动安装流程已结束。"
+        "installing": "安装中...",
+        "button": "自动安装 Python"
       },
       "discovered_label": "自动发现的 Python 版本（你可以在此选择一个）",
       "unsupported": "不受支持",
       "not_found": "未发现 Python",
       "note": "不知道什么是 Python？别担心，我们可以帮你自动安装。安装完成后程序将关闭，需要手动重启。",
-      "auto_install": { "installing": "安装中...", "button": "自动安装 Python" },
       "install_logs": "安装日志",
       "install_failed": "安装失败：{{error}}",
       "next": "下一步",
