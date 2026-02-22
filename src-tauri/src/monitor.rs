@@ -24,17 +24,17 @@ pub struct MonitorState {
     pub pipe_name: Mutex<Option<String>>,
     pub auth_token: Mutex<Option<String>>,
     pub request_counter: AtomicU64,
-    /// 反向 IPC 服务器（用于接收 Python 的存储请求）
+    /// Reverse IPC server instance for receiving storage requests from Python
     pub reverse_ipc: Mutex<Option<ReverseIpcServer>>,
-    /// 反向 IPC 管道名
+    /// Reverse IPC pipe name
     pub reverse_pipe_name: Mutex<Option<String>>,
-    /// Job Object handle - 用于管理子进程生命周期和资源限制
+    /// Job Object handle to manage monitor process and its children
     pub job_handle: Mutex<Option<JobHandle>>,
-    /// 游戏模式：DML 是否被临时关闭
+    /// Game mode: whether DirectML is currently suppressed due to game mode
     pub game_mode_dml_suppressed: AtomicBool,
-    /// 游戏模式：因频繁切换而永久关闭 DML（直到程序重启）
+    /// Game mode: whether the monitor is permanently suppressed due to game mode (until next restart)
     pub game_mode_permanently_suppressed: AtomicBool,
-    /// 游戏模式：监控任务句柄
+    /// Game mode: background task handle for monitoring game mode changes (so we can stop it when monitor stops)
     pub game_mode_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 

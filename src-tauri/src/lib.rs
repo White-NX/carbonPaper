@@ -632,10 +632,10 @@ async fn toggle_game_mode(
     if enabled {
         monitor::start_game_mode_monitor(app);
     } else {
-        monitor::stop_game_mode_monitor(&app);
-        // 如果 DML 被抑制了，需要重启 Python 恢复 DML
+        // If DirectML was suppressed due to game mode, restart monitor to reapply DirectML settings
         let state = app.state::<MonitorState>();
         let was_suppressed = state.game_mode_dml_suppressed.load(std::sync::atomic::Ordering::SeqCst);
+        monitor::stop_game_mode_monitor(&app);
         if was_suppressed {
             let _ = monitor::stop_monitor(app.state::<MonitorState>()).await;
             let _ = monitor::start_monitor(app.state::<MonitorState>(), app.clone()).await;
