@@ -1,3 +1,4 @@
+use crate::capture::CaptureState;
 use crate::resource_utils::{find_existing_file_in_resources, normalize_path_for_command};
 use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
 use crate::storage::StorageState;
@@ -164,7 +165,7 @@ async fn connect_to_pipe(
 }
 
 // 内部函数：发送 IPC 请求 (通用) - 添加认证和序列号
-async fn send_ipc_request(
+pub async fn send_ipc_request(
     pipe_name: &str,
     auth_token: &str,
     seq_no: u64,
@@ -239,6 +240,76 @@ impl Drop for CpuLimitGuard {
 #[tauri::command]
 pub async fn execute_monitor_command(
     state: State<'_, MonitorState>,
+    capture_state: State<'_, Arc<CaptureState>>,
+    storage: State<'_, Arc<StorageState>>,
+    payload: Value,
+) -> Result<Value, String> {
+    // Intercept commands that need Rust-side state updates
+    let command = payload
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    match command {
+        "update_filters" => {
+            // Update Rust-side exclusion settings
+            let filters = payload.get("filters").cloned().unwrap_or(serde_json::Value::Null);
+            let processes = filters.get("processes")
+                .or_else(|| payload.get("processes"))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
+            let titles = filters.get("titles")
+                .or_else(|| payload.get("titles"))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
+            let ignore_protected = filters.get("ignore_protected")
+                .or_else(|| payload.get("ignore_protected"))
+                .and_then(|v| v.as_bool());
+
+            {
+                let data_dir = storage.data_dir.lock().unwrap().clone();
+                capture_state.update_exclusion_settings(
+                    processes,
+                    titles,
+                    ignore_protected,
+                );
+                capture_state.save_exclusion_settings(&data_dir);
+            }
+            // Still forward to Python for its internal state
+        }
+        "update_advanced_config" => {
+            // Update Rust-side backpressure config
+            let capture_on_ocr_busy = payload.get("capture_on_ocr_busy")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let ocr_queue_max_size = payload.get("ocr_queue_max_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+
+            capture_state.capture_on_ocr_busy.store(capture_on_ocr_busy, Ordering::SeqCst);
+            capture_state.ocr_queue_max_size.store(ocr_queue_max_size, Ordering::SeqCst);
+            // Still forward to Python
+        }
+        _ => {}
+    }
+
+    forward_command_to_python(&state, payload).await
+}
+
+// 内部函数：发送仅包含 command 的 IPC 命令 (兼容旧接口)
+async fn send_ipc_command_internal(
+    state: &State<'_, MonitorState>,
+    cmd: &str,
+) -> Result<String, String> {
+    let req = serde_json::json!({ "command": cmd });
+    forward_command_to_python(state, req).await.map(|v| v.to_string())
+}
+
+/// Forward an arbitrary JSON command to the Python process via IPC.
+/// Used by lib.rs callers that need to send commands but don't need
+/// Rust-side capture/storage state updates.
+pub async fn forward_command_to_python(
+    state: &MonitorState,
     payload: Value,
 ) -> Result<Value, String> {
     let pipe_name = {
@@ -265,7 +336,6 @@ pub async fn execute_monitor_command(
         .unwrap_or("");
     let needs_full_cpu = command == "search_nl";
 
-    // 用 RAII guard 确保即使 future 被取消也能恢复 CPU 限制
     let _cpu_guard = if needs_full_cpu {
         let guard = state.job_handle.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref job) = *guard {
@@ -281,37 +351,6 @@ pub async fn execute_monitor_command(
     };
 
     send_ipc_request(&pipe_name, &auth_token, seq_no, payload).await
-}
-
-// 内部函数：发送仅包含 command 的 IPC 命令 (兼容旧接口)
-async fn send_ipc_command_internal(
-    state: &State<'_, MonitorState>,
-    cmd: &str,
-) -> Result<String, String> {
-    let req = serde_json::json!({ "command": cmd });
-
-    let pipe_name = {
-        let guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
-        match &*guard {
-            Some(name) => name.clone(),
-            None => return Err("Monitor not started".to_string()),
-        }
-    };
-
-    let auth_token = {
-        let guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
-        match &*guard {
-            Some(token) => token.clone(),
-            None => return Err("Monitor not authenticated".to_string()),
-        }
-    };
-
-    let seq_no = state.request_counter.fetch_add(1, Ordering::SeqCst);
-
-    match send_ipc_request(&pipe_name, &auth_token, seq_no, req).await {
-        Ok(v) => Ok(v.to_string()),
-        Err(e) => Err(e),
-    }
 }
 
 fn create_job_object(cpu_limit_enabled: bool, cpu_limit_percent: u32) -> Result<JobHandle, String> {
@@ -458,9 +497,11 @@ pub async fn start_monitor(
         {
             let storage = app.state::<Arc<StorageState>>();
             let storage_arc = (*storage).clone();
+            let capture_state = app.state::<Arc<crate::capture::CaptureState>>();
+            let ocr_cache = capture_state.ocr_image_cache.clone();
 
             let mut reverse_server = ReverseIpcServer::new(&reverse_pipe_name);
-            if let Err(e) = reverse_server.start(storage_arc) {
+            if let Err(e) = reverse_server.start(storage_arc, ocr_cache) {
                 tracing::error!("Failed to start reverse IPC server: {}", e);
             }
 
@@ -480,7 +521,7 @@ pub async fn start_monitor(
 
         tracing::info!(
             "Starting monitor: python={} (exists={}) script={} script_abs={} cwd={} pipe={} storage_pipe={}",
-            python_executable, python_exists, script_path, script_abs, cwd, pipe_name, reverse_pipe_name
+            python_executable, python_exists, script_path, script_abs, cwd, pipe_name[0..30].to_string(), reverse_pipe_name[0..30].to_string()
         );
 
         // Start the Python process with stdout/stderr piped, 
@@ -705,7 +746,8 @@ pub async fn start_monitor(
     while started_at.elapsed().as_millis() < STARTUP_MAX_WAIT_MS as u128 {
         match connect_to_pipe(&pipe_name).await {
             Ok(_) => {
-                // 管道可连接，说明服务已就绪
+                // 管道可连接，说明服务已就绪 — 启动 Rust 截图循环
+                spawn_capture_loop(&app);
                 return Ok("Monitor started".into());
             }
             Err(e) => {
@@ -770,9 +812,84 @@ pub async fn start_monitor(
     ))
 }
 
+/// Spawn the Rust-side capture loop using CaptureState
+fn spawn_capture_loop(app: &AppHandle) {
+    let capture_state = app.state::<Arc<CaptureState>>();
+    let storage = app.state::<Arc<StorageState>>();
+    let _monitor_state = app.state::<MonitorState>();
+
+    // Reset capture state for new session
+    capture_state.stopped.store(false, Ordering::SeqCst);
+    capture_state.paused.store(false, Ordering::SeqCst);
+    capture_state.in_flight_ocr_count.store(0, Ordering::SeqCst);
+
+    // Load exclusion settings from disk
+    {
+        let data_dir = storage.data_dir.lock().unwrap().clone();
+        capture_state.load_exclusion_settings(&data_dir);
+    }
+
+    // Load advanced config from registry
+    {
+        let capture_on_ocr_busy =
+            crate::registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
+        let ocr_queue_max_size =
+            crate::registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
+        capture_state.capture_on_ocr_busy.store(capture_on_ocr_busy, Ordering::SeqCst);
+        capture_state.ocr_queue_max_size.store(ocr_queue_max_size, Ordering::SeqCst);
+    }
+
+    let cs = capture_state.inner().clone();
+    let st = storage.inner().clone();
+    // MonitorState is not Arc-wrapped in Tauri managed state, but we access it via AppHandle
+    // We need to pass the AppHandle so the capture loop can access MonitorState
+    let app_handle = app.clone();
+
+    let handle = tauri::async_runtime::spawn(async move {
+        let _ms = app_handle.state::<MonitorState>();
+        // Create a temporary Arc wrapper for the capture loop
+        // MonitorState is behind Tauri's State which is already Arc-like
+        // We'll pass the AppHandle and extract state inside the loop
+        crate::capture::run_capture_loop(cs, st, app_handle.clone()).await;
+    });
+
+    let mut guard = capture_state.capture_task.lock().unwrap();
+    *guard = Some(handle);
+
+    tracing::info!("Rust capture loop spawned");
+}
+
 #[tauri::command]
-pub async fn stop_monitor(state: State<'_, MonitorState>) -> Result<String, String> {
-    // 尝试通过 IPC 发送结束信号
+pub async fn stop_monitor(
+    state: State<'_, MonitorState>,
+    capture_state: State<'_, Arc<CaptureState>>,
+) -> Result<String, String> {
+    // 1. Stop the Rust capture loop
+    capture_state.stopped.store(true, Ordering::SeqCst);
+    capture_state.paused.store(false, Ordering::SeqCst);
+
+    // Abort the capture task
+    {
+        let mut guard = capture_state.capture_task.lock().unwrap();
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+    }
+
+    // Wait for in-flight OCR tasks to complete (with timeout)
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while capture_state.in_flight_ocr_count.load(Ordering::SeqCst) > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "Timed out waiting for {} in-flight OCR tasks",
+                capture_state.in_flight_ocr_count.load(Ordering::SeqCst)
+            );
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    // 2. 尝试通过 IPC 发送结束信号 to Python
     let _ = send_ipc_command_internal(&state, "stop").await;
 
     // 等待进程退出
@@ -826,12 +943,24 @@ pub async fn stop_monitor(state: State<'_, MonitorState>) -> Result<String, Stri
 }
 
 #[tauri::command]
-pub async fn pause_monitor(state: State<'_, MonitorState>) -> Result<String, String> {
+pub async fn pause_monitor(
+    state: State<'_, MonitorState>,
+    capture_state: State<'_, Arc<CaptureState>>,
+) -> Result<String, String> {
+    // Pause Rust capture loop
+    capture_state.paused.store(true, Ordering::SeqCst);
+    // Also forward to Python so OCR worker pauses
     send_ipc_command_internal(&state, "pause").await
 }
 
 #[tauri::command]
-pub async fn resume_monitor(state: State<'_, MonitorState>) -> Result<String, String> {
+pub async fn resume_monitor(
+    state: State<'_, MonitorState>,
+    capture_state: State<'_, Arc<CaptureState>>,
+) -> Result<String, String> {
+    // Resume Rust capture loop
+    capture_state.paused.store(false, Ordering::SeqCst);
+    // Also forward to Python so OCR worker resumes
     send_ipc_command_internal(&state, "resume").await
 }
 
@@ -1062,7 +1191,7 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                     }));
 
                     // 重启 Python（不带 DML）
-                    let _ = stop_monitor(app_clone.state::<MonitorState>()).await;
+                    let _ = stop_monitor(app_clone.state::<MonitorState>(), app_clone.state::<Arc<CaptureState>>()).await;
                     let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
                     continue;
                 }
@@ -1072,7 +1201,7 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                 let _ = app_clone.emit("game-mode-status", serde_json::json!({"active": true, "usage": usage}));
 
                 // 重启 Python（不带 DML）
-                let _ = stop_monitor(app_clone.state::<MonitorState>()).await;
+                let _ = stop_monitor(app_clone.state::<MonitorState>(), app_clone.state::<Arc<CaptureState>>()).await;
                 let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
             } else if currently_suppressed && usage <= 0.40 {
                 // 记录触发时间（恢复也计入）
@@ -1100,7 +1229,7 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                 let _ = app_clone.emit("game-mode-status", serde_json::json!({"active": false, "usage": usage}));
 
                 // 重启 Python（恢复 DML）
-                let _ = stop_monitor(app_clone.state::<MonitorState>()).await;
+                let _ = stop_monitor(app_clone.state::<MonitorState>(), app_clone.state::<Arc<CaptureState>>()).await;
                 let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
             }
         }

@@ -233,9 +233,10 @@ pub async fn updater_extract() -> Result<(), String> {
 pub async fn updater_apply(
     app: AppHandle,
     monitor_state: tauri::State<'_, crate::monitor::MonitorState>,
+    capture_state: tauri::State<'_, std::sync::Arc<crate::capture::CaptureState>>,
 ) -> Result<(), String> {
     // 1. Stop the Python monitor
-    let _ = crate::monitor::stop_monitor(monitor_state).await;
+    let _ = crate::monitor::stop_monitor(monitor_state, capture_state).await;
 
     // 2. Set the updating flag so close is allowed
     crate::IS_UPDATING.store(true, std::sync::atomic::Ordering::Relaxed);

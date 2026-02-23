@@ -1,9 +1,7 @@
 from .capture import (
-    start_capture_thread,
     paused_event,
     stop_event,
     INTERVAL,
-    set_screenshot_callback,
     update_exclusion_settings,
     get_exclusion_settings,
     _get_process_icon_base64,
@@ -105,6 +103,9 @@ def _handle_command_impl(req: dict):
     
     # 检查认证 token
     if _auth_token and req_token != _auth_token:
+        logger.warning('Auth failed: expected=%s... got=%s...',
+                       _auth_token[:16] if _auth_token else 'None',
+                       req_token[:16] if req_token else 'None')
         return {'error': 'Authentication failed: Invalid token'}
     
     # 检查序列号（防止重放攻击）
@@ -453,6 +454,70 @@ def _handle_command_impl(req: dict):
             'ocr_queue_max_size': ocr_queue_max_size,
         }
 
+    # Process OCR command - called by Rust capture loop
+    if cmd == 'process_ocr':
+        screenshot_id = req.get('screenshot_id')
+        if screenshot_id is None:
+            return {'error': 'screenshot_id is required'}
+        if not _ocr_worker:
+            return {'error': 'OCR worker not initialized'}
+
+        try:
+            from PIL import Image
+            import io as _io
+            from storage_client import get_storage_client
+
+            # Fetch decrypted image from Rust via reverse IPC
+            sc = get_storage_client()
+            if not sc:
+                return {'error': 'Storage client not available'}
+
+            resp = sc._send_request({
+                'command': 'get_temp_image',
+                'screenshot_id': screenshot_id,
+            })
+
+            if resp.get('status') != 'success':
+                return {'error': f"Failed to fetch image: {resp.get('error', 'unknown')}"}
+
+            image_data_b64 = resp.get('data', {}).get('image_data')
+            if not image_data_b64:
+                return {'error': 'No image data returned from storage'}
+
+            image_bytes = base64.b64decode(image_data_b64)
+            image_pil = Image.open(_io.BytesIO(image_bytes))
+
+            # Run OCR
+            ocr_results = _ocr_worker.ocr_engine.recognize(image_pil)
+            filtered = [r for r in ocr_results if r.get('confidence', 0) >= 0.5]
+
+            # Vector store (if enabled)
+            if _ocr_worker.enable_vector_store and _ocr_worker.vector_store:
+                image_hash = req.get('image_hash', '')
+                ocr_text = ' '.join([r.get('text', '') for r in filtered])
+                if ocr_text.strip():
+                    try:
+                        _ocr_worker.vector_store.add_image(
+                            image_path=f"memory://{image_hash}",
+                            image=image_pil,
+                            metadata={
+                                'window_title': req.get('window_title', ''),
+                                'process_name': req.get('process_name', ''),
+                                'timestamp': req.get('timestamp', 0),
+                            },
+                            ocr_text=ocr_text
+                        )
+                    except Exception as ve:
+                        logger.warning('Vector store add failed: %s', ve)
+
+            return {
+                'status': 'success',
+                'ocr_results': filtered
+            }
+        except Exception as e:
+            logger.error('process_ocr failed: %s', e)
+            return {'error': str(e)}
+
     return {'error': 'unknown command'}
 
 
@@ -514,43 +579,10 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         vector_db_path=os.path.join(get_data_dir(), 'chroma_db'),
         storage_pipe=storage_pipe  # 传递存储管道名
     )
-    _ocr_worker.start(watch_dir=False) # 由 capture 回调触发，不需要轮询目录
+    _ocr_worker.start(watch_dir=False) # OCR engine init only; capture is handled by Rust
 
-    # 设置截图回调 - 内存模式，不写入明文文件
-    def on_screenshot(image_bytes: bytes, image_pil, info: dict):
-        """
-        处理截图回调 - 纯内存模式
-        
-        Args:
-            image_bytes: JPEG 编码的图像字节
-            image_pil: PIL Image 对象（用于 OCR）
-            info: 截图元数据
-        """
-        if _ocr_worker:
-            metadata = info.get('metadata') or {}
-            if not isinstance(metadata, dict):
-                metadata = {'raw': metadata}
-
-            monitor_data = info.get('monitor')
-            if monitor_data:
-                if isinstance(monitor_data, dict):
-                    metadata.setdefault('monitor', monitor_data)
-                else:
-                    metadata.setdefault('monitor_raw', monitor_data)
-
-            # 使用内存模式处理截图，不经过磁盘
-            _ocr_worker.queue_image_from_memory(
-                image_bytes=image_bytes,
-                image_pil=image_pil,
-                window_title=info.get('window_title'),
-                process_name=info.get('process_name'),
-                metadata=metadata
-            )
-    
-    set_screenshot_callback(on_screenshot)
-
-    # start capture thread
-    start_capture_thread()
+    # NOTE: Screenshot capture loop is now handled by Rust (capture.rs).
+    # Python only provides OCR via the 'process_ocr' IPC command.
 
     return _server
 

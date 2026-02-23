@@ -144,12 +144,29 @@ class _NamedPipeServer:
     def _client_handler(self, handle):
         """Handle a single client connection in a separate thread"""
         import time as _time
+        import pywintypes
         _t0 = _time.perf_counter()
         try:
-            # 读取请求（假设一次性发送完整 JSON）
+            # 读取请求 — 循环读取直到获取完整消息（支持大消息如 process_ocr）
             try:
-                res, data = win32file.ReadFile(handle, 65536)
-                text = data.decode('utf-8').strip()
+                chunks = []
+                while True:
+                    try:
+                        res, data = win32file.ReadFile(handle, 1048576)  # 1MB buffer
+                        if data:
+                            chunks.append(data)
+                        # res == 0: success, no more data for this message
+                        # res == 234 (ERROR_MORE_DATA): more data available
+                        if res == 0:
+                            break
+                    except pywintypes.error as e:
+                        # error code 109 = ERROR_BROKEN_PIPE (client disconnected)
+                        # error code 232 = ERROR_NO_DATA
+                        if e.winerror in (109, 232):
+                            break
+                        raise
+                raw = b''.join(chunks)
+                text = raw.decode('utf-8').strip()
                 if text:
                     req = json.loads(text)
                 else:

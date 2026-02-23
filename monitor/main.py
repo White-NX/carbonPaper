@@ -30,7 +30,7 @@ def main():
     logger.error('必须提供 --pipe-name 和 --auth-token 参数')
     return 1
 
-  logger.info(f'启动监控服务: pipe={args.pipe_name}, token={args.auth_token[:16]}..., storage_pipe={args.storage_pipe}')
+  logger.info(f'启动监控服务: pipe={args.pipe_name[:30]}, token={args.auth_token[:16]}..., storage_pipe={args.storage_pipe[:30]}')
 
   # 初始化存储客户端（如果提供了存储管道名）
   if args.storage_pipe:
