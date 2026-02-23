@@ -881,6 +881,9 @@ pub async fn run_capture_loop(
         let capture_state_clone = capture_state.clone();
         let jpeg_bytes = captured.jpeg_bytes.clone();
         let image_hash_clone = image_hash.clone();
+        let window_title_clone = window_info.title.clone();
+        let process_name_clone = process_name.clone();
+        let timestamp_ms = chrono::Utc::now().timestamp_millis();
         let app_clone = app.clone();
 
         tokio::spawn(async move {
@@ -892,6 +895,9 @@ pub async fn run_capture_loop(
                 screenshot_id,
                 jpeg_bytes,
                 image_hash_clone,
+                window_title_clone,
+                process_name_clone,
+                timestamp_ms,
             )
             .await;
         });
@@ -910,6 +916,9 @@ async fn process_ocr_async(
     screenshot_id: i64,
     jpeg_bytes: Vec<u8>,
     image_hash: String,
+    window_title: String,
+    process_name: String,
+    timestamp_ms: i64,
 ) {
     capture_state.in_flight_ocr_count.fetch_add(1, Ordering::SeqCst);
 
@@ -926,6 +935,9 @@ async fn process_ocr_async(
         screenshot_id,
         &jpeg_bytes,
         &image_hash,
+        &window_title,
+        &process_name,
+        timestamp_ms,
     )
     .await;
 
@@ -956,6 +968,9 @@ async fn process_ocr_inner(
     screenshot_id: i64,
     _jpeg_bytes: &[u8],
     image_hash: &str,
+    window_title: &str,
+    process_name: &str,
+    timestamp_ms: i64,
 ) -> Result<(), String> {
     // Get pipe info for sending to Python
     let pipe_name = {
@@ -969,11 +984,14 @@ async fn process_ocr_inner(
     let seq_no = monitor_state.request_counter.fetch_add(1, Ordering::SeqCst);
 
     // Send process_ocr command to Python with only screenshot_id (small payload).
-    // Python will fetch the decrypted image via reverse IPC (get_temp_image).
+    // Python will fetch the image via reverse IPC (get_temp_image) from in-memory cache.
     let req = serde_json::json!({
         "command": "process_ocr",
         "screenshot_id": screenshot_id,
         "image_hash": image_hash,
+        "window_title": window_title,
+        "process_name": process_name,
+        "timestamp": timestamp_ms,
     });
 
     let response = crate::monitor::send_ipc_request(&pipe_name, &auth_token, seq_no, req).await?;
