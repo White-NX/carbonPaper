@@ -2,6 +2,7 @@
 //!
 //! 该模块创建一个命名管道服务器，Python 子服务可以连接到该管道发送存储请求
 
+use crate::capture::OcrImageCache;
 use crate::storage::{SaveScreenshotRequest, StorageState, OcrResultInput};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -113,18 +114,18 @@ impl ReverseIpcServer {
     }
     
     /// 启动服务器
-    pub fn start(&mut self, storage: Arc<StorageState>) -> Result<(), String> {
+    pub fn start(&mut self, storage: Arc<StorageState>, ocr_cache: OcrImageCache) -> Result<(), String> {
         let pipe_name = self.pipe_name.clone();
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
-        
+
         // 在新线程中运行 tokio runtime
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            
+
             rt.block_on(async move {
                 let full_pipe_name = format!(r"\\.\pipe\{}", pipe_name);
-                
+
                 loop {
                     // 创建管道服务器
                     let server = match ServerOptions::new()
@@ -138,7 +139,7 @@ impl ReverseIpcServer {
                             continue;
                         }
                     };
-                    
+
                     // 等待客户端连接或关闭信号
                     tokio::select! {
                         _ = shutdown_rx.recv() => {
@@ -150,18 +151,19 @@ impl ReverseIpcServer {
                                 tracing::error!("Client connection failed: {}", e);
                                 continue;
                             }
-                            
+
                             // 处理客户端请求
                             let storage_clone = storage.clone();
+                            let ocr_cache_clone = ocr_cache.clone();
                             tokio::spawn(async move {
-                                handle_client(server, storage_clone).await;
+                                handle_client(server, storage_clone, ocr_cache_clone).await;
                             });
                         }
                     }
                 }
             });
         });
-        
+
         Ok(())
     }
     
@@ -179,7 +181,7 @@ impl ReverseIpcServer {
 }
 
 /// 处理单个客户端连接
-async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>) {
+async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, ocr_cache: OcrImageCache) {
     // 读取请求 - 使用循环读取直到管道关闭或超时
     // 因为图片 Base64 数据可能很大（数 MB），单次 read 可能无法读取完整数据
     let mut buf = Vec::with_capacity(4 * 1024 * 1024); // 预分配 4MB
@@ -252,7 +254,7 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>) 
     
     // 解析请求
     let response = match serde_json::from_str::<serde_json::Value>(&request_str) {
-        Ok(req) => process_request(&req, &storage),
+        Ok(req) => process_request(&req, &storage, &ocr_cache),
         Err(e) => StorageResponse::error(&format!("Invalid JSON: {}", e)),
     };
     
@@ -264,7 +266,7 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>) 
 }
 
 /// 处理存储请求
-fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageResponse {
+fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &OcrImageCache) -> StorageResponse {
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
     let diag_start = std::time::Instant::now();
 
@@ -453,7 +455,66 @@ fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageRe
                 Err(e) => StorageResponse::error(&e),
             }
         }
-        
+        "get_temp_image" => {
+            // Return image data from in-memory OCR cache (avoids CNG decryption / Windows Hello)
+            let screenshot_id_val = req.get("screenshot_id").cloned();
+            let screenshot_id = match screenshot_id_val {
+                Some(v) => {
+                    if v.is_i64() {
+                        v.as_i64().unwrap_or(-1)
+                    } else if v.is_u64() {
+                        v.as_u64().map(|x| x as i64).unwrap_or(-1)
+                    } else if v.is_string() {
+                        v.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1)
+                    } else {
+                        -1
+                    }
+                }
+                None => -1,
+            };
+
+            if screenshot_id < 0 {
+                return StorageResponse::error("Invalid screenshot_id");
+            }
+
+            // Look up the in-memory cache first (no CNG decryption needed)
+            let cached = {
+                let cache = ocr_cache.lock().unwrap();
+                cache.get(&screenshot_id).cloned()
+            };
+
+            match cached {
+                Some(jpeg_bytes) => {
+                    let b64_data = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &jpeg_bytes,
+                    );
+                    StorageResponse::success(serde_json::json!({
+                        "image_data": b64_data,
+                        "mime_type": "image/jpeg",
+                    }))
+                }
+                None => {
+                    // Fallback to storage (may trigger CNG) for non-capture callers
+                    match storage.get_screenshot_by_id(screenshot_id) {
+                        Ok(Some(record)) => {
+                            match storage.read_image(&record.image_path) {
+                                Ok((b64_data, mime)) => {
+                                    StorageResponse::success(serde_json::json!({
+                                        "image_data": b64_data,
+                                        "mime_type": mime,
+                                    }))
+                                }
+                                Err(e) => StorageResponse::error(&format!("Failed to read image: {}", e)),
+                            }
+                        }
+                        Ok(None) => StorageResponse::error("Screenshot not found"),
+                        Err(e) => StorageResponse::error(&e),
+                    }
+                }
+            }
+        }
+
         _ => StorageResponse::error(&format!("Unknown command: {}", command)),
     };
 

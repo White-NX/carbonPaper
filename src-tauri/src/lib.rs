@@ -1,5 +1,6 @@
 mod autostart;
 mod analysis;
+mod capture;
 mod credential_manager;
 mod logging;
 mod monitor;
@@ -13,6 +14,7 @@ mod updater;
 
 use autostart::{get_autostart_status, set_autostart};
 use analysis::AnalysisState;
+use capture::CaptureState;
 use credential_manager::CredentialManagerState;
 use monitor::MonitorState;
 use storage::StorageState;
@@ -64,21 +66,24 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<MonitorState>();
-                    let _ = monitor::pause_monitor(state).await;
+                    let cs = app_handle.state::<Arc<CaptureState>>();
+                    let _ = monitor::pause_monitor(state, cs).await;
                 });
             }
             MENU_ID_RESUME => {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<MonitorState>();
-                    let _ = monitor::resume_monitor(state).await;
+                    let cs = app_handle.state::<Arc<CaptureState>>();
+                    let _ = monitor::resume_monitor(state, cs).await;
                 });
             }
             MENU_ID_RESTART => {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<MonitorState>();
-                    let _ = monitor::stop_monitor(state).await;
+                    let cs = app_handle.state::<Arc<CaptureState>>();
+                    let _ = monitor::stop_monitor(state, cs).await;
                     let start_state = app_handle.state::<MonitorState>();
                     let _ = monitor::start_monitor(start_state, app_handle.clone()).await;
                 });
@@ -87,7 +92,8 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<MonitorState>();
-                    let _ = monitor::stop_monitor(state).await;
+                    let cs = app_handle.state::<Arc<CaptureState>>();
+                    let _ = monitor::stop_monitor(state, cs).await;
                     app_handle.exit(0);
                 });
             }
@@ -250,7 +256,7 @@ async fn storage_delete_screenshot(
                 "screenshot_id": screenshot_id,
                 "image_hash": hash
             });
-            match monitor::execute_monitor_command(monitor_state, payload).await {
+            match monitor::forward_command_to_python(&monitor_state, payload).await {
                 Ok(resp) => {
                     vector_deleted = resp.get("vector_deleted").and_then(|v| v.as_i64());
                 }
@@ -295,7 +301,7 @@ async fn storage_delete_by_time_range(
             "image_hashes": image_hashes
         });
 
-        match monitor::execute_monitor_command(monitor_state, payload).await {
+        match monitor::forward_command_to_python(&monitor_state, payload).await {
             Ok(resp) => {
                 vector_deleted = resp.get("vector_deleted").and_then(|v| v.as_i64());
             }
@@ -637,7 +643,7 @@ async fn toggle_game_mode(
         let was_suppressed = state.game_mode_dml_suppressed.load(std::sync::atomic::Ordering::SeqCst);
         monitor::stop_game_mode_monitor(&app);
         if was_suppressed {
-            let _ = monitor::stop_monitor(app.state::<MonitorState>()).await;
+            let _ = monitor::stop_monitor(app.state::<MonitorState>(), app.state::<Arc<CaptureState>>()).await;
             let _ = monitor::start_monitor(app.state::<MonitorState>(), app.clone()).await;
         }
     }
@@ -711,6 +717,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
+        .manage(Arc::new(CaptureState::default()))
         .manage(AnalysisState::default())
         .manage(updater::UpdaterState::new())
         .manage(credential_state)
