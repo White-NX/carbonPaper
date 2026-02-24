@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Play, Pause, Square as StopSquare, Loader2, RotateCw } from 'lucide-react';
+import { Play, Pause, Square as StopSquare, Loader2, RotateCw, HelpCircle } from 'lucide-react';
 
 export default function MonitorServiceSection({
   monitorStatus,
@@ -19,7 +19,15 @@ export default function MonitorServiceSection({
   const { t } = useTranslation();
   return (
     <div className="space-y-3">
-      <label className="text-sm font-semibold text-ide-accent px-1 block">{t('settings.general.monitor.title')}</label>
+      <div className="flex items-center gap-1.5 px-1">
+        <label className="text-sm font-semibold text-ide-accent block">{t('settings.general.monitor.title')}</label>
+        <div className="relative group">
+          <HelpCircle className="w-3.5 h-3.5 text-ide-muted cursor-help" />
+          <div className="absolute left-1/2 -translate-x-1/2 top-full mt-2 w-60 px-3 py-2 bg-ide-panel border border-ide-border rounded-lg shadow-lg text-xs text-ide-muted opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity z-50">
+            {t('settings.general.monitor.tooltip')}
+          </div>
+        </div>
+      </div>
       <div className="p-4 bg-ide-bg border border-ide-border rounded-xl text-sm text-ide-muted space-y-3">
         <div className="flex items-center justify-between gap-4">
           <div>

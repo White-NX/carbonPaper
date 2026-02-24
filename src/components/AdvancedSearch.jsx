@@ -292,7 +292,7 @@ function ProcessFilter({ processes, selected, onChange }) {
   );
 }
 
-export function AdvancedSearch({ active, searchParams, onSelectResult, searchMode, onSearchModeChange }) {
+export function AdvancedSearch({ active, searchParams, onSelectResult, searchMode, onSearchModeChange, backendOnline }) {
   const [query, setQuery] = useState(searchParams?.query || '');
   const [mode, setMode] = useState(searchMode ?? (searchParams?.mode || 'ocr'));
   const [results, setResults] = useState([]);
@@ -361,6 +361,13 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     if (searchMode === undefined || searchMode === mode) return;
     setMode(searchMode);
   }, [searchMode, mode]);
+
+  // Auto-switch back to OCR when backend goes offline
+  useEffect(() => {
+    if (backendOnline === false && mode === 'nl') {
+      handleModeChange('ocr');
+    }
+  }, [backendOnline, mode, handleModeChange]);
 
   useEffect(() => {
     if (!searchParams) return;
@@ -520,8 +527,9 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
             </button>
             <button
               type="button"
-              className={`flex items-center gap-1 px-3 py-1.5 text-xs rounded border ${mode === 'nl' ? 'border-green-400 text-green-300 bg-green-400/10' : 'border-ide-border text-ide-muted hover:bg-ide-hover/30'}`}
-              onClick={() => handleModeChange('nl')}
+              className={`flex items-center gap-1 px-3 py-1.5 text-xs rounded border ${mode === 'nl' ? 'border-green-400 text-green-300 bg-green-400/10' : 'border-ide-border text-ide-muted hover:bg-ide-hover/30'} ${backendOnline === false ? 'opacity-50 cursor-not-allowed' : ''}`}
+              onClick={() => { if (backendOnline === false) return; handleModeChange('nl'); }}
+              title={backendOnline === false ? t('search.nl.disabled_hint') : ''}
             >
               <ImageIcon className="w-3.5 h-3.5" /> {t('advancedSearch.modes.nl')}
             </button>

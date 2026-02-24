@@ -27,8 +27,8 @@ export default {
         card: '0 10px 30px rgba(0,0,0,0.35)',
       },
       fontFamily: {
-        sans: ['Inter', 'Segoe UI', 'system-ui', 'sans-serif'],
-        mono: ['JetBrains Mono', 'SFMono-Regular', 'Menlo', 'monospace'],
+        sans: ['Source Han Sans SC', 'system-ui', 'sans-serif'],
+        mono: ['JetBrains Mono', 'SFMono-Regular', 'Menlo', 'Source Han Sans SC', 'monospace'],
       },
     },
   },

@@ -1,11 +1,17 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@font-face {
+  font-family: 'Source Han Sans SC';
+  src: url('./assets/fonts/SourceHanSansSC-VF.ttf.woff2') format('woff2');
+  font-weight: 200 900;
+  font-style: normal;
+  font-display: swap;
+}
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  font-family: 'Google Sans Flex', 'Inter', system-ui, sans-serif;
+  font-family: 'Source Han Sans SC', system-ui, sans-serif;
   color: var(--ide-text);
   background-color: transparent;
   text-rendering: optimizeLegibility;

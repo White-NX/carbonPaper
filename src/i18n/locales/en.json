@@ -21,6 +21,7 @@
       ,
       "monitor": {
         "title": "Monitor Service",
+        "tooltip": "The Python service handles screenshot capture, OCR text recognition, and image vectorization. When stopped, screenshots and natural language search are unavailable, but existing OCR search still works.",
         "status": "Status: {{status}}",
         "status_label": "Status:",
         "description": "Control the background screenshot & OCR service.",
@@ -265,7 +266,13 @@
   },
   "topbar": {
     "settings": "Settings",
-    "hideToTray": "Hide to tray"
+    "hideToTray": "Hide to tray",
+    "service": {
+      "running": "Running",
+      "paused": "Paused",
+      "starting": "Starting...",
+      "offline": "Offline"
+    }
   },
   "previewAction": {
     "deleteNowTitle": "Delete this record immediately",
@@ -302,6 +309,9 @@
     "switchToNL": "Switch to Natural Language Search",
     "switchToOCR": "Switch to OCR Search",
     "selectMode": "Select Search Mode",
+    "nl": {
+      "disabled_hint": "Requires Python service to be running"
+    },
     "mode": {
       "ocr": {
         "title": "OCR Keyword Search",

@@ -17,7 +17,7 @@ function useDebounce(value, delay) {
     return debouncedValue;
 }
 
-export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange }) {
+export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, backendOnline }) {
     const { t } = useTranslation();
     const [query, setQuery] = useState('');
     const [localMode, setLocalMode] = useState('ocr'); // 'ocr' | 'nl'
@@ -32,6 +32,13 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     const setMode = onModeChange ?? setLocalMode;
     // Track if mode change came from user interaction within this component
     const userInteractionRef = useRef(false);
+
+    // Auto-switch back to OCR mode when backend goes offline
+    useEffect(() => {
+        if (backendOnline === false && mode === 'nl') {
+            setMode('ocr');
+        }
+    }, [backendOnline, mode, setMode]);
 
     useEffect(() => {
         function handleClickOutside(event) {
@@ -103,9 +110,9 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             <div className="flex items-center bg-ide-panel rounded-md border border-ide-border focus-within:border-ide-accent focus-within:ring-1 focus-within:ring-ide-accent transition-all shadow-sm">
                 <div className="relative flex items-center border-r border-ide-border mr-2">
                 <button
-                    className="p-2 text-ide-muted hover:text-ide-text transition-colors"
-                    onClick={() => { userInteractionRef.current = true; setMode(mode === 'ocr' ? 'nl' : 'ocr'); }}
-                    title={mode === 'ocr' ? t('search.switchToNL') : t('search.switchToOCR')}
+                    className={`p-2 text-ide-muted hover:text-ide-text transition-colors ${backendOnline === false && mode === 'ocr' ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    onClick={() => { if (backendOnline === false && mode === 'ocr') return; userInteractionRef.current = true; setMode(mode === 'ocr' ? 'nl' : 'ocr'); }}
+                    title={backendOnline === false && mode === 'ocr' ? t('search.nl.disabled_hint') : (mode === 'ocr' ? t('search.switchToNL') : t('search.switchToOCR'))}
                 >
                     {mode === 'ocr' ? <Type size={16} /> : <ImageIcon size={16} />}
                 </button>
@@ -129,13 +136,17 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                             </div>
                         </button>
                         <button
-                            className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'nl' ? 'bg-ide-active border border-ide-border' : ''}`}
-                            onClick={() => { userInteractionRef.current = true; setMode('nl'); setShowModeMenu(false); }}
+                            className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'nl' ? 'bg-ide-active border border-ide-border' : ''} ${backendOnline === false ? 'opacity-50 cursor-not-allowed' : ''}`}
+                            onClick={() => { if (backendOnline === false) return; userInteractionRef.current = true; setMode('nl'); setShowModeMenu(false); }}
+                            title={backendOnline === false ? t('search.nl.disabled_hint') : ''}
                         >
                             <div className="mt-1 text-ide-success"><ImageIcon size={18} /></div>
                             <div>
                                 <div className="text-sm font-bold text-ide-text">{t('search.mode.nl.title')}</div>
-                                <div className="text-xs text-ide-muted leading-relaxed">{t('search.mode.nl.description')}</div>
+                                <div className="text-xs text-ide-muted leading-relaxed">
+                                    {t('search.mode.nl.description')}
+                                    {backendOnline === false && <span className="block text-xs text-red-400 mt-1">{t('search.nl.disabled_hint')}</span>}
+                                </div>
                             </div>
                         </button>
                     </div>
