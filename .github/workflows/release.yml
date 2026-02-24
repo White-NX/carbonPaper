@@ -31,6 +31,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Build NMH binary
+        run: npm run build:nmh:release
+
       - name: Build and release with Tauri
         uses: tauri-apps/tauri-action@v0
         env:

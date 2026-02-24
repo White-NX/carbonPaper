@@ -134,13 +134,14 @@ export default function CaptureFiltersSection({
             </div>
             <button
               onClick={onToggleProtected}
-               className={`w-11 h-6 shrink-0 rounded-full transition-colors relative ${
-                filterSettings.ignoreProtected ? 'bg-ide-accent' : 'bg-ide-panel border border-ide-border'
+              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${
+                filterSettings.ignoreProtected ? 'bg-ide-accent' : 'bg-ide-border'
               }`}
             >
               <div
-                className="absolute top-1 w-4 h-4 rounded-full bg-white transition-transform shadow-sm"
-                style={{ left: filterSettings.ignoreProtected ? 'calc(100% - 1.25rem)' : '0.25rem' }}
+                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                  filterSettings.ignoreProtected ? 'translate-x-5' : 'translate-x-0.5'
+                }`}
               />
             </button>
           </div>

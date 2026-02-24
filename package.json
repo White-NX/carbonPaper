@@ -1,7 +1,7 @@
 {
   "name": "carbonpaper",
   "private": true,
-  "version": "0.5.1",
+  "version": "0.5.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -13,8 +13,10 @@
     "i18n:check": "node scripts/i18n-check.cjs",
     "codemod:i18n": "jscodeshift -t scripts/transforms/i18n-jscodeshift.cjs src/components --extensions=js,jsx,ts,tsx",
     "bump:version": "node scripts/bump-version.mjs",
+    "build:nmh": "node scripts/build-nmh.mjs",
+    "build:nmh:release": "node scripts/build-nmh.mjs --release",
     "pack:portable": "node scripts/pack-portable.mjs",
-    "tauri:build": "tauri build && node scripts/pack-portable.mjs"
+    "tauri:build": "node scripts/build-nmh.mjs --release && tauri build && node scripts/pack-portable.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "~2.9.0",

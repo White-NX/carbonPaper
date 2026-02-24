@@ -30,6 +30,15 @@ if (!existsSync(mainExe)) {
 }
 filesToPack.push({ src: mainExe, dest: `${productName}.exe` });
 
+// 1b. NMH (Native Messaging Host) binary
+const nmhExe = path.join(releaseDir, 'carbonpaper-nmh.exe');
+if (existsSync(nmhExe)) {
+  filesToPack.push({ src: nmhExe, dest: 'carbonpaper-nmh.exe' });
+  console.log('  Including: carbonpaper-nmh.exe');
+} else {
+  console.warn('  Warning: carbonpaper-nmh.exe not found, skipping');
+}
+
 // 2. All pre-bundle resources
 async function walkDir(dir, prefix) {
   const entries = await readdir(dir, { withFileTypes: true });

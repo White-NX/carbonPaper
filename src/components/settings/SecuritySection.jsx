@@ -133,10 +133,10 @@ export default function SecuritySection({
                         <div className="text-sm text-ide-text flex items-center gap-2">
                           {option.label}
                           {option.warning && (
-                            <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                            <AlertTriangle className="w-3.5 h-3.5 text-ide-warning" />
                           )}
                         </div>
-                        <div className={`text-xs ${option.warning ? 'text-amber-400/70' : 'text-ide-muted'}`}>
+                        <div className={`text-xs ${option.warning ? 'text-ide-warning/70' : 'text-ide-muted'}`}>
                           {option.description}
                         </div>
                       </div>

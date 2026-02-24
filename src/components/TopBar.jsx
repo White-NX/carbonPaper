@@ -1,8 +1,49 @@
 import React from 'react';
-import { Moon, Sun, Settings, Bell, Terminal, Minus, Square, X, Copy } from 'lucide-react';
+import { Moon, Sun, Settings, Bell, Terminal, Minus, Square, X, Copy, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { SearchBox } from './SearchBox';
 import { APP_VERSION } from '../lib/version';
+
+function ServiceStatusBadge({ backendStatus, monitorPaused, handleStartBackend, handlePauseMonitor, handleResumeMonitor }) {
+  const { t } = useTranslation();
+
+  let dotColor, label, onClick, disabled = false, showSpinner = false;
+
+  if (backendStatus === 'online' && !monitorPaused) {
+    dotColor = 'bg-green-500';
+    label = t('topbar.service.running');
+    onClick = handlePauseMonitor;
+  } else if (backendStatus === 'online' && monitorPaused) {
+    dotColor = 'bg-yellow-500';
+    label = t('topbar.service.paused');
+    onClick = handleResumeMonitor;
+  } else if (backendStatus === 'waiting') {
+    dotColor = 'bg-orange-500';
+    label = t('topbar.service.starting');
+    disabled = true;
+    showSpinner = true;
+    onClick = undefined;
+  } else {
+    dotColor = 'bg-red-500';
+    label = t('topbar.service.offline');
+    onClick = handleStartBackend;
+  }
+
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="group flex items-center gap-1.5 p-1.5 rounded-full text-xs font-mono text-ide-muted hover:bg-ide-hover/50 transition-all disabled:opacity-60 disabled:cursor-not-allowed pointer-events-auto"
+      title={label}
+    >
+      <span className={`w-2 h-2 rounded-full ${dotColor} shrink-0`} />
+      <span className={`overflow-hidden transition-all duration-200 whitespace-nowrap ${backendStatus === 'online' ? 'max-w-0 opacity-0 group-hover:max-w-[6rem] group-hover:opacity-100' : 'max-w-[6rem] opacity-100'}`}>
+        {showSpinner && <Loader2 className="w-3 h-3 animate-spin inline mr-1" />}
+        {label}
+      </span>
+    </button>
+  );
+}
 
 export default function TopBar({
   darkMode,
@@ -17,7 +58,13 @@ export default function TopBar({
   onSearchSelect,
   onSearchSubmit,
   searchMode,
-  onSearchModeChange
+  onSearchModeChange,
+  backendStatus,
+  monitorPaused,
+  handleStartBackend,
+  handlePauseMonitor,
+  handleResumeMonitor,
+  backendOnline,
 }) {
   const { t } = useTranslation();
   return (
@@ -37,9 +84,17 @@ export default function TopBar({
         onSubmit={onSearchSubmit}
         mode={searchMode}
         onModeChange={onSearchModeChange}
+        backendOnline={backendOnline}
       />
 
       <div className="flex items-center gap-1">
+        <ServiceStatusBadge
+          backendStatus={backendStatus}
+          monitorPaused={monitorPaused}
+          handleStartBackend={handleStartBackend}
+          handlePauseMonitor={handlePauseMonitor}
+          handleResumeMonitor={handleResumeMonitor}
+        />
         <button
           onClick={() => setShowSettings(true)}
           className="p-2 hover:bg-ide-hover rounded-md text-ide-muted hover:text-ide-text"

@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Play, Pause, Square as StopSquare, Loader2, RotateCw } from 'lucide-react';
+import { Play, Pause, Square as StopSquare, Loader2, RotateCw, HelpCircle } from 'lucide-react';
 
 export default function MonitorServiceSection({
   monitorStatus,
@@ -19,7 +19,15 @@ export default function MonitorServiceSection({
   const { t } = useTranslation();
   return (
     <div className="space-y-3">
-      <label className="text-sm font-semibold text-ide-accent px-1 block">{t('settings.general.monitor.title')}</label>
+      <div className="flex items-center gap-1.5 px-1">
+        <label className="text-sm font-semibold text-ide-accent block">{t('settings.general.monitor.title')}</label>
+        <div className="relative group">
+          <HelpCircle className="w-3.5 h-3.5 text-ide-muted cursor-help" />
+          <div className="absolute left-1/2 -translate-x-1/2 top-full mt-2 w-60 px-3 py-2 bg-ide-panel border border-ide-border rounded-lg shadow-lg text-xs text-ide-muted opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity z-50">
+            {t('settings.general.monitor.tooltip')}
+          </div>
+        </div>
+      </div>
       <div className="p-4 bg-ide-bg border border-ide-border rounded-xl text-sm text-ide-muted space-y-3">
         <div className="flex items-center justify-between gap-4">
           <div>
@@ -102,14 +110,15 @@ export default function MonitorServiceSection({
             </div>
             <button
               onClick={() => onAutoStartMonitorChange?.(!autoStartMonitor)}
-              className={`w-11 h-6 shrink-0 rounded-full transition-colors relative ${
-                autoStartMonitor ? 'bg-ide-accent' : 'bg-ide-panel border border-ide-border'
+              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${
+                autoStartMonitor ? 'bg-ide-accent' : 'bg-ide-border'
               }`}
               title={t('settings.general.monitor.autoStart.tooltip')}
             >
               <div
-                className="absolute top-1 w-4 h-4 rounded-full bg-white transition-transform shadow-sm"
-                style={{ left: autoStartMonitor ? 'calc(100% - 1.25rem)' : '0.25rem' }}
+                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                  autoStartMonitor ? 'translate-x-5' : 'translate-x-0.5'
+                }`}
               />
             </button>
           </div>

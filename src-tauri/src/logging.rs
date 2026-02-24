@@ -1,8 +1,8 @@
-//! 统一日志系统
+//! Logging Module - Daily and Size-Based Rotating Log Files with Gzip Compression and Retention
 //!
-//! 提供按日期和大小轮换的日志文件写入，以及旧日志的 gzip 压缩和自动清理。
-//! Rust 自身使用 tracing 宏输出日志，Python 子进程的 stderr 由 Rust 捕获后
-//! 以 `monitor.stderr` target 写入同一日志文件。
+//! Provides a logging system that writes to daily log files with automatic rotation based on file size.
+//! Rust itself uses the tracing macro to output logs, and the stderr of Python child processes is 
+//! captured by Rust and written to the same log file as the `monitor.stderr` target.
 
 use flate2::write::GzEncoder;
 use flate2::Compression;

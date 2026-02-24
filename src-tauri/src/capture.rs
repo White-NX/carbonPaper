@@ -93,6 +93,7 @@ pub struct CaptureState {
     pub ocr_queue_max_size: AtomicU32,
     pub capture_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     pub ocr_image_cache: OcrImageCache,
+    pub focus_window: Mutex<Option<ActiveWindowInfo>>,
 }
 
 impl Default for CaptureState {
@@ -113,6 +114,7 @@ impl CaptureState {
             ocr_queue_max_size: AtomicU32::new(1),
             capture_task: Mutex::new(None),
             ocr_image_cache: Arc::new(Mutex::new(HashMap::new())),
+            focus_window: Mutex::new(None),
         }
     }
 
@@ -194,14 +196,14 @@ impl CaptureState {
 
 // ==================== Active Window Detection ====================
 
-struct ActiveWindowInfo {
+pub struct ActiveWindowInfo {
     hwnd_raw: isize,
     title: String,
     rect: RECT,
     pid: u32,
 }
 
-fn get_active_window_info() -> Option<ActiveWindowInfo> {
+pub fn get_active_window_info() -> Option<ActiveWindowInfo> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
@@ -236,7 +238,7 @@ fn get_active_window_info() -> Option<ActiveWindowInfo> {
     }
 }
 
-fn get_process_path_from_pid(pid: u32) -> Option<String> {
+pub fn get_process_path_from_pid(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];
@@ -256,7 +258,7 @@ fn get_process_path_from_pid(pid: u32) -> Option<String> {
     }
 }
 
-fn get_process_name_from_path(path: &str) -> String {
+pub fn get_process_name_from_path(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
@@ -794,6 +796,25 @@ pub async fn run_capture_loop(
             String::new()
         };
 
+        // Request extension capture for browsers with extension enhancement enabled
+        // The browser extension captures with richer metadata (URL, title, favicon, links)
+        // If extension capture fails, fall through to normal capture path
+        if crate::reverse_ipc::is_process_extension_enhanced(&process_name) {
+            tracing::debug!("Requesting extension capture for: {}", process_name);
+            match crate::reverse_ipc::request_extension_capture(&process_name).await {
+                Ok(()) => {
+                    // Extension capture request sent successfully, skip normal capture
+                    last_capture_time = std::time::Instant::now();
+                    last_hwnd_raw = current_hwnd_raw;
+                    continue;
+                }
+                Err(e) => {
+                    // Extension capture failed, fall back to normal capture path
+                    tracing::warn!("Extension capture failed, falling back to normal capture: {}", e);
+                }
+            }
+        }
+
         // Get/cache process icon
         let process_icon = if !process_path.is_empty() {
             if let Some(cached) = icon_cache.get(&process_path) {
@@ -848,6 +869,10 @@ pub async fn run_capture_loop(
             process_name: Some(process_name.clone()),
             metadata: Some(metadata.clone()),
             ocr_results: None,
+            source: Some("capture".to_string()),
+            page_url: None,
+            page_icon: None,
+            visible_links: None,
         };
 
         let screenshot_id = match storage.save_screenshot_temp(&save_request) {

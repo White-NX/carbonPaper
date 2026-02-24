@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "carbonpaper"
-version = "0.5.1"
+version = "0.5.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -584,6 +584,7 @@ dependencies = [
  "jieba-rs",
  "md-5",
  "once_cell",
+ "open",
  "percent-encoding",
  "rand 0.8.5",
  "reqwest 0.11.27",

@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "CarbonPaper",
+  "version": "0.5.1",
+  "description": "Capture browser viewport screenshots with page metadata for CarbonPaper",
+  "key": "1wPvM0sWFXvcWzo+2VLk5vbuQgvx+kqwsX3SdvREUqMMgDgxo+GhYIDu2FupOU7Xx1IwYQy2MEvKJ2XtjhPsQggnJOUx57ozDlv5PfwQmddFfwDimmgECsDi3G4QG40WMKMW4N19BAthJzjUwD4/Bpe3pke5Yk8YW9Dzc4t36P90aAOkLLSFYHZXFbkOFFEqnngxdzsJrxv4JKDY4ypSwIHs98Mpjwig0eprc4P0iqBLFGZmgRI6/oGcsJD/qtf6JT36bVZLPXDQlDyFADqgTn9844GymrMa45QxsJ6QMPmeIczkLvagbG+e9Bwewx9ImrlWMl65cvpHXfFBa5ryTu8XGtMOJA7gVGgNUgxhfMRyVV1343le9QEWjSFZSfSEfd7kw9IU",
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "nativeMessaging",
+    "storage"
+  ],
+  "optional_permissions": [
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

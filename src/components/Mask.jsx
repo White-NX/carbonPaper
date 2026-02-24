@@ -449,28 +449,10 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
 
   if (renderBackendStatus === 'online') return null;
 
-  // Two states from original App.jsx
+  // Backend offline/waiting when pythonVersion exists — no longer show fullscreen mask.
+  // The TopBar status badge now handles this state.
   if (renderBackendStatus !== 'online' && renderPythonVersion != null && renderVenvInstallStep == null) {
-    return (
-      <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-ide-bg/80 backdrop-blur-sm text-ide-muted">
-        {isDev && renderDebugSelector()}
-        <WifiOff className="w-12 h-12 mb-4 opacity-50" />
-        <p className="text-lg font-semibold">{t('mask.backend_shutdown.title')}</p>
-        <p className="text-sm opacity-70">{t('mask.backend_shutdown.description')}</p>
-        <div className="flex items-center gap-3 mt-4">
-          <button
-            onClick={handleStartBackend}
-            disabled={renderBackendStatus === 'waiting'}
-            className="flex items-center gap-2 px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded text-xs transition-colors disabled:opacity-50"
-          >
-            {renderBackendStatus === 'waiting' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-3 h-3 fill-current" />}
-            {renderBackendStatus === 'waiting' ? t('mask.start.starting') : t('mask.start.start_service')}
-          </button>
-          {renderBackendStatus === 'waiting' && <span className="text-xs text-ide-muted">{t('mask.start.waiting')}</span>}
-        </div>
-        {backendError && <p className="text-xs text-red-400 mt-2">{backendError}</p>}
-      </div>
-    );
+    return null;
   }
 
   // Install step 1: let user choose/provide python path and optionally auto-install

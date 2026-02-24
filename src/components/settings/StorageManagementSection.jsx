@@ -159,7 +159,7 @@ function StoragePathOption({
           {disabled ? t('settings.storageManagement.storagePath.changing') : t('settings.storageManagement.storagePath.label')}
         </button>
       </div>
-      {error && <div className="mt-2 text-xs text-red-400">{error}</div>}
+      {error && <div className="mt-2 text-xs text-ide-error">{error}</div>}
     </div>
   );
 }
@@ -486,8 +486,8 @@ export default function StorageManagementSection({
 
       {/* Warning for unlimited storage */}
       {storageLimit === 'unlimited' && retentionPeriod === 'permanent' && (
-        <div className="flex items-start gap-3 px-4 py-3 rounded-lg border border-amber-500/40 bg-amber-500/10">
-          <AlertTriangle className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
+        <div className="flex items-start gap-3 px-4 py-3 rounded-lg border border-ide-warning-border bg-ide-warning-bg">
+          <AlertTriangle className="w-4 h-4 text-ide-warning mt-0.5 shrink-0" />
           <div className="text-xs text-yellow-600 dark:text-yellow-500">
             <p className="font-medium mb-1">{t('settings.storageManagement.warning.title')}</p>
             <p>{t('settings.storageManagement.warning.message')}</p>

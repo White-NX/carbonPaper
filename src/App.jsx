@@ -15,6 +15,7 @@ import SettingsDialog from './components/settings/SettingsDialog';
 import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
 import DmlSetupWizard from './components/DmlSetupWizard';
+import ExtensionSetupWizard from './components/ExtensionSetupWizard';
 import LeftSidebar from './components/LeftSidebar';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
@@ -57,6 +58,7 @@ function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authError, setAuthError] = useState(null);
   const [showDmlSetup, setShowDmlSetup] = useState(false);
+  const [showExtensionSetup, setShowExtensionSetup] = useState(false);
   const [sessionTimeout, setSessionTimeout] = useState(() => {
     const saved = localStorage.getItem('sessionTimeout');
     return saved ? parseInt(saved, 10) : 900; // 默认 15 分钟
@@ -70,6 +72,7 @@ function App() {
   const [lastError, setLastError] = useState(null);
   const [highlightedEventId, setHighlightedEventId] = useState(null);
   const [backendStatus, setBackendStatus] = useState('unknown'); // 'online' | 'offline' | 'waiting'
+  const [monitorPaused, setMonitorPaused] = useState(false);
   const [backendError, setBackendError] = useState('');
   const backendStatusRef = useRef('unknown');
   const backendStartAtRef = useRef(null);
@@ -313,6 +316,23 @@ function App() {
     return () => { cancelled = true; };
   }, [backendStatus, isAuthenticated]);
 
+  // Check if extension setup wizard should be shown after auth (and after DML wizard)
+  useEffect(() => {
+    if (backendStatus !== 'online' || !isAuthenticated || showDmlSetup) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const needed = await invoke('check_extension_setup_needed');
+        if (!cancelled && needed) {
+          setShowExtensionSetup(true);
+        }
+      } catch (err) {
+        console.warn('Failed to check extension setup status:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [backendStatus, isAuthenticated, showDmlSetup]);
+
   // 锁定会话回调
   const handleLockSession = useCallback(() => {
     setIsAuthenticated(false);
@@ -332,6 +352,11 @@ function App() {
     } catch {
       // ignore — monitor may not be running
     }
+  }, []);
+
+  // Extension setup wizard callback
+  const handleExtensionSetupComplete = useCallback(() => {
+    setShowExtensionSetup(false);
   }, []);
 
   useEffect(() => {
@@ -400,6 +425,24 @@ function App() {
     }
   };
 
+  const handlePauseMonitor = useCallback(async () => {
+    try {
+      await invoke('pause_monitor');
+      setMonitorPaused(true);
+    } catch (err) {
+      console.warn('Failed to pause monitor:', err);
+    }
+  }, []);
+
+  const handleResumeMonitor = useCallback(async () => {
+    try {
+      await invoke('resume_monitor');
+      setMonitorPaused(false);
+    } catch (err) {
+      console.warn('Failed to resume monitor:', err);
+    }
+  }, []);
+
   const checkBackendStatus = useCallback(async () => {
     const t0 = performance.now();
     try {
@@ -418,6 +461,7 @@ function App() {
       if (res?.stopped) {
         setBackendStatus('offline');
         backendStatusRef.current = 'offline';
+        setMonitorPaused(false);
         setBackendError('');
         lastBackendErrorRef.current = '';
         backendStartAtRef.current = null;
@@ -426,6 +470,7 @@ function App() {
 
       setBackendStatus('online');
       backendStatusRef.current = 'online';
+      setMonitorPaused(!!res?.paused);
       setBackendError('');
       lastBackendErrorRef.current = '';
       backendStartAtRef.current = null;
@@ -643,6 +688,12 @@ function App() {
         onSearchSubmit={handleSearchSubmit}
         searchMode={searchMode}
         onSearchModeChange={setSearchMode}
+        backendStatus={backendStatus}
+        monitorPaused={monitorPaused}
+        handleStartBackend={handleStartBackend}
+        handlePauseMonitor={handlePauseMonitor}
+        handleResumeMonitor={handleResumeMonitor}
+        backendOnline={backendStatus === 'online'}
       />
 
       <div className={`flex-1 min-h-0 flex flex-col overflow-hidden relative ${isMaximized ? '' : 'mx-[3px] mb-[3px] rounded-md'}`}>
@@ -667,6 +718,11 @@ function App() {
       <DmlSetupWizard
         isVisible={backendStatus === 'online' && isAuthenticated && showDmlSetup}
         onComplete={handleDmlSetupComplete}
+      />
+
+      <ExtensionSetupWizard
+        isVisible={backendStatus === 'online' && isAuthenticated && !showDmlSetup && showExtensionSetup}
+        onComplete={handleExtensionSetupComplete}
       />
 
       <Timeline
@@ -696,6 +752,7 @@ function App() {
           advancedSearchParams={advancedSearchParams}
           searchMode={searchMode}
           onSearchModeChange={setSearchMode}
+          backendOnline={backendStatus === 'online'}
           onAdvancedSelect={(res) => {
             const screenshotId = res.screenshot_id !== undefined ? res.screenshot_id : (res.metadata?.screenshot_id);
             const imagePath = res.image_path || res.metadata?.image_path;

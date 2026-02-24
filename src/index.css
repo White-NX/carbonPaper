@@ -1,11 +1,17 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@font-face {
+  font-family: 'Source Han Sans SC';
+  src: url('./assets/fonts/SourceHanSansSC-VF.ttf.woff2') format('woff2');
+  font-weight: 200 900;
+  font-style: normal;
+  font-display: swap;
+}
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  font-family: 'Google Sans Flex', 'Inter', system-ui, sans-serif;
+  font-family: 'Source Han Sans SC', system-ui, sans-serif;
   color: var(--ide-text);
   background-color: transparent;
   text-rendering: optimizeLegibility;
@@ -22,6 +28,11 @@
   --ide-hover: #e5eaf1;
   --ide-error: #dc2626;
   --ide-success: #16a34a;
+  --ide-warning: #b45309;
+  --ide-warning-muted: #92400e;
+  --ide-warning-bg: #fef3c7;
+  --ide-warning-border: #fcd34d;
+  --ide-info-success: #047857;
 }
 
 .dark {
@@ -36,6 +47,11 @@
   --ide-hover: #2a2d2e;
   --ide-error: #f14c4c;
   --ide-success: #89d185;
+  --ide-warning: #f59e0b;
+  --ide-warning-muted: #fbbf24;
+  --ide-warning-bg: rgba(245, 158, 11, 0.1);
+  --ide-warning-border: rgba(245, 158, 11, 0.2);
+  --ide-info-success: #34d399;
 }
 
 html, body {

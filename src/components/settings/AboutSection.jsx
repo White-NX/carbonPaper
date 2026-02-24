@@ -54,7 +54,7 @@ export default function AboutSection({
     if (updateError) {
       return (
         <div className="w-full space-y-1.5">
-          <div className="flex items-center gap-1 text-[10px] text-red-400 justify-center">
+          <div className="flex items-center gap-1 text-[10px] text-ide-error justify-center">
             <AlertCircle className="w-3 h-3" />
             <span className="truncate max-w-[180px]">{updateError}</span>
           </div>
@@ -128,7 +128,7 @@ export default function AboutSection({
         <div className="flex flex-col gap-6">
           <section className="space-y-4">
             {/* Description */}
-            <div className="p-4 bg-ide-panel/30 border border-ide-border/50 rounded-xl text-sm leading-relaxed text-ide-muted space-y-4">
+            <div className="p-4 bg-ide-panel/30 border border-ide-border rounded-xl text-sm leading-relaxed text-ide-muted space-y-4">
               <p>
                 This program is under GPL-3.0 Licence.
               </p>

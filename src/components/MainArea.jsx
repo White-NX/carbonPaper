@@ -65,6 +65,7 @@ export default function MainArea({
   onDeleteRecord,
   onDeleteNearbyRecords,
   onCopyText,
+  backendOnline,
 }) {
   const [showOcrPanel, setShowOcrPanel] = useState(false);
 
@@ -147,6 +148,7 @@ export default function MainArea({
             onSelectResult={onAdvancedSelect}
             searchMode={searchMode}
             onSearchModeChange={onSearchModeChange}
+            backendOnline={backendOnline}
           />
         </div>
       </div>

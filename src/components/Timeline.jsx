@@ -358,7 +358,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                         imagePath: r.image_path,
                         appName: r.process_name,
                         windowTitle: r.window_title,
-                        processIcon: r.process_icon || meta?.process_icon || null,
+                        processIcon: r.process_icon || meta?.process_icon || r.page_icon || null,
                         processPath: r.process_path || meta?.process_path || null,
                     };
                 })
