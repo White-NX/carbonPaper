@@ -19,10 +19,11 @@
         "permanent": "DirectML 已关闭（频繁切换，将在重启后恢复）"
       },
       "monitor": {
-        "title": "监控服务",
+        "title": "Python 子服务",
+        "tooltip": "Python 子服务负责 OCR 识别和图像向量化等后台任务。关闭后截图循环将停止，自然语言搜索将不可用，但已有的 OCR 搜索仍可正常使用。",
         "status": "状态：{{status}}",
         "status_label": "状态：",
-        "description": "控制后台的截图与 OCR 服务。",
+        "description": "控制后台的 Python 子服务。",
         "starting": "正在启动...",
         "start": "启动服务",
         "resume": "继续",
@@ -32,7 +33,7 @@
         "autoStart": {
           "label": "启动时自动子服务",
           "description": "开启后应用启动时会自动尝试拉起 Python 子服务。",
-          "tooltip": "应用启动后自动运行截图/OCR 后台"
+          "tooltip": "应用启动后自动运行 Python 子服务。"
         },
         "autoLaunch": {
           "label": "开机自启动",
@@ -298,7 +299,13 @@
   },
   "topbar": {
     "settings": "设置",
-    "hideToTray": "隐藏到托盘"
+    "hideToTray": "隐藏到托盘",
+    "service": {
+      "running": "运行中",
+      "paused": "已暂停",
+      "starting": "启动中...",
+      "offline": "离线"
+    }
   },
   "previewAction": {
     "deleteNowTitle": "立即删除此记录",
@@ -316,6 +323,9 @@
     "switchToNL": "切换到自然语言搜索",
     "switchToOCR": "切换到 OCR 搜索",
     "selectMode": "选择搜索模式",
+    "nl": {
+      "disabled_hint": "需要 Python 服务运行中"
+    },
     "mode": {
       "ocr": {
         "title": "OCR 关键词搜索模式",
