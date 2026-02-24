@@ -100,14 +100,12 @@ export default function ExtensionSetupWizard({ isVisible, onComplete }) {
                   className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer transition-colors hover:bg-ide-bg/50 ${
                     selectedBrowsers[browser] ? 'bg-ide-accent/10' : ''
                   } ${idx > 0 ? 'border-t border-ide-border' : ''}`}
-                  onClick={() => toggleBrowser(browser)}
                 >
                   <input
                     type="checkbox"
                     checked={selectedBrowsers[browser]}
                     onChange={() => toggleBrowser(browser)}
                     className="accent-ide-accent"
-                    onClick={(e) => e.stopPropagation()}
                   />
                   <Globe className="w-4 h-4 text-ide-muted/70 shrink-0" />
                   <span className="text-sm text-ide-text flex-1">{t(`extensionSetup.${browser}`)}</span>

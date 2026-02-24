@@ -247,7 +247,7 @@
       },
       "enhance": {
         "label": "Extension Enhancement",
-        "description": "When enabled, the browser extension handles screenshots for this browser with richer metadata (page URL, title, favicon, links). The built-in capture loop will skip OCR for this browser.",
+        "description": "Manage browser extension",
         "chrome": "Enable Chrome extension enhancement",
         "edge": "Enable Edge extension enhancement"
       },

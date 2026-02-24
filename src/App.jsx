@@ -359,6 +359,7 @@ function App() {
   }, []);
 
   useEffect(() => {
+    checkAuthStatus();
     const interval = setInterval(checkAuthStatus, 10000);
     return () => clearInterval(interval);
   }, [checkAuthStatus]);

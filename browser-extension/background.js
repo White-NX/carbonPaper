@@ -169,7 +169,7 @@ async function computeHash(data) {
  */
 async function fetchAsBase64(url) {
   try {
-    const response = await fetch(url, { mode: 'no-cors' });
+    const response = await fetch(url);
     const blob = await response.blob();
     if (blob.size === 0) return null;
     const buffer = await blob.arrayBuffer();

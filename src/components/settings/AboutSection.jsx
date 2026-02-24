@@ -128,7 +128,7 @@ export default function AboutSection({
         <div className="flex flex-col gap-6">
           <section className="space-y-4">
             {/* Description */}
-            <div className="p-4 bg-ide-panel/30 border border-ide-border/50 rounded-xl text-sm leading-relaxed text-ide-muted space-y-4">
+            <div className="p-4 bg-ide-panel/30 border border-ide-border rounded-xl text-sm leading-relaxed text-ide-muted space-y-4">
               <p>
                 This program is under GPL-3.0 Licence.
               </p>

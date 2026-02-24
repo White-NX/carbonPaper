@@ -74,11 +74,10 @@ export default function BrowserExtensionSection() {
         <button
           onClick={() => handleInstall(browser)}
           disabled={installing !== null}
-          className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-            status[browser]
+          className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${status[browser]
               ? 'bg-green-500/20 text-green-400 border border-green-500/30'
               : 'bg-ide-accent text-white hover:bg-ide-accent/80'
-          } disabled:opacity-50`}
+            } disabled:opacity-50`}
         >
           {installing === browser
             ? t(`settings.extension.${browser}.registering`)
@@ -90,15 +89,14 @@ export default function BrowserExtensionSection() {
 
       {/* Enhancement toggle */}
       {status[browser] && (
-        <div className="flex items-center justify-between pt-1 border-t border-ide-border/50">
+        <div className="flex items-center justify-between pt-1 border-t border-ide-border">
           <span className="text-xs text-ide-text-secondary">
             {t(`settings.extension.enhance.${browser}`)}
           </span>
           <button
             onClick={() => handleEnhanceToggle(browser, !enhance[browser])}
-            className={`w-11 h-6 shrink-0 rounded-full transition-colors relative ${
-              enhance[browser] ? 'bg-ide-accent' : 'bg-ide-panel border border-ide-border'
-            }`}
+            className={`w-11 h-6 shrink-0 rounded-full transition-colors relative ${enhance[browser] ? 'bg-ide-accent' : 'bg-ide-panel border border-ide-border'
+              }`}
             title={t(`settings.extension.enhance.${browser}`)}
           >
             <div
@@ -113,13 +111,9 @@ export default function BrowserExtensionSection() {
 
   return (
     <div className="space-y-4">
-      <div>
-        <h3 className="text-sm font-semibold text-ide-accent mb-1">
-          {t('settings.extension.title')}
-        </h3>
-        <p className="text-xs text-ide-text-secondary">
-          {t('settings.extension.description')}
-        </p>
+      <div className="space-y-1">
+        <h2 className="text-xl font-semibold">{t('settings.extension.title')}</h2>
+        <p className="text-xs text-ide-muted">{t('settings.extension.description')}</p>
       </div>
 
       <div className="space-y-3">
@@ -134,9 +128,8 @@ export default function BrowserExtensionSection() {
       )}
 
       {message && (
-        <div className={`text-xs px-3 py-2 rounded ${
-          messageType === 'success' ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'
-        }`}>
+        <div className={`text-xs px-3 py-2 rounded ${messageType === 'success' ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'
+          }`}>
           {message}
         </div>
       )}

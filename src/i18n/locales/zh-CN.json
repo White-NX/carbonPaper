@@ -230,7 +230,7 @@
     },
     "extension": {
       "title": "浏览器扩展",
-      "description": "安装 CarbonPaper 浏览器扩展，可捕获浏览器视口截图并附带页面元数据（URL、标题、可见链接）。",
+      "description": "管理 CarbonPaper 浏览器扩展",
       "chrome": {
         "label": "添加到 Chrome",
         "registered": "已注册",

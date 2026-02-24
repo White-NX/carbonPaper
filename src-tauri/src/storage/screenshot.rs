@@ -656,7 +656,7 @@ impl StorageState {
         }
 
         let image_path_str = rec.unwrap();
-        let image_path = std::path::PathBuf::from(&image_path_str);
+        let image_path = self.resolve_image_path(&image_path_str);
 
         if image_path.exists() {
             let _ = std::fs::remove_file(&image_path);
