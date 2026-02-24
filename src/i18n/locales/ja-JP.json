@@ -52,7 +52,8 @@
       "security": "安全",
       "advanced": "高级",
       "analysis": "存储管理",
-      "about": "关于"
+      "about": "关于",
+      "extension": "浏览器扩展"
     },
     "security": {
       "protection": {
@@ -240,6 +241,40 @@
     },
     "analysis": {
       "load_failed": ""
+    },
+    "extension": {
+      "title": "浏览器扩展",
+      "description": "安装 CarbonPaper 浏览器扩展，可捕获浏览器视口截图并附带页面元数据（URL、标题、可见链接）。",
+      "chrome": {
+        "label": "添加到 Chrome",
+        "registered": "已注册",
+        "registering": "注册中..."
+      },
+      "edge": {
+        "label": "添加到 Edge",
+        "registered": "已注册",
+        "registering": "注册中..."
+      },
+      "status": {
+        "registered": "已注册",
+        "not_registered": "未注册"
+      },
+      "enhance": {
+        "label": "扩展增强",
+        "description": "启用后，浏览器扩展将接管该浏览器的截图捕获，提供更丰富的元数据（页面 URL、标题、网站图标、链接）。自带的截图循环将跳过该浏览器的 OCR 处理。",
+        "chrome": "启用 Chrome 扩展增强",
+        "edge": "启用 Edge 扩展增强"
+      },
+      "success": "扩展安装成功。请在浏览器中启用该未打包扩展。",
+      "error": "安装失败：{{error}}",
+      "help": "点击按钮后，请在浏览器扩展管理页面中加载显示路径的未打包扩展。",
+      "tutorial": {
+        "title": "安装步骤",
+        "step1": "点击上方对应浏览器（Chrome 或 Edge）的安装按钮。",
+        "step2": "打开浏览器扩展页面，启用「开发者模式」。",
+        "step3": "点击「加载已解压的扩展程序」，选择安装后显示的扩展文件夹。",
+        "step4": "CarbonPaper 扩展图标将出现在浏览器工具栏中。"
+      }
     }
   },
   "delete": {
@@ -264,6 +299,18 @@
   "topbar": {
     "settings": "设置",
     "hideToTray": "隐藏到托盘"
+  },
+  "previewAction": {
+    "deleteNowTitle": "立即删除此记录",
+    "delete": "删除",
+    "moreDeleteOptions": "更多删除选项",
+    "deleteThisRecord": "删除此记录",
+    "deleteNearby5min": "删除附近5分钟内的记录",
+    "openUrlTitle": "打开 URL: {{url}}",
+    "noUrlDetected": "未检测到 URL",
+    "more": "更多",
+    "showOcr": "显示OCR内容",
+    "alpha": "alpha"
   },
   "search": {
     "switchToNL": "切换到自然语言搜索",
@@ -298,6 +345,10 @@
       "window": "窗口",
       "time": "时间"
     },
+    "links": {
+      "title": "页面上的链接",
+      "currentPage": "当前页面"
+    },
     "empty": "从时间线中选择一个事件以查看详情。"
   },
   "dmlSetup": {
@@ -319,6 +370,20 @@
     "skip": "跳过",
     "acknowledge": "了解",
     "loading": "正在检测 GPU..."
+  },
+  "extensionSetup": {
+    "title": "浏览器扩展",
+    "subtitle": "捕获浏览器截图并附带丰富的元数据",
+    "description": "CarbonPaper 浏览器扩展可以捕获浏览器视口截图，并附带页面元数据（URL、标题、可见链接）。选择你使用的浏览器来安装扩展。",
+    "select_browser": "选择要安装的浏览器",
+    "chrome": "Google Chrome",
+    "edge": "Microsoft Edge",
+    "installing": "安装中...",
+    "apply": "安装扩展",
+    "skip": "跳过",
+    "done": "完成",
+    "success_message": "扩展安装成功。请在浏览器中启用开发者模式，然后从以下路径加载已解压的扩展。",
+    "error_message": "安装失败"
   },
   "authMask": {
     "title": "需要 Windows Hello 验证",
