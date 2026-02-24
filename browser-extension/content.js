@@ -27,7 +27,11 @@
     for (const link of document.querySelectorAll('a[href]')) {
       try {
         const href = link.href;
-        if (!href || href.startsWith('javascript:') || href.startsWith('#')) continue;
+        if (!href ||
+            href.startsWith('javascript:') ||
+            href.startsWith('data:') ||
+            href.startsWith('vbscript:') ||
+            href.startsWith('#')) continue;
         if (!isElementVisible(link)) continue;
 
         // Try title from <a> itself, then from child elements, then textContent
