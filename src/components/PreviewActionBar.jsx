@@ -108,7 +108,7 @@ export default function PreviewActionBar({
 
         <div className="w-px h-5 bg-ide-border/50" />
 
-        {/* Callback Button (Alpha) */}
+        {/* Callback Button (Beta) */}
         <button
           onClick={handleOpenFirstUrl}
           disabled={!hasUrls}
@@ -120,7 +120,7 @@ export default function PreviewActionBar({
         >
           <ExternalLink className="w-3.5 h-3.5" />
           <span>Callback</span>
-          <span className="px-1 py-0.5 bg-amber-500/20 text-amber-400 text-[10px] rounded">alpha</span>
+          <span className="px-1 py-0.5 bg-amber-500/20 text-amber-400 text-[10px] rounded">beta</span>
         </button>
 
         <div className="w-px h-5 bg-ide-border/50" />

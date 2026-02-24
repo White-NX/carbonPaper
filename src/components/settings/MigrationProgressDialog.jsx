@@ -11,7 +11,7 @@ export default function MigrationProgressDialog({ isOpen, onClose, progress, err
     <Dialog isOpen={isOpen} onClose={onClose} title={t('settings.storageManagement.migration.dialog_title')} maxWidth="max-w-xl">
       <div className="p-4 space-y-3">
         {error ? (
-          <div className="text-sm text-red-400">{t('settings.storageManagement.migration.error_default')}: {error}</div>
+          <div className="text-sm text-ide-error">{t('settings.storageManagement.migration.error_default')}: {error}</div>
         ) : (
           <>
             <div className="text-sm text-ide-muted">{t('settings.storageManagement.migration.copying', { copied: progress.copied_files, total: progress.total_files })}</div>

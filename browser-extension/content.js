@@ -15,6 +15,138 @@
   }
 
   /**
+   * Character-level Shannon entropy (bits/char).
+   * Ported from link_scoring.rs — natural language typically falls in [3.0, 5.0].
+   */
+  function charEntropy(text) {
+    const freq = {};
+    let total = 0;
+    for (const ch of text) {
+      freq[ch] = (freq[ch] || 0) + 1;
+      total++;
+    }
+    if (total === 0) return 0;
+    let entropy = 0;
+    for (const count of Object.values(freq)) {
+      const p = count / total;
+      entropy -= p * Math.log2(p);
+    }
+    return entropy;
+  }
+
+  /**
+   * Gaussian penalty for entropy outside the natural-language sweet spot.
+   * Adapted from link_scoring.rs (center=4.0, sigma=1.5).
+   *
+   * For short strings (len ≤ 8), Shannon entropy is inherently capped by
+   * log2(len), so we normalize to the theoretical maximum before applying
+   * the Gaussian.  This lets "视频" (2 chars, H=1.0, max=1.0 → normalized=4.0)
+   * score fairly alongside longer text, without any hard-coded exemption.
+   */
+  function entropyPenalty(text) {
+    const len = text.length;
+    if (len <= 1) return 0;
+    const h = charEntropy(text);
+    // For short text, scale entropy to the [0, ~4.5] range that longer text
+    // naturally occupies, so the Gaussian treats them comparably.
+    const maxH = Math.log2(len);
+    const adjusted = maxH < 4.0 ? (h / maxH) * 4.0 : h;
+    const deviation = (adjusted - 4.0) / 1.5;
+    return Math.exp(-0.5 * deviation * deviation);
+  }
+
+  /**
+   * Score a candidate text string for "title quality".
+   * Adapted from link_scoring.rs: uses entropy penalty, length factor,
+   * density divisor, and letter ratio (replaces IDF which needs DB access).
+   *
+   *   score = ln(1 + len) × entropyPenalty × letterRatio / ln(e + len)
+   *
+   * - Noise like "774", "1:02", "R-18" scores low (poor entropy + low letter ratio)
+   * - Natural titles like "Burnice - Rising Tempo" score high
+   */
+  function textScore(text) {
+    const t = text.trim();
+    if (!t) return 0;
+    if (t.startsWith('http://') || t.startsWith('https://')) return 0;
+    const len = t.length;
+    const lenFactor = Math.log(1 + len);
+    const ep = entropyPenalty(t);
+    const densityDivisor = Math.log(Math.E + len);
+    // Letter ratio: fraction of characters that are letters/CJK (Unicode L category)
+    // Replaces IDF as a "naturalness" signal — real titles are mostly letters
+    const letterCount = [...t].filter(ch => /\p{L}/u.test(ch)).length;
+    const letterRatio = letterCount / len;
+    return lenFactor * ep * letterRatio / densityDivisor;
+  }
+
+  /**
+   * Extract the most meaningful text from a link element.
+   *
+   * Collects ALL candidate texts (attributes, headings, children, full text)
+   * into a single pool, scores each with the entropy + letter-ratio formula,
+   * and returns the highest-scoring candidate.  No priority tiers or hard-coded
+   * thresholds — the scoring function alone decides what is "best".
+   *
+   * Returns { text, score } so callers can compare across multiple <a> tags
+   * that share the same href.
+   */
+  function extractLinkText(link) {
+    const candidates = new Set();
+
+    // Explicit attributes (aria-label, title) — on link and children
+    const ariaLabel = (link.getAttribute('aria-label') || '').trim();
+    if (ariaLabel) candidates.add(ariaLabel);
+    if (link.title && link.title.trim()) candidates.add(link.title.trim());
+
+    for (const el of link.querySelectorAll('[aria-label]')) {
+      const val = (el.getAttribute('aria-label') || '').trim();
+      if (val) candidates.add(val);
+    }
+    for (const el of link.querySelectorAll('[title]')) {
+      const val = (el.title || '').trim();
+      if (val) candidates.add(val);
+    }
+
+    // Semantic heading / strong elements
+    for (const el of link.querySelectorAll('h1, h2, h3, h4, h5, h6, strong')) {
+      const t = el.textContent.trim();
+      if (t) candidates.add(t);
+    }
+
+    // Elements with title/name/heading/caption in class or data attributes
+    for (const el of link.querySelectorAll(
+      '[class*="title"], [class*="name"], [class*="heading"], [class*="caption"], [data-title], [data-name]'
+    )) {
+      const t = el.textContent.trim();
+      if (t) candidates.add(t);
+    }
+
+    // Direct child elements
+    for (const child of link.children) {
+      const t = child.textContent.trim();
+      if (t) candidates.add(t);
+    }
+
+    // Full textContent
+    const full = (link.textContent || '').trim();
+    if (full) candidates.add(full);
+
+    // Score every candidate — highest wins
+    let bestText = '';
+    let bestScore = 0;
+    for (const text of candidates) {
+      const s = textScore(text);
+      if (s > bestScore) {
+        bestScore = s;
+        bestText = text;
+      }
+    }
+
+    return { text: bestText, score: bestScore };
+  }
+
+  /**
    * Get all visible links in the current viewport.
    * Extracts from <a> tags as well as URLs found in text content of
    * <p>, <span>, <li>, <td>, <div>, <h1>-<h6>, and <label> elements.
@@ -34,27 +166,23 @@
             href.startsWith('#')) continue;
         if (!isElementVisible(link)) continue;
 
-        // Try title from <a> itself, then from child elements, then textContent
-        let text = link.title;
-        if (!text) {
-          const titledChild = link.querySelector('[title]');
-          if (titledChild) text = titledChild.title;
-        }
-        text = (text || link.textContent || '').trim().substring(0, 200) || href;
+        const { text: extracted, score } = extractLinkText(link);
+        const text = (extracted || href).substring(0, 200);
 
         const existing = linkMap.get(href);
         if (!existing) {
-          linkMap.set(href, { text, url: href });
-        } else if (text !== href && (existing.text === href || existing.text === existing.url)) {
-          // Current <a> has a real title while the earlier one only had the URL — upgrade
+          linkMap.set(href, { text, url: href, _score: score });
+        } else if (score > existing._score) {
+          // A higher-scoring <a> for the same URL — upgrade text
           existing.text = text;
+          existing._score = score;
         }
       } catch (e) {
         // Skip problematic elements silently
       }
     }
 
-    const result = Array.from(linkMap.values());
+    const result = Array.from(linkMap.values()).map(({ text, url }) => ({ text, url }));
     const seen = new Set(linkMap.keys());
 
     // 2. Extract URLs from text content in common container elements

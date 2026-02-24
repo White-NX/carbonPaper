@@ -17,6 +17,11 @@ export default {
         'ide-hover': 'var(--ide-hover)',
         'ide-error': 'var(--ide-error)',
         'ide-success': 'var(--ide-success)',
+        'ide-warning': 'var(--ide-warning)',
+        'ide-warning-muted': 'var(--ide-warning-muted)',
+        'ide-warning-bg': 'var(--ide-warning-bg)',
+        'ide-warning-border': 'var(--ide-warning-border)',
+        'ide-info-success': 'var(--ide-info-success)',
       },
       boxShadow: {
         card: '0 10px 30px rgba(0,0,0,0.35)',

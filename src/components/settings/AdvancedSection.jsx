@@ -147,9 +147,9 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
   return (
     <div className="space-y-6">
 
-      <div className="flex items-center gap-2 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg">
-        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-        <p className="text-xs text-amber-300/90">{t('settings.advanced.warning')}</p>
+      <div className="flex items-center gap-2 p-2.5 bg-ide-warning-bg border border-ide-warning-border rounded-lg">
+        <AlertTriangle className="w-4 h-4 text-ide-warning shrink-0" />
+        <p className="text-xs text-ide-warning-muted">{t('settings.advanced.warning')}</p>
       </div>
 
       {/* CPU 限制 */}
@@ -218,13 +218,13 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
           )}
 
           {cpuChanged && (
-            <div className="flex items-center gap-2 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg">
-              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-              <p className="text-xs text-amber-300/90 flex-1">{t('settings.advanced.cpu.changed_notice')}</p>
+            <div className="flex items-center gap-2 p-2.5 bg-ide-warning-bg border border-ide-warning-border rounded-lg">
+              <AlertTriangle className="w-4 h-4 text-ide-warning shrink-0" />
+              <p className="text-xs text-ide-warning-muted flex-1">{t('settings.advanced.cpu.changed_notice')}</p>
               {monitorStatus === 'running' && onRestartMonitor && (
                 <button
                   onClick={() => { onRestartMonitor(); setCpuChanged(false); }}
-                  className="text-xs text-amber-300 hover:text-amber-200 underline shrink-0 transition-colors"
+                  className="text-xs text-ide-warning hover:opacity-80 underline shrink-0 transition-colors"
                 >
                   {t('settings.advanced.quick_restart')}
                 </button>
@@ -403,13 +403,13 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
           )}
 
           {dmlChanged && (
-            <div className="flex items-center gap-2 p-2.5 bg-amber-500/10 border border-amber-500/20 rounded-lg">
-              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-              <p className="text-xs text-amber-300/90 flex-1">{t('settings.advanced.dml.changed_notice')}</p>
+            <div className="flex items-center gap-2 p-2.5 bg-ide-warning-bg border border-ide-warning-border rounded-lg">
+              <AlertTriangle className="w-4 h-4 text-ide-warning shrink-0" />
+              <p className="text-xs text-ide-warning-muted flex-1">{t('settings.advanced.dml.changed_notice')}</p>
               {monitorStatus === 'running' && onRestartMonitor && (
                 <button
                   onClick={() => { onRestartMonitor(); setDmlChanged(false); }}
-                  className="text-xs text-amber-300 hover:text-amber-200 underline shrink-0 transition-colors"
+                  className="text-xs text-ide-warning hover:opacity-80 underline shrink-0 transition-colors"
                 >
                   {t('settings.advanced.quick_restart')}
                 </button>

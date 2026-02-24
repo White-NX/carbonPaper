@@ -102,14 +102,15 @@ export default function MonitorServiceSection({
             </div>
             <button
               onClick={() => onAutoStartMonitorChange?.(!autoStartMonitor)}
-              className={`w-11 h-6 shrink-0 rounded-full transition-colors relative ${
-                autoStartMonitor ? 'bg-ide-accent' : 'bg-ide-panel border border-ide-border'
+              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${
+                autoStartMonitor ? 'bg-ide-accent' : 'bg-ide-border'
               }`}
               title={t('settings.general.monitor.autoStart.tooltip')}
             >
               <div
-                className="absolute top-1 w-4 h-4 rounded-full bg-white transition-transform shadow-sm"
-                style={{ left: autoStartMonitor ? 'calc(100% - 1.25rem)' : '0.25rem' }}
+                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                  autoStartMonitor ? 'translate-x-5' : 'translate-x-0.5'
+                }`}
               />
             </button>
           </div>

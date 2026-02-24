@@ -89,7 +89,7 @@ async function captureCurrentTab() {
     // Capture the visible tab
     const dataUrl = await chrome.tabs.captureVisibleTab(null, {
       format: 'jpeg',
-      quality: 70
+      quality: 60
     });
 
     if (!dataUrl) return;

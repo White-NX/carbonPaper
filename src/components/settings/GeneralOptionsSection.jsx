@@ -70,13 +70,14 @@ export default function GeneralOptionsSection({
           </div>
           <button
             onClick={onToggleTelemetry}
-            className={`w-11 h-6 shrink-0 rounded-full transition-colors relative ${sendTelemetryDiagnostics ? 'bg-ide-accent' : 'bg-ide-panel border border-ide-border'
+            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${sendTelemetryDiagnostics ? 'bg-ide-accent' : 'bg-ide-border'
               }`}
             title={t('settings.general.telemetry.label')}
           >
             <div
-              className="absolute top-1 w-4 h-4 rounded-full bg-white transition-transform shadow-sm"
-              style={{ left: sendTelemetryDiagnostics ? 'calc(100% - 1.25rem)' : '0.25rem' }}
+              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                sendTelemetryDiagnostics ? 'translate-x-5' : 'translate-x-0.5'
+              }`}
             />
           </button>
         </div>
@@ -94,12 +95,12 @@ export default function GeneralOptionsSection({
               {t('settings.general.gameMode.description')}
             </p>
             {!useDml && !gameModeLoading && (
-              <p className="text-xs text-amber-400 mt-1">
+              <p className="text-xs text-ide-warning mt-1">
                 {t('settings.general.gameMode.requires_dml')}
               </p>
             )}
             {gameModeEnabled && useDml && (
-              <p className={`text-xs mt-1 ${gameModeActive ? 'text-amber-400' : 'text-emerald-400'}`}>
+              <p className={`text-xs mt-1 ${gameModeActive ? 'text-ide-warning' : 'text-ide-info-success'}`}>
                 {gameModePermanent
                   ? t('settings.general.gameMode.permanent')
                   : gameModeActive
@@ -112,18 +113,19 @@ export default function GeneralOptionsSection({
           <button
             onClick={handleToggleGameMode}
             disabled={!useDml || gameModeLoading}
-            className={`w-11 h-6 shrink-0 rounded-full transition-colors relative ${
+            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${
               !useDml || gameModeLoading
                 ? 'bg-ide-border opacity-50 cursor-not-allowed'
                 : gameModeEnabled
                   ? 'bg-ide-accent'
-                  : 'bg-ide-panel border border-ide-border'
+                  : 'bg-ide-border'
             }`}
             title={t('settings.general.gameMode.label')}
           >
             <div
-              className="absolute top-1 w-4 h-4 rounded-full bg-white transition-transform shadow-sm"
-              style={{ left: gameModeEnabled && useDml ? 'calc(100% - 1.25rem)' : '0.25rem' }}
+              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                gameModeEnabled && useDml ? 'translate-x-5' : 'translate-x-0.5'
+              }`}
             />
           </button>
         </div>

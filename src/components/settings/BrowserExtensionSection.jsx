@@ -66,7 +66,7 @@ export default function BrowserExtensionSection() {
           <Globe className="w-5 h-5 text-ide-text-secondary" />
           <div>
             <div className="text-sm font-medium">{label}</div>
-            <div className={`text-xs ${status[browser] ? 'text-green-400' : 'text-ide-text-secondary'}`}>
+            <div className={`text-xs ${status[browser] ? 'text-ide-info-success' : 'text-ide-text-secondary'}`}>
               {status[browser] ? t('settings.extension.status.registered') : t('settings.extension.status.not_registered')}
             </div>
           </div>
@@ -75,7 +75,7 @@ export default function BrowserExtensionSection() {
           onClick={() => handleInstall(browser)}
           disabled={installing !== null}
           className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${status[browser]
-              ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+              ? 'bg-green-500/20 text-ide-info-success border border-green-500/30'
               : 'bg-ide-accent text-white hover:bg-ide-accent/80'
             } disabled:opacity-50`}
         >
@@ -95,13 +95,14 @@ export default function BrowserExtensionSection() {
           </span>
           <button
             onClick={() => handleEnhanceToggle(browser, !enhance[browser])}
-            className={`w-11 h-6 shrink-0 rounded-full transition-colors relative ${enhance[browser] ? 'bg-ide-accent' : 'bg-ide-panel border border-ide-border'
+            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${enhance[browser] ? 'bg-ide-accent' : 'bg-ide-border'
               }`}
             title={t(`settings.extension.enhance.${browser}`)}
           >
             <div
-              className="absolute top-1 w-4 h-4 rounded-full bg-white transition-transform shadow-sm"
-              style={{ left: enhance[browser] ? 'calc(100% - 1.25rem)' : '0.25rem' }}
+              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                enhance[browser] ? 'translate-x-5' : 'translate-x-0.5'
+              }`}
             />
           </button>
         </div>
@@ -112,7 +113,7 @@ export default function BrowserExtensionSection() {
   return (
     <div className="space-y-4">
       <div className="space-y-1">
-        <h2 className="text-xl font-semibold">{t('settings.extension.title')}</h2>
+        <h2 className="text-xl font-semibold">{t('settings.extension.title')} <span className="px-1 py-0.5 bg-amber-500/20 text-amber-400 text-[10px] rounded">alpha</span></h2>
         <p className="text-xs text-ide-muted">{t('settings.extension.description')}</p>
       </div>
 
@@ -128,7 +129,7 @@ export default function BrowserExtensionSection() {
       )}
 
       {message && (
-        <div className={`text-xs px-3 py-2 rounded ${messageType === 'success' ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'
+        <div className={`text-xs px-3 py-2 rounded ${messageType === 'success' ? 'bg-green-500/10 text-ide-info-success' : 'bg-red-500/10 text-ide-error'
           }`}>
           {message}
         </div>
