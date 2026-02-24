@@ -210,7 +210,7 @@ class OCREngine:
                 logger.exception("[OCR Engine] PaddleOCR.predict() 异常: %s", ocr_err)
                 return []
 
-        if not result or result[0] is None:
+        if not result or result[0] is None or not isinstance(result[0], (dict, list)):
             # 尝试释放临时对象
             try:
                 del result
@@ -287,7 +287,12 @@ class OCREngine:
         else:
             logger.warning("[OCR Engine] 未知的 page_result 格式: %s", type(page_result))
         
-        logger.info("[OCR Engine] 解析完成，得到 %d 个文本块，OCR任务用时 %.3f 秒", len(ocr_results), self.ocr.get_last_elapse()[2])
+        try:
+            elapse = self.ocr.get_last_elapse()
+            elapse_total = elapse[2] if isinstance(elapse, (list, tuple)) and len(elapse) > 2 else 0.0
+        except Exception:
+            elapse_total = 0.0
+        logger.info("[OCR Engine] 解析完成，得到 %d 个文本块，OCR任务用时 %.3f 秒", len(ocr_results), elapse_total)
 
         # 清理临时对象
         try:
