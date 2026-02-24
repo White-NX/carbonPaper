@@ -125,9 +125,28 @@ fn main() {
     // 复制 aria2c
     copy_if_exists(Path::new("../aria2c.exe"), Path::new("pre-bundle/aria2c.exe"));
 
-    // --- 6. 告诉 Tauri 需要重新运行此脚本 ---
+    // --- 7. 复制 browser-extension 目录到 pre-bundle ---
+    let ext_source = Path::new("../browser-extension");
+    let ext_dest = Path::new("pre-bundle/browser-extension");
+    if ext_source.exists() && ext_source.is_dir() {
+        fs::create_dir_all(ext_dest).expect("Failed to create browser-extension dir in pre-bundle");
+        for entry in WalkDir::new(ext_source).into_iter().filter_map(|e| e.ok()) {
+            let src_path = entry.path();
+            let relative = src_path.strip_prefix(ext_source).expect("strip_prefix failed");
+            let dest_path = ext_dest.join(relative);
+            if src_path.is_dir() {
+                fs::create_dir_all(&dest_path).expect("Failed to create dir");
+            } else if src_path.is_file() {
+                copy_file_if_needed(src_path, &dest_path);
+            }
+        }
+        println!("cargo:warning=Included browser-extension directory");
+    }
+
+    // --- 8. 告诉 Tauri 需要重新运行此脚本 ---
     println!("cargo:rerun-if-changed=../monitor");
     println!("cargo:rerun-if-changed=../python-3.12.10-amd64.exe");
+    println!("cargo:rerun-if-changed=../browser-extension");
 
     // 最后，调用 tauri_build
     tauri_build::build();

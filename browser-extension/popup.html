@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      width: 260px;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .header img {
+      width: 24px;
+      height: 24px;
+    }
+    .header h1 {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 0;
+    }
+    .toggle-label {
+      font-size: 13px;
+    }
+    .toggle {
+      position: relative;
+      width: 40px;
+      height: 22px;
+      cursor: pointer;
+    }
+    .toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .toggle-slider {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #45475a;
+      border-radius: 11px;
+      transition: background-color 0.2s;
+    }
+    .toggle-slider::before {
+      content: '';
+      position: absolute;
+      width: 16px;
+      height: 16px;
+      left: 3px;
+      top: 3px;
+      background-color: #cdd6f4;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+    .toggle input:checked + .toggle-slider {
+      background-color: #89b4fa;
+    }
+    .toggle input:checked + .toggle-slider::before {
+      transform: translateX(18px);
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 12px;
+      padding: 8px;
+      background: #181825;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-dot.connected {
+      background: #a6e3a1;
+    }
+    .status-dot.disconnected {
+      background: #f38ba8;
+    }
+    .status-dot.disabled {
+      background: #6c7086;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <img src="icons/icon48.png" alt="CarbonPaper">
+    <h1>CarbonPaper</h1>
+  </div>
+
+  <div class="toggle-row">
+    <span class="toggle-label">Enable capture</span>
+    <label class="toggle">
+      <input type="checkbox" id="enableToggle">
+      <span class="toggle-slider"></span>
+    </label>
+  </div>
+
+  <div class="status" id="statusBar">
+    <span class="status-dot disabled" id="statusDot"></span>
+    <span id="statusText">Checking...</span>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

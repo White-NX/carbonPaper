@@ -4,6 +4,7 @@ mod capture;
 mod credential_manager;
 mod logging;
 mod monitor;
+mod native_messaging;
 mod python;
 mod registry_config;
 mod resource_utils;
@@ -343,6 +344,14 @@ async fn storage_save_screenshot(
 }
 
 #[tauri::command]
+async fn storage_compute_link_scores(
+    state: tauri::State<'_, Arc<StorageState>>,
+    links: Vec<storage::VisibleLink>,
+) -> Result<Vec<storage::ScoredLink>, String> {
+    state.compute_link_scores(&links)
+}
+
+#[tauri::command]
 async fn storage_get_public_key(
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<String, String> {
@@ -661,6 +670,35 @@ fn mark_dml_setup_done() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn check_extension_setup_needed() -> Result<bool, String> {
+    Ok(!registry_config::get_bool("extension_setup_done").unwrap_or(false))
+}
+
+#[tauri::command]
+fn mark_extension_setup_done() -> Result<(), String> {
+    registry_config::set_bool("extension_setup_done", true)
+}
+
+#[tauri::command]
+fn get_extension_enhancement_config() -> Result<serde_json::Value, String> {
+    let chrome = registry_config::get_bool("extension_enhanced_chrome").unwrap_or(false);
+    let edge = registry_config::get_bool("extension_enhanced_edge").unwrap_or(false);
+    Ok(serde_json::json!({
+        "chrome": chrome,
+        "edge": edge,
+    }))
+}
+
+#[tauri::command]
+fn set_extension_enhancement(browser: String, enabled: bool) -> Result<(), String> {
+    match browser.as_str() {
+        "chrome" => registry_config::set_bool("extension_enhanced_chrome", enabled),
+        "edge" => registry_config::set_bool("extension_enhanced_edge", enabled),
+        _ => Err(format!("Unknown browser: {}", browser)),
+    }
+}
+
+#[tauri::command]
 fn get_game_mode_status(
     app: tauri::AppHandle,
 ) -> serde_json::Value {
@@ -800,6 +838,37 @@ pub fn run() {
                 monitor::start_game_mode_monitor(app.handle().clone());
             }
 
+            // Sync installed browser extension if source was updated
+            match native_messaging::sync_installed_extension() {
+                Ok(true) => tracing::info!("Browser extension synced to latest version"),
+                Ok(false) => {}
+                Err(e) => tracing::warn!("Extension sync check failed: {}", e),
+            }
+
+            // Start NMH pipe server for browser extension communication
+            {
+                let data_dir_clone = data_dir.clone();
+                let storage_for_nmh = storage.inner().clone();
+                let capture_for_nmh = app.state::<Arc<CaptureState>>().inner().clone();
+                let app_handle_for_nmh = app.handle().clone();
+                std::thread::spawn(move || {
+                    match reverse_ipc::generate_nmh_auth_token(&data_dir_clone) {
+                        Ok(token) => {
+                            let mut nmh_server = reverse_ipc::NmhPipeServer::new();
+                            if let Err(e) = nmh_server.start(storage_for_nmh, capture_for_nmh, app_handle_for_nmh, token) {
+                                tracing::error!("Failed to start NMH pipe server: {}", e);
+                            }
+                            // Keep the server alive by not dropping it
+                            // (it runs in its own thread internally)
+                            std::mem::forget(nmh_server);
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to generate NMH auth token: {}", e);
+                        }
+                    }
+                });
+            }
+
             Ok(())
         }})
         .invoke_handler(tauri::generate_handler![
@@ -824,6 +893,7 @@ pub fn run() {
             storage_set_policy,
             storage_get_policy,
             storage_get_public_key,
+            storage_compute_link_scores,
             storage_encrypt_for_chromadb,
             storage_decrypt_from_chromadb,
             analysis::get_analysis_overview,
@@ -863,6 +933,16 @@ pub fn run() {
             updater::updater_download,
             updater::updater_extract,
             updater::updater_apply,
+            // Native messaging commands
+            native_messaging::get_nm_host_status,
+            native_messaging::register_nm_host_chrome,
+            native_messaging::register_nm_host_edge,
+            native_messaging::install_browser_extension,
+            native_messaging::sync_extension_if_needed,
+            check_extension_setup_needed,
+            mark_extension_setup_done,
+            get_extension_enhancement_config,
+            set_extension_enhancement,
         ]);
 
     #[cfg(desktop)]

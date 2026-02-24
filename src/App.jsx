@@ -15,6 +15,7 @@ import SettingsDialog from './components/settings/SettingsDialog';
 import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
 import DmlSetupWizard from './components/DmlSetupWizard';
+import ExtensionSetupWizard from './components/ExtensionSetupWizard';
 import LeftSidebar from './components/LeftSidebar';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
@@ -57,6 +58,7 @@ function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authError, setAuthError] = useState(null);
   const [showDmlSetup, setShowDmlSetup] = useState(false);
+  const [showExtensionSetup, setShowExtensionSetup] = useState(false);
   const [sessionTimeout, setSessionTimeout] = useState(() => {
     const saved = localStorage.getItem('sessionTimeout');
     return saved ? parseInt(saved, 10) : 900; // 默认 15 分钟
@@ -313,6 +315,23 @@ function App() {
     return () => { cancelled = true; };
   }, [backendStatus, isAuthenticated]);
 
+  // Check if extension setup wizard should be shown after auth (and after DML wizard)
+  useEffect(() => {
+    if (backendStatus !== 'online' || !isAuthenticated || showDmlSetup) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const needed = await invoke('check_extension_setup_needed');
+        if (!cancelled && needed) {
+          setShowExtensionSetup(true);
+        }
+      } catch (err) {
+        console.warn('Failed to check extension setup status:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [backendStatus, isAuthenticated, showDmlSetup]);
+
   // 锁定会话回调
   const handleLockSession = useCallback(() => {
     setIsAuthenticated(false);
@@ -334,8 +353,12 @@ function App() {
     }
   }, []);
 
+  // Extension setup wizard callback
+  const handleExtensionSetupComplete = useCallback(() => {
+    setShowExtensionSetup(false);
+  }, []);
+
   useEffect(() => {
-    checkAuthStatus();
     const interval = setInterval(checkAuthStatus, 10000);
     return () => clearInterval(interval);
   }, [checkAuthStatus]);
@@ -667,6 +690,11 @@ function App() {
       <DmlSetupWizard
         isVisible={backendStatus === 'online' && isAuthenticated && showDmlSetup}
         onComplete={handleDmlSetupComplete}
+      />
+
+      <ExtensionSetupWizard
+        isVisible={backendStatus === 'online' && isAuthenticated && !showDmlSetup && showExtensionSetup}
+        onComplete={handleExtensionSetupComplete}
       />
 
       <Timeline

@@ -53,7 +53,8 @@
       "security": "Security",
       "advanced": "Advanced",
       "analysis": "Storage",
-      "about": "About"
+      "about": "About",
+      "extension": "Browser Extension"
     },
     "security": {
       "protection": {
@@ -226,11 +227,57 @@
     },
     "analysis": {
       "load_failed": ""
+    },
+    "extension": {
+      "title": "Browser Extension",
+      "description": "Install the CarbonPaper browser extension to capture viewport screenshots with page metadata (URL, title, visible links).",
+      "chrome": {
+        "label": "Add to Chrome",
+        "registered": "Registered",
+        "registering": "Registering..."
+      },
+      "edge": {
+        "label": "Add to Edge",
+        "registered": "Registered",
+        "registering": "Registering..."
+      },
+      "status": {
+        "registered": "Registered",
+        "not_registered": "Not registered"
+      },
+      "enhance": {
+        "label": "Extension Enhancement",
+        "description": "When enabled, the browser extension handles screenshots for this browser with richer metadata (page URL, title, favicon, links). The built-in capture loop will skip OCR for this browser.",
+        "chrome": "Enable Chrome extension enhancement",
+        "edge": "Enable Edge extension enhancement"
+      },
+      "success": "Extension installed successfully. Please enable the unpacked extension in your browser.",
+      "error": "Installation failed: {{error}}",
+      "help": "After clicking the button, load the unpacked extension from the path shown in your browser's extension settings page.",
+      "tutorial": {
+        "title": "How to install",
+        "step1": "Click the install button for your browser (Chrome or Edge) above.",
+        "step2": "Open the browser extensions page and enable \"Developer mode\".",
+        "step3": "Click \"Load unpacked\" and select the extension folder shown after installation.",
+        "step4": "The CarbonPaper extension icon will appear in your browser toolbar."
+      }
     }
   },
   "topbar": {
     "settings": "Settings",
     "hideToTray": "Hide to tray"
+  },
+  "previewAction": {
+    "deleteNowTitle": "Delete this record immediately",
+    "delete": "Delete",
+    "moreDeleteOptions": "More delete options",
+    "deleteThisRecord": "Delete this record",
+    "deleteNearby5min": "Delete records within 5 minutes",
+    "openUrlTitle": "Open URL: {{url}}",
+    "noUrlDetected": "No URL detected",
+    "more": "More",
+    "showOcr": "Show OCR content",
+    "alpha": "alpha"
   },
   "delete": {
     "failure": "Delete failed: {{error}}",
@@ -284,6 +331,10 @@
       "window": "Window",
       "time": "Time"
     },
+    "links": {
+      "title": "Links on Page",
+      "currentPage": "Current Page"
+    },
     "empty": "Select an event from the timeline to view details."
   }
   ,
@@ -306,6 +357,21 @@
     "skip": "Skip",
     "acknowledge": "Got it",
     "loading": "Detecting GPUs..."
+  }
+  ,
+  "extensionSetup": {
+    "title": "Browser Extension",
+    "subtitle": "Capture browser screenshots with rich metadata",
+    "description": "The CarbonPaper browser extension captures viewport screenshots along with page metadata such as URL, title, and visible links. Select the browsers you use to install the extension.",
+    "select_browser": "Select browsers to install",
+    "chrome": "Google Chrome",
+    "edge": "Microsoft Edge",
+    "installing": "Installing...",
+    "apply": "Install Extension",
+    "skip": "Skip",
+    "done": "Done",
+    "success_message": "Extension installed successfully. Enable Developer mode in your browser and load the unpacked extension from the path below.",
+    "error_message": "Installation failed"
   }
   ,
   "authMask": {

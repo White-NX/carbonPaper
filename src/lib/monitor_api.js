@@ -418,3 +418,7 @@ export const deletePlaintextFiles = async () => {
         return result;
     });
 };
+
+export const computeLinkScores = async (links) => {
+    return await invoke('storage_compute_link_scores', { links });
+};
