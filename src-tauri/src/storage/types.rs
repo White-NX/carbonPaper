@@ -135,6 +135,11 @@ pub(super) struct RawScreenshotRow {
     pub(super) page_url_enc: Option<Vec<u8>>,
     pub(super) page_icon_enc: Option<Vec<u8>>,
     pub(super) visible_links_enc: Option<Vec<u8>>,
+    // Dedup table references (from LEFT JOIN)
+    pub(super) page_icon_ref_enc: Option<Vec<u8>>,
+    pub(super) page_icon_ref_key: Option<Vec<u8>>,
+    pub(super) link_set_ref_enc: Option<Vec<u8>>,
+    pub(super) link_set_ref_key: Option<Vec<u8>>,
 }
 
 impl RawScreenshotRow {
@@ -176,14 +181,37 @@ impl RawScreenshotRow {
                 .ok()
                 .and_then(|v| String::from_utf8(v).ok()),
             _ => None,
-        };
+        }
+        .or_else(|| {
+            // Fall back to dedup table data
+            match (self.page_icon_ref_enc.as_ref(), self.page_icon_ref_key.as_ref()) {
+                (Some(data), Some(key)) => {
+                    let dedup_row_key = decrypt_row_key_with_cng(key).ok()?;
+                    let decrypted = decrypt_with_master_key(&dedup_row_key, data).ok()?;
+                    String::from_utf8(decrypted).ok()
+                }
+                _ => None,
+            }
+        });
         let visible_links = match (self.visible_links_enc.as_ref(), row_key.as_ref()) {
             (Some(data), Some(key)) => decrypt_with_master_key(key, data)
                 .ok()
                 .and_then(|v| String::from_utf8(v).ok())
                 .and_then(|s| serde_json::from_str::<Vec<VisibleLink>>(&s).ok()),
             _ => None,
-        };
+        }
+        .or_else(|| {
+            // Fall back to dedup table data
+            match (self.link_set_ref_enc.as_ref(), self.link_set_ref_key.as_ref()) {
+                (Some(data), Some(key)) => {
+                    let dedup_row_key = decrypt_row_key_with_cng(key).ok()?;
+                    let decrypted = decrypt_with_master_key(&dedup_row_key, data).ok()?;
+                    let s = String::from_utf8(decrypted).ok()?;
+                    serde_json::from_str::<Vec<VisibleLink>>(&s).ok()
+                }
+                _ => None,
+            }
+        });
 
         if let Some(ref mut key) = row_key {
             StorageState::zeroize_bytes(key);
@@ -232,6 +260,11 @@ impl RawScreenshotRow {
             page_url_enc: row.get(15)?,
             page_icon_enc: row.get(16)?,
             visible_links_enc: row.get(17)?,
+            // Dedup table references from LEFT JOIN (columns 18-21)
+            page_icon_ref_enc: row.get(18)?,
+            page_icon_ref_key: row.get(19)?,
+            link_set_ref_enc: row.get(20)?,
+            link_set_ref_key: row.get(21)?,
         })
     }
 }

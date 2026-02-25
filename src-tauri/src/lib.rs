@@ -568,6 +568,7 @@ async fn credential_initialize(
 #[tauri::command]
 async fn credential_verify_user(
     state: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<bool, String> {
     #[cfg(windows)]
     {
@@ -579,11 +580,15 @@ async fn credential_verify_user(
         // 认证成功，更新会话时间
         state.update_auth_time();
 
+        // 认证成功后尝试执行去重迁移（仅首次）
+        storage_state.try_dedup_migration();
+
         Ok(true)
     }
 
     #[cfg(not(windows))]
     {
+        let _ = &storage_state; // suppress unused warning
         Err("Windows Hello is only available on Windows".to_string())
     }
 }

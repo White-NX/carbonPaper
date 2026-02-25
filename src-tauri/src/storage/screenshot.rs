@@ -1,12 +1,12 @@
 //! Screenshot CRUD operations (save, get, delete, commit, abort).
 
 use crate::credential_manager::{
-    encrypt_row_key_with_cng,
+    decrypt_row_key_with_cng, decrypt_with_master_key, encrypt_row_key_with_cng,
     encrypt_with_master_key,
 };
 use chrono::{DateTime, Utc};
 use rand::RngCore;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::atomic::Ordering;
 
 use super::types::RawScreenshotRow;
@@ -118,22 +118,14 @@ impl StorageState {
             ),
             _ => None,
         };
-        let page_icon_enc_save = match &request.page_icon {
-            Some(value) if !value.is_empty() => Some(
-                encrypt_with_master_key(&row_key, value.as_bytes())
-                    .map_err(|e| format!("Failed to encrypt page_icon: {}", e))?,
-            ),
+
+        // Use dedup tables for page_icon and visible_links
+        let page_icon_id: Option<i64> = match &request.page_icon {
+            Some(value) if !value.is_empty() => Some(Self::get_or_create_page_icon(conn, value)?),
             _ => None,
         };
-        let visible_links_enc_save = match &request.visible_links {
-            Some(links) if !links.is_empty() => {
-                let json = serde_json::to_string(links)
-                    .map_err(|e| format!("Failed to serialize visible_links: {}", e))?;
-                Some(
-                    encrypt_with_master_key(&row_key, json.as_bytes())
-                        .map_err(|e| format!("Failed to encrypt visible_links: {}", e))?,
-                )
-            }
+        let link_set_id: Option<i64> = match &request.visible_links {
+            Some(links) if !links.is_empty() => Some(Self::get_or_create_link_set(conn, links)?),
             _ => None,
         };
 
@@ -145,7 +137,7 @@ impl StorageState {
                 window_title, process_name, metadata,
                 window_title_enc, process_name_enc, metadata_enc,
                 content_key_encrypted,
-                source, page_url_enc, page_icon_enc, visible_links_enc
+                source, page_url_enc, page_icon_id, link_set_id
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 &image_path_str,
@@ -161,8 +153,8 @@ impl StorageState {
                 encrypted_row_key,
                 request.source.as_deref(),
                 page_url_enc_save,
-                page_icon_enc_save,
-                visible_links_enc_save,
+                page_icon_id,
+                link_set_id,
             ],
         )
         .map_err(|e| format!("Failed to insert screenshot: {}", e))?;
@@ -381,22 +373,14 @@ impl StorageState {
             ),
             _ => None,
         };
-        let page_icon_enc = match &request.page_icon {
-            Some(value) if !value.is_empty() => Some(
-                encrypt_with_master_key(&row_key, value.as_bytes())
-                    .map_err(|e| format!("Failed to encrypt page_icon: {}", e))?,
-            ),
+
+        // Use dedup tables for page_icon and visible_links
+        let page_icon_id: Option<i64> = match &request.page_icon {
+            Some(value) if !value.is_empty() => Some(Self::get_or_create_page_icon(conn, value)?),
             _ => None,
         };
-        let visible_links_enc = match &request.visible_links {
-            Some(links) if !links.is_empty() => {
-                let json = serde_json::to_string(links)
-                    .map_err(|e| format!("Failed to serialize visible_links: {}", e))?;
-                Some(
-                    encrypt_with_master_key(&row_key, json.as_bytes())
-                        .map_err(|e| format!("Failed to encrypt visible_links: {}", e))?,
-                )
-            }
+        let link_set_id: Option<i64> = match &request.visible_links {
+            Some(links) if !links.is_empty() => Some(Self::get_or_create_link_set(conn, links)?),
             _ => None,
         };
 
@@ -408,7 +392,7 @@ impl StorageState {
                 window_title, process_name, metadata,
                 window_title_enc, process_name_enc, metadata_enc,
                 content_key_encrypted, status,
-                source, page_url_enc, page_icon_enc, visible_links_enc
+                source, page_url_enc, page_icon_id, link_set_id
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 &image_path_str,
@@ -425,8 +409,8 @@ impl StorageState {
                 "pending",
                 request.source.as_deref(),
                 page_url_enc,
-                page_icon_enc,
-                visible_links_enc,
+                page_icon_id,
+                link_set_id,
             ],
         )
         .map_err(|e| format!("Failed to insert screenshot: {}", e))?;
@@ -713,15 +697,19 @@ impl StorageState {
             };
 
             let sql = format!(
-                "SELECT id, image_path, image_hash, width, height,
-                        window_title, process_name, metadata,
-                        window_title_enc, process_name_enc, metadata_enc,
-                        content_key_encrypted,
-                        strftime('%s', created_at) as timestamp, created_at,
-                        source, page_url_enc, page_icon_enc, visible_links_enc
-                 FROM screenshots
-                 WHERE created_at BETWEEN '{}' AND '{}'
-                 ORDER BY created_at ASC{}",
+                "SELECT s.id, s.image_path, s.image_hash, s.width, s.height,
+                        s.window_title, s.process_name, s.metadata,
+                        s.window_title_enc, s.process_name_enc, s.metadata_enc,
+                        s.content_key_encrypted,
+                        strftime('%s', s.created_at) as timestamp, s.created_at,
+                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        pi.icon_enc, pi.icon_key_encrypted,
+                        ls.links_enc, ls.links_key_encrypted
+                 FROM screenshots s
+                 LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
+                 LEFT JOIN link_sets ls ON s.link_set_id = ls.id
+                 WHERE s.created_at BETWEEN '{}' AND '{}'
+                 ORDER BY s.created_at ASC{}",
                 start_dt, end_dt, limit_clause
             );
 
@@ -768,13 +756,18 @@ impl StorageState {
             let conn = guard.as_ref().unwrap();
 
             let sql = format!(
-                "SELECT id, image_path, image_hash, width, height,
-                        window_title, process_name, metadata,
-                        window_title_enc, process_name_enc, metadata_enc,
-                        content_key_encrypted,
-                        strftime('%s', created_at) as timestamp, created_at,
-                        source, page_url_enc, page_icon_enc, visible_links_enc
-                 FROM screenshots WHERE id = {}",
+                "SELECT s.id, s.image_path, s.image_hash, s.width, s.height,
+                        s.window_title, s.process_name, s.metadata,
+                        s.window_title_enc, s.process_name_enc, s.metadata_enc,
+                        s.content_key_encrypted,
+                        strftime('%s', s.created_at) as timestamp, s.created_at,
+                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        pi.icon_enc, pi.icon_key_encrypted,
+                        ls.links_enc, ls.links_key_encrypted
+                 FROM screenshots s
+                 LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
+                 LEFT JOIN link_sets ls ON s.link_set_id = ls.id
+                 WHERE s.id = {}",
                 id
             );
 
@@ -899,6 +892,8 @@ impl StorageState {
                 Ordering::Relaxed,
                 |v| Some(v.saturating_sub(ocr_count as u64)),
             );
+            // Clean up orphaned dedup entries
+            let _ = Self::cleanup_orphaned_dedup_entries(conn);
         }
 
         Ok(deleted > 0)
@@ -955,6 +950,8 @@ impl StorageState {
                 Ordering::Relaxed,
                 |v| Some(v.saturating_sub(ocr_count as u64)),
             );
+            // Clean up orphaned dedup entries
+            let _ = Self::cleanup_orphaned_dedup_entries(conn);
         }
 
         // Try to delete image files
@@ -964,5 +961,340 @@ impl StorageState {
         }
 
         Ok(deleted as i32)
+    }
+
+    /// Canonicalize a list of visible links into a deterministic JSON string.
+    /// Links are sorted by (url, text) to ensure the same set always produces the same hash.
+    fn canonicalize_links(links: &[super::VisibleLink]) -> String {
+        let mut sorted: Vec<(&str, &str)> = links.iter().map(|l| (l.url.as_str(), l.text.as_str())).collect();
+        sorted.sort();
+        serde_json::to_string(&sorted).unwrap_or_default()
+    }
+
+    /// Get or create a page_icon dedup entry. Returns the row ID.
+    /// Uses INSERT OR IGNORE + SELECT pattern for atomic upsert.
+    fn get_or_create_page_icon(
+        conn: &Connection,
+        plaintext: &str,
+    ) -> Result<i64, String> {
+        let content_hash = Self::compute_hmac_hash(plaintext);
+
+        // Try to find existing entry first (fast path)
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM page_icons WHERE content_hash = ?",
+                params![&content_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to query page_icons: {}", e))?;
+
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+
+        // Encrypt with its own independent row key
+        let mut row_key = vec![0u8; 32];
+        rand::thread_rng().fill_bytes(&mut row_key);
+
+        let icon_enc = encrypt_with_master_key(&row_key, plaintext.as_bytes())
+            .map_err(|e| format!("Failed to encrypt page_icon: {}", e))?;
+        let icon_key_encrypted = encrypt_row_key_with_cng(&row_key)
+            .map_err(|e| format!("Failed to wrap page_icon row key: {}", e))?;
+
+        Self::zeroize_bytes(&mut row_key);
+
+        // INSERT OR IGNORE handles race conditions
+        conn.execute(
+            "INSERT OR IGNORE INTO page_icons (content_hash, icon_enc, icon_key_encrypted) VALUES (?, ?, ?)",
+            params![&content_hash, &icon_enc, &icon_key_encrypted],
+        )
+        .map_err(|e| format!("Failed to insert page_icon: {}", e))?;
+
+        // SELECT the id (whether we just inserted or it was already there)
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM page_icons WHERE content_hash = ?",
+                params![&content_hash],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to get page_icon id: {}", e))?;
+
+        Ok(id)
+    }
+
+    /// Get or create a link_set dedup entry. Returns the row ID.
+    fn get_or_create_link_set(
+        conn: &Connection,
+        links: &[super::VisibleLink],
+    ) -> Result<i64, String> {
+        let canonical = Self::canonicalize_links(links);
+        let content_hash = Self::compute_hmac_hash(&canonical);
+
+        // Try to find existing entry first (fast path)
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM link_sets WHERE content_hash = ?",
+                params![&content_hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to query link_sets: {}", e))?;
+
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+
+        // Encrypt the original JSON (not canonical) for faithful reconstruction
+        let json = serde_json::to_string(links)
+            .map_err(|e| format!("Failed to serialize visible_links: {}", e))?;
+
+        let mut row_key = vec![0u8; 32];
+        rand::thread_rng().fill_bytes(&mut row_key);
+
+        let links_enc = encrypt_with_master_key(&row_key, json.as_bytes())
+            .map_err(|e| format!("Failed to encrypt link_set: {}", e))?;
+        let links_key_encrypted = encrypt_row_key_with_cng(&row_key)
+            .map_err(|e| format!("Failed to wrap link_set row key: {}", e))?;
+
+        Self::zeroize_bytes(&mut row_key);
+
+        conn.execute(
+            "INSERT OR IGNORE INTO link_sets (content_hash, links_enc, links_key_encrypted, link_count) VALUES (?, ?, ?, ?)",
+            params![&content_hash, &links_enc, &links_key_encrypted, links.len() as i64],
+        )
+        .map_err(|e| format!("Failed to insert link_set: {}", e))?;
+
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM link_sets WHERE content_hash = ?",
+                params![&content_hash],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to get link_set id: {}", e))?;
+
+        Ok(id)
+    }
+
+    /// Clean up orphaned page_icons and link_sets entries after screenshot deletion.
+    fn cleanup_orphaned_dedup_entries(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(
+            "DELETE FROM page_icons WHERE id NOT IN (SELECT DISTINCT page_icon_id FROM screenshots WHERE page_icon_id IS NOT NULL);
+             DELETE FROM link_sets WHERE id NOT IN (SELECT DISTINCT link_set_id FROM screenshots WHERE link_set_id IS NOT NULL);"
+        )
+        .map_err(|e| format!("Failed to cleanup orphaned dedup entries: {}", e))?;
+        Ok(())
+    }
+
+    /// Migrate existing inline page_icon_enc / visible_links_enc data into dedup tables.
+    ///
+    /// Processes rows in batches: for each row with inline data but no dedup reference,
+    /// decrypts the inline blob, creates/reuses a dedup entry, sets the FK, and NULLs
+    /// the inline column. Safe to call multiple times (idempotent).
+    pub fn migrate_inline_to_dedup(&self) -> Result<(usize, usize), String> {
+        const BATCH_SIZE: i64 = 100;
+        let mut migrated_icons: usize = 0;
+        let mut migrated_links: usize = 0;
+
+        loop {
+            let mut guard = self.get_connection_named("migrate_inline_to_dedup")?;
+            let conn = guard.as_mut().unwrap();
+
+            // Fetch a batch of rows that still have inline page_icon_enc but no dedup ref
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, page_icon_enc, content_key_encrypted
+                     FROM screenshots
+                     WHERE page_icon_enc IS NOT NULL AND page_icon_id IS NULL
+                     LIMIT ?",
+                )
+                .map_err(|e| format!("Failed to prepare migration query (icons): {}", e))?;
+
+            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt
+                .query_map(params![BATCH_SIZE], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|e| format!("Failed to query migration rows (icons): {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            if rows.is_empty() {
+                break;
+            }
+
+            for (id, icon_enc, content_key_enc) in &rows {
+                // Decrypt inline data using the screenshot's row key
+                let row_key = match decrypt_row_key_with_cng(content_key_enc) {
+                    Ok(k) => k,
+                    Err(_) => {
+                        tracing::warn!("migrate_inline_to_dedup: failed to decrypt row key for screenshot id={}", id);
+                        continue;
+                    }
+                };
+                let plaintext = match decrypt_with_master_key(&row_key, icon_enc) {
+                    Ok(d) => match String::from_utf8(d) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                };
+
+                if plaintext.is_empty() {
+                    // Just NULL the inline column for empty values
+                    let _ = conn.execute(
+                        "UPDATE screenshots SET page_icon_enc = NULL WHERE id = ?",
+                        params![id],
+                    );
+                    continue;
+                }
+
+                // Create/reuse dedup entry and update screenshot
+                match Self::get_or_create_page_icon(conn, &plaintext) {
+                    Ok(icon_id) => {
+                        conn.execute(
+                            "UPDATE screenshots SET page_icon_id = ?, page_icon_enc = NULL WHERE id = ?",
+                            params![icon_id, id],
+                        )
+                        .map_err(|e| format!("Failed to update screenshot {}: {}", id, e))?;
+                        migrated_icons += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!("migrate_inline_to_dedup: failed to create page_icon for screenshot id={}: {}", id, e);
+                    }
+                }
+            }
+
+            // If we got fewer than BATCH_SIZE, we're done
+            if (rows.len() as i64) < BATCH_SIZE {
+                break;
+            }
+        }
+
+        // Now migrate visible_links_enc
+        loop {
+            let mut guard = self.get_connection_named("migrate_inline_to_dedup")?;
+            let conn = guard.as_mut().unwrap();
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, visible_links_enc, content_key_encrypted
+                     FROM screenshots
+                     WHERE visible_links_enc IS NOT NULL AND link_set_id IS NULL
+                     LIMIT ?",
+                )
+                .map_err(|e| format!("Failed to prepare migration query (links): {}", e))?;
+
+            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt
+                .query_map(params![BATCH_SIZE], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|e| format!("Failed to query migration rows (links): {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            if rows.is_empty() {
+                break;
+            }
+
+            for (id, links_enc, content_key_enc) in &rows {
+                let row_key = match decrypt_row_key_with_cng(content_key_enc) {
+                    Ok(k) => k,
+                    Err(_) => {
+                        tracing::warn!("migrate_inline_to_dedup: failed to decrypt row key for screenshot id={}", id);
+                        continue;
+                    }
+                };
+                let plaintext = match decrypt_with_master_key(&row_key, links_enc) {
+                    Ok(d) => match String::from_utf8(d) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                };
+
+                if plaintext.is_empty() {
+                    let _ = conn.execute(
+                        "UPDATE screenshots SET visible_links_enc = NULL WHERE id = ?",
+                        params![id],
+                    );
+                    continue;
+                }
+
+                // Parse links JSON
+                let links: Vec<super::VisibleLink> = match serde_json::from_str(&plaintext) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tracing::warn!("migrate_inline_to_dedup: failed to parse visible_links JSON for screenshot id={}", id);
+                        continue;
+                    }
+                };
+
+                if links.is_empty() {
+                    let _ = conn.execute(
+                        "UPDATE screenshots SET visible_links_enc = NULL WHERE id = ?",
+                        params![id],
+                    );
+                    continue;
+                }
+
+                match Self::get_or_create_link_set(conn, &links) {
+                    Ok(set_id) => {
+                        conn.execute(
+                            "UPDATE screenshots SET link_set_id = ?, visible_links_enc = NULL WHERE id = ?",
+                            params![set_id, id],
+                        )
+                        .map_err(|e| format!("Failed to update screenshot {}: {}", id, e))?;
+                        migrated_links += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!("migrate_inline_to_dedup: failed to create link_set for screenshot id={}: {}", id, e);
+                    }
+                }
+            }
+
+            if (rows.len() as i64) < BATCH_SIZE {
+                break;
+            }
+        }
+
+        if migrated_icons > 0 || migrated_links > 0 {
+            tracing::info!(
+                "[DEDUP:MIGRATE] Migrated {} page_icons, {} link_sets from inline to dedup tables",
+                migrated_icons,
+                migrated_links
+            );
+        }
+
+        Ok((migrated_icons, migrated_links))
+    }
+
+    /// Attempt dedup migration if not already done this session.
+    /// Should be called after user authentication succeeds.
+    /// Uses compare_exchange to ensure it only runs once.
+    pub fn try_dedup_migration(&self) {
+        // Only run once per session
+        if self.dedup_migrated.compare_exchange(
+            false, true,
+            Ordering::SeqCst, Ordering::SeqCst,
+        ).is_err() {
+            return;
+        }
+
+        let t0 = std::time::Instant::now();
+        match self.migrate_inline_to_dedup() {
+            Ok((icons, links)) => {
+                if icons > 0 || links > 0 {
+                    tracing::info!(
+                        "[DEDUP:MIGRATE] Completed in {:?} ({} icons, {} link_sets)",
+                        t0.elapsed(), icons, links
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[DEDUP:MIGRATE] Migration failed (non-fatal): {}", e);
+                // Reset flag so it can be retried on next auth
+                self.dedup_migrated.store(false, Ordering::SeqCst);
+            }
+        }
     }
 }

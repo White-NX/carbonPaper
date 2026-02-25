@@ -45,6 +45,8 @@ pub struct StorageState {
     lock_holder: Mutex<&'static str>,
     /// Approximate OCR row count for O(1) IDF lookups (initialized from DB, maintained on insert/delete)
     ocr_row_count: AtomicU64,
+    /// Whether dedup migration has already been performed this session
+    dedup_migrated: AtomicBool,
 }
 
 impl StorageState {
@@ -61,6 +63,7 @@ impl StorageState {
             migration_in_progress: AtomicBool::new(false),
             lock_holder: Mutex::new(""),
             ocr_row_count: AtomicU64::new(0),
+            dedup_migrated: AtomicBool::new(false),
         }
     }
 
