@@ -295,7 +295,7 @@ export const listProcesses = async () => {
 export const getScreenshotDetails = async (id, path = null) => {
     try {
         // 直接使用 Rust 存储层 API
-        const response = await invoke('storage_get_screenshot_details', { id });
+        const response = await invoke('storage_get_screenshot_details', { id, path });
         if (response.error) {
             console.error("Details error:", response.error);
             return { error: response.error };

@@ -15,16 +15,33 @@ impl StorageState {
             let guard = self.get_connection_named("read_image")?;
             let conn = guard.as_ref().unwrap();
 
-            let key: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT content_key_encrypted FROM screenshots WHERE image_path = ?",
-                    [path],
-                    |row| row.get(0),
-                )
-                .ok();
+            if path.starts_with("memory://") {
+                // 旧数据兼容：从 memory:// 中提取 hash 查找
+                let hash = &path["memory://".len()..];
+                let result: Option<(Option<Vec<u8>>, String)> = conn
+                    .query_row(
+                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ?",
+                        [hash],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .ok();
+                match result {
+                    Some((key, real_path)) => (key, self.resolve_image_path(&real_path)),
+                    None => return Err(format!("No screenshot found for hash: {}", hash)),
+                }
+            } else {
+                // 正常路径查找（原有逻辑）
+                let key: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ?",
+                        [path],
+                        |row| row.get(0),
+                    )
+                    .ok();
 
-            let resolved = self.resolve_image_path(path);
-            (key, resolved)
+                let resolved = self.resolve_image_path(path);
+                (key, resolved)
+            }
             // guard dropped here, mutex released
         };
 
