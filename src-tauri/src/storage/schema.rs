@@ -156,6 +156,25 @@ impl StorageState {
             CREATE INDEX IF NOT EXISTS idx_created_at ON screenshots(created_at);
             CREATE INDEX IF NOT EXISTS idx_process_name ON screenshots(process_name);
 
+            -- Content-addressed dedup table for favicons
+            CREATE TABLE IF NOT EXISTS page_icons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_hash TEXT UNIQUE NOT NULL,
+                icon_enc BLOB NOT NULL,
+                icon_key_encrypted BLOB NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Content-addressed dedup table for link sets
+            CREATE TABLE IF NOT EXISTS link_sets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_hash TEXT UNIQUE NOT NULL,
+                links_enc BLOB NOT NULL,
+                links_key_encrypted BLOB NOT NULL,
+                link_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             -- Enable foreign key constraints
             PRAGMA foreign_keys = ON;
             "#,
@@ -185,6 +204,10 @@ impl StorageState {
         Self::add_column_if_missing(conn, "screenshots", "page_url_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "screenshots", "page_icon_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "screenshots", "visible_links_enc", "BLOB")?;
+
+        // Content-addressed dedup references
+        Self::add_column_if_missing(conn, "screenshots", "page_icon_id", "INTEGER")?;
+        Self::add_column_if_missing(conn, "screenshots", "link_set_id", "INTEGER")?;
 
         Ok(())
     }
