@@ -805,7 +805,7 @@ class ScreenshotOCRWorker:
         # 应用偏移与限制
         result = filtered[int(offset): int(offset) + int(n_results)]
 
-        if _t_total > 5.0:
+        if (_time.perf_counter() - _t_total) > 5.0:
             logger.warning(
                 "[DIAG:search_nl] vector_search=%.3fs filter=%.3fs "
                 "db_queries=%d raw=%d filtered=%d returned=%d total=%.3fs",

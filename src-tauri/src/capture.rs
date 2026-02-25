@@ -840,6 +840,8 @@ pub async fn run_capture_loop(
         // Hash the combination of window title for identity and privacy protection
         std::hash::Hash::hash(&window_title, &mut s);
 
+        let title_hash = std::hash::Hasher::finish(&s);
+
         tracing::info!(
             "[{}] Captured ({}): {} bytes, {}x{} - {} ({})",
             ts_str,
@@ -847,7 +849,7 @@ pub async fn run_capture_loop(
             captured.jpeg_bytes.len(),
             captured.width,
             captured.height,
-            &window_title,
+            &title_hash,
             &process_name
         );
 
