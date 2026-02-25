@@ -572,7 +572,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     from screenshot_worker import ScreenshotOCRWorker
 
     # 初始化并启动 OCR 工作进程
-    logger.info("正在启动 OCR 工作进程...")
+    logger.info("Initalizing OCR worker...")
     _ocr_worker = ScreenshotOCRWorker(
         screenshot_dir=os.path.join(get_data_dir(), 'screenshots'),
         db_path=os.path.join(get_data_dir(), 'ocr_data.db'),

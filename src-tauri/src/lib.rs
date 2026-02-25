@@ -221,19 +221,38 @@ async fn storage_get_image(
 async fn storage_get_screenshot_details(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
-    id: i64,
+    id: Option<i64>,
+    path: Option<String>,
 ) -> Result<serde_json::Value, String> {
     // 检查认证状态
     check_auth_required(&credential_state)?;
-    
-    let record = state.get_screenshot_by_id(id)?;
-    let ocr_results = state.get_screenshot_ocr_results(id)?;
-    
-    Ok(serde_json::json!({
-        "status": "success",
-        "record": record,
-        "ocr_results": ocr_results
-    }))
+
+    // 优先按 id 查找，其次按 path 查找
+    let record = if let Some(id) = id {
+        state.get_screenshot_by_id(id)?
+    } else if let Some(ref p) = path {
+        state.get_screenshot_by_image_path(p)?
+    } else {
+        return Err("Either id or path must be provided".into());
+    };
+
+    match &record {
+        Some(r) => {
+            let ocr_results = state.get_screenshot_ocr_results(r.id)?;
+            Ok(serde_json::json!({
+                "status": "success",
+                "record": record,
+                "ocr_results": ocr_results
+            }))
+        }
+        None => {
+            Ok(serde_json::json!({
+                "status": "not_found",
+                "record": null,
+                "ocr_results": []
+            }))
+        }
+    }
 }
 
 #[tauri::command]

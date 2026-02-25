@@ -833,14 +833,24 @@ pub async fn run_capture_loop(
 
         let ts_str = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
 
+        let mut s = std::collections::hash_map::DefaultHasher::new();
+
+        let window_title = &window_info.title.chars().take(50).collect::<String>();
+
+        // Hash the combination of window title for identity and privacy protection
+        std::hash::Hash::hash(&window_title, &mut s);
+
+        let title_hash = std::hash::Hasher::finish(&s);
+
         tracing::info!(
-            "[{}] Captured ({}): {} bytes, {}x{} - {}",
+            "[{}] Captured ({}): {} bytes, {}x{} - {} ({})",
             ts_str,
             scan_reason,
             captured.jpeg_bytes.len(),
             captured.width,
             captured.height,
-            &window_info.title.chars().take(50).collect::<String>()
+            &title_hash,
+            &process_name
         );
 
         // Build metadata

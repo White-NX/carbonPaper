@@ -65,24 +65,24 @@ class ScreenshotOCRWorker:
             logger.info("存储客户端已初始化: %s", storage_pipe)
         
         # 初始化组件
-        logger.info("初始化OCR引擎...")
+        logger.info("Initalizing OCR engine...")
         try:
             self.ocr_engine = get_ocr_engine()
-            logger.info("OCR引擎实例已获取")
+            logger.info("OCR engine initialized successfully.")
         except Exception as e:
-            logger.error("OCR引擎初始化失败: %s", e)
+            logger.error("OCR Engine initalized failed: %s", e)
             import traceback
-            logger.exception("OCR引擎初始化异常")
+            logger.exception("OCR Engine initialization ERROR")
             raise
         
         # 数据库处理器（当没有存储客户端时使用本地数据库）
-        logger.info("初始化数据库处理器...")
+        logger.info("Initalizing local database handler...")
         self.db_handler = OCRDatabaseHandler(db_path)
         
         self.enable_vector_store = enable_vector_store
         self.vector_store: Optional[VectorStore] = None
         if enable_vector_store:
-            logger.info("初始化向量存储...")
+            logger.info("Initalizing vector store...")
             self.vector_store = VectorStore(
                 collection_name="screenshots",
                 persist_directory=vector_db_path,
@@ -293,13 +293,15 @@ class ScreenshotOCRWorker:
             
             # 保存到向量存储（用于语义搜索）
             if self.enable_vector_store and self.vector_store:
-                screenshot_id_val = result['db_result'].get('screenshot_id') if result['db_result'] else None
+                screenshot_id_val = screenshot_id  # 直接使用已有变量（来自 save_screenshot_temp）
+                real_image_path = (result['db_result'].get('image_path')
+                                   if result.get('db_result') else None) or f"memory://{image_hash}"
                 try:
                     import datetime
                     created_at_value = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
                     vector_id = self.vector_store.add_image(
-                        image_path=f"memory://{image_hash}",  # 虚拟路径标识
+                        image_path=real_image_path,
                         image=image_pil,
                         metadata={
                             'window_title': window_title or '',
@@ -803,13 +805,14 @@ class ScreenshotOCRWorker:
         # 应用偏移与限制
         result = filtered[int(offset): int(offset) + int(n_results)]
 
-        logger.warning(
-            "[DIAG:search_nl] vector_search=%.3fs filter=%.3fs "
-            "db_queries=%d raw=%d filtered=%d returned=%d total=%.3fs",
-            _t_vector_search, _t_filter,
-            _db_query_count, len(raw_results), len(filtered), len(result),
-            _time.perf_counter() - _t_total
-        )
+        if (_time.perf_counter() - _t_total) > 5.0:
+            logger.warning(
+                "[DIAG:search_nl] vector_search=%.3fs filter=%.3fs "
+                "db_queries=%d raw=%d filtered=%d returned=%d total=%.3fs",
+                _t_vector_search, _t_filter,
+                _db_query_count, len(raw_results), len(filtered), len(result),
+                _time.perf_counter() - _t_total
+            )
         return result
 
     def list_processes(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:

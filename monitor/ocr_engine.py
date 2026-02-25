@@ -124,17 +124,17 @@ class OCREngine:
         if det_model_dir and os.path.exists(det_model_dir):
             init_params['det_model_dir'] = det_model_dir
         elif det_model_dir:
-            logger.warning("det_model_dir 不存在，将使用默认下载路径: %s", det_model_dir)
+            logger.warning("det_model_dir NOT FOUND, using default download path: %s", det_model_dir)
 
         if rec_model_dir and os.path.exists(rec_model_dir):
             init_params['rec_model_dir'] = rec_model_dir
         elif rec_model_dir:
-            logger.warning("rec_model_dir 不存在，将使用默认下载路径: %s", rec_model_dir)
+            logger.warning("rec_model_dir NOT FOUND, using default download path: %s", rec_model_dir)
 
         if cls_model_dir and os.path.exists(cls_model_dir):
             init_params['cls_model_dir'] = cls_model_dir
         elif cls_model_dir:
-            logger.warning("cls_model_dir 不存在，将禁用方向分类器: %s", cls_model_dir)
+            logger.warning("cls_model_dir NOT FOUND, disabling angle classification: %s", cls_model_dir)
             init_params['use_angle_cls'] = False
             
         # 使用锁确保并发下只会初始化一次
@@ -149,18 +149,18 @@ class OCREngine:
                     init_params['dml_device_id'] = self._dml_device_id
                 self.ocr = RapidPaddleOCR(**init_params)
             except Exception as e:
-                logger.error("使用 %s 初始化 RapidOCR 失败: %s", ocr_version, e)
+                logger.error("Using %s to initialize RapidOCR FAILED: %s", ocr_version, e)
                 if 'ocr_version' in init_params:
                      del init_params['ocr_version']
                 try:
                     init_params['cpu_threads'] = 1
                     self.ocr = RapidPaddleOCR(**init_params)
                 except Exception as e2:
-                    logger.error("重试初始化失败: %s", e2)
+                    logger.error("Retry to initialize RapidOCR FAILED: %s", e2)
                     raise e2
 
             self._initialized = True
-            logger.info("OCR 初始化完成 (DirectML=%s)", self._use_dml)
+            logger.info("OCR initialized successfully (DirectML=%s)", self._use_dml)
 
     def close(self) -> None:
         """显式释放 OCR 实例并清理内存。
@@ -201,13 +201,13 @@ class OCREngine:
         # 使用推理锁，防止并发导致重复创建或竞态
         with self._inference_lock:
             try:
-                logger.info("[OCR Engine] 调用 PaddleOCR.predict()，图像尺寸: %s", image_np.shape if hasattr(image_np, 'shape') else 'unknown')
+                logger.info("[OCR Engine] Using PaddleOCR.predict()，Image Size: %s", image_np.shape if hasattr(image_np, 'shape') else 'unknown')
                 # PaddleOCR 3.x 不再支持在 ocr() 调用时传入 cls 参数
                 # 角度分类器在初始化时通过 use_angle_cls 控制
                 result = self.ocr.predict(image_np)
-                logger.info("[OCR Engine] PaddleOCR.predict() 返回: %s, 长度: %s", type(result), len(result) if result else 'None')
+                logger.info("[OCR Engine] PaddleOCR.predict() return: %s, length: %s", type(result), len(result) if result else 'None')
             except Exception as ocr_err:
-                logger.exception("[OCR Engine] PaddleOCR.predict() 异常: %s", ocr_err)
+                logger.exception("[OCR Engine] PaddleOCR.predict() ERROR: %s", ocr_err)
                 return []
 
         if not result or result[0] is None or not isinstance(result[0], (dict, list)):
@@ -282,17 +282,17 @@ class OCREngine:
                             'confidence': confidence
                         })
                 except Exception as parse_err:
-                    logger.error("[OCR Engine] 解析 OCR 结果行失败: %s", parse_err)
+                    logger.error("[OCR Engine] Reasoning OCR result line failed: %s", parse_err)
                     continue
         else:
-            logger.warning("[OCR Engine] 未知的 page_result 格式: %s", type(page_result))
+            logger.warning("[OCR Engine] Unknown page_result format: %s", type(page_result))
         
         try:
             elapse = self.ocr.get_last_elapse()
             elapse_total = elapse[2] if isinstance(elapse, (list, tuple)) and len(elapse) > 2 else 0.0
         except Exception:
             elapse_total = 0.0
-        logger.info("[OCR Engine] 解析完成，得到 %d 个文本块，OCR任务用时 %.3f 秒", len(ocr_results), elapse_total)
+        logger.info("[OCR Engine] Reasoning Complete, got %d text block, used %.3f seconds", len(ocr_results), elapse_total)
 
         # 清理临时对象
         try:

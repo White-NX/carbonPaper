@@ -802,6 +802,70 @@ impl StorageState {
         }
     }
 
+    /// Get a screenshot by image_path (or by image_hash if path starts with "memory://").
+    pub fn get_screenshot_by_image_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<ScreenshotRecord>, String> {
+        tracing::debug!("get_screenshot_by_image_path called with path={}", path);
+
+        let raw_row = {
+            let guard = self.get_connection_named("get_screenshot_by_image_path")?;
+            let conn = guard.as_ref().unwrap();
+
+            let (where_clause, param_value): (&str, String) = if path.starts_with("memory://") {
+                let hash = &path["memory://".len()..];
+                ("WHERE s.image_hash = ?", hash.to_string())
+            } else {
+                ("WHERE s.image_path = ?", path.to_string())
+            };
+
+            let sql = format!(
+                "SELECT s.id, s.image_path, s.image_hash, s.width, s.height,
+                        s.window_title, s.process_name, s.metadata,
+                        s.window_title_enc, s.process_name_enc, s.metadata_enc,
+                        s.content_key_encrypted,
+                        strftime('%s', s.created_at) as timestamp, s.created_at,
+                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        pi.icon_enc, pi.icon_key_encrypted,
+                        ls.links_enc, ls.links_key_encrypted
+                 FROM screenshots s
+                 LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
+                 LEFT JOIN link_sets ls ON s.link_set_id = ls.id
+                 {}",
+                where_clause
+            );
+
+            let result =
+                conn.query_row(&sql, [&param_value], |row| RawScreenshotRow::from_row(row));
+
+            match result {
+                Ok(raw) => Some(raw),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    tracing::debug!("No record found for path={}", path);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    tracing::error!("Query error for path={}: {}", path, e);
+                    return Err(format!("Failed to get screenshot by path: {}", e));
+                }
+            }
+        };
+
+        match raw_row {
+            Some(raw) => {
+                let record = raw.into_record();
+                tracing::debug!(
+                    "Found record id={}, image_path={}",
+                    record.id,
+                    record.image_path
+                );
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Get OCR results for a screenshot.
     pub fn get_screenshot_ocr_results(
         &self,
