@@ -157,6 +157,15 @@ function App() {
         }
         setSelectedDetails(det);
 
+        // 从 DB 记录中获取权威时间戳，修正时间线跳转位置
+        const recordCreatedAt = det?.record?.created_at;
+        if (recordCreatedAt) {
+          const dbTimestampMs = normalizeTimestampToMs(recordCreatedAt, { assumeUtc: true });
+          if (dbTimestampMs) {
+            setTimelineJump({ time: dbTimestampMs, ts: Date.now() });
+          }
+        }
+
         // Then get image
         const img = await fetchImage(targetId, targetPath);
         console.log("Received image:", img ? "base64 data received" : "null");

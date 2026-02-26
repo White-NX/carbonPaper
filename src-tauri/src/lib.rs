@@ -1,26 +1,26 @@
-mod autostart;
 mod analysis;
+mod autostart;
 mod capture;
 mod credential_manager;
 mod logging;
+mod model_management;
 mod monitor;
 mod native_messaging;
 mod python;
 mod registry_config;
 mod resource_utils;
-mod model_management;
 mod reverse_ipc;
 mod storage;
 mod updater;
 
-use autostart::{get_autostart_status, set_autostart};
 use analysis::AnalysisState;
+use autostart::{get_autostart_status, set_autostart};
 use capture::CaptureState;
 use credential_manager::CredentialManagerState;
 use monitor::MonitorState;
-use storage::StorageState;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use storage::StorageState;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Emitter;
@@ -138,8 +138,16 @@ async fn storage_get_timeline(
     check_auth_required(&credential_state)?;
 
     // 如果传入的是毫秒级时间戳，转换为秒
-    let start_ts = if start_time > 10_000_000_000.0 { start_time / 1000.0 } else { start_time };
-    let end_ts = if end_time > 10_000_000_000.0 { end_time / 1000.0 } else { end_time };
+    let start_ts = if start_time > 10_000_000_000.0 {
+        start_time / 1000.0
+    } else {
+        start_time
+    };
+    let end_ts = if end_time > 10_000_000_000.0 {
+        end_time / 1000.0
+    } else {
+        end_time
+    };
 
     state.get_screenshots_by_time_range_limited(start_ts, end_ts, max_records.or(Some(500)))
 }
@@ -158,7 +166,7 @@ async fn storage_search(
 ) -> Result<Vec<storage::SearchResult>, String> {
     // 检查认证状态
     check_auth_required(&credential_state)?;
-    
+
     state.search_text(
         &query,
         limit.unwrap_or(20),
@@ -179,7 +187,7 @@ async fn storage_get_image(
 ) -> Result<serde_json::Value, String> {
     // 检查认证状态
     check_auth_required(&credential_state)?;
-    
+
     tracing::debug!("id={:?}, path={:?}", id, path);
 
     let image_path = if let Some(id) = id {
@@ -245,13 +253,11 @@ async fn storage_get_screenshot_details(
                 "ocr_results": ocr_results
             }))
         }
-        None => {
-            Ok(serde_json::json!({
-                "status": "not_found",
-                "record": null,
-                "ocr_results": []
-            }))
-        }
+        None => Ok(serde_json::json!({
+            "status": "not_found",
+            "record": null,
+            "ocr_results": []
+        })),
     }
 }
 
@@ -303,7 +309,10 @@ async fn storage_delete_by_time_range(
     let start_ts = start_time / 1000.0;
     let end_ts = end_time / 1000.0;
     let image_hashes = match state.get_screenshots_by_time_range(start_ts, end_ts) {
-        Ok(records) => records.into_iter().map(|r| r.image_hash).collect::<Vec<_>>(),
+        Ok(records) => records
+            .into_iter()
+            .map(|r| r.image_hash)
+            .collect::<Vec<_>>(),
         Err(e) => {
             tracing::error!("Failed to load hashes: {}", e);
             Vec::new()
@@ -346,12 +355,15 @@ async fn storage_list_processes(
     check_auth_required(&credential_state)?;
 
     let processes = state.list_distinct_processes()?;
-    Ok(processes.into_iter().map(|(name, count)| {
-        serde_json::json!({
-            "process_name": name,
-            "count": count
+    Ok(processes
+        .into_iter()
+        .map(|(name, count)| {
+            serde_json::json!({
+                "process_name": name,
+                "count": count
+            })
         })
-    }).collect())
+        .collect())
 }
 
 #[tauri::command]
@@ -375,7 +387,10 @@ async fn storage_get_public_key(
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<String, String> {
     let key = state.get_public_key()?;
-    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key))
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &key,
+    ))
 }
 
 // ==================== 存储策略（policy）命令 ====================
@@ -395,7 +410,9 @@ async fn storage_set_policy(
 async fn storage_get_policy(
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<serde_json::Value, String> {
-    state.load_policy().map_err(|e| format!("Failed to load policy: {}", e))
+    state
+        .load_policy()
+        .map_err(|e| format!("Failed to load policy: {}", e))
 }
 
 #[tauri::command]
@@ -437,7 +454,7 @@ async fn storage_migrate_plaintext(
 ) -> Result<storage::MigrationResult, String> {
     // 检查认证状态
     check_auth_required(&credential_state)?;
-    
+
     state.migrate_plaintext_screenshots()
 }
 
@@ -486,7 +503,7 @@ async fn storage_delete_plaintext(
 ) -> Result<serde_json::Value, String> {
     // 检查认证状态
     check_auth_required(&credential_state)?;
-    
+
     let deleted = state.delete_plaintext_screenshots()?;
     Ok(serde_json::json!({
         "status": "success",
@@ -499,7 +516,8 @@ fn get_advanced_config() -> Result<serde_json::Value, String> {
     let cpu_limit_enabled = registry_config::get_bool("cpu_limit_enabled").unwrap_or(true);
     let cpu_limit_percent = registry_config::get_u32("cpu_limit_percent").unwrap_or(10);
     let capture_on_ocr_busy = registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
-    let ocr_queue_limit_enabled = registry_config::get_bool("ocr_queue_limit_enabled").unwrap_or(true);
+    let ocr_queue_limit_enabled =
+        registry_config::get_bool("ocr_queue_limit_enabled").unwrap_or(true);
     let ocr_queue_max_size = registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
     let use_dml = registry_config::get_bool("use_dml").unwrap_or(false);
     let dml_device_id = registry_config::get_u32("dml_device_id").unwrap_or(0);
@@ -528,7 +546,10 @@ fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     if let Some(v) = config.get("capture_on_ocr_busy").and_then(|v| v.as_bool()) {
         registry_config::set_bool("capture_on_ocr_busy", v)?;
     }
-    if let Some(v) = config.get("ocr_queue_limit_enabled").and_then(|v| v.as_bool()) {
+    if let Some(v) = config
+        .get("ocr_queue_limit_enabled")
+        .and_then(|v| v.as_bool())
+    {
         registry_config::set_bool("ocr_queue_limit_enabled", v)?;
     }
     if let Some(v) = config.get("ocr_queue_max_size").and_then(|v| v.as_u64()) {
@@ -577,7 +598,7 @@ async fn credential_initialize(
 
         Ok("Credentials initialized successfully".to_string())
     }
-    
+
     #[cfg(not(windows))]
     {
         Err("Windows Hello is only available on Windows".to_string())
@@ -647,7 +668,8 @@ async fn credential_set_session_timeout(
 ) -> Result<(), String> {
     state.set_session_timeout(timeout);
     // 尝试写入注册表作为持久化机制
-    if let Err(e) = crate::registry_config::set_string("session_timeout_secs", &timeout.to_string()) {
+    if let Err(e) = crate::registry_config::set_string("session_timeout_secs", &timeout.to_string())
+    {
         tracing::error!("Failed to persist session_timeout_secs: {}", e);
         // 不要因为持久化失败而使设置失败——仍将会话超时应用于内存状态
     }
@@ -663,20 +685,23 @@ async fn credential_get_session_timeout(
 }
 
 #[tauri::command]
-async fn toggle_game_mode(
-    app: tauri::AppHandle,
-    enabled: bool,
-) -> Result<(), String> {
+async fn toggle_game_mode(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     registry_config::set_bool("game_mode_enabled", enabled)?;
     if enabled {
         monitor::start_game_mode_monitor(app);
     } else {
         // If DirectML was suppressed due to game mode, restart monitor to reapply DirectML settings
         let state = app.state::<MonitorState>();
-        let was_suppressed = state.game_mode_dml_suppressed.load(std::sync::atomic::Ordering::SeqCst);
+        let was_suppressed = state
+            .game_mode_dml_suppressed
+            .load(std::sync::atomic::Ordering::SeqCst);
         monitor::stop_game_mode_monitor(&app);
         if was_suppressed {
-            let _ = monitor::stop_monitor(app.state::<MonitorState>(), app.state::<Arc<CaptureState>>()).await;
+            let _ = monitor::stop_monitor(
+                app.state::<MonitorState>(),
+                app.state::<Arc<CaptureState>>(),
+            )
+            .await;
             let _ = monitor::start_monitor(app.state::<MonitorState>(), app.clone()).await;
         }
     }
@@ -723,12 +748,14 @@ fn set_extension_enhancement(browser: String, enabled: bool) -> Result<(), Strin
 }
 
 #[tauri::command]
-fn get_game_mode_status(
-    app: tauri::AppHandle,
-) -> serde_json::Value {
+fn get_game_mode_status(app: tauri::AppHandle) -> serde_json::Value {
     let state = app.state::<MonitorState>();
-    let active = state.game_mode_dml_suppressed.load(std::sync::atomic::Ordering::SeqCst);
-    let permanent = state.game_mode_permanently_suppressed.load(std::sync::atomic::Ordering::SeqCst);
+    let active = state
+        .game_mode_dml_suppressed
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let permanent = state
+        .game_mode_permanently_suppressed
+        .load(std::sync::atomic::Ordering::SeqCst);
     serde_json::json!({
         "active": active,
         "permanent": permanent,
@@ -748,7 +775,9 @@ fn get_data_dir() -> std::path::PathBuf {
             .unwrap_or_else(|| ".".to_string())
     });
 
-    let cfg_path = std::path::PathBuf::from(&local_appdata).join("CarbonPaper").join("config.json");
+    let cfg_path = std::path::PathBuf::from(&local_appdata)
+        .join("CarbonPaper")
+        .join("config.json");
     if cfg_path.exists() {
         if let Ok(s) = std::fs::read_to_string(&cfg_path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
@@ -762,18 +791,23 @@ fn get_data_dir() -> std::path::PathBuf {
         }
     }
 
-    std::path::PathBuf::from(local_appdata).join("CarbonPaper").join("data")
+    std::path::PathBuf::from(local_appdata)
+        .join("CarbonPaper")
+        .join("data")
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 创建凭证管理器状态
     let data_dir = get_data_dir();
-    let _log_guard = logging::init_logging(&data_dir);  // 最早初始化日志系统
+    let _log_guard = logging::init_logging(&data_dir); // 最早初始化日志系统
 
     let credential_state = Arc::new(CredentialManagerState::new(data_dir.clone()));
-    let storage_state = Arc::new(StorageState::new(data_dir.clone(), credential_state.clone()));
-    
+    let storage_state = Arc::new(StorageState::new(
+        data_dir.clone(),
+        credential_state.clone(),
+    ));
+
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -796,105 +830,135 @@ pub fn run() {
         .setup({
             let data_dir = data_dir.clone();
             move |app| {
-            build_tray(app)?;
+                build_tray(app)?;
 
-            // 应用亚克力磨砂透明效果
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
-            }
-
-            analysis::start_memory_sampler(app.handle().clone());
-            logging::spawn_maintenance_task(data_dir.clone());
-            
-            // 初始化凭据管理器（加载公钥或首次创建）
-            let credential_state = app.state::<Arc<CredentialManagerState>>();
-
-            // 公钥用于弱数据库加密与行级封装
-            let public_key_ready = match credential_manager::load_public_key_from_file(&credential_state) {
-                Ok(public_key) => {
-                    tracing::info!("Public key loaded from file, length: {}", public_key.len());
-                    true
+                // 应用亚克力磨砂透明效果
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
                 }
-                Err(credential_manager::CredentialError::KeyNotFound) => {
-                    tracing::info!("Public key file missing, exporting from CNG...");
 
-                    match credential_manager::export_or_get_public_key(&credential_state) {
+                analysis::start_memory_sampler(app.handle().clone());
+                logging::spawn_maintenance_task(data_dir.clone());
+
+                tracing::info!(
+                    r#"
+ ('-. .-. ('-. (`\ .-') /` _ .-') _ .-') _ ,---.
+( OO ) / _( OO) `.( OO ),' ( \( -O ) ( ( OO) ) | |
+,--. ,--.(,------.,--. ,--. .-'),-----. ,--./ .--. .-'),-----. ,------. ,--. \ .'_ | |
+| | | | | .---'| |.-') | |.-') ( OO' .-. ' | | | ( OO' .-. '| /`. ' | |.-') ,`'--..._)| |
+| .| | | | | | OO ) | | OO )/ | | | | | | | |, / | | | || / | | | | OO )| | \ '| |
+| |(| '--. | |`-' | | |`-' |\_) | |\| | | |.'.| |_)\_) | |\| || |_.' | | |`-' || | ' || .'
+| .-. | | .--'(| '---.'(| '---.' \ | | | | | | \ | | | || . '.'(| '---.'| | / :`--'
+| | | | | `---.| | | | `' '-' '.-. | ,'. | `' '-' '| |\ \ | | | '--' /.--.
+`--' `--' `------'`------' `------' `-----' ',/ '--' '--' `-----' `--' '--' `------' `-------' '--'
+    "#
+                );
+
+                // 初始化凭据管理器（加载公钥或首次创建）
+                let credential_state = app.state::<Arc<CredentialManagerState>>();
+
+                // 公钥用于弱数据库加密与行级封装
+                let public_key_ready =
+                    match credential_manager::load_public_key_from_file(&credential_state) {
                         Ok(public_key) => {
-                            tracing::info!("CNG public key exported, length: {}", public_key.len());
-                            if let Err(e) = credential_manager::save_public_key_to_file(&credential_state, &public_key) {
-                                tracing::error!("Failed to save public key: {}", e);
-                            }
+                            tracing::info!(
+                                "Public key loaded from file, length: {}",
+                                public_key.len()
+                            );
                             true
                         }
+                        Err(credential_manager::CredentialError::KeyNotFound) => {
+                            tracing::info!("Public key file missing, exporting from CNG...");
+
+                            match credential_manager::export_or_get_public_key(&credential_state) {
+                                Ok(public_key) => {
+                                    tracing::info!(
+                                        "CNG public key exported, length: {}",
+                                        public_key.len()
+                                    );
+                                    if let Err(e) = credential_manager::save_public_key_to_file(
+                                        &credential_state,
+                                        &public_key,
+                                    ) {
+                                        tracing::error!("Failed to save public key: {}", e);
+                                    }
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to export CNG public key: {:?}", e);
+                                    false
+                                }
+                            }
+                        }
                         Err(e) => {
-                            tracing::error!("Failed to export CNG public key: {:?}", e);
+                            tracing::error!("Failed to load public key: {:?}", e);
                             false
                         }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to load public key: {:?}", e);
-                    false
-                }
-            };
+                    };
 
-            // 初始化存储（弱加密，不需要认证）
-            let storage = app.state::<Arc<StorageState>>();
-            if public_key_ready {
-                if let Err(e) = storage.initialize() {
-                    tracing::error!("Failed to initialize storage: {}", e);
+                // 初始化存储（弱加密，不需要认证）
+                let storage = app.state::<Arc<StorageState>>();
+                if public_key_ready {
+                    if let Err(e) = storage.initialize() {
+                        tracing::error!("Failed to initialize storage: {}", e);
+                    } else {
+                        // Start background migration to backfill plaintext process_name
+                        let storage_clone = storage.inner().clone();
+                        std::thread::spawn(move || {
+                            StorageState::backfill_plaintext_process_names(storage_clone);
+                        });
+                    }
                 } else {
-                    // Start background migration to backfill plaintext process_name
-                    let storage_clone = storage.inner().clone();
+                    tracing::error!("Storage initialization deferred: public key unavailable");
+                }
+
+                // 如果游戏模式已启用且 DML 已启用，启动 GPU 监控
+                if registry_config::get_bool("game_mode_enabled").unwrap_or(false)
+                    && registry_config::get_bool("use_dml").unwrap_or(false)
+                {
+                    tracing::info!("Restoring game mode monitor on startup");
+                    monitor::start_game_mode_monitor(app.handle().clone());
+                }
+
+                // Sync installed browser extension if source was updated
+                match native_messaging::sync_installed_extension() {
+                    Ok(true) => tracing::info!("Browser extension synced to latest version"),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("Extension sync check failed: {}", e),
+                }
+
+                // Start NMH pipe server for browser extension communication
+                {
+                    let data_dir_clone = data_dir.clone();
+                    let storage_for_nmh = storage.inner().clone();
+                    let capture_for_nmh = app.state::<Arc<CaptureState>>().inner().clone();
+                    let app_handle_for_nmh = app.handle().clone();
                     std::thread::spawn(move || {
-                        StorageState::backfill_plaintext_process_names(storage_clone);
+                        match reverse_ipc::generate_nmh_auth_token(&data_dir_clone) {
+                            Ok(token) => {
+                                let mut nmh_server = reverse_ipc::NmhPipeServer::new();
+                                if let Err(e) = nmh_server.start(
+                                    storage_for_nmh,
+                                    capture_for_nmh,
+                                    app_handle_for_nmh,
+                                    token,
+                                ) {
+                                    tracing::error!("Failed to start NMH pipe server: {}", e);
+                                }
+                                // Keep the server alive by not dropping it
+                                // (it runs in its own thread internally)
+                                std::mem::forget(nmh_server);
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to generate NMH auth token: {}", e);
+                            }
+                        }
                     });
                 }
-            } else {
-                tracing::error!("Storage initialization deferred: public key unavailable");
-            }
 
-            // 如果游戏模式已启用且 DML 已启用，启动 GPU 监控
-            if registry_config::get_bool("game_mode_enabled").unwrap_or(false)
-                && registry_config::get_bool("use_dml").unwrap_or(false)
-            {
-                tracing::info!("Restoring game mode monitor on startup");
-                monitor::start_game_mode_monitor(app.handle().clone());
+                Ok(())
             }
-
-            // Sync installed browser extension if source was updated
-            match native_messaging::sync_installed_extension() {
-                Ok(true) => tracing::info!("Browser extension synced to latest version"),
-                Ok(false) => {}
-                Err(e) => tracing::warn!("Extension sync check failed: {}", e),
-            }
-
-            // Start NMH pipe server for browser extension communication
-            {
-                let data_dir_clone = data_dir.clone();
-                let storage_for_nmh = storage.inner().clone();
-                let capture_for_nmh = app.state::<Arc<CaptureState>>().inner().clone();
-                let app_handle_for_nmh = app.handle().clone();
-                std::thread::spawn(move || {
-                    match reverse_ipc::generate_nmh_auth_token(&data_dir_clone) {
-                        Ok(token) => {
-                            let mut nmh_server = reverse_ipc::NmhPipeServer::new();
-                            if let Err(e) = nmh_server.start(storage_for_nmh, capture_for_nmh, app_handle_for_nmh, token) {
-                                tracing::error!("Failed to start NMH pipe server: {}", e);
-                            }
-                            // Keep the server alive by not dropping it
-                            // (it runs in its own thread internally)
-                            std::mem::forget(nmh_server);
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to generate NMH auth token: {}", e);
-                        }
-                    }
-                });
-            }
-
-            Ok(())
-        }})
+        })
         .invoke_handler(tauri::generate_handler![
             greet,
             close_process,
