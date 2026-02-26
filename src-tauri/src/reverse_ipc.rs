@@ -151,7 +151,7 @@ impl ReverseIpcServer {
                     // 等待客户端连接或关闭信号
                     tokio::select! {
                         _ = shutdown_rx.recv() => {
-                            tracing::info!("Reverse IPC server shutting down");
+                            tracing::info!("Reverse IPC server shutting down, goodbye");
                             break;
                         }
                         result = server.connect() => {

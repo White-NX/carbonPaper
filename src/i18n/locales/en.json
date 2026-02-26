@@ -231,7 +231,7 @@
     },
     "extension": {
       "title": "Browser Extension",
-      "description": "Install the CarbonPaper browser extension to capture viewport screenshots with page metadata (URL, title, visible links).",
+      "description": "Manage browser extension",
       "chrome": {
         "label": "Add to Chrome",
         "registered": "Registered",
@@ -248,7 +248,7 @@
       },
       "enhance": {
         "label": "Extension Enhancement",
-        "description": "Manage browser extension",
+        "description": "Install the CarbonPaper browser extension to capture viewport screenshots with page metadata (URL, title, visible links).",
         "chrome": "Enable Chrome extension enhancement",
         "edge": "Enable Edge extension enhancement"
       },

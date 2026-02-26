@@ -288,6 +288,10 @@ try {{
         Start-Sleep -Seconds 2
     }}
 
+    # Kill NMH processes (browser extension native messaging host)
+    Stop-Process -Name 'carbonpaper-nmh' -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+
     # Test write access; if denied, re-launch with elevation
     $testFile = Join-Path '{app_dir}' '.update_test'
     try {{

@@ -776,23 +776,14 @@ class ScreenshotOCRWorker:
             if normalized_processes and process_name not in normalized_processes:
                 continue
 
-            created_at_str = metadata.get('created_at')
+            created_at_str = metadata.get('created_at') or metadata.get('screenshot_created_at')
             created_ts = _parse_timestamp(created_at_str)
 
-            # 尝试从数据库获取截图真实时间
-            record = None
-            screenshot_id = metadata.get('screenshot_id')
-            try:
-                if screenshot_id and int(screenshot_id) >= 0:
-                    record = self.db_handler.get_screenshot_by_id(int(screenshot_id))
-                    _db_query_count += 1
-            except (ValueError, TypeError):
-                record = None
-
-            if record and record.get('created_at'):
-                metadata['screenshot_created_at'] = record.get('created_at')
-                item['screenshot_created_at'] = record.get('created_at')
-                created_ts = datetime.datetime.strptime(record['created_at'], '%Y-%m-%d %H:%M:%S').timestamp()
+            # 确保 screenshot_created_at 始终设置（前端时间线跳转依赖此字段）
+            if created_at_str:
+                if 'screenshot_created_at' not in metadata:
+                    metadata['screenshot_created_at'] = created_at_str
+                item['screenshot_created_at'] = created_at_str
 
             if start_ts is not None and created_ts is not None and created_ts < start_ts:
                 continue
