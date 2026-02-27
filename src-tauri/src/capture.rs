@@ -508,8 +508,8 @@ fn capture_foreground_window(
         // 4. Compute crop region (window rect relative to monitor)
         let crop_x = (rect.left - mon_rect.left).max(0) as u32;
         let crop_y = (rect.top - mon_rect.top).max(0) as u32;
-        let crop_x2 = ((rect.right - mon_rect.left) as u32).min(full_width);
-        let crop_y2 = ((rect.bottom - mon_rect.top) as u32).min(full_height);
+        let crop_x2 = ((rect.right - mon_rect.left).max(0) as u32).min(full_width);
+        let crop_y2 = ((rect.bottom - mon_rect.top).max(0) as u32).min(full_height);
         let crop_w = crop_x2.saturating_sub(crop_x);
         let crop_h = crop_y2.saturating_sub(crop_y);
 
