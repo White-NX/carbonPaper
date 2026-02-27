@@ -1,6 +1,6 @@
 [package]
 name = "carbonpaper"
-version = "0.5.6"
+version = "0.5.7"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -59,8 +59,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 flate2 = "1"
 window-vibrancy = "0.5"
-xcap = "0.4"
 open = "5"
+windows-capture = "2.0.0-alpha.7"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

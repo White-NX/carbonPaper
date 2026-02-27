@@ -157,12 +157,14 @@ function App() {
         }
         setSelectedDetails(det);
 
-        // 从 DB 记录中获取权威时间戳，修正时间线跳转位置
-        const recordCreatedAt = det?.record?.created_at;
-        if (recordCreatedAt) {
-          const dbTimestampMs = normalizeTimestampToMs(recordCreatedAt, { assumeUtc: true });
-          if (dbTimestampMs) {
-            setTimelineJump({ time: dbTimestampMs, ts: Date.now() });
+        // 仅 NL 搜索结果跳转时，若元数据时间与 DB 权威时间偏差较大则修正
+        if (selectedEvent._fromNlSearch) {
+          const recordCreatedAt = det?.record?.created_at;
+          if (recordCreatedAt) {
+            const dbTimestampMs = normalizeTimestampToMs(recordCreatedAt, { assumeUtc: true });
+            if (dbTimestampMs && Math.abs((selectedEvent.timestamp || 0) - dbTimestampMs) > 5000) {
+              setTimelineJump({ time: dbTimestampMs, ts: Date.now() });
+            }
           }
         }
 
@@ -385,7 +387,7 @@ function App() {
           setSessionTimeout(backendTimeout);
           try {
             localStorage.setItem('sessionTimeout', String(backendTimeout));
-          } catch {}
+          } catch { }
         }
       } catch (err) {
         // 后端不可用或命令缺失：尝试从 localStorage 迁移到后端（若有）
@@ -644,7 +646,8 @@ function App() {
         path: imagePath,
         appName: res.process_name || res.metadata?.process_name,
         windowTitle: res.window_title || res.metadata?.window_title,
-        timestamp: timestampMs ?? Date.now()
+        timestamp: timestampMs ?? Date.now(),
+        _fromNlSearch: isNl
       });
       setHighlightedEventId(screenshotId || -1);
       if (timestampMs) {
@@ -706,112 +709,113 @@ function App() {
       />
 
       <div className={`flex-1 min-h-0 flex flex-col overflow-hidden relative ${isMaximized ? '' : 'mx-[3px] mb-[3px] rounded-md'}`}>
-      <Mask
-        backendStatus={backendStatus}
-        pythonVersion={pythonVersion}
-        backendError={backendError}
-        handleStartBackend={handleStartBackend}
-        onRefreshPythonVersion={refreshPythonVersion}
-        depsNeedUpdate={depsNeedUpdate}
-        depsSyncing={depsSyncing}
-        onDepsSync={handleDepsSync}
-      />
-
-      <AuthMask
-        isVisible={backendStatus === 'online' && pythonVersion && !isAuthenticated}
-        onAuthSuccess={handleAuthSuccess}
-        authError={authError}
-        setAuthError={setAuthError}
-      />
-
-      <DmlSetupWizard
-        isVisible={backendStatus === 'online' && isAuthenticated && showDmlSetup}
-        onComplete={handleDmlSetupComplete}
-      />
-
-      <ExtensionSetupWizard
-        isVisible={backendStatus === 'online' && isAuthenticated && !showDmlSetup && showExtensionSetup}
-        onComplete={handleExtensionSetupComplete}
-      />
-
-      <Timeline
-        onSelectEvent={(evt) => {
-          setSelectedEvent(evt);
-          setHighlightedEventId(evt?.id ?? null);
-        }}
-        onClearHighlight={() => setHighlightedEventId(null)}
-        jumpTimestamp={timelineJump}
-        highlightedEventId={highlightedEventId}
-        refreshKey={timelineRefreshKey}
-      />
-
-      {/* Main Workspace Grid */}
-      <main className="flex-1 flex flex-col md:grid md:grid-cols-[250px_1fr] overflow-hidden relative bg-ide-bg">
-        <LeftSidebar selectedEvent={selectedEvent} selectedDetails={selectedDetails} />
-
-        <MainArea
-          activeTab={activeTab}
-          setActiveTab={setActiveTab}
-          selectedImageSrc={selectedImageSrc}
-          isLoadingDetails={isLoadingDetails}
-          selectedEvent={selectedEvent}
-          selectedDetails={selectedDetails}
-          lastError={lastError}
-          ocrBoxes={ocrBoxes}
-          advancedSearchParams={advancedSearchParams}
-          searchMode={searchMode}
-          onSearchModeChange={setSearchMode}
-          backendOnline={backendStatus === 'online'}
-          onAdvancedSelect={(res) => {
-            const screenshotId = res.screenshot_id !== undefined ? res.screenshot_id : (res.metadata?.screenshot_id);
-            const imagePath = res.image_path || res.metadata?.image_path;
-            const timestamp = res.screenshot_created_at || res.metadata?.screenshot_created_at || res.metadata?.created_at || res.created_at || new Date().toISOString();
-            const isNl = res.similarity !== undefined || res.distance !== undefined || (res.metadata?.screenshot_id !== undefined && res.screenshot_id === undefined);
-            const timestampMs = normalizeTimestampToMs(timestamp, { assumeUtc: !isNl });
-            if (screenshotId !== undefined || imagePath) {
-              setSelectedEvent({
-                id: screenshotId || -1,
-                path: imagePath,
-                appName: res.process_name || res.metadata?.process_name,
-                windowTitle: res.window_title || res.metadata?.window_title,
-                timestamp: timestampMs ?? Date.now()
-              });
-              setHighlightedEventId(screenshotId || -1);
-              if (timestampMs) {
-                setTimelineJump({ time: timestampMs, ts: Date.now() });
-              }
-            }
-            setActiveTab('preview');
-          }}
-          onInspectorBoxClick={(box) => handleCopyText(box.label)}
-          onDeleteRecord={async (id) => {
-            try {
-              await deleteScreenshot(id);
-              setSelectedEvent(null);
-              setSelectedDetails(null);
-              setSelectedImageSrc(null);
-              bumpTimelineRefresh();
-            } catch (e) {
-              console.error('Failed to delete record', e);
-            }
-          }}
-          onDeleteNearbyRecords={async (timestamp, minutes) => {
-            try {
-              const ts = normalizeTimestampToMs(timestamp);
-              if (ts) {
-                await deleteRecordsByTimeRange(minutes, ts);
-              }
-              setSelectedEvent(null);
-              setSelectedDetails(null);
-              setSelectedImageSrc(null);
-              bumpTimelineRefresh();
-            } catch (e) {
-              console.error('Failed to delete nearby records', e);
-            }
-          }}
-          onCopyText={handleCopyText}
+        <Mask
+          backendStatus={backendStatus}
+          pythonVersion={pythonVersion}
+          backendError={backendError}
+          handleStartBackend={handleStartBackend}
+          onRefreshPythonVersion={refreshPythonVersion}
+          depsNeedUpdate={depsNeedUpdate}
+          depsSyncing={depsSyncing}
+          onDepsSync={handleDepsSync}
         />
-      </main>
+
+        <AuthMask
+          isVisible={backendStatus === 'online' && pythonVersion && !isAuthenticated}
+          onAuthSuccess={handleAuthSuccess}
+          authError={authError}
+          setAuthError={setAuthError}
+        />
+
+        <DmlSetupWizard
+          isVisible={backendStatus === 'online' && isAuthenticated && showDmlSetup}
+          onComplete={handleDmlSetupComplete}
+        />
+
+        <ExtensionSetupWizard
+          isVisible={backendStatus === 'online' && isAuthenticated && !showDmlSetup && showExtensionSetup}
+          onComplete={handleExtensionSetupComplete}
+        />
+
+        <Timeline
+          onSelectEvent={(evt) => {
+            setSelectedEvent(evt);
+            setHighlightedEventId(evt?.id ?? null);
+          }}
+          onClearHighlight={() => setHighlightedEventId(null)}
+          jumpTimestamp={timelineJump}
+          highlightedEventId={highlightedEventId}
+          refreshKey={timelineRefreshKey}
+        />
+
+        {/* Main Workspace Grid */}
+        <main className="flex-1 flex flex-col md:grid md:grid-cols-[250px_1fr] overflow-hidden relative bg-ide-bg">
+          <LeftSidebar selectedEvent={selectedEvent} selectedDetails={selectedDetails} />
+
+          <MainArea
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
+            selectedImageSrc={selectedImageSrc}
+            isLoadingDetails={isLoadingDetails}
+            selectedEvent={selectedEvent}
+            selectedDetails={selectedDetails}
+            lastError={lastError}
+            ocrBoxes={ocrBoxes}
+            advancedSearchParams={advancedSearchParams}
+            searchMode={searchMode}
+            onSearchModeChange={setSearchMode}
+            backendOnline={backendStatus === 'online'}
+            onAdvancedSelect={(res) => {
+              const screenshotId = res.screenshot_id !== undefined ? res.screenshot_id : (res.metadata?.screenshot_id);
+              const imagePath = res.image_path || res.metadata?.image_path;
+              const timestamp = res.screenshot_created_at || res.metadata?.screenshot_created_at || res.metadata?.created_at || res.created_at || new Date().toISOString();
+              const isNl = res.similarity !== undefined || res.distance !== undefined || (res.metadata?.screenshot_id !== undefined && res.screenshot_id === undefined);
+              const timestampMs = normalizeTimestampToMs(timestamp, { assumeUtc: !isNl });
+              if (screenshotId !== undefined || imagePath) {
+                setSelectedEvent({
+                  id: screenshotId || -1,
+                  path: imagePath,
+                  appName: res.process_name || res.metadata?.process_name,
+                  windowTitle: res.window_title || res.metadata?.window_title,
+                  timestamp: timestampMs ?? Date.now(),
+                  _fromNlSearch: isNl
+                });
+                setHighlightedEventId(screenshotId || -1);
+                if (timestampMs) {
+                  setTimelineJump({ time: timestampMs, ts: Date.now() });
+                }
+              }
+              setActiveTab('preview');
+            }}
+            onInspectorBoxClick={(box) => handleCopyText(box.label)}
+            onDeleteRecord={async (id) => {
+              try {
+                await deleteScreenshot(id);
+                setSelectedEvent(null);
+                setSelectedDetails(null);
+                setSelectedImageSrc(null);
+                bumpTimelineRefresh();
+              } catch (e) {
+                console.error('Failed to delete record', e);
+              }
+            }}
+            onDeleteNearbyRecords={async (timestamp, minutes) => {
+              try {
+                const ts = normalizeTimestampToMs(timestamp);
+                if (ts) {
+                  await deleteRecordsByTimeRange(minutes, ts);
+                }
+                setSelectedEvent(null);
+                setSelectedDetails(null);
+                setSelectedImageSrc(null);
+                bumpTimelineRefresh();
+              } catch (e) {
+                console.error('Failed to delete nearby records', e);
+              }
+            }}
+            onCopyText={handleCopyText}
+          />
+        </main>
       </div>
 
       <NotificationToast
