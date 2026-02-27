@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -17,6 +20,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect, GetWindowTextW,
     GetWindowThreadProcessId,
 };
+
+use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
+use windows_capture::monitor::Monitor as WcMonitor;
 
 // ==================== Configuration ====================
 
@@ -75,6 +81,19 @@ impl Default for ExclusionSettings {
     }
 }
 
+// ==================== DXGI Desktop Duplication (via windows-capture) ====================
+
+struct DxgiCaptureSession {
+    dup: DxgiDuplicationApi,
+    /// HMONITOR handle that this session was created for
+    monitor_handle: isize,
+}
+
+// Safety: DxgiDuplicationApi wraps D3D11 device and DXGI interfaces which are
+// free-threaded COM objects. We only access via Mutex<Option<..>> so at most
+// one thread touches the session at a time.
+unsafe impl Send for DxgiCaptureSession {}
+
 // ==================== Capture State ====================
 
 /// In-memory cache for JPEG bytes awaiting OCR.
@@ -94,6 +113,7 @@ pub struct CaptureState {
     pub capture_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     pub ocr_image_cache: OcrImageCache,
     pub focus_window: Mutex<Option<ActiveWindowInfo>>,
+    pub dxgi_state: Mutex<Option<DxgiCaptureSession>>,
 }
 
 impl Default for CaptureState {
@@ -115,6 +135,7 @@ impl CaptureState {
             capture_task: Mutex::new(None),
             ocr_image_cache: Arc::new(Mutex::new(HashMap::new())),
             focus_window: Mutex::new(None),
+            dxgi_state: Mutex::new(None),
         }
     }
 
@@ -405,7 +426,7 @@ fn is_redundant(current: &DHash, history: &[DHash], threshold: u32) -> bool {
     false
 }
 
-// ==================== Window Screenshot (xcap) ====================
+// ==================== Window Screenshot (DXGI Desktop Duplication) ====================
 
 struct CapturedImage {
     jpeg_bytes: Vec<u8>,
@@ -416,81 +437,164 @@ struct CapturedImage {
 
 fn capture_foreground_window(
     hwnd_raw: isize,
-    _rect: &RECT,
+    rect: &RECT,
     max_side: u32,
     jpeg_quality: u8,
+    dxgi_state: &Mutex<Option<DxgiCaptureSession>>,
 ) -> Option<CapturedImage> {
-    // Use xcap to capture the specific window
-    let windows = match xcap::Window::all() {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!("xcap::Window::all() failed: {}", e);
+    unsafe {
+        // 1. Get the monitor this window is on
+        let hmonitor = MonitorFromWindow(HWND(hwnd_raw as *mut _), MONITOR_DEFAULTTONEAREST);
+        let mut monitor_info: MONITORINFO = std::mem::zeroed();
+        monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmonitor, &mut monitor_info).as_bool() == false {
+            tracing::warn!("GetMonitorInfoW failed");
             return None;
         }
-    };
+        let mon_rect = monitor_info.rcMonitor;
 
-    // Find the window matching our HWND
-    let target = windows.into_iter().find(|w| {
-        w.id().ok() == Some(hwnd_raw as u32)
-    });
+        let hmonitor_val = hmonitor.0 as isize;
 
-    let window = match target {
-        Some(w) => w,
-        None => {
-            tracing::debug!("xcap: window HWND {} not found in window list", hwnd_raw);
+        // 2. Get or create DXGI session via windows-capture
+        let mut session_guard = dxgi_state.lock().unwrap();
+
+        // Check if we need to (re)create the session
+        let need_create = match session_guard.as_ref() {
+            Some(s) => s.monitor_handle != hmonitor_val,
+            None => true,
+        };
+
+        if need_create {
+            if session_guard.is_some() {
+                tracing::info!("DXGI: monitor changed, recreating session");
+            }
+            let wc_monitor = WcMonitor::from_raw_hmonitor(hmonitor.0 as *mut std::ffi::c_void);
+            match DxgiDuplicationApi::new(wc_monitor) {
+                Ok(dup) => {
+                    *session_guard = Some(DxgiCaptureSession {
+                        dup,
+                        monitor_handle: hmonitor_val,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("DxgiDuplicationApi::new failed: {:?}", e);
+                    *session_guard = None;
+                    return None;
+                }
+            }
+        }
+
+        let session = session_guard.as_mut().unwrap();
+
+        // 3. Acquire frame (500ms timeout — more lenient than hand-written 100ms)
+        let mut frame = match session.dup.acquire_next_frame(500) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!("acquire_next_frame failed: {:?}", e);
+                // Invalidate session so it gets recreated next time
+                *session_guard = None;
+                return None;
+            }
+        };
+
+        let full_width = frame.width();
+        let full_height = frame.height();
+
+        if full_width == 0 || full_height == 0 {
+            tracing::warn!("DXGI frame has 0x0 resolution");
             return None;
         }
-    };
 
-    // Capture the window image
-    let rgba_image = match window.capture_image() {
-        Ok(img) => img,
-        Err(e) => {
-            tracing::debug!("xcap: capture_image failed: {}", e);
+        // 4. Compute crop region (window rect relative to monitor)
+        let crop_x = (rect.left - mon_rect.left).max(0) as u32;
+        let crop_y = (rect.top - mon_rect.top).max(0) as u32;
+        let crop_x2 = ((rect.right - mon_rect.left) as u32).min(full_width);
+        let crop_y2 = ((rect.bottom - mon_rect.top) as u32).min(full_height);
+        let crop_w = crop_x2.saturating_sub(crop_x);
+        let crop_h = crop_y2.saturating_sub(crop_y);
+
+        if crop_w == 0 || crop_h == 0 {
+            tracing::warn!(
+                "Crop region is 0x0 (crop: {}x{}, window: [{},{},{},{}], monitor: [{},{},{},{}])",
+                crop_w, crop_h,
+                rect.left, rect.top, rect.right, rect.bottom,
+                mon_rect.left, mon_rect.top, mon_rect.right, mon_rect.bottom
+            );
             return None;
         }
-    };
 
-    // Convert RGBA to RGB (JPEG doesn't support alpha)
-    let (w, h) = rgba_image.dimensions();
-    if w == 0 || h == 0 {
-        return None;
+        // 5. Get cropped frame buffer (GPU crop + CPU map)
+        let mut buffer = match frame.buffer_crop(crop_x, crop_y, crop_x2, crop_y2) {
+            Ok(buf) => buf,
+            Err(e) => {
+                tracing::warn!("buffer_crop failed: {:?}", e);
+                *session_guard = None;
+                return None;
+            }
+        };
+
+        // 6. Extract BGRA pixels and convert to RGB
+        let row_pitch = buffer.row_pitch() as usize;
+        let raw = buffer.as_raw_buffer();
+        let mut rgb_pixels = Vec::with_capacity((crop_w * crop_h * 3) as usize);
+
+        for row in 0..crop_h {
+            let row_start = (row as usize) * row_pitch;
+            for col in 0..crop_w {
+                let offset = row_start + (col as usize) * 4;
+                let b = raw[offset];
+                let g = raw[offset + 1];
+                let r = raw[offset + 2];
+                // Skip alpha (offset + 3)
+                rgb_pixels.push(r);
+                rgb_pixels.push(g);
+                rgb_pixels.push(b);
+            }
+        }
+
+        // 7. Create image and scale if needed
+        let rgb_image = match RgbImage::from_raw(crop_w, crop_h, rgb_pixels) {
+            Some(img) => img,
+            None => {
+                tracing::warn!("Failed to create RgbImage from DXGI pixels ({}x{})", crop_w, crop_h);
+                return None;
+            }
+        };
+
+        let mut dynamic = DynamicImage::ImageRgb8(rgb_image);
+
+        let max_dim = crop_w.max(crop_h);
+        if max_dim > max_side {
+            let ratio = max_side as f64 / max_dim as f64;
+            let new_w = (crop_w as f64 * ratio) as u32;
+            let new_h = (crop_h as f64 * ratio) as u32;
+            dynamic = dynamic.resize(new_w, new_h, image::imageops::FilterType::Lanczos3);
+        }
+
+        let (final_w, final_h) = dynamic.dimensions();
+
+        if final_w == 0 || final_h == 0 {
+            tracing::warn!("Final image is 0x0 after resize ({}x{} -> {}x{})", crop_w, crop_h, final_w, final_h);
+            return None;
+        }
+
+        // 8. Encode as JPEG
+        let mut jpeg_buf = Vec::new();
+        {
+            let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, jpeg_quality);
+            if let Err(e) = encoder.encode_image(&dynamic) {
+                tracing::warn!("JPEG encoding failed: {}", e);
+                return None;
+            }
+        }
+
+        Some(CapturedImage {
+            jpeg_bytes: jpeg_buf,
+            width: final_w,
+            height: final_h,
+            dynamic_image: dynamic,
+        })
     }
-
-    let rgb_image: RgbImage = RgbImage::from_fn(w, h, |x, y| {
-        let pixel = rgba_image.get_pixel(x, y);
-        image::Rgb([pixel[0], pixel[1], pixel[2]])
-    });
-
-    let mut dynamic = DynamicImage::ImageRgb8(rgb_image);
-
-    // Scale down if needed
-    let max_dim = w.max(h);
-    if max_dim > max_side {
-        let ratio = max_side as f64 / max_dim as f64;
-        let new_w = (w as f64 * ratio) as u32;
-        let new_h = (h as f64 * ratio) as u32;
-        dynamic = dynamic.resize(new_w, new_h, image::imageops::FilterType::Lanczos3);
-    }
-
-    let (final_w, final_h) = dynamic.dimensions();
-
-    // Encode as JPEG
-    let mut jpeg_buf = Vec::new();
-    {
-        let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, jpeg_quality);
-        if let Err(e) = encoder.encode_image(&dynamic) {
-            tracing::warn!("JPEG encoding failed: {}", e);
-            return None;
-        }
-    }
-
-    Some(CapturedImage {
-        jpeg_bytes: jpeg_buf,
-        width: final_w,
-        height: final_h,
-        dynamic_image: dynamic,
-    })
 }
 
 // ==================== Process Icon Extraction ====================
@@ -766,6 +870,7 @@ pub async fn run_capture_loop(
             &window_info.rect,
             max_side,
             jpeg_quality,
+            &capture_state.dxgi_state,
         ) {
             Some(c) => c,
             None => {
