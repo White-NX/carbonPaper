@@ -1,6 +1,6 @@
 """
-向量存储模块 - Chinese-CLIP图片向量化 + ChromaDB存储
-使用 OFA-Sys/chinese-clip-vit-base-patch16 模型进行图片和文本的向量化
+Vector store module — Chinese-CLIP image vectorisation + ChromaDB storage.
+Uses OFA-Sys/chinese-clip-vit-base-patch16 for image and text encoding.
 """
 import os
 import hashlib
@@ -12,12 +12,12 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# 延迟导入，避免启动时加载过慢
+# Lazy import to avoid slow startup
 _clip_instance = None
 
 
 class ChineseCLIPSingleton:
-    """Chinese-CLIP 模型单例封装"""
+    """Singleton wrapper for the Chinese-CLIP model."""
     
     _instance = None
     _model = None
@@ -30,11 +30,11 @@ class ChineseCLIPSingleton:
         return cls._instance
         
     def initialize(self):
-        """初始化加载模型"""
+        """Initialise and load the model."""
         if self._initialized:
             return
             
-        logger.info("正在加载 Chinese-CLIP 模型 (常驻内存)...")
+        logger.info("Loading Chinese-CLIP model (resident in memory)...")
 
         model_name = os.environ.get('MODEL_PATH', None)
         if not model_name:
@@ -56,52 +56,52 @@ class ChineseCLIPSingleton:
             )
             self._model.eval()
             self._initialized = True
-            logger.info("Chinese-CLIP 模型加载完成")
+            logger.info("Chinese-CLIP model loaded successfully")
         except Exception as e:
-            logger.error("Chinese-CLIP 模型加载失败: %s", e)
+            logger.error("Chinese-CLIP model loading failed: %s", e)
             raise
             
     def get_components(self):
-        """获取模型组件"""
+        """Return model components (model, processor)."""
         if not self._initialized:
             self.initialize()
         return self._model, self._processor
 
 
 def _load_clip_model():
-    """获取单例模型实例"""
+    """Return the singleton model instance."""
     singleton = ChineseCLIPSingleton()
     return singleton.get_components()
 
 
 class ImageVectorizer:
-    """图片向量化器 - 使用Chinese-CLIP"""
+    """Image vectoriser using Chinese-CLIP."""
     
     def __init__(self):
-        """初始化向量化器"""
+        """Initialise the vectoriser."""
         self.model = None
         self.processor = None
         self._singleton = ChineseCLIPSingleton()
     
     def _ensure_initialized(self):
-        """确保模型已初始化"""
+        """Ensure the model is initialised."""
         if self.model is None:
             self.model, self.processor = self._singleton.get_components()
     
     def encode_image(self, image: Union[str, Image.Image, np.ndarray]) -> np.ndarray:
         """
-        将图片编码为向量
-        
+        Encode an image into a feature vector.
+
         Args:
-            image: 图片路径、PIL Image对象或numpy数组
-            
+            image: Image path, PIL Image object, or numpy array.
+
         Returns:
-            图片特征向量 (归一化后)
+            Normalised image feature vector.
         """
         self._ensure_initialized()
         import torch
 
-        # 处理不同类型的输入
+        # Handle different input types
         if isinstance(image, str):
             image = Image.open(image).convert('RGB')
         elif isinstance(image, np.ndarray):
@@ -109,7 +109,7 @@ class ImageVectorizer:
         elif isinstance(image, Image.Image):
             image = image.convert('RGB')
 
-        # 处理图片
+        # Process image
         inputs = self.processor(images=image, return_tensors="pt")
         # Ensure inputs are on the same device as model
         inputs = {k: v.to(self.model.device) for k, v in inputs.items() if v is not None}
@@ -213,20 +213,20 @@ class ImageVectorizer:
                 else:
                     image_features = pooled
 
-            # 归一化
+            # Normalise
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         return image_features.cpu().numpy().flatten()
     
     def encode_text(self, text: str) -> np.ndarray:
         """
-        将文本编码为向量
+        Encode text into a feature vector.
 
         Args:
-            text: 要编码的文本
+            text: Text to encode.
 
         Returns:
-            文本特征向量 (归一化后)
+            Normalised text feature vector.
         """
         _t_total = _time.perf_counter()
         self._ensure_initialized()
@@ -265,7 +265,7 @@ class ImageVectorizer:
         return arr
     
     def encode_images_batch(self, images: List[Union[str, Image.Image]]) -> np.ndarray:
-        """批量编码图片"""
+        """Batch-encode images."""
         self._ensure_initialized()
         import torch
         
@@ -375,25 +375,25 @@ class ImageVectorizer:
         text: str
     ) -> float:
         """
-        计算图片和文本的相似度
-        
+        Compute similarity between an image and text.
+
         Args:
-            image: 图片
-            text: 文本
-            
+            image: Image.
+            text: Text.
+
         Returns:
-            相似度分数 (0-1)
+            Similarity score (0-1).
         """
         image_vec = self.encode_image(image)
         text_vec = self.encode_text(text)
         
-        # 余弦相似度 (已归一化，直接点积)
+        # Cosine similarity (already normalised, direct dot product)
         similarity = np.dot(image_vec, text_vec)
         return float(similarity)
 
 
 class VectorStore:
-    """向量存储 - 基于ChromaDB"""
+    """Vector store backed by ChromaDB."""
     
     def __init__(
         self, 
@@ -402,33 +402,33 @@ class VectorStore:
         storage_client = None
     ):
         """
-        初始化向量存储
-        
+        Initialise vector store.
+
         Args:
-            collection_name: ChromaDB集合名称
-            persist_directory: 持久化目录
-            storage_client: 存储客户端（用于加密明文数据）
+            collection_name: ChromaDB collection name.
+            persist_directory: Persistence directory.
+            storage_client: Storage client (used for encrypting plaintext data).
         """
         import chromadb
         from chromadb.config import Settings
         
         self.persist_directory = persist_directory
         self.collection_name = collection_name
-        self.storage_client = storage_client  # 用于加密明文数据
+        self.storage_client = storage_client  # used for encrypting plaintext data
         
-        # 初始化ChromaDB客户端（持久化模式）
+        # Initialise ChromaDB client (persistent mode)
         self.client = chromadb.PersistentClient(
             path=persist_directory,
             settings=Settings(anonymized_telemetry=False)
         )
         
-        # 获取或创建集合
+        # Get or create collection
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
-            metadata={"hnsw:space": "cosine"}  # 使用余弦相似度
+            metadata={"hnsw:space": "cosine"}  # cosine similarity
         )
         
-        # 初始化向量化器
+        # Initialise vectoriser
         self.vectorizer = ImageVectorizer()
         # Diagnostic: print collection basic info
         try:
@@ -446,7 +446,7 @@ class VectorStore:
         logger.info("[vector_store] Initialized VectorStore collection='%s' persist='%s' exists=%s count=%s files=%s encrypted=%s", self.collection_name, abs_path, path_exists, count, path_list, storage_client is not None)
     
     def _encrypt_text(self, text: str) -> str:
-        """加密文本（如果有存储客户端）"""
+        """Encrypt text if a storage client is available."""
         if self.storage_client and text:
             encrypted = self.storage_client.encrypt_for_chromadb(text)
             if encrypted:
@@ -454,9 +454,9 @@ class VectorStore:
         return text
     
     def _decrypt_text(self, text: str) -> str:
-        """解密文本（如果有存储客户端）"""
+        """Decrypt text if a storage client is available."""
         if self.storage_client and text:
-            # 检查是否是加密数据（以 ENC2:/ENC: 前缀标识）
+            # Check for encrypted data prefix (ENC2: / ENC:)
             if text.startswith("ENC2:") or text.startswith("ENC:"):
                 decrypted = self.storage_client.decrypt_from_chromadb(text)
                 if decrypted is not None:
@@ -464,7 +464,7 @@ class VectorStore:
         return text
 
     def _decrypt_texts(self, texts: List[str]) -> List[str]:
-        """批量解密文本（保持输入顺序）"""
+        """Batch-decrypt texts (preserving input order)."""
         if not self.storage_client or not texts:
             return texts
 
@@ -494,12 +494,12 @@ class VectorStore:
         return result
     
     def _decrypt_metadata(self, meta: Dict[str, Any]) -> Dict[str, Any]:
-        """解密元数据中的加密字段"""
+        """Decrypt encrypted fields within metadata."""
         if not meta or not self.storage_client:
             return meta
         
         decrypted = dict(meta)
-        # 需要解密的字段
+        # Fields that may need decryption
         encrypted_fields = {'image_path', 'window_title', 'process_name', 'app_name', 'url'}
 
         batch_values = []
@@ -520,7 +520,7 @@ class VectorStore:
         return decrypted
     
     def _decrypt_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """解密单个搜索结果"""
+        """Decrypt a single search result."""
         if not result:
             return result
 
@@ -544,24 +544,24 @@ class VectorStore:
                 if value is not None:
                     decrypted[key] = value
 
-        # decrypt metadata
+        # Decrypt metadata
         if isinstance(decrypted.get('metadata'), dict):
             decrypted['metadata'] = self._decrypt_metadata(decrypted['metadata'])
 
         return decrypted
 
     def _decrypt_results_batch(self, results: List[Dict]) -> List[Dict]:
-        """批量解密多条搜索结果（单次 IPC 调用）"""
+        """Batch-decrypt multiple search results (single IPC call)."""
         if not results or not self.storage_client:
             return results
 
-        # Collect all encrypted values from top-level and metadata fields
+        # Collect all encrypted values from top-level fields and metadata
         encrypted_to_index: Dict[str, int] = {}
         all_unique: List[str] = []
 
-        # top-leve
+        # Top-level fields
         top_level_fields = ('image_path', 'ocr_text')
-        # fields in metadata that may contain encrypted values
+        # Fields in metadata that may contain encrypted values
         meta_fields = ('image_path', 'window_title', 'process_name', 'app_name', 'url')
 
         def _collect(value: Any):
@@ -581,7 +581,7 @@ class VectorStore:
         if not all_unique:
             return results
 
-        # single batch decryption
+        # Single batch decryption
         decrypted_list = self._decrypt_texts(all_unique)
         decrypt_map: Dict[str, str] = {}
         for i, enc_val in enumerate(all_unique):
@@ -594,7 +594,7 @@ class VectorStore:
                 return decrypt_map[value]
             return value
 
-        # backfill decrypted values into results
+        # Backfill decrypted values into results
         out = []
         for r in results:
             d = r.copy()
@@ -614,7 +614,7 @@ class VectorStore:
     
     @staticmethod
     def _compute_id(image_path: str) -> str:
-        """根据图片路径生成唯一ID"""
+        """Generate a unique ID from the image path."""
         return hashlib.md5(image_path.encode()).hexdigest()
     
     def add_image(
@@ -625,22 +625,22 @@ class VectorStore:
         ocr_text: Optional[str] = None
     ) -> str:
         """
-        添加图片到向量存储
-        
+        Add an image to the vector store.
+
         Args:
-            image_path: 图片路径（用于生成ID和存储引用）
-            image: 图片对象（可选，不提供则从路径加载）
-            metadata: 元数据
-            ocr_text: OCR识别的文本（作为元数据存储）
-            
+            image_path: Image path (used for ID generation and reference storage).
+            image: Image object (optional; loaded from path if not provided).
+            metadata: Extra metadata.
+            ocr_text: OCR-recognised text (stored as searchable document).
+
         Returns:
-            存储的ID
+            Stored document ID.
         """
         doc_id = self._compute_id(image_path)
 
         logger.info("[vector_store] add_image called image_path=%s doc_id=%s", image_path, doc_id)
 
-        # 检查是否已存在
+        # Check if already exists
         try:
             existing = self.collection.get(ids=[doc_id])
             # Diagnostic: show what get returned
@@ -658,25 +658,24 @@ class VectorStore:
             logger.info("[vector_store] add_image skipped, already exists: %s", doc_id)
             return doc_id
 
-        # 编码图片
+        # Encode image
         if image is None:
             image = image_path
 
         embedding = self.vectorizer.encode_image(image)
         logger.info("[vector_store] add_image -> embedding len=%d", len(embedding))
         
-        # 准备元数据
+        # Prepare metadata
         meta = {
-            'image_path': self._encrypt_text(image_path),  # 加密图片路径
+            'image_path': self._encrypt_text(image_path),
             'added_at': str(np.datetime64('now'))
         }
         if metadata:
-            # ChromaDB元数据只支持字符串、整数、浮点数
-            # 需要加密的敏感字段
+            # ChromaDB metadata only supports str, int, float
             sensitive_fields = {'window_title', 'process_name', 'app_name', 'url'}
             for k, v in metadata.items():
                 if isinstance(v, (str, int, float, bool)):
-                    # 对敏感字段进行加密
+                    # Encrypt sensitive fields
                     if k in sensitive_fields and isinstance(v, str):
                         meta[k] = self._encrypt_text(v)
                     else:
@@ -688,10 +687,10 @@ class VectorStore:
                     else:
                         meta[k] = str_val
         
-        # 准备文档（OCR文本作为可搜索的文档内容）- 加密
+        # Prepare document (OCR text as searchable content) — encrypted
         document = self._encrypt_text(ocr_text) if ocr_text else ""
         
-        # 添加到集合
+        # Add to collection
         try:
             # Diagnostic counts before add
             try:
@@ -732,17 +731,17 @@ class VectorStore:
         image_data: List[Dict[str, Any]]
     ) -> List[str]:
         """
-        批量添加图片
-        
+        Batch-add images.
+
         Args:
-            image_data: 图片数据列表，每项包含:
-                - image_path: 图片路径
-                - image: 图片对象（可选）
-                - metadata: 元数据（可选）
-                - ocr_text: OCR文本（可选）
-                
+            image_data: List of dicts, each with:
+                - image_path: Image path.
+                - image: Image object (optional).
+                - metadata: Metadata (optional).
+                - ocr_text: OCR text (optional).
+
         Returns:
-            添加的ID列表
+            List of added IDs.
         """
         ids = []
         embeddings = []
@@ -753,7 +752,7 @@ class VectorStore:
             image_path = data['image_path']
             doc_id = self._compute_id(image_path)
             logger.info("[vector_store] add_images_batch processing %s -> %s", image_path, doc_id)
-            # 检查是否已存在
+            # Check if already exists
             try:
                 existing = self.collection.get(ids=[doc_id])
             except Exception:
@@ -763,11 +762,11 @@ class VectorStore:
                 ids.append(doc_id)
                 continue
             
-            # 编码图片
+            # Encode image
             image = data.get('image', image_path)
             embedding = self.vectorizer.encode_image(image)
             
-            # 准备元数据 - 加密敏感字段
+            # Prepare metadata — encrypt sensitive fields
             meta = {
                 'image_path': self._encrypt_text(image_path),
                 'added_at': str(np.datetime64('now'))
@@ -790,7 +789,7 @@ class VectorStore:
             ids.append(doc_id)
             embeddings.append(embedding.tolist())
             metadatas.append(meta)
-            # 加密 OCR 文本
+            # Encrypt OCR text
             ocr_text = data.get('ocr_text', '')
             documents.append(self._encrypt_text(ocr_text) if ocr_text else '')
         
@@ -839,24 +838,24 @@ class VectorStore:
         min_similarity: float = 0.32
     ) -> List[Dict[str, Any]]:
         """
-        使用自然语言搜索图片
+        Search images using natural language.
 
         Args:
-            query: 搜索查询文本
-            n_results: 返回结果数量
-            min_similarity: 最小相似度阈值 (0-1)
+            query: Search query text.
+            n_results: Number of results to return.
+            min_similarity: Minimum similarity threshold (0-1).
 
         Returns:
-            搜索结果列表
+            List of search results.
         """
         _t_total = _time.perf_counter()
 
-        # 将查询文本编码为向量
+        # Encode query text
         _t0 = _time.perf_counter()
         query_embedding = self.vectorizer.encode_text(query)
         _t_encode = _time.perf_counter() - _t0
 
-        # 在ChromaDB中搜索
+        # Search ChromaDB
         _t0 = _time.perf_counter()
         try:
             results = self.collection.query(
@@ -869,7 +868,7 @@ class VectorStore:
             raise
         _t_chromadb = _time.perf_counter() - _t0
 
-        # 格式化结果
+        # Format results
         try:
             ids_list = results['ids'][0] if results and results['ids'] else []
             distances_list = results['distances'][0] if results and results['distances'] else []
@@ -891,7 +890,7 @@ class VectorStore:
                 meta = {}
                 ocr = None
 
-            # 过滤低置信度结果
+            # Filter low-confidence results
             if similarity < min_similarity:
                 continue
 
@@ -904,7 +903,7 @@ class VectorStore:
                 'similarity': similarity
             })
 
-        # 解密结果中的敏感数据
+        # Decrypt sensitive data in results
         _t0 = _time.perf_counter()
         decrypted = self._decrypt_results_batch(formatted_results)
         _t_decrypt = _time.perf_counter() - _t0
@@ -926,26 +925,26 @@ class VectorStore:
         n_results: int = 10
     ) -> List[Dict[str, Any]]:
         """
-        使用图片搜索相似图片
-        
+        Search for similar images using an image query.
+
         Args:
-            image: 查询图片
-            n_results: 返回结果数量
-            
+            image: Query image.
+            n_results: Number of results to return.
+
         Returns:
-            搜索结果列表
+            List of search results.
         """
-        # 编码查询图片
+        # Encode query image
         query_embedding = self.vectorizer.encode_image(image)
         
-        # 搜索
+        # Search
         results = self.collection.query(
             query_embeddings=[query_embedding.tolist()],
             n_results=n_results,
             include=['metadatas', 'documents', 'distances']
         )
         
-        # 格式化结果
+        # Format results
         formatted_results = []
         if results and results['ids']:
             for i, doc_id in enumerate(results['ids'][0]):
@@ -958,7 +957,7 @@ class VectorStore:
                     'similarity': 1 - results['distances'][0][i] if results['distances'] else None
                 })
         
-        # 解密结果中的敏感数据
+        # Decrypt sensitive data in results
         return self._decrypt_results_batch(formatted_results)
 
     def search_by_ocr_text(
@@ -967,16 +966,16 @@ class VectorStore:
         n_results: int = 10
     ) -> List[Dict[str, Any]]:
         """
-        搜索OCR文本内容（全文搜索）
-        
+        Search OCR text content (full-text search).
+
         Args:
-            query: 搜索文本
-            n_results: 返回结果数量
-            
+            query: Search text.
+            n_results: Number of results to return.
+
         Returns:
-            搜索结果列表
+            List of search results.
         """
-        # ChromaDB的文档搜索
+        # ChromaDB document search
         results = self.collection.query(
             query_texts=[query],
             n_results=n_results,
@@ -994,11 +993,11 @@ class VectorStore:
                     'distance': results['distances'][0][i] if results['distances'] else None
                 })
         
-        # 解密结果中的敏感数据
+        # Decrypt sensitive data in results
         return self._decrypt_results_batch(formatted_results)
 
     def delete_image(self, image_path: str) -> bool:
-        """删除图片"""
+        """Delete an image from the vector store."""
         doc_id = self._compute_id(image_path)
         try:
             self.collection.delete(ids=[doc_id])
@@ -1007,7 +1006,7 @@ class VectorStore:
             return False
     
     def get_collection_stats(self) -> Dict[str, Any]:
-        """获取集合统计信息"""
+        """Return collection statistics."""
         return {
             'name': self.collection_name,
             'count': self.collection.count(),
@@ -1015,56 +1014,10 @@ class VectorStore:
         }
     
     def clear_collection(self):
-        """清空集合"""
+        """Clear the entire collection."""
         self.client.delete_collection(self.collection_name)
         self.collection = self.client.get_or_create_collection(
             name=self.collection_name,
             metadata={"hnsw:space": "cosine"}
         )
 
-
-if __name__ == "__main__":
-    # 测试代码
-    print("测试向量存储模块...")
-    
-    # 创建测试图片
-    test_img = Image.new('RGB', (200, 100), color='white')
-    test_img_path = "test_vector_image.png"
-    test_img.save(test_img_path)
-    
-    # 测试向量化
-    vectorizer = ImageVectorizer()
-    img_vec = vectorizer.encode_image(test_img_path)
-    print(f"图片向量维度: {img_vec.shape}")
-    
-    text_vec = vectorizer.encode_text("测试图片")
-    print(f"文本向量维度: {text_vec.shape}")
-    
-    similarity = vectorizer.compute_similarity(test_img_path, "人物写真")
-    print(f"相似度: {similarity:.4f}")
-    
-    # 测试向量存储
-    store = VectorStore(
-        collection_name="test_collection",
-        persist_directory="./test_chroma_db"
-    )
-    
-    # 添加图片
-    doc_id = store.add_image(
-        image_path=test_img_path,
-        metadata={'source': 'test'},
-        ocr_text="这是一个测试图片"
-    )
-    print(f"添加的文档ID: {doc_id}")
-    
-    # 搜索
-    results = store.search_by_text("测试", n_results=5)
-    print(f"搜索结果: {results}")
-    
-    # 统计
-    stats = store.get_collection_stats()
-    print(f"集合统计: {stats}")
-    
-    # 清理测试文件
-    os.remove(test_img_path)
-    print("测试完成!")

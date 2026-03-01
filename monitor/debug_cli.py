@@ -1,6 +1,6 @@
 """
-IPC 调试工具
-用于通过命令行与后台监控进程进行交互，发送调试指令。
+IPC debug tool.
+Interact with the background monitor process via the command line.
 """
 
 import sys

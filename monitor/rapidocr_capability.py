@@ -26,16 +26,16 @@ def _patch_ort_dml_device_id(device_id: int):
         return
 
     if getattr(ort.InferenceSession, "_dml_device_patched", False):
-        return  # 已经 patch 过
+        return  # Already patched
 
     _original_init = ort.InferenceSession.__init__
 
     def _patched_init(self, *args, **kwargs):
         providers = kwargs.get("providers", None)
         if not providers and len(args) >= 2:
-            # providers 可能作为位置参数传入 (path_or_bytes, providers, ...)
-            # InferenceSession(path, providers=...) 或 InferenceSession(path, sess_options, providers)
-            pass  # 只处理 kwargs 形式，位置参数较少见
+            # providers may be passed as a positional arg (path_or_bytes, providers, ...)
+            # InferenceSession(path, providers=...) or InferenceSession(path, sess_options, providers)
+            pass  # Only handle the kwargs form; positional args are rare
 
         if providers:
             new_providers = []
@@ -67,20 +67,20 @@ def _patch_ort_dml_device_id(device_id: int):
 
 class PaddleOCR:
     """
-    RapidOCR的PaddleOCR 3.3兼容层
+    RapidOCR-to-PaddleOCR 3.3 compatibility layer.
 
-    支持的初始化参数：
-    - use_angle_cls: 是否使用方向分类器
-    - lang: 语言（'ch', 'en'等，但RapidOCR主要支持中英文）
-    - show_log: 是否显示日志
-    - use_gpu: GPU加速（兼容参数）
-    - use_dml: 是否使用 DirectML 加速
-    - cpu_threads: CPU线程数（不知道实际上有没有作用的参数）
-    - use_doc_orientation_classify: 文档方向分类（兼容）
-    - use_doc_unwarping: 文档去畸变（兼容）
-    - text_detection_model_name: 文本检测模型名称（兼容）
-    - text_recognition_model_name: 文本识别模型名称（兼容）
-    - ocr_version: OCR模型版本（兼容）
+    Supported init parameters:
+    - use_angle_cls: Whether to use orientation classifier.
+    - lang: Language ('ch', 'en', etc.; RapidOCR mainly supports Chinese/English).
+    - show_log: Whether to show logs.
+    - use_gpu: GPU acceleration (compatibility parameter).
+    - use_dml: Whether to use DirectML acceleration.
+    - cpu_threads: CPU thread count (unclear whether effective; may be removed).
+    - use_doc_orientation_classify: Document orientation classification (compat).
+    - use_doc_unwarping: Document unwarping (compat).
+    - text_detection_model_name: Text detection model name (compat).
+    - text_recognition_model_name: Text recognition model name (compat).
+    - ocr_version: OCR model version (compat).
     """
 
     def __init__(
@@ -99,17 +99,17 @@ class PaddleOCR:
         ocr_version: Optional[str] = None,
     ):
         """
-        初始化OCR引擎
+        Initialise the OCR engine.
 
         Args:
-            use_angle_cls: 是否使用文字方向分类
-            lang: 语言类型（兼容参数，实际由RapidOCR处理）
-            use_gpu: 是否使用GPU（兼容参数）
-            use_dml: 是否使用 DirectML 加速（需要 onnxruntime-directml）
-            dml_device_id: DirectML 设备 ID（默认 None 表示使用默认 GPU）
-            show_log: 是否显示日志
-            cpu_threads: CPU线程数（不知道为什么在主程序中被使用了，之后会移除）
-            TODO: 移除 cpu_threads 参数
+            use_angle_cls: Whether to use text orientation classification.
+            lang: Language type (compatibility parameter; handled by RapidOCR internally).
+            use_gpu: Whether to use GPU (compatibility parameter).
+            use_dml: Whether to use DirectML acceleration (requires onnxruntime-directml).
+            dml_device_id: DirectML device ID (None = default GPU).
+            show_log: Whether to show logs.
+            cpu_threads: CPU thread count (unclear if effective; may be removed later).
+            TODO: Remove cpu_threads parameter.
         """
         params = {
             "Global.use_cls": use_angle_cls,
@@ -136,7 +136,7 @@ class PaddleOCR:
         cls: bool = True,
     ) -> List[List[List]]:
         """
-        兼容PaddleOCR 3.3的predict方法，调用ocr()
+        PaddleOCR 3.3-compatible predict method; delegates to ocr().
         """
         return self.ocr(img, det=det, rec=rec, cls=cls)
 
@@ -148,40 +148,40 @@ class PaddleOCR:
         cls: bool = True,
     ) -> List[List[List]]:
         """
-        执行OCR识别（兼容PaddleOCR 3.3格式）
+        Perform OCR (PaddleOCR 3.3-compatible output format).
 
         Args:
-            img: 图片路径、numpy数组、bytes或PIL Image对象
-            det: 是否进行文本检测（兼容参数）
-            rec: 是否进行文本识别（兼容参数）
-            cls: 是否进行方向分类（兼容参数）
+            img: Image path, numpy array, bytes, or PIL Image.
+            det: Whether to perform text detection (compat parameter).
+            rec: Whether to perform text recognition (compat parameter).
+            cls: Whether to perform orientation classification (compat parameter).
 
         Returns:
-            PaddleOCR 3.3格式的结果:
+            PaddleOCR 3.3-format result:
             [
-                [  # 第一页/第一张图
-                    [box, (text, score)],  # 第一行文本
-                    [box, (text, score)],  # 第二行文本
+                [  # First page / first image
+                    [box, (text, score)],  # First text line
+                    [box, (text, score)],  # Second text line
                     ...
                 ]
             ]
 
-            其中：
-            - box: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] 四个角点坐标
-            - text: str, 识别的文本
-            - score: float, 置信度(0-1)
+            Where:
+            - box: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] four corner coordinates
+            - text: str, recognised text
+            - score: float, confidence (0-1)
         """
-        # 调用RapidOCR（新版返回 RapidOCROutput 对象）
+        # Call RapidOCR (newer versions return a RapidOCROutput object)
         result = self.engine(img)
         self._last_elapse = result.elapse
         self._last_elapse_list = result.elapse_list
 
-        # 转换为PaddleOCR 3.3格式
+        # Convert to PaddleOCR 3.3 format
         if result.boxes is None or len(result.boxes) == 0:
-            # 空结果：返回 [[]]
+            # Empty result: return [[]]
             return [[]]
 
-        # 转换格式：RapidOCROutput -> PaddleOCR [box, (text, score)]
+        # Convert format: RapidOCROutput -> PaddleOCR [box, (text, score)]
         paddle_format = []
         for i in range(len(result.txts)):
             box = (
@@ -192,58 +192,22 @@ class PaddleOCR:
             text = result.txts[i]
             score = result.scores[i]
 
-            # 组装成PaddleOCR格式
+            # Assemble into PaddleOCR format
             paddle_format.append([box, (text, score)])
 
-        # 外层再包一层列表（模拟多页结果）
+        # Wrap in an outer list (simulating multi-page results)
         return [paddle_format]
 
     def get_last_elapse(self):
         """
-        获取上次OCR耗时
-        返回 (det_time, cls_time, rec_time) 元组或总耗时
+        Return the elapsed time of the last OCR call.
+        Returns a (det_time, cls_time, rec_time) tuple or the total elapsed time.
         """
         if hasattr(self, "_last_elapse_list") and self._last_elapse_list:
             return self._last_elapse_list
         return self._last_elapse
 
     def __call__(self, img, **kwargs):
-        """支持直接调用：ocr(img)"""
+        """Support direct invocation: ocr(img)"""
         return self.ocr(img, **kwargs)
 
-
-if __name__ == "__main__":
-    ocr = PaddleOCR(
-        use_angle_cls=True, lang="ch", use_gpu=False, show_log=True, cpu_threads=2
-    )
-
-    # 方式1: 使用文件路径
-    result = ocr.ocr("test.jpg", cls=True)
-
-    # 方式2: 使用numpy数组
-    import cv2
-
-    img = cv2.imread("test.jpg")
-    result = ocr.ocr(img)
-
-    # 方式3: 直接调用
-    result = ocr("test.jpg")
-
-    # 解析结果
-    for res in result:
-        if not res:
-            print("未检测到文本")
-            continue
-
-        for line in res:
-            box = line[0]
-            text = line[1][0]
-            score = line[1][1]
-
-            print(f"文本: {text}")
-            print(f"置信度: {score:.4f}")
-            print(f"坐标: {box}")
-            print("-" * 50)
-
-    # 额外功能：获取耗时
-    print(f"\nOCR耗时: {ocr.get_last_elapse():.3f}秒")

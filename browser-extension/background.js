@@ -4,6 +4,7 @@
 // requests through NMH, which forwards them here.
 
 const NM_HOST_NAME = 'com.carbonpaper.nmh';
+const MAX_RETRY = 30;
 
 let nmPort = null;
 let isEnabled = true;
@@ -36,7 +37,7 @@ function connectNative() {
       } else if (message.type === 'nmh_ready') {
         // Startup diagnostic from NMH
         console.log('[CarbonPaper] NMH ready — browser:', message.browser_type,
-                    'cmd_pipe:', message.cmd_pipe, 'data_pipe:', message.data_pipe);
+          'cmd_pipe:', message.cmd_pipe, 'data_pipe:', message.data_pipe);
       } else if (message.status === 'error') {
         // Suppress expected cold-start errors — the main app hasn't started
         // yet or has restarted with a new auth token.
@@ -67,6 +68,12 @@ function connectNative() {
   } catch (e) {
     isConnected = false;
     console.error('[CarbonPaper] Failed to connect to NMH:', e);
+
+    // Retry after delay
+    if (isEnabled && isConnected === false) {
+      setTimeout(connectNative, 5000);
+    }
+
   }
 }
 
@@ -82,7 +89,7 @@ async function captureCurrentTab() {
 
     // Skip chrome:// and edge:// pages
     if (tab.url && (tab.url.startsWith('chrome://') || tab.url.startsWith('edge://') ||
-        tab.url.startsWith('chrome-extension://') || tab.url.startsWith('about:'))) {
+      tab.url.startsWith('chrome-extension://') || tab.url.startsWith('about:'))) {
       return;
     }
 
@@ -111,6 +118,9 @@ async function captureCurrentTab() {
       visibleLinks: []
     };
 
+    // Trying to recapture while meeting "user may dragging the window" error.
+    let retry = 0;
+
     try {
       const response = await chrome.tabs.sendMessage(tab.id, { type: 'getPageData' });
       if (response) {
@@ -119,6 +129,11 @@ async function captureCurrentTab() {
     } catch (e) {
       // Content script may not be injected (e.g., on new tab page)
       // Use tab data as fallback
+      if (retry < MAX_RETRY) {
+        retry++;
+        setTimeout(() => captureCurrentTab(), 500);
+        return;
+      }
     }
 
     // Convert favicon URL to base64 data URI (same format as local process icons)
@@ -149,6 +164,16 @@ async function captureCurrentTab() {
 
   } catch (e) {
     // captureVisibleTab can fail if window is minimized, etc.
+
+    if (e.message?.includes('user may be dragging a tab') && retry < MAX_RETRY) {
+      // This is a known Chrome bug.
+      // We can retry after a short delay.
+      console.warn(`[CarbonPaper] Capture failed due to dragging state, retrying (${retry}): `, e.message);
+      retry++;
+      setTimeout(captureCurrentTab, 500);
+      return;
+    }
+
     if (!e.message?.includes('No active web contents')) {
       console.warn('[CarbonPaper] Capture failed:', e.message);
     }

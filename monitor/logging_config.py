@@ -1,13 +1,13 @@
-"""统一日志配置 — 仅输出到 stderr（由 Rust 捕获并写入文件）"""
+"""Unified logging configuration — outputs to stderr only (captured by Rust and written to file)."""
 
 import logging
 import sys
 
 
 def setup_logging():
-    """配置 Python 日志，仅输出到 stderr。
+    """Configure Python logging to output to stderr only.
 
-    格式不含时间戳，因为 Rust 的 tracing 层会统一添加时间戳。
+    The format omits timestamps because the Rust tracing layer adds them.
     """
     formatter = logging.Formatter(
         '[%(levelname)s] %(name)s: %(message)s'
