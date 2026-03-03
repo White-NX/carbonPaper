@@ -1,12 +1,12 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { WifiOff, Loader2, Play, Route, PackageOpen, Shield, ShieldEllipsis, RotateCcw } from 'lucide-react';
+import { WifiOff, Loader2, Play, Route, PackageOpen, Shield, ShieldEllipsis, RotateCcw, Download } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
 
-export default function Mask({ backendStatus, pythonVersion, backendError, handleStartBackend, onRefreshPythonVersion, depsNeedUpdate, depsSyncing, onDepsSync }) {
+export default function Mask({ backendStatus, pythonVersion, backendError, handleStartBackend, onRefreshPythonVersion, depsNeedUpdate, depsSyncing, onDepsSync, modelsNeedDownload, missingModels, onModelsDownloadComplete }) {
 
   const [venvInstallStep, setVenvInstallStep] = React.useState(null);
   const [pythonPath, setPythonPath] = React.useState('');
@@ -191,6 +191,90 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
 
   const autoPostInstallRef = React.useRef(false);
 
+  // ==================== Model download overlay state ====================
+  const [modelDownloadLog, setModelDownloadLog] = React.useState([]);
+  const [modelDownloadError, setModelDownloadError] = React.useState(null);
+  const [modelDownloading, setModelDownloading] = React.useState(false);
+  const modelDownloadLogRef = React.useRef(null);
+  const modelDownloadStartedRef = React.useRef(false);
+
+  // Auto-scroll model download log
+  React.useEffect(() => {
+    if (modelDownloadLogRef?.current) {
+      modelDownloadLogRef.current.scrollTop = modelDownloadLogRef.current.scrollHeight;
+    }
+  }, [modelDownloadLog]);
+
+  // Capture install-log events into model download log when downloading
+  React.useEffect(() => {
+    if (!modelDownloading) return;
+    let mounted = true;
+    let unlisten;
+    (async () => {
+      try {
+        unlisten = await listen('install-log', (event) => {
+          if (!mounted) return;
+          const payload = event?.payload || {};
+          const line = payload.line || JSON.stringify(payload);
+          const ts = new Date().toLocaleTimeString();
+          setModelDownloadLog((prev) => [...prev, `[${ts}] ${line}`]);
+        });
+      } catch (e) {
+        console.warn('Failed to register model download log listener', e);
+      }
+    })();
+    return () => {
+      mounted = false;
+      if (unlisten) unlisten();
+    };
+  }, [modelDownloading]);
+
+  // Auto-start model download when needed
+  React.useEffect(() => {
+    if (!modelsNeedDownload || !missingModels) return;
+    if (modelDownloadStartedRef.current || modelDownloading) return;
+    // Don't show during first install or deps update
+    if (renderVenvInstallStep != null || depsNeedUpdate) return;
+
+    modelDownloadStartedRef.current = true;
+    setModelDownloading(true);
+    setModelDownloadLog([]);
+    setModelDownloadError(null);
+
+    (async () => {
+      try {
+        // Download each missing model
+        if (missingModels['chinese-clip'] && !missingModels['chinese-clip'].complete) {
+          setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_clip')}`]);
+          await invoke('download_model');
+        }
+        if (missingModels['bge-small-zh'] && !missingModels['bge-small-zh'].complete) {
+          setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_bge')}`]);
+          await invoke('download_model', {
+            repo: 'BAAI/bge-small-zh-v1.5',
+            subdir: 'bge-small-zh-v1.5',
+            files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'vocab.txt', 'special_tokens_map.json'],
+          });
+        }
+        if (missingModels['minilm-l12'] && !missingModels['minilm-l12'].complete) {
+          setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_minilm')}`]);
+          await invoke('download_model', {
+            repo: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
+            subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
+            files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'sentencepiece.bpe.model'],
+          });
+        }
+        setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.complete')}`]);
+        if (onModelsDownloadComplete) onModelsDownloadComplete();
+      } catch (err) {
+        setModelDownloadError(err?.message || String(err));
+      } finally {
+        setModelDownloading(false);
+        modelDownloadStartedRef.current = false;
+      }
+    })();
+  }, [modelsNeedDownload, missingModels, modelDownloading, renderVenvInstallStep, depsNeedUpdate]);
+
   // ==================== Deps update overlay state ====================
   const [depsSyncLog, setDepsSyncLog] = React.useState([]);
   const [depsSyncError, setDepsSyncError] = React.useState(null);
@@ -299,10 +383,26 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
           // pass the python executable path chosen in the previous step (escaped)
           const res = await invoke('install_python_venv', { python_path: processedPythonPath });
           appendDepsLog(res);
-          // download model files
+          // download model files (Chinese-CLIP)
           appendDepsLog(t('mask.venv.step2.download_models'));
           const modelRes = await invoke('download_model');
           appendDepsLog(modelRes);
+          // download BGE classification model
+          appendDepsLog(t('mask.venv.step2.download_bge'));
+          const bgeRes = await invoke('download_model', {
+            repo: 'BAAI/bge-small-zh-v1.5',
+            subdir: 'bge-small-zh-v1.5',
+            files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'vocab.txt', 'special_tokens_map.json'],
+          });
+          appendDepsLog(bgeRes);
+          // download MiniLM clustering model
+          appendDepsLog(t('mask.venv.step2.download_minilm'));
+          const minilmRes = await invoke('download_model', {
+            repo: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
+            subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
+            files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'sentencepiece.bpe.model'],
+          });
+          appendDepsLog(minilmRes);
           appendDepsLog(t('mask.venv.step2.deps_complete'));
           setDepsInstallSuccess(true);
         } catch (err) {
@@ -447,7 +547,49 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
     );
   }
 
-  if (renderBackendStatus === 'online') return null;
+  if (renderBackendStatus === 'online' && !modelsNeedDownload) return null;
+
+  // ==================== Model download overlay ====================
+  if (modelsNeedDownload && renderPythonVersion && renderVenvInstallStep == null && !depsNeedUpdate) {
+    return (
+      <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-ide-bg/80 backdrop-blur-sm text-ide-muted">
+        {isDev && renderDebugSelector()}
+        <Download className="w-12 h-12 mb-4 opacity-50" />
+        <p className="text-lg font-semibold">{t('mask.model_download.title')}</p>
+        <p className="text-sm opacity-70 mt-1">{t('mask.model_download.subtitle')}</p>
+
+        <div className="mt-6 w-full max-w-2xl px-6">
+          <textarea
+            ref={modelDownloadLogRef}
+            readOnly
+            value={modelDownloadLog.join('\n')}
+            rows={10}
+            className={`w-full bg-ide-bg border ${modelDownloadError ? 'border-rose-400' : 'border-ide-border'} rounded-md p-3 text-xs font-mono ${modelDownloadError ? 'text-rose-400' : 'text-ide-muted'} resize-none`}
+          />
+          {modelDownloadError ? (
+            <div className="mt-3 flex items-center gap-3">
+              <span className="text-xs text-rose-400">{t('mask.model_download.failed', { error: modelDownloadError })}</span>
+              <button
+                onClick={() => {
+                  setModelDownloadError(null);
+                  modelDownloadStartedRef.current = false;
+                }}
+                className="flex items-center gap-1 px-2 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs transition-colors"
+              >
+                <RotateCcw className="w-3 h-3" />
+                {t('mask.model_download.retry')}
+              </button>
+            </div>
+          ) : (
+            <div className="mt-3 flex items-center gap-2 text-xs text-ide-muted">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              {t('mask.model_download.syncing')}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // Backend offline/waiting when pythonVersion exists — no longer show fullscreen mask.
   // The TopBar status badge now handles this state.

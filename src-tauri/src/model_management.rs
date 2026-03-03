@@ -298,11 +298,13 @@ async fn perform_download_hf_repo(
 /// Download model files from Hugging Face repository using aria2 with concurrency and logging.
 /// - `app`: Tauri AppHandle for emitting events
 /// - `files`: List of file paths (relative to repo root) to download
+/// - `subdir`: Optional subdirectory under `models/` to download into
 /// - `concurrency`: Optional maximum number of concurrent downloads
 pub async fn download_model(
     app: AppHandle,
     files: Option<Vec<String>>,
     repo: Option<&str>,
+    subdir: Option<&str>,
     concurrency: Option<usize>,
 ) -> Result<String, String> {
     // prepare aria2 path
@@ -317,7 +319,9 @@ pub async fn download_model(
     let mut download_path = file_in_local_appdata()
         .ok_or_else(|| "Could not determine resource directory.".to_string())?
         .join("models");
-    //download_path.push("model_cache");
+    if let Some(sub) = subdir {
+        download_path = download_path.join(sub);
+    }
     std::fs::create_dir_all(&download_path).map_err(|e| e.to_string())?;
 
     // prepare log file under log path
@@ -343,4 +347,59 @@ pub async fn download_model(
         Ok(path) => Ok(path.to_string_lossy().to_string()),
         Err(e) => Err(format!("download_model error: {}", e)),
     }
+}
+
+#[tauri::command]
+/// Check whether all required model files exist on disk.
+/// Returns a JSON object mapping each model key to its status.
+pub async fn check_model_files() -> Result<serde_json::Value, String> {
+    let models_dir = file_in_local_appdata()
+        .ok_or_else(|| "Could not determine local appdata directory.".to_string())?
+        .join("models");
+
+    // Define all models and their required files
+    let models: Vec<(&str, Option<&str>, Vec<&str>)> = vec![
+        (
+            "chinese-clip",
+            None, // files are directly under models/
+            vec!["vocab.txt", "pytorch_model.bin", "config.json", "preprocessor_config.json"],
+        ),
+        (
+            "bge-small-zh",
+            Some("bge-small-zh-v1.5"),
+            vec!["config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"],
+        ),
+        (
+            "minilm-l12",
+            Some("paraphrase-multilingual-MiniLM-L12-v2"),
+            vec!["config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "sentencepiece.bpe.model"],
+        ),
+    ];
+
+    let mut result = serde_json::Map::new();
+
+    for (key, subdir, files) in &models {
+        let base = match subdir {
+            Some(s) => models_dir.join(s),
+            None => models_dir.clone(),
+        };
+        let mut missing: Vec<String> = Vec::new();
+        for file in files {
+            let path = base.join(file);
+            let exists = path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+            if !exists {
+                missing.push(file.to_string());
+            }
+        }
+        if missing.is_empty() {
+            result.insert(key.to_string(), json!({ "complete": true }));
+        } else {
+            result.insert(key.to_string(), json!({
+                "complete": false,
+                "missing_files": missing
+            }));
+        }
+    }
+
+    Ok(serde_json::Value::Object(result))
 }
