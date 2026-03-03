@@ -240,6 +240,7 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
         limit = 20,
         offset = 0,
         processNames = [],
+        categories = [],
         startTime = null,
         endTime = null,
         fuzzy = true
@@ -273,6 +274,7 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
             offset: offset,
             fuzzy: fuzzy,
             processNames: processNames.length > 0 ? processNames : null,
+            categories: categories.length > 0 ? categories : null,
             startTime: startTime,
             endTime: endTime
         });
@@ -421,4 +423,62 @@ export const deletePlaintextFiles = async () => {
 
 export const computeLinkScores = async (links) => {
     return await invoke('storage_compute_link_scores', { links });
+};
+
+// ==================== 分类相关 ====================
+
+export const updateScreenshotCategory = async (screenshotId, category) => {
+    return await invoke('storage_update_category', {
+        screenshotId,
+        category,
+    });
+};
+
+export const getCategories = async () => {
+    return await invoke('storage_get_categories');
+};
+
+export const getCategoriesFromDb = async () => {
+    try {
+        return await invoke('storage_get_categories_from_db');
+    } catch (e) {
+        console.error('Failed to get categories from db', e);
+        return [];
+    }
+};
+
+export const batchGetCategories = async (imageHashes) => {
+    try {
+        return await invoke('storage_batch_get_categories', { imageHashes });
+    } catch (e) {
+        console.error('Failed to batch get categories', e);
+        return {};
+    }
+};
+
+export const classifyDebug = async ({ title = '', ocrText = '', processName = '' } = {}) => {
+    const payload = {
+        command: 'classify_debug',
+        title,
+        ocr_text: ocrText,
+        process_name: processName,
+    };
+    const response = await invoke('execute_monitor_command', { payload });
+    if (response?.error) {
+        throw new Error(response.error);
+    }
+    return response;
+};
+
+export const removeLocalAnchorsByProcess = async (category, processName) => {
+    const payload = {
+        command: 'remove_local_anchors_by_process',
+        category,
+        process_name: processName,
+    };
+    const response = await invoke('execute_monitor_command', { payload });
+    if (response?.error) {
+        throw new Error(response.error);
+    }
+    return response;
 };

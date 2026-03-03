@@ -1146,8 +1146,12 @@ async fn process_ocr_inner(
         .get("ocr_results")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-    // Commit screenshot with OCR results
-    storage.commit_screenshot(screenshot_id, ocr_results.as_ref())?;
+    // Extract category from Python response
+    let category = response.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let category_confidence = response.get("category_confidence").and_then(|v| v.as_f64());
+
+    // Commit screenshot with OCR results and category
+    storage.commit_screenshot(screenshot_id, ocr_results.as_ref(), category.as_deref(), category_confidence)?;
 
     tracing::debug!(
         "Screenshot {} committed with {} OCR results",

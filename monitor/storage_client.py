@@ -119,8 +119,8 @@ class StorageClient:
                         try:
                             response = json.loads(response_bytes.decode('utf-8'))
                             return response
-                        except json.JSONDecodeError:
-                            # Incomplete response — continue reading
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            # Incomplete response or mid-character split — continue reading
                             continue
                     except pywintypes.error as e:
                         # Pipe ended (109) or other error
@@ -276,6 +276,25 @@ class StorageClient:
         logger.error("[storage_client] Batch decryption failed: %s", response.get('error'))
         return results
     
+    def list_screenshots_for_clustering(
+        self,
+        start_ts: float = 0.0,
+        end_ts: float = 0.0,
+        offset: int = 0,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """Fetch screenshots with OCR text from SQLite for clustering backfill.
+
+        Returns {'screenshots': [...], 'total': int}.
+        """
+        return self._send_request({
+            'command': 'list_screenshots_for_clustering',
+            'start_ts': start_ts,
+            'end_ts': end_ts,
+            'offset': offset,
+            'limit': limit,
+        })
+
     def screenshot_exists(self, image_hash: str) -> bool:
         """
         Check whether a screenshot already exists.
