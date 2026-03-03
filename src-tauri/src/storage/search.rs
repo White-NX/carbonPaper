@@ -94,9 +94,29 @@ impl StorageState {
         process_names: Option<Vec<String>>,
         start_time: Option<f64>,
         end_time: Option<f64>,
+        categories: Option<Vec<String>>,
     ) -> Result<Vec<SearchResult>, String> {
         let mut guard = self.get_connection_named("search_text")?;
         let conn = guard.as_mut().unwrap();
+
+        // Pre-compute set of screenshot IDs matching the category filter.
+        // This allows us to filter bitmap candidates BEFORE pagination,
+        // avoiding the expensive fetch-decrypt-then-discard pattern.
+        let category_screenshot_ids: Option<std::collections::HashSet<i64>> = match &categories {
+            Some(cats) if !cats.is_empty() => {
+                let placeholders = cats.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
+                let sql = format!("SELECT id FROM screenshots WHERE category IN ({})", placeholders);
+                let cat_params: Vec<&dyn rusqlite::ToSql> = cats.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+                let mut stmt = conn.prepare(&sql).map_err(|e| format!("Failed to query category filter: {}", e))?;
+                let ids: std::collections::HashSet<i64> = stmt
+                    .query_map(cat_params.as_slice(), |row| row.get::<_, i64>(0))
+                    .map_err(|e| format!("Failed to fetch category ids: {}", e))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Some(ids)
+            }
+            _ => None,
+        };
 
         // Split keywords by whitespace, compute bigrams for each keyword independently
         // to avoid generating invalid cross-keyword bigrams containing spaces
@@ -205,6 +225,11 @@ impl StorageState {
                             matching.retain(|id| s.contains(id));
                         }
 
+                        // Pre-filter by category before pagination
+                        if let Some(ref cat_ids) = category_screenshot_ids {
+                            matching.retain(|id| cat_ids.contains(id));
+                        }
+
                         if matching.is_empty() {
                             return Ok(vec![]);
                         }
@@ -228,6 +253,36 @@ impl StorageState {
                         intersection.into_iter().map(|v| v as i64).collect();
                     ids.sort_unstable_by(|a, b| b.cmp(a));
 
+                    // For single-keyword path (OCR-level IDs), pre-filter by category
+                    if !is_multi_keyword {
+                        if let Some(ref cat_ids) = category_screenshot_ids {
+                            let needed = (offset + limit) as usize;
+                            let mut filtered_ids = Vec::with_capacity(needed);
+                            for chunk in ids.chunks(500) {
+                                if filtered_ids.len() >= needed { break; }
+                                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
+                                let sql = format!("SELECT id, screenshot_id FROM ocr_results WHERE id IN ({})", placeholders);
+                                let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                                let mut stmt = conn.prepare(&sql).map_err(|e| format!("Failed to filter by category: {}", e))?;
+                                let mut chunk_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+                                let rows = stmt.query_map(params.as_slice(), |row| {
+                                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                                }).map_err(|e| format!("Failed to filter by category: {}", e))?;
+                                for row in rows.filter_map(|r| r.ok()) {
+                                    chunk_map.insert(row.0, row.1);
+                                }
+                                for &id in chunk {
+                                    if let Some(&sid) = chunk_map.get(&id) {
+                                        if cat_ids.contains(&sid) {
+                                            filtered_ids.push(id);
+                                        }
+                                    }
+                                }
+                            }
+                            ids = filtered_ids;
+                        }
+                    }
+
                     // Pagination
                     let start = offset as usize;
                     let end = std::cmp::min(ids.len(), (offset + limit) as usize);
@@ -250,7 +305,8 @@ impl StorageState {
                                     r.box_x1, r.box_y1, r.box_x2, r.box_y2,
                                     r.box_x3, r.box_y3, r.box_x4, r.box_y4,
                                     s.image_path, s.window_title_enc, s.process_name_enc,
-                                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at
+                                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at,
+                                    s.category
                              FROM ocr_results r
                              JOIN screenshots s ON r.screenshot_id = s.id
                              WHERE s.id IN ({})
@@ -265,7 +321,8 @@ impl StorageState {
                                     r.box_x1, r.box_y1, r.box_x2, r.box_y2,
                                     r.box_x3, r.box_y3, r.box_x4, r.box_y4,
                                     s.image_path, s.window_title_enc, s.process_name_enc,
-                                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at
+                                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at,
+                                    s.category
                              FROM ocr_results r
                              JOIN screenshots s ON r.screenshot_id = s.id
                              WHERE r.id IN ({})
@@ -310,6 +367,7 @@ impl StorageState {
                                 screenshot_key_enc,
                                 row.get::<_, String>(17)?,
                                 row.get::<_, String>(18)?,
+                                row.get::<_, Option<String>>(19)?,
                             ))
                         })
                         .map_err(|e| format!("Failed to execute search query: {}", e))?
@@ -328,6 +386,7 @@ impl StorageState {
                                 screenshot_key_enc,
                                 created_at,
                                 screenshot_created_at,
+                                category,
                             )| {
                                 let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
                                     (Some(data), Some(key)) => self
@@ -385,6 +444,7 @@ impl StorageState {
                                     image_path,
                                     window_title,
                                     process_name,
+                                    category,
                                     created_at,
                                     screenshot_created_at,
                                 })
@@ -397,6 +457,7 @@ impl StorageState {
                     }
 
                     // Post-processing: filter by process name and time range
+                    // (category is already pre-filtered at bitmap level)
                     let filtered: Vec<SearchResult> = results
                         .into_iter()
                         .filter(|r| {
@@ -446,7 +507,8 @@ impl StorageState {
                         r.box_x1, r.box_y1, r.box_x2, r.box_y2,
                         r.box_x3, r.box_y3, r.box_x4, r.box_y4,
                         s.image_path, s.window_title_enc, s.process_name_enc,
-                        s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at
+                        s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at,
+                        s.category
                  FROM ocr_results r
                  JOIN screenshots s ON r.screenshot_id = s.id",
             );
@@ -468,6 +530,16 @@ impl StorageState {
                     .unwrap_or_default();
                 where_clauses.push("s.created_at <= ?".to_string());
                 params.push(Box::new(end_dt));
+            }
+
+            if let Some(ref cats) = categories {
+                if !cats.is_empty() {
+                    let cat_placeholders = cats.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
+                    where_clauses.push(format!("s.category IN ({})", cat_placeholders));
+                    for cat in cats {
+                        params.push(Box::new(cat.clone()));
+                    }
+                }
             }
 
             if !where_clauses.is_empty() {
@@ -515,6 +587,7 @@ impl StorageState {
                         screenshot_key_enc,
                         row.get::<_, String>(17)?,
                         row.get::<_, String>(18)?,
+                        row.get::<_, Option<String>>(19)?,
                     ))
                 })
                 .map_err(|e| format!("Failed to execute search query: {}", e))?
@@ -533,6 +606,7 @@ impl StorageState {
                         screenshot_key_enc,
                         created_at,
                         screenshot_created_at,
+                        category,
                     )| {
                         let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
                             (Some(data), Some(key)) => self
@@ -580,6 +654,7 @@ impl StorageState {
                             image_path,
                             window_title,
                             process_name,
+                            category,
                             created_at,
                             screenshot_created_at,
                         })
@@ -591,24 +666,25 @@ impl StorageState {
                 Self::zeroize_bytes(&mut key);
             }
 
-            // Post-processing: filter by process name
-            let filtered = if let Some(names) = process_names {
-                if names.is_empty() {
-                    results
-                } else {
-                    results
-                        .into_iter()
-                        .filter(|r| {
-                            r.process_name
-                                .as_ref()
-                                .map(|p| names.contains(p))
-                                .unwrap_or(false)
-                        })
-                        .collect()
-                }
-            } else {
-                results
-            };
+            // Post-processing: filter by process name only
+            // (category and time range already handled in SQL)
+            let filtered: Vec<SearchResult> = results
+                .into_iter()
+                .filter(|r| {
+                    if let Some(ref names) = process_names {
+                        if !names.is_empty() {
+                            if let Some(p) = &r.process_name {
+                                if !names.contains(p) {
+                                    return false;
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
+                .collect();
 
             return Ok(filtered);
         }
@@ -696,6 +772,11 @@ impl StorageState {
                 matching_screenshots.retain(|id| s.contains(id));
             }
 
+            // Pre-filter by category before pagination
+            if let Some(ref cat_ids) = category_screenshot_ids {
+                matching_screenshots.retain(|id| cat_ids.contains(id));
+            }
+
             if matching_screenshots.is_empty() {
                 return Ok(vec![]);
             }
@@ -727,7 +808,8 @@ impl StorageState {
                         r.box_x1, r.box_y1, r.box_x2, r.box_y2,
                         r.box_x3, r.box_y3, r.box_x4, r.box_y4,
                         s.image_path, s.window_title_enc, s.process_name_enc,
-                        s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at
+                        s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at,
+                        s.category
                  FROM ocr_results r
                  JOIN screenshots s ON r.screenshot_id = s.id
                  WHERE s.id IN ({})
@@ -775,6 +857,7 @@ impl StorageState {
                         screenshot_key_enc,
                         row.get::<_, String>(17)?,
                         row.get::<_, String>(18)?,
+                        row.get::<_, Option<String>>(19)?,
                     ))
                 })
                 .map_err(|e| format!("Failed to execute search query: {}", e))?
@@ -793,6 +876,7 @@ impl StorageState {
                         screenshot_key_enc,
                         created_at,
                         screenshot_created_at,
+                        category,
                     )| {
                         let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
                             (Some(data), Some(key)) => self
@@ -840,6 +924,7 @@ impl StorageState {
                             image_path,
                             window_title,
                             process_name,
+                            category,
                             created_at,
                             screenshot_created_at,
                         })
@@ -852,6 +937,7 @@ impl StorageState {
             }
 
             // Post-processing: filter by process name and time range
+            // (category is already pre-filtered at bitmap level)
             let filtered: Vec<SearchResult> = results
                 .into_iter()
                 .filter(|r| {
@@ -912,6 +998,34 @@ impl StorageState {
         // Sort by id descending (approximate time order)
         ids.sort_unstable_by(|a, b| b.cmp(a));
 
+        // Pre-filter OCR IDs by category before pagination
+        if let Some(ref cat_ids) = category_screenshot_ids {
+            let needed = (offset + limit) as usize;
+            let mut filtered_ids = Vec::with_capacity(needed);
+            for chunk in ids.chunks(500) {
+                if filtered_ids.len() >= needed { break; }
+                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
+                let sql = format!("SELECT id, screenshot_id FROM ocr_results WHERE id IN ({})", placeholders);
+                let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                let mut stmt = conn.prepare(&sql).map_err(|e| format!("Failed to filter by category: {}", e))?;
+                let mut chunk_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+                let rows = stmt.query_map(params.as_slice(), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                }).map_err(|e| format!("Failed to filter by category: {}", e))?;
+                for row in rows.filter_map(|r| r.ok()) {
+                    chunk_map.insert(row.0, row.1);
+                }
+                for &id in chunk {
+                    if let Some(&sid) = chunk_map.get(&id) {
+                        if cat_ids.contains(&sid) {
+                            filtered_ids.push(id);
+                        }
+                    }
+                }
+            }
+            ids = filtered_ids;
+        }
+
         // Pagination
         let start = offset as usize;
         let end = std::cmp::min(ids.len(), (offset + limit) as usize);
@@ -932,7 +1046,8 @@ impl StorageState {
                     r.box_x1, r.box_y1, r.box_x2, r.box_y2,
                     r.box_x3, r.box_y3, r.box_x4, r.box_y4,
                     s.image_path, s.window_title_enc, s.process_name_enc,
-                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at
+                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at,
+                    s.category
              FROM ocr_results r
              JOIN screenshots s ON r.screenshot_id = s.id
              WHERE r.id IN ({})
@@ -977,6 +1092,7 @@ impl StorageState {
                     screenshot_key_enc,
                     row.get::<_, String>(17)?,
                     row.get::<_, String>(18)?,
+                    row.get::<_, Option<String>>(19)?,
                 ))
             })
             .map_err(|e| format!("Failed to execute search query: {}", e))?
@@ -995,6 +1111,7 @@ impl StorageState {
                     screenshot_key_enc,
                     created_at,
                     screenshot_created_at,
+                    category,
                 )| {
                     let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
                         (Some(data), Some(key)) => self
@@ -1042,6 +1159,7 @@ impl StorageState {
                         image_path,
                         window_title,
                         process_name,
+                        category,
                         created_at,
                         screenshot_created_at,
                     })
@@ -1054,6 +1172,7 @@ impl StorageState {
         }
 
         // Post-processing: filter by process name and time range
+        // (category is already pre-filtered at bitmap level)
         let filtered: Vec<SearchResult> = results
             .into_iter()
             .filter(|r| {

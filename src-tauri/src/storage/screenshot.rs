@@ -446,6 +446,8 @@ impl StorageState {
         &self,
         screenshot_id: i64,
         ocr_results: Option<&Vec<OcrResultInput>>,
+        category: Option<&str>,
+        category_confidence: Option<f64>,
     ) -> Result<SaveScreenshotResponse, String> {
         let fn_start = std::time::Instant::now();
         let ocr_count = ocr_results.map(|v| v.len()).unwrap_or(0);
@@ -589,8 +591,8 @@ impl StorageState {
 
         // Mark committed and set committed_at, update image_path to renamed path
         conn.execute(
-            "UPDATE screenshots SET image_path = ?, status = ?, committed_at = CURRENT_TIMESTAMP WHERE id = ?",
-            params![final_image_path_str, "committed", screenshot_id],
+            "UPDATE screenshots SET image_path = ?, status = ?, committed_at = CURRENT_TIMESTAMP, category = ?, category_confidence = ? WHERE id = ?",
+            params![final_image_path_str, "committed", category, category_confidence, screenshot_id],
         )
         .map_err(|e| format!("Failed to mark screenshot committed: {}", e))?;
 
@@ -615,6 +617,93 @@ impl StorageState {
             added,
             skipped,
         })
+    }
+
+    /// Update the category of a screenshot.
+    pub fn update_screenshot_category(
+        &self,
+        screenshot_id: i64,
+        category: &str,
+        category_confidence: Option<f64>,
+    ) -> Result<bool, String> {
+        let mut guard = self.get_connection_named("update_screenshot_category")?;
+        let conn = guard.as_mut().unwrap();
+
+        let rows = conn
+            .execute(
+                "UPDATE screenshots SET category = ?, category_confidence = ? WHERE id = ?",
+                params![category, category_confidence, screenshot_id],
+            )
+            .map_err(|e| format!("Failed to update category: {}", e))?;
+
+        Ok(rows > 0)
+    }
+
+    /// Get distinct categories from the screenshots table (does not require Python).
+    pub fn get_categories_from_db(&self) -> Result<Vec<String>, String> {
+        let guard = self.get_connection_named("get_categories_from_db")?;
+        let conn = guard.as_ref().unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT category FROM screenshots WHERE category IS NOT NULL AND category != '' ORDER BY category",
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let categories: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to execute query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(categories)
+    }
+
+    /// Batch get categories by image hashes. Returns a map of image_hash -> category.
+    pub fn batch_get_categories_by_hash(
+        &self,
+        image_hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, Option<String>>, String> {
+        if image_hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let guard = self.get_connection_named("batch_get_categories_by_hash")?;
+        let conn = guard.as_ref().unwrap();
+
+        let mut result_map = std::collections::HashMap::new();
+
+        // Process in chunks to avoid SQL param limits
+        for chunk in image_hashes.chunks(500) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT image_hash, category FROM screenshots WHERE image_hash IN ({})",
+                placeholders.join(",")
+            );
+            let params: Vec<&dyn rusqlite::ToSql> = chunk
+                .iter()
+                .map(|h| h as &dyn rusqlite::ToSql)
+                .collect();
+
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| format!("Failed to prepare batch query: {}", e))?;
+
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                })
+                .map_err(|e| format!("Failed to execute batch query: {}", e))?;
+
+            for row in rows.filter_map(|r| r.ok()) {
+                result_map.insert(row.0, row.1);
+            }
+        }
+
+        Ok(result_map)
     }
 
     /// Abort pending screenshot: delete encrypted file and mark DB record as aborted.
@@ -704,7 +793,8 @@ impl StorageState {
                         strftime('%s', s.created_at) as timestamp, s.created_at,
                         s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
-                        ls.links_enc, ls.links_key_encrypted
+                        ls.links_enc, ls.links_key_encrypted,
+                        s.category, s.category_confidence
                  FROM screenshots s
                  LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
                  LEFT JOIN link_sets ls ON s.link_set_id = ls.id
@@ -746,6 +836,104 @@ impl StorageState {
         Ok(records)
     }
 
+    /// Count screenshots within a time range (no decryption, very fast).
+    pub fn count_screenshots_by_time_range(
+        &self,
+        start_ts: f64,
+        end_ts: f64,
+    ) -> Result<i64, String> {
+        let guard = self.get_connection_named("count_screenshots_by_time_range")?;
+        let conn = guard.as_ref().unwrap();
+
+        let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+        let end_dt = DateTime::<Utc>::from_timestamp(end_ts as i64, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+
+        let sql = format!(
+            "SELECT COUNT(*) FROM screenshots WHERE created_at BETWEEN '{}' AND '{}'",
+            start_dt, end_dt
+        );
+
+        conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+            .map_err(|e| format!("Failed to count screenshots: {}", e))
+    }
+
+    /// Get screenshots within a time range with SQL-level LIMIT/OFFSET.
+    /// Only the requested page is fetched and decrypted.
+    pub fn get_screenshots_by_time_range_paged(
+        &self,
+        start_ts: f64,
+        end_ts: f64,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<ScreenshotRecord>, String> {
+        let diag_start = std::time::Instant::now();
+
+        // Phase 1: Hold mutex only for SQL query, extract raw data without decryption
+        let raw_rows = {
+            let mut guard = self.get_connection_named("get_screenshots_by_time_range_paged")?;
+            let conn = guard.as_mut().unwrap();
+
+            let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            let end_dt = DateTime::<Utc>::from_timestamp(end_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+
+            let sql = format!(
+                "SELECT s.id, s.image_path, s.image_hash, s.width, s.height,
+                        s.window_title, s.process_name, s.metadata,
+                        s.window_title_enc, s.process_name_enc, s.metadata_enc,
+                        s.content_key_encrypted,
+                        strftime('%s', s.created_at) as timestamp, s.created_at,
+                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        pi.icon_enc, pi.icon_key_encrypted,
+                        ls.links_enc, ls.links_key_encrypted,
+                        s.category, s.category_confidence
+                 FROM screenshots s
+                 LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
+                 LEFT JOIN link_sets ls ON s.link_set_id = ls.id
+                 WHERE s.created_at BETWEEN '{}' AND '{}'
+                 ORDER BY s.created_at ASC
+                 LIMIT {} OFFSET {}",
+                start_dt, end_dt, limit, offset
+            );
+
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+            let rows: Vec<RawScreenshotRow> = stmt
+                .query_map([], |row| RawScreenshotRow::from_row(row))
+                .map_err(|e| format!("Failed to execute query: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            rows
+        };
+
+        let query_elapsed = diag_start.elapsed();
+
+        // Phase 2: Decrypt only the page rows
+        let records: Vec<ScreenshotRecord> =
+            raw_rows.into_iter().map(|raw| raw.into_record()).collect();
+
+        if diag_start.elapsed().as_secs() >= 2 {
+            tracing::warn!(
+                "[DIAG:DB] get_screenshots_by_time_range_paged({} ~ {}, offset={}, limit={}) returned {} records, query {:?}, total {:?}",
+                start_ts, end_ts, offset, limit,
+                records.len(),
+                query_elapsed,
+                diag_start.elapsed()
+            );
+        }
+        Ok(records)
+    }
+
     /// Get screenshot details by ID.
     pub fn get_screenshot_by_id(&self, id: i64) -> Result<Option<ScreenshotRecord>, String> {
         tracing::debug!("get_screenshot_by_id called with id={}", id);
@@ -763,7 +951,8 @@ impl StorageState {
                         strftime('%s', s.created_at) as timestamp, s.created_at,
                         s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
-                        ls.links_enc, ls.links_key_encrypted
+                        ls.links_enc, ls.links_key_encrypted,
+                        s.category, s.category_confidence
                  FROM screenshots s
                  LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
                  LEFT JOIN link_sets ls ON s.link_set_id = ls.id
@@ -828,7 +1017,8 @@ impl StorageState {
                         strftime('%s', s.created_at) as timestamp, s.created_at,
                         s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
                         pi.icon_enc, pi.icon_key_encrypted,
-                        ls.links_enc, ls.links_key_encrypted
+                        ls.links_enc, ls.links_key_encrypted,
+                        s.category, s.category_confidence
                  FROM screenshots s
                  LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
                  LEFT JOIN link_sets ls ON s.link_set_id = ls.id
