@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Search, SlidersHorizontal, Filter, CalendarRange, X, Loader2, RefreshCw, Type, Image as ImageIcon } from 'lucide-react';
+import { Search, SlidersHorizontal, Filter, CalendarRange, X, Loader2, RefreshCw, Type, Image as ImageIcon, Tag } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { searchScreenshots, fetchImage, listProcesses } from '../lib/monitor_api';
+import { searchScreenshots, fetchImage, listProcesses, getCategoriesFromDb, batchGetCategories } from '../lib/monitor_api';
+import { CATEGORY_COLORS } from '../lib/categories';
+import { ThumbnailCard, CategoryBadge } from './ThumbnailCard';
 
 const PAGE_SIZE = 40;
 const NL_PAGE_SIZE = 100;
@@ -73,6 +75,7 @@ function ResultPreview({ item, mode, onSelect, queryTokens }) {
   const createdAt = item.screenshot_created_at || item.created_at || item.metadata?.created_at;
   const displayText = mode === 'nl' ? item.ocr_text : item.text;
   const normalizedText = displayText ? displayText.trim() : '';
+  const categoryValue = item.category || item.metadata?.category || null;
 
   const formattedTimestamp = useMemo(() => {
     if (!createdAt) return null;
@@ -125,11 +128,14 @@ function ResultPreview({ item, mode, onSelect, queryTokens }) {
             <span className="text-sm font-semibold text-blue-300 truncate">
               {processName || t('advancedSearch.unknown')}
             </span>
-            {formattedTimestamp && (
-              <span className="text-[11px] text-ide-muted whitespace-nowrap">
-                {formattedTimestamp}
-              </span>
-            )}
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <CategoryBadge category={categoryValue} />
+              {formattedTimestamp && (
+                <span className="text-[11px] text-ide-muted whitespace-nowrap">
+                  {formattedTimestamp}
+                </span>
+              )}
+            </div>
           </div>
           {windowTitle && (
             <div className="text-xs font-semibold text-ide-text truncate" title={windowTitle}>
@@ -147,75 +153,6 @@ function ResultPreview({ item, mode, onSelect, queryTokens }) {
             </div>
           )}
         </div>
-      </div>
-    </button>
-  );
-}
-
-function ThumbnailCard({ item, onSelect }) {
-  const { t } = useTranslation();
-  const [imageSrc, setImageSrc] = useState(null);
-  const [loadingImage, setLoadingImage] = useState(false);
-
-  useEffect(() => {
-    let active = true;
-    const loadImage = async () => {
-      if (!item) return;
-      const screenshotId = item.screenshot_id ?? item.metadata?.screenshot_id;
-      const id = typeof screenshotId === 'number' && screenshotId > 0 ? screenshotId : null;
-      const targetPath = item.image_path || item.metadata?.image_path || item.path;
-      if (!id && !targetPath) return;
-      setLoadingImage(true);
-      const dataUrl = await fetchImage(id, id ? null : targetPath);
-      if (active) {
-        setImageSrc(dataUrl);
-        setLoadingImage(false);
-      }
-    };
-    loadImage();
-    return () => { active = false; };
-  }, [item]);
-
-  const processName = item.metadata?.process_name;
-  const similarity = item.similarity;
-
-  const normalizedItem = {
-    ...item,
-    id: item.screenshot_id || item.id,
-    path: item.image_path || item.metadata?.image_path || item.path,
-  };
-
-  return (
-    <button
-      className="group relative aspect-video overflow-hidden rounded border
-                 border-ide-border bg-ide-panel hover:border-ide-accent/70
-                 transition focus-visible:outline-none focus-visible:ring-2
-                 focus-visible:ring-ide-accent/60"
-      onClick={(event) => {
-        event.stopPropagation();
-        onSelect(normalizedItem);
-      }}
-    >
-      {imageSrc ? (
-        <img src={imageSrc} className="h-full w-full object-cover" loading="lazy" />
-      ) : loadingImage ? (
-        <div className="flex h-full w-full items-center justify-center">
-          <Loader2 className="w-4 h-4 animate-spin text-ide-muted" />
-        </div>
-      ) : (
-        <div className="flex h-full w-full items-center justify-center bg-ide-bg text-ide-muted text-xs">
-          {t('advancedSearch.no_image')}
-        </div>
-      )}
-      <div className="pointer-events-none absolute inset-0 flex flex-col justify-end
-                      bg-gradient-to-t from-black/60 to-transparent opacity-0
-                      transition group-hover:opacity-100 p-2">
-        <span className="text-xs text-white font-semibold truncate">{processName || t('advancedSearch.unknown')}</span>
-        {similarity !== undefined && (
-            <span className="text-[10px] text-white/80">
-            {t('advancedSearch.similarity', { score: similarity.toFixed(2) })}
-          </span>
-        )}
       </div>
     </button>
   );
@@ -292,6 +229,78 @@ function ProcessFilter({ processes, selected, onChange }) {
   );
 }
 
+function CategoryFilter({ categories, selected, onChange }) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const handleClick = (event) => {
+      if (ref.current && !ref.current.contains(event.target)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, []);
+
+  const toggleValue = (value) => {
+    if (selected.includes(value)) {
+      onChange(selected.filter((item) => item !== value));
+    } else {
+      onChange([...selected, value]);
+    }
+  };
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        className="flex items-center gap-2 px-3 py-1.5 bg-ide-panel border border-ide-border rounded text-xs hover:bg-ide-hover/40"
+        onClick={() => setOpen((prev) => !prev)}
+        type="button"
+      >
+        <Tag className="w-3.5 h-3.5" />
+        {selected.length > 0 ? t('advancedSearch.categories.count', { count: selected.length }) : t('advancedSearch.categories.all')}
+      </button>
+      {open && (
+        <div className="absolute z-30 mt-2 min-w-[200px] max-h-60 overflow-y-auto bg-ide-panel border border-ide-border rounded shadow-lg p-2 space-y-1">
+          <div className="flex items-center justify-between text-[11px] text-ide-muted mb-1">
+            <span>{t('advancedSearch.categories.select')}</span>
+            {selected.length > 0 && (
+              <button className="text-blue-300" onClick={() => onChange([])}>{t('advancedSearch.categories.clear')}</button>
+            )}
+          </div>
+          {categories.length === 0 && (
+            <div className="text-xs text-ide-muted px-2 py-3">{t('advancedSearch.categories.no_data')}</div>
+          )}
+          {categories.map((cat) => {
+            const isChecked = selected.includes(cat);
+            const color = CATEGORY_COLORS[cat] || '#6b7280';
+            return (
+              <label
+                key={cat}
+                className="flex items-center gap-2 text-xs px-2 py-1 rounded hover:bg-ide-hover/30 cursor-pointer"
+              >
+                <input
+                  type="checkbox"
+                  className="accent-blue-400"
+                  checked={isChecked}
+                  onChange={() => toggleValue(cat)}
+                />
+                <span
+                  className="w-2 h-2 rounded-full flex-shrink-0"
+                  style={{ backgroundColor: color }}
+                />
+                <span>{cat}</span>
+              </label>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function AdvancedSearch({ active, searchParams, onSelectResult, searchMode, onSearchModeChange, backendOnline }) {
   const [query, setQuery] = useState(searchParams?.query || '');
   const [mode, setMode] = useState(searchMode ?? (searchParams?.mode || 'ocr'));
@@ -301,6 +310,8 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
   const [hasMore, setHasMore] = useState(false);
   const [selectedProcesses, setSelectedProcesses] = useState([]);
   const [processOptions, setProcessOptions] = useState([]);
+  const [selectedCategories, setSelectedCategories] = useState([]);
+  const [categoryOptions, setCategoryOptions] = useState([]);
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const offsetRef = useRef(0);
@@ -337,8 +348,11 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     if (!active) return;
     let mounted = true;
     (async () => {
-      const data = await listProcesses();
-      if (mounted) setProcessOptions(data);
+      const [data, cats] = await Promise.all([listProcesses(), getCategoriesFromDb()]);
+      if (mounted) {
+        setProcessOptions(data);
+        setCategoryOptions(cats);
+      }
     })();
     return () => {
       mounted = false;
@@ -399,7 +413,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
   const resetAndFetch = useCallback(async () => {
     if (!active) return;
     const normalizedQuery = debouncedQuery.trim();
-    const hasFilters = selectedProcesses.length > 0 || startDate || endDate;
+    const hasFilters = selectedProcesses.length > 0 || selectedCategories.length > 0 || startDate || endDate;
     if (!normalizedQuery && !hasFilters) {
       searchIdRef.current += 1;
       setResults([]);
@@ -419,16 +433,37 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
       limit: pageSize,
       offset: 0,
       processNames: selectedProcesses,
+      categories: mode === 'ocr' ? selectedCategories : [],
       startTime: computeTimestamp(startDate),
       endTime: computeTimestamp(endDate),
       fuzzy: mode !== 'nl'
     });
     if (searchIdRef.current !== currentSearchId) return;
+
+    // NL 模式：批量enrichment分类信息
+    if (mode === 'nl' && fetched.length > 0) {
+      const hashes = fetched
+        .map((item) => (item.image_path || '').replace('memory://', ''))
+        .filter(Boolean);
+      if (hashes.length > 0) {
+        const categoryMap = await batchGetCategories(hashes);
+        if (searchIdRef.current === currentSearchId) {
+          for (const item of fetched) {
+            const hash = (item.image_path || '').replace('memory://', '');
+            if (hash && categoryMap[hash] !== undefined) {
+              item.category = categoryMap[hash];
+            }
+          }
+        }
+      }
+    }
+
+    if (searchIdRef.current !== currentSearchId) return;
     setResults(fetched);
     setHasMore(fetched.length === pageSize);
     offsetRef.current = fetched.length;
     setLoading(false);
-  }, [active, debouncedQuery, mode, selectedProcesses, startDate, endDate, computeTimestamp]);
+  }, [active, debouncedQuery, mode, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp]);
 
   useEffect(() => {
     resetAndFetch();
@@ -450,16 +485,37 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
       limit: pageSize,
       offset: offsetRef.current,
       processNames: selectedProcesses,
+      categories: mode === 'ocr' ? selectedCategories : [],
       startTime: computeTimestamp(startDate),
       endTime: computeTimestamp(endDate),
       fuzzy: mode !== 'nl'
     });
     if (searchIdRef.current !== currentSearchId) return;
+
+    // NL 模式：批量enrichment
+    if (mode === 'nl' && fetched.length > 0) {
+      const hashes = fetched
+        .map((item) => (item.image_path || '').replace('memory://', ''))
+        .filter(Boolean);
+      if (hashes.length > 0) {
+        const categoryMap = await batchGetCategories(hashes);
+        if (searchIdRef.current === currentSearchId) {
+          for (const item of fetched) {
+            const hash = (item.image_path || '').replace('memory://', '');
+            if (hash && categoryMap[hash] !== undefined) {
+              item.category = categoryMap[hash];
+            }
+          }
+        }
+      }
+    }
+
+    if (searchIdRef.current !== currentSearchId) return;
     setResults((prev) => [...prev, ...fetched]);
     setHasMore(fetched.length === pageSize);
     offsetRef.current += fetched.length;
     setLoadingMore(false);
-  }, [debouncedQuery, mode, selectedProcesses, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading]);
+  }, [debouncedQuery, mode, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading]);
 
   useEffect(() => {
     if (!active) return;
@@ -490,22 +546,33 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
 
   const clearFilters = () => {
     setSelectedProcesses([]);
+    setSelectedCategories([]);
     setStartDate('');
     setEndDate('');
   };
 
   return (
     <div className={`flex flex-col flex-1 min-h-0 w-full ${active ? 'opacity-100' : 'opacity-0 pointer-events-none'} transition-opacity duration-200`}>
-      <form className="border-b border-ide-border bg-ide-panel p-4" onSubmit={handleSubmit}>
+      <form className="shrink-0 border-b border-ide-border bg-ide-panel px-4 py-2.5 space-y-2" onSubmit={handleSubmit}>
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-sm font-semibold text-ide-text flex items-center gap-2">
+            <Search className="w-4 h-4 text-ide-accent" />
+            {t('advancedSearch.title')}
+          </h2>
+          <button
+            type="button"
+            className="flex items-center gap-1 px-3 py-1.5 text-xs border border-ide-border rounded text-ide-muted hover:text-ide-text hover:bg-ide-hover/30"
+            onClick={clearFilters}
+          >
+            <RefreshCw className="w-3.5 h-3.5" /> 重置
+          </button>
+        </div>
+
         <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center bg-ide-bg border border-ide-border rounded-md overflow-hidden">
-            <div className="flex items-center gap-2 px-3 border-r border-ide-border text-ide-muted text-xs uppercase">
-              <Search className="w-3.5 h-3.5" />
-              {t('advancedSearch.title')}
-            </div>
             <input
               type="text"
-              className="bg-transparent text-sm px-3 py-1.5 focus:outline-none min-w-[220px]"
+              className="bg-transparent text-sm px-3 py-1.5 focus:outline-none min-w-[260px]"
               placeholder={mode === 'ocr' ? t('advancedSearch.search.placeholder_ocr') : t('advancedSearch.search.placeholder_nl')}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
@@ -534,7 +601,9 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
               <ImageIcon className="w-3.5 h-3.5" /> {t('advancedSearch.modes.nl')}
             </button>
           </div>
-          <ProcessFilter processes={processOptions} selected={selectedProcesses} onChange={setSelectedProcesses} />
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2 text-xs text-ide-muted">
             <CalendarRange className="w-3.5 h-3.5" />
             <input
@@ -551,13 +620,10 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
               className="bg-ide-bg border border-ide-border rounded px-2 py-1"
             />
           </div>
-          <button
-            type="button"
-            className="flex items-center gap-1 px-3 py-1.5 text-xs border border-ide-border rounded text-ide-muted hover:text-ide-text hover:bg-ide-hover/30"
-            onClick={clearFilters}
-          >
-            <RefreshCw className="w-3.5 h-3.5" /> 重置
-          </button>
+          <ProcessFilter processes={processOptions} selected={selectedProcesses} onChange={setSelectedProcesses} />
+          {mode === 'ocr' && (
+            <CategoryFilter categories={categoryOptions} selected={selectedCategories} onChange={setSelectedCategories} />
+          )}
         </div>
         {mode === 'nl' && (
           <div className="text-ide-muted mt-2 text-sm">
@@ -574,7 +640,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
         )}
         {!loading && results.length === 0 && (
           <div className="flex flex-col items-center justify-center py-16 text-ide-muted gap-2 text-sm">
-            {(!query.trim() && selectedProcesses.length === 0 && !startDate && !endDate) ? (
+            {(!query.trim() && selectedProcesses.length === 0 && selectedCategories.length === 0 && !startDate && !endDate) ? (
               <>
                 <Search className="w-5 h-5" />
                 <span>{t('advancedSearch.search.enter_keyword')}</span>

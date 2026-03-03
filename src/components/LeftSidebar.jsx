@@ -1,12 +1,15 @@
 import React, { useMemo, useState, useEffect } from 'react';
-import { Monitor, Clock, Globe, ExternalLink } from 'lucide-react';
+import { Monitor, Clock, Globe, ExternalLink, Tag } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { computeLinkScores } from '../lib/monitor_api';
+import { computeLinkScores, updateScreenshotCategory } from '../lib/monitor_api';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { CATEGORY_LIST, CATEGORY_COLORS } from '../lib/categories';
 
-export default function LeftSidebar({ selectedEvent, selectedDetails }) {
+export default function LeftSidebar({ selectedEvent, selectedDetails, onCategoryChange }) {
   const { t } = useTranslation();
   const [scoredLinks, setScoredLinks] = useState([]);
+  const [editingCategory, setEditingCategory] = useState(false);
+  const [localCategory, setLocalCategory] = useState(null);
 
   const iconSrc = useMemo(() => {
     const raw = selectedDetails?.record?.process_icon || selectedEvent?.processIcon || selectedDetails?.record?.page_icon;
@@ -36,6 +39,26 @@ export default function LeftSidebar({ selectedEvent, selectedDetails }) {
   }, [selectedDetails?.record?.visible_links]);
 
   const pageUrl = selectedDetails?.record?.page_url;
+
+  // Sync local category state when selection changes
+  const currentCategory = localCategory ?? selectedDetails?.record?.category ?? selectedEvent?.category ?? null;
+
+  useEffect(() => {
+    setLocalCategory(null);
+    setEditingCategory(false);
+  }, [selectedEvent?.id]);
+
+  const handleCategoryChange = async (newCategory) => {
+    if (!selectedEvent?.id) return;
+    setLocalCategory(newCategory);
+    setEditingCategory(false);
+    try {
+      await updateScreenshotCategory(selectedEvent.id, newCategory);
+      if (onCategoryChange) onCategoryChange(selectedEvent.id, newCategory);
+    } catch (err) {
+      console.error('Failed to update category:', err);
+    }
+  };
 
   const getHostname = (url) => {
     try {
@@ -87,6 +110,44 @@ export default function LeftSidebar({ selectedEvent, selectedDetails }) {
               <div className="flex items-center gap-2 mt-1 text-sm opacity-80">
                 <Clock size={14} />
                 {new Date(selectedEvent.timestamp).toLocaleString()}
+              </div>
+            </div>
+            <div>
+              <label className="text-xs text-ide-muted uppercase font-bold">{t('sidebar.labels.category', '分类')}</label>
+              <div className="mt-1">
+                {editingCategory ? (
+                  <div className="space-y-1">
+                    {CATEGORY_LIST.map((cat) => (
+                      <button
+                        key={cat}
+                        className={`w-full text-left px-2 py-1 rounded text-xs hover:bg-ide-hover flex items-center gap-2 ${
+                          currentCategory === cat ? 'bg-ide-active' : ''
+                        }`}
+                        onClick={() => handleCategoryChange(cat)}
+                      >
+                        <span
+                          className="w-2 h-2 rounded-full shrink-0"
+                          style={{ backgroundColor: CATEGORY_COLORS[cat] || '#6b7280' }}
+                        />
+                        {cat}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <button
+                    className="flex items-center gap-2 text-sm opacity-80 hover:opacity-100 cursor-pointer"
+                    onClick={() => setEditingCategory(true)}
+                  >
+                    <Tag size={14} />
+                    {currentCategory && currentCategory !== '未分类' ? (
+                      <span className="px-1.5 py-0.5 rounded text-xs text-white" style={{ backgroundColor: CATEGORY_COLORS[currentCategory] || '#6b7280' }}>
+                        {currentCategory}
+                      </span>
+                    ) : (
+                      <span className="text-ide-muted">{t('sidebar.labels.uncategorized', '未分类')}</span>
+                    )}
+                  </button>
+                )}
               </div>
             </div>
             {(pageUrl || scoredLinks.length > 0) && (

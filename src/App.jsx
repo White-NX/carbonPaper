@@ -16,11 +16,13 @@ import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
 import DmlSetupWizard from './components/DmlSetupWizard';
 import ExtensionSetupWizard from './components/ExtensionSetupWizard';
-import LeftSidebar from './components/LeftSidebar';
+import ClusteringSetupWizard from './components/ClusteringSetupWizard';
+import ActivityBar from './components/ActivityBar';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
 import { getScreenshotDetails, fetchImage, deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
+import { runClustering, saveClusteringResults } from './lib/task_api';
 import { checkForUpdate } from './lib/update_api';
 
 function App() {
@@ -59,6 +61,8 @@ function App() {
   const [authError, setAuthError] = useState(null);
   const [showDmlSetup, setShowDmlSetup] = useState(false);
   const [showExtensionSetup, setShowExtensionSetup] = useState(false);
+  const [showClusteringSetup, setShowClusteringSetup] = useState(false);
+  const clusteringTimerRef = useRef(null);
   const [sessionTimeout, setSessionTimeout] = useState(() => {
     const saved = localStorage.getItem('sessionTimeout');
     return saved ? parseInt(saved, 10) : 900; // 默认 15 分钟
@@ -77,7 +81,8 @@ function App() {
   const backendStatusRef = useRef('unknown');
   const backendStartAtRef = useRef(null);
   const lastBackendErrorRef = useRef('');
-  const [activeTab, setActiveTab] = useState('preview'); // 'preview' | 'advanced-search'
+  const [activeTab, setActiveTab] = useState('preview'); // 'preview' | 'advanced-search' | 'tasks'
+  const [sidebarExpanded, setSidebarExpanded] = useState(false);
   const [searchMode, setSearchMode] = useState('ocr');
   const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
   const [timelineRefreshKey, setTimelineRefreshKey] = useState(0);
@@ -89,6 +94,10 @@ function App() {
   const [depsNeedUpdate, setDepsNeedUpdate] = useState(false);
   const [depsSyncing, setDepsSyncing] = useState(false);
   const [depsCheckDone, setDepsCheckDone] = useState(false);
+
+  // Model file check state
+  const [modelsNeedDownload, setModelsNeedDownload] = useState(false);
+  const [missingModels, setMissingModels] = useState(null);
 
   // State to trigger timeline jumps
   const [timelineJump, setTimelineJump] = useState(null); // { time: number, ts: number }
@@ -370,6 +379,101 @@ function App() {
     setShowExtensionSetup(false);
   }, []);
 
+  // Check if clustering setup wizard should be shown (after DML + Extension wizard)
+  useEffect(() => {
+    if (backendStatus !== 'online' || !isAuthenticated || showDmlSetup || showExtensionSetup) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const needed = await invoke('check_clustering_setup_needed');
+        if (!cancelled && needed) {
+          setShowClusteringSetup(true);
+        }
+      } catch (err) {
+        console.warn('Failed to check clustering setup status:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [backendStatus, isAuthenticated, showDmlSetup, showExtensionSetup]);
+
+  // Clustering setup wizard callback — delayed background execution
+  const handleClusteringSetupComplete = useCallback((shouldRun) => {
+    setShowClusteringSetup(false);
+    if (!shouldRun) return;
+
+    // Clear any previous timer
+    if (clusteringTimerRef.current) {
+      clearTimeout(clusteringTimerRef.current);
+    }
+
+    // Wait 60 seconds for the embedding model to finish initialising, then run
+    clusteringTimerRef.current = setTimeout(async () => {
+      clusteringTimerRef.current = null;
+      pushNotification({
+        id: `clustering-start-${Date.now()}`,
+        type: 'info',
+        title: '任务聚类',
+        message: '正在对历史快照进行任务聚类，这可能需要几分钟时间…',
+        timestamp: Date.now(),
+      });
+
+      try {
+        const result = await runClustering();
+
+        if (result && result.status === 'already_running') {
+          pushNotification({
+            id: `clustering-running-${Date.now()}`,
+            type: 'info',
+            title: '任务聚类',
+            message: '聚类任务已在后台运行中，请稍后查看结果。',
+            timestamp: Date.now(),
+          });
+          return;
+        }
+
+        // Save results to SQLite
+        if (result && result.clusters && result.clusters.length > 0) {
+          const tasks = result.clusters.map((c) => ({
+            label: c.label || null,
+            layer: 'hot',
+            centroid: c.centroid || [],
+            screenshot_ids: c.screenshot_ids || [],
+            start_time: c.start_time || null,
+            end_time: c.end_time || null,
+            dominant_process: c.dominant_process || null,
+            dominant_category: c.dominant_category || null,
+          }));
+          await saveClusteringResults(tasks);
+          pushNotification({
+            id: `clustering-done-${Date.now()}`,
+            type: 'success',
+            title: '任务聚类完成',
+            message: `已将历史快照归纳为 ${tasks.length} 个任务，可在"任务"面板中查看。`,
+            timestamp: Date.now(),
+          });
+        } else {
+          pushNotification({
+            id: `clustering-empty-${Date.now()}`,
+            type: 'info',
+            title: '任务聚类完成',
+            message: '未发现可归类的任务。快照数量可能不足，系统将在积累更多数据后自动尝试。',
+            timestamp: Date.now(),
+          });
+        }
+      } catch (err) {
+        console.error('Background clustering failed:', err);
+        pushNotification({
+          id: `clustering-error-${Date.now()}`,
+          type: 'error',
+          title: '任务聚类失败',
+          message: typeof err === 'string' ? err : (err?.message || '聚类过程中发生错误，请稍后在"任务"面板手动重试。'),
+          details: typeof err === 'string' ? '' : (err?.stack || ''),
+          timestamp: Date.now(),
+        });
+      }
+    }, 60_000);
+  }, [pushNotification]);
+
   useEffect(() => {
     checkAuthStatus();
     const interval = setInterval(checkAuthStatus, 10000);
@@ -574,10 +678,11 @@ function App() {
     if (!pythonVersion) return;
     if (!depsCheckDone) return;
     if (depsNeedUpdate || depsSyncing) return;
+    if (modelsNeedDownload) return;
     if (backendStatus === 'offline' && backendStatusRef.current !== 'waiting') {
       handleStartBackend();
     }
-  }, [autoStartMonitor, autoStartSuppressed, backendStatus, pythonVersion, handleStartBackend, depsNeedUpdate, depsSyncing, depsCheckDone]);
+  }, [autoStartMonitor, autoStartSuppressed, backendStatus, pythonVersion, handleStartBackend, depsNeedUpdate, depsSyncing, depsCheckDone, modelsNeedDownload]);
 
   // debug: print out python version
   const refreshPythonVersion = useCallback(async () => {
@@ -598,6 +703,23 @@ function App() {
         } catch (err) {
           console.warn('Failed to check deps freshness:', err);
           setDepsNeedUpdate(false);
+        }
+
+        // Check if model files are complete
+        try {
+          const modelStatus = await invoke('check_model_files');
+          const hasIncomplete = Object.values(modelStatus).some((m) => !m.complete);
+          if (hasIncomplete) {
+            console.log('Model files incomplete:', modelStatus);
+            setModelsNeedDownload(true);
+            setMissingModels(modelStatus);
+          } else {
+            setModelsNeedDownload(false);
+            setMissingModels(null);
+          }
+        } catch (err) {
+          console.warn('Failed to check model files:', err);
+          setModelsNeedDownload(false);
         }
       }
     } catch (error) {
@@ -718,6 +840,12 @@ function App() {
           depsNeedUpdate={depsNeedUpdate}
           depsSyncing={depsSyncing}
           onDepsSync={handleDepsSync}
+          modelsNeedDownload={modelsNeedDownload}
+          missingModels={missingModels}
+          onModelsDownloadComplete={() => {
+            setModelsNeedDownload(false);
+            setMissingModels(null);
+          }}
         />
 
         <AuthMask
@@ -737,6 +865,11 @@ function App() {
           onComplete={handleExtensionSetupComplete}
         />
 
+        <ClusteringSetupWizard
+          isVisible={backendStatus === 'online' && isAuthenticated && !showDmlSetup && !showExtensionSetup && showClusteringSetup}
+          onComplete={handleClusteringSetupComplete}
+        />
+
         <Timeline
           onSelectEvent={(evt) => {
             setSelectedEvent(evt);
@@ -749,8 +882,13 @@ function App() {
         />
 
         {/* Main Workspace Grid */}
-        <main className="flex-1 flex flex-col md:grid md:grid-cols-[250px_1fr] overflow-hidden relative bg-ide-bg">
-          <LeftSidebar selectedEvent={selectedEvent} selectedDetails={selectedDetails} />
+        <main className="flex-1 flex flex-col md:flex-row overflow-hidden relative bg-ide-bg">
+          <ActivityBar
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
+            expanded={sidebarExpanded}
+            onToggleExpand={() => setSidebarExpanded(prev => !prev)}
+          />
 
           <MainArea
             activeTab={activeTab}
