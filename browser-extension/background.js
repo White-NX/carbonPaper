@@ -79,7 +79,7 @@ function connectNative() {
 
 // Screenshot Capture Logic
 
-async function captureCurrentTab() {
+async function captureCurrentTab(retry = 0) {
   if (!isEnabled || !isConnected || !nmPort) return;
 
   try {
@@ -118,9 +118,6 @@ async function captureCurrentTab() {
       visibleLinks: []
     };
 
-    // Trying to recapture while meeting "user may dragging the window" error.
-    let retry = 0;
-
     try {
       const response = await chrome.tabs.sendMessage(tab.id, { type: 'getPageData' });
       if (response) {
@@ -130,8 +127,8 @@ async function captureCurrentTab() {
       // Content script may not be injected (e.g., on new tab page)
       // Use tab data as fallback
       if (retry < MAX_RETRY) {
-        retry++;
-        setTimeout(() => captureCurrentTab(), 500);
+        const nextRetry = retry + 1;
+        setTimeout(() => captureCurrentTab(nextRetry), 500);
         return;
       }
     }
@@ -168,9 +165,9 @@ async function captureCurrentTab() {
     if (e.message?.includes('user may be dragging a tab') && retry < MAX_RETRY) {
       // This is a known Chrome bug.
       // We can retry after a short delay.
-      console.warn(`[CarbonPaper] Capture failed due to dragging state, retrying (${retry}): `, e.message);
-      retry++;
-      setTimeout(captureCurrentTab, 500);
+      console.warn(`[CarbonPaper] Capture failed due to dragging state, retrying (${nextRetry}): `, e.message);
+      const nextRetry = retry + 1;
+      setTimeout(() => captureCurrentTab(nextRetry), 500);
       return;
     }
 

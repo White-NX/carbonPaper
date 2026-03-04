@@ -650,7 +650,8 @@ class ClassificationService:
                 return ("未分类", 0.0)
             title = ocr_text[:200]
 
-        title_emb = self.embedder.encode_single(title)  # (dim,)
+        clean_title = self._strip_app_suffix(title, process_name)
+        title_emb = self.embedder.encode_single(clean_title)  # (dim,)
         title_local = self._score_embedding(title_emb, process_name=process_name, channel="local")
         title_global = self._score_embedding(title_emb, process_name=process_name, channel="global")
         cat_scores = self._blend_channel_scores(title_local, title_global, self.category_names)
