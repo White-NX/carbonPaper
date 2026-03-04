@@ -27,6 +27,10 @@ pub struct ScreenshotRecord {
     pub page_icon: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visible_links: Option<Vec<VisibleLink>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_confidence: Option<f64>,
 }
 
 /// OcrResult representing a row in the ocr_results table, with decrypted fields.
@@ -68,6 +72,7 @@ pub struct SearchResult {
     pub image_path: String,
     pub window_title: Option<String>,
     pub process_name: Option<String>,
+    pub category: Option<String>,
     pub created_at: String,
     pub screenshot_created_at: String,
 }
@@ -140,6 +145,9 @@ pub(super) struct RawScreenshotRow {
     pub(super) page_icon_ref_key: Option<Vec<u8>>,
     pub(super) link_set_ref_enc: Option<Vec<u8>>,
     pub(super) link_set_ref_key: Option<Vec<u8>>,
+    // Classification
+    pub(super) category: Option<String>,
+    pub(super) category_confidence: Option<f64>,
 }
 
 impl RawScreenshotRow {
@@ -232,6 +240,8 @@ impl RawScreenshotRow {
             page_url,
             page_icon,
             visible_links,
+            category: self.category,
+            category_confidence: self.category_confidence,
         }
     }
 
@@ -265,6 +275,8 @@ impl RawScreenshotRow {
             page_icon_ref_key: row.get(19)?,
             link_set_ref_enc: row.get(20)?,
             link_set_ref_key: row.get(21)?,
+            category: row.get(22)?,
+            category_confidence: row.get(23)?,
         })
     }
 }

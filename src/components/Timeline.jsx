@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { getTimeline, fetchTimelineImage, clearTimelineImageQueue, cancelTimelineImageRequest } from '../lib/monitor_api';
 import { Locate, Play } from 'lucide-react';
+import { CATEGORY_COLORS } from '../lib/categories';
 
 // Simple debounce
 function simpleDebounce(func, wait) {
@@ -228,10 +229,22 @@ const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showTex
                             ) : (
                                 <div className="text-ide-muted text-[8px]">...</div>
                             )}
+                            {event.category && event.category !== '未分类' && (
+                                <div
+                                    className="absolute bottom-0 left-0 right-0 h-1.5 opacity-80"
+                                    style={{ backgroundColor: CATEGORY_COLORS[event.category] || '#6b7280' }}
+                                    title={event.category}
+                                />
+                            )}
                         </div>
                     </div>
                     
                     <div className={`opacity-0 group-hover:opacity-100 absolute top-full mt-1 bg-ide-panel text-xs text-ide-text px-2 py-1 rounded shadow border border-ide-border whitespace-nowrap z-20 pointer-events-none ${isHighlighted ? 'opacity-100' : ''}`}>
+                        {event.category && event.category !== '未分类' && (
+                            <span className="mr-1 px-1 py-0.5 rounded text-[10px] text-white" style={{ backgroundColor: CATEGORY_COLORS[event.category] || '#6b7280' }}>
+                                {event.category}
+                            </span>
+                        )}
                         {new Date(event.timestamp).toLocaleString()}
                     </div>
                 </div>
@@ -360,6 +373,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                         windowTitle: r.window_title,
                         processIcon: r.process_icon || meta?.process_icon || r.page_icon || null,
                         processPath: r.process_path || meta?.process_path || null,
+                        category: r.category || null,
                     };
                 })
                 .filter(e => !isNaN(e.timestamp)); // Filter out invalid timestamps

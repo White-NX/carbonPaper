@@ -430,7 +430,11 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                 None => None,
             };
 
-            match storage.commit_screenshot(screenshot_id, ocr_results.as_ref()) {
+            // Extract category from request (may be provided by Python classification)
+            let category = req.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let category_confidence = req.get("category_confidence").and_then(|v| v.as_f64());
+
+            match storage.commit_screenshot(screenshot_id, ocr_results.as_ref(), category.as_deref(), category_confidence) {
                 Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
                 Err(e) => StorageResponse::error(&e),
             }
@@ -520,6 +524,57 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                         Err(e) => StorageResponse::error(&e),
                     }
                 }
+            }
+        }
+
+        "list_screenshots_for_clustering" => {
+            let start_ts = req.get("start_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let end_ts = req.get("end_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let offset = req.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
+            let limit = req.get("limit").and_then(|v| v.as_i64()).unwrap_or(500).min(1000);
+
+            // If no time range given, use full range
+            let (s, e) = if end_ts <= start_ts {
+                (0.0_f64, 4102444800.0_f64) // epoch 0 to 2100-01-01
+            } else {
+                (start_ts, end_ts)
+            };
+
+            // Fast COUNT query (no decryption)
+            let total = match storage.count_screenshots_by_time_range(s, e) {
+                Ok(n) => n,
+                Err(err) => return StorageResponse::error(&err),
+            };
+
+            // Paged query with SQL LIMIT/OFFSET (only decrypt this page)
+            match storage.get_screenshots_by_time_range_paged(s, e, offset, limit) {
+                Ok(records) => {
+                    let page: Vec<serde_json::Value> = records
+                        .into_iter()
+                        .map(|rec| {
+                            // Fetch OCR text for each screenshot
+                            let ocr_text = match storage.get_screenshot_ocr_results(rec.id) {
+                                Ok(ocr_results) => {
+                                    ocr_results.iter().map(|r| r.text.clone()).collect::<Vec<_>>().join(" ")
+                                }
+                                Err(_) => String::new(),
+                            };
+                            serde_json::json!({
+                                "id": rec.id,
+                                "process_name": rec.process_name.unwrap_or_default(),
+                                "window_title": rec.window_title.unwrap_or_default(),
+                                "ocr_text": ocr_text,
+                                "timestamp": rec.timestamp.unwrap_or(0) as f64,
+                                "category": rec.category.unwrap_or_default(),
+                            })
+                        })
+                        .collect();
+                    StorageResponse::success(serde_json::json!({
+                        "screenshots": page,
+                        "total": total,
+                    }))
+                }
+                Err(e) => StorageResponse::error(&e),
             }
         }
 
@@ -1044,7 +1099,11 @@ async fn process_extension_ocr(
         .get("ocr_results")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-    storage.commit_screenshot(screenshot_id, ocr_results.as_ref())?;
+    // Extract category from Python response
+    let category = response.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let category_confidence = response.get("category_confidence").and_then(|v| v.as_f64());
+
+    storage.commit_screenshot(screenshot_id, ocr_results.as_ref(), category.as_deref(), category_confidence)?;
 
     tracing::debug!(
         "Extension screenshot {} committed with {} OCR results",

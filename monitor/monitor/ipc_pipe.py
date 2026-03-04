@@ -16,16 +16,16 @@ from typing import Callable
 
 
 def _make_security_attributes_for_current_user():
-    # 创建仅允许当前用户访问的安全属性（SECURITY_ATTRIBUTES）
+    # Create SECURITY_ATTRIBUTES that only allow the current user to access the pipe
     sd = win32security.SECURITY_DESCRIPTOR()
     sd.Initialize()
 
-    # 获取当前进程用户的 SID
+    # Get the SID of the current process user
     hProc = win32api.GetCurrentProcess()
     hToken = win32security.OpenProcessToken(hProc, win32con.TOKEN_QUERY)
     user_sid = win32security.GetTokenInformation(hToken, win32security.TokenUser)[0]
 
-    # 创建 DACL，只给当前用户读写权限
+    # Create a DACL granting only the current user read/write access
     dacl = win32security.ACL()
     mask = ntsecuritycon.FILE_GENERIC_READ | ntsecuritycon.FILE_GENERIC_WRITE
     dacl.AddAccessAllowedAce(win32security.ACL_REVISION, mask, user_sid)
@@ -147,7 +147,7 @@ class _NamedPipeServer:
         import pywintypes
         _t0 = _time.perf_counter()
         try:
-            # 读取请求 — 循环读取直到获取完整消息（支持大消息如 process_ocr）
+            # Read request — loop until the full message is received (supports large messages like process_ocr)
             try:
                 chunks = []
                 while True:
@@ -218,7 +218,7 @@ class _NamedPipeServer:
                 if (_t1 - _t0) > 5.0:
                     logger.warning('[DIAG:PIPE-PY] CreateNamedPipe took %.3fs (GIL contention?)', _t1 - _t0)
             except Exception as e:
-                logger.error('创建命名管道失败: %s', e)
+                logger.error('Failed to create named pipe: %s', e)
                 # Sleep a bit to avoid hot loop on error
                 import time
                 time.sleep(1)

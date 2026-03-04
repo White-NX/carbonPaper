@@ -111,6 +111,18 @@
         "gpu_select": "选择 GPU 设备",
         "gpu_loading": "正在检测 GPU...",
         "gpu_none": "未检测到兼容的 GPU"
+      },
+      "clustering": {
+        "title": "任务聚类",
+        "interval_label": "自动聚类间隔",
+        "interval_desc": "设置后台自动运行任务聚类的时间间隔",
+        "info": "任务聚类会自动将相似的活动分组为长期任务。使用 MiniLM-L12 模型编码文本，模型在聚类完成后会自动卸载以释放内存。",
+        "intervals": {
+          "1d": "每天",
+          "1w": "每周",
+          "1m": "每月",
+          "6m": "每半年"
+        }
       }
     },
     "storageManagement": {
@@ -339,15 +351,26 @@
     "labels": {
       "process": "进程",
       "window": "窗口",
-      "time": "时间"
+      "time": "时间",
+      "category": "分类",
+      "uncategorized": "未分类"
     },
     "links": {
       "title": "页面上的链接",
       "currentPage": "当前页面"
     },
+    "related": {
+      "title": "可能相关的快照"
+    },
     "empty": "从时间线中选择一个事件以查看详情。"
-  }
-  ,
+  },
+  "activityBar": {
+    "preview": "预览",
+    "advancedSearch": "高级搜索",
+    "tasks": "长期任务",
+    "expand": "展开侧栏",
+    "collapse": "收起侧栏"
+  },
   "dmlSetup": {
     "title": "DirectML GPU 加速",
     "subtitle": "新版本支持使用 GPU 加速 OCR 文字识别",
@@ -382,6 +405,16 @@
     "done": "完成",
     "success_message": "扩展安装成功。请在浏览器中启用开发者模式，然后从以下路径加载已解压的扩展。",
     "error_message": "安装失败"
+  }
+  ,
+  "clusteringSetup": {
+    "title": "整理活动记录",
+    "subtitle": "将已有的截图快照自动归类为任务",
+    "description": "新版本支持将你积累的截图快照按活动内容自动聚类为「任务」，帮助你按主题回顾和整理历史工作记录。",
+    "delay_hint": "确认后将在 1 分钟后于后台自动执行聚类（等待嵌入模型加载完成），期间你可以正常使用应用。",
+    "info_note": "你也可以跳过此步骤，之后随时在「任务」面板中手动执行聚类。",
+    "apply": "开始整理",
+    "skip": "跳过"
   }
   ,
   "authMask": {
@@ -424,6 +457,13 @@
       "clear": "清除",
       "no_data": "无进程数据",
       "count": "{{count}} 个进程"
+    },
+    "categories": {
+      "all": "所有分类",
+      "select": "选择分类",
+      "clear": "清除",
+      "no_data": "无分类数据",
+      "count": "{{count}} 个分类"
     },
     "filters": {
       "reset": "重置"
@@ -497,6 +537,8 @@
         "using_python": "使用 Python 路径: {{path}}",
         "using_python_default": "(未指定，将使用默认路径)",
         "download_models": "开始下载模型文件...",
+        "download_bge": "开始下载分类模型 (BGE-small-zh-v1.5)...",
+        "download_minilm": "开始下载聚类模型 (MiniLM-L12-v2)...",
         "deps_complete": "所有依赖安装完成。",
         "install_logs": "安装日志",
         "install_failed": "安装失败",
@@ -517,6 +559,46 @@
       "syncing": "正在同步依赖...",
       "failed": "依赖更新失败：{{error}}",
       "retry": "重试"
+    },
+    "model_download": {
+      "title": "正在下载模型文件",
+      "subtitle": "检测到模型文件缺失，正在自动下载...",
+      "syncing": "正在下载...",
+      "failed": "下载失败：{{error}}",
+      "retry": "重试",
+      "downloading_clip": "正在下载 Chinese-CLIP 模型...",
+      "downloading_bge": "正在下载分类模型 (BGE-small-zh-v1.5)...",
+      "downloading_minilm": "正在下载聚类模型 (MiniLM-L12-v2)...",
+      "complete": "模型下载完成。"
     }
+  },
+  "tasks": {
+    "title": "长期任务",
+    "unnamed": "未命名任务",
+    "rename": "重命名",
+    "delete": "删除",
+    "merge": "合并",
+    "mergeMode": "合并模式",
+    "cancel": "取消",
+    "refresh": "刷新",
+    "runClustering": "运行聚类",
+    "lastRun": "上次运行",
+    "never": "从未运行",
+    "empty": "暂无任务",
+    "emptyHint": "运行聚类以自动发现长期任务",
+    "selectHint": "选择一个任务查看详情",
+    "snapshots": "张快照",
+    "noScreenshots": "暂无关联快照",
+    "noData": "没有足够的数据用于聚类，请积累更多快照后再试",
+    "modelMissing": "聚类模型 (MiniLM-L12) 未下载，请在 设置 > 关于 中下载模型",
+    "showInactive": "显示不活跃任务",
+    "hideInactive": "隐藏不活跃任务",
+    "inactiveTasks": "不活跃",
+    "showEntertainment": "显示娱乐任务",
+    "hideEntertainment": "隐藏娱乐任务",
+    "entertainmentTasks": "娱乐",
+    "showSocial": "显示社交任务",
+    "hideSocial": "隐藏社交任务",
+    "socialTasks": "社交"
   }
 }

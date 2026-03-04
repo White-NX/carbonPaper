@@ -1,5 +1,5 @@
 """
-存储客户端模块 - 通过 IPC 与 Rust 存储服务通信
+Storage client module — communicates with the Rust storage service via IPC.
 """
 import json
 import time
@@ -15,14 +15,14 @@ from typing import Optional, Dict, Any, List
 
 
 class StorageClient:
-    """与 Rust 存储服务通信的客户端"""
+    """Client for communicating with the Rust storage service."""
     
     def __init__(self, pipe_name: str):
         r"""
-        初始化存储客户端
-        
+        Initialise the storage client.
+
         Args:
-            pipe_name: Rust 存储服务的管道名（不含 \\.\pipe\ 前缀）
+            pipe_name: Pipe name of the Rust storage service (without the \\.\pipe\ prefix).
         """
         self.pipe_name = pipe_name
         self.full_pipe_name = rf"\\.\pipe\{pipe_name}"
@@ -46,20 +46,20 @@ class StorageClient:
     
     def _send_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """
-        发送请求到 Rust 存储服务
-        
+        Send a request to the Rust storage service.
+
         Args:
-            request: 请求数据
-            
+            request: Request payload.
+
         Returns:
-            响应数据
+            Response data.
         """
         try:
             self._semaphore.acquire()
             handle = None
             last_error = None
 
-            # 连接到管道（使用消息模式以支持大数据传输）
+            # Connect to the pipe (byte mode for large data transfer)
             for attempt in range(6):
                 try:
                     handle = win32file.CreateFile(
@@ -86,7 +86,7 @@ class StorageClient:
                 return {'status': 'error', 'error': 'Failed to connect to pipe'}
             
             try:
-                # 设置管道模式为消息读取模式
+                # Set pipe mode to byte-read mode
                 win32pipe.SetNamedPipeHandleState(
                     handle,
                     win32pipe.PIPE_READMODE_BYTE,
@@ -94,7 +94,7 @@ class StorageClient:
                     None
                 )
                 
-                # 发送请求（分块写入大数据）
+                # Send request (write large data in chunks)
                 request_bytes = json.dumps(request).encode('utf-8')
                 chunk_size = 64 * 1024  # 64KB chunks
                 offset = 0
@@ -104,10 +104,10 @@ class StorageClient:
                     win32file.WriteFile(handle, chunk)
                     offset += len(chunk)
                 
-                # 刷新管道确保所有数据都已发送
+                # Flush pipe to ensure all data has been sent
                 win32file.FlushFileBuffers(handle)
                 
-                # 读取响应（支持分块读取大响应）
+                # Read response (supports chunked reads for large responses)
                 response_bytes = b''
                 while True:
                     try:
@@ -115,15 +115,15 @@ class StorageClient:
                         if not chunk:
                             break
                         response_bytes += chunk
-                        # 尝试解析，如果成功则说明响应完整
+                        # Try to parse; if successful, the response is complete
                         try:
                             response = json.loads(response_bytes.decode('utf-8'))
                             return response
-                        except json.JSONDecodeError:
-                            # 响应不完整，继续读取
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            # Incomplete response or mid-character split — continue reading
                             continue
                     except pywintypes.error as e:
-                        # 管道已结束（109）或其他错误
+                        # Pipe ended (109) or other error
                         if e.winerror == 109:
                             break
                         raise
@@ -146,10 +146,10 @@ class StorageClient:
     
     def get_public_key(self) -> Optional[bytes]:
         """
-        获取公钥（用于加密 ChromaDB 数据）
-        
+        Get the public key (used for encrypting ChromaDB data).
+
         Returns:
-            公钥字节数据，或 None 如果失败
+            Public key bytes, or None on failure.
         """
         if self._public_key is not None:
             return self._public_key
@@ -169,13 +169,13 @@ class StorageClient:
     
     def encrypt_for_chromadb(self, plaintext: str) -> Optional[str]:
         """
-        加密数据（用于 ChromaDB 明文字段）
-        
+        Encrypt data (for ChromaDB plaintext fields).
+
         Args:
-            plaintext: 要加密的明文
-            
+            plaintext: Plaintext to encrypt.
+
         Returns:
-            加密后的 Base64 字符串，或 None 如果失败
+            Encrypted Base64 string, or None on failure.
         """
         if plaintext:
             cached = self._cache_get(self._encrypt_cache, plaintext)
@@ -199,13 +199,13 @@ class StorageClient:
     
     def decrypt_from_chromadb(self, encrypted: str) -> Optional[str]:
         """
-        解密数据
-        
+        Decrypt data.
+
         Args:
-            encrypted: 加密的 Base64 字符串
-            
+            encrypted: Encrypted Base64 string.
+
         Returns:
-            解密后的明文，或 None 如果失败
+            Decrypted plaintext, or None on failure.
         """
         if encrypted:
             cached = self._cache_get(self._decrypt_cache, encrypted)
@@ -229,13 +229,13 @@ class StorageClient:
 
     def decrypt_many_from_chromadb(self, encrypted_list: List[str]) -> List[Optional[str]]:
         """
-        批量解密数据
+        Batch-decrypt data.
 
         Args:
-            encrypted_list: 加密字符串列表
+            encrypted_list: List of encrypted strings.
 
         Returns:
-            解密后的字符串列表（与输入顺序一致，失败项为 None）
+            List of decrypted strings (matching input order; None for failures).
         """
         if not encrypted_list:
             return []
@@ -276,15 +276,34 @@ class StorageClient:
         logger.error("[storage_client] Batch decryption failed: %s", response.get('error'))
         return results
     
+    def list_screenshots_for_clustering(
+        self,
+        start_ts: float = 0.0,
+        end_ts: float = 0.0,
+        offset: int = 0,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """Fetch screenshots with OCR text from SQLite for clustering backfill.
+
+        Returns {'screenshots': [...], 'total': int}.
+        """
+        return self._send_request({
+            'command': 'list_screenshots_for_clustering',
+            'start_ts': start_ts,
+            'end_ts': end_ts,
+            'offset': offset,
+            'limit': limit,
+        })
+
     def screenshot_exists(self, image_hash: str) -> bool:
         """
-        检查截图是否已存在
-        
+        Check whether a screenshot already exists.
+
         Args:
-            image_hash: 图片哈希
-            
+            image_hash: Image hash.
+
         Returns:
-            是否存在
+            Whether it exists.
         """
         response = self._send_request({
             'command': 'screenshot_exists',
@@ -309,20 +328,20 @@ class StorageClient:
         ocr_results: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
-        保存截图到 Rust 存储服务
-        
+        Save a screenshot to the Rust storage service.
+
         Args:
-            image_data: 图片二进制数据
-            image_hash: 图片哈希
-            width: 图片宽度
-            height: 图片高度
-            window_title: 窗口标题
-            process_name: 进程名
-            metadata: 元数据
-            ocr_results: OCR 结果列表
-            
+            image_data: Image binary data.
+            image_hash: Image hash.
+            width: Image width.
+            height: Image height.
+            window_title: Window title.
+            process_name: Process name.
+            metadata: Metadata.
+            ocr_results: OCR result list.
+
         Returns:
-            保存结果
+            Save result.
         """
         import base64
         
@@ -359,7 +378,8 @@ class StorageClient:
         metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        将截图临时保存（加密并标记为 pending），返回一个 screenshot_id 用于后续 commit/abort。
+        Temporarily save a screenshot (encrypted and marked as pending); returns a
+        screenshot_id for later commit/abort.
         """
         import base64
 
@@ -386,7 +406,7 @@ class StorageClient:
 
     def commit_screenshot(self, screenshot_id: str, ocr_results: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
         """
-        提交之前临时保存的截图并写入 OCR 结果与索引。
+        Commit a previously saved temporary screenshot and write OCR results and index.
         """
         request = {
             'command': 'commit_screenshot',
@@ -406,7 +426,7 @@ class StorageClient:
 
     def abort_screenshot(self, screenshot_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
         """
-        中止之前临时保存的截图（删除临时文件并回滚记录）。
+        Abort a previously saved temporary screenshot (delete temp files and roll back the record).
         """
         request = {
             'command': 'abort_screenshot',
@@ -425,24 +445,24 @@ class StorageClient:
         }
 
 
-# 全局存储客户端实例
+# Global storage client instance
 _storage_client: Optional[StorageClient] = None
 
 
 def get_storage_client() -> Optional[StorageClient]:
-    """获取全局存储客户端实例"""
+    """Return the global storage client instance."""
     return _storage_client
 
 
 def init_storage_client(pipe_name: str) -> StorageClient:
     """
-    初始化全局存储客户端
-    
+    Initialise the global storage client.
+
     Args:
-        pipe_name: 管道名
-        
+        pipe_name: Pipe name.
+
     Returns:
-        存储客户端实例
+        Storage client instance.
     """
     global _storage_client
     _storage_client = StorageClient(pipe_name)

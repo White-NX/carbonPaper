@@ -163,6 +163,7 @@ async fn storage_search(
     process_names: Option<Vec<String>>,
     start_time: Option<f64>,
     end_time: Option<f64>,
+    categories: Option<Vec<String>>,
 ) -> Result<Vec<storage::SearchResult>, String> {
     // 检查认证状态
     check_auth_required(&credential_state)?;
@@ -175,6 +176,7 @@ async fn storage_search(
         process_names,
         start_time,
         end_time,
+        categories,
     )
 }
 
@@ -435,6 +437,173 @@ async fn storage_decrypt_from_chromadb(
     state.decrypt_from_chromadb(&encrypted)
 }
 
+// ==================== 分类命令 ====================
+
+#[tauri::command]
+async fn storage_update_category(
+    state: tauri::State<'_, Arc<StorageState>>,
+    monitor_state: tauri::State<'_, MonitorState>,
+    screenshot_id: i64,
+    category: String,
+) -> Result<serde_json::Value, String> {
+    // Read old category before updating
+    let old_category = state
+        .get_screenshot_by_id(screenshot_id)
+        .ok()
+        .flatten()
+        .and_then(|r| r.category.clone());
+
+    // Update category in DB with confidence 1.0 (user-set)
+    let updated = state.update_screenshot_category(screenshot_id, &category, Some(1.0))?;
+
+    // Also tell Python to learn from this user classification
+    if updated {
+        if let Ok(Some(record)) = state.get_screenshot_by_id(screenshot_id) {
+            let title = record.window_title.clone().unwrap_or_default();
+            let process_name = record.process_name.clone().unwrap_or_default();
+
+            // Collect OCR text for this screenshot
+            let ocr_text = match state.get_screenshot_ocr_results(screenshot_id) {
+                Ok(results) => {
+                    let texts: Vec<String> = results.iter().map(|r| r.text.clone()).collect();
+                    texts.join(" ")
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get OCR results for learning: {}", e);
+                    String::new()
+                }
+            };
+
+            let payload = serde_json::json!({
+                "command": "add_anchor",
+                "category": category,
+                "title": title,
+                "ocr_text": ocr_text,
+                "old_category": old_category,
+                "process_name": process_name
+            });
+            // Fire-and-forget: don't fail the command if Python is unavailable
+            match monitor::forward_command_to_python(&monitor_state, payload).await {
+                Ok(resp) => {
+                    tracing::info!(
+                        "Anchor learning result for screenshot {}: {:?}",
+                        screenshot_id, resp
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to add anchor to classifier: {}", e);
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": "success",
+        "updated": updated
+    }))
+}
+
+#[tauri::command]
+async fn storage_get_categories(
+    monitor_state: tauri::State<'_, MonitorState>,
+) -> Result<serde_json::Value, String> {
+    let payload = serde_json::json!({
+        "command": "get_categories"
+    });
+    monitor::forward_command_to_python(&monitor_state, payload).await
+}
+
+/// 从数据库获取所有已使用的分类（纯 Rust，不依赖 Python）
+#[tauri::command]
+async fn storage_get_categories_from_db(
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<Vec<String>, String> {
+    state.get_categories_from_db()
+}
+
+/// 批量通过 image_hash 获取分类信息
+#[tauri::command]
+async fn storage_batch_get_categories(
+    state: tauri::State<'_, Arc<StorageState>>,
+    image_hashes: Vec<String>,
+) -> Result<std::collections::HashMap<String, Option<String>>, String> {
+    state.batch_get_categories_by_hash(&image_hashes)
+}
+
+// ==================== 任务聚类命令 ====================
+
+/// 获取任务列表
+#[tauri::command]
+async fn storage_get_tasks(
+    state: tauri::State<'_, Arc<StorageState>>,
+    layer: Option<String>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    hide_inactive: Option<bool>,
+    hide_entertainment: Option<bool>,
+    hide_social: Option<bool>,
+) -> Result<Vec<storage::task::TaskRecord>, String> {
+    state.get_tasks(layer.as_deref(), start_time, end_time, hide_inactive, hide_entertainment, hide_social)
+}
+
+/// 获取与当前快照同任务簇的相关快照
+#[tauri::command]
+async fn storage_get_related_screenshots(
+    state: tauri::State<'_, Arc<StorageState>>,
+    screenshot_id: i64,
+    limit: Option<i64>,
+) -> Result<storage::task::RelatedScreenshotsResult, String> {
+    state.get_related_screenshots(screenshot_id, limit.unwrap_or(8))
+}
+
+/// 获取任务关联的快照
+#[tauri::command]
+async fn storage_get_task_screenshots(
+    state: tauri::State<'_, Arc<StorageState>>,
+    task_id: i64,
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<Vec<storage::task::TaskScreenshotStub>, String> {
+    state.get_task_screenshots(task_id, page.unwrap_or(0), page_size.unwrap_or(50))
+}
+
+/// 更新任务标签
+#[tauri::command]
+async fn storage_update_task_label(
+    state: tauri::State<'_, Arc<StorageState>>,
+    task_id: i64,
+    label: String,
+) -> Result<(), String> {
+    state.update_task_label(task_id, &label)
+}
+
+/// 删除任务（保留快照）
+#[tauri::command]
+async fn storage_delete_task(
+    state: tauri::State<'_, Arc<StorageState>>,
+    task_id: i64,
+) -> Result<(), String> {
+    state.delete_task(task_id)
+}
+
+/// 合并多个任务
+#[tauri::command]
+async fn storage_merge_tasks(
+    state: tauri::State<'_, Arc<StorageState>>,
+    task_ids: Vec<i64>,
+) -> Result<i64, String> {
+    state.merge_tasks(&task_ids)
+}
+
+/// 保存聚类结果
+#[tauri::command]
+async fn storage_save_clustering_results(
+    state: tauri::State<'_, Arc<StorageState>>,
+    tasks: Vec<storage::task::SaveTaskRequest>,
+) -> Result<Vec<i64>, String> {
+    state.save_clustering_results(&tasks)
+}
+
 // ==================== 数据迁移命令 ====================
 
 /// 列出所有未加密的明文截图文件
@@ -522,6 +691,7 @@ fn get_advanced_config() -> Result<serde_json::Value, String> {
     let use_dml = registry_config::get_bool("use_dml").unwrap_or(false);
     let dml_device_id = registry_config::get_u32("dml_device_id").unwrap_or(0);
     let game_mode_enabled = registry_config::get_bool("game_mode_enabled").unwrap_or(true);
+    let clustering_interval = registry_config::get_string("clustering_interval").unwrap_or_else(|| "1w".to_string());
 
     Ok(serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
@@ -532,6 +702,7 @@ fn get_advanced_config() -> Result<serde_json::Value, String> {
         "use_dml": use_dml,
         "dml_device_id": dml_device_id,
         "game_mode_enabled": game_mode_enabled,
+        "clustering_interval": clustering_interval,
     }))
 }
 
@@ -563,6 +734,9 @@ fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     }
     if let Some(v) = config.get("game_mode_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("game_mode_enabled", v)?;
+    }
+    if let Some(v) = config.get("clustering_interval").and_then(|v| v.as_str()) {
+        registry_config::set_string("clustering_interval", v)?;
     }
     Ok(())
 }
@@ -726,6 +900,24 @@ fn check_extension_setup_needed() -> Result<bool, String> {
 #[tauri::command]
 fn mark_extension_setup_done() -> Result<(), String> {
     registry_config::set_bool("extension_setup_done", true)
+}
+
+#[tauri::command]
+async fn check_clustering_setup_needed(
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<bool, String> {
+    // Already completed → not needed
+    if registry_config::get_bool("clustering_setup_done").unwrap_or(false) {
+        return Ok(false);
+    }
+    // No screenshots at all → new install, skip wizard
+    let count = state.count_screenshots_by_time_range(0.0, 9_999_999_999.0)?;
+    Ok(count > 0)
+}
+
+#[tauri::command]
+fn mark_clustering_setup_done() -> Result<(), String> {
+    registry_config::set_bool("clustering_setup_done", true)
 }
 
 #[tauri::command]
@@ -983,6 +1175,18 @@ pub fn run() {
             storage_compute_link_scores,
             storage_encrypt_for_chromadb,
             storage_decrypt_from_chromadb,
+            storage_update_category,
+            storage_get_categories,
+            storage_get_categories_from_db,
+            storage_batch_get_categories,
+            // 任务聚类命令
+            storage_get_tasks,
+            storage_get_related_screenshots,
+            storage_get_task_screenshots,
+            storage_update_task_label,
+            storage_delete_task,
+            storage_merge_tasks,
+            storage_save_clustering_results,
             analysis::get_analysis_overview,
             // 高级配置命令
             get_advanced_config,
@@ -1015,6 +1219,7 @@ pub fn run() {
             python::check_deps_freshness,
             python::sync_python_deps,
             model_management::download_model,
+            model_management::check_model_files,
             // Updater commands
             updater::updater_check,
             updater::updater_download,
@@ -1028,6 +1233,8 @@ pub fn run() {
             native_messaging::sync_extension_if_needed,
             check_extension_setup_needed,
             mark_extension_setup_done,
+            check_clustering_setup_needed,
+            mark_clustering_setup_done,
             get_extension_enhancement_config,
             set_extension_enhancement,
         ]);

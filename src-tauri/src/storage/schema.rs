@@ -209,6 +209,50 @@ impl StorageState {
         Self::add_column_if_missing(conn, "screenshots", "page_icon_id", "INTEGER")?;
         Self::add_column_if_missing(conn, "screenshots", "link_set_id", "INTEGER")?;
 
+        // Classification columns
+        Self::add_column_if_missing(conn, "screenshots", "category", "TEXT")?;
+        Self::add_column_if_missing(conn, "screenshots", "category_confidence", "REAL")?;
+
+        // Task clustering tables
+        Self::create_table_if_missing(
+            conn,
+            "tasks",
+            r#"
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT,
+                auto_label TEXT,
+                dominant_process TEXT,
+                dominant_category TEXT,
+                start_time REAL,
+                end_time REAL,
+                snapshot_count INTEGER DEFAULT 0,
+                layer TEXT DEFAULT 'hot',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )?;
+        Self::create_table_if_missing(
+            conn,
+            "task_assignments",
+            r#"
+            CREATE TABLE IF NOT EXISTS task_assignments (
+                screenshot_id INTEGER NOT NULL,
+                task_id INTEGER NOT NULL,
+                confidence REAL,
+                PRIMARY KEY (screenshot_id, task_id),
+                FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE,
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            )
+            "#,
+        )?;
+
+        // Index for reverse lookup: task_id → screenshot_ids
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_task_assignments_task_id ON task_assignments(task_id)",
+        ).map_err(|e| format!("Failed to create task_assignments index: {}", e))?;
+
         Ok(())
     }
 
@@ -235,6 +279,16 @@ impl StorageState {
             .map_err(|e| format!("Failed to add column {}.{}: {}", table, column, e))?;
         }
 
+        Ok(())
+    }
+
+    fn create_table_if_missing(
+        conn: &Connection,
+        _table_name: &str,
+        create_sql: &str,
+    ) -> Result<(), String> {
+        conn.execute_batch(create_sql)
+            .map_err(|e| format!("Failed to create table {}: {}", _table_name, e))?;
         Ok(())
     }
 }

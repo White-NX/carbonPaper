@@ -1,17 +1,18 @@
 --index-url https://mirrors.aliyun.com/pypi/simple/
 
-mss
 Pillow
 pywin32
 
 rapidocr==3.6.0
 onnxruntime-directml==1.24.2
-opencv-python
 
 transformers>=4.30.0
 torch
 chromadb>=0.4.0
 
 numpy<2.0.0
-psutil
-pywinauto
+
+scikit-learn>=1.3.0
+hdbscan>=0.8.38
+pacmap>=0.7.0
+sentence-transformers>=2.2.0

@@ -15,6 +15,7 @@ mod process;
 mod schema;
 mod screenshot;
 mod search;
+pub mod task;
 mod types;
 
 #[allow(unused_imports)]

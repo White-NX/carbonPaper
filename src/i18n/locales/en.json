@@ -111,6 +111,18 @@
         "gpu_select": "Select GPU device",
         "gpu_loading": "Detecting GPUs...",
         "gpu_none": "No compatible GPU detected"
+      },
+      "clustering": {
+        "title": "Task Clustering",
+        "interval_label": "Auto-clustering interval",
+        "interval_desc": "Set the time interval for automatic background task clustering",
+        "info": "Task clustering automatically groups similar activities into long-term tasks. Uses MiniLM-L12 model for text encoding; the model is automatically unloaded after clustering to free memory.",
+        "intervals": {
+          "1d": "Daily",
+          "1w": "Weekly",
+          "1m": "Monthly",
+          "6m": "Every 6 months"
+        }
       }
     },
     "storageManagement": {
@@ -339,15 +351,26 @@
     "labels": {
       "process": "Process",
       "window": "Window",
-      "time": "Time"
+      "time": "Time",
+      "category": "Category",
+      "uncategorized": "Uncategorized"
     },
     "links": {
       "title": "Links on Page",
       "currentPage": "Current Page"
     },
+    "related": {
+      "title": "Related Snapshots"
+    },
     "empty": "Select an event from the timeline to view details."
-  }
-  ,
+  },
+  "activityBar": {
+    "preview": "Preview",
+    "advancedSearch": "Advanced Search",
+    "tasks": "Long-term Tasks",
+    "expand": "Expand Sidebar",
+    "collapse": "Collapse Sidebar"
+  },
   "dmlSetup": {
     "title": "DirectML GPU Acceleration",
     "subtitle": "This version supports GPU-accelerated OCR text recognition",
@@ -382,6 +405,16 @@
     "done": "Done",
     "success_message": "Extension installed successfully. Enable Developer mode in your browser and load the unpacked extension from the path below.",
     "error_message": "Installation failed"
+  }
+  ,
+  "clusteringSetup": {
+    "title": "Organize Activity History",
+    "subtitle": "Automatically group existing snapshots into tasks",
+    "description": "This version can automatically cluster your accumulated screenshots into \"Tasks\" based on their content, helping you review and organize your work history by topic.",
+    "delay_hint": "After confirming, clustering will start automatically in the background after a 1-minute delay (to allow the embedding model to load). You can continue using the app normally.",
+    "info_note": "You can also skip this step and manually run clustering later from the Tasks panel.",
+    "apply": "Start Organizing",
+    "skip": "Skip"
   }
   ,
   "authMask": {
@@ -424,6 +457,13 @@
       "clear": "Clear",
       "no_data": "No process data",
       "count": "{{count}} Processes"
+    },
+    "categories": {
+      "all": "All Categories",
+      "select": "Select Categories",
+      "clear": "Clear",
+      "no_data": "No category data",
+      "count": "{{count}} Categories"
     },
     "filters": {
       "reset": "Reset"
@@ -497,6 +537,8 @@
         "using_python": "Using Python path: {{path}}",
         "using_python_default": "(not specified, will use default)",
         "download_models": "Downloading model files...",
+        "download_bge": "Downloading classification model (BGE-small-zh-v1.5)...",
+        "download_minilm": "Downloading clustering model (MiniLM-L12-v2)...",
         "deps_complete": "All dependencies installed.",
         "install_logs": "Install logs",
         "install_failed": "Installation failed",
@@ -517,6 +559,46 @@
       "syncing": "Syncing dependencies...",
       "failed": "Dependency update failed: {{error}}",
       "retry": "Retry"
+    },
+    "model_download": {
+      "title": "Downloading Model Files",
+      "subtitle": "Model files missing, downloading automatically...",
+      "syncing": "Downloading...",
+      "failed": "Download failed: {{error}}",
+      "retry": "Retry",
+      "downloading_clip": "Downloading Chinese-CLIP model...",
+      "downloading_bge": "Downloading classification model (BGE-small-zh-v1.5)...",
+      "downloading_minilm": "Downloading clustering model (MiniLM-L12-v2)...",
+      "complete": "Model download complete."
     }
+  },
+  "tasks": {
+    "title": "Long-term Tasks",
+    "unnamed": "Unnamed Task",
+    "rename": "Rename",
+    "delete": "Delete",
+    "merge": "Merge",
+    "mergeMode": "Merge Mode",
+    "cancel": "Cancel",
+    "refresh": "Refresh",
+    "runClustering": "Run Clustering",
+    "lastRun": "Last run",
+    "never": "Never",
+    "empty": "No tasks yet",
+    "emptyHint": "Run clustering to auto-discover long-term tasks",
+    "selectHint": "Select a task to view details",
+    "snapshots": "snapshots",
+    "noScreenshots": "No screenshots assigned",
+    "noData": "Not enough data for clustering. Accumulate more snapshots and try again.",
+    "modelMissing": "Clustering model (MiniLM-L12) not downloaded. Please download it in Settings > About.",
+    "showInactive": "Show inactive tasks",
+    "hideInactive": "Hide inactive tasks",
+    "inactiveTasks": "Inactive",
+    "showEntertainment": "Show entertainment tasks",
+    "hideEntertainment": "Hide entertainment tasks",
+    "entertainmentTasks": "Entertainment",
+    "showSocial": "Show social tasks",
+    "hideSocial": "Hide social tasks",
+    "socialTasks": "Social"
   }
 }

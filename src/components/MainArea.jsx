@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import Tabs from './Tabs';
 import { AdvancedSearch } from './AdvancedSearch';
 import { InspectorImage } from './InspectorImage';
+import DetailCard from './DetailCard';
+import TasksView from './TasksView';
 import { Loader2, Copy, X } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import PreviewActionBar from './PreviewActionBar';
@@ -89,8 +90,6 @@ export default function MainArea({
 
   return (
     <section className="flex flex-col bg-ide-bg overflow-hidden relative flex-1">
-      <Tabs activeTab={activeTab} setActiveTab={setActiveTab} />
-
       <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
         <div className={`${activeTab === 'preview' ? 'flex' : 'hidden'} flex-1 items-center justify-center bg-grid-pattern bg-[length:20px_20px] p-4 overflow-hidden relative min-w-0 min-h-0`}>
           {selectedImageSrc ? (
@@ -131,6 +130,13 @@ export default function MainArea({
             />
           )}
 
+          {/* Detail Card (floating overlay) */}
+          <DetailCard
+            selectedEvent={selectedEvent}
+            selectedDetails={selectedDetails}
+            onSelectRelated={onAdvancedSelect}
+          />
+
           {/* OCR Content Panel */}
           {showOcrPanel && (
             <OcrContentPanel
@@ -149,6 +155,15 @@ export default function MainArea({
             searchMode={searchMode}
             onSearchModeChange={onSearchModeChange}
             backendOnline={backendOnline}
+          />
+        </div>
+
+        <div className={`${activeTab === 'tasks' ? 'flex flex-col' : 'hidden'} flex-1 w-full min-w-0 min-h-0 overflow-hidden`}>
+          <TasksView
+            backendOnline={backendOnline}
+            onSelectScreenshot={(evt) => {
+              onAdvancedSelect?.(evt);
+            }}
           />
         </div>
       </div>

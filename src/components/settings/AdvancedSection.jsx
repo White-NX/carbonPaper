@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap, Monitor } from 'lucide-react';
+import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap, Monitor, Layers } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
 const CPU_PERCENT_OPTIONS = [5, 10, 15, 20, 30, 50];
@@ -13,6 +13,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
   const [cpuDropdownOpen, setCpuDropdownOpen] = useState(false);
   const [queueDropdownOpen, setQueueDropdownOpen] = useState(false);
   const [gpuDropdownOpen, setGpuDropdownOpen] = useState(false);
+  const [clusteringDropdownOpen, setClusteringDropdownOpen] = useState(false);
   const [cpuChanged, setCpuChanged] = useState(false);
   const [dmlChanged, setDmlChanged] = useState(false);
   const [gpus, setGpus] = useState([]);
@@ -127,8 +128,9 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
       setCpuDropdownOpen(false);
       setQueueDropdownOpen(false);
       setGpuDropdownOpen(false);
+      setClusteringDropdownOpen(false);
     };
-    if (cpuDropdownOpen || queueDropdownOpen || gpuDropdownOpen) {
+    if (cpuDropdownOpen || queueDropdownOpen || gpuDropdownOpen || clusteringDropdownOpen) {
       document.addEventListener('click', handler);
       return () => document.removeEventListener('click', handler);
     }
@@ -416,6 +418,72 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
               )}
             </div>
           )}
+        </div>
+      </div>
+
+      {/* 聚类间隔 */}
+      <div className="space-y-3">
+        <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
+          <Layers className="w-4 h-4" />
+          {t('settings.advanced.clustering.title')}
+        </label>
+
+        <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1 min-w-0">
+              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.clustering.interval_label')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.clustering.interval_desc')}</p>
+            </div>
+            <div className="relative">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setClusteringDropdownOpen(!clusteringDropdownOpen);
+                }}
+                className="flex items-center gap-2 px-4 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm text-ide-text hover:bg-ide-hover transition-colors min-w-[120px]"
+              >
+                <span className="flex-1 text-left">{t(`settings.advanced.clustering.intervals.${config.clustering_interval || '1w'}`)}</span>
+                <ChevronDown
+                  className={`w-4 h-4 text-ide-muted transition-transform ${clusteringDropdownOpen ? 'rotate-180' : ''}`}
+                />
+              </button>
+              {clusteringDropdownOpen && (
+                <div
+                  className="absolute right-0 top-full mt-2 w-40 bg-ide-panel border border-ide-border rounded-xl shadow-xl z-50 overflow-hidden"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {['1d', '1w', '1m', '6m'].map((interval) => (
+                    <button
+                      key={interval}
+                      onClick={async () => {
+                        setClusteringDropdownOpen(false);
+                        const newConfig = { ...config, clustering_interval: interval };
+                        await saveConfig(newConfig);
+                        // Also sync to Python backend
+                        try {
+                          await invoke('execute_monitor_command', {
+                            payload: { command: 'set_clustering_interval', interval },
+                          });
+                        } catch { /* best-effort */ }
+                      }}
+                      className={`w-full px-4 py-2.5 text-left hover:bg-ide-hover transition-colors flex items-center justify-between ${interval === (config.clustering_interval || '1w') ? 'bg-ide-accent/10' : ''
+                        }`}
+                    >
+                      <span className="text-sm text-ide-text">{t(`settings.advanced.clustering.intervals.${interval}`)}</span>
+                      {interval === (config.clustering_interval || '1w') && (
+                        <div className="w-2 h-2 rounded-full bg-ide-accent shrink-0" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="flex items-start gap-2 p-2.5 bg-ide-panel/50 border border-ide-border/30 rounded-lg">
+            <Info className="w-4 h-4 text-ide-muted shrink-0 mt-0.5" />
+            <p className="text-xs text-ide-muted leading-relaxed">{t('settings.advanced.clustering.info')}</p>
+          </div>
         </div>
       </div>
     </div>
