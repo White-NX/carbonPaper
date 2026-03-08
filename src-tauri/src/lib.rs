@@ -2,6 +2,7 @@ mod analysis;
 mod autostart;
 mod capture;
 mod credential_manager;
+mod error_window;
 mod logging;
 mod model_management;
 mod monitor;
@@ -28,6 +29,34 @@ use tauri::Manager;
 use window_vibrancy::apply_acrylic;
 
 const MENU_ID_OPEN: &str = "open";
+
+#[tauri::command]
+fn get_log_dir() -> String {
+    let data_dir = get_data_dir();
+    data_dir.join("logs").to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    tauri::process::restart(&app.env());
+}
+
+#[tauri::command]
+async fn trigger_test_error() {
+    // Spawn a blocking task so the panic happens inside Tokio's executor,
+    // which wraps it in catch_unwind. Our global panic hook fires first
+    // (showing the error overlay), then Tokio catches the unwind — the
+    // thread and process survive.
+    let _ = tokio::task::spawn_blocking(|| {
+        panic!("This is a test panic triggered from Rust!");
+    }).await;
+}
+
+#[tauri::command]
+fn exit_app() {
+    std::process::exit(1);
+}
+
 const MENU_ID_PAUSE: &str = "pause";
 const MENU_ID_RESUME: &str = "resume";
 const MENU_ID_RESTART: &str = "restart";
@@ -1122,16 +1151,27 @@ pub fn run() {
         .manage(storage_state)
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if !IS_UPDATING.load(Ordering::Relaxed) {
-                    api.prevent_close();
-                    let _ = window.hide();
-                    let _ = window.app_handle().emit("app-hidden", ());
+                if window.label() == "main" {
+                    // If a critical error has occurred, close = exit
+                    if error_window::HAS_CRITICAL_ERROR.load(Ordering::Relaxed) {
+                        std::process::exit(1);
+                    }
+                    // Normal: hide instead of close (unless updating)
+                    if !IS_UPDATING.load(Ordering::Relaxed) {
+                        api.prevent_close();
+                        let _ = window.hide();
+                        let _ = window.app_handle().emit("app-hidden", ());
+                    }
                 }
             }
         })
         .setup({
             let data_dir = data_dir.clone();
             move |app| {
+                // Install global panic hook (before anything else that might panic)
+                error_window::set_app_handle(app.handle().clone());
+                error_window::install_panic_hook();
+
                 build_tray(app)?;
 
                 // 应用亚克力磨砂透明效果
@@ -1349,6 +1389,11 @@ pub fn run() {
             mark_clustering_setup_done,
             get_extension_enhancement_config,
             set_extension_enhancement,
+            // Error window commands
+            get_log_dir,
+            restart_app,
+            trigger_test_error,
+            exit_app,
         ]);
 
     #[cfg(desktop)]

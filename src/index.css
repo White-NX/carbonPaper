@@ -54,7 +54,8 @@
   --ide-info-success: #34d399;
 }
 
-html, body {
+html:not([data-page="error"]),
+html:not([data-page="error"]) > body {
   background: transparent !important;
 }
 
@@ -137,4 +138,19 @@ body {
 ::selection {
   background: rgba(93, 224, 255, 0.35);
   color: #050713;
+}
+
+/* Error window rainbow text animation */
+@keyframes rainbow-shift {
+  0% { color: #ff0000; }
+  16% { color: #ff8000; }
+  33% { color: #ffff00; }
+  50% { color: #00cc00; }
+  66% { color: #0066ff; }
+  83% { color: #8800ff; }
+  100% { color: #ff0000; }
+}
+
+.error-rainbow-text {
+  animation: rainbow-shift 3s linear infinite;
 }

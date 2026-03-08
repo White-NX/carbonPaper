@@ -21,6 +21,7 @@ import ActivityBar from './components/ActivityBar';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
+import ErrorWindow from './components/ErrorWindow';
 import { getScreenshotDetails, fetchImage, deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 import { runClustering, saveClusteringResults } from './lib/task_api';
 import { checkForUpdate } from './lib/update_api';
@@ -98,6 +99,10 @@ function App() {
   // Model file check state
   const [modelsNeedDownload, setModelsNeedDownload] = useState(false);
   const [missingModels, setMissingModels] = useState(null);
+
+  // Critical error overlay state
+  const [criticalErrors, setCriticalErrors] = useState([]);
+  const [criticalErrorLogPath, setCriticalErrorLogPath] = useState('');
 
   // State to trigger timeline jumps
   const [timelineJump, setTimelineJump] = useState(null); // { time: number, ts: number }
@@ -668,6 +673,21 @@ function App() {
     };
   }, [reportBackendError, formatErrorDetails]);
 
+  // Listen for critical errors from Rust backend
+  useEffect(() => {
+    let unlisten;
+    const setup = async () => {
+      unlisten = await listen('critical-error', (event) => {
+        const msg = event.payload?.message || event.payload || 'Unknown error';
+        setCriticalErrors((prev) => [...prev, msg]);
+        // Fetch log path on first error
+        invoke('get_log_dir').then(setCriticalErrorLogPath).catch(() => {});
+      });
+    };
+    setup();
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
@@ -879,6 +899,14 @@ function App() {
           onAuthSuccess={handleAuthSuccess}
           authError={authError}
           setAuthError={setAuthError}
+        />
+
+        <ErrorWindow
+          isVisible={criticalErrors.length > 0}
+          errors={criticalErrors}
+          logPath={criticalErrorLogPath}
+          onRestart={() => invoke('restart_app').catch(() => {})}
+          onExit={() => invoke('exit_app').catch(() => {})}
         />
 
         <DmlSetupWizard

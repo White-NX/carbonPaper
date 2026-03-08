@@ -760,7 +760,11 @@ pub async fn run_capture_loop(
     tracing::info!("Rust capture loop started");
 
     let mut last_hwnd_raw: isize = 0;
-    let mut last_capture_time = std::time::Instant::now() - std::time::Duration::from_secs(999);
+    // Use checked_sub to avoid panic when system uptime < 999s (Instant can't go before boot)
+    let mut last_capture_time = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(999))
+        .unwrap_or(std::time::Instant::now());
+    let mut force_first_capture = true;
     let mut history_hashes: Vec<DHash> = Vec::new();
     let mut icon_cache: HashMap<String, Option<String>> = HashMap::new();
 
@@ -835,7 +839,7 @@ pub async fn run_capture_loop(
             }
         }
         // Interval trigger
-        else if last_capture_time.elapsed().as_secs() >= interval_secs {
+        else if force_first_capture || last_capture_time.elapsed().as_secs() >= interval_secs {
             if !capture_on_busy && in_flight > 0 {
                 // Conservative: skip
             } else if in_flight > max_queue {
@@ -850,6 +854,8 @@ pub async fn run_capture_loop(
             last_hwnd_raw = current_hwnd_raw;
             continue;
         }
+
+        force_first_capture = false;
 
         // Focus change: wait for window to stabilize
         if scan_reason == "focus_change" {

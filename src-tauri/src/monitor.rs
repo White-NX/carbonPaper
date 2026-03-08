@@ -847,10 +847,20 @@ fn spawn_capture_loop(app: &AppHandle) {
 
     let handle = tauri::async_runtime::spawn(async move {
         let _ms = app_handle.state::<MonitorState>();
-        // Create a temporary Arc wrapper for the capture loop
-        // MonitorState is behind Tauri's State which is already Arc-like
-        // We'll pass the AppHandle and extract state inside the loop
-        crate::capture::run_capture_loop(cs, st, app_handle.clone()).await;
+        // Use AssertUnwindSafe + catch_unwind to detect panics in the capture loop
+        let result = std::panic::AssertUnwindSafe(
+            crate::capture::run_capture_loop(cs, st, app_handle.clone())
+        );
+        match futures::FutureExt::catch_unwind(result).await {
+            Ok(()) => {
+                // Normal exit
+            }
+            Err(_panic_payload) => {
+                // The global panic hook (installed via error_window::install_panic_hook)
+                // already handles showing the error overlay, so we just log here.
+                tracing::error!("Capture loop panicked (error overlay shown by global hook)");
+            }
+        }
     });
 
     let mut guard = capture_state.capture_task.lock().unwrap();

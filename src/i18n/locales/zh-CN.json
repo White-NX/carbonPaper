@@ -600,5 +600,17 @@
     "showSocial": "显示社交任务",
     "hideSocial": "隐藏社交任务",
     "socialTasks": "社交"
+  },
+  "errorWindow": {
+    "title": "程序出现关键错误",
+    "unknownError": "未知错误",
+    "feedbackTitle": "如何反馈？",
+    "feedbackIssue": "请前往以下地址提出问题：",
+    "logLocation": "日志位置：",
+    "restart": "重启 CarbonPaper",
+    "exit": "退出",
+    "switchToNormal": "切换到正常模式",
+    "switchToXibao": "切换到喜报模式",
+    "triggerTest": "触发测试错误窗口"
   }
 }
