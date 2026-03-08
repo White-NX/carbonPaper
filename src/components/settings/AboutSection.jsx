@@ -1,6 +1,8 @@
 import React from 'react';
-import { Github, User, CheckCircle2, Download, AlertCircle, RefreshCw } from 'lucide-react';
+import { Github, User, CheckCircle2, Download, AlertCircle, RefreshCw, Bug } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { invoke } from '@tauri-apps/api/core';
+import { useTranslation } from 'react-i18next';
 import { APP_VERSION } from '../../lib/version';
 
 export default function AboutSection({
@@ -13,6 +15,7 @@ export default function AboutSection({
   downloadProgress,
   onDownloadUpdate,
 }) {
+  const { t } = useTranslation();
   const progressPercent =
     downloading && downloadProgress.contentLength > 0
       ? Math.round((downloadProgress.downloaded / downloadProgress.contentLength) * 100)
@@ -157,6 +160,21 @@ export default function AboutSection({
               </div>
             </div>
           </section>
+
+          {/* Debug: Test Error Window (dev only) */}
+          {import.meta.env.DEV && (
+            <section className="space-y-2">
+              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl">
+                <button
+                  onClick={() => invoke('trigger_test_error').catch(console.error)}
+                  className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
+                >
+                  <Bug className="w-3.5 h-3.5" />
+                  {t('errorWindow.triggerTest')}
+                </button>
+              </div>
+            </section>
+          )}
         </div>
       </div>
     </div>

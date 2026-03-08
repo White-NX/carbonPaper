@@ -600,5 +600,17 @@
     "showSocial": "Show social tasks",
     "hideSocial": "Hide social tasks",
     "socialTasks": "Social"
+  },
+  "errorWindow": {
+    "title": "Critical Error",
+    "unknownError": "Unknown error",
+    "feedbackTitle": "How to report?",
+    "feedbackIssue": "Please submit an issue at:",
+    "logLocation": "Log location:",
+    "restart": "Restart CarbonPaper",
+    "exit": "Exit",
+    "switchToNormal": "Switch to Normal Mode",
+    "switchToXibao": "Switch to Celebration Mode",
+    "triggerTest": "Trigger Test Error Window"
   }
 }

@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Loader2, Tag } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { fetchImage } from '../lib/monitor_api';
+import { fetchThumbnail } from '../lib/monitor_api';
 import { CATEGORY_COLORS } from '../lib/categories';
 
 export function CategoryBadge({ category }) {
@@ -32,7 +32,7 @@ export function ThumbnailCard({ item, onSelect }) {
       const targetPath = item.image_path || item.metadata?.image_path || item.path;
       if (!id && !targetPath) return;
       setLoadingImage(true);
-      const dataUrl = await fetchImage(id, id ? null : targetPath);
+      const dataUrl = await fetchThumbnail(id, id ? null : targetPath);
       if (active) {
         setImageSrc(dataUrl);
         setLoadingImage(false);

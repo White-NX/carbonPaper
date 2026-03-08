@@ -15,6 +15,21 @@ use super::{
 };
 
 impl StorageState {
+    /// Get all screenshot image paths (for thumbnail warmup).
+    pub fn get_all_image_paths(&self) -> Result<Vec<String>, String> {
+        let guard = self.get_connection_named("get_all_image_paths")?;
+        let conn = guard.as_ref().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT image_path FROM screenshots ORDER BY created_at DESC")
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+        let paths: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| format!("Failed to query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(paths)
+    }
+
     /// Check if a screenshot with the given hash already exists.
     pub fn screenshot_exists(&self, image_hash: &str) -> Result<bool, String> {
         let mut guard = self.get_connection_named("screenshot_exists")?;
@@ -79,6 +94,11 @@ impl StorageState {
             .map_err(|e| format!("Failed to save encrypted image file: {}", e))?;
 
         let image_path_str = self.to_relative_image_path(&image_path);
+
+        // Generate thumbnail while we still have image_data and row_key
+        if let Err(e) = self.generate_thumbnail_from_data(&image_data, &image_path, &row_key) {
+            tracing::warn!("Failed to generate thumbnail during save: {}", e);
+        }
 
         // Save to database (SQLCipher whole-database encryption)
         let mut guard = self.get_connection_named("save_screenshot")?;
@@ -331,6 +351,20 @@ impl StorageState {
         let file_write_dur = t2.elapsed();
 
         let image_path_str = self.to_relative_image_path(&image_path);
+
+        // Generate thumbnail while we still have image_data and row_key
+        // Use the final path (without .pending) so thumbnail path stays valid after commit rename
+        let final_image_path = {
+            let fname = image_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if fname.ends_with(".pending") {
+                image_path.with_file_name(fname.trim_end_matches(".pending"))
+            } else {
+                image_path.clone()
+            }
+        };
+        if let Err(e) = self.generate_thumbnail_from_data(&image_data, &final_image_path, &row_key) {
+            tracing::warn!("Failed to generate thumbnail during temp save: {}", e);
+        }
 
         let mut guard = self.get_connection_named("save_screenshot_temp")?;
         let conn = guard.as_mut().unwrap();
@@ -733,6 +767,20 @@ impl StorageState {
 
         if image_path.exists() {
             let _ = std::fs::remove_file(&image_path);
+        }
+
+        // Also remove the thumbnail (generated at the non-.pending path)
+        let final_path = {
+            let fname = image_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if fname.ends_with(".pending") {
+                image_path.with_file_name(fname.trim_end_matches(".pending"))
+            } else {
+                image_path.clone()
+            }
+        };
+        let thumb_path = Self::thumbnail_path_for(&final_path);
+        if thumb_path.exists() {
+            let _ = std::fs::remove_file(&thumb_path);
         }
 
         // Mark as aborted
@@ -1140,6 +1188,8 @@ impl StorageState {
             if let Some(path) = image_path {
                 let abs_path = self.resolve_image_path(&path);
                 let _ = std::fs::remove_file(&abs_path);
+                let thumb = Self::thumbnail_path_for(&abs_path);
+                let _ = std::fs::remove_file(&thumb);
             }
             let _ = self.ocr_row_count.fetch_update(
                 Ordering::Relaxed,
@@ -1212,6 +1262,8 @@ impl StorageState {
         for path in paths {
             let abs_path = self.resolve_image_path(&path);
             let _ = std::fs::remove_file(&abs_path);
+            let thumb = Self::thumbnail_path_for(&abs_path);
+            let _ = std::fs::remove_file(&thumb);
         }
 
         Ok(deleted as i32)

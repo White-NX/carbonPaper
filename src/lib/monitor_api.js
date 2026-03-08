@@ -132,6 +132,8 @@ class RequestQueue {
 
 // Global request queue for image fetching (limit concurrent requests)
 const imageQueue = new RequestQueue(3, 100);
+// Dedicated queue for card thumbnails — separate from imageQueue to avoid starvation
+const thumbnailQueue = new RequestQueue(6, 100);
 // Timeline thumbnails should load in parallel to avoid long UI delays after pan/zoom
 const timelineImageQueue = new RequestQueue(20, 800);
 
@@ -195,16 +197,16 @@ export const fetchImage = async (id, path = null) => {
 };
 
 /**
- * 时间线缩略图专用获取（低优先级，避免阻塞预览图）
+ * 时间线缩略图专用获取（低优先级，使用 thumbnail API）
  */
 export const fetchTimelineImage = async (id, path = null, options = {}) => {
     const { priority = 'normal', key = null } = options || {};
     return timelineImageQueue.enqueue(async () => {
         return withAuth(async () => {
             try {
-                const response = await invoke('storage_get_image', { id, path });
+                const response = await invoke('storage_get_thumbnail', { id, path });
                 if (response && response.status === 'success' && response.data) {
-                    return `data:${response.mime_type || 'image/png'};base64,${response.data}`;
+                    return `data:${response.mime_type || 'image/jpeg'};base64,${response.data}`;
                 }
                 return null;
             } catch (err) {
@@ -222,6 +224,21 @@ export const fetchTimelineImage = async (id, path = null, options = {}) => {
 
 export const clearTimelineImageQueue = () => {
     timelineImageQueue.clearPending();
+};
+
+/**
+ * 通用缩略图获取（用于搜索结果等卡片展示）
+ */
+export const fetchThumbnail = async (id, path = null) => {
+    return thumbnailQueue.enqueue(async () => {
+        return withAuth(async () => {
+            const response = await invoke('storage_get_thumbnail', { id, path });
+            if (response && response.status === 'success' && response.data) {
+                return `data:${response.mime_type || 'image/jpeg'};base64,${response.data}`;
+            }
+            return null;
+        });
+    }, { priority: 'normal' });
 };
 
 export const cancelTimelineImageRequest = (key) => {

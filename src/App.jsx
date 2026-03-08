@@ -21,6 +21,7 @@ import ActivityBar from './components/ActivityBar';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
+import ErrorWindow from './components/ErrorWindow';
 import { getScreenshotDetails, fetchImage, deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 import { runClustering, saveClusteringResults } from './lib/task_api';
 import { checkForUpdate } from './lib/update_api';
@@ -99,6 +100,10 @@ function App() {
   const [modelsNeedDownload, setModelsNeedDownload] = useState(false);
   const [missingModels, setMissingModels] = useState(null);
 
+  // Critical error overlay state
+  const [criticalErrors, setCriticalErrors] = useState([]);
+  const [criticalErrorLogPath, setCriticalErrorLogPath] = useState('');
+
   // State to trigger timeline jumps
   const [timelineJump, setTimelineJump] = useState(null); // { time: number, ts: number }
 
@@ -148,7 +153,8 @@ function App() {
     setLastError(null);
     setSelectedImageSrc(null); // Reset immediately
 
-    // Sequential requests to avoid pipe busy errors
+    let cancelled = false;
+
     const loadData = async () => {
       try {
         const targetId = selectedEvent.id === -1 ? null : selectedEvent.id;
@@ -157,8 +163,14 @@ function App() {
 
         console.log("Loading with targetId:", targetId, "targetPath:", targetPath);
 
-        // First get details
-        const det = await getScreenshotDetails(targetId, targetPath);
+        // Load details and image in parallel
+        const [det, img] = await Promise.all([
+          getScreenshotDetails(targetId, targetPath),
+          fetchImage(targetId, targetPath),
+        ]);
+
+        if (cancelled) return;
+
         console.log("Received details:", det);
 
         if (det && det.error) {
@@ -177,8 +189,6 @@ function App() {
           }
         }
 
-        // Then get image
-        const img = await fetchImage(targetId, targetPath);
         console.log("Received image:", img ? "base64 data received" : "null");
 
         if (!img) {
@@ -187,6 +197,7 @@ function App() {
         setSelectedImageSrc(img);
         setIsLoadingDetails(false);
       } catch (err) {
+        if (cancelled) return;
         console.error("Failed to load details", err);
         setLastError(err.message || "Failed to load image details");
         setIsLoadingDetails(false);
@@ -194,6 +205,10 @@ function App() {
     };
 
     loadData();
+
+    return () => {
+      cancelled = true;
+    };
   }, [selectedEvent]);
 
   // Construct boxes for InspectorOverlay from OCR results
@@ -395,6 +410,21 @@ function App() {
     })();
     return () => { cancelled = true; };
   }, [backendStatus, isAuthenticated, showDmlSetup, showExtensionSetup]);
+
+  // Background thumbnail warmup after auth
+  useEffect(() => {
+    if (backendStatus !== 'online' || !isAuthenticated) return;
+    let cancelled = false;
+    console.log('[Warmup] Starting background thumbnail warmup...');
+    invoke('storage_warmup_thumbnails')
+      .then((result) => {
+        if (!cancelled) {
+          console.log(`[Warmup] Done — generated: ${result?.generated ?? 0}, skipped: ${result?.skipped ?? 0}, errors: ${result?.errors ?? 0}`);
+        }
+      })
+      .catch((err) => console.warn('[Warmup] Thumbnail warmup failed:', err));
+    return () => { cancelled = true; };
+  }, [backendStatus, isAuthenticated]);
 
   // Clustering setup wizard callback — delayed background execution
   const handleClusteringSetupComplete = useCallback((shouldRun) => {
@@ -642,6 +672,22 @@ function App() {
       }
     };
   }, [reportBackendError, formatErrorDetails]);
+
+  // Listen for critical errors from Rust backend
+  useEffect(() => {
+    let unlisten;
+    const setup = async () => {
+      unlisten = await listen('critical-error', (event) => {
+        const msg = event.payload?.message || event.payload || 'Unknown error';
+        setCriticalErrors((prev) => [...prev, msg]);
+        // Fetch log path on first error
+        invoke('get_log_dir').then(setCriticalErrorLogPath).catch(() => {});
+      });
+    };
+    setup();
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
@@ -853,6 +899,14 @@ function App() {
           onAuthSuccess={handleAuthSuccess}
           authError={authError}
           setAuthError={setAuthError}
+        />
+
+        <ErrorWindow
+          isVisible={criticalErrors.length > 0}
+          errors={criticalErrors}
+          logPath={criticalErrorLogPath}
+          onRestart={() => invoke('restart_app').catch(() => {})}
+          onExit={() => invoke('exit_app').catch(() => {})}
         />
 
         <DmlSetupWizard
