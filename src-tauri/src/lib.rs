@@ -149,7 +149,12 @@ async fn storage_get_timeline(
         end_time
     };
 
-    state.get_screenshots_by_time_range_limited(start_ts, end_ts, max_records.or(Some(500)))
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        state.get_screenshots_by_time_range_limited(start_ts, end_ts, max_records.or(Some(500)))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
 #[tauri::command]
@@ -168,16 +173,24 @@ async fn storage_search(
     // 检查认证状态
     check_auth_required(&credential_state)?;
 
-    state.search_text(
-        &query,
-        limit.unwrap_or(20),
-        offset.unwrap_or(0),
-        fuzzy.unwrap_or(true),
-        process_names,
-        start_time,
-        end_time,
-        categories,
-    )
+    let state = state.inner().clone();
+    let limit = limit.unwrap_or(20);
+    let offset = offset.unwrap_or(0);
+    let fuzzy = fuzzy.unwrap_or(true);
+    tokio::task::spawn_blocking(move || {
+        state.search_text(
+            &query,
+            limit,
+            offset,
+            fuzzy,
+            process_names,
+            start_time,
+            end_time,
+            categories,
+        )
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
 #[tauri::command]
@@ -192,39 +205,131 @@ async fn storage_get_image(
 
     tracing::debug!("id={:?}, path={:?}", id, path);
 
-    let image_path = if let Some(id) = id {
-        let record = state.get_screenshot_by_id(id)?;
-        tracing::debug!("Found record: {:?}", record.as_ref().map(|r| &r.image_path));
-        record.map(|r| r.image_path)
-    } else {
-        path
-    };
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let image_path = if let Some(id) = id {
+            let record = state.get_screenshot_by_id(id)?;
+            tracing::debug!("Found record: {:?}", record.as_ref().map(|r| &r.image_path));
+            record.map(|r| r.image_path)
+        } else {
+            path
+        };
 
-    tracing::debug!("Final image_path={:?}", image_path);
+        tracing::debug!("Final image_path={:?}", image_path);
 
-    match image_path {
-        Some(path) => {
-            // 使用 StorageManager::read_image 读取加密图片
-            match state.read_image(&path) {
-                Ok((data, mime_type)) => {
-                    tracing::debug!("Successfully read image, mime={}", mime_type);
-                    Ok(serde_json::json!({
-                        "status": "success",
-                        "data": data,
-                        "mime_type": mime_type
-                    }))
-                }
-                Err(e) => {
-                    tracing::error!("Failed to read image: {}", e);
-                    Err(e)
+        match image_path {
+            Some(path) => {
+                // 使用 StorageManager::read_image 读取加密图片
+                match state.read_image(&path) {
+                    Ok((data, mime_type)) => {
+                        tracing::debug!("Successfully read image, mime={}", mime_type);
+                        Ok(serde_json::json!({
+                            "status": "success",
+                            "data": data,
+                            "mime_type": mime_type
+                        }))
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to read image: {}", e);
+                        Err(e)
+                    }
                 }
             }
+            None => {
+                tracing::warn!("Image not found - no path available");
+                Err("Image not found".to_string())
+            }
         }
-        None => {
-            tracing::warn!("Image not found - no path available");
-            Err("Image not found".to_string())
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+#[tauri::command]
+async fn storage_get_thumbnail(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    id: Option<i64>,
+    path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let image_path = if let Some(id) = id {
+            let record = state.get_screenshot_by_id(id)?;
+            record.map(|r| r.image_path)
+        } else {
+            path
+        };
+
+        match image_path {
+            Some(path) => match state.read_thumbnail(&path) {
+                Ok((data, mime_type)) => Ok(serde_json::json!({
+                    "status": "success",
+                    "data": data,
+                    "mime_type": mime_type
+                })),
+                Err(e) => Err(e),
+            },
+            None => Err("Image not found".to_string()),
         }
-    }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+#[tauri::command]
+async fn storage_warmup_thumbnails(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let paths = state.get_all_image_paths()?;
+        let total = paths.len();
+        tracing::info!("[Warmup] Starting thumbnail warmup for {} screenshots", total);
+        let start = std::time::Instant::now();
+        let mut generated: u64 = 0;
+        let mut skipped: u64 = 0;
+        let mut errors: u64 = 0;
+        let mut last_progress = std::time::Instant::now();
+
+        for (i, path) in paths.iter().enumerate() {
+            match state.ensure_thumbnail_cached(path) {
+                Ok(true) => generated += 1,
+                Ok(false) => skipped += 1,
+                Err(e) => {
+                    tracing::warn!("[Warmup] [{}/{}] Error for {}: {}", i + 1, total, path, e);
+                    errors += 1;
+                }
+            }
+            // Periodic progress every 5 seconds
+            if last_progress.elapsed().as_secs() >= 5 {
+                tracing::info!(
+                    "[Warmup] Progress: {}/{} (generated: {}, skipped: {}, errors: {})",
+                    i + 1, total, generated, skipped, errors
+                );
+                last_progress = std::time::Instant::now();
+            }
+        }
+
+        let elapsed = start.elapsed();
+        tracing::info!(
+            "[Warmup] Done in {:.1}s — generated: {}, skipped: {}, errors: {} (total: {})",
+            elapsed.as_secs_f64(), generated, skipped, errors, total
+        );
+
+        Ok(serde_json::json!({
+            "generated": generated,
+            "skipped": skipped,
+            "errors": errors
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
 #[tauri::command]
@@ -237,30 +342,35 @@ async fn storage_get_screenshot_details(
     // 检查认证状态
     check_auth_required(&credential_state)?;
 
-    // 优先按 id 查找，其次按 path 查找
-    let record = if let Some(id) = id {
-        state.get_screenshot_by_id(id)?
-    } else if let Some(ref p) = path {
-        state.get_screenshot_by_image_path(p)?
-    } else {
-        return Err("Either id or path must be provided".into());
-    };
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        // 优先按 id 查找，其次按 path 查找
+        let record = if let Some(id) = id {
+            state.get_screenshot_by_id(id)?
+        } else if let Some(ref p) = path {
+            state.get_screenshot_by_image_path(p)?
+        } else {
+            return Err("Either id or path must be provided".into());
+        };
 
-    match &record {
-        Some(r) => {
-            let ocr_results = state.get_screenshot_ocr_results(r.id)?;
-            Ok(serde_json::json!({
-                "status": "success",
-                "record": record,
-                "ocr_results": ocr_results
-            }))
+        match &record {
+            Some(r) => {
+                let ocr_results = state.get_screenshot_ocr_results(r.id)?;
+                Ok(serde_json::json!({
+                    "status": "success",
+                    "record": record,
+                    "ocr_results": ocr_results
+                }))
+            }
+            None => Ok(serde_json::json!({
+                "status": "not_found",
+                "record": null,
+                "ocr_results": []
+            })),
         }
-        None => Ok(serde_json::json!({
-            "status": "not_found",
-            "record": null,
-            "ocr_results": []
-        })),
-    }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
 #[tauri::command]
@@ -1164,6 +1274,8 @@ pub fn run() {
             storage_get_timeline,
             storage_search,
             storage_get_image,
+            storage_get_thumbnail,
+            storage_warmup_thumbnails,
             storage_get_screenshot_details,
             storage_delete_screenshot,
             storage_delete_by_time_range,

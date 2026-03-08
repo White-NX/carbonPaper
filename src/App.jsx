@@ -148,7 +148,8 @@ function App() {
     setLastError(null);
     setSelectedImageSrc(null); // Reset immediately
 
-    // Sequential requests to avoid pipe busy errors
+    let cancelled = false;
+
     const loadData = async () => {
       try {
         const targetId = selectedEvent.id === -1 ? null : selectedEvent.id;
@@ -157,8 +158,14 @@ function App() {
 
         console.log("Loading with targetId:", targetId, "targetPath:", targetPath);
 
-        // First get details
-        const det = await getScreenshotDetails(targetId, targetPath);
+        // Load details and image in parallel
+        const [det, img] = await Promise.all([
+          getScreenshotDetails(targetId, targetPath),
+          fetchImage(targetId, targetPath),
+        ]);
+
+        if (cancelled) return;
+
         console.log("Received details:", det);
 
         if (det && det.error) {
@@ -177,8 +184,6 @@ function App() {
           }
         }
 
-        // Then get image
-        const img = await fetchImage(targetId, targetPath);
         console.log("Received image:", img ? "base64 data received" : "null");
 
         if (!img) {
@@ -187,6 +192,7 @@ function App() {
         setSelectedImageSrc(img);
         setIsLoadingDetails(false);
       } catch (err) {
+        if (cancelled) return;
         console.error("Failed to load details", err);
         setLastError(err.message || "Failed to load image details");
         setIsLoadingDetails(false);
@@ -194,6 +200,10 @@ function App() {
     };
 
     loadData();
+
+    return () => {
+      cancelled = true;
+    };
   }, [selectedEvent]);
 
   // Construct boxes for InspectorOverlay from OCR results
@@ -395,6 +405,21 @@ function App() {
     })();
     return () => { cancelled = true; };
   }, [backendStatus, isAuthenticated, showDmlSetup, showExtensionSetup]);
+
+  // Background thumbnail warmup after auth
+  useEffect(() => {
+    if (backendStatus !== 'online' || !isAuthenticated) return;
+    let cancelled = false;
+    console.log('[Warmup] Starting background thumbnail warmup...');
+    invoke('storage_warmup_thumbnails')
+      .then((result) => {
+        if (!cancelled) {
+          console.log(`[Warmup] Done — generated: ${result?.generated ?? 0}, skipped: ${result?.skipped ?? 0}, errors: ${result?.errors ?? 0}`);
+        }
+      })
+      .catch((err) => console.warn('[Warmup] Thumbnail warmup failed:', err));
+    return () => { cancelled = true; };
+  }, [backendStatus, isAuthenticated]);
 
   // Clustering setup wizard callback — delayed background execution
   const handleClusteringSetupComplete = useCallback((shouldRun) => {
@@ -642,6 +667,7 @@ function App() {
       }
     };
   }, [reportBackendError, formatErrorDetails]);
+
   const [isMaximized, setIsMaximized] = useState(false);
 
   useEffect(() => {
