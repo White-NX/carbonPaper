@@ -769,6 +769,20 @@ impl StorageState {
             let _ = std::fs::remove_file(&image_path);
         }
 
+        // Also remove the thumbnail (generated at the non-.pending path)
+        let final_path = {
+            let fname = image_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if fname.ends_with(".pending") {
+                image_path.with_file_name(fname.trim_end_matches(".pending"))
+            } else {
+                image_path.clone()
+            }
+        };
+        let thumb_path = Self::thumbnail_path_for(&final_path);
+        if thumb_path.exists() {
+            let _ = std::fs::remove_file(&thumb_path);
+        }
+
         // Mark as aborted
         conn.execute(
             "UPDATE screenshots SET status = ? WHERE id = ?",
