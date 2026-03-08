@@ -10,12 +10,12 @@ const labelArgInline = args.find((arg) => arg.startsWith('--label='));
 const dryRun = args.includes('--dry-run');
 
 if (!versionArg) {
-  console.error('用法: node scripts/bump-version.mjs <version> [--label "Alpha T.V."] [--dry-run]');
+  console.error('用法: node scripts/bump-version.mjs <version> [--label "Beta"] [--dry-run]');
   process.exit(1);
 }
 
 const normalizedVersion = versionArg.startsWith('v') ? versionArg.slice(1) : versionArg;
-const label = labelArgInline?.slice('--label='.length) ?? labelArgValue ?? 'Alpha T.V.';
+const label = labelArgInline?.slice('--label='.length) ?? labelArgValue ?? 'Beta';
 const appVersion = label ? `v${normalizedVersion} ${label}` : `v${normalizedVersion}`;
 
 const filePaths = {
