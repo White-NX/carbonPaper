@@ -46,7 +46,14 @@ function connectNative() {
           message.error.includes('CarbonPaper not running') ||
           message.error.includes('Cannot connect to CarbonPaper')
         );
-        if (!ignorable) {
+        if (ignorable) {
+          // Main app not ready yet — reconnect NMH so it re-authenticates
+          // once CarbonPaper starts up.
+          console.warn('[CarbonPaper] NMH cold-start error, will retry:', message.error);
+          if (isEnabled) {
+            setTimeout(connectNative, 5000);
+          }
+        } else {
           console.error('[CarbonPaper] NMH error:', message.error);
         }
       }

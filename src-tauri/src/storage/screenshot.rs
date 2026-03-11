@@ -1603,4 +1603,405 @@ impl StorageState {
             }
         }
     }
+
+    // ==================== Bitmap Index Migration ====================
+
+    /// Marker key stored in the live table after atomic swap to signal completion (legacy location).
+    const BITMAP_MIGRATION_DONE_KEY_LEGACY: &'static str = "__bitmap_migration_done__";
+    /// Marker key in app_metadata for bitmap migration completion.
+    const BITMAP_MIGRATION_DONE_KEY: &'static str = "bitmap_migration_done";
+    /// Progress key stored in the staging table (blob = 8-byte little-endian i64).
+    const STAGING_LAST_ID_KEY: &'static str = "__staging_last_id__";
+    /// Number of OCR rows to process per batch.
+    const BITMAP_MIGRATION_BATCH: i64 = 500;
+
+    /// Attempt bitmap index migration (punctuation cleanup) if not already done.
+    /// Called after user authentication succeeds.
+    pub fn try_bitmap_index_migration(&self) {
+        // Session-level guard: only run once per session
+        if self
+            .bitmap_index_migrated
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let t0 = std::time::Instant::now();
+        match self.run_bitmap_index_migration() {
+            Ok(migrated) => {
+                if migrated > 0 {
+                    tracing::info!(
+                        "[BITMAP:MIGRATE] Completed in {:?} ({} OCR rows re-indexed)",
+                        t0.elapsed(),
+                        migrated
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[BITMAP:MIGRATE] Migration failed (non-fatal): {}", e);
+                // Reset so it can be retried next session/auth
+                self.bitmap_index_migrated.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Rebuild bitmap index with punctuation-free bigrams.
+    fn run_bitmap_index_migration(&self) -> Result<i64, String> {
+        // Check persistent completion marker — new location (app_metadata) first, then legacy
+        {
+            let guard = self.get_connection_named("bitmap_migrate_check")?;
+            let conn = guard.as_ref().unwrap();
+
+            let done_new: bool = conn
+                .query_row(
+                    "SELECT 1 FROM app_metadata WHERE key = ?1",
+                    params![Self::BITMAP_MIGRATION_DONE_KEY],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if done_new {
+                return Ok(0);
+            }
+
+            let done_legacy: bool = conn
+                .query_row(
+                    "SELECT 1 FROM blind_bitmap_index WHERE token_hash = ?1",
+                    params![Self::BITMAP_MIGRATION_DONE_KEY_LEGACY],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if done_legacy {
+                // Migrate marker to app_metadata, then clean up legacy sentinel
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
+                    params![Self::BITMAP_MIGRATION_DONE_KEY],
+                );
+                let _ = conn.execute(
+                    "DELETE FROM blind_bitmap_index WHERE token_hash = ?1",
+                    params![Self::BITMAP_MIGRATION_DONE_KEY_LEGACY],
+                );
+                return Ok(0);
+            }
+        }
+
+        tracing::info!("[BITMAP:MIGRATE] Processing database optimization...");
+
+        // Read persisted progress from staging table
+        let mut last_id: i64 = {
+            let guard = self.get_connection_named("bitmap_migrate_progress")?;
+            let conn = guard.as_ref().unwrap();
+            Self::read_staging_last_id(conn)
+        };
+
+        let mut total_processed: i64 = 0;
+        let report_interval = std::time::Duration::from_secs(5);
+        let mut last_report = std::time::Instant::now();
+
+        // Incremental batch loop
+        loop {
+            // Read OCR rows (hold DB mutex briefly)
+            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+                let guard = self.get_connection_named("bitmap_migrate_read")?;
+                let conn = guard.as_ref().unwrap();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, text_enc, text_key_encrypted \
+                         FROM ocr_results \
+                         WHERE id > ?1 AND text_enc IS NOT NULL AND text_key_encrypted IS NOT NULL \
+                         ORDER BY id ASC LIMIT ?2",
+                    )
+                    .map_err(|e| format!("bitmap migrate prepare: {}", e))?;
+                let mapped = stmt
+                    .query_map(params![last_id, Self::BITMAP_MIGRATION_BATCH], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    })
+                    .map_err(|e| format!("bitmap migrate query: {}", e))?;
+                mapped.filter_map(|r| r.ok()).collect()
+            };
+
+            // all rows processed
+            if rows.is_empty() {
+                break;
+            }
+
+            // Decrypt and tokenize
+            let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
+                std::collections::HashMap::new();
+            let mut batch_max_id: i64 = last_id;
+
+            for (ocr_id, text_enc, text_key_enc) in &rows {
+                let plaintext = match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(s) => s,
+                        Err(_) => continue, // skip non-utf8
+                    },
+                    Err(_) => continue, // skip rows that fail to decrypt
+                };
+
+                let bigrams = Self::bigram_tokenize(&plaintext);
+                for token in bigrams {
+                    let hash = Self::compute_hmac_hash(&token);
+                    batch_tokens
+                        .entry(hash)
+                        .or_insert_with(roaring::RoaringBitmap::new)
+                        .insert(*ocr_id as u32);
+                }
+                if *ocr_id > batch_max_id {
+                    batch_max_id = *ocr_id;
+                }
+            }
+
+            // Merge into staging table (single transaction)
+            {
+                let mut guard = self.get_connection_named("bitmap_migrate_write")?;
+                let conn = guard.as_mut().unwrap();
+                let tx = conn
+                    .transaction()
+                    .map_err(|e| format!("bitmap migrate tx: {}", e))?;
+
+                {
+                    let mut get_stmt = tx
+                        .prepare_cached(
+                            "SELECT postings_blob FROM blind_bitmap_index_staging WHERE token_hash = ?1",
+                        )
+                        .map_err(|e| format!("bitmap migrate prepare get: {}", e))?;
+                    let mut put_stmt = tx
+                        .prepare_cached(
+                            "INSERT OR REPLACE INTO blind_bitmap_index_staging (token_hash, postings_blob) VALUES (?1, ?2)",
+                        )
+                        .map_err(|e| format!("bitmap migrate prepare put: {}", e))?;
+
+                    for (hash, new_bitmap) in &batch_tokens {
+                        let existing_blob: Option<Vec<u8>> = get_stmt
+                            .query_row(params![hash], |row| row.get(0))
+                            .optional()
+                            .map_err(|e| format!("bitmap migrate get: {}", e))?;
+
+                        let merged = if let Some(blob) = existing_blob {
+                            let mut existing =
+                                roaring::RoaringBitmap::deserialize_from(&blob[..])
+                                    .map_err(|e| format!("bitmap migrate deser: {}", e))?;
+                            existing |= new_bitmap;
+                            existing
+                        } else {
+                            new_bitmap.clone()
+                        };
+
+                        let mut buf = Vec::new();
+                        merged
+                            .serialize_into(&mut buf)
+                            .map_err(|e| format!("bitmap migrate ser: {}", e))?;
+                        put_stmt
+                            .execute(params![hash, buf])
+                            .map_err(|e| format!("bitmap migrate put: {}", e))?;
+                    }
+                    drop(get_stmt);
+                    drop(put_stmt);
+                }
+
+                // Update progress marker
+                Self::write_staging_last_id(&tx, batch_max_id)?;
+
+                tx.commit()
+                    .map_err(|e| format!("bitmap migrate commit: {}", e))?;
+            }
+
+            total_processed += rows.len() as i64;
+            last_id = batch_max_id;
+
+            // Periodic progress report
+            if last_report.elapsed() >= report_interval {
+                tracing::info!(
+                    "[BITMAP:MIGRATE] Progress: {} rows optimized so far (last_id={})",
+                    total_processed,
+                    last_id
+                );
+                last_report = std::time::Instant::now();
+            }
+        }
+
+        // Process any rows added during migration
+        // (new rows already use the updated bigram_tokenize, but they wrote to
+        // the live table which will be dropped — re-index them into staging)
+        loop {
+            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+                let guard = self.get_connection_named("bitmap_migrate_catchup")?;
+                let conn = guard.as_ref().unwrap();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, text_enc, text_key_encrypted \
+                         FROM ocr_results \
+                         WHERE id > ?1 AND text_enc IS NOT NULL AND text_key_encrypted IS NOT NULL \
+                         ORDER BY id ASC LIMIT ?2",
+                    )
+                    .map_err(|e| format!("bitmap catchup prepare: {}", e))?;
+                let mapped = stmt
+                    .query_map(params![last_id, Self::BITMAP_MIGRATION_BATCH], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    })
+                    .map_err(|e| format!("bitmap catchup query: {}", e))?;
+                mapped.filter_map(|r| r.ok()).collect()
+            };
+
+            if rows.is_empty() {
+                break;
+            }
+
+            let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
+                std::collections::HashMap::new();
+            let mut batch_max_id = last_id;
+
+            for (ocr_id, text_enc, text_key_enc) in &rows {
+                let plaintext = match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                };
+
+                let bigrams = Self::bigram_tokenize(&plaintext);
+                for token in bigrams {
+                    let hash = Self::compute_hmac_hash(&token);
+                    batch_tokens
+                        .entry(hash)
+                        .or_insert_with(roaring::RoaringBitmap::new)
+                        .insert(*ocr_id as u32);
+                }
+                if *ocr_id > batch_max_id {
+                    batch_max_id = *ocr_id;
+                }
+            }
+
+            {
+                let mut guard = self.get_connection_named("bitmap_migrate_catchup_write")?;
+                let conn = guard.as_mut().unwrap();
+                let tx = conn
+                    .transaction()
+                    .map_err(|e| format!("bitmap catchup tx: {}", e))?;
+
+                {
+                    let mut get_stmt = tx
+                        .prepare_cached(
+                            "SELECT postings_blob FROM blind_bitmap_index_staging WHERE token_hash = ?1",
+                        )
+                        .map_err(|e| format!("bitmap catchup prepare get: {}", e))?;
+                    let mut put_stmt = tx
+                        .prepare_cached(
+                            "INSERT OR REPLACE INTO blind_bitmap_index_staging (token_hash, postings_blob) VALUES (?1, ?2)",
+                        )
+                        .map_err(|e| format!("bitmap catchup prepare put: {}", e))?;
+
+                    for (hash, new_bitmap) in &batch_tokens {
+                        let existing_blob: Option<Vec<u8>> = get_stmt
+                            .query_row(params![hash], |row| row.get(0))
+                            .optional()
+                            .map_err(|e| format!("bitmap catchup get: {}", e))?;
+
+                        let merged = if let Some(blob) = existing_blob {
+                            let mut existing =
+                                roaring::RoaringBitmap::deserialize_from(&blob[..])
+                                    .map_err(|e| format!("bitmap catchup deser: {}", e))?;
+                            existing |= new_bitmap;
+                            existing
+                        } else {
+                            new_bitmap.clone()
+                        };
+
+                        let mut buf = Vec::new();
+                        merged
+                            .serialize_into(&mut buf)
+                            .map_err(|e| format!("bitmap catchup ser: {}", e))?;
+                        put_stmt
+                            .execute(params![hash, buf])
+                            .map_err(|e| format!("bitmap catchup put: {}", e))?;
+                    }
+                    drop(get_stmt);
+                    drop(put_stmt);
+                }
+
+                Self::write_staging_last_id(&tx, batch_max_id)?;
+
+                tx.commit()
+                    .map_err(|e| format!("bitmap catchup commit: {}", e))?;
+            }
+
+            total_processed += rows.len() as i64;
+            last_id = batch_max_id;
+        }
+
+        // 5. Atomic swap: DROP old table → RENAME staging → insert done marker
+        {
+            let mut guard = self.get_connection_named("bitmap_migrate_swap")?;
+            let conn = guard.as_mut().unwrap();
+
+            // Remove progress marker from staging before swap
+            conn.execute(
+                "DELETE FROM blind_bitmap_index_staging WHERE token_hash = ?1",
+                params![Self::STAGING_LAST_ID_KEY],
+            )
+            .map_err(|e| format!("bitmap swap cleanup: {}", e))?;
+
+            conn.execute_batch(
+                "BEGIN TRANSACTION;
+                 DROP TABLE blind_bitmap_index;
+                 ALTER TABLE blind_bitmap_index_staging RENAME TO blind_bitmap_index;
+                 COMMIT;",
+            )
+            .map_err(|e| format!("bitmap swap failed: {}", e))?;
+
+            // Insert completion marker into app_metadata
+            conn.execute(
+                "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
+                params![Self::BITMAP_MIGRATION_DONE_KEY],
+            )
+            .map_err(|e| format!("bitmap done marker insert: {}", e))?;
+        }
+
+        if total_processed > 0 {
+            tracing::info!(
+                "[BITMAP:MIGRATE] Atomic swap complete. {} OCR rows re-indexed with clean bigrams.",
+                total_processed
+            );
+        }
+
+        Ok(total_processed)
+    }
+
+    /// Read the last-processed OCR id from the staging table.
+    fn read_staging_last_id(conn: &Connection) -> i64 {
+        let blob: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT postings_blob FROM blind_bitmap_index_staging WHERE token_hash = ?1",
+                params![Self::STAGING_LAST_ID_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+
+        match blob {
+            Some(b) if b.len() == 8 => i64::from_le_bytes(b.try_into().unwrap()),
+            _ => 0,
+        }
+    }
+
+    /// Write the last-processed OCR id into the staging table.
+    fn write_staging_last_id(tx: &rusqlite::Transaction, id: i64) -> Result<(), String> {
+        tx.execute(
+            "INSERT OR REPLACE INTO blind_bitmap_index_staging (token_hash, postings_blob) VALUES (?1, ?2)",
+            params![Self::STAGING_LAST_ID_KEY, id.to_le_bytes().to_vec()],
+        )
+        .map_err(|e| format!("bitmap write progress: {}", e))?;
+        Ok(())
+    }
 }

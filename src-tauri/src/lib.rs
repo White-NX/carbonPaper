@@ -317,6 +317,35 @@ async fn storage_warmup_thumbnails(
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
+        // Session-level guard: skip if already done this session
+        if state.thumbnail_warmup_done.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!("[Warmup] Thumbnail warmup already done this session, skipping");
+            return Ok(serde_json::json!({
+                "generated": 0,
+                "skipped": 0,
+                "errors": 0,
+                "cached": true
+            }));
+        }
+
+        // Persistent guard: check sentinel in DB
+        match state.is_thumbnail_warmup_done() {
+            Ok(true) => {
+                tracing::info!("[Warmup] Thumbnail warmup already completed (sentinel found), skipping");
+                state.thumbnail_warmup_done.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(serde_json::json!({
+                    "generated": 0,
+                    "skipped": 0,
+                    "errors": 0,
+                    "cached": true
+                }));
+            }
+            Ok(false) => {} // proceed
+            Err(e) => {
+                tracing::warn!("[Warmup] Failed to check sentinel: {}, proceeding with warmup", e);
+            }
+        }
+
         let paths = state.get_all_image_paths()?;
         let total = paths.len();
         tracing::info!("[Warmup] Starting thumbnail warmup for {} screenshots", total);
@@ -350,6 +379,12 @@ async fn storage_warmup_thumbnails(
             "[Warmup] Done in {:.1}s — generated: {}, skipped: {}, errors: {} (total: {})",
             elapsed.as_secs_f64(), generated, skipped, errors, total
         );
+
+        // Mark as done: write persistent sentinel and set session flag
+        if let Err(e) = state.mark_thumbnail_warmup_done() {
+            tracing::warn!("[Warmup] Failed to write sentinel: {}", e);
+        }
+        state.thumbnail_warmup_done.store(true, std::sync::atomic::Ordering::SeqCst);
 
         Ok(serde_json::json!({
             "generated": generated,
@@ -935,6 +970,9 @@ async fn credential_verify_user(
 
         // 认证成功后尝试执行去重迁移（仅首次）
         storage_state.try_dedup_migration();
+
+        // 认证成功后尝试执行 bitmap 索引优化迁移（去标点 bigram）
+        storage_state.try_bitmap_index_migration();
 
         Ok(true)
     }
