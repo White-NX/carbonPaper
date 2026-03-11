@@ -9,6 +9,7 @@ const MAX_RETRY = 30;
 let nmPort = null;
 let isEnabled = true;
 let isConnected = false;
+let reconnectTimer = null;
 let lastCaptureHash = null;
 
 // Detect browser process name
@@ -21,7 +22,21 @@ function getBrowserName() {
 
 // Native Messaging Connection Management
 
+function scheduleReconnect(delayMs = 5000) {
+  if (reconnectTimer !== null) return; // already scheduled
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectNative();
+  }, delayMs);
+}
+
 function connectNative() {
+  // Cancel any pending scheduled reconnection — we're connecting now
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
   if (nmPort) {
     try { nmPort.disconnect(); } catch (e) { /* ignore */ }
   }
@@ -51,7 +66,7 @@ function connectNative() {
           // once CarbonPaper starts up.
           console.warn('[CarbonPaper] NMH cold-start error, will retry:', message.error);
           if (isEnabled) {
-            setTimeout(connectNative, 5000);
+            scheduleReconnect();
           }
         } else {
           console.error('[CarbonPaper] NMH error:', message.error);
@@ -67,7 +82,7 @@ function connectNative() {
 
       // Reconnect after delay
       if (isEnabled) {
-        setTimeout(connectNative, 5000);
+        scheduleReconnect();
       }
     });
 
@@ -78,7 +93,7 @@ function connectNative() {
 
     // Retry after delay
     if (isEnabled && isConnected === false) {
-      setTimeout(connectNative, 5000);
+      scheduleReconnect();
     }
 
   }

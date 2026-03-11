@@ -1825,10 +1825,12 @@ impl StorageState {
             }
         }
 
-        // Process any rows added during migration
-        // (new rows already use the updated bigram_tokenize, but they wrote to
-        // the live table which will be dropped — re-index them into staging)
+        // Process any rows added during migration, then atomically swap tables.
+        // IMPORTANT: The final "no more rows" check and table swap MUST happen
+        // under a single mutex acquisition to prevent a race where new bitmap
+        // entries are inserted between the empty check and DROP TABLE.
         loop {
+            // Step 1: Acquire mutex, read remaining rows, release mutex
             let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
                 let guard = self.get_connection_named("bitmap_migrate_catchup")?;
                 let conn = guard.as_ref().unwrap();
@@ -1852,119 +1854,235 @@ impl StorageState {
                 mapped.filter_map(|r| r.ok()).collect()
             };
 
-            if rows.is_empty() {
-                break;
-            }
+            if !rows.is_empty() {
+                // Step 2: Decrypt + tokenize OUTSIDE mutex (CPU-intensive, no DB needed)
+                let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
+                    std::collections::HashMap::new();
+                let mut batch_max_id = last_id;
 
-            let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
-                std::collections::HashMap::new();
-            let mut batch_max_id = last_id;
-
-            for (ocr_id, text_enc, text_key_enc) in &rows {
-                let plaintext = match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
-                    Ok(bytes) => match String::from_utf8(bytes) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                };
-
-                let bigrams = Self::bigram_tokenize(&plaintext);
-                for token in bigrams {
-                    let hash = Self::compute_hmac_hash(&token);
-                    batch_tokens
-                        .entry(hash)
-                        .or_insert_with(roaring::RoaringBitmap::new)
-                        .insert(*ocr_id as u32);
-                }
-                if *ocr_id > batch_max_id {
-                    batch_max_id = *ocr_id;
-                }
-            }
-
-            {
-                let mut guard = self.get_connection_named("bitmap_migrate_catchup_write")?;
-                let conn = guard.as_mut().unwrap();
-                let tx = conn
-                    .transaction()
-                    .map_err(|e| format!("bitmap catchup tx: {}", e))?;
-
-                {
-                    let mut get_stmt = tx
-                        .prepare_cached(
-                            "SELECT postings_blob FROM blind_bitmap_index_staging WHERE token_hash = ?1",
-                        )
-                        .map_err(|e| format!("bitmap catchup prepare get: {}", e))?;
-                    let mut put_stmt = tx
-                        .prepare_cached(
-                            "INSERT OR REPLACE INTO blind_bitmap_index_staging (token_hash, postings_blob) VALUES (?1, ?2)",
-                        )
-                        .map_err(|e| format!("bitmap catchup prepare put: {}", e))?;
-
-                    for (hash, new_bitmap) in &batch_tokens {
-                        let existing_blob: Option<Vec<u8>> = get_stmt
-                            .query_row(params![hash], |row| row.get(0))
-                            .optional()
-                            .map_err(|e| format!("bitmap catchup get: {}", e))?;
-
-                        let merged = if let Some(blob) = existing_blob {
-                            let mut existing =
-                                roaring::RoaringBitmap::deserialize_from(&blob[..])
-                                    .map_err(|e| format!("bitmap catchup deser: {}", e))?;
-                            existing |= new_bitmap;
-                            existing
-                        } else {
-                            new_bitmap.clone()
+                for (ocr_id, text_enc, text_key_enc) in &rows {
+                    let plaintext =
+                        match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
+                            Ok(bytes) => match String::from_utf8(bytes) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            },
+                            Err(_) => continue,
                         };
 
-                        let mut buf = Vec::new();
-                        merged
-                            .serialize_into(&mut buf)
-                            .map_err(|e| format!("bitmap catchup ser: {}", e))?;
-                        put_stmt
-                            .execute(params![hash, buf])
-                            .map_err(|e| format!("bitmap catchup put: {}", e))?;
+                    let bigrams = Self::bigram_tokenize(&plaintext);
+                    for token in bigrams {
+                        let hash = Self::compute_hmac_hash(&token);
+                        batch_tokens
+                            .entry(hash)
+                            .or_insert_with(roaring::RoaringBitmap::new)
+                            .insert(*ocr_id as u32);
                     }
-                    drop(get_stmt);
-                    drop(put_stmt);
+                    if *ocr_id > batch_max_id {
+                        batch_max_id = *ocr_id;
+                    }
                 }
 
-                Self::write_staging_last_id(&tx, batch_max_id)?;
+                // Step 3: Write to staging (acquire mutex briefly)
+                {
+                    let mut guard =
+                        self.get_connection_named("bitmap_migrate_catchup_write")?;
+                    let conn = guard.as_mut().unwrap();
+                    let tx = conn
+                        .transaction()
+                        .map_err(|e| format!("bitmap catchup tx: {}", e))?;
 
-                tx.commit()
-                    .map_err(|e| format!("bitmap catchup commit: {}", e))?;
+                    {
+                        let mut get_stmt = tx
+                            .prepare_cached(
+                                "SELECT postings_blob FROM blind_bitmap_index_staging WHERE token_hash = ?1",
+                            )
+                            .map_err(|e| format!("bitmap catchup prepare get: {}", e))?;
+                        let mut put_stmt = tx
+                            .prepare_cached(
+                                "INSERT OR REPLACE INTO blind_bitmap_index_staging (token_hash, postings_blob) VALUES (?1, ?2)",
+                            )
+                            .map_err(|e| format!("bitmap catchup prepare put: {}", e))?;
+
+                        for (hash, new_bitmap) in &batch_tokens {
+                            let existing_blob: Option<Vec<u8>> = get_stmt
+                                .query_row(params![hash], |row| row.get(0))
+                                .optional()
+                                .map_err(|e| format!("bitmap catchup get: {}", e))?;
+
+                            let merged = if let Some(blob) = existing_blob {
+                                let mut existing =
+                                    roaring::RoaringBitmap::deserialize_from(&blob[..])
+                                        .map_err(|e| format!("bitmap catchup deser: {}", e))?;
+                                existing |= new_bitmap;
+                                existing
+                            } else {
+                                new_bitmap.clone()
+                            };
+
+                            let mut buf = Vec::new();
+                            merged
+                                .serialize_into(&mut buf)
+                                .map_err(|e| format!("bitmap catchup ser: {}", e))?;
+                            put_stmt
+                                .execute(params![hash, buf])
+                                .map_err(|e| format!("bitmap catchup put: {}", e))?;
+                        }
+                        drop(get_stmt);
+                        drop(put_stmt);
+                    }
+
+                    Self::write_staging_last_id(&tx, batch_max_id)?;
+
+                    tx.commit()
+                        .map_err(|e| format!("bitmap catchup commit: {}", e))?;
+                }
+
+                total_processed += rows.len() as i64;
+                last_id = batch_max_id;
+                continue;
             }
 
-            total_processed += rows.len() as i64;
-            last_id = batch_max_id;
-        }
+            // rows was empty — but mutex was already released after step 1,
+            // so a concurrent insert could have added rows in the gap.
+            // Step 4: FINAL — acquire mutex ONCE for re-check + swap atomically.
+            // This guarantees no rows can be inserted between the check and DROP.
+            {
+                let mut guard = self.get_connection_named("bitmap_migrate_swap")?;
+                let conn = guard.as_mut().unwrap();
 
-        // 5. Atomic swap: DROP old table → RENAME staging → insert done marker
-        {
-            let mut guard = self.get_connection_named("bitmap_migrate_swap")?;
-            let conn = guard.as_mut().unwrap();
+                // Re-check for any rows inserted after step 1 released the mutex
+                let late_rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id, text_enc, text_key_encrypted \
+                             FROM ocr_results \
+                             WHERE id > ?1 AND text_enc IS NOT NULL \
+                             AND text_key_encrypted IS NOT NULL \
+                             ORDER BY id ASC",
+                        )
+                        .map_err(|e| format!("bitmap swap recheck prepare: {}", e))?;
+                    let mapped = stmt
+                        .query_map(params![last_id], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, Vec<u8>>(1)?,
+                                row.get::<_, Vec<u8>>(2)?,
+                            ))
+                        })
+                        .map_err(|e| format!("bitmap swap recheck query: {}", e))?;
+                    mapped.filter_map(|r| r.ok()).collect()
+                };
 
-            // Remove progress marker from staging before swap
-            conn.execute(
-                "DELETE FROM blind_bitmap_index_staging WHERE token_hash = ?1",
-                params![Self::STAGING_LAST_ID_KEY],
-            )
-            .map_err(|e| format!("bitmap swap cleanup: {}", e))?;
+                // Process any late arrivals in-place under mutex.
+                // Typically 0 rows; at most 1-2 in a race scenario.
+                // decrypt_payload_with_row_key uses CNG API, not DB mutex — safe.
+                if !late_rows.is_empty() {
+                    tracing::info!(
+                        "[BITMAP:MIGRATE] Processing {} late row(s) during final swap",
+                        late_rows.len()
+                    );
 
-            conn.execute_batch(
-                "BEGIN TRANSACTION;
-                 DROP TABLE blind_bitmap_index;
-                 ALTER TABLE blind_bitmap_index_staging RENAME TO blind_bitmap_index;
-                 COMMIT;",
-            )
-            .map_err(|e| format!("bitmap swap failed: {}", e))?;
+                    let mut batch_tokens: std::collections::HashMap<
+                        String,
+                        roaring::RoaringBitmap,
+                    > = std::collections::HashMap::new();
 
-            // Insert completion marker into app_metadata
-            conn.execute(
-                "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
-                params![Self::BITMAP_MIGRATION_DONE_KEY],
-            )
-            .map_err(|e| format!("bitmap done marker insert: {}", e))?;
+                    for (ocr_id, text_enc, text_key_enc) in &late_rows {
+                        let plaintext =
+                            match self.decrypt_payload_with_row_key(text_enc, text_key_enc)
+                            {
+                                Ok(bytes) => match String::from_utf8(bytes) {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
+                                },
+                                Err(_) => continue,
+                            };
+
+                        let bigrams = Self::bigram_tokenize(&plaintext);
+                        for token in bigrams {
+                            let hash = Self::compute_hmac_hash(&token);
+                            batch_tokens
+                                .entry(hash)
+                                .or_insert_with(roaring::RoaringBitmap::new)
+                                .insert(*ocr_id as u32);
+                        }
+                    }
+
+                    let tx = conn
+                        .transaction()
+                        .map_err(|e| format!("bitmap swap late tx: {}", e))?;
+                    {
+                        let mut get_stmt = tx
+                            .prepare_cached(
+                                "SELECT postings_blob FROM blind_bitmap_index_staging WHERE token_hash = ?1",
+                            )
+                            .map_err(|e| format!("bitmap swap late prepare get: {}", e))?;
+                        let mut put_stmt = tx
+                            .prepare_cached(
+                                "INSERT OR REPLACE INTO blind_bitmap_index_staging (token_hash, postings_blob) VALUES (?1, ?2)",
+                            )
+                            .map_err(|e| format!("bitmap swap late prepare put: {}", e))?;
+
+                        for (hash, new_bitmap) in &batch_tokens {
+                            let existing_blob: Option<Vec<u8>> = get_stmt
+                                .query_row(params![hash], |row| row.get(0))
+                                .optional()
+                                .map_err(|e| format!("bitmap swap late get: {}", e))?;
+
+                            let merged = if let Some(blob) = existing_blob {
+                                let mut existing =
+                                    roaring::RoaringBitmap::deserialize_from(&blob[..])
+                                        .map_err(|e| {
+                                            format!("bitmap swap late deser: {}", e)
+                                        })?;
+                                existing |= new_bitmap;
+                                existing
+                            } else {
+                                new_bitmap.clone()
+                            };
+
+                            let mut buf = Vec::new();
+                            merged
+                                .serialize_into(&mut buf)
+                                .map_err(|e| format!("bitmap swap late ser: {}", e))?;
+                            put_stmt
+                                .execute(params![hash, buf])
+                                .map_err(|e| format!("bitmap swap late put: {}", e))?;
+                        }
+                        drop(get_stmt);
+                        drop(put_stmt);
+                    }
+                    tx.commit()
+                        .map_err(|e| format!("bitmap swap late commit: {}", e))?;
+
+                    total_processed += late_rows.len() as i64;
+                }
+
+                // Remove progress marker from staging before swap
+                conn.execute(
+                    "DELETE FROM blind_bitmap_index_staging WHERE token_hash = ?1",
+                    params![Self::STAGING_LAST_ID_KEY],
+                )
+                .map_err(|e| format!("bitmap swap cleanup: {}", e))?;
+
+                // Atomic swap — guaranteed no concurrent inserts (mutex held)
+                conn.execute_batch(
+                    "BEGIN TRANSACTION;
+                     DROP TABLE blind_bitmap_index;
+                     ALTER TABLE blind_bitmap_index_staging RENAME TO blind_bitmap_index;
+                     COMMIT;",
+                )
+                .map_err(|e| format!("bitmap swap failed: {}", e))?;
+
+                // Insert completion marker into app_metadata
+                conn.execute(
+                    "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
+                    params![Self::BITMAP_MIGRATION_DONE_KEY],
+                )
+                .map_err(|e| format!("bitmap done marker insert: {}", e))?;
+            } // mutex released — swap complete
+            break;
         }
 
         if total_processed > 0 {
