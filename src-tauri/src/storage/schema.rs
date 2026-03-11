@@ -177,6 +177,13 @@ impl StorageState {
 
             -- Enable foreign key constraints
             PRAGMA foreign_keys = ON;
+
+            -- Generic key-value store for app-level metadata / migration markers
+            CREATE TABLE IF NOT EXISTS app_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
             "#,
         )
         .map_err(|e| format!("Failed to initialize tables: {}", e))?;
@@ -252,6 +259,18 @@ impl StorageState {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_task_assignments_task_id ON task_assignments(task_id)",
         ).map_err(|e| format!("Failed to create task_assignments index: {}", e))?;
+
+        // Staging table for bitmap index migration (same structure as blind_bitmap_index)
+        Self::create_table_if_missing(
+            conn,
+            "blind_bitmap_index_staging",
+            r#"
+            CREATE TABLE IF NOT EXISTS blind_bitmap_index_staging (
+                token_hash TEXT PRIMARY KEY,
+                postings_blob BLOB NOT NULL
+            )
+            "#,
+        )?;
 
         Ok(())
     }

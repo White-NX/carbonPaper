@@ -211,6 +211,36 @@ impl StorageState {
         result.map(|_| true)
     }
 
+    // ==================== Thumbnail Warmup Sentinel ====================
+
+    const THUMBNAIL_WARMUP_DONE_KEY: &'static str = "thumbnail_warmup_done";
+
+    /// Check whether thumbnail warmup has already been completed (persistent marker in app_metadata).
+    pub fn is_thumbnail_warmup_done(&self) -> Result<bool, String> {
+        let guard = self.get_connection_named("thumb_warmup_check")?;
+        let conn = guard.as_ref().unwrap();
+        let done: bool = conn
+            .query_row(
+                "SELECT 1 FROM app_metadata WHERE key = ?1",
+                rusqlite::params![Self::THUMBNAIL_WARMUP_DONE_KEY],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        Ok(done)
+    }
+
+    /// Write the persistent marker for thumbnail warmup completion.
+    pub fn mark_thumbnail_warmup_done(&self) -> Result<(), String> {
+        let guard = self.get_connection_named("thumb_warmup_mark")?;
+        let conn = guard.as_ref().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
+            rusqlite::params![Self::THUMBNAIL_WARMUP_DONE_KEY],
+        )
+        .map_err(|e| format!("Failed to mark thumbnail warmup done: {}", e))?;
+        Ok(())
+    }
+
     fn try_read_cached_thumbnail(
         &self,
         thumb_path: &Path,

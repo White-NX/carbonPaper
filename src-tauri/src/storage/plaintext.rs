@@ -153,6 +153,9 @@ impl StorageState {
         Ok(files)
     }
 
+    /// Marker key in app_metadata for backfill completion.
+    const BACKFILL_PROCESS_NAMES_DONE_KEY: &'static str = "backfill_process_names_done";
+
     /// Background migration: batch-decrypt old records and backfill plaintext process_name.
     /// Waits for user authentication before starting CNG decryption.
     pub fn backfill_plaintext_process_names(storage: Arc<Self>) {
@@ -166,6 +169,28 @@ impl StorageState {
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
+
+        // Check persistent sentinel — skip entirely if already completed
+        match storage.get_connection_named("backfill_check") {
+            Ok(guard) => {
+                let conn = guard.as_ref().unwrap();
+                let done: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM app_metadata WHERE key = ?1",
+                        params![Self::BACKFILL_PROCESS_NAMES_DONE_KEY],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if done {
+                    tracing::info!("[BACKFILL] already completed (sentinel found), skipping");
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[BACKFILL] Failed to check sentinel: {}, proceeding", e);
+            }
+        }
+
         tracing::info!("[BACKFILL] user authenticated, starting migration");
 
         let migrate_start = std::time::Instant::now();
@@ -301,6 +326,22 @@ impl StorageState {
             total_dur,
             batch_num
         );
+
+        // Mark as done persistently
+        match storage.get_connection_named("backfill_mark_done") {
+            Ok(guard) => {
+                let conn = guard.as_ref().unwrap();
+                if let Err(e) = conn.execute(
+                    "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
+                    params![Self::BACKFILL_PROCESS_NAMES_DONE_KEY],
+                ) {
+                    tracing::warn!("[BACKFILL] Failed to write sentinel: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[BACKFILL] Failed to get connection for sentinel: {}", e);
+            }
+        }
     }
 
     /// Delete all plaintext screenshot files (without migration, direct deletion).

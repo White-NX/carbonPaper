@@ -59,9 +59,12 @@ impl StorageState {
         unique_tokens.into_iter().collect()
     }
 
-    /// Bigram tokenization.
+    /// Bigram tokenization (punctuation filtered).
     pub(super) fn bigram_tokenize(text: &str) -> HashSet<String> {
-        let chars: Vec<char> = text.chars().collect();
+        let chars: Vec<char> = text
+            .chars()
+            .filter(|c| c.is_alphanumeric() || Self::is_cjk(*c))
+            .collect();
         if chars.len() < 2 {
             return HashSet::new(); // ignore texts too short for bigrams
         }
