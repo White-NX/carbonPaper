@@ -1178,22 +1178,35 @@ async fn tool_get_task_clusters(state: &McpServerInner, args: Value) -> Result<V
     .map_err(|e| format!("Task join error: {:?}", e))??;
 
     // Presidio second-pass on task labels
+    // Analyze label and auto_label independently so PII offsets are correct for each field.
     if presidio_enabled && !tasks.is_empty() {
-        let labels: Vec<String> = tasks.iter()
-            .map(|t| {
-                t.label.clone()
-                    .or_else(|| t.auto_label.clone())
-                    .unwrap_or_default()
-            })
-            .collect();
-        let pii_results = presidio_analyze_texts(&app_handle, &labels, &presidio_lang, &presidio_entities).await;
+        let mut all_texts: Vec<String> = Vec::new();
+        // Per-task indices into all_texts: (label_index, auto_label_index)
+        let mut pii_indices: Vec<(Option<usize>, Option<usize>)> = Vec::new();
+        for t in tasks.iter() {
+            let label_idx = t.label.as_ref().map(|l| {
+                let idx = all_texts.len();
+                all_texts.push(l.clone());
+                idx
+            });
+            let auto_label_idx = t.auto_label.as_ref().map(|al| {
+                let idx = all_texts.len();
+                all_texts.push(al.clone());
+                idx
+            });
+            pii_indices.push((label_idx, auto_label_idx));
+        }
+        let pii_results = presidio_analyze_texts(&app_handle, &all_texts, &presidio_lang, &presidio_entities).await;
         let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
         let mode = filter_reload.get_mode();
         match mode.as_str() {
             "reject" => {
                 let mut keep = Vec::new();
                 for (i, t) in tasks.into_iter().enumerate() {
-                    if !has_pii(&pii_results[i]) {
+                    let (li, ali) = pii_indices[i];
+                    let any_pii = li.map_or(false, |idx| has_pii(&pii_results[idx]))
+                        || ali.map_or(false, |idx| has_pii(&pii_results[idx]));
+                    if !any_pii {
                         keep.push(t);
                     }
                 }
@@ -1201,7 +1214,10 @@ async fn tool_get_task_clusters(state: &McpServerInner, args: Value) -> Result<V
             }
             "remove_paragraph" => {
                 for (i, t) in tasks.iter_mut().enumerate() {
-                    if has_pii(&pii_results[i]) {
+                    let (li, ali) = pii_indices[i];
+                    let any_pii = li.map_or(false, |idx| has_pii(&pii_results[idx]))
+                        || ali.map_or(false, |idx| has_pii(&pii_results[idx]));
+                    if any_pii {
                         t.label = Some(CENSORED_LABEL.to_string());
                         t.auto_label = Some(CENSORED_LABEL.to_string());
                     }
@@ -1209,12 +1225,15 @@ async fn tool_get_task_clusters(state: &McpServerInner, args: Value) -> Result<V
             }
             "mask" => {
                 for (i, t) in tasks.iter_mut().enumerate() {
-                    if has_pii(&pii_results[i]) {
-                        if let Some(ref label) = t.label {
-                            t.label = Some(mask_pii_in_text(label, &pii_results[i]));
+                    let (li, ali) = pii_indices[i];
+                    if let (Some(ref label), Some(idx)) = (&t.label, li) {
+                        if has_pii(&pii_results[idx]) {
+                            t.label = Some(mask_pii_in_text(label, &pii_results[idx]));
                         }
-                        if let Some(ref auto_label) = t.auto_label {
-                            t.auto_label = Some(mask_pii_in_text(auto_label, &pii_results[i]));
+                    }
+                    if let (Some(ref auto_label), Some(idx)) = (&t.auto_label, ali) {
+                        if has_pii(&pii_results[idx]) {
+                            t.auto_label = Some(mask_pii_in_text(auto_label, &pii_results[idx]));
                         }
                     }
                 }

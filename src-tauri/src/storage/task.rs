@@ -234,7 +234,7 @@ impl StorageState {
                 .prepare(
                     "SELECT ta.screenshot_id, ta.confidence, s.image_path, \
                      s.process_name, s.window_title, s.created_at, s.category, \
-                     s.window_title_enc, s.process_name_enc, s.content_key_enc \
+                     s.window_title_enc, s.process_name_enc, s.content_key_encrypted \
                      FROM task_assignments ta \
                      JOIN screenshots s ON s.id = ta.screenshot_id \
                      WHERE ta.task_id = ? \
@@ -343,7 +343,7 @@ impl StorageState {
                 .prepare(
                     "SELECT ta.screenshot_id, ta.confidence, s.image_path, \
                      s.process_name, s.window_title, s.created_at, s.category, \
-                     s.window_title_enc, s.process_name_enc, s.content_key_enc \
+                     s.window_title_enc, s.process_name_enc, s.content_key_encrypted \
                      FROM task_assignments ta \
                      JOIN screenshots s ON s.id = ta.screenshot_id \
                      WHERE ta.task_id = ? AND ta.screenshot_id != ? \

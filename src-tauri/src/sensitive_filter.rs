@@ -182,10 +182,8 @@ impl SensitiveFilterState {
 
         let guard = self.active_automaton.read().unwrap();
         match &*guard {
-            Some(automaton) => {
-                let lower = text.to_lowercase();
-                automaton.is_match(&lower)
-            }
+            // ascii_case_insensitive is set on the automaton, no need to lowercase
+            Some(automaton) => automaton.is_match(text),
             None => false,
         }
     }
@@ -234,8 +232,9 @@ impl SensitiveFilterState {
             None => return text.to_string(),
         };
 
-        let lower = text.to_lowercase();
-        let matches: Vec<_> = automaton.find_iter(&lower).collect();
+        // ascii_case_insensitive is set on the automaton – match directly on
+        // the original text so byte offsets stay valid.
+        let matches: Vec<_> = automaton.find_iter(text).collect();
         if matches.is_empty() {
             return text.to_string();
         }
