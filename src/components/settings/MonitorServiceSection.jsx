@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Play, Pause, Square as StopSquare, Loader2, RotateCw, HelpCircle } from 'lucide-react';
+import { Play, Pause, Square as StopSquare, Loader2, RotateCw, HelpCircle, Squirrel, Circle } from 'lucide-react';
 
 export default function MonitorServiceSection({
   monitorStatus,
@@ -20,6 +20,7 @@ export default function MonitorServiceSection({
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-1.5 px-1">
+        <Squirrel className="w-4 h-4 text-ide-accent" />
         <label className="text-sm font-semibold text-ide-accent block">{t('settings.general.monitor.title')}</label>
         <div className="relative group">
           <HelpCircle className="w-3.5 h-3.5 text-ide-muted cursor-help" />

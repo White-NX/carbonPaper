@@ -1081,3 +1081,516 @@ pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
     let _ = app_for_emit.emit("install-log", json!({"source":"installer","line": "Dependency sync completed successfully."}));
     Ok("Dependencies synced successfully.".into())
 }
+
+// ==================== spaCy model management ====================
+
+/// Install a spaCy model package (e.g. `zh_core_web_sm`, `en_core_web_sm`)
+/// using pip from the existing venv.  Streams progress via `install-log` events.
+#[tauri::command]
+pub async fn install_spacy_model(
+    app: AppHandle,
+    model_name: String,
+) -> Result<String, String> {
+    // Validate model name to prevent injection
+    let allowed = ["zh_core_web_sm", "en_core_web_sm"];
+    if !allowed.contains(&model_name.as_str()) {
+        return Err(format!("Unsupported spaCy model: {}", model_name));
+    }
+
+    let venv_dir = get_venv_dir(&app);
+    let python_exec = venv_dir.join("Scripts").join("python.exe");
+    if !python_exec.is_file() {
+        let msg = format!("Virtual environment python.exe not found at {:?}", python_exec);
+        tracing::error!("install_spacy_model: {}", msg);
+        return Err(msg);
+    }
+    let python_exec_cmd = normalize_path_for_command(&python_exec);
+
+    // For transformer models, install spacy-transformers first
+    if model_name.contains("trf") {
+        tracing::info!("install_spacy_model: installing spacy-transformers prerequisite");
+        let _ = app.emit("install-log", json!({
+            "source": "spacy",
+            "line": "Installing spacy-transformers prerequisite..."
+        }));
+
+        let mut trf_cmd = Command::new(&python_exec_cmd);
+        trf_cmd
+            .arg("-u")
+            .arg("-m")
+            .arg("pip")
+            .arg("install")
+            .arg("spacy-transformers")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        #[cfg(windows)]
+        {
+            trf_cmd.creation_flags(0x08000000);
+        }
+
+        match trf_cmd.output() {
+            Ok(output) => {
+                if output.status.success() {
+                    tracing::info!("install_spacy_model: spacy-transformers installed successfully");
+                    let _ = app.emit("install-log", json!({
+                        "source": "spacy",
+                        "line": "spacy-transformers installed."
+                    }));
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!("install_spacy_model: spacy-transformers install failed: {}", stderr.trim());
+                    let _ = app.emit("install-log", json!({
+                        "source": "spacy",
+                        "line": format!("Warning: spacy-transformers install failed, continuing anyway...")
+                    }));
+                }
+            }
+            Err(e) => {
+                tracing::warn!("install_spacy_model: failed to run pip install spacy-transformers: {}", e);
+            }
+        }
+    }
+
+    tracing::info!("install_spacy_model: installing {} via {}", model_name, python_exec_cmd);
+    let _ = app.emit("install-log", json!({
+        "source": "spacy",
+        "line": format!("Installing spaCy model: {}...", model_name)
+    }));
+
+    // Primary method: `python -m spacy download <model>`
+    // This is the official way — spaCy resolves the compatible model version
+    // and downloads from GitHub releases automatically.
+    let mut cmd_proc = Command::new(&python_exec_cmd);
+    cmd_proc
+        .arg("-u")
+        .arg("-m")
+        .arg("spacy")
+        .arg("download")
+        .arg(&model_name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        cmd_proc.creation_flags(0x08000000);
+    }
+
+    tracing::info!("install_spacy_model: spawning `python -m spacy download {}`", model_name);
+    let _ = app.emit("install-log", json!({
+        "source": "spacy",
+        "line": format!("Running: python -m spacy download {}...", model_name)
+    }));
+
+    let mut child = cmd_proc.spawn().map_err(|e| {
+        let msg = format!("Failed to spawn spacy download: {}", e);
+        tracing::error!("install_spacy_model: {}", msg);
+        msg
+    })?;
+
+    let stdout = child.stdout.take().expect("failed to capture stdout");
+    let stderr = child.stderr.take().expect("failed to capture stderr");
+
+    let app_clone_stdout = app.clone();
+    let model_name_for_log = model_name.clone();
+    let stdout_handle = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line_res in reader.lines() {
+            if let Ok(line) = line_res {
+                tracing::info!("install_spacy_model[{}] stdout: {}", model_name_for_log, line);
+                let _ = app_clone_stdout.emit("install-log", json!({"source":"spacy","line": line}));
+            }
+        }
+    });
+
+    let app_clone_stderr = app.clone();
+    let model_name_for_log2 = model_name.clone();
+    let stderr_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr_lines_clone = Arc::clone(&stderr_lines);
+    let stderr_handle = thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line_res in reader.lines() {
+            if let Ok(line) = line_res {
+                tracing::warn!("install_spacy_model[{}] stderr: {}", model_name_for_log2, line);
+                let _ = app_clone_stderr.emit("install-log", json!({"source":"spacy","line": line}));
+                if let Ok(mut lines) = stderr_lines_clone.lock() {
+                    lines.push(line);
+                }
+            }
+        }
+    });
+
+    let status = child.wait().map_err(|e| {
+        let msg = format!("Failed waiting for spacy download: {}", e);
+        tracing::error!("install_spacy_model: {}", msg);
+        msg
+    })?;
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
+    let exit_code_1 = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+    tracing::info!("install_spacy_model: `spacy download {}` exit code: {}", model_name, exit_code_1);
+
+    if status.success() {
+        tracing::info!("install_spacy_model: {} installed successfully via spacy download", model_name);
+        let _ = crate::registry_config::set_bool(&spacy_reg_key(&model_name), true);
+        let _ = app.emit("install-log", json!({
+            "source": "spacy",
+            "line": format!("spaCy model {} installed successfully.", model_name)
+        }));
+        return Ok(format!("{} installed successfully", model_name));
+    }
+
+    // Collect stderr from first attempt for diagnostics
+    let first_stderr = stderr_lines.lock()
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_default();
+    tracing::warn!(
+        "install_spacy_model: `spacy download` failed (exit code {}), stderr:\n{}",
+        exit_code_1, first_stderr
+    );
+
+    // Fallback: query installed spaCy version, then pip install the matching GitHub wheel
+    let _ = app.emit("install-log", json!({
+        "source": "spacy",
+        "line": format!("`spacy download` failed (exit code {}), trying direct GitHub wheel...", exit_code_1)
+    }));
+
+    // Get the installed spaCy version to determine the compatible model version
+    tracing::info!("install_spacy_model: querying spaCy version for fallback wheel URL");
+    let mut ver_cmd = Command::new(&python_exec_cmd);
+    ver_cmd
+        .arg("-c")
+        .arg("import spacy; print(spacy.__version__)");
+    #[cfg(windows)]
+    {
+        ver_cmd.creation_flags(0x08000000);
+    }
+    let ver_output = ver_cmd.output().map_err(|e| {
+        let msg = format!("Failed to query spaCy version: {}", e);
+        tracing::error!("install_spacy_model: {}", msg);
+        msg
+    })?;
+
+    let spacy_version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
+    if spacy_version.is_empty() || !ver_output.status.success() {
+        let ver_stderr = String::from_utf8_lossy(&ver_output.stderr);
+        tracing::error!("install_spacy_model: could not determine spaCy version. stderr: {}", ver_stderr);
+        return Err(format!(
+            "Failed to install {} (`spacy download` exit code {}). Could not determine spaCy version for fallback.\n\
+             Last output:\n{}",
+            model_name, exit_code_1,
+            first_stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+        ));
+    }
+    tracing::info!("install_spacy_model: detected spaCy version: {}", spacy_version);
+
+    // Extract major.minor from spaCy version (e.g. "3.7.5" → "3.7")
+    let spacy_major_minor: String = {
+        let parts: Vec<&str> = spacy_version.split('.').collect();
+        if parts.len() >= 2 {
+            format!("{}.{}", parts[0], parts[1])
+        } else {
+            spacy_version.clone()
+        }
+    };
+
+    // spaCy model versions track spaCy major.minor, with patch starting at 0
+    // e.g. spaCy 3.7.x → model 3.7.0, spaCy 3.8.x → model 3.8.0
+    let model_version = format!("{}.0", spacy_major_minor);
+    let whl_url = format!(
+        "https://gh-proxy.com/https://github.com/explosion/spacy-models/releases/download/{model}-{ver}/{model}-{ver}-py3-none-any.whl",
+        model = model_name,
+        ver = model_version,
+    );
+    tracing::info!("install_spacy_model: fallback URL: {}", whl_url);
+    let _ = app.emit("install-log", json!({
+        "source": "spacy",
+        "line": format!("Downloading from GitHub via gh-proxy: {}-{}...", model_name, model_version)
+    }));
+
+    let mut fallback_cmd = Command::new(&python_exec_cmd);
+    fallback_cmd
+        .arg("-u")
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg(&whl_url)
+        .arg("--progress-bar")
+        .arg("off")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        fallback_cmd.creation_flags(0x08000000);
+    }
+
+    let mut child2 = fallback_cmd.spawn().map_err(|e| {
+        let msg = format!("Fallback spawn failed: {}", e);
+        tracing::error!("install_spacy_model: {}", msg);
+        msg
+    })?;
+
+    let stdout2 = child2.stdout.take().expect("failed to capture stdout");
+    let stderr2 = child2.stderr.take().expect("failed to capture stderr");
+
+    let app_clone2 = app.clone();
+    let model_name_for_log3 = model_name.clone();
+    let stdout_handle2 = thread::spawn(move || {
+        let reader = BufReader::new(stdout2);
+        for line_res in reader.lines() {
+            if let Ok(line) = line_res {
+                tracing::info!("install_spacy_model[{}] fallback stdout: {}", model_name_for_log3, line);
+                let _ = app_clone2.emit("install-log", json!({"source":"spacy","line": line}));
+            }
+        }
+    });
+
+    let app_clone3 = app.clone();
+    let model_name_for_log4 = model_name.clone();
+    let stderr_lines2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let stderr_lines2_clone = Arc::clone(&stderr_lines2);
+    let stderr_handle2 = thread::spawn(move || {
+        let reader = BufReader::new(stderr2);
+        for line_res in reader.lines() {
+            if let Ok(line) = line_res {
+                tracing::warn!("install_spacy_model[{}] fallback stderr: {}", model_name_for_log4, line);
+                let _ = app_clone3.emit("install-log", json!({"source":"spacy","line": line}));
+                if let Ok(mut lines) = stderr_lines2_clone.lock() {
+                    lines.push(line);
+                }
+            }
+        }
+    });
+
+    let status2 = child2.wait().map_err(|e| {
+        let msg = format!("Fallback wait failed: {}", e);
+        tracing::error!("install_spacy_model: {}", msg);
+        msg
+    })?;
+    let _ = stdout_handle2.join();
+    let _ = stderr_handle2.join();
+
+    let exit_code_2 = status2.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+    tracing::info!("install_spacy_model: fallback pip exit code: {}", exit_code_2);
+
+    if status2.success() {
+        tracing::info!("install_spacy_model: {} installed successfully from GitHub wheel", model_name);
+        let _ = crate::registry_config::set_bool(&spacy_reg_key(&model_name), true);
+        let _ = app.emit("install-log", json!({
+            "source": "spacy",
+            "line": format!("spaCy model {} installed successfully (from GitHub).", model_name)
+        }));
+        Ok(format!("{} installed successfully", model_name))
+    } else {
+        let fallback_stderr = stderr_lines2.lock()
+            .map(|lines| lines.join("\n"))
+            .unwrap_or_default();
+        tracing::error!(
+            "install_spacy_model: both attempts failed for {}.\n\
+             `spacy download` exit code: {}, GitHub wheel exit code: {}\n\
+             `spacy download` stderr:\n{}\n\
+             GitHub wheel stderr:\n{}",
+            model_name, exit_code_1, exit_code_2, first_stderr, fallback_stderr
+        );
+
+        // Build a user-facing error with the last few stderr lines
+        let last_lines: String = {
+            let combined = if !fallback_stderr.is_empty() { &fallback_stderr } else { &first_stderr };
+            let lines: Vec<&str> = combined.lines().collect();
+            let start = if lines.len() > 10 { lines.len() - 10 } else { 0 };
+            lines[start..].join("\n")
+        };
+        Err(format!(
+            "Failed to install {} (`spacy download` exit code {}, GitHub wheel exit code {}).\nLast output:\n{}",
+            model_name, exit_code_1, exit_code_2, last_lines
+        ))
+    }
+}
+
+/// Probe a single spaCy model by spawning Python to try importing it.
+fn check_single_spacy_model(python_exec_cmd: &str, model: &str) -> bool {
+    let mut cmd = Command::new(python_exec_cmd);
+    cmd.arg("-c").arg(format!("import {}; print('ok')", model));
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    match cmd.output() {
+        Ok(output) => {
+            let ok = output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "ok";
+            if !ok {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::debug!(
+                    "check_single_spacy_model: {} not available (exit={:?}, stderr={})",
+                    model, output.status.code(), stderr.trim()
+                );
+            }
+            ok
+        }
+        Err(e) => {
+            tracing::warn!("check_single_spacy_model: failed to probe {}: {}", model, e);
+            false
+        }
+    }
+}
+
+/// Registry key name for a spaCy model install cache.
+fn spacy_reg_key(model: &str) -> String {
+    format!("spacy_model_{}_installed", model)
+}
+
+/// Check which spaCy models are installed. Uses registry cache when available;
+/// only spawns Python processes when the cache key is missing.
+#[tauri::command]
+pub fn check_spacy_models(app: AppHandle) -> Result<serde_json::Value, String> {
+    use crate::registry_config;
+
+    let models = ["zh_core_web_sm", "en_core_web_sm"];
+
+    let venv_dir = get_venv_dir(&app);
+    let python_exec = venv_dir.join("Scripts").join("python.exe");
+    let have_python = python_exec.is_file();
+
+    let mut result = serde_json::Map::new();
+
+    for model in &models {
+        let reg_key = spacy_reg_key(model);
+        let installed = match registry_config::get_bool(&reg_key) {
+            Some(cached) => {
+                tracing::debug!("check_spacy_models: {} cached={}", model, cached);
+                cached
+            }
+            None => {
+                if !have_python {
+                    tracing::debug!("check_spacy_models: no python, {} = false", model);
+                    false
+                } else {
+                    let python_exec_cmd = normalize_path_for_command(&python_exec);
+                    let probed = check_single_spacy_model(&python_exec_cmd, model);
+                    let _ = registry_config::set_bool(&reg_key, probed);
+                    tracing::info!("check_spacy_models: probed {} = {}, cached", model, probed);
+                    probed
+                }
+            }
+        };
+        result.insert(model.to_string(), json!({ "installed": installed }));
+    }
+
+    tracing::info!(
+        "check_spacy_models: zh_sm={}, en_sm={}",
+        result.get("zh_core_web_sm").and_then(|v| v.get("installed")).and_then(|v| v.as_bool()).unwrap_or(false),
+        result.get("en_core_web_sm").and_then(|v| v.get("installed")).and_then(|v| v.as_bool()).unwrap_or(false),
+    );
+
+    Ok(serde_json::Value::Object(result))
+}
+
+/// Clear cached spaCy model status and re-probe via Python.
+#[tauri::command]
+pub fn force_recheck_spacy_models(app: AppHandle) -> Result<serde_json::Value, String> {
+    use crate::registry_config;
+
+    let models = ["zh_core_web_sm", "en_core_web_sm"];
+
+    // Clear cache
+    for model in &models {
+        let reg_key = spacy_reg_key(model);
+        // set to false first to clear, then we will overwrite with the real value
+        let _ = registry_config::set_bool(&reg_key, false);
+    }
+
+    let venv_dir = get_venv_dir(&app);
+    let python_exec = venv_dir.join("Scripts").join("python.exe");
+    if !python_exec.is_file() {
+        return Ok(json!({
+            "zh_core_web_sm": { "installed": false },
+            "en_core_web_sm": { "installed": false }
+        }));
+    }
+    let python_exec_cmd = normalize_path_for_command(&python_exec);
+
+    let mut result = serde_json::Map::new();
+    for model in &models {
+        let installed = check_single_spacy_model(&python_exec_cmd, model);
+        let reg_key = spacy_reg_key(model);
+        let _ = registry_config::set_bool(&reg_key, installed);
+        tracing::info!("force_recheck_spacy_models: {} = {}", model, installed);
+        result.insert(model.to_string(), json!({ "installed": installed }));
+    }
+
+    Ok(serde_json::Value::Object(result))
+}
+
+/// Background auto-install of missing spaCy models at app startup.
+pub fn auto_install_spacy_models(app: AppHandle) {
+    use crate::registry_config;
+
+    thread::spawn(move || {
+        let models = ["zh_core_web_sm", "en_core_web_sm"];
+
+        let venv_dir = get_venv_dir(&app);
+        let python_exec = venv_dir.join("Scripts").join("python.exe");
+        if !python_exec.is_file() {
+            tracing::debug!("auto_install_spacy_models: no venv python found, skipping");
+            return;
+        }
+        let python_exec_cmd = normalize_path_for_command(&python_exec);
+
+        for model in &models {
+            let reg_key = spacy_reg_key(model);
+            let installed = match registry_config::get_bool(&reg_key) {
+                Some(cached) => cached,
+                None => {
+                    let probed = check_single_spacy_model(&python_exec_cmd, model);
+                    let _ = registry_config::set_bool(&reg_key, probed);
+                    probed
+                }
+            };
+
+            if installed {
+                tracing::info!("auto_install_spacy_models: {} already installed", model);
+                continue;
+            }
+
+            tracing::info!("auto_install_spacy_models: {} not installed, starting install", model);
+            let _ = app.emit("spacy-model-status", json!({
+                "model": model,
+                "status": "installing"
+            }));
+
+            let app_clone = app.clone();
+            let model_name = model.to_string();
+            // Use a blocking call within this thread (models install sequentially)
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let result = match rt {
+                Ok(rt) => rt.block_on(install_spacy_model(app_clone, model_name.clone())),
+                Err(e) => Err(format!("Failed to create runtime: {}", e)),
+            };
+
+            match result {
+                Ok(_) => {
+                    let _ = registry_config::set_bool(&reg_key, true);
+                    tracing::info!("auto_install_spacy_models: {} installed successfully", model);
+                    let _ = app.emit("spacy-model-status", json!({
+                        "model": model,
+                        "status": "installed"
+                    }));
+                }
+                Err(e) => {
+                    tracing::error!("auto_install_spacy_models: {} install failed: {}", model, e);
+                    let _ = app.emit("spacy-model-status", json!({
+                        "model": model,
+                        "status": "failed",
+                        "error": e
+                    }));
+                }
+            }
+        }
+        tracing::info!("auto_install_spacy_models: finished");
+    });
+}

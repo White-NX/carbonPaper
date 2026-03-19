@@ -241,6 +241,25 @@ export const fetchThumbnail = async (id, path = null) => {
     }, { priority: 'normal' });
 };
 
+/**
+ * 批量获取缩略图（单次 IPC 往返）
+ * @param {number[]} ids - 截图 ID 列表
+ * @returns {Promise<Object>} { [id]: dataUrl }
+ */
+export const fetchThumbnailBatch = async (ids) => {
+    return withAuth(async () => {
+        const response = await invoke('storage_batch_get_thumbnails', { ids });
+        if (!response?.results) return {};
+        const mapped = {};
+        for (const [id, entry] of Object.entries(response.results)) {
+            if (entry.status === 'success' && entry.data) {
+                mapped[id] = `data:${entry.mime_type || 'image/jpeg'};base64,${entry.data}`;
+            }
+        }
+        return mapped;
+    });
+};
+
 export const cancelTimelineImageRequest = (key) => {
     timelineImageQueue.cancelByKey(key);
 };

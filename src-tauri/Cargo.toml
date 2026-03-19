@@ -1,6 +1,6 @@
 [package]
 name = "carbonpaper"
-version = "0.6.1"
+version = "0.6.3"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -47,6 +47,7 @@ rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"]
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 aes-gcm = "0.10"
+aho-corasick = "1"
 sha2 = "0.10"
 md-5 = "0.10"
 hmac = "0.12"
@@ -62,6 +63,9 @@ flate2 = "1"
 window-vibrancy = "0.5"
 open = "5"
 windows-capture = "2.0.0-alpha.7"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

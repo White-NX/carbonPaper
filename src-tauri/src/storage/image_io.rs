@@ -211,6 +211,185 @@ impl StorageState {
         result.map(|_| true)
     }
 
+    /// Batch read thumbnails by screenshot IDs.
+    /// Does batch id→path lookup and then batch thumbnail reading, all within the storage module.
+    /// Returns a map of id (as string) → Result with base64/mime or error.
+    pub fn batch_read_thumbnails_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> std::collections::HashMap<String, Result<(String, String), String>> {
+        if ids.is_empty() {
+            return std::collections::HashMap::new();
+        }
+
+        // Batch id → image_path lookup (single DB query)
+        let id_path_map: std::collections::HashMap<i64, String> = {
+            let guard = match self.get_connection_named("batch_thumbnails_by_ids") {
+                Ok(g) => g,
+                Err(e) => {
+                    return ids
+                        .iter()
+                        .map(|id| (id.to_string(), Err(format!("DB connection error: {}", e))))
+                        .collect();
+                }
+            };
+            let conn = guard.as_ref().unwrap();
+
+            let mut map = std::collections::HashMap::new();
+            for chunk in ids.chunks(500) {
+                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+                let sql = format!(
+                    "SELECT id, image_path FROM screenshots WHERE id IN ({})",
+                    placeholders.join(",")
+                );
+                let params: Vec<&dyn rusqlite::ToSql> = chunk
+                    .iter()
+                    .map(|id| id as &dyn rusqlite::ToSql)
+                    .collect();
+
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                        for row in rows.filter_map(|r| r.ok()) {
+                            map.insert(row.0, row.1);
+                        }
+                    }
+                }
+            }
+            map
+            // guard dropped here
+        };
+
+        // Collect paths and batch read thumbnails
+        let paths: Vec<String> = ids
+            .iter()
+            .filter_map(|id| id_path_map.get(id).cloned())
+            .collect();
+
+        let thumb_results = self.batch_read_thumbnails(&paths);
+
+        // Build path → result lookup
+        let path_result_map: std::collections::HashMap<&str, &Result<(String, String), String>> =
+            thumb_results
+                .iter()
+                .map(|(p, r)| (p.as_str(), r))
+                .collect();
+
+        // Build result keyed by id string
+        let mut results = std::collections::HashMap::new();
+        for id in ids {
+            let result = if let Some(path) = id_path_map.get(id) {
+                if let Some(r) = path_result_map.get(path.as_str()) {
+                    (*r).clone()
+                } else {
+                    Err("Thumbnail processing failed".to_string())
+                }
+            } else {
+                Err("Screenshot not found".to_string())
+            };
+            results.insert(id.to_string(), result);
+        }
+
+        results
+    }
+
+    /// Batch read thumbnails for multiple image paths in a single operation.
+    /// Does one DB query to fetch all encrypted keys, then processes each thumbnail outside the lock.
+    /// Returns a Vec of (path, Result<(base64, mime_type), error_string>).
+    pub fn batch_read_thumbnails(
+        &self,
+        paths: &[String],
+    ) -> Vec<(String, Result<(String, String), String>)> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+
+        // Single DB query to get all content_key_encrypted values
+        let key_map: std::collections::HashMap<String, Option<Vec<u8>>> = {
+            let guard = match self.get_connection_named("batch_read_thumbnails") {
+                Ok(g) => g,
+                Err(e) => {
+                    return paths
+                        .iter()
+                        .map(|p| (p.clone(), Err(format!("DB connection error: {}", e))))
+                        .collect();
+                }
+            };
+            let conn = guard.as_ref().unwrap();
+
+            let mut map = std::collections::HashMap::new();
+            for chunk in paths.chunks(500) {
+                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+                let sql = format!(
+                    "SELECT image_path, content_key_encrypted FROM screenshots WHERE image_path IN ({})",
+                    placeholders.join(",")
+                );
+                let params: Vec<&dyn rusqlite::ToSql> = chunk
+                    .iter()
+                    .map(|p| p as &dyn rusqlite::ToSql)
+                    .collect();
+
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<Vec<u8>>>(1)?,
+                        ))
+                    }) {
+                        for row in rows.filter_map(|r| r.ok()) {
+                            map.insert(row.0, row.1);
+                        }
+                    }
+                }
+            }
+            map
+            // guard dropped here, mutex released
+        };
+
+        // Process each path outside the lock
+        paths
+            .iter()
+            .map(|path| {
+                let result = (|| -> Result<(String, String), String> {
+                    let key_enc = key_map
+                        .get(path)
+                        .ok_or_else(|| format!("No screenshot found for path: {}", path))?;
+
+                    let mut row_key = key_enc
+                        .as_ref()
+                        .and_then(|enc| decrypt_row_key_with_cng(enc).ok())
+                        .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
+
+                    let abs_path = self.resolve_image_path(path);
+                    let thumb_path = Self::thumbnail_path_for(&abs_path);
+
+                    let result = if thumb_path.exists() {
+                        match self.try_read_cached_thumbnail(&thumb_path, &row_key) {
+                            Ok(r) => Ok(r),
+                            Err(_) => {
+                                let _ = std::fs::remove_file(&thumb_path);
+                                let abs_path_str = abs_path.to_string_lossy().to_string();
+                                self.generate_and_cache_thumbnail(
+                                    &abs_path_str,
+                                    &thumb_path,
+                                    &row_key,
+                                )
+                            }
+                        }
+                    } else {
+                        let abs_path_str = abs_path.to_string_lossy().to_string();
+                        self.generate_and_cache_thumbnail(&abs_path_str, &thumb_path, &row_key)
+                    };
+
+                    Self::zeroize_bytes(&mut row_key);
+                    result
+                })();
+                (path.clone(), result)
+            })
+            .collect()
+    }
+
     // ==================== Thumbnail Warmup Sentinel ====================
 
     const THUMBNAIL_WARMUP_DONE_KEY: &'static str = "thumbnail_warmup_done";

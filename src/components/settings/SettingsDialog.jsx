@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
-import { Settings as SettingsIcon, Shield, Info, Activity, Image as ImageIcon, Database, HardDrive, Wrench, Languages, Globe } from 'lucide-react';
+import { Settings as SettingsIcon, Shield, Info, Activity, Image as ImageIcon, Database, HardDrive, Wrench, Languages, Globe, Plug } from 'lucide-react';
 import { Dialog } from '../Dialog';
 import { updateMonitorFilters, deleteRecordsByTimeRange } from '../../lib/monitor_api';
 import { getAnalysisOverview } from '../../lib/analysis_api';
@@ -14,6 +14,7 @@ import AboutSection from './AboutSection';
 import AdvancedSection from './AdvancedSection';
 import LanguageSection from './LanguageSection';
 import BrowserExtensionSection from './BrowserExtensionSection';
+import AiEmbeddingSection from './AiEmbeddingSection';
 import { defaultFilterSettings, formatInvokeError, normalizeList } from './filterUtils';
 import { REFRESH_INTERVAL_MS } from './analysisUtils';
 import { checkForUpdate, downloadAndInstallUpdate } from '../../lib/update_api';
@@ -420,6 +421,7 @@ function SettingsDialog({
     { id: 'security', label: t('settings.tabs.security'), icon: Shield },
     { id: 'advanced', label: t('settings.tabs.advanced'), icon: Wrench },
     { id: 'extension', label: t('settings.tabs.extension'), icon: Globe },
+    { id: 'ai_embedding', label: t('settings.tabs.ai_embedding'), icon: Plug },
     { id: 'analysis', label: t('settings.tabs.analysis'), icon: HardDrive },
     { id: 'about', label: t('settings.tabs.about'), icon: Info },
   ];
@@ -524,6 +526,10 @@ function SettingsDialog({
           {activeTab === 'extension' && (
             <BrowserExtensionSection />
           )}
+
+          <div className={activeTab !== 'ai_embedding' ? 'hidden' : ''}>
+            <AiEmbeddingSection />
+          </div>
 
           {activeTab === 'analysis' && (
             <StorageManagementSection

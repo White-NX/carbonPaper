@@ -451,6 +451,72 @@ def _handle_command_impl(req: dict):
             'anchors': _classifier.get_anchors(),
         }
 
+    # ----- Presidio PII detection commands -----
+    if cmd == 'presidio_analyze':
+        texts = req.get('texts', [])
+        language = req.get('language', 'zh-CN')
+        entity_types = req.get('entity_types')
+        if not isinstance(texts, list) or len(texts) == 0:
+            return {'error': 'texts must be a non-empty list'}
+        try:
+            from .presidio_service import PresidioService
+            svc = PresidioService.get_instance()
+            if not svc._initialized:
+                svc.initialize(language)
+            results = svc.analyze(texts, entity_types)
+            return {
+                'status': 'success',
+                'results': [
+                    {'entities': list(ents)} for ents in results
+                ],
+            }
+        except Exception as e:
+            logger.error('presidio_analyze failed: %s', e)
+            return {'error': str(e)}
+
+    if cmd == 'presidio_set_language':
+        language = req.get('language', 'zh-CN')
+        try:
+            from .presidio_service import PresidioService
+            svc = PresidioService.get_instance()
+            svc.switch_language(language)
+            return {
+                'status': 'success',
+                'ok': True,
+                'language': language,
+            }
+        except Exception as e:
+            logger.error('presidio_set_language failed: %s', e)
+            return {'error': str(e)}
+
+    if cmd == 'presidio_status':
+        try:
+            from .presidio_service import PresidioService
+            svc = PresidioService.get_instance()
+            return {'status': 'success', **svc.get_status()}
+        except Exception as e:
+            return {'status': 'success', 'loaded': False, 'language': None, 'model': 'none'}
+
+    if cmd == 'presidio_unload':
+        try:
+            from .presidio_service import PresidioService
+            svc = PresidioService.get_instance()
+            svc.unload()
+            return {'status': 'success', 'unloaded': True}
+        except Exception as e:
+            logger.error('presidio_unload failed: %s', e)
+            return {'error': str(e)}
+
+    if cmd == 'presidio_check_idle':
+        try:
+            from .presidio_service import PresidioService
+            svc = PresidioService.get_instance()
+            unloaded = svc.check_idle_and_unload()
+            return {'status': 'success', 'unloaded': unloaded}
+        except Exception as e:
+            logger.error('presidio_check_idle failed: %s', e)
+            return {'error': str(e)}
+
     # ----- Task clustering commands -----
     if cmd == 'run_clustering':
         if not _clustering_scheduler:

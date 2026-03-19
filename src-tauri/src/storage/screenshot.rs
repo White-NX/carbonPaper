@@ -46,6 +46,46 @@ impl StorageState {
         Ok(count > 0)
     }
 
+    /// Batch-lookup screenshot IDs by image hashes.
+    /// Returns a map from image_hash to screenshot id.
+    pub fn batch_get_screenshot_ids_by_hash(
+        &self,
+        hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, i64>, String> {
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let guard = self.get_connection_named("batch_get_screenshot_ids_by_hash")?;
+        let conn = guard.as_ref().unwrap();
+
+        let placeholders = hashes.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT image_hash, id FROM screenshots WHERE image_hash IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare batch id lookup: {}", e))?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            hashes.iter().map(|h| h as &dyn rusqlite::types::ToSql).collect();
+
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                let hash: String = row.get(0)?;
+                let id: i64 = row.get(1)?;
+                Ok((hash, id))
+            })
+            .map_err(|e| format!("Failed to batch-query screenshot ids: {}", e))?;
+
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (hash, id) = row.map_err(|e| format!("Failed to read row: {}", e))?;
+            map.insert(hash, id);
+        }
+        Ok(map)
+    }
+
     /// Save a screenshot and its OCR results.
     pub fn save_screenshot(
         &self,

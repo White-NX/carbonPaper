@@ -55,7 +55,8 @@
       "advanced": "高级",
       "analysis": "存储管理",
       "about": "关于",
-      "extension": "浏览器扩展"
+      "extension": "浏览器扩展",
+      "ai_embedding": "人工智能嵌入"
     },
     "security": {
       "protection": {
@@ -273,6 +274,109 @@
         "step2": "打开浏览器扩展页面，启用「开发者模式」。",
         "step3": "点击「加载已解压的扩展程序」，选择安装后显示的扩展文件夹。",
         "step4": "CarbonPaper 扩展图标将出现在浏览器工具栏中。"
+      }
+    },
+    "ai_embedding": {
+      "title": "人工智能嵌入",
+      "description": "管理人工智能嵌入服务",
+      "mcp_service": "MCP 服务",
+      "mcp_description": "启用后将启动本地 MCP 服务，允许 AI 工具连接获取快照数据（截图元数据、OCR 文本、任务聚类信息）。请注意隐私安全风险，确保只授权可信的 AI 工具连接。",
+      "enable_label": "MCP 服务",
+      "privacy_warning": {
+        "title": "隐私安全警告",
+        "message": "启用此功能后，您的快照数据（包括截图元数据、OCR 文本、任务聚类信息）将通过本地 HTTP 服务对外暴露。虽然服务仅绑定 localhost 且需要令牌认证，但本机上运行的任何程序都有可能访问这些数据。\n\n请确认您理解此风险并自愿启用。",
+        "confirm_prompt": "请输入以下文本以确认：",
+        "confirm_text": "我已阅读警告并且我接受可能的暴露风险",
+        "confirm_button": "确认启用",
+        "cancel_button": "取消"
+      },
+      "token": {
+        "title": "授权令牌",
+        "description": "AI 工具连接时需要使用此令牌进行身份验证。",
+        "show_once_warning": "此令牌仅显示一次，关闭后无法再次查看。请立即复制并保存。",
+        "copy": "复制",
+        "copied": "已复制",
+        "reset": "重置令牌",
+        "reset_confirm_title": "重置授权令牌",
+        "reset_confirm_message": "重置令牌将使所有已配置的 AI 工具连接失效，需要重新配置。确定继续？"
+      },
+      "status": {
+        "running": "服务运行中",
+        "stopped": "服务已停止",
+        "port_label": "端口",
+        "auth_required": "需要先在应用中完成 Windows Hello 认证才能处理数据请求"
+      },
+      "connection_info": {
+        "title": "连接信息",
+        "endpoint": "端点",
+        "auth_header": "认证头"
+      },
+      "content_filter": {
+        "title": "内容过滤",
+        "description": "基于合规规则过滤 MCP 服务返回结果中的标记内容。",
+        "level_label": "基于关键词的合规化保护",
+        "levels": {
+          "standard": {
+            "title": "标准保护",
+            "description": "过滤可能触发 AI 提供商审核的内容，防止账户被标记或数据被人工审查。"
+          },
+          "minimal": {
+            "title": "最小过滤",
+            "description": "仅过滤可能导致 API 请求被拒绝的内容。"
+          },
+          "off": {
+            "title": "关闭",
+            "description": "所有截屏内容均可能发送至 AI 提供商。"
+          },
+          "custom": {
+            "title": "自定义",
+            "description": "过滤类别已被手动修改。"
+          }
+        },
+        "advanced_toggle": "高级选项",
+        "filter_mode": {
+          "label": "过滤方式",
+          "reject": {
+            "title": "拒绝整个快照",
+            "description": "检测到敏感内容时，拒绝返回整个快照请求。"
+          },
+          "remove_paragraph": {
+            "title": "去除敏感段落",
+            "description": "移除包含敏感词的 OCR 文本段落，快照的其余内容仍然返回。"
+          },
+          "mask": {
+            "title": "隐去敏感词（不建议）",
+            "description": "使用 █ 字符替换敏感词，快照和周围文本仍然返回。"
+          }
+        },
+        "categories": {
+          "cat_01": "垃圾信息 / 推广",
+          "cat_02": "法律合规",
+          "cat_03": "地区合规",
+          "cat_04": "NSFW 内容",
+          "cat_05": "可能触发安全审查的内容"
+        },
+        "pii": {
+          "title": "个人信息检测",
+          "description": "使用 NLP 模型从 MCP 响应中检测并过滤个人身份信息（姓名、手机号、身份证号等）。",
+          "toggle_label": "启用个人信息检测",
+          "model_status": "模型状态",
+          "model_installed": "已安装",
+          "model_not_installed": "未安装",
+          "model_download": "下载",
+          "model_downloading": "下载中...",
+          "model_active": "当前使用",
+          "model_note": "当前使用的模型会跟随语言设置自动切换",
+          "recheck": "重新检测",
+          "entity_types_label": "检测的信息类型",
+          "entity_types": {
+            "PHONE_NUMBER": "手机号码",
+            "CN_ID_CARD": "身份证号码",
+            "EMAIL_ADDRESS": "电子邮箱",
+            "CN_BANK_CARD": "银行卡号",
+            "ADDRESS": "地址"
+          }
+        }
       }
     }
   },

@@ -1,7 +1,7 @@
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import { Monitor, Clock, Globe, ExternalLink, Tag, Info, Layers } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { computeLinkScores, updateScreenshotCategory } from '../lib/monitor_api';
+import { computeLinkScores, updateScreenshotCategory, fetchThumbnailBatch } from '../lib/monitor_api';
 import { getRelatedScreenshots } from '../lib/task_api';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { CATEGORY_LIST, CATEGORY_COLORS } from '../lib/categories';
@@ -13,6 +13,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
   const [editingCategory, setEditingCategory] = useState(false);
   const [localCategory, setLocalCategory] = useState(null);
   const [relatedResult, setRelatedResult] = useState(null);
+  const [thumbnailMap, setThumbnailMap] = useState({});
 
   // Card visibility state
   const [isVisible, setIsVisible] = useState(false);
@@ -74,6 +75,25 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
       });
     return () => { cancelled = true; };
   }, [selectedEvent?.id]);
+
+  // Batch load thumbnails for related screenshots
+  useEffect(() => {
+    if (!relatedResult?.screenshots?.length) {
+      setThumbnailMap({});
+      return;
+    }
+    let cancelled = false;
+    const ids = relatedResult.screenshots
+      .map(s => s.screenshot_id)
+      .filter(id => typeof id === 'number' && id > 0);
+    if (ids.length === 0) return;
+    fetchThumbnailBatch(ids).then(map => {
+      if (!cancelled) setThumbnailMap(map || {});
+    }).catch(() => {
+      if (!cancelled) setThumbnailMap({});
+    });
+    return () => { cancelled = true; };
+  }, [relatedResult]);
 
   // --- Auto show/hide logic ---
   const clearTimer = useCallback(() => {
@@ -341,6 +361,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
                       category: s.category,
                       created_at: s.created_at,
                     }}
+                    preloadedSrc={thumbnailMap[s.screenshot_id] ?? null}
                     onSelect={(payload) => onSelectRelated?.(payload)}
                   />
                 ))}

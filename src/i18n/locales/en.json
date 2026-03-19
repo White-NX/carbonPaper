@@ -55,7 +55,8 @@
       "advanced": "Advanced",
       "analysis": "Storage",
       "about": "About",
-      "extension": "Browser Extension"
+      "extension": "Browser Extension",
+      "ai_embedding": "AI Embedding"
     },
     "security": {
       "protection": {
@@ -273,6 +274,107 @@
         "step2": "Open the browser extensions page and enable \"Developer mode\".",
         "step3": "Click \"Load unpacked\" and select the extension folder shown after installation.",
         "step4": "The CarbonPaper extension icon will appear in your browser toolbar."
+      }
+    },
+    "ai_embedding": {
+      "title": "AI Embedding",
+      "description": "Expose a local MCP (Model Context Protocol) HTTP server so that AI assistants can query your snapshot data, OCR text, and task clusters.",
+      "enable_label": "Enable MCP Server",
+      "privacy_warning": {
+        "title": "Privacy Warning",
+        "message": "Enabling the MCP server will allow any application on this machine that knows the token to access your snapshot data, including screenshots, OCR text, and task information.\n\nThe server binds to localhost only and is not accessible from external networks, but any local process with the token can read your data.\n\nPlease make sure you understand the risks before enabling.",
+        "confirm_prompt": "Type the following text to confirm:",
+        "confirm_text": "I have read the warning and I accept the potential exposure risk",
+        "confirm_button": "Enable",
+        "cancel_button": "Cancel"
+      },
+      "token": {
+        "title": "Access Token",
+        "description": "The token is used for API authentication. It is only shown once when generated.",
+        "show_once_warning": "This token will only be shown once. Please copy and save it now. You will not be able to view it again.",
+        "copy": "Copy",
+        "copied": "Copied",
+        "reset": "Reset Token",
+        "reset_confirm_title": "Reset Access Token?",
+        "reset_confirm_message": "The current token will be permanently invalidated. All clients using the old token will lose access. A new token will be generated."
+      },
+      "status": {
+        "running": "MCP server is running",
+        "stopped": "MCP server is stopped",
+        "port_label": "Port",
+        "auth_required": "Authentication required"
+      },
+      "connection_info": {
+        "title": "Connection Information",
+        "endpoint": "Endpoint",
+        "auth_header": "Authorization Header"
+      },
+      "content_filter": {
+        "title": "Content Filter",
+        "description": "Filter flagged content from MCP server responses based on compliance rules.",
+        "level_label": "Privacy Protection Level",
+        "levels": {
+          "standard": {
+            "title": "Standard Protection",
+            "description": "Filter content that may trigger AI provider review, preventing your account from being flagged or data from being manually reviewed."
+          },
+          "minimal": {
+            "title": "Minimal Filtering",
+            "description": "Only filter content likely to cause API request rejection."
+          },
+          "off": {
+            "title": "Off",
+            "description": "All screenshot content may be sent to your AI provider."
+          },
+          "custom": {
+            "title": "Custom",
+            "description": "Category selection has been manually customized."
+          }
+        },
+        "advanced_toggle": "Advanced Options",
+        "filter_mode": {
+          "label": "Filter Behavior",
+          "reject": {
+            "title": "Reject Entire Snapshot",
+            "description": "Block the entire snapshot from being returned when sensitive content is detected."
+          },
+          "remove_paragraph": {
+            "title": "Remove Sensitive Paragraphs",
+            "description": "Remove OCR text entries that contain sensitive words; the rest of the snapshot is still returned."
+          },
+          "mask": {
+            "title": "Mask Sensitive Words",
+            "description": "Replace sensitive words with █ characters; the snapshot and surrounding text are still returned."
+          }
+        },
+        "categories": {
+          "cat_01": "Spam / Promotion",
+          "cat_02": "Legal Compliance",
+          "cat_03": "Regional Compliance",
+          "cat_04": "NSFW",
+          "cat_05": "Content That May Trigger Safety Review"
+        },
+        "pii": {
+          "title": "PII Detection",
+          "description": "Detect and filter personal identifiable information (names, phone numbers, ID cards, etc.) from MCP responses using NLP models.",
+          "toggle_label": "Enable PII Detection",
+          "model_status": "Model Status",
+          "model_installed": "Installed",
+          "model_not_installed": "Not installed",
+          "model_download": "Download",
+          "model_downloading": "Downloading...",
+          "model_active": "Active",
+          "model_note": "Active model follows your language setting",
+          "recheck": "Re-check",
+          "entity_types_label": "Entity Types to Detect",
+          "entity_types": {
+            "PHONE_NUMBER": "Phone Numbers",
+            "CN_ID_CARD": "ID Card Numbers",
+            "EMAIL_ADDRESS": "Email Addresses",
+            "CN_BANK_CARD": "Bank Card Numbers",
+            "ADDRESS": "Addresses"
+          }
+        }
       }
     }
   },
