@@ -74,10 +74,13 @@ fn main() {
         else if src_path.is_file() {
             let mut should_copy = false;
 
-            // 规则 1: 是否在 `model` 或 `models` 文件夹内？（打包该目录下全部文件，不筛选）
+            // 规则 1: 打包特定的文件夹
             let model_dir_singular = source_dir.join("model");
             let model_dir_plural = source_dir.join("models");
-            if src_path.starts_with(&model_dir_singular) || src_path.starts_with(&model_dir_plural)
+            let sensitive_dicts = source_dir.join("compliance_process");
+            if src_path.starts_with(&model_dir_singular)
+                || src_path.starts_with(&model_dir_plural)
+                || src_path.starts_with(&sensitive_dicts)
             {
                 should_copy = true;
             }
@@ -121,9 +124,15 @@ fn main() {
     }
 
     // 复制 python 可执行文件
-    copy_if_exists(Path::new("../python-3.12.10-amd64.exe"), Path::new("pre-bundle/python-3.12.10-amd64.exe"));
+    copy_if_exists(
+        Path::new("../python-3.12.10-amd64.exe"),
+        Path::new("pre-bundle/python-3.12.10-amd64.exe"),
+    );
     // 复制 aria2c
-    copy_if_exists(Path::new("../aria2c.exe"), Path::new("pre-bundle/aria2c.exe"));
+    copy_if_exists(
+        Path::new("../aria2c.exe"),
+        Path::new("pre-bundle/aria2c.exe"),
+    );
 
     // --- 7. 复制 browser-extension 目录到 pre-bundle ---
     let ext_source = Path::new("../browser-extension");
@@ -132,7 +141,9 @@ fn main() {
         fs::create_dir_all(ext_dest).expect("Failed to create browser-extension dir in pre-bundle");
         for entry in WalkDir::new(ext_source).into_iter().filter_map(|e| e.ok()) {
             let src_path = entry.path();
-            let relative = src_path.strip_prefix(ext_source).expect("strip_prefix failed");
+            let relative = src_path
+                .strip_prefix(ext_source)
+                .expect("strip_prefix failed");
             let dest_path = ext_dest.join(relative);
             if src_path.is_dir() {
                 fs::create_dir_all(&dest_path).expect("Failed to create dir");

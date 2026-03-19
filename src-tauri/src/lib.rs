@@ -4,6 +4,7 @@ mod capture;
 mod credential_manager;
 mod error_window;
 mod logging;
+mod mcp_server;
 mod model_management;
 mod monitor;
 mod native_messaging;
@@ -11,6 +12,7 @@ mod python;
 mod registry_config;
 mod resource_utils;
 mod reverse_ipc;
+mod sensitive_filter;
 mod storage;
 mod updater;
 
@@ -19,6 +21,7 @@ use autostart::{get_autostart_status, set_autostart};
 use capture::CaptureState;
 use credential_manager::CredentialManagerState;
 use monitor::MonitorState;
+use sensitive_filter::SensitiveFilterState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use storage::StorageState;
@@ -303,6 +306,40 @@ async fn storage_get_thumbnail(
             },
             None => Err("Image not found".to_string()),
         }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+#[tauri::command]
+async fn storage_batch_get_thumbnails(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    ids: Vec<i64>,
+) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        let results_map = state.batch_read_thumbnails_by_ids(&ids);
+
+        let mut results = serde_json::Map::new();
+        for (id_str, result) in results_map {
+            let entry = match result {
+                Ok((data, mime_type)) => serde_json::json!({
+                    "status": "success",
+                    "data": data,
+                    "mime_type": mime_type
+                }),
+                Err(e) => serde_json::json!({
+                    "status": "error",
+                    "error": e
+                }),
+            };
+            results.insert(id_str, entry);
+        }
+
+        Ok(serde_json::json!({ "results": results }))
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))?
@@ -778,6 +815,156 @@ async fn storage_save_clustering_results(
     state.save_clustering_results(&tasks)
 }
 
+// ==================== MCP 服务命令 ====================
+
+#[tauri::command]
+async fn mcp_set_enabled(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+    mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    if enabled {
+        // Load existing policy
+        let mut policy = storage_state.load_policy()?;
+
+        // Check if token already exists
+        let existing_token = policy.get("mcp_token_encrypted").and_then(|v| v.as_str());
+        let (token_plaintext, is_new_token) = if existing_token.is_some() {
+            // Token exists, decrypt for hash
+            let encrypted_b64 = existing_token.unwrap();
+            let token = mcp_server::decrypt_token(&credential_state, encrypted_b64)?;
+            (token, false)
+        } else {
+            // Generate new token
+            let token = mcp_server::generate_token();
+            let encrypted_b64 = mcp_server::encrypt_token(&credential_state, &token)?;
+            policy.as_object_mut().unwrap().insert("mcp_token_encrypted".into(), serde_json::json!(encrypted_b64));
+            (token, true)
+        };
+
+        let port = policy.get("mcp_port")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u16)
+            .unwrap_or(mcp_server::get_port(&storage_state));
+
+        // Save enabled state
+        policy.as_object_mut().unwrap().insert("mcp_enabled".into(), serde_json::json!(true));
+        if policy.get("mcp_port").is_none() {
+            policy.as_object_mut().unwrap().insert("mcp_port".into(), serde_json::json!(port));
+        }
+        storage_state.save_policy(&policy)?;
+
+        // Compute hash and start server
+        let token_hash = mcp_server::hash_token(&token_plaintext);
+        mcp_state.set_token_hash(token_hash);
+        mcp_server::start_server(app, port, token_hash).await?;
+
+        if is_new_token {
+            Ok(serde_json::json!({ "status": "ok", "token": token_plaintext, "port": port }))
+        } else {
+            Ok(serde_json::json!({ "status": "ok", "port": port }))
+        }
+    } else {
+        // Disable: stop server and save policy
+        mcp_server::stop_server(&mcp_state).await;
+
+        let mut policy = storage_state.load_policy()?;
+        policy.as_object_mut().unwrap().insert("mcp_enabled".into(), serde_json::json!(false));
+        storage_state.save_policy(&policy)?;
+
+        Ok(serde_json::json!({ "status": "ok" }))
+    }
+}
+
+#[tauri::command]
+async fn mcp_get_status(
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+    mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
+) -> Result<serde_json::Value, String> {
+    let policy = storage_state.load_policy()?;
+    let enabled = policy.get("mcp_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let port = mcp_server::get_port(&storage_state);
+    let running = mcp_state.is_running();
+
+    Ok(serde_json::json!({
+        "enabled": enabled,
+        "port": port,
+        "running": running
+    }))
+}
+
+#[tauri::command]
+async fn mcp_reset_token(
+    app: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+    mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
+) -> Result<serde_json::Value, String> {
+    let token = mcp_server::generate_token();
+    let encrypted_b64 = mcp_server::encrypt_token(&credential_state, &token)?;
+
+    // Update policy
+    let mut policy = storage_state.load_policy()?;
+    policy.as_object_mut().unwrap().insert("mcp_token_encrypted".into(), serde_json::json!(encrypted_b64));
+    storage_state.save_policy(&policy)?;
+
+    // Update runtime hash
+    let token_hash = mcp_server::hash_token(&token);
+    mcp_state.set_token_hash(token_hash);
+
+    // Restart server if running
+    let was_running = mcp_state.is_running();
+    if was_running {
+        mcp_server::stop_server(&mcp_state).await;
+        let port = mcp_server::get_port(&storage_state);
+        mcp_server::start_server(app, port, token_hash).await?;
+    }
+
+    Ok(serde_json::json!({ "status": "ok", "token": token }))
+}
+
+#[tauri::command]
+async fn mcp_get_port(
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<u16, String> {
+    Ok(mcp_server::get_port(&storage_state))
+}
+
+#[tauri::command]
+async fn mcp_set_port(
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+    port: u16,
+) -> Result<(), String> {
+    let mut policy = storage_state.load_policy()?;
+    policy.as_object_mut().unwrap().insert("mcp_port".into(), serde_json::json!(port));
+    storage_state.save_policy(&policy)
+}
+
+#[tauri::command]
+async fn mcp_get_sensitive_filter_config(
+    filter_state: tauri::State<'_, Arc<SensitiveFilterState>>,
+) -> Result<sensitive_filter::SensitiveFilterConfig, String> {
+    Ok(filter_state.get_config())
+}
+
+#[tauri::command]
+async fn mcp_set_sensitive_filter_config(
+    filter_state: tauri::State<'_, Arc<SensitiveFilterState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+    config: sensitive_filter::SensitiveFilterConfig,
+) -> Result<(), String> {
+    filter_state.update_config(config.clone());
+
+    // Persist to policy JSON
+    let mut policy = storage_state.load_policy()?;
+    let config_value = serde_json::to_value(&config)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    policy.as_object_mut().unwrap().insert("sensitive_filter".into(), config_value);
+    storage_state.save_policy(&policy)
+}
+
 // ==================== 数据迁移命令 ====================
 
 /// 列出所有未加密的明文截图文件
@@ -1185,6 +1372,8 @@ pub fn run() {
         .manage(Arc::new(CaptureState::default()))
         .manage(AnalysisState::default())
         .manage(updater::UpdaterState::new())
+        .manage(mcp_server::McpRuntimeState::new())
+        .manage(Arc::new(SensitiveFilterState::default()))
         .manage(credential_state)
         .manage(storage_state)
         .on_window_event(|window, event| {
@@ -1335,6 +1524,48 @@ pub fn run() {
                     });
                 }
 
+                // Load sensitive filter dictionaries and persisted config
+                {
+                    let filter_state = app.state::<Arc<SensitiveFilterState>>();
+                    filter_state.load_dicts(app.handle());
+                    // Load persisted config from policy
+                    if let Ok(policy) = storage.load_policy() {
+                        if let Some(filter_config) = policy.get("sensitive_filter") {
+                            if let Ok(config) = serde_json::from_value::<sensitive_filter::SensitiveFilterConfig>(filter_config.clone()) {
+                                filter_state.update_config(config);
+                            }
+                        }
+                    }
+                }
+
+                // Auto-start MCP server if enabled in policy
+                {
+                    let app_handle_mcp = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        use tauri::Manager;
+                        let storage = app_handle_mcp.state::<Arc<StorageState>>();
+                        let credential = app_handle_mcp.state::<Arc<CredentialManagerState>>();
+                        let mcp_runtime = app_handle_mcp.state::<mcp_server::McpRuntimeState>();
+
+                        if let Ok(policy) = storage.load_policy() {
+                            if policy.get("mcp_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                match mcp_server::auto_start(
+                                    app_handle_mcp.clone(),
+                                    &credential,
+                                    &storage,
+                                    &mcp_runtime,
+                                ).await {
+                                    Ok(()) => tracing::info!("MCP server auto-started"),
+                                    Err(e) => tracing::error!("MCP auto-start failed: {}", e),
+                                }
+                            }
+                        }
+                    });
+                }
+
+                // Auto-install missing spaCy models in background
+                python::auto_install_spacy_models(app.handle().clone());
+
                 Ok(())
             }
         })
@@ -1353,6 +1584,7 @@ pub fn run() {
             storage_search,
             storage_get_image,
             storage_get_thumbnail,
+            storage_batch_get_thumbnails,
             storage_warmup_thumbnails,
             storage_get_screenshot_details,
             storage_delete_screenshot,
@@ -1378,6 +1610,14 @@ pub fn run() {
             storage_merge_tasks,
             storage_save_clustering_results,
             analysis::get_analysis_overview,
+            // MCP 服务命令
+            mcp_set_enabled,
+            mcp_get_status,
+            mcp_reset_token,
+            mcp_get_port,
+            mcp_set_port,
+            mcp_get_sensitive_filter_config,
+            mcp_set_sensitive_filter_config,
             // 高级配置命令
             get_advanced_config,
             set_advanced_config,
@@ -1408,6 +1648,9 @@ pub fn run() {
             python::install_python_venv,
             python::check_deps_freshness,
             python::sync_python_deps,
+            python::install_spacy_model,
+            python::check_spacy_models,
+            python::force_recheck_spacy_models,
             model_management::download_model,
             model_management::check_model_files,
             // Updater commands

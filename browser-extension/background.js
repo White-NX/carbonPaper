@@ -262,6 +262,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       enabled: isEnabled,
       connected: isConnected
     });
+
+    if (isEnabled && !isConnected) {
+      console.warn('[CarbonPaper] Status requested but main process is not connected. Attempting to reconnect...');
+      connectNative();
+    }
+
   }
   return true;
 });

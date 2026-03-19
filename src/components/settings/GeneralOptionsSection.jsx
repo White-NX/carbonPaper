@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Gamepad2 } from 'lucide-react';
+import { Circle } from 'lucide-react';
 
 export default function GeneralOptionsSection({
   lowResolutionAnalysis,
@@ -75,9 +75,8 @@ export default function GeneralOptionsSection({
             title={t('settings.general.telemetry.label')}
           >
             <div
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                sendTelemetryDiagnostics ? 'translate-x-5' : 'translate-x-0.5'
-              }`}
+              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${sendTelemetryDiagnostics ? 'translate-x-5' : 'translate-x-0.5'
+                }`}
             />
           </button>
         </div>
@@ -88,7 +87,6 @@ export default function GeneralOptionsSection({
         <div className="flex items-center justify-between gap-4">
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-1">
-              <Gamepad2 className="w-4 h-4 text-ide-text" />
               <label className="block font-semibold text-ide-text">{t('settings.general.gameMode.label')}</label>
             </div>
             <p className="text-xs text-ide-muted">
@@ -113,19 +111,17 @@ export default function GeneralOptionsSection({
           <button
             onClick={handleToggleGameMode}
             disabled={!useDml || gameModeLoading}
-            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${
-              !useDml || gameModeLoading
-                ? 'bg-ide-border opacity-50 cursor-not-allowed'
-                : gameModeEnabled
-                  ? 'bg-ide-accent'
-                  : 'bg-ide-border'
-            }`}
+            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${!useDml || gameModeLoading
+              ? 'bg-ide-border opacity-50 cursor-not-allowed'
+              : gameModeEnabled
+                ? 'bg-ide-accent'
+                : 'bg-ide-border'
+              }`}
             title={t('settings.general.gameMode.label')}
           >
             <div
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                gameModeEnabled && useDml ? 'translate-x-5' : 'translate-x-0.5'
-              }`}
+              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${gameModeEnabled && useDml ? 'translate-x-5' : 'translate-x-0.5'
+                }`}
             />
           </button>
         </div>

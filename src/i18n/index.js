@@ -55,6 +55,12 @@ i18n.on('languageChanged', (lng) => {
   } catch (e) {
     // ignore
   }
+  // Notify Presidio PII service of language change (best-effort, non-blocking)
+  import('@tauri-apps/api/core').then(({ invoke }) => {
+    invoke('execute_monitor_command', {
+      payload: { command: 'presidio_set_language', language: lng }
+    }).catch(() => { /* Monitor may not be running, ignore */ });
+  }).catch(() => {});
 });
 
 export default i18n;

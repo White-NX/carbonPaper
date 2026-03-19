@@ -4,6 +4,7 @@
 //! `tasks` and `task_assignments` tables.  The frontend can list, rename,
 //! merge, and delete tasks via the Tauri commands defined in `lib.rs`.
 
+use crate::credential_manager::{decrypt_row_key_with_cng, decrypt_with_master_key};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
@@ -227,36 +228,76 @@ impl StorageState {
 
         let offset = page * page_size;
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT ta.screenshot_id, ta.confidence, s.image_path, \
-                 s.process_name, s.window_title, s.created_at, s.category \
-                 FROM task_assignments ta \
-                 JOIN screenshots s ON s.id = ta.screenshot_id \
-                 WHERE ta.task_id = ? \
-                 ORDER BY s.created_at DESC \
-                 LIMIT ? OFFSET ?",
-            )
-            .map_err(|e| format!("Failed to prepare get_task_screenshots: {}", e))?;
+        // Collect raw rows (including encrypted blobs) while holding the mutex
+        let raw_results: Vec<_> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ta.screenshot_id, ta.confidence, s.image_path, \
+                     s.process_name, s.window_title, s.created_at, s.category, \
+                     s.window_title_enc, s.process_name_enc, s.content_key_enc \
+                     FROM task_assignments ta \
+                     JOIN screenshots s ON s.id = ta.screenshot_id \
+                     WHERE ta.task_id = ? \
+                     ORDER BY s.created_at DESC \
+                     LIMIT ? OFFSET ?",
+                )
+                .map_err(|e| format!("Failed to prepare get_task_screenshots: {}", e))?;
 
-        let rows = stmt
-            .query_map(params![task_id, page_size, offset], |row| {
-                Ok(TaskScreenshotStub {
-                    screenshot_id: row.get(0)?,
-                    confidence: row.get(1)?,
-                    image_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    process_name: row.get(3)?,
-                    window_title: row.get(4)?,
-                    created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                    category: row.get(6)?,
+            let rows = stmt
+                .query_map(params![task_id, page_size, offset], |row| {
+                    Ok((
+                        TaskScreenshotStub {
+                            screenshot_id: row.get(0)?,
+                            confidence: row.get(1)?,
+                            image_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                            process_name: row.get(3)?,
+                            window_title: row.get(4)?,
+                            created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                            category: row.get(6)?,
+                        },
+                        row.get::<_, Option<Vec<u8>>>(7)?,  // window_title_enc
+                        row.get::<_, Option<Vec<u8>>>(8)?,  // process_name_enc
+                        row.get::<_, Option<Vec<u8>>>(9)?,  // content_key_enc
+                    ))
                 })
-            })
-            .map_err(|e| format!("Failed to query task screenshots: {}", e))?;
+                .map_err(|e| format!("Failed to query task screenshots: {}", e))?;
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.map_err(|e| format!("Failed to read task screenshot row: {}", e))?);
-        }
+            let mut collected = Vec::new();
+            for row in rows {
+                collected.push(row.map_err(|e| format!("Failed to read task screenshot row: {}", e))?);
+            }
+            collected
+        };
+        drop(guard);
+
+        // Decrypt encrypted fields outside the DB mutex
+        let results = raw_results
+            .into_iter()
+            .map(|(mut stub, wt_enc, pn_enc, key_enc)| {
+                let row_key = key_enc
+                    .as_ref()
+                    .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+
+                if let (Some(data), Some(key)) = (wt_enc.as_ref(), row_key.as_ref()) {
+                    if let Ok(decrypted) = decrypt_with_master_key(key, data) {
+                        if let Ok(title) = String::from_utf8(decrypted) {
+                            stub.window_title = Some(title);
+                        }
+                    }
+                }
+
+                if let (Some(data), Some(key)) = (pn_enc.as_ref(), row_key.as_ref()) {
+                    if let Ok(decrypted) = decrypt_with_master_key(key, data) {
+                        if let Ok(name) = String::from_utf8(decrypted) {
+                            stub.process_name = Some(name);
+                        }
+                    }
+                }
+
+                stub
+            })
+            .collect();
+
         Ok(results)
     }
 
@@ -297,38 +338,76 @@ impl StorageState {
         let display_label = label.or(auto_label);
 
         // Then, fetch other screenshots from the same task
-        let mut stmt = conn
-            .prepare(
-                "SELECT ta.screenshot_id, ta.confidence, s.image_path, \
-                 s.process_name, s.window_title, s.created_at, s.category \
-                 FROM task_assignments ta \
-                 JOIN screenshots s ON s.id = ta.screenshot_id \
-                 WHERE ta.task_id = ? AND ta.screenshot_id != ? \
-                 ORDER BY s.created_at DESC \
-                 LIMIT ?",
-            )
-            .map_err(|e| format!("Failed to prepare get_related_screenshots: {}", e))?;
+        let raw_results: Vec<_> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ta.screenshot_id, ta.confidence, s.image_path, \
+                     s.process_name, s.window_title, s.created_at, s.category, \
+                     s.window_title_enc, s.process_name_enc, s.content_key_enc \
+                     FROM task_assignments ta \
+                     JOIN screenshots s ON s.id = ta.screenshot_id \
+                     WHERE ta.task_id = ? AND ta.screenshot_id != ? \
+                     ORDER BY s.created_at DESC \
+                     LIMIT ?",
+                )
+                .map_err(|e| format!("Failed to prepare get_related_screenshots: {}", e))?;
 
-        let rows = stmt
-            .query_map(params![task_id, screenshot_id, limit], |row| {
-                Ok(TaskScreenshotStub {
-                    screenshot_id: row.get(0)?,
-                    confidence: row.get(1)?,
-                    image_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    process_name: row.get(3)?,
-                    window_title: row.get(4)?,
-                    created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                    category: row.get(6)?,
+            let rows = stmt
+                .query_map(params![task_id, screenshot_id, limit], |row| {
+                    Ok((
+                        TaskScreenshotStub {
+                            screenshot_id: row.get(0)?,
+                            confidence: row.get(1)?,
+                            image_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                            process_name: row.get(3)?,
+                            window_title: row.get(4)?,
+                            created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                            category: row.get(6)?,
+                        },
+                        row.get::<_, Option<Vec<u8>>>(7)?,  // window_title_enc
+                        row.get::<_, Option<Vec<u8>>>(8)?,  // process_name_enc
+                        row.get::<_, Option<Vec<u8>>>(9)?,  // content_key_enc
+                    ))
                 })
-            })
-            .map_err(|e| format!("Failed to query related screenshots: {}", e))?;
+                .map_err(|e| format!("Failed to query related screenshots: {}", e))?;
 
-        let mut screenshots = Vec::new();
-        for row in rows {
-            screenshots.push(
-                row.map_err(|e| format!("Failed to read related screenshot row: {}", e))?,
-            );
-        }
+            let mut collected = Vec::new();
+            for row in rows {
+                collected.push(
+                    row.map_err(|e| format!("Failed to read related screenshot row: {}", e))?,
+                );
+            }
+            collected
+        };
+        drop(guard);
+
+        // Decrypt encrypted fields outside the DB mutex
+        let screenshots = raw_results
+            .into_iter()
+            .map(|(mut stub, wt_enc, pn_enc, key_enc)| {
+                let row_key = key_enc
+                    .as_ref()
+                    .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+
+                if let (Some(data), Some(key)) = (wt_enc.as_ref(), row_key.as_ref()) {
+                    if let Ok(decrypted) = decrypt_with_master_key(key, data) {
+                        if let Ok(title) = String::from_utf8(decrypted) {
+                            stub.window_title = Some(title);
+                        }
+                    }
+                }
+
+                if let (Some(data), Some(key)) = (pn_enc.as_ref(), row_key.as_ref()) {
+                    if let Ok(decrypted) = decrypt_with_master_key(key, data) {
+                        if let Ok(name) = String::from_utf8(decrypted) {
+                            stub.process_name = Some(name);
+                        }
+                    }
+                }
+
+                stub
+            })
+            .collect();
 
         Ok(RelatedScreenshotsResult {
             task_id,

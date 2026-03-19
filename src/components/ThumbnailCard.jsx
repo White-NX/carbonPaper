@@ -18,12 +18,17 @@ export function CategoryBadge({ category }) {
   );
 }
 
-export function ThumbnailCard({ item, onSelect }) {
+export function ThumbnailCard({ item, onSelect, preloadedSrc = null }) {
   const { t } = useTranslation();
-  const [imageSrc, setImageSrc] = useState(null);
-  const [loadingImage, setLoadingImage] = useState(false);
+  const [imageSrc, setImageSrc] = useState(preloadedSrc);
+  const [loadingImage, setLoadingImage] = useState(!preloadedSrc);
 
   useEffect(() => {
+    if (preloadedSrc) {
+      setImageSrc(preloadedSrc);
+      setLoadingImage(false);
+      return;
+    }
     let active = true;
     const loadImage = async () => {
       if (!item) return;
@@ -40,7 +45,7 @@ export function ThumbnailCard({ item, onSelect }) {
     };
     loadImage();
     return () => { active = false; };
-  }, [item]);
+  }, [item, preloadedSrc]);
 
   const processName = item.process_name || item.metadata?.process_name;
   const similarity = item.similarity;
