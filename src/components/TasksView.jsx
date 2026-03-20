@@ -6,6 +6,7 @@ import {
   Eye, EyeOff, Gamepad2, MessageCircle,
 } from 'lucide-react';
 import { getTasks, getTaskScreenshots, deleteTask, updateTaskLabel, mergeTasks, runClustering, getClusteringStatus, saveClusteringResults } from '../lib/task_api';
+import { fetchThumbnailBatch } from '../lib/monitor_api';
 import { CATEGORY_COLORS, ENTERTAINMENT_CATEGORIES, SOCIAL_CATEGORIES } from '../lib/categories';
 import { ThumbnailCard } from './ThumbnailCard';
 
@@ -225,6 +226,23 @@ export default function TasksView({ backendOnline, onSelectScreenshot }) {
       }
     })();
   }, [selectedTask]);
+
+  // Batch-load thumbnails when screenshots change
+  const [thumbnailCache, setThumbnailCache] = useState({});
+  useEffect(() => {
+    if (!screenshots.length) { setThumbnailCache({}); return; }
+    let active = true;
+    const ids = [...new Set(screenshots
+      .map(s => s.screenshot_id)
+      .filter(id => typeof id === 'number' && id > 0))];
+    if (ids.length === 0) return;
+    fetchThumbnailBatch(ids)
+      .then(batch => {
+        if (active && batch) setThumbnailCache(batch);
+      })
+      .catch(err => console.error('Failed to batch load thumbnails:', err));
+    return () => { active = false; };
+  }, [screenshots]);
 
   // ── actions ──
 
@@ -507,6 +525,7 @@ export default function TasksView({ backendOnline, onSelectScreenshot }) {
                         category: s.category,
                         created_at: s.created_at,
                       }}
+                      preloadedSrc={thumbnailCache[s.screenshot_id] || null}
                       onSelect={(payload) => onSelectScreenshot?.(payload)}
                     />
                   ))}

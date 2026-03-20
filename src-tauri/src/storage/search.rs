@@ -6,7 +6,7 @@ use hmac::{Hmac, Mac};
 use jieba_rs::Jieba;
 use once_cell::sync::Lazy;
 use rusqlite::{params, OptionalExtension};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::{SearchResult, StorageState};
 
@@ -692,8 +692,11 @@ impl StorageState {
             return Ok(filtered);
         }
 
-        // Has bigram tokens: intersect each keyword's bigrams, then cross-keyword intersection
+        // Has bigram tokens: load bitmaps per keyword
+        // In fuzzy mode, union bigram bitmaps and count matches per OCR ID.
+        // In strict mode, intersect bigram bitmaps (original behavior).
         let mut keyword_bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
+        let mut keyword_count_maps: Vec<HashMap<u32, u32>> = Vec::new();
         for kw_bigrams in &per_keyword_bigrams {
             let mut bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
             for token in kw_bigrams {
@@ -711,11 +714,12 @@ impl StorageState {
                     let rb = roaring::RoaringBitmap::deserialize_from(&b[..])
                         .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?;
                     bitmaps.push(rb);
-                } else {
-                    // A keyword's bigram has no posting => this keyword has no matches
+                } else if !fuzzy {
+                    // Strict mode: a missing bigram means no matches for this keyword
                     bitmaps.clear();
                     break;
                 }
+                // Fuzzy mode: skip missing bigrams
             }
 
             if bitmaps.is_empty() {
@@ -723,13 +727,27 @@ impl StorageState {
                 return Ok(vec![]);
             }
 
-            // Intra-keyword bigram intersection
-            let mut iter = bitmaps.into_iter();
-            let mut kw_intersection = iter.next().unwrap();
-            for bm in iter {
-                kw_intersection &= &bm;
+            if fuzzy {
+                // Union all bigram bitmaps and count how many bigrams each OCR ID matches
+                let mut count_map: HashMap<u32, u32> = HashMap::new();
+                let mut union = roaring::RoaringBitmap::new();
+                for bm in &bitmaps {
+                    union |= bm;
+                    for id in bm.iter() {
+                        *count_map.entry(id).or_insert(0) += 1;
+                    }
+                }
+                keyword_bitmaps.push(union);
+                keyword_count_maps.push(count_map);
+            } else {
+                // Strict mode: intra-keyword bigram intersection
+                let mut iter = bitmaps.into_iter();
+                let mut kw_intersection = iter.next().unwrap();
+                for bm in iter {
+                    kw_intersection &= &bm;
+                }
+                keyword_bitmaps.push(kw_intersection);
             }
-            keyword_bitmaps.push(kw_intersection);
         }
 
         // Cross-keyword intersection
@@ -982,24 +1000,32 @@ impl StorageState {
             return Ok(filtered);
         }
 
-        // Single keyword: use OCR-level intersection
+        // Single keyword: use OCR-level bitmap
         let mut kw_iter = keyword_bitmaps.into_iter();
-        let mut intersection = if let Some(first) = kw_iter.next() {
+        let bitmap = if let Some(first) = kw_iter.next() {
             first
         } else {
             roaring::RoaringBitmap::new()
         };
-        for bm in kw_iter {
-            intersection &= &bm;
-        }
 
-        if intersection.is_empty() {
+        if bitmap.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut ids: Vec<i64> = intersection.into_iter().map(|v| v as i64).collect();
-        // Sort by id descending (approximate time order)
-        ids.sort_unstable_by(|a, b| b.cmp(a));
+        let mut ids: Vec<i64> = bitmap.iter().map(|v| v as i64).collect();
+
+        if fuzzy && !keyword_count_maps.is_empty() {
+            // Sort by bigram match count descending, then id descending (time order tiebreak)
+            let count_map = &keyword_count_maps[0];
+            ids.sort_unstable_by(|a, b| {
+                let ca = count_map.get(&(*a as u32)).copied().unwrap_or(0);
+                let cb = count_map.get(&(*b as u32)).copied().unwrap_or(0);
+                cb.cmp(&ca).then_with(|| b.cmp(a))
+            });
+        } else {
+            // Sort by id descending (approximate time order)
+            ids.sort_unstable_by(|a, b| b.cmp(a));
+        }
 
         // Pre-filter OCR IDs by category before pagination
         if let Some(ref cat_ids) = category_screenshot_ids {
@@ -1169,6 +1195,14 @@ impl StorageState {
                 },
             )
             .collect();
+
+        // In fuzzy mode, re-sort results to match the relevance order of page_ids
+        // (SQL ORDER BY destroys our score-based ordering)
+        let mut results = results;
+        if fuzzy {
+            let id_order: HashMap<i64, usize> = page_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+            results.sort_by_key(|r| id_order.get(&r.id).copied().unwrap_or(usize::MAX));
+        }
 
         for (_, mut key) in screenshot_key_cache.into_iter() {
             Self::zeroize_bytes(&mut key);
