@@ -142,3 +142,55 @@ impl StorageState {
         Ok(scored)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_char_entropy_empty() {
+        assert_eq!(StorageState::char_entropy(""), 0.0);
+    }
+
+    #[test]
+    fn test_char_entropy_single_char() {
+        // All same characters -> zero entropy
+        assert!(StorageState::char_entropy("aaaa") < 0.001);
+    }
+
+    #[test]
+    fn test_char_entropy_two_chars() {
+        // "ab" has 2 equally likely characters -> entropy = 1.0 bit
+        let e = StorageState::char_entropy("ab");
+        assert!((e - 1.0).abs() < 0.001, "entropy of 'ab' should be ~1.0, got {}", e);
+    }
+
+    #[test]
+    fn test_char_entropy_four_chars() {
+        // "abcd" has 4 equally likely characters -> entropy = 2.0 bits
+        let e = StorageState::char_entropy("abcd");
+        assert!((e - 2.0).abs() < 0.001, "entropy of 'abcd' should be ~2.0, got {}", e);
+    }
+
+    #[test]
+    fn test_entropy_penalty_natural_text() {
+        // Natural language typically has entropy near 4.0 (the center).
+        // The penalty should be close to 1.0 for text near the center.
+        let penalty = StorageState::entropy_penalty("the quick brown fox jumps over the lazy dog");
+        assert!(penalty > 0.5, "Natural text should have penalty > 0.5, got {}", penalty);
+    }
+
+    #[test]
+    fn test_entropy_penalty_repetitive() {
+        // Very low entropy text -> should be penalized (low penalty value)
+        let penalty = StorageState::entropy_penalty("aaaaaaaaaa");
+        assert!(penalty < 0.1, "Repetitive text should have penalty < 0.1, got {}", penalty);
+    }
+
+    #[test]
+    fn test_entropy_penalty_empty() {
+        // Empty string has entropy 0.0, far from center of 4.0 -> heavily penalized
+        let penalty = StorageState::entropy_penalty("");
+        assert!(penalty < 0.05, "Empty string should have very low penalty, got {}", penalty);
+    }
+}

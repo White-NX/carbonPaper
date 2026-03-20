@@ -99,6 +99,7 @@ pub struct SaveScreenshotRequest {
     pub visible_links: Option<Vec<VisibleLink>>,
 }
 
+/// OCR result from the Python backend for a single detected text region.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OcrResultInput {
     pub text: String,
@@ -107,6 +108,7 @@ pub struct OcrResultInput {
     pub box_coords: Vec<Vec<f64>>,
 }
 
+/// Response after saving a screenshot, contains the assigned ID and dedup counts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveScreenshotResponse {
     pub status: String,

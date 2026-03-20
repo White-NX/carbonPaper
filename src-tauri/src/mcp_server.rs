@@ -55,7 +55,7 @@ impl McpRuntimeState {
     }
 
     pub fn is_running(&self) -> bool {
-        let guard = self.server_handle.lock().unwrap();
+        let guard = self.server_handle.lock().unwrap_or_else(|e| e.into_inner());
         match &*guard {
             Some(h) => !h.is_finished(),
             None => false,
@@ -63,12 +63,12 @@ impl McpRuntimeState {
     }
 
     pub fn set_token_hash(&self, hash: [u8; 32]) {
-        let mut guard = self.token_hash.lock().unwrap();
+        let mut guard = self.token_hash.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(hash);
     }
 
     pub fn get_token_hash(&self) -> Option<[u8; 32]> {
-        *self.token_hash.lock().unwrap()
+        *self.token_hash.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -389,7 +389,7 @@ async fn presidio_analyze_texts(
         "language": language,
     });
     if !entity_types.is_empty() {
-        payload.as_object_mut().unwrap().insert(
+        payload.as_object_mut().expect("just constructed as object").insert(
             "entity_types".to_string(),
             serde_json::to_value(entity_types).unwrap(),
         );
@@ -606,7 +606,7 @@ async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value
             "created_at": r.created_at,
             "timestamp": r.timestamp,
         });
-        let m = obj.as_object_mut().unwrap();
+        let m = obj.as_object_mut().expect("just constructed as object");
         if let Some(ref v) = r.source { m.insert("source".into(), serde_json::json!(v)); }
         if let Some(ref v) = r.page_url { m.insert("page_url".into(), serde_json::json!(v)); }
         if let Some(ref v) = r.category { m.insert("category".into(), serde_json::json!(v)); }
@@ -1105,7 +1105,7 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
             "similarity": item.get("similarity"),
             "screenshot_created_at": item.get("screenshot_created_at"),
         });
-        let m = obj.as_object_mut().unwrap();
+        let m = obj.as_object_mut().expect("just constructed as object");
         if let Some(t) = window_title { m.insert("window_title".into(), Value::String(t.to_string())); }
         if let Some(p) = process_name { m.insert("process_name".into(), Value::String(p.to_string())); }
         obj
@@ -1502,11 +1502,11 @@ pub async fn start_server(
 
     let mcp_runtime = app_handle.state::<McpRuntimeState>();
     {
-        let mut guard = mcp_runtime.server_handle.lock().unwrap();
+        let mut guard = mcp_runtime.server_handle.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(handle);
     }
     {
-        let mut guard = mcp_runtime.shutdown_tx.lock().unwrap();
+        let mut guard = mcp_runtime.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(shutdown_tx);
     }
 
@@ -1521,7 +1521,7 @@ pub async fn start_server(
                 presidio_check_idle(&app_for_idle).await;
             }
         });
-        let mut guard = mcp_runtime.idle_check_handle.lock().unwrap();
+        let mut guard = mcp_runtime.idle_check_handle.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(idle_handle);
     }
 
@@ -1532,7 +1532,7 @@ pub async fn start_server(
 pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
     // Abort the idle check timer
     let idle_handle = {
-        let mut guard = mcp_runtime.idle_check_handle.lock().unwrap();
+        let mut guard = mcp_runtime.idle_check_handle.lock().unwrap_or_else(|e| e.into_inner());
         guard.take()
     };
     if let Some(h) = idle_handle {
@@ -1544,7 +1544,7 @@ pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
     // Send shutdown signal — select! in the server task will drop the
     // serve future (and TcpListener).
     let tx = {
-        let mut guard = mcp_runtime.shutdown_tx.lock().unwrap();
+        let mut guard = mcp_runtime.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
         guard.take()
     };
     if let Some(tx) = tx {
@@ -1552,7 +1552,7 @@ pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
         tracing::info!("MCP shutdown signal sent");
     }
     let handle = {
-        let mut guard = mcp_runtime.server_handle.lock().unwrap();
+        let mut guard = mcp_runtime.server_handle.lock().unwrap_or_else(|e| e.into_inner());
         guard.take()
     };
     if let Some(handle) = handle {

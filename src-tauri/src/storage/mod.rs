@@ -77,7 +77,7 @@ impl StorageState {
     /// Convert an absolute image path to a relative path (relative to data_dir).
     /// Uses forward slashes for consistency across platforms.
     fn to_relative_image_path(&self, abs_path: &Path) -> String {
-        let data_dir = self.data_dir.lock().unwrap().clone();
+        let data_dir = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
         match abs_path.strip_prefix(&data_dir) {
             Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
             Err(_) => abs_path.to_string_lossy().replace('\\', "/"),
@@ -91,7 +91,7 @@ impl StorageState {
         if p.is_absolute() {
             p.to_path_buf()
         } else {
-            self.data_dir.lock().unwrap().join(rel_path)
+            self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).join(rel_path)
         }
     }
 
@@ -112,7 +112,7 @@ impl StorageState {
     ) -> Result<std::sync::MutexGuard<'_, Option<Connection>>, String> {
         let wait_start = std::time::Instant::now();
         let current_holder = self.lock_holder.lock().ok().map(|g| *g).unwrap_or("?");
-        let guard = self.db.lock().unwrap();
+        let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
         let wait_dur = wait_start.elapsed();
         // Update lock holder to current caller
         if let Ok(mut h) = self.lock_holder.lock() {

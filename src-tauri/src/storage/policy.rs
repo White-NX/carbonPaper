@@ -7,7 +7,7 @@ use super::StorageState;
 impl StorageState {
     /// Save storage policy to storage_policy.json in the app config directory.
     pub fn save_policy(&self, policy: &JsonValue) -> Result<(), String> {
-        let mut cfg_dir = self.data_dir.lock().unwrap().clone();
+        let mut cfg_dir = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(parent) = cfg_dir.parent() {
             cfg_dir = parent.to_path_buf();
         }
@@ -21,7 +21,7 @@ impl StorageState {
 
     /// Load storage policy from storage_policy.json. Returns empty object if file doesn't exist.
     pub fn load_policy(&self) -> Result<JsonValue, String> {
-        let mut cfg_dir = self.data_dir.lock().unwrap().clone();
+        let mut cfg_dir = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(parent) = cfg_dir.parent() {
             cfg_dir = parent.to_path_buf();
         }

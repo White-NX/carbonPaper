@@ -656,6 +656,8 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tower",
  "tower-http",

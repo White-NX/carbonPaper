@@ -18,43 +18,35 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use thiserror::Error;
 
 
 /// 凭证管理器错误类型
-#[derive(Debug)]
+#[derive(Debug, Error)]
 #[allow(dead_code)]
 pub enum CredentialError {
     /// Windows Hello 不可用
+    #[error("Windows Hello is not available")]
     WindowsHelloNotAvailable,
     /// 用户取消了认证
+    #[error("User cancelled authentication")]
     UserCancelled,
     /// 密钥不存在
+    #[error("Credential key not found")]
     KeyNotFound,
     /// 需要用户认证
+    #[error("Authentication required")]
     AuthRequired,
     /// 加密/解密失败
+    #[error("Crypto error: {0}")]
     CryptoError(String),
     /// 系统错误
+    #[error("System error: {0}")]
     SystemError(String),
     /// 密钥已存在
+    #[error("Credential key already exists")]
     KeyAlreadyExists,
 }
-
-impl std::fmt::Display for CredentialError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WindowsHelloNotAvailable => write!(f, "Windows Hello is not available"),
-            Self::UserCancelled => write!(f, "User cancelled authentication"),
-            Self::KeyNotFound => write!(f, "Credential key not found"),
-            Self::AuthRequired => write!(f, "Authentication required"),
-            Self::CryptoError(msg) => write!(f, "Crypto error: {}", msg),
-            Self::SystemError(msg) => write!(f, "System error: {}", msg),
-            Self::KeyAlreadyExists => write!(f, "Credential key already exists"),
-        }
-    }
-}
-
-impl std::error::Error for CredentialError {}
 
 /// 默认认证会话超时时间（秒）
 const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 15 * 60; // 15 分钟
@@ -112,21 +104,21 @@ impl CredentialManagerState {
     /// 设置会话超时时间（秒），-1 表示永不超时
     #[allow(dead_code)]
     pub fn set_session_timeout(&self, timeout_secs: i64) {
-        let mut timeout = self.session_timeout_secs.lock().unwrap();
+        let mut timeout = self.session_timeout_secs.lock().unwrap_or_else(|e| e.into_inner());
         *timeout = timeout_secs;
     }
     
     /// 获取当前会话超时时间设置
     #[allow(dead_code)]
     pub fn get_session_timeout(&self) -> i64 {
-        *self.session_timeout_secs.lock().unwrap()
+        *self.session_timeout_secs.lock().unwrap_or_else(|e| e.into_inner())
     }
     
     /// 检查当前认证会话是否有效
     pub fn is_session_valid(&self) -> bool {
-        let last_auth = self.last_auth_time.lock().unwrap();
-        let in_foreground = *self.app_in_foreground.lock().unwrap();
-        let timeout_secs = *self.session_timeout_secs.lock().unwrap();
+        let last_auth = self.last_auth_time.lock().unwrap_or_else(|e| e.into_inner());
+        let in_foreground = *self.app_in_foreground.lock().unwrap_or_else(|e| e.into_inner());
+        let timeout_secs = *self.session_timeout_secs.lock().unwrap_or_else(|e| e.into_inner());
         
         match *last_auth {
             Some(auth_time) => {
@@ -147,25 +139,25 @@ impl CredentialManagerState {
     
     /// 更新认证时间戳
     pub fn update_auth_time(&self) {
-        let mut last_auth = self.last_auth_time.lock().unwrap();
+        let mut last_auth = self.last_auth_time.lock().unwrap_or_else(|e| e.into_inner());
         *last_auth = Some(std::time::Instant::now());
     }
     
     /// 清除认证会话（锁定 UI 访问权限）
     /// 注意：不清除 cached_master_key，以允许后台继续加密数据
     pub fn invalidate_session(&self) {
-        let mut last_auth = self.last_auth_time.lock().unwrap();
+        let mut last_auth = self.last_auth_time.lock().unwrap_or_else(|e| e.into_inner());
         *last_auth = None;
 
         // 只清除 db_key 缓存（用于 UI 层的数据库访问）
         // 保留 master_key 缓存，允许后台服务继续加密新数据
         {
-            let mut cached_db = self.cached_db_key.lock().unwrap();
+            let mut cached_db = self.cached_db_key.lock().unwrap_or_else(|e| e.into_inner());
             *cached_db = None;
         }
         // 不清除 master_key - 后台加密需要它
         // {
-        //     let mut cached_master = self.cached_master_key.lock().unwrap();
+        //     let mut cached_master = self.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
         //     *cached_master = None;
         // }
     }
@@ -173,26 +165,26 @@ impl CredentialManagerState {
     /// 完全清除所有缓存（应用退出或重置时调用）
     pub fn clear_all_cached_keys(&self) {
         {
-            let mut cached_db = self.cached_db_key.lock().unwrap();
+            let mut cached_db = self.cached_db_key.lock().unwrap_or_else(|e| e.into_inner());
             *cached_db = None;
         }
         {
-            let mut cached_master = self.cached_master_key.lock().unwrap();
+            let mut cached_master = self.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
             *cached_master = None;
         }
         {
-            let mut cached_pub = self.cached_public_key.lock().unwrap();
+            let mut cached_pub = self.cached_public_key.lock().unwrap_or_else(|e| e.into_inner());
             *cached_pub = None;
         }
     }
     
     /// 设置应用前台/后台状态
     pub fn set_foreground_state(&self, in_foreground: bool) {
-        let mut state = self.app_in_foreground.lock().unwrap();
+        let mut state = self.app_in_foreground.lock().unwrap_or_else(|e| e.into_inner());
         *state = in_foreground;
         
         // 如果进入后台，立即使会话失效（除非设置为永不超时）
-        let timeout = *self.session_timeout_secs.lock().unwrap();
+        let timeout = *self.session_timeout_secs.lock().unwrap_or_else(|e| e.into_inner());
         if !in_foreground && timeout != -1 {
             self.invalidate_session();
         }
@@ -345,7 +337,7 @@ mod windows_impl {
     ) -> Result<Vec<u8>, CredentialError> {
         // 首先检查是否有缓存的公钥
         {
-            let cached = state.cached_public_key.lock().unwrap();
+            let cached = state.cached_public_key.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref key) = *cached {
                 return Ok(key.clone());
             }
@@ -356,7 +348,7 @@ mod windows_impl {
 
         // 缓存公钥
         {
-            let mut cached = state.cached_public_key.lock().unwrap();
+            let mut cached = state.cached_public_key.lock().unwrap_or_else(|e| e.into_inner());
             *cached = Some(public_key.clone());
         }
 
@@ -390,7 +382,7 @@ mod windows_impl {
         };
 
         {
-            let mut cached = state.cached_master_key.lock().unwrap();
+            let mut cached = state.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
             *cached = Some(master_key.clone());
         }
 
@@ -457,7 +449,7 @@ mod windows_impl {
         let master_key = decrypt_master_key_with_cng(&ciphertext)?;
 
         {
-            let mut cached = state.cached_master_key.lock().unwrap();
+            let mut cached = state.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
             *cached = Some(master_key.clone());
         }
 
@@ -507,7 +499,7 @@ pub fn ensure_master_key_created(state: &CredentialManagerState) -> Result<(), C
         .map_err(|e| CredentialError::SystemError(format!("Failed to save master key: {}", e)))?;
 
     {
-        let mut cached = state.cached_master_key.lock().unwrap();
+        let mut cached = state.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
         *cached = Some(master_key.clone());
     }
 
@@ -542,7 +534,7 @@ pub async fn ensure_master_key_ready(state: &CredentialManagerState) -> Result<V
         .map_err(|e| CredentialError::SystemError(format!("Failed to save master key: {}", e)))?;
 
     {
-        let mut cached = state.cached_master_key.lock().unwrap();
+        let mut cached = state.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
         *cached = Some(master_key.clone());
     }
 
@@ -559,17 +551,17 @@ fn ensure_session_valid(state: &CredentialManagerState) -> Result<(), Credential
 
 /// 获取缓存的主密钥
 pub fn get_cached_master_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
-    state.cached_master_key.lock().unwrap().clone()
+    state.cached_master_key.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// 获取缓存的数据库密钥
 pub fn get_cached_db_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
-    state.cached_db_key.lock().unwrap().clone()
+    state.cached_db_key.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// 获取缓存的公钥
 pub fn get_cached_public_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
-    state.cached_public_key.lock().unwrap().clone()
+    state.cached_public_key.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// 获取或创建数据库密钥（同步版本，用于数据库初始化）
@@ -588,7 +580,7 @@ pub fn get_or_create_db_key_sync(state: &CredentialManagerState) -> Result<Vec<u
 
     // 更新缓存
     {
-        let mut cached_db = state.cached_db_key.lock().unwrap();
+        let mut cached_db = state.cached_db_key.lock().unwrap_or_else(|e| e.into_inner());
         *cached_db = Some(db_key.clone());
     }
 
@@ -856,7 +848,7 @@ pub fn load_public_key_from_file(state: &CredentialManagerState) -> Result<Vec<u
         .map_err(|e| CredentialError::SystemError(format!("Failed to read public key: {}", e)))?;
 
     {
-        let mut cached = state.cached_public_key.lock().unwrap();
+        let mut cached = state.cached_public_key.lock().unwrap_or_else(|e| e.into_inner());
         *cached = Some(public_key.clone());
     }
 
@@ -892,7 +884,7 @@ pub fn decrypt_row_key_with_cng(_ciphertext: &[u8]) -> Result<Vec<u8>, Credentia
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_encrypt_decrypt() {
         let public_key = b"12345678901234567890123456789012";
@@ -900,10 +892,10 @@ mod tests {
 
         let encrypted = encrypt_with_master_key(public_key, plaintext).unwrap();
         let decrypted = decrypt_with_master_key(public_key, &encrypted).unwrap();
-        
+
         assert_eq!(plaintext.to_vec(), decrypted);
     }
-    
+
     #[test]
     fn test_base64_encrypt_decrypt() {
         let public_key = b"12345678901234567890123456789012";
@@ -911,19 +903,56 @@ mod tests {
 
         let encrypted = encrypt_to_base64_with_master_key(public_key, plaintext).unwrap();
         let decrypted = decrypt_from_base64_with_master_key(public_key, &encrypted).unwrap();
-        
+
         assert_eq!(plaintext, decrypted);
     }
-    
+
     #[test]
     fn test_db_key_generation() {
         let public_key = b"12345678901234567890123456789012";
         let db_key = derive_db_key_from_master(public_key);
-        
+
         assert_eq!(db_key.len(), 32); // SHA-256 outputs 32 bytes
-        
+
         let hex_key = db_key_to_hex(&db_key);
         assert!(hex_key.starts_with("x'"));
         assert!(hex_key.ends_with("'"));
+    }
+
+    #[test]
+    fn test_decrypt_invalid_data() {
+        let key = b"12345678901234567890123456789012";
+        // 5 bytes is too short (need at least 12 nonce + 16 tag = 28 bytes)
+        let corrupt_data: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42];
+        let result = decrypt_with_master_key(key, &corrupt_data);
+        assert!(result.is_err(), "Decrypting corrupt/short ciphertext should return an error");
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_empty() {
+        let key = b"12345678901234567890123456789012";
+        let plaintext: &[u8] = b"";
+        let encrypted = encrypt_with_master_key(key, plaintext).unwrap();
+        let decrypted = decrypt_with_master_key(key, &encrypted).unwrap();
+        assert_eq!(decrypted, Vec::<u8>::new(), "Round-trip of empty plaintext should produce empty Vec");
+    }
+
+    #[test]
+    fn test_db_key_deterministic() {
+        let master_key = b"some-master-key-for-testing-1234";
+        let key1 = derive_db_key_from_master(master_key);
+        let key2 = derive_db_key_from_master(master_key);
+        assert_eq!(key1, key2, "derive_db_key_from_master should be deterministic");
+    }
+
+    #[test]
+    fn test_db_key_to_hex_format() {
+        let key = b"12345678901234567890123456789012";
+        let db_key = derive_db_key_from_master(key);
+        let hex_str = db_key_to_hex(&db_key);
+        assert!(hex_str.starts_with("x'"), "hex key should start with x'");
+        assert!(hex_str.ends_with("'"), "hex key should end with '");
+        // db_key is 32 bytes = 64 hex chars, plus "x'" prefix and "'" suffix = 67 chars total
+        assert_eq!(hex_str.len(), 67, "hex key should be x' + 64 hex chars + ' = 67 chars");
     }
 }

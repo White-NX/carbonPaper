@@ -126,7 +126,7 @@ impl StorageState {
         // Generate filename (use .enc extension to indicate encrypted file)
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("screenshot_{}.png.enc", timestamp);
-        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let image_path = screenshot_dir.join(&filename);
 
         // Save encrypted image file
@@ -383,7 +383,7 @@ impl StorageState {
         let t2 = std::time::Instant::now();
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("screenshot_{}.png.enc.pending", timestamp);
-        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let image_path = screenshot_dir.join(&filename);
 
         std::fs::write(&image_path, &encrypted_image)

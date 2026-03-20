@@ -10,6 +10,7 @@ use crate::resource_utils::{file_in_local_appdata, normalize_path_for_command};
 const UPDATE_CHECK_URL: &str =
     "https://github.com/White-NX/carbonPaper/releases/latest/download/latest.json";
 
+/// Metadata about an available update (version, download URL, SHA256 hash, release notes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateManifest {
     pub version: String,
@@ -19,6 +20,7 @@ pub struct UpdateManifest {
     pub pub_date: Option<String>,
 }
 
+/// Shared state for the update checker, caching the latest update manifest.
 pub struct UpdaterState {
     manifest: Mutex<Option<UpdateManifest>>,
 }
@@ -52,6 +54,7 @@ fn is_newer(remote: &str, current: &str) -> bool {
     parse(remote) > parse(current)
 }
 
+/// Result of checking for updates (whether one is available, version info).
 #[derive(Serialize)]
 pub struct CheckResult {
     available: bool,
@@ -100,7 +103,7 @@ pub async fn updater_check(
     };
 
     if available {
-        *state.manifest.lock().unwrap() = Some(manifest);
+        *state.manifest.lock().unwrap_or_else(|e| e.into_inner()) = Some(manifest);
     }
 
     Ok(result)
