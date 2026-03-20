@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Image as ImageIcon, Type, Loader2, X, ChevronDown } from 'lucide-react';
-import { searchScreenshots, fetchThumbnailBatch } from '../lib/monitor_api';
+import { searchScreenshots, fetchThumbnailBatch, fetchImage } from '../lib/monitor_api';
 
 // Simple debounce hook
 function useDebounce(value, delay) {
@@ -226,12 +226,36 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
 
 function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
     const [imgSrc, setImgSrc] = useState(preloadedSrc);
+    const [loadFailed, setLoadFailed] = useState(false);
 
     useEffect(() => {
         if (preloadedSrc) {
             setImgSrc(preloadedSrc);
+            setLoadFailed(false);
         }
     }, [preloadedSrc]);
+
+    // Fallback: individually fetch if batch didn't provide a thumbnail
+    useEffect(() => {
+        if (imgSrc || loadFailed) return;
+        let active = true;
+        const timer = setTimeout(async () => {
+            const screenshotId = mode === 'nl' ? item.metadata?.screenshot_id : item.screenshot_id;
+            const id = typeof screenshotId === 'number' && screenshotId > 0 ? screenshotId : null;
+            const path = item.image_path || item.metadata?.image_path || item.path;
+            if (!id && !path) { if (active) setLoadFailed(true); return; }
+            try {
+                const src = await fetchImage(id, id ? null : path);
+                if (active) {
+                    if (src) setImgSrc(src);
+                    else setLoadFailed(true);
+                }
+            } catch {
+                if (active) setLoadFailed(true);
+            }
+        }, 100);
+        return () => { active = false; clearTimeout(timer); };
+    }, [imgSrc, loadFailed, item, mode]);
 
     // Highlighting logic for OCR
     const renderOCRText = () => {
@@ -274,6 +298,10 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
             <div className="w-28 h-20 flex-shrink-0 bg-ide-bg rounded-md overflow-hidden border border-ide-border shadow-sm relative group-hover:border-ide-accent transition-colors">
                 {imgSrc ? (
                     <img src={imgSrc} alt="" className="w-full h-full object-cover" />
+                ) : loadFailed ? (
+                    <div className="w-full h-full flex items-center justify-center">
+                        <ImageIcon size={16} className="text-ide-muted opacity-50" />
+                    </div>
                 ) : (
                     <div className="w-full h-full flex items-center justify-center">
                         <Loader2 size={16} className="animate-spin text-ide-muted" />
