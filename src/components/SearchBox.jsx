@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Image as ImageIcon, Type, Loader2, X, ChevronDown } from 'lucide-react';
-import { searchScreenshots, fetchImage } from '../lib/monitor_api';
+import { searchScreenshots, fetchThumbnailBatch } from '../lib/monitor_api';
 
 // Simple debounce hook
 function useDebounce(value, delay) {
@@ -77,6 +77,22 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
 
         doSearch();
     }, [debouncedQuery, mode]);
+
+    // Batch-load thumbnails when results change
+    const [thumbCache, setThumbCache] = useState({});
+    useEffect(() => {
+        if (!results.length) { setThumbCache({}); return; }
+        let active = true;
+        const ids = results.map(item => {
+            const sid = mode === 'nl' ? item.metadata?.screenshot_id : item.screenshot_id;
+            return typeof sid === 'number' && sid > 0 ? sid : null;
+        }).filter(Boolean);
+        if (ids.length === 0) return;
+        fetchThumbnailBatch([...new Set(ids)])
+            .then(batch => { if (active && batch) setThumbCache(batch); })
+            .catch(() => {});
+        return () => { active = false; };
+    }, [results, mode]);
 
     const handleSelect = (item) => {
         // Determine ID based on mode/structure
@@ -193,6 +209,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                                     mode={mode}
                                     query={debouncedQuery}
                                     onClick={() => handleSelect(item)}
+                                    preloadedSrc={thumbCache[mode === 'nl' ? item.metadata?.screenshot_id : item.screenshot_id] || null}
                                 />
                             ))
                             ) : loading ? (
@@ -207,21 +224,14 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     );
 }
 
-function SearchResultItem({ item, mode, query, onClick }) {
-    const [imgSrc, setImgSrc] = useState(null);
+function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
+    const [imgSrc, setImgSrc] = useState(preloadedSrc);
 
     useEffect(() => {
-        let active = true;
-        const loadImg = async () => {
-            const screenshotId = mode === 'nl' ? item.metadata?.screenshot_id : item.screenshot_id;
-            const id = typeof screenshotId === 'number' && screenshotId > 0 ? screenshotId : null;
-            const path = item.image_path || item.metadata?.image_path || item.path;
-            const src = await fetchImage(id, id ? null : path);
-            if (active) setImgSrc(src);
-        };
-        loadImg();
-        return () => { active = false; };
-    }, [item, mode]);
+        if (preloadedSrc) {
+            setImgSrc(preloadedSrc);
+        }
+    }, [preloadedSrc]);
 
     // Highlighting logic for OCR
     const renderOCRText = () => {

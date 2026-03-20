@@ -33,6 +33,7 @@
   --ide-warning-bg: #fef3c7;
   --ide-warning-border: #fcd34d;
   --ide-info-success: #047857;
+  --ide-timeline-bg: #f0f2f5;
 }
 
 .dark {
@@ -52,6 +53,7 @@
   --ide-warning-bg: rgba(245, 158, 11, 0.1);
   --ide-warning-border: rgba(245, 158, 11, 0.2);
   --ide-info-success: #34d399;
+  --ide-timeline-bg: #141414;
 }
 
 html:not([data-page="error"]),

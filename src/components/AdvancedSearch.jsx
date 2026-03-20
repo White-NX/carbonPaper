@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Search, SlidersHorizontal, Filter, CalendarRange, X, Loader2, RefreshCw, Type, Image as ImageIcon, Tag } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { searchScreenshots, fetchImage, listProcesses, getCategoriesFromDb, batchGetCategories } from '../lib/monitor_api';
+import { searchScreenshots, fetchImage, fetchThumbnailBatch, listProcesses, getCategoriesFromDb, batchGetCategories } from '../lib/monitor_api';
 import { CATEGORY_COLORS } from '../lib/categories';
 import { ThumbnailCard, CategoryBadge } from './ThumbnailCard';
 
@@ -44,12 +44,17 @@ function highlightMatches(text, tokens) {
   );
 }
 
-function ResultPreview({ item, mode, onSelect, queryTokens }) {
+function ResultPreview({ item, mode, onSelect, queryTokens, preloadedSrc = null }) {
   const { t } = useTranslation();
-  const [imageSrc, setImageSrc] = useState(null);
-  const [loadingImage, setLoadingImage] = useState(false);
+  const [imageSrc, setImageSrc] = useState(preloadedSrc);
+  const [loadingImage, setLoadingImage] = useState(!preloadedSrc);
 
   useEffect(() => {
+    if (preloadedSrc) {
+      setImageSrc(preloadedSrc);
+      setLoadingImage(false);
+      return;
+    }
     let active = true;
     const loadImage = async () => {
       if (!item) return;
@@ -68,7 +73,7 @@ function ResultPreview({ item, mode, onSelect, queryTokens }) {
     return () => {
       active = false;
     };
-  }, [item]);
+  }, [item, preloadedSrc]);
 
   const processName = mode === 'nl' ? item.metadata?.process_name : item.process_name;
   const windowTitle = mode === 'nl' ? item.metadata?.window_title : item.window_title;
@@ -305,6 +310,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
   const [query, setQuery] = useState(searchParams?.query || '');
   const [mode, setMode] = useState(searchMode ?? (searchParams?.mode || 'ocr'));
   const [results, setResults] = useState([]);
+  const [thumbnailCache, setThumbnailCache] = useState({});
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(false);
@@ -363,6 +369,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     if (nextMode === mode) return;
     searchIdRef.current += 1;
     setResults([]);
+    setThumbnailCache({});
     setHasMore(false);
     setLoading(false);
     setLoadingMore(false);
@@ -417,6 +424,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     if (!normalizedQuery && !hasFilters) {
       searchIdRef.current += 1;
       setResults([]);
+      setThumbnailCache({});
       setHasMore(false);
       setLoading(false);
       setLoadingMore(false);
@@ -427,6 +435,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     const currentSearchId = ++searchIdRef.current;
     setLoading(true);
     setLoadingMore(false);
+    setThumbnailCache({});
     offsetRef.current = 0;
     const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
     const fetched = await searchScreenshots(normalizedQuery, mode, {
@@ -475,6 +484,25 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     if (searchParams.refreshKey === undefined) return;
     resetAndFetch();
   }, [searchParams?.refreshKey, active, resetAndFetch]);
+
+  // Batch-fetch thumbnails when results change
+  useEffect(() => {
+    if (results.length === 0) return;
+    let active = true;
+    (async () => {
+      const ids = results
+        .map((item) => item.screenshot_id ?? item.metadata?.screenshot_id)
+        .filter((id) => typeof id === 'number' && id > 0);
+      // Deduplicate and exclude already-cached IDs
+      const uniqueIds = [...new Set(ids)].filter((id) => !thumbnailCache[id]);
+      if (uniqueIds.length === 0) return;
+      const batch = await fetchThumbnailBatch(uniqueIds);
+      if (active && batch) {
+        setThumbnailCache((prev) => ({ ...prev, ...batch }));
+      }
+    })();
+    return () => { active = false; };
+  }, [results]);
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMore || loading) return;
@@ -663,6 +691,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
                 key={`${item.id || item.image_path || index}-${index}`}
                 item={item}
                 onSelect={(payload) => onSelectResult?.(payload)}
+                preloadedSrc={thumbnailCache[item.screenshot_id ?? item.metadata?.screenshot_id] || null}
               />
             ))}
           </div>
@@ -675,6 +704,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
                   mode={mode}
                   queryTokens={queryTokens}
                   onSelect={(payload) => onSelectResult?.(payload)}
+                  preloadedSrc={thumbnailCache[item.screenshot_id ?? item.metadata?.screenshot_id] || null}
                 />
               </li>
             ))}

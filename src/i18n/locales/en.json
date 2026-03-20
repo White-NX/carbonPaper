@@ -714,5 +714,16 @@
     "switchToNormal": "Switch to Normal Mode",
     "switchToXibao": "Switch to Celebration Mode",
     "triggerTest": "Trigger Test Error Window"
+  },
+  "timeline": {
+    "month": "1M",
+    "week": "1W",
+    "today": "Today",
+    "zoomMonth": "Zoom to 1 month",
+    "zoomWeek": "Zoom to 1 week",
+    "zoomToday": "Zoom to today",
+    "collapse": "Collapse",
+    "expandQuickZoom": "Expand quick zoom",
+    "jumpToNow": "Jump to Now"
   }
 }

@@ -22,6 +22,7 @@ export default {
         'ide-warning-bg': 'var(--ide-warning-bg)',
         'ide-warning-border': 'var(--ide-warning-border)',
         'ide-info-success': 'var(--ide-info-success)',
+        'ide-timeline-bg': 'var(--ide-timeline-bg)',
       },
       boxShadow: {
         card: '0 10px 30px rgba(0,0,0,0.35)',

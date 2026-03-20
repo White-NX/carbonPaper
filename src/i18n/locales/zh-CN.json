@@ -716,5 +716,16 @@
     "switchToNormal": "切换到正常模式",
     "switchToXibao": "切换到喜报模式",
     "triggerTest": "触发测试错误窗口"
+  },
+  "timeline": {
+    "month": "1月",
+    "week": "1周",
+    "today": "当日",
+    "zoomMonth": "缩放到1个月",
+    "zoomWeek": "缩放到1周",
+    "zoomToday": "缩放到当日",
+    "collapse": "收起",
+    "expandQuickZoom": "展开快速缩放",
+    "jumpToNow": "跳转到现在"
   }
 }

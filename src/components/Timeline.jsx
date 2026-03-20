@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { getTimeline, fetchTimelineImage, clearTimelineImageQueue, cancelTimelineImageRequest } from '../lib/monitor_api';
-import { Locate, Play } from 'lucide-react';
+import { getTimeline, fetchThumbnailBatch, clearTimelineImageQueue } from '../lib/monitor_api';
+import { Locate, Play, ChevronLeft, ChevronRight } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import { CATEGORY_COLORS } from '../lib/categories';
 
 // Simple debounce
@@ -82,79 +83,16 @@ const setTimelineImageCache = (key, dataUrl) => {
 // Sub-component for individual events to handle lazy loading
 const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showText, showLabel, isSameActivityAsNext, isSameActivityAsPrev, prevAppName, prevWindowTitle, onClick, isHighlighted, imageEpoch }) => {
     const [imageUrl, setImageUrl] = useState(null);
-    const [loading, setLoading] = useState(false);
-    const [retryToken, setRetryToken] = useState(0);
-    const requestIdRef = useRef(0);
-    const loadingRef = useRef(false);
-    const retryTimerRef = useRef(null);
-    const retryCountRef = useRef(0);
 
+    // Only read from cache — batch loading in parent handles fetching
     useEffect(() => {
-        let cancelled = false;
+        if (!visible || !showImage) return;
         const cacheKey = getTimelineImageCacheKey(event);
-        const scheduleRetry = (delayMs) => {
-            if (retryTimerRef.current) return;
-            retryTimerRef.current = setTimeout(() => {
-                retryTimerRef.current = null;
-                setRetryToken((value) => value + 1);
-            }, delayMs);
-        };
-        // If highlighted, force load image even if density says no?
-        // Actually density logic happens in parent. If parent says showImage=false, we don't render this block.
-        // We should ensure parent sets showImage=true for highlighted events.
-        if (!visible || !showImage) {
-            cancelTimelineImageRequest(cacheKey);
-            return () => {
-                cancelled = true;
-            };
+        const cached = cacheKey ? timelineImageCache.get(cacheKey) : null;
+        if (cached && cached !== imageUrl) {
+            setImageUrl(cached);
         }
-
-        if (visible && showImage) {
-            const cached = cacheKey ? timelineImageCache.get(cacheKey) : null;
-            if (cached && cached !== imageUrl) {
-                setImageUrl(cached);
-            } else if (!imageUrl && !loadingRef.current) {
-                loadingRef.current = true;
-                setLoading(true);
-                const requestId = requestIdRef.current + 1;
-                requestIdRef.current = requestId;
-                fetchTimelineImage(event.id, event.imagePath, { priority: 'high', key: cacheKey })
-                    .then((data) => {
-                        if (cancelled || requestIdRef.current !== requestId) return;
-                        if (data) {
-                            setTimelineImageCache(cacheKey, data);
-                            setImageUrl(data);
-                        }
-                        retryCountRef.current = 0;
-                    })
-                    .catch((err) => {
-                        if (cancelled || requestIdRef.current !== requestId) return;
-                        if (err?.code === 'not_found') {
-                            return;
-                        }
-                        if (visible && showImage && !imageUrl) {
-                            const nextRetry = Math.min(retryCountRef.current + 1, 5);
-                            retryCountRef.current = nextRetry;
-                            const delayMs = err?.message === 'cancelled' ? 200 : 400 * nextRetry;
-                            scheduleRetry(delayMs);
-                        }
-                    })
-                    .finally(() => {
-                        if (cancelled || requestIdRef.current !== requestId) return;
-                        loadingRef.current = false;
-                        setLoading(false);
-                    });
-            }
-        }
-        return () => {
-            cancelled = true;
-            loadingRef.current = false;
-            if (retryTimerRef.current) {
-                clearTimeout(retryTimerRef.current);
-                retryTimerRef.current = null;
-            }
-        };
-    }, [visible, showImage, event.id, event.imagePath, imageEpoch, imageUrl, retryToken]);
+    }, [visible, showImage, event.id, event.imagePath, imageEpoch]);
 
     const iconSrc = useMemo(() => {
         if (!event.processIcon) return null;
@@ -254,6 +192,7 @@ const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showTex
 });
 
 const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedEventId, refreshKey }) => {
+    const { t } = useTranslation();
     const containerRef = useRef(null);
     const canvasRef = useRef(null);
     const wheelIdleTimerRef = useRef(null);
@@ -278,6 +217,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     const isDraggingRef = useRef(false);
     const [isFollowingNow, setIsFollowingNow] = useState(false);
     const fetchEpochRef = useRef(0);
+    const [toolbarExpanded, setToolbarExpanded] = useState(false);
 
     // Initial width detection
     useEffect(() => {
@@ -328,6 +268,14 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         setCenterTime(Date.now());
         setZoom(MAX_ZOOM); // Zoom to max (seconds view)
         setIsFollowingNow(true);
+        clearTimelineImageQueue();
+        setImageEpoch(prev => prev + 1);
+    };
+
+    const handleQuickZoom = (spanMs) => {
+        setIsFollowingNow(false);
+        setCenterTime(Date.now());
+        setZoom(width / spanMs);
         clearTimelineImageQueue();
         setImageEpoch(prev => prev + 1);
     };
@@ -434,6 +382,44 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         return () => clearInterval(interval);
     }, [isFollowingNow, isDragging, centerTime, zoom, width, fetchEventsDebounced]);
 
+    // Track visible event IDs that need images for batch loading
+    const pendingImageIdsRef = useRef([]);
+    const batchTimerRef = useRef(null);
+
+    // Batch load thumbnails for visible events (debounced after render)
+    useEffect(() => {
+        if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
+        batchTimerRef.current = setTimeout(() => {
+            const ids = pendingImageIdsRef.current;
+            if (!ids || ids.length === 0) return;
+
+            const uncachedIds = ids.filter(id => typeof id === 'number' && id > 0 && !timelineImageCache.has(id));
+            if (uncachedIds.length === 0) return;
+
+            fetchThumbnailBatch(uncachedIds)
+                .then(batch => {
+                    if (batch) {
+                        let added = 0;
+                        for (const [id, dataUrl] of Object.entries(batch)) {
+                            if (dataUrl) {
+                                setTimelineImageCache(Number(id), dataUrl);
+                                added++;
+                            }
+                        }
+                        if (added > 0) {
+                            setImageEpoch(prev => prev + 1);
+                        }
+                    }
+                })
+                .catch(err => {
+                    console.error('[Timeline] Batch thumbnail load error:', err);
+                });
+        }, 300);
+        return () => {
+            if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
+        };
+    }, [centerTime, zoom, width, events]);
+
 
     // Interaction Handlers
     const handleMouseDown = (e) => {
@@ -527,7 +513,11 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         const s = String(date.getSeconds()).padStart(2, '0');
         const ms = String(date.getMilliseconds()).padStart(3, '0');
 
-        if (stepMs >= 3600000) return `${h}:00`;
+        if (stepMs >= 3600000) {
+            const m2 = date.getMonth() + 1;
+            const d2 = date.getDate();
+            return `${m2}/${d2} ${h}:00`;
+        }
         if (stepMs >= 60000) return `${h}:${m}`;
         if (stepMs >= 1000) return `${h}:${m}:${s}`;
         return `${h}:${m}:${s}.${ms}`;
@@ -691,7 +681,8 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     return (
         <div 
             ref={containerRef}
-            className="w-full h-32 bg-ide-bg border-b border-ide-border relative overflow-hidden cursor-move select-none shadow-inner"
+            className="w-full h-32 border-b border-ide-border relative overflow-hidden cursor-move select-none shadow-inner"
+            style={{ backgroundColor: 'var(--ide-timeline-bg)' }}
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
@@ -745,6 +736,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                 const seenSampleBuckets = macroScale ? new Set() : null;
                 
                 const visibleNodes = [];
+                const batchImageIds = [];
 
                 for (let index = startIndex; index < endIndex; index++) {
                     const event = events[index];
@@ -808,6 +800,10 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                         continue;
                     }
 
+                    if (showImage && typeof event.id === 'number' && event.id > 0) {
+                        batchImageIds.push(event.id);
+                    }
+
                     const eventKey = getEventKey(event) ?? `${event.timestamp}-${index}`;
                     visibleNodes.push(
                         <TimelineEvent 
@@ -829,23 +825,52 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                         />
                     );
                 }
+                pendingImageIdsRef.current = batchImageIds;
                 return visibleNodes;
             })()}
             
             <div className="absolute top-0 bottom-0 left-1/2 w-px bg-ide-accent opacity-50 pointer-events-none z-0"></div>
             
-             {/* Now Button */}
-            <button 
-                className={`absolute bottom-2 right-2 p-1.5 rounded-full shadow-lg border transition-all z-50
-                    ${isFollowingNow 
-                        ? 'bg-ide-accent text-white border-ide-accent' 
-                        : 'bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active'
-                    }`}
-                onClick={(e) => { e.stopPropagation(); handleNowClick(); }}
-                title="Jump to Now"
-            >
-                <Play size={16} fill={isFollowingNow ? "currentColor" : "none"} className={isFollowingNow ? "" : "ml-0.5"} />
-            </button>
+             {/* Timeline Toolbar */}
+            <div className="absolute bottom-2 right-2 flex items-center gap-1 z-50">
+                {toolbarExpanded && (
+                    <>
+                        <button
+                            className="px-2 py-1 text-xs rounded shadow border bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active transition-colors"
+                            onClick={(e) => { e.stopPropagation(); handleQuickZoom(30 * 86400000); }}
+                            title={t('timeline.zoomMonth')}
+                        >{t('timeline.month')}</button>
+                        <button
+                            className="px-2 py-1 text-xs rounded shadow border bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active transition-colors"
+                            onClick={(e) => { e.stopPropagation(); handleQuickZoom(7 * 86400000); }}
+                            title={t('timeline.zoomWeek')}
+                        >{t('timeline.week')}</button>
+                        <button
+                            className="px-2 py-1 text-xs rounded shadow border bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active transition-colors"
+                            onClick={(e) => { e.stopPropagation(); handleQuickZoom(86400000); }}
+                            title={t('timeline.zoomToday')}
+                        >{t('timeline.today')}</button>
+                    </>
+                )}
+                <button
+                    className="p-1 rounded shadow border bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active transition-colors"
+                    onClick={(e) => { e.stopPropagation(); setToolbarExpanded(prev => !prev); }}
+                    title={toolbarExpanded ? t('timeline.collapse') : t('timeline.expandQuickZoom')}
+                >
+                    {toolbarExpanded ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+                </button>
+                <button
+                    className={`p-1.5 rounded-full shadow-lg border transition-all
+                        ${isFollowingNow
+                            ? 'bg-ide-accent text-white border-ide-accent'
+                            : 'bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active'
+                        }`}
+                    onClick={(e) => { e.stopPropagation(); handleNowClick(); }}
+                    title={t('timeline.jumpToNow')}
+                >
+                    <Play size={16} fill={isFollowingNow ? "currentColor" : "none"} className={isFollowingNow ? "" : "ml-0.5"} />
+                </button>
+            </div>
         </div>
     );
 };
