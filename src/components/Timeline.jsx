@@ -275,7 +275,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     const handleQuickZoom = (spanMs) => {
         setIsFollowingNow(false);
         setCenterTime(Date.now());
-        setZoom(width / spanMs);
+        setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, width / spanMs)));
         clearTimelineImageQueue();
         setImageEpoch(prev => prev + 1);
     };

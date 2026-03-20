@@ -232,9 +232,9 @@ export default function TasksView({ backendOnline, onSelectScreenshot }) {
   useEffect(() => {
     if (!screenshots.length) { setThumbnailCache({}); return; }
     let active = true;
-    const ids = screenshots
+    const ids = [...new Set(screenshots
       .map(s => s.screenshot_id)
-      .filter(id => typeof id === 'number' && id > 0);
+      .filter(id => typeof id === 'number' && id > 0))];
     if (ids.length === 0) return;
     fetchThumbnailBatch(ids)
       .then(batch => {
