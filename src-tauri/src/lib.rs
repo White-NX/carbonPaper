@@ -2,6 +2,7 @@ mod analysis;
 mod autostart;
 mod capture;
 mod credential_manager;
+pub mod error;
 mod error_window;
 mod logging;
 mod mcp_server;
@@ -32,6 +33,10 @@ use tauri::Manager;
 use window_vibrancy::apply_acrylic;
 
 const MENU_ID_OPEN: &str = "open";
+
+fn policy_as_object_mut(policy: &mut serde_json::Value) -> Result<&mut serde_json::Map<String, serde_json::Value>, String> {
+    policy.as_object_mut().ok_or_else(|| "Policy is not a valid JSON object".to_string())
+}
 
 #[tauri::command]
 fn get_log_dir() -> String {
@@ -150,7 +155,7 @@ fn close_process() {
 
 // ==================== 存储相关命令 ====================
 
-/// 检查认证状态，如果未认证返回错误
+/// Checks whether the current session requires re-authentication.
 fn check_auth_required(credential_state: &CredentialManagerState) -> Result<(), String> {
     if !credential_state.is_session_valid() {
         return Err("AUTH_REQUIRED".to_string());
@@ -158,6 +163,7 @@ fn check_auth_required(credential_state: &CredentialManagerState) -> Result<(), 
     Ok(())
 }
 
+/// Retrieves a paginated timeline of screenshots within a time range.
 #[tauri::command]
 async fn storage_get_timeline(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -189,6 +195,7 @@ async fn storage_get_timeline(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Full-text search across screenshot OCR text with optional filters.
 #[tauri::command]
 async fn storage_search(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -225,6 +232,7 @@ async fn storage_search(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Retrieves the full-resolution image for a screenshot by ID or path.
 #[tauri::command]
 async fn storage_get_image(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -277,6 +285,7 @@ async fn storage_get_image(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Retrieves a thumbnail image for a screenshot by ID or path.
 #[tauri::command]
 async fn storage_get_thumbnail(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -311,6 +320,7 @@ async fn storage_get_thumbnail(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Retrieves multiple thumbnails in a single batch request by screenshot IDs.
 #[tauri::command]
 async fn storage_batch_get_thumbnails(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -433,6 +443,7 @@ async fn storage_warmup_thumbnails(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Retrieves full metadata and OCR results for a specific screenshot.
 #[tauri::command]
 async fn storage_get_screenshot_details(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -474,6 +485,7 @@ async fn storage_get_screenshot_details(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Deletes a screenshot and its associated image data and vector embeddings.
 #[tauri::command]
 async fn storage_delete_screenshot(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -512,6 +524,7 @@ async fn storage_delete_screenshot(
     }))
 }
 
+/// Deletes all screenshots within a specified time range.
 #[tauri::command]
 async fn storage_delete_by_time_range(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -579,6 +592,7 @@ async fn storage_list_processes(
         .collect())
 }
 
+/// Saves a new screenshot with OCR text and metadata.
 #[tauri::command]
 async fn storage_save_screenshot(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -608,6 +622,7 @@ async fn storage_get_public_key(
 
 // ==================== 存储策略（policy）命令 ====================
 
+/// Saves application policy/configuration as JSON.
 #[tauri::command]
 async fn storage_set_policy(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -619,6 +634,7 @@ async fn storage_set_policy(
     Ok(policy)
 }
 
+/// Retrieves the current application policy/configuration.
 #[tauri::command]
 async fn storage_get_policy(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -817,6 +833,7 @@ async fn storage_save_clustering_results(
 
 // ==================== MCP 服务命令 ====================
 
+/// Enables or disables the MCP (Model Context Protocol) server.
 #[tauri::command]
 async fn mcp_set_enabled(
     app: tauri::AppHandle,
@@ -840,7 +857,7 @@ async fn mcp_set_enabled(
             // Generate new token
             let token = mcp_server::generate_token();
             let encrypted_b64 = mcp_server::encrypt_token(&credential_state, &token)?;
-            policy.as_object_mut().unwrap().insert("mcp_token_encrypted".into(), serde_json::json!(encrypted_b64));
+            policy_as_object_mut(&mut policy)?.insert("mcp_token_encrypted".into(), serde_json::json!(encrypted_b64));
             (token, true)
         };
 
@@ -850,9 +867,9 @@ async fn mcp_set_enabled(
             .unwrap_or(mcp_server::get_port(&storage_state));
 
         // Save enabled state
-        policy.as_object_mut().unwrap().insert("mcp_enabled".into(), serde_json::json!(true));
+        policy_as_object_mut(&mut policy)?.insert("mcp_enabled".into(), serde_json::json!(true));
         if policy.get("mcp_port").is_none() {
-            policy.as_object_mut().unwrap().insert("mcp_port".into(), serde_json::json!(port));
+            policy_as_object_mut(&mut policy)?.insert("mcp_port".into(), serde_json::json!(port));
         }
         storage_state.save_policy(&policy)?;
 
@@ -871,13 +888,14 @@ async fn mcp_set_enabled(
         mcp_server::stop_server(&mcp_state).await;
 
         let mut policy = storage_state.load_policy()?;
-        policy.as_object_mut().unwrap().insert("mcp_enabled".into(), serde_json::json!(false));
+        policy_as_object_mut(&mut policy)?.insert("mcp_enabled".into(), serde_json::json!(false));
         storage_state.save_policy(&policy)?;
 
         Ok(serde_json::json!({ "status": "ok" }))
     }
 }
 
+/// Returns the current MCP server status (enabled, port, running).
 #[tauri::command]
 async fn mcp_get_status(
     storage_state: tauri::State<'_, Arc<StorageState>>,
@@ -907,7 +925,7 @@ async fn mcp_reset_token(
 
     // Update policy
     let mut policy = storage_state.load_policy()?;
-    policy.as_object_mut().unwrap().insert("mcp_token_encrypted".into(), serde_json::json!(encrypted_b64));
+    policy_as_object_mut(&mut policy)?.insert("mcp_token_encrypted".into(), serde_json::json!(encrypted_b64));
     storage_state.save_policy(&policy)?;
 
     // Update runtime hash
@@ -938,7 +956,7 @@ async fn mcp_set_port(
     port: u16,
 ) -> Result<(), String> {
     let mut policy = storage_state.load_policy()?;
-    policy.as_object_mut().unwrap().insert("mcp_port".into(), serde_json::json!(port));
+    policy_as_object_mut(&mut policy)?.insert("mcp_port".into(), serde_json::json!(port));
     storage_state.save_policy(&policy)
 }
 
@@ -961,7 +979,7 @@ async fn mcp_set_sensitive_filter_config(
     let mut policy = storage_state.load_policy()?;
     let config_value = serde_json::to_value(&config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
-    policy.as_object_mut().unwrap().insert("sensitive_filter".into(), config_value);
+    policy_as_object_mut(&mut policy)?.insert("sensitive_filter".into(), config_value);
     storage_state.save_policy(&policy)
 }
 
@@ -1102,6 +1120,7 @@ fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Initializes the credential manager and Windows Hello key pair.
 #[tauri::command]
 async fn credential_initialize(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1140,6 +1159,7 @@ async fn credential_initialize(
     }
 }
 
+/// Prompts Windows Hello authentication and establishes a session.
 #[tauri::command]
 async fn credential_verify_user(
     state: tauri::State<'_, Arc<CredentialManagerState>>,

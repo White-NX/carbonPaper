@@ -26,6 +26,7 @@ use windows_capture::monitor::Monitor as WcMonitor;
 
 // ==================== Configuration ====================
 
+/// Configuration for screen capture behavior (intervals, quality, dedup thresholds).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureConfig {
     pub interval_secs: u64,
@@ -49,6 +50,7 @@ impl Default for CaptureConfig {
     }
 }
 
+/// Settings for excluding specific windows and processes from capture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExclusionSettings {
     pub exclusion_keywords: Vec<String>,
@@ -102,6 +104,7 @@ unsafe impl Send for DxgiCaptureSession {}
 /// from encrypted storage (which triggers Windows Hello CNG decryption).
 pub type OcrImageCache = Arc<Mutex<HashMap<i64, Vec<u8>>>>;
 
+/// Shared state for the capture subsystem, including pause/stop flags and OCR backpressure.
 pub struct CaptureState {
     pub paused: AtomicBool,
     pub stopped: AtomicBool,
@@ -143,7 +146,7 @@ impl CaptureState {
         let path = data_dir.join("monitor_filters.json");
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
-                let mut settings = self.exclusion_settings.lock().unwrap();
+                let mut settings = self.exclusion_settings.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(processes) = data.get("processes").and_then(|v| v.as_array()) {
                     settings.user_excluded_processes = processes
                         .iter()
@@ -173,7 +176,7 @@ impl CaptureState {
     }
 
     pub fn save_exclusion_settings(&self, data_dir: &std::path::Path) {
-        let settings = self.exclusion_settings.lock().unwrap();
+        let settings = self.exclusion_settings.lock().unwrap_or_else(|e| e.into_inner());
         let payload = serde_json::json!({
             "processes": settings.user_excluded_processes.iter().cloned().collect::<Vec<_>>(),
             "titles": settings.user_excluded_titles.iter().cloned().collect::<Vec<_>>(),
@@ -194,7 +197,7 @@ impl CaptureState {
         titles: Option<Vec<String>>,
         ignore_protected: Option<bool>,
     ) {
-        let mut settings = self.exclusion_settings.lock().unwrap();
+        let mut settings = self.exclusion_settings.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(procs) = processes {
             settings.user_excluded_processes = procs
                 .into_iter()
@@ -217,6 +220,7 @@ impl CaptureState {
 
 // ==================== Active Window Detection ====================
 
+/// Information about the currently focused window (handle, title, rect, PID).
 pub struct ActiveWindowInfo {
     hwnd_raw: isize,
     title: String,
@@ -456,7 +460,7 @@ fn capture_foreground_window(
         let hmonitor_val = hmonitor.0 as isize;
 
         // 2. Get or create DXGI session via windows-capture
-        let mut session_guard = dxgi_state.lock().unwrap();
+        let mut session_guard = dxgi_state.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check if we need to (re)create the session
         let need_create = match session_guard.as_ref() {
@@ -752,6 +756,8 @@ fn extract_process_icon_base64(exe_path: &str) -> Option<String> {
 
 // ==================== Main Capture Loop ====================
 
+/// Main loop that periodically captures screenshots of the active window,
+/// deduplicates via dHash, and dispatches OCR tasks to the Python backend.
 pub async fn run_capture_loop(
     capture_state: Arc<CaptureState>,
     storage: Arc<StorageState>,
@@ -770,7 +776,7 @@ pub async fn run_capture_loop(
 
     // Load config
     let (interval_secs, polling_rate_ms, max_side, jpeg_quality, dhash_threshold, dhash_history_size) = {
-        let config = capture_state.config.lock().unwrap();
+        let config = capture_state.config.lock().unwrap_or_else(|e| e.into_inner());
         (
             config.interval_secs,
             config.polling_rate_ms,
@@ -807,7 +813,7 @@ pub async fn run_capture_loop(
 
         // Exclusion check
         {
-            let settings = capture_state.exclusion_settings.lock().unwrap();
+            let settings = capture_state.exclusion_settings.lock().unwrap_or_else(|e| e.into_inner());
             if is_excluded(&window_info, &settings) {
                 last_hwnd_raw = current_hwnd_raw;
                 continue;
@@ -1071,7 +1077,7 @@ async fn process_ocr_async(
     // Store JPEG bytes in in-memory cache so Python can fetch via get_temp_image
     // without triggering CNG decryption (Windows Hello PIN).
     {
-        let mut cache = capture_state.ocr_image_cache.lock().unwrap();
+        let mut cache = capture_state.ocr_image_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.insert(screenshot_id, jpeg_bytes.clone());
     }
 
@@ -1089,7 +1095,7 @@ async fn process_ocr_async(
 
     // Always remove from cache regardless of success/failure
     {
-        let mut cache = capture_state.ocr_image_cache.lock().unwrap();
+        let mut cache = capture_state.ocr_image_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.remove(&screenshot_id);
     }
 
@@ -1120,11 +1126,11 @@ async fn process_ocr_inner(
 ) -> Result<(), String> {
     // Get pipe info for sending to Python
     let pipe_name = {
-        let guard = monitor_state.pipe_name.lock().unwrap();
+        let guard = monitor_state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
         guard.clone().ok_or_else(|| "Monitor pipe not available".to_string())?
     };
     let auth_token = {
-        let guard = monitor_state.auth_token.lock().unwrap();
+        let guard = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
         guard.clone().ok_or_else(|| "Auth token not available".to_string())?
     };
     let seq_no = monitor_state.request_counter.fetch_add(1, Ordering::SeqCst);
@@ -1176,4 +1182,96 @@ fn md5_hash(data: &[u8]) -> String {
     hasher.update(data);
     let result = hasher.finalize();
     hex::encode(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hamming_distance_identical() {
+        let hash = [0u64; 4];
+        assert_eq!(hamming_distance(&hash, &hash), 0);
+    }
+
+    #[test]
+    fn test_hamming_distance_all_different() {
+        let a = [0u64; 4];
+        let b = [u64::MAX; 4];
+        assert_eq!(hamming_distance(&a, &b), 256);
+    }
+
+    #[test]
+    fn test_hamming_distance_one_bit() {
+        let a = [0u64; 4];
+        let mut b = [0u64; 4];
+        b[0] = 1;
+        assert_eq!(hamming_distance(&a, &b), 1);
+    }
+
+    #[test]
+    fn test_get_process_name_from_path_exe() {
+        // get_process_name_from_path returns lowercase
+        assert_eq!(get_process_name_from_path(r"C:\Program Files\app.exe"), "app.exe");
+    }
+
+    #[test]
+    fn test_get_process_name_from_path_empty() {
+        assert_eq!(get_process_name_from_path(""), "");
+    }
+
+    #[test]
+    fn test_get_process_name_from_path_no_dir() {
+        assert_eq!(get_process_name_from_path("notepad.exe"), "notepad.exe");
+    }
+
+    #[test]
+    fn test_get_process_name_from_path_mixed_case() {
+        assert_eq!(get_process_name_from_path(r"C:\Windows\System32\Notepad.EXE"), "notepad.exe");
+    }
+
+    #[test]
+    fn test_md5_hash_known() {
+        assert_eq!(md5_hash(b"hello"), "5d41402abc4b2a76b9719d911017c592");
+    }
+
+    #[test]
+    fn test_md5_hash_empty() {
+        assert_eq!(md5_hash(b""), "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn test_compute_dhash_uniform_image() {
+        // A uniform white image should produce all-zero hash (no gradient differences)
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255])));
+        let hash = compute_dhash(&img, 8);
+        assert_eq!(hash, [0u64; 4]);
+    }
+
+    #[test]
+    fn test_compute_dhash_uniform_black() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 16, image::Rgb([0, 0, 0])));
+        let hash = compute_dhash(&img, 8);
+        assert_eq!(hash, [0u64; 4]);
+    }
+
+    #[test]
+    fn test_is_redundant_empty_history() {
+        let hash = [0u64; 4];
+        assert!(!is_redundant(&hash, &[], 10));
+    }
+
+    #[test]
+    fn test_is_redundant_identical() {
+        let hash = [0u64; 4];
+        assert!(is_redundant(&hash, &[hash], 10));
+    }
+
+    #[test]
+    fn test_is_redundant_above_threshold() {
+        let a = [0u64; 4];
+        let b = [u64::MAX; 4]; // distance = 256
+        // threshold=10: distance(256) >= threshold(10) so NOT redundant
+        assert!(!is_redundant(&a, &[b], 10));
+    }
 }

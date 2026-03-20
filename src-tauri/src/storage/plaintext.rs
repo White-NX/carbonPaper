@@ -27,7 +27,7 @@ impl StorageState {
         };
 
         // Scan screenshots directory
-        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let entries = std::fs::read_dir(&screenshot_dir)
             .map_err(|e| format!("Failed to read screenshot directory: {}", e))?;
 
@@ -102,7 +102,7 @@ impl StorageState {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
         let new_file_name = format!("{}.enc", file_name);
-        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let new_path = screenshot_dir.join(&new_file_name);
 
         // Save encrypted file
@@ -133,7 +133,7 @@ impl StorageState {
 
     /// List all plaintext (non-encrypted) screenshot files.
     pub fn list_plaintext_screenshots(&self) -> Result<Vec<String>, String> {
-        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let entries = std::fs::read_dir(&screenshot_dir)
             .map_err(|e| format!("Failed to read screenshot directory: {}", e))?;
 

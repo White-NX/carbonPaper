@@ -37,6 +37,7 @@ const DICT_FILES: &[(&str, &str)] = &[
     ("cat_05", "dict_05.dict.enc"),
 ];
 
+/// Configuration for sensitive data detection and masking (categories, mode, Presidio settings).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensitiveFilterConfig {
     pub enabled: bool,
@@ -82,6 +83,7 @@ impl Default for SensitiveFilterConfig {
     }
 }
 
+/// Shared state for the sensitive data filter (config, word lists, Aho-Corasick automaton).
 pub struct SensitiveFilterState {
     config: RwLock<SensitiveFilterConfig>,
     /// Per-category word lists, populated once via load_dicts()
@@ -385,4 +387,109 @@ fn decrypt_dict(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<String>, String>
         .collect();
 
     Ok(words)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a SensitiveFilterState with given words in a single category.
+    fn make_state_with_words(words: Vec<&str>) -> SensitiveFilterState {
+        let state = SensitiveFilterState::default();
+        {
+            let mut wl = state.word_lists.write().unwrap();
+            wl.insert(
+                "cat_01".to_string(),
+                words.into_iter().map(|w| w.to_string()).collect(),
+            );
+        }
+        // Rebuild automaton with default config (all categories enabled)
+        let config = state.get_config();
+        state.rebuild_automaton(&config);
+        state
+    }
+
+    #[test]
+    fn test_contains_sensitive_match() {
+        let state = make_state_with_words(vec!["secret", "password"]);
+        assert!(state.contains_sensitive("my secret data"));
+        assert!(state.contains_sensitive("enter your password here"));
+    }
+
+    #[test]
+    fn test_contains_sensitive_no_match() {
+        let state = make_state_with_words(vec!["secret", "password"]);
+        assert!(!state.contains_sensitive("hello world"));
+    }
+
+    #[test]
+    fn test_contains_sensitive_case_insensitive() {
+        let state = make_state_with_words(vec!["secret"]);
+        assert!(state.contains_sensitive("MY SECRET DATA"));
+        assert!(state.contains_sensitive("Secret"));
+    }
+
+    #[test]
+    fn test_contains_sensitive_disabled() {
+        let state = make_state_with_words(vec!["secret"]);
+        // Disable the filter
+        let mut config = state.get_config();
+        config.enabled = false;
+        state.update_config(config);
+        assert!(!state.contains_sensitive("this is secret"));
+    }
+
+    #[test]
+    fn test_mask_sensitive_basic() {
+        let state = make_state_with_words(vec!["secret"]);
+        let result = state.mask_sensitive("my secret data");
+        assert!(!result.contains("secret"), "masked text should not contain 'secret': {}", result);
+        assert!(result.contains("my "), "non-sensitive part should remain");
+        assert!(result.contains(" data"), "non-sensitive part should remain");
+    }
+
+    #[test]
+    fn test_mask_sensitive_no_match() {
+        let state = make_state_with_words(vec!["secret"]);
+        let result = state.mask_sensitive("hello world");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_mask_sensitive_disabled() {
+        let state = make_state_with_words(vec!["secret"]);
+        let mut config = state.get_config();
+        config.enabled = false;
+        state.update_config(config);
+        let result = state.mask_sensitive("my secret data");
+        assert_eq!(result, "my secret data");
+    }
+
+    #[test]
+    fn test_is_record_sensitive() {
+        let state = make_state_with_words(vec!["secret"]);
+        assert!(state.is_record_sensitive(Some("secret title"), &[]));
+        assert!(state.is_record_sensitive(None, &["contains secret text"]));
+        assert!(!state.is_record_sensitive(Some("normal title"), &["normal text"]));
+    }
+
+    #[test]
+    fn test_short_words_filtered() {
+        // Words shorter than MIN_WORD_CHARS (2) should be excluded
+        let state = make_state_with_words(vec!["a", "ab", "abc"]);
+        // "a" is too short (1 char), should not match
+        assert!(!state.contains_sensitive("a"));
+        // "ab" meets the minimum, should match
+        assert!(state.contains_sensitive("ab"));
+        assert!(state.contains_sensitive("abc"));
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = SensitiveFilterConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.mode, "reject");
+        assert!(config.presidio_enabled);
+        assert_eq!(config.categories.len(), CATEGORY_IDS.len());
+    }
 }

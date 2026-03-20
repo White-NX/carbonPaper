@@ -22,12 +22,16 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tauri::AppHandle;
 use tauri::Emitter;
+/// Errors that can occur when locating the Python interpreter.
 #[derive(Debug)]
 pub enum FindPythonError {
+    /// Failed to access the Windows Registry.
     RegistryAccessError(io::Error),
 
+    /// The `Software\Python\PythonCore` registry key was not found.
     PythonCoreKeyNotFound,
 
+    /// Python installations were found, but none matched the required version.
     NoMatchingVersionFound,
 }
 
@@ -410,7 +414,7 @@ fn perform_install_python_venv(
     // 检查是否为打包好的虚拟环境
     if venv_dir.exists() && venv_dir.join("Scripts").join("python.exe").exists() {
         writeln!(
-            log_file.lock().unwrap(),
+            log_file.lock().unwrap_or_else(|e| e.into_inner()),
             "Found packaged virtual env at: {:?}",
             venv_dir
         )?;
@@ -421,7 +425,7 @@ fn perform_install_python_venv(
         );
     } else {
         writeln!(
-            log_file.lock().unwrap(),
+            log_file.lock().unwrap_or_else(|e| e.into_inner()),
             "Creating virtual environment at: {:?} by using {:?}",
             venv_dir,
             python_path
@@ -435,13 +439,13 @@ fn perform_install_python_venv(
         // 如果本地 .venv 已存在，先删除
         if venv_dir.exists() {
             writeln!(
-                log_file.lock().unwrap(),
+                log_file.lock().unwrap_or_else(|e| e.into_inner()),
                 "Existing venv found at {:?}, removing...",
                 venv_dir
             )?;
             let _ = app.emit("install-log", json!({"source":"installer","line": format!("Existing venv found at {:?}, removing...", venv_dir)}));
             fs::remove_dir_all(&venv_dir).map_err(|e| {
-                writeln!(log_file.lock().unwrap(), "Failed to remove existing venv: {}", e).ok();
+                writeln!(log_file.lock().unwrap_or_else(|e| e.into_inner()), "Failed to remove existing venv: {}", e).ok();
                 let _ = app.emit("install-log", json!({"source":"installer","line": format!("Failed to remove existing venv: {}", e)}));
                 io::Error::new(
                     io::ErrorKind::Other,
@@ -449,7 +453,7 @@ fn perform_install_python_venv(
                 )
             })?;
             writeln!(
-                log_file.lock().unwrap(),
+                log_file.lock().unwrap_or_else(|e| e.into_inner()),
                 "Removed existing venv at {:?}",
                 venv_dir
             )?;
@@ -463,7 +467,7 @@ fn perform_install_python_venv(
         // 使用指定 python 可执行文件或 PATH 中的 python
         let python_cmd = python_path.unwrap_or("python");
         writeln!(
-            log_file.lock().unwrap(),
+            log_file.lock().unwrap_or_else(|e| e.into_inner()),
             "Using python executable: {}",
             python_cmd
         )?;
@@ -484,7 +488,7 @@ fn perform_install_python_venv(
         }
         let status = venv_cmd.status().map_err(|e| {
             writeln!(
-                log_file.lock().unwrap(),
+                log_file.lock().unwrap_or_else(|e| e.into_inner()),
                 "Failed to spawn venv process: {}",
                 e
             )
@@ -496,7 +500,7 @@ fn perform_install_python_venv(
         })?;
 
         writeln!(
-            log_file.lock().unwrap(),
+            log_file.lock().unwrap_or_else(|e| e.into_inner()),
             "Venv command exit status: {:?}",
             status
         )?;
@@ -508,7 +512,7 @@ fn perform_install_python_venv(
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "unknown".into());
             writeln!(
-                log_file.lock().unwrap(),
+                log_file.lock().unwrap_or_else(|e| e.into_inner()),
                 "ERROR: creating virtualenv with '{}' failed (exit code {}).",
                 python_cmd,
                 exit_code
@@ -523,7 +527,7 @@ fn perform_install_python_venv(
         }
 
         writeln!(
-            log_file.lock().unwrap(),
+            log_file.lock().unwrap_or_else(|e| e.into_inner()),
             "Virtual environment created at: {:?} using {}.",
             venv_dir,
             python_cmd
@@ -540,7 +544,7 @@ fn perform_install_python_venv(
     }
 
     {
-        let mut f = log_file.lock().unwrap();
+        let mut f = log_file.lock().unwrap_or_else(|e| e.into_inner());
         writeln!(&mut *f, "Using virtual env at: {:?}", venv_dir)?;
         writeln!(&mut *f, "Installing required packages...")?;
     }
@@ -549,7 +553,7 @@ fn perform_install_python_venv(
     let python_exec = venv_dir.join("Scripts").join("python.exe");
     let pip_exec = venv_dir.join("Scripts").join("pip.exe");
     if !python_exec.is_file() || !pip_exec.is_file() {
-        let mut f = log_file.lock().unwrap();
+        let mut f = log_file.lock().unwrap_or_else(|e| e.into_inner());
         writeln!(
             &mut *f,
             "ERROR: venv is missing executables. python.exe exists: {}, pip.exe exists: {}",
@@ -567,7 +571,7 @@ fn perform_install_python_venv(
     let requirements_path = file_in_resources(app, "monitor/requirements.txt")
         .unwrap_or_else(|| PathBuf::from("monitor/requirements.txt"));
     {
-        let mut f = log_file.lock().unwrap();
+        let mut f = log_file.lock().unwrap_or_else(|e| e.into_inner());
         writeln!(
             &mut *f,
             "Installing from requirements file at: {:?}",
@@ -600,7 +604,7 @@ fn perform_install_python_venv(
 
     // spawn 子进程（不要用 .output()）
     let mut child = cmd_proc.spawn().map_err(|e| {
-        let mut f = log_file.lock().unwrap();
+        let mut f = log_file.lock().unwrap_or_else(|e| e.into_inner());
         writeln!(&mut *f, "Failed to spawn pip process: {}", e).ok();
         tracing::error!(
             "perform_install_python_venv: failed to spawn pip process: {}",

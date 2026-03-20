@@ -164,7 +164,7 @@ async fn connect_to_pipe(
     Err(last_error)
 }
 
-// 内部函数：发送 IPC 请求 (通用) - 添加认证和序列号
+/// Sends a JSON request to the Python process via named pipe IPC, adding auth token and sequence number.
 pub async fn send_ipc_request(
     pipe_name: &str,
     auth_token: &str,
@@ -237,6 +237,7 @@ impl Drop for CpuLimitGuard {
     }
 }
 
+/// Sends an arbitrary command to the Python monitor via IPC.
 #[tauri::command]
 pub async fn execute_monitor_command(
     state: State<'_, MonitorState>,
@@ -267,7 +268,7 @@ pub async fn execute_monitor_command(
                 .and_then(|v| v.as_bool());
 
             {
-                let data_dir = storage.data_dir.lock().unwrap().clone();
+                let data_dir = storage.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 capture_state.update_exclusion_settings(
                     processes,
                     titles,
@@ -395,6 +396,7 @@ fn create_job_object(cpu_limit_enabled: bool, cpu_limit_percent: u32) -> Result<
     }
 }
 
+/// Starts the Python monitor subprocess for screenshot capture and OCR.
 #[tauri::command]
 pub async fn start_monitor(
     state: State<'_, MonitorState>,
@@ -825,7 +827,7 @@ fn spawn_capture_loop(app: &AppHandle) {
 
     // Load exclusion settings from disk
     {
-        let data_dir = storage.data_dir.lock().unwrap().clone();
+        let data_dir = storage.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
         capture_state.load_exclusion_settings(&data_dir);
     }
 
@@ -863,12 +865,13 @@ fn spawn_capture_loop(app: &AppHandle) {
         }
     });
 
-    let mut guard = capture_state.capture_task.lock().unwrap();
+    let mut guard = capture_state.capture_task.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(handle);
 
     tracing::info!("Rust capture loop spawned");
 }
 
+/// Stops the Python monitor subprocess and the Rust capture loop.
 #[tauri::command]
 pub async fn stop_monitor(
     state: State<'_, MonitorState>,
@@ -880,7 +883,7 @@ pub async fn stop_monitor(
 
     // Abort the capture task
     {
-        let mut guard = capture_state.capture_task.lock().unwrap();
+        let mut guard = capture_state.capture_task.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(handle) = guard.take() {
             handle.abort();
         }
@@ -952,6 +955,7 @@ pub async fn stop_monitor(
     Ok("Monitor stopped".into())
 }
 
+/// Pauses screenshot capture without stopping the Python process.
 #[tauri::command]
 pub async fn pause_monitor(
     state: State<'_, MonitorState>,
@@ -963,6 +967,7 @@ pub async fn pause_monitor(
     send_ipc_command_internal(&state, "pause").await
 }
 
+/// Resumes screenshot capture after a pause.
 #[tauri::command]
 pub async fn resume_monitor(
     state: State<'_, MonitorState>,

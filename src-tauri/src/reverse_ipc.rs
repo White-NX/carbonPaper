@@ -18,11 +18,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc;
 
-/// 来自 Python 的存储请求
+/// Commands that Python can send to Rust via the reverse IPC named pipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command")]
 pub enum StorageCommand {
-    /// 保存截图
+    /// Save a screenshot with image data, metadata, and optional OCR results.
     #[serde(rename = "save_screenshot")]
     SaveScreenshot {
         image_data: String,
@@ -34,7 +34,7 @@ pub enum StorageCommand {
         metadata: Option<serde_json::Value>,
         ocr_results: Option<Vec<OcrResultInput>>,
     },
-    /// 临时保存截图（pending），等待后续 commit/abort
+    /// Save a screenshot as pending, awaiting a subsequent commit or abort.
     #[serde(rename = "save_screenshot_temp")]
     SaveScreenshotTemp {
         image_data: String,
@@ -45,32 +45,32 @@ pub enum StorageCommand {
         process_name: Option<String>,
         metadata: Option<serde_json::Value>,
     },
-    /// 提交之前临时保存的截图并写入 OCR 结果
+    /// Commit a pending screenshot and write its OCR results.
     #[serde(rename = "commit_screenshot")]
     CommitScreenshot {
         screenshot_id: String,
         ocr_results: Option<Vec<OcrResultInput>>,
     },
-    /// 中止之前临时保存的截图（删除临时文件并回滚记录）
+    /// Abort a pending screenshot (delete temp files and roll back the DB record).
     #[serde(rename = "abort_screenshot")]
     AbortScreenshot {
         screenshot_id: String,
         reason: Option<String>,
     },
-    /// 获取公钥
+    /// Retrieve the RSA public key for encryption.
     #[serde(rename = "get_public_key")]
     GetPublicKey,
-    /// 加密数据（用于 ChromaDB）
+    /// Encrypt plaintext data for storage in ChromaDB.
     #[serde(rename = "encrypt_for_chromadb")]
     EncryptForChromaDb {
         plaintext: String,
     },
-    /// 解密数据
+    /// Decrypt data previously encrypted for ChromaDB.
     #[serde(rename = "decrypt_from_chromadb")]
     DecryptFromChromaDb {
         encrypted: String,
     },
-    /// 检查截图是否存在
+    /// Check whether a screenshot with the given hash already exists.
     #[serde(rename = "screenshot_exists")]
     ScreenshotExists {
         image_hash: String,
@@ -79,7 +79,7 @@ pub enum StorageCommand {
 
 // Use OcrResultInput from crate::storage to keep a single canonical type
 
-/// 存储响应
+/// Response sent back to Python after processing a storage command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageResponse {
     pub status: String,
@@ -107,7 +107,7 @@ impl StorageResponse {
     }
 }
 
-/// 反向 IPC 服务器状态
+/// Named pipe server for Python-to-Rust reverse IPC (storage requests).
 pub struct ReverseIpcServer {
     pipe_name: String,
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -121,7 +121,7 @@ impl ReverseIpcServer {
         }
     }
     
-    /// 启动服务器
+    /// Start the named pipe server that listens for Python storage requests.
     pub fn start(&mut self, storage: Arc<StorageState>, ocr_cache: OcrImageCache) -> Result<(), String> {
         let pipe_name = self.pipe_name.clone();
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -129,7 +129,13 @@ impl ReverseIpcServer {
 
         // 在新线程中运行 tokio runtime
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to create runtime: {}", e);
+                    return;
+                }
+            };
 
             rt.block_on(async move {
                 let full_pipe_name = format!(r"\\.\pipe\{}", pipe_name);
@@ -491,7 +497,7 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
 
             // Look up the in-memory cache first (no CNG decryption needed)
             let cached = {
-                let cache = ocr_cache.lock().unwrap();
+                let cache = ocr_cache.lock().unwrap_or_else(|e| e.into_inner());
                 cache.get(&screenshot_id).cloned()
             };
 
@@ -704,7 +710,13 @@ impl NmhPipeServer {
         tracing::info!("Starting NMH pipe server on {}", pipe_name);
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create NMH runtime");
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("Failed to create NMH runtime: {}", e);
+                    return;
+                }
+            };
 
             rt.block_on(async move {
                 loop {
@@ -920,7 +932,7 @@ async fn process_nmh_request(
                         ) {
                             // Store in OCR cache so Python can fetch via get_temp_image
                             {
-                                let mut cache = capture_state.ocr_image_cache.lock().unwrap();
+                                let mut cache = capture_state.ocr_image_cache.lock().unwrap_or_else(|e| e.into_inner());
                                 cache.insert(screenshot_id, jpeg_bytes);
                             }
 
@@ -948,7 +960,7 @@ async fn process_nmh_request(
 
                                 // Remove from OCR cache
                                 {
-                                    let mut cache = capture_arc.ocr_image_cache.lock().unwrap();
+                                    let mut cache = capture_arc.ocr_image_cache.lock().unwrap_or_else(|e| e.into_inner());
                                     cache.remove(&screenshot_id);
                                 }
 
@@ -1071,11 +1083,11 @@ async fn process_extension_ocr(
     timestamp_ms: i64,
 ) -> Result<(), String> {
     let pipe_name = {
-        let guard = monitor_state.pipe_name.lock().unwrap();
+        let guard = monitor_state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
         guard.clone().ok_or_else(|| "Monitor pipe not available".to_string())?
     };
     let auth_token = {
-        let guard = monitor_state.auth_token.lock().unwrap();
+        let guard = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
         guard.clone().ok_or_else(|| "Auth token not available".to_string())?
     };
     let seq_no = monitor_state.request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1112,4 +1124,77 @@ async fn process_extension_ocr(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_storage_response_success() {
+        let resp = StorageResponse::success(serde_json::json!({"id": 1}));
+        assert_eq!(resp.status, "success");
+        assert!(resp.error.is_none());
+        assert!(resp.data.is_some());
+        assert_eq!(resp.data.unwrap()["id"], 1);
+    }
+
+    #[test]
+    fn test_storage_response_error() {
+        let resp = StorageResponse::error("something failed");
+        assert_eq!(resp.status, "error");
+        assert_eq!(resp.error.unwrap(), "something failed");
+        assert!(resp.data.is_none());
+    }
+
+    #[test]
+    fn test_storage_response_success_serialization() {
+        let resp = StorageResponse::success(serde_json::json!({"key": "value"}));
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"status\":\"success\""));
+        assert!(json.contains("\"key\":\"value\""));
+        // error field should be skipped (skip_serializing_if = "Option::is_none")
+        assert!(!json.contains("\"error\""));
+    }
+
+    #[test]
+    fn test_storage_response_error_serialization() {
+        let resp = StorageResponse::error("bad request");
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"status\":\"error\""));
+        assert!(json.contains("\"error\":\"bad request\""));
+        // data field should be skipped
+        assert!(!json.contains("\"data\""));
+    }
+
+    #[test]
+    fn test_process_name_to_browser_type_chrome() {
+        assert_eq!(process_name_to_browser_type("chrome.exe"), "chrome");
+    }
+
+    #[test]
+    fn test_process_name_to_browser_type_edge() {
+        assert_eq!(process_name_to_browser_type("msedge.exe"), "edge");
+    }
+
+    #[test]
+    fn test_process_name_to_browser_type_unknown() {
+        // Unknown browsers default to "chrome"
+        assert_eq!(process_name_to_browser_type("firefox.exe"), "chrome");
+    }
+
+    #[test]
+    fn test_generate_reverse_pipe_name_format() {
+        let name = generate_reverse_pipe_name();
+        assert!(name.starts_with("carbon_storage_"), "pipe name should start with 'carbon_storage_': {}", name);
+        // The random suffix is 32 bytes * 2 hex chars = 64 chars
+        assert_eq!(name.len(), "carbon_storage_".len() + 64);
+    }
+
+    #[test]
+    fn test_generate_reverse_pipe_name_unique() {
+        let name1 = generate_reverse_pipe_name();
+        let name2 = generate_reverse_pipe_name();
+        assert_ne!(name1, name2, "Two generated pipe names should be different");
+    }
 }

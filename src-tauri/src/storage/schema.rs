@@ -12,14 +12,14 @@ impl StorageState {
     /// Initialize storage (create directories and database).
     pub fn initialize(&self) -> Result<(), String> {
         let init_start = std::time::Instant::now();
-        let mut initialized = self.initialized.lock().unwrap();
+        let mut initialized = self.initialized.lock().unwrap_or_else(|e| e.into_inner());
         if *initialized {
             return Ok(());
         }
 
         // Create directories
-        let data_dir = self.data_dir.lock().unwrap().clone();
-        let screenshot_dir = self.screenshot_dir.lock().unwrap().clone();
+        let data_dir = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data directory: {}", e))?;
@@ -57,12 +57,12 @@ impl StorageState {
         self.init_tables(&conn)?;
         let tables_dur = t3.elapsed();
 
-        *self.db.lock().unwrap() = Some(conn);
+        *self.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn);
 
         // Initialize approximate OCR row count using MAX(id) — O(log N) via primary key index.
         // AUTOINCREMENT ids only increase, so MAX(id) >= actual row count; acceptable for IDF.
         {
-            let guard = self.db.lock().unwrap();
+            let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(conn) = guard.as_ref() {
                 let approx_count: i64 = conn
                     .query_row(

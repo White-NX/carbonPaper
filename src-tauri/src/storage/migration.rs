@@ -55,9 +55,9 @@ impl StorageState {
         cancelled: bool,
     ) -> Result<serde_json::Value, String> {
         {
-            let mut data_guard = self.data_dir.lock().unwrap();
+            let mut data_guard = self.data_dir.lock().unwrap_or_else(|e| e.into_inner());
             *data_guard = src.clone();
-            let mut ss_guard = self.screenshot_dir.lock().unwrap();
+            let mut ss_guard = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner());
             *ss_guard = src.join("screenshots");
         }
 
@@ -107,7 +107,7 @@ impl StorageState {
         let _migration_guard =
             MigrationRunGuard::new(&self.migration_in_progress, &self.migration_cancel_requested);
 
-        let src = self.data_dir.lock().unwrap().clone();
+        let src = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // User selects a storage root; actual data_dir is always under its "data" subdirectory
         let dst = PathBuf::from(&target).join("data");
 
@@ -339,9 +339,9 @@ impl StorageState {
         }
 
         {
-            let mut data_guard = self.data_dir.lock().unwrap();
+            let mut data_guard = self.data_dir.lock().unwrap_or_else(|e| e.into_inner());
             *data_guard = dst.clone();
-            let mut ss_guard = self.screenshot_dir.lock().unwrap();
+            let mut ss_guard = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner());
             *ss_guard = dst.join("screenshots");
         }
 

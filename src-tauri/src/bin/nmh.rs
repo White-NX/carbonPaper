@@ -124,7 +124,7 @@ fn send_nm_response(stdout_mutex: &Arc<Mutex<io::Stdout>>, value: &serde_json::V
     let data = serde_json::to_vec(value).unwrap_or_default();
     let len = (data.len() as u32).to_le_bytes();
 
-    let mut handle = stdout_mutex.lock().unwrap();
+    let mut handle = stdout_mutex.lock().unwrap_or_else(|e| e.into_inner());
     let _ = handle.write_all(&len);
     let _ = handle.write_all(&data);
     let _ = handle.flush();
@@ -472,7 +472,7 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
                     let len = (data.len() as u32).to_le_bytes();
 
                     {
-                        let mut handle = stdout_mutex.lock().unwrap();
+                        let mut handle = stdout_mutex.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = handle.write_all(&len);
                         let _ = handle.write_all(&data);
                         let _ = handle.flush();

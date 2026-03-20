@@ -14,12 +14,14 @@ const MEMORY_WINDOW: Duration = Duration::from_secs(30 * 60);
 const STORAGE_CACHE_TTL: Duration = Duration::from_secs(5 * 60 * 60);
 const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// A single data point for memory usage tracking (timestamp + RSS bytes).
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryPoint {
     pub timestamp_ms: u64,
     pub rss_bytes: u64,
 }
 
+/// Database and disk storage statistics (images, models, database sizes).
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageStats {
     pub root_path: String,
@@ -31,6 +33,7 @@ pub struct StorageStats {
     pub cached_at_ms: u64,
 }
 
+/// Combined analysis data including memory history and storage statistics.
 #[derive(Debug, Clone, Serialize)]
 pub struct AnalysisOverview {
     pub memory: Vec<MemoryPoint>,
@@ -42,6 +45,7 @@ struct StorageCache {
     stats: StorageStats,
 }
 
+/// Shared state for the analysis subsystem (memory history and storage cache).
 pub struct AnalysisState {
     pub memory_history: Mutex<VecDeque<MemoryPoint>>,
     pub storage_cache: Mutex<Option<StorageCache>>,
@@ -157,7 +161,7 @@ pub fn start_memory_sampler(app: AppHandle) {
 
             let pid_opt = {
                 let monitor_state = app.state::<MonitorState>();
-                let mut guard = monitor_state.process.lock().unwrap();
+                let mut guard = monitor_state.process.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(child) = guard.as_mut() {
                     if let Ok(Some(_)) = child.try_wait() {
                         *guard = None;
@@ -213,7 +217,7 @@ pub async fn get_analysis_overview(
     }
 
     // 从 StorageState 获取实际的 data_dir
-    let data_dir = storage_state.data_dir.lock().unwrap().clone();
+    let data_dir = storage_state.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
     // Perform expensive storage computation on a blocking thread.
     let stats = tokio::task::spawn_blocking(move || compute_storage_stats(data_dir))
