@@ -10,6 +10,10 @@
         "label": "Allow sending telemetry diagnostic data",
         "description": "Allow program to upload error logs that do not contain privacy data to the telemetry server."
       },
+      "powerSaving": {
+        "label": "Power Saving Mode",
+        "description": "Automatically stop the Python subservice to save battery when AC power is disconnected."
+      },
       "gameMode": {
         "label": "Game Mode",
         "description": "Automatically disable DirectML when high GPU load is detected to reduce impact on game performance",

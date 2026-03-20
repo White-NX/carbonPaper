@@ -39,6 +39,18 @@ fn policy_as_object_mut(policy: &mut serde_json::Value) -> Result<&mut serde_jso
 }
 
 #[tauri::command]
+fn frontend_log(level: &str, message: &str) {
+    match level {
+        "error" => tracing::error!("[FRONTEND] {}", message),
+        "warn" => tracing::warn!("[FRONTEND] {}", message),
+        "info" => tracing::info!("[FRONTEND] {}", message),
+        "debug" => tracing::debug!("[FRONTEND] {}", message),
+        "trace" => tracing::trace!("[FRONTEND] {}", message),
+        _ => tracing::info!("[FRONTEND] {}", message),
+    }
+}
+
+#[tauri::command]
 fn get_log_dir() -> String {
     let data_dir = get_data_dir();
     data_dir.join("logs").to_string_lossy().to_string()
@@ -1691,6 +1703,7 @@ pub fn run() {
             get_extension_enhancement_config,
             set_extension_enhancement,
             // Error window commands
+            frontend_log,
             get_log_dir,
             restart_app,
             trigger_test_error,
