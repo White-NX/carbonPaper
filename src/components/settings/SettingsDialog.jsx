@@ -31,6 +31,7 @@ function SettingsDialog({
   onSessionTimeoutChange,
   isSessionValid,
   onLockSession,
+  powerSavingSuppressed,
 }) {
   const [activeTab, setActiveTab] = useState('general');
   const [lowResolutionAnalysis, setLowResolutionAnalysis] = useState(() => localStorage.getItem('lowResolutionAnalysis') === 'true');
@@ -467,6 +468,7 @@ function SettingsDialog({
                 autoLaunchLoading={autoLaunchLoading}
                 autoLaunchMessage={autoLaunchMessage}
                 onToggleAutoLaunch={handleToggleAutoLaunch}
+                powerSavingSuppressed={powerSavingSuppressed}
               />
 
               <GeneralOptionsSection

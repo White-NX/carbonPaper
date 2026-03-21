@@ -31,6 +31,7 @@
         "pause": "Pause",
         "stop": "Stop",
         "restart": "Restart",
+        "power_saving_blocked": "Power saving mode is active. Connect AC power to start the service.",
         "autoStart": {
           "label": "Auto-start Subservice",
           "description": "When enabled the app will attempt to launch the Python subservice on startup.",

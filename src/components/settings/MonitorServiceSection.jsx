@@ -15,6 +15,7 @@ export default function MonitorServiceSection({
   autoLaunchLoading,
   autoLaunchMessage,
   onToggleAutoLaunch,
+  powerSavingSuppressed,
 }) {
   const { t } = useTranslation();
   return (
@@ -49,13 +50,17 @@ export default function MonitorServiceSection({
               </span>
             </label>
             <p className="text-xs text-ide-muted">{t('settings.general.monitor.description')}</p>
+            {powerSavingSuppressed && monitorStatus === 'stopped' && (
+              <p className="text-xs text-yellow-500">{t('settings.general.monitor.power_saving_blocked')}</p>
+            )}
           </div>
           <div className="flex gap-2 shrink-0">
             {monitorStatus === 'stopped' || monitorStatus === 'waiting' ? (
               <button
                 onClick={onStart}
-                disabled={monitorStatus === 'loading' || monitorStatus === 'waiting'}
+                disabled={monitorStatus === 'loading' || monitorStatus === 'waiting' || powerSavingSuppressed}
                 className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
+                title={powerSavingSuppressed ? t('settings.general.monitor.power_saving_blocked') : undefined}
               >
                 {monitorStatus === 'waiting' ? (
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />

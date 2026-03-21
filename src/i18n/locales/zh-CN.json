@@ -31,6 +31,7 @@
         "pause": "暂停",
         "stop": "停止",
         "restart": "重启",
+        "power_saving_blocked": "节电模式已激活，无法启动子服务。请接入电源后重试。",
         "autoStart": {
           "label": "启动时自动子服务",
           "description": "开启后应用启动时会自动尝试拉起 Python 子服务。",

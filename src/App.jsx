@@ -56,6 +56,7 @@ function App() {
     return saved === null ? true : saved === 'true';
   });
   const [autoStartSuppressed, setAutoStartSuppressed] = useState(false);
+  const [powerSavingSuppressed, setPowerSavingSuppressed] = useState(false);
 
   // Windows Hello Authentication State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -895,7 +896,7 @@ function App() {
         />
 
         <AuthMask
-          isVisible={backendStatus === 'online' && pythonVersion && !isAuthenticated}
+          isVisible={pythonVersion && !isAuthenticated}
           onAuthSuccess={handleAuthSuccess}
           authError={authError}
           setAuthError={setAuthError}
@@ -1027,6 +1028,7 @@ function App() {
         onClose={() => setShowSettings(false)}
         autoStartMonitor={autoStartMonitor}
         onRecordsDeleted={bumpTimelineRefresh}
+        powerSavingSuppressed={powerSavingSuppressed}
         onAutoStartMonitorChange={(next) => {
           setAutoStartMonitor(next);
           if (next) {
