@@ -37,6 +37,8 @@ pub struct MonitorState {
     pub game_mode_permanently_suppressed: AtomicBool,
     /// Game mode: background task handle for monitoring game mode changes (so we can stop it when monitor stops)
     pub game_mode_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// Set to true during intentional stop_monitor to suppress the watcher's monitor-exited event
+    pub stopping: AtomicBool,
 }
 
 impl MonitorState {
@@ -52,6 +54,7 @@ impl MonitorState {
             game_mode_dml_suppressed: AtomicBool::new(false),
             game_mode_permanently_suppressed: AtomicBool::new(false),
             game_mode_task: Mutex::new(None),
+            stopping: AtomicBool::new(false),
         }
     }
 }
@@ -405,6 +408,10 @@ pub async fn start_monitor(
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|e| format!("<failed to get cwd: {}>", e));
+
+    // Reset the stopping flag for a fresh start
+    state.stopping.store(false, Ordering::SeqCst);
+
     let stdout_cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     // 寻找 python 脚本路径，按优先级尝试多种方式
@@ -718,21 +725,27 @@ pub async fn start_monitor(
                     Ok(Some(status)) => {
                         *guard = None;
                         drop(guard);
-                        let code = status
-                            .code()
-                            .map(|c| c.to_string())
-                            .unwrap_or_else(|| "unknown".to_string());
-                        let _ = app_clone.emit("monitor-exited", serde_json::json!({"code": code}));
+                        // Don't emit monitor-exited during intentional stop
+                        if !state.stopping.load(Ordering::SeqCst) {
+                            let code = status
+                                .code()
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let _ = app_clone.emit("monitor-exited", serde_json::json!({"code": code}));
+                        }
                         break;
                     }
                     Ok(None) => {}
                     Err(e) => {
                         *guard = None;
                         drop(guard);
-                        let _ = app_clone.emit(
-                            "monitor-exited",
-                            serde_json::json!({"code": "unknown", "error": e.to_string()}),
-                        );
+                        // Don't emit monitor-exited during intentional stop
+                        if !state.stopping.load(Ordering::SeqCst) {
+                            let _ = app_clone.emit(
+                                "monitor-exited",
+                                serde_json::json!({"code": "unknown", "error": e.to_string()}),
+                            );
+                        }
                         break;
                     }
                 }
@@ -881,6 +894,9 @@ pub async fn stop_monitor(
     capture_state.stopped.store(true, Ordering::SeqCst);
     capture_state.paused.store(false, Ordering::SeqCst);
 
+    // Signal the watcher thread to suppress monitor-exited event
+    state.stopping.store(true, Ordering::SeqCst);
+
     // Abort the capture task
     {
         let mut guard = capture_state.capture_task.lock().unwrap_or_else(|e| e.into_inner());
@@ -951,6 +967,8 @@ pub async fn stop_monitor(
             .unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
+
+    state.stopping.store(false, Ordering::SeqCst);
 
     Ok("Monitor stopped".into())
 }

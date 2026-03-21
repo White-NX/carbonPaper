@@ -31,6 +31,9 @@ function SettingsDialog({
   onSessionTimeoutChange,
   isSessionValid,
   onLockSession,
+  powerSavingSuppressed,
+  powerSavingMode,
+  onPowerSavingModeChange,
 }) {
   const [activeTab, setActiveTab] = useState('general');
   const [lowResolutionAnalysis, setLowResolutionAnalysis] = useState(() => localStorage.getItem('lowResolutionAnalysis') === 'true');
@@ -467,6 +470,7 @@ function SettingsDialog({
                 autoLaunchLoading={autoLaunchLoading}
                 autoLaunchMessage={autoLaunchMessage}
                 onToggleAutoLaunch={handleToggleAutoLaunch}
+                powerSavingSuppressed={powerSavingSuppressed}
               />
 
               <GeneralOptionsSection
@@ -474,6 +478,8 @@ function SettingsDialog({
                 onToggleLowRes={() => setLowResolutionAnalysis((v) => !v)}
                 sendTelemetryDiagnostics={sendTelemetryDiagnostics}
                 onToggleTelemetry={() => setSendTelemetryDiagnostics((v) => !v)}
+                powerSavingMode={powerSavingMode}
+                onTogglePowerSaving={() => onPowerSavingModeChange?.(!powerSavingMode)}
               />
             </div>
           )}

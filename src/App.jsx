@@ -57,6 +57,41 @@ function App() {
   });
   const [autoStartSuppressed, setAutoStartSuppressed] = useState(false);
 
+  // Power Saving Mode State
+  const [powerSavingMode, setPowerSavingMode] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    const saved = localStorage.getItem('powerSavingMode');
+    return saved === null ? true : saved === 'true';
+  });
+  const [powerSavingSuppressed, setPowerSavingSuppressed] = useState(false);
+
+  useEffect(() => {
+    localStorage.setItem('powerSavingMode', powerSavingMode ? 'true' : 'false');
+  }, [powerSavingMode]);
+
+  useEffect(() => {
+    if (!('getBattery' in navigator)) return;
+
+    let battery = null;
+    const handleBatteryChange = () => {
+      if (battery) {
+        setPowerSavingSuppressed(powerSavingMode && !battery.charging);
+      }
+    };
+
+    navigator.getBattery().then(b => {
+      battery = b;
+      handleBatteryChange();
+      b.addEventListener('chargingchange', handleBatteryChange);
+    });
+
+    return () => {
+      if (battery) {
+        battery.removeEventListener('chargingchange', handleBatteryChange);
+      }
+    };
+  }, [powerSavingMode])
+
   // Windows Hello Authentication State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authError, setAuthError] = useState(null);
@@ -681,7 +716,7 @@ function App() {
         const msg = event.payload?.message || event.payload || 'Unknown error';
         setCriticalErrors((prev) => [...prev, msg]);
         // Fetch log path on first error
-        invoke('get_log_dir').then(setCriticalErrorLogPath).catch(() => {});
+        invoke('get_log_dir').then(setCriticalErrorLogPath).catch(() => { });
       });
     };
     setup();
@@ -721,6 +756,7 @@ function App() {
   useEffect(() => {
     if (!autoStartMonitor) return;
     if (autoStartSuppressed) return;
+    if (powerSavingSuppressed) return;
     if (!pythonVersion) return;
     if (!depsCheckDone) return;
     if (depsNeedUpdate || depsSyncing) return;
@@ -728,7 +764,31 @@ function App() {
     if (backendStatus === 'offline' && backendStatusRef.current !== 'waiting') {
       handleStartBackend();
     }
-  }, [autoStartMonitor, autoStartSuppressed, backendStatus, pythonVersion, handleStartBackend, depsNeedUpdate, depsSyncing, depsCheckDone, modelsNeedDownload]);
+  }, [autoStartMonitor, autoStartSuppressed, powerSavingSuppressed, backendStatus, pythonVersion, handleStartBackend, depsNeedUpdate, depsSyncing, depsCheckDone, modelsNeedDownload]);
+
+  useEffect(() => {
+    if (powerSavingSuppressed && backendStatus === 'online') {
+      invoke('stop_monitor').catch(console.warn);
+      invoke('frontend_log', { level: 'info', message: 'Power Saving Mode activated: AC disconnected. Stopped sub-service.' }).catch(console.warn);
+      pushNotification({
+        id: `power-saving-${Date.now()}`,
+        type: 'info',
+        title: '节电模式已激活',
+        message: '检测到交流电源断开，已暂停子服务运行。',
+        timestamp: Date.now(),
+      });
+    }
+  }, [powerSavingSuppressed, backendStatus, pushNotification]);
+
+  const prevPowerSavingSuppressedRef = useRef(powerSavingSuppressed);
+  useEffect(() => {
+    if (prevPowerSavingSuppressedRef.current !== powerSavingSuppressed) {
+      if (!powerSavingSuppressed && autoStartMonitor) {
+        invoke('frontend_log', { level: 'info', message: 'Power Saving Mode deactivated: AC connected. Autostarting sub-service if applicable.' }).catch(console.warn);
+      }
+      prevPowerSavingSuppressedRef.current = powerSavingSuppressed;
+    }
+  }, [powerSavingSuppressed, autoStartMonitor]);
 
   // debug: print out python version
   const refreshPythonVersion = useCallback(async () => {
@@ -895,7 +955,7 @@ function App() {
         />
 
         <AuthMask
-          isVisible={backendStatus === 'online' && pythonVersion && !isAuthenticated}
+          isVisible={pythonVersion && !isAuthenticated}
           onAuthSuccess={handleAuthSuccess}
           authError={authError}
           setAuthError={setAuthError}
@@ -905,8 +965,8 @@ function App() {
           isVisible={criticalErrors.length > 0}
           errors={criticalErrors}
           logPath={criticalErrorLogPath}
-          onRestart={() => invoke('restart_app').catch(() => {})}
-          onExit={() => invoke('exit_app').catch(() => {})}
+          onRestart={() => invoke('restart_app').catch(() => { })}
+          onExit={() => invoke('exit_app').catch(() => { })}
         />
 
         <DmlSetupWizard
@@ -1027,6 +1087,9 @@ function App() {
         onClose={() => setShowSettings(false)}
         autoStartMonitor={autoStartMonitor}
         onRecordsDeleted={bumpTimelineRefresh}
+        powerSavingSuppressed={powerSavingSuppressed}
+        powerSavingMode={powerSavingMode}
+        onPowerSavingModeChange={setPowerSavingMode}
         onAutoStartMonitorChange={(next) => {
           setAutoStartMonitor(next);
           if (next) {

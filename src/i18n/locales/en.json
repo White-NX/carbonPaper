@@ -10,6 +10,10 @@
         "label": "Allow sending telemetry diagnostic data",
         "description": "Allow program to upload error logs that do not contain privacy data to the telemetry server."
       },
+      "powerSaving": {
+        "label": "Power Saving Mode",
+        "description": "Automatically pause Python sub-service when on battery power, and resume when plugged in."
+      },
       "gameMode": {
         "label": "Game Mode",
         "description": "Automatically disable DirectML when high GPU load is detected to reduce impact on game performance",
@@ -31,6 +35,7 @@
         "pause": "Pause",
         "stop": "Stop",
         "restart": "Restart",
+        "power_saving_blocked": "Power saving mode is active. Connect AC power to start the service.",
         "autoStart": {
           "label": "Auto-start Subservice",
           "description": "When enabled the app will attempt to launch the Python subservice on startup.",
@@ -627,7 +632,8 @@
       "unsupported": "Not supported",
       "not_found": "No Python discovered",
       "note": "Not sure what Python is? We can auto-install it. After install the app will exit and must be restarted.",
-      "auto_install": { "installing": "Installing...", "button": "Auto-install Python" },
+      "installing": "Installing...",
+      "auto_install_button": "Auto-install Python",
       "install_logs": "Install logs",
       "install_failed": "Installation failed: {{error}}",
       "next": "Next",

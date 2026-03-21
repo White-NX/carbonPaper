@@ -10,6 +10,10 @@
         "label": "允许发送遥测诊断数据",
         "description": "允许程序将不包含隐私数据的错误日志上传至遥测服务器。"
       },
+      "powerSaving": {
+        "label": "节能模式",
+        "description": "使用电池供电时自动暂停 Python 子服务，插入电源后自动恢复运行。"
+      },
       "gameMode": {
         "label": "游戏模式",
         "description": "检测到 GPU 高负载时自动关闭 DirectML，降低对游戏性能的影响。如果你有多张显卡，建议在高级 > OCR 推理加速中选择性能较差或闲置的显卡进行OCR推理，并关闭游戏模式以获得更稳定的OCR性能。",
@@ -31,6 +35,7 @@
         "pause": "暂停",
         "stop": "停止",
         "restart": "重启",
+        "power_saving_blocked": "节电模式已激活，无法启动子服务。请接入电源后重试。",
         "autoStart": {
           "label": "启动时自动子服务",
           "description": "开启后应用启动时会自动尝试拉起 Python 子服务。",
@@ -629,7 +634,8 @@
       "unsupported": "不受支持",
       "not_found": "未发现 Python",
       "note": "不知道什么是 Python？别担心，我们可以帮你自动安装。安装完成后程序将关闭，需要手动重启。",
-      "auto_install": { "installing": "安装中...", "button": "自动安装 Python" },
+      "installing": "安装中...",
+      "auto_install_button": "自动安装 Python",
       "install_logs": "安装日志",
       "install_failed": "安装失败：{{error}}",
       "next": "下一步",

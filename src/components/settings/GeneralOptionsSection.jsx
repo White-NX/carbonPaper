@@ -9,6 +9,8 @@ export default function GeneralOptionsSection({
   onToggleLowRes,
   sendTelemetryDiagnostics,
   onToggleTelemetry,
+  powerSavingMode,
+  onTogglePowerSaving,
 }) {
   const { t } = useTranslation();
   const [gameModeEnabled, setGameModeEnabled] = useState(false);
@@ -76,6 +78,29 @@ export default function GeneralOptionsSection({
           >
             <div
               className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${sendTelemetryDiagnostics ? 'translate-x-5' : 'translate-x-0.5'
+                }`}
+            />
+          </button>
+        </div>
+
+        {/* Power saving */}
+        <div className="w-full h-px bg-ide-border/50" />
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.powerSaving.label')}</label>
+            <p className="text-xs text-ide-muted">
+              {t('settings.general.powerSaving.description')}
+            </p>
+          </div>
+          <button
+            onClick={onTogglePowerSaving}
+            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${powerSavingMode ? 'bg-ide-accent' : 'bg-ide-border'
+              }`}
+            title={t('settings.general.powerSaving.label')}
+          >
+            <div
+              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${powerSavingMode ? 'translate-x-5' : 'translate-x-0.5'
                 }`}
             />
           </button>
