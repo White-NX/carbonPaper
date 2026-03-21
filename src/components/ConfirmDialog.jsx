@@ -3,15 +3,15 @@ import PropTypes from 'prop-types';
 import { cn } from '../lib/utils';
 
 export function ConfirmDialog({
-  isOpen,
+  isOpen = false,
   title,
-  message,
-  confirmLabel,
-  cancelLabel,
-  onConfirm,
-  onCancel,
-  confirmVariant,
-  loading,
+  message = '',
+  confirmLabel = 'Confirm',
+  cancelLabel = 'Cancel',
+  onConfirm = undefined,
+  onCancel = undefined,
+  confirmVariant = 'default',
+  loading = false,
 }) {
   if (!isOpen) return null;
 
@@ -71,17 +71,6 @@ ConfirmDialog.propTypes = {
   onCancel: PropTypes.func,
   confirmVariant: PropTypes.oneOf(['default', 'danger']),
   loading: PropTypes.bool,
-};
-
-ConfirmDialog.defaultProps = {
-  isOpen: false,
-  message: '',
-  confirmLabel: 'Confirm',
-  cancelLabel: 'Cancel',
-  onConfirm: undefined,
-  onCancel: undefined,
-  confirmVariant: 'default',
-  loading: false,
 };
 
 export default ConfirmDialog;

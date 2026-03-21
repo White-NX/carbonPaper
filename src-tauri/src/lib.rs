@@ -39,6 +39,18 @@ fn policy_as_object_mut(policy: &mut serde_json::Value) -> Result<&mut serde_jso
 }
 
 #[tauri::command]
+fn frontend_log(level: String, message: String) {
+    match level.as_str() {
+        "info" => tracing::info!("Frontend: {}", message),
+        "warn" => tracing::warn!("Frontend: {}", message),
+        "error" => tracing::error!("Frontend: {}", message),
+        "debug" => tracing::debug!("Frontend: {}", message),
+        "trace" => tracing::trace!("Frontend: {}", message),
+        _ => tracing::info!("Frontend: {}", message),
+    }
+}
+
+#[tauri::command]
 fn get_log_dir() -> String {
     let data_dir = get_data_dir();
     data_dir.join("logs").to_string_lossy().to_string()
@@ -1695,6 +1707,7 @@ pub fn run() {
             restart_app,
             trigger_test_error,
             exit_app,
+            frontend_log,
         ]);
 
     #[cfg(desktop)]
