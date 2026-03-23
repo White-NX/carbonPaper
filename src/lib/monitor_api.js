@@ -179,6 +179,21 @@ export const getTimeline = async (startTime, endTime, maxRecords = null) => {
 };
 
 /**
+ * 获取时间线密度数据 - 返回按时间桶分组的快照计数
+ * 用于大时间尺度下显示快照密集程度
+ */
+export const getTimelineDensity = async (startTime, endTime, bucketMs) => {
+    return withAuth(async () => {
+        const buckets = await invoke('storage_get_timeline_density', {
+            startTime,
+            endTime,
+            bucketMs,
+        });
+        return buckets || [];
+    });
+};
+
+/**
  * 获取图片 - 直接从 Rust 存储层获取
  * 需要认证才能访问
  */

@@ -11,7 +11,8 @@ use std::sync::atomic::Ordering;
 
 use super::types::RawScreenshotRow;
 use super::{
-    OcrResultInput, SaveScreenshotRequest, SaveScreenshotResponse, ScreenshotRecord, StorageState,
+    DensityBucket, OcrResultInput, SaveScreenshotRequest, SaveScreenshotResponse,
+    ScreenshotRecord, StorageState,
 };
 
 impl StorageState {
@@ -947,6 +948,54 @@ impl StorageState {
 
         conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
             .map_err(|e| format!("Failed to count screenshots: {}", e))
+    }
+
+    /// Get screenshot density (counts per time bucket) within a time range.
+    /// No decryption or joins — extremely fast index-only scan.
+    pub fn get_screenshot_density(
+        &self,
+        start_ts: f64,
+        end_ts: f64,
+        bucket_seconds: i64,
+    ) -> Result<Vec<DensityBucket>, String> {
+        let guard = self.get_connection_named("get_screenshot_density")?;
+        let conn = guard.as_ref().unwrap();
+
+        let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+        let end_dt = DateTime::<Utc>::from_timestamp(end_ts as i64, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+
+        let sql = format!(
+            "SELECT (CAST(strftime('%s', created_at) AS INTEGER) / {bs}) * {bs} AS bucket, \
+                    COUNT(*) AS cnt \
+             FROM screenshots \
+             WHERE created_at BETWEEN '{start}' AND '{end}' \
+             GROUP BY bucket \
+             ORDER BY bucket",
+            bs = bucket_seconds,
+            start = start_dt,
+            end = end_dt
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare density query: {}", e))?;
+
+        let rows: Vec<DensityBucket> = stmt
+            .query_map([], |row| {
+                Ok(DensityBucket {
+                    timestamp: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })
+            .map_err(|e| format!("Failed to execute density query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
     }
 
     /// Get screenshots within a time range with SQL-level LIMIT/OFFSET.

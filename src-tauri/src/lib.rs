@@ -207,6 +207,39 @@ async fn storage_get_timeline(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Get screenshot density (counts per time bucket) for timeline visualization.
+/// Ultra-fast: no decryption, no joins, just COUNT(*) GROUP BY time bucket.
+#[tauri::command]
+async fn storage_get_timeline_density(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    start_time: f64,
+    end_time: f64,
+    bucket_ms: i64,
+) -> Result<Vec<storage::DensityBucket>, String> {
+    check_auth_required(&credential_state)?;
+
+    let start_ts = if start_time > 10_000_000_000.0 {
+        start_time / 1000.0
+    } else {
+        start_time
+    };
+    let end_ts = if end_time > 10_000_000_000.0 {
+        end_time / 1000.0
+    } else {
+        end_time
+    };
+
+    let bucket_seconds = (bucket_ms / 1000).max(1);
+
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        state.get_screenshot_density(start_ts, end_ts, bucket_seconds)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
 /// Full-text search across screenshot OCR text with optional filters.
 #[tauri::command]
 async fn storage_search(
@@ -1613,6 +1646,7 @@ pub fn run() {
             monitor::execute_monitor_command,
             // 存储相关命令
             storage_get_timeline,
+            storage_get_timeline_density,
             storage_search,
             storage_get_image,
             storage_get_thumbnail,
