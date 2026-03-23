@@ -283,6 +283,15 @@ impl RawScreenshotRow {
     }
 }
 
+/// A time bucket with its screenshot count, used for density visualization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DensityBucket {
+    /// Bucket start time as Unix seconds
+    pub timestamp: i64,
+    /// Number of screenshots in this bucket
+    pub count: i64,
+}
+
 /// Migration statistics result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationResult {

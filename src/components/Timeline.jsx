@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { getTimeline, fetchThumbnailBatch, clearTimelineImageQueue } from '../lib/monitor_api';
+import { getTimeline, getTimelineDensity, fetchThumbnailBatch, clearTimelineImageQueue } from '../lib/monitor_api';
 import { Locate, Play, ChevronLeft, ChevronRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { CATEGORY_COLORS } from '../lib/categories';
@@ -218,6 +218,8 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     const [isFollowingNow, setIsFollowingNow] = useState(false);
     const fetchEpochRef = useRef(0);
     const [toolbarExpanded, setToolbarExpanded] = useState(false);
+    const [densityBuckets, setDensityBuckets] = useState([]);
+    const densityEpochRef = useRef(0);
 
     // Initial width detection
     useEffect(() => {
@@ -351,6 +353,47 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     const fetchEventsDebounced = useMemo(() => simpleDebounce(fetchEventsRaw, 500), []);
     const fetchEventsThrottled = useMemo(() => simpleThrottle(fetchEventsRaw, 1000), []);
 
+    // Snap bucket size to nice intervals
+    const snapBucketMs = (raw) => {
+        const nice = [
+            60000, 300000, 900000, 1800000, 3600000,   // 1m, 5m, 15m, 30m, 1h
+            10800000, 21600000, 43200000, 86400000,     // 3h, 6h, 12h, 1d
+            604800000, 2592000000                       // 7d, 30d
+        ];
+        return nice.find(s => s >= raw) || nice[nice.length - 1];
+    };
+
+    // Density fetch (only at macro scale)
+    const fetchDensityRaw = async (center, currentZoom, containerWidth) => {
+        if (!containerWidth) return;
+        const currentTickStep = getTickStep(currentZoom);
+        if (currentTickStep <= 120000) {
+            // Fine zoom — no density needed
+            setDensityBuckets([]);
+            return;
+        }
+
+        const epoch = ++densityEpochRef.current;
+        const timeSpan = containerWidth / currentZoom;
+        const startTime = center - (timeSpan / 2) - (timeSpan * 0.5);
+        const endTime = center + (timeSpan / 2) + (timeSpan * 0.5);
+        const bucketMs = snapBucketMs(timeSpan / 150);
+
+        try {
+            const buckets = await getTimelineDensity(startTime, endTime, bucketMs);
+            if (densityEpochRef.current !== epoch) return;
+            setDensityBuckets(buckets.map(b => ({
+                timestamp: b.timestamp * 1000, // convert seconds to ms
+                count: b.count,
+                bucketMs,
+            })));
+        } catch (err) {
+            console.error('[Timeline] Density fetch error:', err);
+        }
+    };
+
+    const fetchDensityDebounced = useMemo(() => simpleDebounce(fetchDensityRaw, 600), []);
+
     // One-shot refresh (e.g., after delete)
     useEffect(() => {
         if (refreshKey === undefined) return;
@@ -367,7 +410,8 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         } else {
             fetchEventsDebounced(centerTime, zoom, width);
         }
-    }, [centerTime, zoom, width, isFollowingNow, fetchEventsDebounced, fetchEventsThrottled]);
+        fetchDensityDebounced(centerTime, zoom, width);
+    }, [centerTime, zoom, width, isFollowingNow, fetchEventsDebounced, fetchEventsThrottled, fetchDensityDebounced]);
 
     // Periodic refresh for static view (every 5s)
     useEffect(() => {
@@ -569,6 +613,31 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         ctx.scale(dpr, dpr);
         ctx.clearRect(0, 0, rect.width, rect.height);
 
+        // Draw density histogram behind everything else
+        if (densityBuckets.length > 0) {
+            const startTime = centerTime - (width / 2) / zoom;
+            const getLocalX = (ts) => (width / 2) + ((ts - centerTime) * zoom);
+            const maxCount = Math.max(...densityBuckets.map(b => b.count));
+            if (maxCount > 0) {
+                const densityBarMaxHeight = 25;
+                const densityBarTop = rect.height - densityBarMaxHeight;
+                // Get the accent color from CSS custom property
+                const accentColor = getComputedStyle(containerRef.current).getPropertyValue('--ide-accent').trim() || '#4f8cff';
+                for (const bucket of densityBuckets) {
+                    const x = getLocalX(bucket.timestamp);
+                    const bucketWidth = Math.max(1, bucket.bucketMs * zoom);
+                    // Cull offscreen
+                    if (x + bucketWidth < 0 || x > rect.width) continue;
+                    const ratio = bucket.count / maxCount;
+                    const barH = Math.max(5, ratio * densityBarMaxHeight);
+                    ctx.fillStyle = accentColor;
+                    ctx.globalAlpha = 0.15 + ratio * 0.30; // 12%-30% opacity
+                    ctx.fillRect(x, densityBarTop + densityBarMaxHeight - barH, bucketWidth - 1, barH);
+                }
+                ctx.globalAlpha = 1.0;
+            }
+        }
+
         if (events.length === 0) return;
 
         const startTime = centerTime - (width / 2) / zoom;
@@ -644,7 +713,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                  ctx.fill();
              }
         }
-    }, [events, centerTime, zoom, width]);
+    }, [events, centerTime, zoom, width, densityBuckets]);
 
     const renderTicks = () => {
         if (!width) return null;
