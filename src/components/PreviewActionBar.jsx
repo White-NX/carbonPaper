@@ -56,7 +56,7 @@ export default function PreviewActionBar({
 
   return (
     <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30">
-      <div className="flex items-center gap-1 px-2 py-1.5 bg-ide-panel/95 backdrop-blur-sm border border-ide-border rounded-full shadow-lg">
+      <div className="flex items-center gap-1 px-2 py-1.5 preview-action-bar border border-ide-border rounded-full">
         {/* Delete Button with Split Action */}
         <div className="relative">
           <div className="flex items-center rounded-full overflow-hidden border border-ide-border">
