@@ -79,6 +79,15 @@ struct McpServerInner {
     skill_instructions: String,
 }
 
+fn require_authenticated_session(app_handle: &tauri::AppHandle) -> Result<(), String> {
+    let credential_state = app_handle.state::<Arc<CredentialManagerState>>();
+    if credential_state.is_session_valid() {
+        Ok(())
+    } else {
+        Err("AUTH_REQUIRED: CarbonPaper is locked. User needs to complete CNG authentication in the app before you retrying this MCP request.".to_string())
+    }
+}
+
 // ==================== JSON-RPC types ====================
 
 #[derive(Deserialize)]
@@ -343,7 +352,7 @@ async fn handle_tools_call(
         }
         Err(e) => {
             tracing::warn!("MCP tools/call: tool={} — error: {}", tool_name, e);
-            let code = if e.contains("CNG") || e.contains("authentication") {
+            let code = if e.contains("AUTH_REQUIRED") || e.contains("CNG") || e.contains("authentication") {
                 -32001 // CNG auth required
             } else if e.contains("Monitor not started") {
                 -32002 // Monitor not running
@@ -509,6 +518,8 @@ fn decode_url_for_filter(url: &str) -> String {
 }
 
 async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
     let start_time = args.get("start_time").and_then(|v| v.as_f64())
         .ok_or("Missing required parameter: start_time")?;
     let end_time = args.get("end_time").and_then(|v| v.as_f64())
@@ -616,6 +627,8 @@ async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value
 }
 
 async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
     let id = args.get("id").and_then(|v| v.as_i64())
         .ok_or("Missing required parameter: id")?;
     let include_coords = args.get("include_coords").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -918,6 +931,8 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
 }
 
 async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
     let query = args.get("query").and_then(|v| v.as_str())
         .ok_or("Missing required parameter: query")?.to_string();
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20) as i32;
@@ -999,6 +1014,8 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
 }
 
 async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
     let monitor_state = state.app_handle.state::<MonitorState>();
 
     let payload = serde_json::json!({
@@ -1131,6 +1148,8 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
 }
 
 async fn tool_get_task_clusters(state: &McpServerInner, args: Value) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
     let layer = args.get("layer").and_then(|v| v.as_str()).map(String::from);
     let start_time = args.get("start_time").and_then(|v| v.as_f64());
     let end_time = args.get("end_time").and_then(|v| v.as_f64());
@@ -1262,6 +1281,8 @@ async fn tool_get_task_clusters(state: &McpServerInner, args: Value) -> Result<V
 }
 
 async fn tool_get_task_screenshots(state: &McpServerInner, args: Value) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
     let task_id = args.get("task_id").and_then(|v| v.as_i64())
         .ok_or("Missing required parameter: task_id")?;
     let page = args.get("page").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -1346,6 +1367,8 @@ async fn tool_get_task_screenshots(state: &McpServerInner, args: Value) -> Resul
 }
 
 async fn tool_rename_task(state: &McpServerInner, args: Value) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
     let task_id = args.get("task_id").and_then(|v| v.as_i64())
         .ok_or("Missing required parameter: task_id")?;
     let label = args.get("label").and_then(|v| v.as_str())
