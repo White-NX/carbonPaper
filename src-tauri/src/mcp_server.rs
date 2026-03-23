@@ -979,7 +979,23 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
         }
     }
 
-    Ok(serde_json::to_value(&results).unwrap_or(Value::Null))
+    // Strip box_coords to save tokens — not useful in MCP search results
+    let stripped: Vec<Value> = results.iter().map(|r| {
+        serde_json::json!({
+            "id": r.id,
+            "screenshot_id": r.screenshot_id,
+            "text": r.text,
+            "confidence": r.confidence,
+            "image_path": r.image_path,
+            "window_title": r.window_title,
+            "process_name": r.process_name,
+            "category": r.category,
+            "created_at": r.created_at,
+            "screenshot_created_at": r.screenshot_created_at,
+        })
+    }).collect();
+
+    Ok(serde_json::to_value(&stripped).unwrap_or(Value::Null))
 }
 
 async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, String> {

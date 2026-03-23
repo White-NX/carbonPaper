@@ -77,10 +77,8 @@ fn main() {
             // 规则 1: 打包特定的文件夹
             let model_dir_singular = source_dir.join("model");
             let model_dir_plural = source_dir.join("models");
-            let sensitive_dicts = source_dir.join("compliance_process");
             if src_path.starts_with(&model_dir_singular)
                 || src_path.starts_with(&model_dir_plural)
-                || src_path.starts_with(&sensitive_dicts)
             {
                 should_copy = true;
             }
@@ -134,7 +132,27 @@ fn main() {
         Path::new("pre-bundle/aria2c.exe"),
     );
 
-    // --- 7. 复制 browser-extension 目录到 pre-bundle ---
+    // --- 7. 复制 compliance_process 到 pre-bundle ---
+    let cp_source = Path::new("../compliance_process");
+    let cp_dest = Path::new("pre-bundle/compliance_process");
+    if cp_source.exists() && cp_source.is_dir() {
+        fs::create_dir_all(cp_dest).expect("Failed to create compliance_process dir in pre-bundle");
+        for entry in WalkDir::new(cp_source).into_iter().filter_map(|e| e.ok()) {
+            let src_path = entry.path();
+            let relative = src_path
+                .strip_prefix(cp_source)
+                .expect("strip_prefix failed");
+            let dest_path = cp_dest.join(relative);
+            if src_path.is_dir() {
+                fs::create_dir_all(&dest_path).expect("Failed to create dir");
+            } else if src_path.is_file() {
+                copy_file_if_needed(src_path, &dest_path);
+            }
+        }
+        println!("cargo:warning=Included compliance_process directory");
+    }
+
+    // --- 8. 复制 browser-extension 目录到 pre-bundle ---
     let ext_source = Path::new("../browser-extension");
     let ext_dest = Path::new("pre-bundle/browser-extension");
     if ext_source.exists() && ext_source.is_dir() {
@@ -154,8 +172,9 @@ fn main() {
         println!("cargo:warning=Included browser-extension directory");
     }
 
-    // --- 8. 告诉 Tauri 需要重新运行此脚本 ---
+    // --- 9. 告诉 Tauri 需要重新运行此脚本 ---
     println!("cargo:rerun-if-changed=../monitor");
+    println!("cargo:rerun-if-changed=../compliance_process");
     println!("cargo:rerun-if-changed=../python-3.12.10-amd64.exe");
     println!("cargo:rerun-if-changed=../browser-extension");
 

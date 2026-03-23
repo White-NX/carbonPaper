@@ -136,6 +136,19 @@ body {
   background-color: rgba(37, 37, 38, 0.65);
 }
 
+/* 预览区操作条亚克力效果 —— 确保操作条在任意截图背景上都可读 */
+.preview-action-bar {
+  background-color: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.06);
+}
+
+.dark .preview-action-bar {
+  background-color: rgba(37, 37, 38, 0.92);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
 
 ::selection {
   background: rgba(93, 224, 255, 0.35);
