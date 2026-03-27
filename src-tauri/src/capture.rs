@@ -680,7 +680,7 @@ fn f16_to_f32(bits: u16) -> f32 {
             return f32::from_bits(sign << 31);
         }
         // Subnormal: normalize
-        let mut e = 1u32;
+        let mut e = 0u32;
         let mut m = mantissa;
         while (m & 0x400) == 0 {
             m <<= 1;
