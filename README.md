@@ -54,7 +54,7 @@ Architecture: x64
 
 Internet Access: Yes
 
-Graphics Card: (Suggested, *optinal*)
+Graphics Card: (*optinal*)
 | 制造商 | 最早支持型号 | 发布日期 |
 | --- | --- | --- |
 | 🟢NVIDIA | GeForce GTX 480  | 2010/3/26 |
@@ -70,7 +70,10 @@ CarbonPaper needs storage space to store models, dependencies, snapshots and dat
 The model files and dependencies will take up approximately 4GB. With high-frequency use, it is estimated that approximately 2GB of snapshots and database usage will be generated per month.
 
 ## API
-未来的 CarbonPaper 会提供开放API的功能，以允许用户使用 AI 进行快照的增删改查
+
+### MCP Server
+
+最新的 CarbonPaper 添加了内置的 MCP 服务器，用户可以自行在自己喜欢的 AI Agent 中配置 MCP 服务器实现 AI 与程序的交互。
 
 ## Main open source libs used
 

@@ -191,7 +191,7 @@ const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showTex
     );
 });
 
-const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedEventId, refreshKey }) => {
+const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedEventId, refreshKey, sqlPaused }) => {
     const { t } = useTranslation();
     const containerRef = useRef(null);
     const canvasRef = useRef(null);
@@ -405,18 +405,20 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
 
     // Main interaction effect
     useEffect(() => {
+        if (sqlPaused) return;
         if (isFollowingNow) {
             fetchEventsThrottled(centerTime, zoom, width);
         } else {
             fetchEventsDebounced(centerTime, zoom, width);
         }
         fetchDensityDebounced(centerTime, zoom, width);
-    }, [centerTime, zoom, width, isFollowingNow, fetchEventsDebounced, fetchEventsThrottled, fetchDensityDebounced]);
+    }, [centerTime, zoom, width, isFollowingNow, fetchEventsDebounced, fetchEventsThrottled, fetchDensityDebounced, sqlPaused]);
 
     // Periodic refresh for static view (every 5s)
     useEffect(() => {
+        if (sqlPaused) return;
         const interval = setInterval(() => {
-            // Only refresh if NOT following now (following handles itself) 
+            // Only refresh if NOT following now (following handles itself)
             // and NOT currently dragging (avoid jank)
             if (!isFollowingNow && !isDragging) {
                 // Use debounce version to avoid conflict
@@ -424,7 +426,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
             }
         }, 5000);
         return () => clearInterval(interval);
-    }, [isFollowingNow, isDragging, centerTime, zoom, width, fetchEventsDebounced]);
+    }, [isFollowingNow, isDragging, centerTime, zoom, width, fetchEventsDebounced, sqlPaused]);
 
     // Track visible event IDs that need images for batch loading
     const pendingImageIdsRef = useRef([]);
@@ -432,6 +434,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
 
     // Batch load thumbnails for visible events (debounced after render)
     useEffect(() => {
+        if (sqlPaused) return;
         if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
         batchTimerRef.current = setTimeout(() => {
             const ids = pendingImageIdsRef.current;
@@ -462,7 +465,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         return () => {
             if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
         };
-    }, [centerTime, zoom, width, events]);
+    }, [centerTime, zoom, width, events, sqlPaused]);
 
 
     // Interaction Handlers

@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId,
 };
 
-use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
+use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
 use windows_capture::monitor::Monitor as WcMonitor;
 
 // ==================== Configuration ====================
@@ -537,22 +537,87 @@ fn capture_foreground_window(
             }
         };
 
-        // 6. Extract BGRA pixels and convert to RGB
+        // 6. Extract pixels and convert to RGB, handling HDR formats
+        let format = buffer.format();
         let row_pitch = buffer.row_pitch() as usize;
         let raw = buffer.as_raw_buffer();
         let mut rgb_pixels = Vec::with_capacity((crop_w * crop_h * 3) as usize);
 
-        for row in 0..crop_h {
-            let row_start = (row as usize) * row_pitch;
-            for col in 0..crop_w {
-                let offset = row_start + (col as usize) * 4;
-                let b = raw[offset];
-                let g = raw[offset + 1];
-                let r = raw[offset + 2];
-                // Skip alpha (offset + 3)
-                rgb_pixels.push(r);
-                rgb_pixels.push(g);
-                rgb_pixels.push(b);
+        match format {
+            DxgiDuplicationFormat::Bgra8 | DxgiDuplicationFormat::Bgra8Srgb => {
+                for row in 0..crop_h {
+                    let row_start = (row as usize) * row_pitch;
+                    for col in 0..crop_w {
+                        let offset = row_start + (col as usize) * 4;
+                        let b = raw[offset];
+                        let g = raw[offset + 1];
+                        let r = raw[offset + 2];
+                        rgb_pixels.push(r);
+                        rgb_pixels.push(g);
+                        rgb_pixels.push(b);
+                    }
+                }
+            }
+            DxgiDuplicationFormat::Rgba8 | DxgiDuplicationFormat::Rgba8Srgb => {
+                for row in 0..crop_h {
+                    let row_start = (row as usize) * row_pitch;
+                    for col in 0..crop_w {
+                        let offset = row_start + (col as usize) * 4;
+                        rgb_pixels.push(raw[offset]);     // R
+                        rgb_pixels.push(raw[offset + 1]); // G
+                        rgb_pixels.push(raw[offset + 2]); // B
+                    }
+                }
+            }
+            DxgiDuplicationFormat::Rgba16F => {
+                // HDR: 16-bit float RGBA (scRGB linear), 8 bytes per pixel.
+                // Tone map to SDR by clamping to [0,1] and applying sRGB gamma.
+                for row in 0..crop_h {
+                    let row_start = (row as usize) * row_pitch;
+                    for col in 0..crop_w {
+                        let offset = row_start + (col as usize) * 8;
+                        let r = f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]]));
+                        let g = f16_to_f32(u16::from_le_bytes([raw[offset + 2], raw[offset + 3]]));
+                        let b = f16_to_f32(u16::from_le_bytes([raw[offset + 4], raw[offset + 5]]));
+                        rgb_pixels.push(linear_to_srgb_u8(r));
+                        rgb_pixels.push(linear_to_srgb_u8(g));
+                        rgb_pixels.push(linear_to_srgb_u8(b));
+                    }
+                }
+            }
+            DxgiDuplicationFormat::Rgb10A2 => {
+                // 10-bit RGB + 2-bit alpha packed in u32: R[0:9] G[10:19] B[20:29] A[30:31]
+                for row in 0..crop_h {
+                    let row_start = (row as usize) * row_pitch;
+                    for col in 0..crop_w {
+                        let offset = row_start + (col as usize) * 4;
+                        let pixel = u32::from_le_bytes([
+                            raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3],
+                        ]);
+                        rgb_pixels.push(((pixel & 0x3FF) >> 2) as u8);
+                        rgb_pixels.push((((pixel >> 10) & 0x3FF) >> 2) as u8);
+                        rgb_pixels.push((((pixel >> 20) & 0x3FF) >> 2) as u8);
+                    }
+                }
+            }
+            DxgiDuplicationFormat::Rgb10XrA2 => {
+                // 10-bit RGB with XR bias + 2-bit alpha packed in u32.
+                // Actual value = (stored - 384) / 510
+                for row in 0..crop_h {
+                    let row_start = (row as usize) * row_pitch;
+                    for col in 0..crop_w {
+                        let offset = row_start + (col as usize) * 4;
+                        let pixel = u32::from_le_bytes([
+                            raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3],
+                        ]);
+                        let r10 = (pixel & 0x3FF) as i32;
+                        let g10 = ((pixel >> 10) & 0x3FF) as i32;
+                        let b10 = ((pixel >> 20) & 0x3FF) as i32;
+                        rgb_pixels.push((((r10 - 384) * 255 + 255) / 510).clamp(0, 255) as u8);
+                        rgb_pixels.push((((g10 - 384) * 255 + 255) / 510).clamp(0, 255) as u8);
+                        rgb_pixels.push((((b10 - 384) * 255 + 255) / 510).clamp(0, 255) as u8);
+                    }
+                }
             }
         }
 
@@ -599,6 +664,51 @@ fn capture_foreground_window(
             dynamic_image: dynamic,
         })
     }
+}
+
+// ==================== HDR Format Conversion Helpers ====================
+
+/// Convert IEEE 754 half-precision float (f16) bits to f32.
+#[inline]
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exponent = ((bits >> 10) & 0x1F) as u32;
+    let mantissa = (bits & 0x3FF) as u32;
+
+    if exponent == 0 {
+        if mantissa == 0 {
+            return f32::from_bits(sign << 31);
+        }
+        // Subnormal: normalize
+        let mut e = 0u32;
+        let mut m = mantissa;
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e += 1;
+        }
+        return f32::from_bits((sign << 31) | ((127 - 15 + 1 - e) << 23) | ((m & 0x3FF) << 13));
+    }
+
+    if exponent == 31 {
+        // Inf or NaN
+        return f32::from_bits((sign << 31) | (0xFF << 23) | (mantissa << 13));
+    }
+
+    // Normalized: rebias exponent from f16 (bias 15) to f32 (bias 127)
+    f32::from_bits((sign << 31) | ((exponent + 127 - 15) << 23) | (mantissa << 13))
+}
+
+/// Convert a linear-light scRGB value to sRGB 8-bit.
+/// HDR values (>1.0) are clamped to SDR white, matching Windows Snipping Tool behavior.
+#[inline]
+fn linear_to_srgb_u8(linear: f32) -> u8 {
+    let c = linear.clamp(0.0, 1.0);
+    let srgb = if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (srgb * 255.0 + 0.5) as u8
 }
 
 // ==================== Process Icon Extraction ====================
