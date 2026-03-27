@@ -18,8 +18,6 @@ import DmlSetupWizard from './components/DmlSetupWizard';
 import ExtensionSetupWizard from './components/ExtensionSetupWizard';
 import ClusteringSetupWizard from './components/ClusteringSetupWizard';
 import ActivityBar from './components/ActivityBar';
-// [TEMP] DB stress test — remove after debugging
-import './lib/db_stress_test';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
