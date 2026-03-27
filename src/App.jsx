@@ -18,6 +18,8 @@ import DmlSetupWizard from './components/DmlSetupWizard';
 import ExtensionSetupWizard from './components/ExtensionSetupWizard';
 import ClusteringSetupWizard from './components/ClusteringSetupWizard';
 import ActivityBar from './components/ActivityBar';
+// [TEMP] DB stress test — remove after debugging
+import './lib/db_stress_test';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
@@ -64,6 +66,7 @@ function App() {
     return saved === null ? true : saved === 'true';
   });
   const [powerSavingSuppressed, setPowerSavingSuppressed] = useState(false);
+  const [windowFocused, setWindowFocused] = useState(true);
 
   useEffect(() => {
     localStorage.setItem('powerSavingMode', powerSavingMode ? 'true' : 'false');
@@ -91,6 +94,17 @@ function App() {
       }
     };
   }, [powerSavingMode])
+
+  // Window focus tracking for power saving SQL pause
+  useEffect(() => {
+    const appWindow = getCurrentWindow();
+    const unlistenFocus = appWindow.listen('tauri://focus', () => setWindowFocused(true));
+    const unlistenBlur = appWindow.listen('tauri://blur', () => setWindowFocused(false));
+    return () => {
+      unlistenFocus.then(f => f());
+      unlistenBlur.then(f => f());
+    };
+  }, []);
 
   // Windows Hello Authentication State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -993,6 +1007,7 @@ function App() {
           jumpTimestamp={timelineJump}
           highlightedEventId={highlightedEventId}
           refreshKey={timelineRefreshKey}
+          sqlPaused={!windowFocused}
         />
 
         {/* Main Workspace Grid */}
