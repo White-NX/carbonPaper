@@ -1311,15 +1311,6 @@ async fn toggle_game_mode(app: tauri::AppHandle, enabled: bool) -> Result<(), St
     Ok(())
 }
 
-#[tauri::command]
-fn check_dml_setup_needed() -> Result<bool, String> {
-    Ok(!registry_config::get_bool("dml_setup_done").unwrap_or(false))
-}
-
-#[tauri::command]
-fn mark_dml_setup_done() -> Result<(), String> {
-    registry_config::set_bool("dml_setup_done", true)
-}
 
 #[tauri::command]
 fn check_extension_setup_needed() -> Result<bool, String> {
@@ -1377,9 +1368,14 @@ fn get_game_mode_status(app: tauri::AppHandle) -> serde_json::Value {
     let permanent = state
         .game_mode_permanently_suppressed
         .load(std::sync::atomic::Ordering::SeqCst);
+    let capture_state = app.state::<Arc<CaptureState>>();
+    let fullscreen_paused = capture_state
+        .game_mode_capture_paused
+        .load(std::sync::atomic::Ordering::SeqCst);
     serde_json::json!({
         "active": active,
         "permanent": permanent,
+        "fullscreen_paused": fullscreen_paused,
     })
 }
 
@@ -1545,10 +1541,8 @@ pub fn run() {
                     tracing::error!("Storage initialization deferred: public key unavailable");
                 }
 
-                // 如果游戏模式已启用且 DML 已启用，启动 GPU 监控
-                if registry_config::get_bool("game_mode_enabled").unwrap_or(false)
-                    && registry_config::get_bool("use_dml").unwrap_or(false)
-                {
+                // 如果游戏模式已启用，启动游戏模式监控（GPU 负载 + 全屏暂停）
+                if registry_config::get_bool("game_mode_enabled").unwrap_or(false) {
                     tracing::info!("Restoring game mode monitor on startup");
                     monitor::start_game_mode_monitor(app.handle().clone());
                 }
@@ -1690,8 +1684,6 @@ pub fn run() {
             monitor::enumerate_gpus,
             toggle_game_mode,
             get_game_mode_status,
-            check_dml_setup_needed,
-            mark_dml_setup_done,
             // 数据迁移命令
             storage_list_plaintext_files,
             storage_migrate_plaintext,

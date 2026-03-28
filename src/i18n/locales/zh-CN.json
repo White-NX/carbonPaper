@@ -16,13 +16,13 @@
       },
       "gameMode": {
         "label": "游戏模式",
-        "description": "检测到 GPU 高负载时自动关闭 DirectML，降低对游戏性能的影响。如果你有多张显卡，建议在高级 > OCR 推理加速中选择性能较差或闲置的显卡进行OCR推理，并关闭游戏模式以获得更稳定的OCR性能。",
+        "description": "启用后将在游戏启动时禁用DML和截图以获得更好的游戏性能。",
         "requires_dml": "需要先启用 DirectML 加速",
         "active": "已激活：DirectML 已临时关闭",
         "inactive": "GPU 负载正常",
-        "permanent": "DirectML 已关闭（频繁切换，将在重启后恢复）"
-      }
-      ,
+        "permanent": "DirectML 已关闭（频繁切换，将在重启后恢复）",
+        "fullscreen_paused": "已激活：检测到全屏非浏览器程序，截图已暂停"
+      },
       "monitor": {
         "title": "Python 子服务",
         "tooltip": "Python 子服务负责 OCR 识别和图像向量化等后台任务。关闭后截图循环将停止，自然语言搜索将不可用，但已有的 OCR 搜索仍可正常使用。",
@@ -73,11 +73,27 @@
         "title": "自动锁定时间",
         "description": "设置在用户无操作多长时间后自动锁定并需要重新验证",
         "options": {
-          "5m": { "label": "5 分钟", "description": "较高安全性" },
-          "15m": { "label": "15 分钟", "description": "推荐" },
-          "1h": { "label": "1 小时", "description": "方便使用" },
-          "1d": { "label": "1 天", "description": "较低安全性" },
-          "until_close": { "label": "直到关闭", "description": "不推荐", "warning": true }
+          "5m": {
+            "label": "5 分钟",
+            "description": "较高安全性"
+          },
+          "15m": {
+            "label": "15 分钟",
+            "description": "推荐"
+          },
+          "1h": {
+            "label": "1 小时",
+            "description": "方便使用"
+          },
+          "1d": {
+            "label": "1 天",
+            "description": "较低安全性"
+          },
+          "until_close": {
+            "label": "直到关闭",
+            "description": "不推荐",
+            "warning": true
+          }
         },
         "current": {
           "unlocked": "已解锁",
@@ -178,8 +194,7 @@
       "warning": {
         "title": "警告",
         "message": "当前设置为不限制存储空间且永久保留，快照文件可能会占用大量磁盘空间。建议设置合理的存储上限或保留时间。"
-      }
-      ,
+      },
       "migration": {
         "dialog_title": "迁移 data 目录",
         "error_default": "迁移出错",
@@ -480,27 +495,6 @@
     "expand": "展开侧栏",
     "collapse": "收起侧栏"
   },
-  "dmlSetup": {
-    "title": "DirectML GPU 加速",
-    "subtitle": "新版本支持使用 GPU 加速 OCR 文字识别",
-    "detected_gpus": "检测到的 GPU",
-    "no_gpu": "未检测到兼容的 GPU，将使用 CPU 进行推理。",
-    "no_gpu_note": "你可以稍后在 设置 > 高级 中更改此选项。",
-    "single_gpu_recommend": "推荐启用 DirectML 加速以提升 OCR 识别速度，同时开启游戏模式保护游戏体验。",
-    "multi_gpu_recommend": "推荐使用集成显卡进行 OCR 推理，将独立显卡留给游戏和主力应用。",
-    "enable_dml": "启用 DirectML 加速",
-    "enable_game_mode": "启用游戏模式",
-    "game_mode_hint": "GPU 高负载时自动暂停加速",
-    "game_mode_multi_gpu_note": "多显卡模式下选择集显进行 OCR 时，不建议启用游戏模式。除非两张显卡在运行任务时均有可能不闲置。",
-    "tag_integrated": "集显",
-    "tag_discrete": "独显",
-    "tag_recommended": "推荐",
-    "apply": "应用推荐设置",
-    "skip": "跳过",
-    "acknowledge": "了解",
-    "loading": "正在检测 GPU..."
-  }
-  ,
   "extensionSetup": {
     "title": "浏览器扩展",
     "subtitle": "捕获浏览器截图并附带丰富的元数据",
@@ -514,8 +508,7 @@
     "done": "完成",
     "success_message": "扩展安装成功。请在浏览器中启用开发者模式，然后从以下路径加载已解压的扩展。",
     "error_message": "安装失败"
-  }
-  ,
+  },
   "clusteringSetup": {
     "title": "整理活动记录",
     "subtitle": "将已有的截图快照自动归类为任务",
@@ -524,8 +517,7 @@
     "info_note": "你也可以跳过此步骤，之后随时在「任务」面板中手动执行聚类。",
     "apply": "开始整理",
     "skip": "跳过"
-  }
-  ,
+  },
   "authMask": {
     "title": "需要 Windows Hello 验证",
     "description": "Carbon Paper 使用 Windows Hello 加密您的屏幕截图和 OCR 数据，请通过 PIN、指纹或面部识别来解锁。",
@@ -540,8 +532,7 @@
       "init_failed": "初始化失败：{{error}}",
       "generic_failed": "验证失败：{{error}}"
     }
-  }
-  ,
+  },
   "advancedSearch": {
     "title": "ADVANCED",
     "search": {
@@ -592,8 +583,7 @@
       "我是皱皮",
       "阿米娅你听我解释，我真的没有偏向佩丽卡！"
     ]
-  }
-  ,
+  },
   "mask": {
     "debug": {
       "label": "调试",

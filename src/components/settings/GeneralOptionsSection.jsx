@@ -16,6 +16,7 @@ export default function GeneralOptionsSection({
   const [gameModeEnabled, setGameModeEnabled] = useState(false);
   const [gameModeActive, setGameModeActive] = useState(false);
   const [gameModePermanent, setGameModePermanent] = useState(false);
+  const [fullscreenPaused, setFullscreenPaused] = useState(false);
   const [useDml, setUseDml] = useState(false);
   const [gameModeLoading, setGameModeLoading] = useState(true);
 
@@ -30,6 +31,7 @@ export default function GeneralOptionsSection({
         const status = await invoke('get_game_mode_status');
         setGameModeActive(status.active || false);
         setGameModePermanent(status.permanent || false);
+        setFullscreenPaused(status.fullscreen_paused || false);
       } catch (err) {
         console.error('Failed to load config for game mode:', err);
       } finally {
@@ -42,6 +44,9 @@ export default function GeneralOptionsSection({
     const unlisten = listen('game-mode-status', (event) => {
       setGameModeActive(event.payload?.active || false);
       setGameModePermanent(event.payload?.permanent || false);
+      if (event.payload?.fullscreen_paused !== undefined) {
+        setFullscreenPaused(event.payload.fullscreen_paused);
+      }
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -117,11 +122,6 @@ export default function GeneralOptionsSection({
             <p className="text-xs text-ide-muted">
               {t('settings.general.gameMode.description')}
             </p>
-            {!useDml && !gameModeLoading && (
-              <p className="text-xs text-ide-warning mt-1">
-                {t('settings.general.gameMode.requires_dml')}
-              </p>
-            )}
             {gameModeEnabled && useDml && (
               <p className={`text-xs mt-1 ${gameModeActive ? 'text-ide-warning' : 'text-ide-info-success'}`}>
                 {gameModePermanent
@@ -132,11 +132,16 @@ export default function GeneralOptionsSection({
                 }
               </p>
             )}
+            {gameModeEnabled && fullscreenPaused && (
+              <p className="text-xs mt-1 text-ide-warning">
+                {t('settings.general.gameMode.fullscreen_paused')}
+              </p>
+            )}
           </div>
           <button
             onClick={handleToggleGameMode}
-            disabled={!useDml || gameModeLoading}
-            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${!useDml || gameModeLoading
+            disabled={gameModeLoading}
+            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${gameModeLoading
               ? 'bg-ide-border opacity-50 cursor-not-allowed'
               : gameModeEnabled
                 ? 'bg-ide-accent'
@@ -145,7 +150,7 @@ export default function GeneralOptionsSection({
             title={t('settings.general.gameMode.label')}
           >
             <div
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${gameModeEnabled && useDml ? 'translate-x-5' : 'translate-x-0.5'
+              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${gameModeEnabled ? 'translate-x-5' : 'translate-x-0.5'
                 }`}
             />
           </button>

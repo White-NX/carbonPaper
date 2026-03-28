@@ -1156,7 +1156,7 @@ fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
     }
 }
 
-/// 启动游戏模式 GPU 监控循环
+/// 启动游戏模式监控循环（GPU 负载 + 全屏非浏览器检测）
 pub fn start_game_mode_monitor(app: AppHandle) {
     let monitor_state = app.state::<MonitorState>();
 
@@ -1168,7 +1168,7 @@ pub fn start_game_mode_monitor(app: AppHandle) {
         }
     }
 
-    tracing::info!("Game mode: starting GPU memory monitor (polling every 10s, checking GPU 0)");
+    tracing::info!("Game mode: starting monitor (GPU polling 10s, fullscreen polling 3s)");
 
     let app_clone = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
@@ -1177,8 +1177,48 @@ pub fn start_game_mode_monitor(app: AppHandle) {
         // 频繁切换计数：记录最近的触发时间戳
         let mut trigger_timestamps: Vec<std::time::Instant> = Vec::new();
 
+        // Fullscreen polling runs every 3s, GPU polling runs every 10s.
+        // We use a 3s tick and run GPU check every ~3rd tick.
+        let mut gpu_tick_counter: u32 = 0;
+        const GPU_CHECK_INTERVAL_TICKS: u32 = 3; // 3 * 3s ≈ 9s (close to original 10s)
+
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+            // ── Fullscreen non-browser detection ──
+            {
+                let capture_state = app_clone.state::<Arc<CaptureState>>();
+                let was_paused = capture_state.game_mode_capture_paused.load(Ordering::SeqCst);
+
+                let should_pause = match crate::capture::check_foreground_fullscreen() {
+                    Some((process_name, true)) if !process_name.is_empty() => {
+                        // Fullscreen detected — pause only if it's NOT a browser
+                        !crate::capture::is_browser_process(&process_name)
+                    }
+                    _ => false,
+                };
+
+                if should_pause != was_paused {
+                    capture_state.game_mode_capture_paused.store(should_pause, Ordering::SeqCst);
+                    if should_pause {
+                        tracing::info!("Game mode: non-browser fullscreen app detected, pausing capture");
+                    } else {
+                        tracing::info!("Game mode: fullscreen app exited, resuming capture");
+                    }
+                    let _ = app_clone.emit("game-mode-status", serde_json::json!({
+                        "active": app_clone.state::<MonitorState>().game_mode_dml_suppressed.load(Ordering::SeqCst),
+                        "permanent": app_clone.state::<MonitorState>().game_mode_permanently_suppressed.load(Ordering::SeqCst),
+                        "fullscreen_paused": should_pause,
+                    }));
+                }
+            }
+
+            // ── GPU memory polling (every ~9s) ──
+            gpu_tick_counter += 1;
+            if gpu_tick_counter < GPU_CHECK_INTERVAL_TICKS {
+                continue;
+            }
+            gpu_tick_counter = 0;
 
             // 检查 DML 是否仍然启用
             if !crate::registry_config::get_bool("use_dml").unwrap_or(false) {
@@ -1284,8 +1324,18 @@ pub fn stop_game_mode_monitor(app: &AppHandle) {
     // 重置所有游戏模式状态
     monitor_state.game_mode_permanently_suppressed.store(false, Ordering::SeqCst);
     let was_suppressed = monitor_state.game_mode_dml_suppressed.swap(false, Ordering::SeqCst);
-    if was_suppressed {
-        let _ = app.emit("game-mode-status", serde_json::json!({"active": false, "usage": 0.0}));
+
+    // 重置全屏暂停状态
+    let capture_state = app.state::<Arc<CaptureState>>();
+    let was_fullscreen_paused = capture_state.game_mode_capture_paused.swap(false, Ordering::SeqCst);
+
+    if was_suppressed || was_fullscreen_paused {
+        let _ = app.emit("game-mode-status", serde_json::json!({
+            "active": false,
+            "usage": 0.0,
+            "fullscreen_paused": false,
+        }));
     }
     tracing::info!("Game mode: monitor stopped");
 }
+

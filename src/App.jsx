@@ -14,7 +14,7 @@ import { AdvancedSearch } from './components/AdvancedSearch';
 import SettingsDialog from './components/settings/SettingsDialog';
 import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
-import DmlSetupWizard from './components/DmlSetupWizard';
+
 import ExtensionSetupWizard from './components/ExtensionSetupWizard';
 import ClusteringSetupWizard from './components/ClusteringSetupWizard';
 import ActivityBar from './components/ActivityBar';
@@ -107,7 +107,7 @@ function App() {
   // Windows Hello Authentication State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authError, setAuthError] = useState(null);
-  const [showDmlSetup, setShowDmlSetup] = useState(false);
+
   const [showExtensionSetup, setShowExtensionSetup] = useState(false);
   const [showClusteringSetup, setShowClusteringSetup] = useState(false);
   const clusteringTimerRef = useRef(null);
@@ -381,26 +381,11 @@ function App() {
     setAuthError(null);
   }, []);
 
-  // Check if DML setup wizard should be shown after auth
+
+
+  // Check if extension setup wizard should be shown after auth
   useEffect(() => {
     if (backendStatus !== 'online' || !isAuthenticated) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const needed = await invoke('check_dml_setup_needed');
-        if (!cancelled && needed) {
-          setShowDmlSetup(true);
-        }
-      } catch (err) {
-        console.warn('Failed to check DML setup status:', err);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [backendStatus, isAuthenticated]);
-
-  // Check if extension setup wizard should be shown after auth (and after DML wizard)
-  useEffect(() => {
-    if (backendStatus !== 'online' || !isAuthenticated || showDmlSetup) return;
     let cancelled = false;
     (async () => {
       try {
@@ -413,37 +398,23 @@ function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [backendStatus, isAuthenticated, showDmlSetup]);
+  }, [backendStatus, isAuthenticated]);
 
   // 锁定会话回调
   const handleLockSession = useCallback(() => {
     setIsAuthenticated(false);
   }, []);
 
-  // DML setup wizard Callback
-  const handleDmlSetupComplete = useCallback(async () => {
-    setShowDmlSetup(false);
-    // If monitor is running, restart to apply new settings
-    try {
-      const resString = await invoke('get_monitor_status');
-      const res = JSON.parse(resString);
-      if (res && !res.stopped) {
-        await invoke('stop_monitor');
-        await invoke('start_monitor');
-      }
-    } catch {
-      // ignore — monitor may not be running
-    }
-  }, []);
+
 
   // Extension setup wizard callback
   const handleExtensionSetupComplete = useCallback(() => {
     setShowExtensionSetup(false);
   }, []);
 
-  // Check if clustering setup wizard should be shown (after DML + Extension wizard)
+  // Check if clustering setup wizard should be shown (after Extension wizard)
   useEffect(() => {
-    if (backendStatus !== 'online' || !isAuthenticated || showDmlSetup || showExtensionSetup) return;
+    if (backendStatus !== 'online' || !isAuthenticated || showExtensionSetup) return;
     let cancelled = false;
     (async () => {
       try {
@@ -456,7 +427,7 @@ function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [backendStatus, isAuthenticated, showDmlSetup, showExtensionSetup]);
+  }, [backendStatus, isAuthenticated, showExtensionSetup]);
 
   // Background thumbnail warmup after auth
   useEffect(() => {
@@ -981,18 +952,15 @@ function App() {
           onExit={() => invoke('exit_app').catch(() => { })}
         />
 
-        <DmlSetupWizard
-          isVisible={backendStatus === 'online' && isAuthenticated && showDmlSetup}
-          onComplete={handleDmlSetupComplete}
-        />
+
 
         <ExtensionSetupWizard
-          isVisible={backendStatus === 'online' && isAuthenticated && !showDmlSetup && showExtensionSetup}
+          isVisible={backendStatus === 'online' && isAuthenticated && showExtensionSetup}
           onComplete={handleExtensionSetupComplete}
         />
 
         <ClusteringSetupWizard
-          isVisible={backendStatus === 'online' && isAuthenticated && !showDmlSetup && !showExtensionSetup && showClusteringSetup}
+          isVisible={backendStatus === 'online' && isAuthenticated && !showExtensionSetup && showClusteringSetup}
           onComplete={handleClusteringSetupComplete}
         />
 
