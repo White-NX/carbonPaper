@@ -17,12 +17,30 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId,
+    GetClassNameW, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId,
 };
 
-use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
-use windows_capture::monitor::Monitor as WcMonitor;
+use windows::core::{Interface, IInspectable};
+use windows::Foundation::TypedEventHandler;
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession, Direct3D11CaptureFrame
+};
+use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Texture2D,
+};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::System::WinRT::Direct3D11::{
+    CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+};
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use std::sync::mpsc::{sync_channel, Receiver};
 
 // ==================== Configuration ====================
 
@@ -83,18 +101,22 @@ impl Default for ExclusionSettings {
     }
 }
 
-// ==================== DXGI Desktop Duplication (via windows-capture) ====================
+// ==================== WGC Window Capture ====================
 
-struct DxgiCaptureSession {
-    dup: DxgiDuplicationApi,
-    /// HMONITOR handle that this session was created for
-    monitor_handle: isize,
+pub struct WgcCaptureSession {
+    hwnd: isize,
+    _session: GraphicsCaptureSession,
+    frame_pool: Direct3D11CaptureFramePool,
+    rx: Receiver<Direct3D11CaptureFrame>,
+    d3d_device: ID3D11Device,
+    d3d_context: ID3D11DeviceContext,
+    item: GraphicsCaptureItem,
+    current_size: windows::Graphics::SizeInt32,
+    last_image: Option<CapturedImage>,
 }
 
-// Safety: DxgiDuplicationApi wraps D3D11 device and DXGI interfaces which are
-// free-threaded COM objects. We only access via Mutex<Option<..>> so at most
-// one thread touches the session at a time.
-unsafe impl Send for DxgiCaptureSession {}
+// Safety: WGC COM objects are agile, D3D11 context usage is serialized by the Mutex.
+unsafe impl Send for WgcCaptureSession {}
 
 // ==================== Capture State ====================
 
@@ -116,7 +138,7 @@ pub struct CaptureState {
     pub capture_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     pub ocr_image_cache: OcrImageCache,
     pub focus_window: Mutex<Option<ActiveWindowInfo>>,
-    pub dxgi_state: Mutex<Option<DxgiCaptureSession>>,
+    pub wgc_state: Mutex<Option<WgcCaptureSession>>,
     /// Game mode: capture paused because a non-browser fullscreen app is in the foreground
     pub game_mode_capture_paused: AtomicBool,
 }
@@ -140,7 +162,7 @@ impl CaptureState {
             capture_task: Mutex::new(None),
             ocr_image_cache: Arc::new(Mutex::new(HashMap::new())),
             focus_window: Mutex::new(None),
-            dxgi_state: Mutex::new(None),
+            wgc_state: Mutex::new(None),
             game_mode_capture_paused: AtomicBool::new(false),
         }
     }
@@ -149,7 +171,10 @@ impl CaptureState {
         let path = data_dir.join("monitor_filters.json");
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
-                let mut settings = self.exclusion_settings.lock().unwrap_or_else(|e| e.into_inner());
+                let mut settings = self
+                    .exclusion_settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(processes) = data.get("processes").and_then(|v| v.as_array()) {
                     settings.user_excluded_processes = processes
                         .iter()
@@ -166,7 +191,9 @@ impl CaptureState {
                         .map(|s| s.trim().to_lowercase())
                         .collect();
                 }
-                if let Some(ignore_protected) = data.get("ignore_protected").and_then(|v| v.as_bool()) {
+                if let Some(ignore_protected) =
+                    data.get("ignore_protected").and_then(|v| v.as_bool())
+                {
                     settings.ignore_protected_windows = ignore_protected;
                 }
                 tracing::info!(
@@ -179,7 +206,10 @@ impl CaptureState {
     }
 
     pub fn save_exclusion_settings(&self, data_dir: &std::path::Path) {
-        let settings = self.exclusion_settings.lock().unwrap_or_else(|e| e.into_inner());
+        let settings = self
+            .exclusion_settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let payload = serde_json::json!({
             "processes": settings.user_excluded_processes.iter().cloned().collect::<Vec<_>>(),
             "titles": settings.user_excluded_titles.iter().cloned().collect::<Vec<_>>(),
@@ -200,7 +230,10 @@ impl CaptureState {
         titles: Option<Vec<String>>,
         ignore_protected: Option<bool>,
     ) {
-        let mut settings = self.exclusion_settings.lock().unwrap_or_else(|e| e.into_inner());
+        let mut settings = self
+            .exclusion_settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(procs) = processes {
             settings.user_excluded_processes = procs
                 .into_iter()
@@ -268,23 +301,40 @@ pub fn get_active_window_info() -> Option<ActiveWindowInfo> {
 
 /// Known browser executable names (lowercase, without extension).
 const BROWSER_EXECUTABLES: &[&str] = &[
-    "chrome", "chrome.exe",
-    "msedge", "msedge.exe",
-    "firefox", "firefox.exe",
-    "brave", "brave.exe",
-    "opera", "opera.exe",
-    "vivaldi", "vivaldi.exe",
-    "iexplore", "iexplore.exe",
-    "360se", "360se.exe",
-    "sogouexplorer", "sogouexplorer.exe",
-    "qqbrowser", "qqbrowser.exe",
-    "2345explorer", "2345explorer.exe",
-    "maxthon", "maxthon.exe",
-    "seamonkey", "seamonkey.exe",
-    "waterfox", "waterfox.exe",
-    "floorp", "floorp.exe",
-    "librewolf", "librewolf.exe",
-    "arc", "arc.exe",
+    "chrome",
+    "chrome.exe",
+    "msedge",
+    "msedge.exe",
+    "firefox",
+    "firefox.exe",
+    "brave",
+    "brave.exe",
+    "opera",
+    "opera.exe",
+    "vivaldi",
+    "vivaldi.exe",
+    "iexplore",
+    "iexplore.exe",
+    "360se",
+    "360se.exe",
+    "sogouexplorer",
+    "sogouexplorer.exe",
+    "qqbrowser",
+    "qqbrowser.exe",
+    "2345explorer",
+    "2345explorer.exe",
+    "maxthon",
+    "maxthon.exe",
+    "seamonkey",
+    "seamonkey.exe",
+    "waterfox",
+    "waterfox.exe",
+    "floorp",
+    "floorp.exe",
+    "librewolf",
+    "librewolf.exe",
+    "arc",
+    "arc.exe",
 ];
 
 /// Check if a process name (e.g. "chrome.exe") is a known browser.
@@ -297,19 +347,19 @@ pub fn is_browser_process(process_name: &str) -> bool {
 /// These are used to prevent false-positive game detection for elevated processes
 /// whose process name cannot be queried.
 const SYSTEM_FULLSCREEN_CLASSES: &[&str] = &[
-    "progman",                       // Desktop Program Manager
-    "workerw",                       // Desktop worker window
-    "shell_traywnd",                 // Taskbar
-    "shell_secondarytraywnd",        // Secondary monitor taskbar
-    "windows.ui.core.corewindow",    // UWP system windows (Start menu, Action Center)
-    "applicationframewindow",        // UWP app host frame
-    "lockapp",                       // Lock screen (Windows 10+)
-    "foregroundstaging",             // Window transition staging
-    "multitaskingviewframe",         // Alt+Tab / Task View
-    "ghost",                         // "Not Responding" ghost window
-    "tooltips_class32",              // Tooltip
-    "#32769",                        // Desktop
-    "xaml_windowedpopupclass",       // XAML popup
+    "progman",                    // Desktop Program Manager
+    "workerw",                    // Desktop worker window
+    "shell_traywnd",              // Taskbar
+    "shell_secondarytraywnd",     // Secondary monitor taskbar
+    "windows.ui.core.corewindow", // UWP system windows (Start menu, Action Center)
+    "applicationframewindow",     // UWP app host frame
+    "lockapp",                    // Lock screen (Windows 10+)
+    "foregroundstaging",          // Window transition staging
+    "multitaskingviewframe",      // Alt+Tab / Task View
+    "ghost",                      // "Not Responding" ghost window
+    "tooltips_class32",           // Tooltip
+    "#32769",                     // Desktop
+    "xaml_windowedpopupclass",    // XAML popup
 ];
 
 /// Check whether a window class name belongs to a known system/shell window.
@@ -400,26 +450,23 @@ pub fn get_process_name_from_path(path: &str) -> String {
 }
 
 fn get_process_command_line(pid: u32) -> Option<String> {
-    use sysinfo::{Pid, System, ProcessRefreshKind, UpdateKind};
+    use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind};
     let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
-    );
-    sys.process(Pid::from_u32(pid))
-        .and_then(|p| {
-            let cmd = p.cmd();
-            if cmd.is_empty() {
-                None
-            } else {
-                Some(
-                    cmd.iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .to_lowercase(),
-                )
-            }
-        })
+    sys.refresh_processes_specifics(ProcessRefreshKind::new().with_cmd(UpdateKind::Always));
+    sys.process(Pid::from_u32(pid)).and_then(|p| {
+        let cmd = p.cmd();
+        if cmd.is_empty() {
+            None
+        } else {
+            Some(
+                cmd.iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase(),
+            )
+        }
+    })
 }
 
 // ==================== Window Exclusion ====================
@@ -541,6 +588,7 @@ fn is_redundant(current: &DHash, history: &[DHash], threshold: u32) -> bool {
 
 // ==================== Window Screenshot (DXGI Desktop Duplication) ====================
 
+#[derive(Clone)]
 struct CapturedImage {
     jpeg_bytes: Vec<u8>,
     width: u32,
@@ -550,211 +598,328 @@ struct CapturedImage {
 
 fn capture_foreground_window(
     hwnd_raw: isize,
-    rect: &RECT,
+    _rect: &RECT, // Not used strictly because WGC directly captures window
     max_side: u32,
     jpeg_quality: u8,
-    dxgi_state: &Mutex<Option<DxgiCaptureSession>>,
+    wgc_state: &Mutex<Option<WgcCaptureSession>>,
 ) -> Option<CapturedImage> {
     unsafe {
-        // 1. Get the monitor this window is on
-        let hmonitor = MonitorFromWindow(HWND(hwnd_raw as *mut _), MONITOR_DEFAULTTONEAREST);
-        let mut monitor_info: MONITORINFO = std::mem::zeroed();
-        monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(hmonitor, &mut monitor_info).as_bool() == false {
-            tracing::warn!("GetMonitorInfoW failed");
-            return None;
-        }
-        let mon_rect = monitor_info.rcMonitor;
+        let mut session_guard = wgc_state.lock().unwrap_or_else(|e| e.into_inner());
 
-        let hmonitor_val = hmonitor.0 as isize;
-
-        // 2. Get or create DXGI session via windows-capture
-        let mut session_guard = dxgi_state.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Check if we need to (re)create the session
         let need_create = match session_guard.as_ref() {
-            Some(s) => s.monitor_handle != hmonitor_val,
+            Some(s) => {
+                if s.hwnd != hwnd_raw {
+                    true
+                } else if let Ok(size) = s.item.Size() {
+                    size.Width != s.current_size.Width || size.Height != s.current_size.Height
+                } else {
+                    true
+                }
+            },
             None => true,
         };
 
         if need_create {
             if session_guard.is_some() {
-                tracing::info!("DXGI: monitor changed, recreating session");
+                tracing::info!("WGC: window changed, recreating session");
             }
-            let wc_monitor = WcMonitor::from_raw_hmonitor(hmonitor.0 as *mut std::ffi::c_void);
-            match DxgiDuplicationApi::new(wc_monitor) {
-                Ok(dup) => {
-                    *session_guard = Some(DxgiCaptureSession {
-                        dup,
-                        monitor_handle: hmonitor_val,
-                    });
-                }
+            // 1. Create D3D11 device
+            let mut d3d_device: Option<ID3D11Device> = None;
+            let mut d3d_context: Option<ID3D11DeviceContext> = None;
+            let mut feature_level = D3D_FEATURE_LEVEL_11_0;
+
+            let hr = D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                None,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut d3d_device),
+                Some(&mut feature_level),
+                Some(&mut d3d_context),
+            );
+
+            if hr.is_err() {
+                tracing::warn!("D3D11CreateDevice failed: {:?}", hr);
+                *session_guard = None;
+                return None;
+            }
+            
+            let d3d_device = d3d_device.unwrap();
+            let d3d_context = d3d_context.unwrap();
+
+            let dxgi_device: IDXGIDevice = match d3d_device.cast() {
+                Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("DxgiDuplicationApi::new failed: {:?}", e);
+                    tracing::warn!("Failed to cast D3D11Device to DXGIDevice: {:?}", e);
                     *session_guard = None;
                     return None;
                 }
+            };
+            
+            let inspectable = match CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::warn!("CreateDirect3D11DeviceFromDXGIDevice failed: {:?}", e);
+                    *session_guard = None;
+                    return None;
+                }
+            };
+            
+            let device: IDirect3DDevice = match inspectable.cast() {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Failed to cast inspectable to IDirect3DDevice: {:?}", e);
+                    *session_guard = None;
+                    return None;
+                }
+            };
+
+            // 2. Create GraphicsCaptureItem
+            let interop = match windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>() {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::warn!("Failed to get IGraphicsCaptureItemInterop: {:?}", e);
+                    *session_guard = None;
+                    return None;
+                }
+            };
+            
+            let hwnd = HWND(hwnd_raw as *mut _);
+            let item: GraphicsCaptureItem = match interop.CreateForWindow(hwnd) {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::debug!("CreateForWindow failed for hwnd {:?}: {:?}", hwnd_raw, e);
+                    *session_guard = None;
+                    return None;
+                }
+            };
+
+            let item_size = match item.Size() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to get item Size: {:?}", e);
+                    *session_guard = None;
+                    return None;
+                }
+            };
+
+            if item_size.Width <= 0 || item_size.Height <= 0 {
+                tracing::debug!("Target window size is 0x0, skipping capture");
+                *session_guard = None;
+                return None;
             }
+
+            // 3. Create frame pool and session
+            let frame_pool = match Direct3D11CaptureFramePool::CreateFreeThreaded(
+                &device,
+                DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                1,
+                item_size
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("CreateFreeThreaded frame pool failed: {:?}", e);
+                    *session_guard = None;
+                    return None;
+                }
+            };
+
+            let session = match frame_pool.CreateCaptureSession(&item) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("CreateCaptureSession failed: {:?}", e);
+                    *session_guard = None;
+                    return None;
+                }
+            };
+
+            // Hide the yellow border (requires Windows 10 version 2004+)
+            if let Err(e) = session.SetIsBorderRequired(false) {
+                tracing::debug!("Failed to hide capture border (maybe older OS): {:?}", e);
+            }
+            // Hide the mouse cursor in the capture
+            if let Err(e) = session.SetIsCursorCaptureEnabled(false) {
+                tracing::debug!("Failed to hide capture cursor: {:?}", e);
+            }
+
+            let (tx, rx) = sync_channel(1);
+
+            let handler = TypedEventHandler::new(
+                move |pool: &Option<Direct3D11CaptureFramePool>, _: &Option<IInspectable>| {
+                    if let Some(pool) = pool {
+                        if let Ok(frame) = pool.TryGetNextFrame() {
+                            let _ = tx.try_send(frame);
+                        }
+                    }
+                    Ok(())
+                }
+            );
+
+            if let Err(e) = frame_pool.FrameArrived(&handler) {
+                tracing::warn!("Failed to register FrameArrived event: {:?}", e);
+                *session_guard = None;
+                return None;
+            }
+
+            if let Err(e) = session.StartCapture() {
+                tracing::warn!("StartCapture failed: {:?}", e);
+                *session_guard = None;
+                return None;
+            }
+
+            *session_guard = Some(WgcCaptureSession {
+                hwnd: hwnd_raw,
+                _session: session,
+                frame_pool,
+                rx,
+                d3d_device,
+                d3d_context,
+                item,
+                current_size: item_size,
+                last_image: None,
+            });
         }
 
         let session = session_guard.as_mut().unwrap();
 
-        // 3. Acquire frame (500ms timeout — more lenient than hand-written 100ms)
-        let mut frame = match session.dup.acquire_next_frame(500) {
+        // 4. Wait for a frame (up to 500ms)
+        let frame = match session.rx.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(f) => f,
+            Err(_) => {
+                // Timeout means the window hasn't updated its content. Very common.
+                // DXGI used to uniformly return the last desktop frame, so we replicate it
+                // by returning the cached frame. This helps the fixed-interval polling correctly
+                // trigger OCR retries if the scene hasn't visually changed.
+                return session.last_image.clone();
+            }
+        };
+
+        let content_size = match frame.ContentSize() {
+            Ok(s) => s,
             Err(e) => {
-                tracing::debug!("acquire_next_frame failed: {:?}", e);
-                // Invalidate session so it gets recreated next time
+                tracing::warn!("Failed to get frame ContentSize: {:?}", e);
                 *session_guard = None;
                 return None;
             }
         };
 
-        let full_width = frame.width();
-        let full_height = frame.height();
+        let width = content_size.Width as u32;
+        let height = content_size.Height as u32;
 
-        if full_width == 0 || full_height == 0 {
-            tracing::warn!("DXGI frame has 0x0 resolution");
+        if width == 0 || height == 0 {
+            tracing::warn!("WGC frame has 0x0 resolution");
+            *session_guard = None;
             return None;
         }
 
-        // 4. Compute crop region (window rect relative to monitor)
-        let crop_x = (rect.left - mon_rect.left).max(0) as u32;
-        let crop_y = (rect.top - mon_rect.top).max(0) as u32;
-        let crop_x2 = ((rect.right - mon_rect.left).max(0) as u32).min(full_width);
-        let crop_y2 = ((rect.bottom - mon_rect.top).max(0) as u32).min(full_height);
-        let crop_w = crop_x2.saturating_sub(crop_x);
-        let crop_h = crop_y2.saturating_sub(crop_y);
-
-        if crop_w == 0 || crop_h == 0 {
-            tracing::warn!(
-                "Crop region is 0x0 (crop: {}x{}, window: [{},{},{},{}], monitor: [{},{},{},{}])",
-                crop_w, crop_h,
-                rect.left, rect.top, rect.right, rect.bottom,
-                mon_rect.left, mon_rect.top, mon_rect.right, mon_rect.bottom
-            );
-            return None;
-        }
-
-        // 5. Get cropped frame buffer (GPU crop + CPU map)
-        let mut buffer = match frame.buffer_crop(crop_x, crop_y, crop_x2, crop_y2) {
-            Ok(buf) => buf,
+        let surface = match frame.Surface() {
+            Ok(s) => s,
             Err(e) => {
-                tracing::warn!("buffer_crop failed: {:?}", e);
+                tracing::warn!("Failed to get frame Surface: {:?}", e);
                 *session_guard = None;
                 return None;
             }
         };
 
-        // 6. Extract pixels and convert to RGB, handling HDR formats
-        let format = buffer.format();
-        let row_pitch = buffer.row_pitch() as usize;
-        let raw = buffer.as_raw_buffer();
-        let mut rgb_pixels = Vec::with_capacity((crop_w * crop_h * 3) as usize);
+        let dxgi_interface: IDirect3DDxgiInterfaceAccess = match surface.cast() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Failed to cast surface to IDirect3DDxgiInterfaceAccess: {:?}", e);
+                *session_guard = None;
+                return None;
+            }
+        };
 
-        match format {
-            DxgiDuplicationFormat::Bgra8 | DxgiDuplicationFormat::Bgra8Srgb => {
-                for row in 0..crop_h {
-                    let row_start = (row as usize) * row_pitch;
-                    for col in 0..crop_w {
-                        let offset = row_start + (col as usize) * 4;
-                        let b = raw[offset];
-                        let g = raw[offset + 1];
-                        let r = raw[offset + 2];
-                        rgb_pixels.push(r);
-                        rgb_pixels.push(g);
-                        rgb_pixels.push(b);
-                    }
-                }
+        let source_texture: ID3D11Texture2D = match dxgi_interface.GetInterface() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to get ID3D11Texture2D: {:?}", e);
+                *session_guard = None;
+                return None;
             }
-            DxgiDuplicationFormat::Rgba8 | DxgiDuplicationFormat::Rgba8Srgb => {
-                for row in 0..crop_h {
-                    let row_start = (row as usize) * row_pitch;
-                    for col in 0..crop_w {
-                        let offset = row_start + (col as usize) * 4;
-                        rgb_pixels.push(raw[offset]);     // R
-                        rgb_pixels.push(raw[offset + 1]); // G
-                        rgb_pixels.push(raw[offset + 2]); // B
-                    }
-                }
-            }
-            DxgiDuplicationFormat::Rgba16F => {
-                // HDR: 16-bit float RGBA (scRGB linear), 8 bytes per pixel.
-                // Tone map to SDR by clamping to [0,1] and applying sRGB gamma.
-                for row in 0..crop_h {
-                    let row_start = (row as usize) * row_pitch;
-                    for col in 0..crop_w {
-                        let offset = row_start + (col as usize) * 8;
-                        let r = f16_to_f32(u16::from_le_bytes([raw[offset], raw[offset + 1]]));
-                        let g = f16_to_f32(u16::from_le_bytes([raw[offset + 2], raw[offset + 3]]));
-                        let b = f16_to_f32(u16::from_le_bytes([raw[offset + 4], raw[offset + 5]]));
-                        rgb_pixels.push(linear_to_srgb_u8(r));
-                        rgb_pixels.push(linear_to_srgb_u8(g));
-                        rgb_pixels.push(linear_to_srgb_u8(b));
-                    }
-                }
-            }
-            DxgiDuplicationFormat::Rgb10A2 => {
-                // 10-bit RGB + 2-bit alpha packed in u32: R[0:9] G[10:19] B[20:29] A[30:31]
-                for row in 0..crop_h {
-                    let row_start = (row as usize) * row_pitch;
-                    for col in 0..crop_w {
-                        let offset = row_start + (col as usize) * 4;
-                        let pixel = u32::from_le_bytes([
-                            raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3],
-                        ]);
-                        rgb_pixels.push(((pixel & 0x3FF) >> 2) as u8);
-                        rgb_pixels.push((((pixel >> 10) & 0x3FF) >> 2) as u8);
-                        rgb_pixels.push((((pixel >> 20) & 0x3FF) >> 2) as u8);
-                    }
-                }
-            }
-            DxgiDuplicationFormat::Rgb10XrA2 => {
-                // 10-bit RGB with XR bias + 2-bit alpha packed in u32.
-                // Actual value = (stored - 384) / 510
-                for row in 0..crop_h {
-                    let row_start = (row as usize) * row_pitch;
-                    for col in 0..crop_w {
-                        let offset = row_start + (col as usize) * 4;
-                        let pixel = u32::from_le_bytes([
-                            raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3],
-                        ]);
-                        let r10 = (pixel & 0x3FF) as i32;
-                        let g10 = ((pixel >> 10) & 0x3FF) as i32;
-                        let b10 = ((pixel >> 20) & 0x3FF) as i32;
-                        rgb_pixels.push((((r10 - 384) * 255 + 255) / 510).clamp(0, 255) as u8);
-                        rgb_pixels.push((((g10 - 384) * 255 + 255) / 510).clamp(0, 255) as u8);
-                        rgb_pixels.push((((b10 - 384) * 255 + 255) / 510).clamp(0, 255) as u8);
-                    }
-                }
+        };
+
+        // 5. Create staging texture to read pixels to CPU
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        source_texture.GetDesc(&mut desc);
+
+        // The canonical pattern to handle window resizing:
+        // Verification that ContentSize matches our locally allocated texture bounds.
+        // If the window grew or shrunk, ContentSize differs from the Surface (desc) dimension.
+        if width != desc.Width || height != desc.Height {
+            tracing::info!("WGC: Window content size changed ({}x{} -> {}x{}), invalidating session to force recreation.", desc.Width, desc.Height, width, height);
+            *session_guard = None;
+            return None;
+        }
+
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+
+        let mut staging_texture: Option<ID3D11Texture2D> = None;
+        if let Err(e) = session.d3d_device.CreateTexture2D(&desc, None, Some(&mut staging_texture)) {
+            tracing::warn!("Failed to create staging texture: {:?}", e);
+            *session_guard = None;
+            return None;
+        }
+        let staging_texture = staging_texture.unwrap();
+
+        // Copy resource from GPU to staging
+        session.d3d_context.CopyResource(&staging_texture, &source_texture);
+
+        // 6. Map and extract pixels
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        if let Err(e) = session.d3d_context.Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) {
+            tracing::warn!("Failed to map staging texture: {:?}", e);
+            *session_guard = None;
+            return None;
+        }
+
+        // WGC uses B8G8R8A8 normalized
+        let row_pitch = mapped.RowPitch as usize;
+        let mut rgb_pixels = Vec::with_capacity((width * height * 3) as usize);
+        let raw = std::slice::from_raw_parts(mapped.pData as *const u8, row_pitch * height as usize);
+
+        for row in 0..height {
+            let row_start = (row as usize) * row_pitch;
+            for col in 0..width {
+                let offset = row_start + (col as usize) * 4;
+                let b = raw[offset];
+                let g = raw[offset + 1];
+                let r = raw[offset + 2];
+                // Ignore alpha
+                rgb_pixels.push(r);
+                rgb_pixels.push(g);
+                rgb_pixels.push(b);
             }
         }
+
+        session.d3d_context.Unmap(&staging_texture, 0);
 
         // 7. Create image and scale if needed
-        let rgb_image = match RgbImage::from_raw(crop_w, crop_h, rgb_pixels) {
+        let rgb_image = match RgbImage::from_raw(width, height, rgb_pixels) {
             Some(img) => img,
             None => {
-                tracing::warn!("Failed to create RgbImage from DXGI pixels ({}x{})", crop_w, crop_h);
+                tracing::warn!("Failed to create RgbImage from WGC pixels");
+                *session_guard = None;
                 return None;
             }
         };
 
         let mut dynamic = DynamicImage::ImageRgb8(rgb_image);
 
-        let max_dim = crop_w.max(crop_h);
+        let max_dim = width.max(height);
         if max_dim > max_side {
             let ratio = max_side as f64 / max_dim as f64;
-            let new_w = (crop_w as f64 * ratio) as u32;
-            let new_h = (crop_h as f64 * ratio) as u32;
+            let new_w = (width as f64 * ratio) as u32;
+            let new_h = (height as f64 * ratio) as u32;
             dynamic = dynamic.resize(new_w, new_h, image::imageops::FilterType::Lanczos3);
         }
 
         let (final_w, final_h) = dynamic.dimensions();
-
-        if final_w == 0 || final_h == 0 {
-            tracing::warn!("Final image is 0x0 after resize ({}x{} -> {}x{})", crop_w, crop_h, final_w, final_h);
-            return None;
-        }
 
         // 8. Encode as JPEG
         let mut jpeg_buf = Vec::new();
@@ -762,70 +927,30 @@ fn capture_foreground_window(
             let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, jpeg_quality);
             if let Err(e) = encoder.encode_image(&dynamic) {
                 tracing::warn!("JPEG encoding failed: {}", e);
+                *session_guard = None;
                 return None;
             }
         }
-
-        Some(CapturedImage {
+        let captured = CapturedImage {
             jpeg_bytes: jpeg_buf,
             width: final_w,
             height: final_h,
             dynamic_image: dynamic,
-        })
+        };
+
+        session.last_image = Some(captured.clone());
+
+        Some(captured)
     }
 }
 
-// ==================== HDR Format Conversion Helpers ====================
-
-/// Convert IEEE 754 half-precision float (f16) bits to f32.
-#[inline]
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exponent = ((bits >> 10) & 0x1F) as u32;
-    let mantissa = (bits & 0x3FF) as u32;
-
-    if exponent == 0 {
-        if mantissa == 0 {
-            return f32::from_bits(sign << 31);
-        }
-        // Subnormal: normalize
-        let mut e = 0u32;
-        let mut m = mantissa;
-        while (m & 0x400) == 0 {
-            m <<= 1;
-            e += 1;
-        }
-        return f32::from_bits((sign << 31) | ((127 - 15 + 1 - e) << 23) | ((m & 0x3FF) << 13));
-    }
-
-    if exponent == 31 {
-        // Inf or NaN
-        return f32::from_bits((sign << 31) | (0xFF << 23) | (mantissa << 13));
-    }
-
-    // Normalized: rebias exponent from f16 (bias 15) to f32 (bias 127)
-    f32::from_bits((sign << 31) | ((exponent + 127 - 15) << 23) | (mantissa << 13))
-}
-
-/// Convert a linear-light scRGB value to sRGB 8-bit.
-/// HDR values (>1.0) are clamped to SDR white, matching Windows Snipping Tool behavior.
-#[inline]
-fn linear_to_srgb_u8(linear: f32) -> u8 {
-    let c = linear.clamp(0.0, 1.0);
-    let srgb = if c <= 0.0031308 {
-        c * 12.92
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
-    };
-    (srgb * 255.0 + 0.5) as u8
-}
 
 // ==================== Process Icon Extraction ====================
 
 fn extract_process_icon_base64(exe_path: &str) -> Option<String> {
+    use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::UI::Shell::ExtractIconExW;
     use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
-    use windows::Win32::Graphics::Gdi::*;
 
     unsafe {
         // Convert path to wide string
@@ -994,8 +1119,18 @@ pub async fn run_capture_loop(
     let mut icon_cache: HashMap<String, Option<String>> = HashMap::new();
 
     // Load config
-    let (interval_secs, polling_rate_ms, max_side, jpeg_quality, dhash_threshold, dhash_history_size) = {
-        let config = capture_state.config.lock().unwrap_or_else(|e| e.into_inner());
+    let (
+        interval_secs,
+        polling_rate_ms,
+        max_side,
+        jpeg_quality,
+        dhash_threshold,
+        dhash_history_size,
+    ) = {
+        let config = capture_state
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         (
             config.interval_secs,
             config.polling_rate_ms,
@@ -1023,7 +1158,10 @@ pub async fn run_capture_loop(
         }
 
         // Check game mode fullscreen pause
-        if capture_state.game_mode_capture_paused.load(Ordering::SeqCst) {
+        if capture_state
+            .game_mode_capture_paused
+            .load(Ordering::SeqCst)
+        {
             continue;
         }
 
@@ -1037,7 +1175,10 @@ pub async fn run_capture_loop(
 
         // Exclusion check
         {
-            let settings = capture_state.exclusion_settings.lock().unwrap_or_else(|e| e.into_inner());
+            let settings = capture_state
+                .exclusion_settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if is_excluded(&window_info, &settings) {
                 last_hwnd_raw = current_hwnd_raw;
                 continue;
@@ -1098,7 +1239,10 @@ pub async fn run_capture_loop(
             if capture_state.paused.load(Ordering::SeqCst) {
                 continue;
             }
-            if capture_state.game_mode_capture_paused.load(Ordering::SeqCst) {
+            if capture_state
+                .game_mode_capture_paused
+                .load(Ordering::SeqCst)
+            {
                 continue;
             }
         }
@@ -1109,7 +1253,7 @@ pub async fn run_capture_loop(
             &window_info.rect,
             max_side,
             jpeg_quality,
-            &capture_state.dxgi_state,
+            &capture_state.wgc_state,
         ) {
             Some(c) => c,
             None => {
@@ -1154,7 +1298,10 @@ pub async fn run_capture_loop(
                 }
                 Err(e) => {
                     // Extension capture failed, fall back to normal capture path
-                    tracing::warn!("Extension capture failed, falling back to normal capture: {}", e);
+                    tracing::warn!(
+                        "Extension capture failed, falling back to normal capture: {}",
+                        e
+                    );
                 }
             }
         }
@@ -1211,8 +1358,7 @@ pub async fn run_capture_loop(
         });
 
         // Save screenshot temp (directly, no IPC needed)
-        let image_data_b64 =
-            base64::engine::general_purpose::STANDARD.encode(&captured.jpeg_bytes);
+        let image_data_b64 = base64::engine::general_purpose::STANDARD.encode(&captured.jpeg_bytes);
 
         let save_request = SaveScreenshotRequest {
             image_data: image_data_b64.clone(),
@@ -1299,12 +1445,17 @@ async fn process_ocr_async(
     process_name: String,
     timestamp_ms: i64,
 ) {
-    capture_state.in_flight_ocr_count.fetch_add(1, Ordering::SeqCst);
+    capture_state
+        .in_flight_ocr_count
+        .fetch_add(1, Ordering::SeqCst);
 
     // Store JPEG bytes in in-memory cache so Python can fetch via get_temp_image
     // without triggering CNG decryption (Windows Hello PIN).
     {
-        let mut cache = capture_state.ocr_image_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = capture_state
+            .ocr_image_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.insert(screenshot_id, jpeg_bytes.clone());
     }
 
@@ -1322,7 +1473,10 @@ async fn process_ocr_async(
 
     // Always remove from cache regardless of success/failure
     {
-        let mut cache = capture_state.ocr_image_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = capture_state
+            .ocr_image_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cache.remove(&screenshot_id);
     }
 
@@ -1338,7 +1492,9 @@ async fn process_ocr_async(
         }
     }
 
-    capture_state.in_flight_ocr_count.fetch_sub(1, Ordering::SeqCst);
+    capture_state
+        .in_flight_ocr_count
+        .fetch_sub(1, Ordering::SeqCst);
 }
 
 async fn process_ocr_inner(
@@ -1353,12 +1509,22 @@ async fn process_ocr_inner(
 ) -> Result<(), String> {
     // Get pipe info for sending to Python
     let pipe_name = {
-        let guard = monitor_state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
-        guard.clone().ok_or_else(|| "Monitor pipe not available".to_string())?
+        let guard = monitor_state
+            .pipe_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .clone()
+            .ok_or_else(|| "Monitor pipe not available".to_string())?
     };
     let auth_token = {
-        let guard = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
-        guard.clone().ok_or_else(|| "Auth token not available".to_string())?
+        let guard = monitor_state
+            .auth_token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .clone()
+            .ok_or_else(|| "Auth token not available".to_string())?
     };
     let seq_no = monitor_state.request_counter.fetch_add(1, Ordering::SeqCst);
 
@@ -1386,11 +1552,19 @@ async fn process_ocr_inner(
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     // Extract category from Python response
-    let category = response.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let category = response
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let category_confidence = response.get("category_confidence").and_then(|v| v.as_f64());
 
     // Commit screenshot with OCR results and category
-    storage.commit_screenshot(screenshot_id, ocr_results.as_ref(), category.as_deref(), category_confidence)?;
+    storage.commit_screenshot(
+        screenshot_id,
+        ocr_results.as_ref(),
+        category.as_deref(),
+        category_confidence,
+    )?;
 
     tracing::debug!(
         "Screenshot {} committed with {} OCR results",
@@ -1404,7 +1578,7 @@ async fn process_ocr_inner(
 // ==================== Utility ====================
 
 fn md5_hash(data: &[u8]) -> String {
-    use md5::{Md5, Digest};
+    use md5::{Digest, Md5};
     let mut hasher = Md5::new();
     hasher.update(data);
     let result = hasher.finalize();
@@ -1439,7 +1613,10 @@ mod tests {
     #[test]
     fn test_get_process_name_from_path_exe() {
         // get_process_name_from_path returns lowercase
-        assert_eq!(get_process_name_from_path(r"C:\Program Files\app.exe"), "app.exe");
+        assert_eq!(
+            get_process_name_from_path(r"C:\Program Files\app.exe"),
+            "app.exe"
+        );
     }
 
     #[test]
@@ -1454,7 +1631,10 @@ mod tests {
 
     #[test]
     fn test_get_process_name_from_path_mixed_case() {
-        assert_eq!(get_process_name_from_path(r"C:\Windows\System32\Notepad.EXE"), "notepad.exe");
+        assert_eq!(
+            get_process_name_from_path(r"C:\Windows\System32\Notepad.EXE"),
+            "notepad.exe"
+        );
     }
 
     #[test]
@@ -1470,7 +1650,8 @@ mod tests {
     #[test]
     fn test_compute_dhash_uniform_image() {
         // A uniform white image should produce all-zero hash (no gradient differences)
-        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255])));
+        let img =
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255])));
         let hash = compute_dhash(&img, 8);
         assert_eq!(hash, [0u64; 4]);
     }
@@ -1498,7 +1679,7 @@ mod tests {
     fn test_is_redundant_above_threshold() {
         let a = [0u64; 4];
         let b = [u64::MAX; 4]; // distance = 256
-        // threshold=10: distance(256) >= threshold(10) so NOT redundant
+                               // threshold=10: distance(256) >= threshold(10) so NOT redundant
         assert!(!is_redundant(&a, &[b], 10));
     }
 }
