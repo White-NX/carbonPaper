@@ -17,8 +17,8 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId,
+    GetClassNameW, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId,
 };
 
 use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
@@ -117,6 +117,8 @@ pub struct CaptureState {
     pub ocr_image_cache: OcrImageCache,
     pub focus_window: Mutex<Option<ActiveWindowInfo>>,
     pub dxgi_state: Mutex<Option<DxgiCaptureSession>>,
+    /// Game mode: capture paused because a non-browser fullscreen app is in the foreground
+    pub game_mode_capture_paused: AtomicBool,
 }
 
 impl Default for CaptureState {
@@ -139,6 +141,7 @@ impl CaptureState {
             ocr_image_cache: Arc::new(Mutex::new(HashMap::new())),
             focus_window: Mutex::new(None),
             dxgi_state: Mutex::new(None),
+            game_mode_capture_paused: AtomicBool::new(false),
         }
     }
 
@@ -260,6 +263,112 @@ pub fn get_active_window_info() -> Option<ActiveWindowInfo> {
             rect,
             pid,
         })
+    }
+}
+
+/// Known browser executable names (lowercase, without extension).
+const BROWSER_EXECUTABLES: &[&str] = &[
+    "chrome", "chrome.exe",
+    "msedge", "msedge.exe",
+    "firefox", "firefox.exe",
+    "brave", "brave.exe",
+    "opera", "opera.exe",
+    "vivaldi", "vivaldi.exe",
+    "iexplore", "iexplore.exe",
+    "360se", "360se.exe",
+    "sogouexplorer", "sogouexplorer.exe",
+    "qqbrowser", "qqbrowser.exe",
+    "2345explorer", "2345explorer.exe",
+    "maxthon", "maxthon.exe",
+    "seamonkey", "seamonkey.exe",
+    "waterfox", "waterfox.exe",
+    "floorp", "floorp.exe",
+    "librewolf", "librewolf.exe",
+    "arc", "arc.exe",
+];
+
+/// Check if a process name (e.g. "chrome.exe") is a known browser.
+pub fn is_browser_process(process_name: &str) -> bool {
+    let lower = process_name.to_lowercase();
+    BROWSER_EXECUTABLES.iter().any(|&name| lower == name)
+}
+
+/// Known system window classes that may appear fullscreen but are not games.
+/// These are used to prevent false-positive game detection for elevated processes
+/// whose process name cannot be queried.
+const SYSTEM_FULLSCREEN_CLASSES: &[&str] = &[
+    "progman",                       // Desktop Program Manager
+    "workerw",                       // Desktop worker window
+    "shell_traywnd",                 // Taskbar
+    "shell_secondarytraywnd",        // Secondary monitor taskbar
+    "windows.ui.core.corewindow",    // UWP system windows (Start menu, Action Center)
+    "applicationframewindow",        // UWP app host frame
+    "lockapp",                       // Lock screen (Windows 10+)
+    "foregroundstaging",             // Window transition staging
+    "multitaskingviewframe",         // Alt+Tab / Task View
+    "ghost",                         // "Not Responding" ghost window
+    "tooltips_class32",              // Tooltip
+    "#32769",                        // Desktop
+    "xaml_windowedpopupclass",       // XAML popup
+];
+
+/// Check whether a window class name belongs to a known system/shell window.
+pub fn is_system_window_class(class_name: &str) -> bool {
+    let lower = class_name.to_lowercase();
+    SYSTEM_FULLSCREEN_CLASSES.iter().any(|&name| lower == name)
+}
+
+/// Detect whether the foreground window is covering the entire monitor (fullscreen).
+/// Returns `Some((process_name, window_class, is_fullscreen))` or `None` if the
+/// foreground window cannot be determined.
+pub fn check_foreground_fullscreen() -> Option<(String, String, bool)> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+
+        // Get PID
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+
+        let process_name = get_process_path_from_pid(pid)
+            .map(|p| get_process_name_from_path(&p))
+            .unwrap_or_default();
+
+        // Get window class name (for system window filtering)
+        let window_class = {
+            let mut buf = [0u16; 256];
+            let len = GetClassNameW(hwnd, &mut buf);
+            if len > 0 {
+                String::from_utf16_lossy(&buf[..len as usize])
+            } else {
+                String::new()
+            }
+        };
+
+        // Get window rect
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return Some((process_name, window_class, false));
+        }
+
+        // Get monitor info for the window's monitor
+        let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut monitor_info: MONITORINFO = std::mem::zeroed();
+        monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if !GetMonitorInfoW(hmonitor, &mut monitor_info).as_bool() {
+            return Some((process_name, window_class, false));
+        }
+        let mon_rect = monitor_info.rcMonitor;
+
+        // A window is considered fullscreen if it covers the entire monitor
+        let is_fullscreen = rect.left <= mon_rect.left
+            && rect.top <= mon_rect.top
+            && rect.right >= mon_rect.right
+            && rect.bottom >= mon_rect.bottom;
+
+        Some((process_name, window_class, is_fullscreen))
     }
 }
 
@@ -913,6 +1022,11 @@ pub async fn run_capture_loop(
             continue;
         }
 
+        // Check game mode fullscreen pause
+        if capture_state.game_mode_capture_paused.load(Ordering::SeqCst) {
+            continue;
+        }
+
         // Get active window
         let window_info = match get_active_window_info() {
             Some(info) => info,
@@ -982,6 +1096,9 @@ pub async fn run_capture_loop(
                 break;
             }
             if capture_state.paused.load(Ordering::SeqCst) {
+                continue;
+            }
+            if capture_state.game_mode_capture_paused.load(Ordering::SeqCst) {
                 continue;
             }
         }

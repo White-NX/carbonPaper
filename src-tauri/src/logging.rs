@@ -10,6 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use sysinfo::System;
 use tracing_subscriber::fmt::MakeWriter;
 
 /// 单个日志分片的最大字节数（30 MB）
@@ -176,7 +177,7 @@ pub fn init_logging(data_dir: &Path) -> DailyRotatingWriter {
     let logs_root = data_dir.join("logs");
     let _ = fs::create_dir_all(&logs_root);
 
-    let writer = DailyRotatingWriter::new(logs_root);
+    let writer = DailyRotatingWriter::new(logs_root.clone());
 
     // Default to "info" level if RUST_LOG is not set or invalid
     let default_level = "info";
@@ -204,6 +205,8 @@ pub fn init_logging(data_dir: &Path) -> DailyRotatingWriter {
         .with(file_layer)
         .with(stderr_layer)
         .init();
+
+    log_startup_diagnostics(data_dir, &logs_root);
 
     writer
 }
@@ -304,4 +307,46 @@ fn gzip_file(src: &Path, dst: &Path) -> io::Result<()> {
     encoder.write_all(&input)?;
     encoder.finish()?;
     Ok(())
+}
+
+fn log_startup_diagnostics(data_dir: &Path, logs_root: &Path) {
+    let mut system = System::new_all();
+    system.refresh_all();
+
+    let app_version = env!("CARGO_PKG_VERSION");
+    let os_name = System::name().unwrap_or_else(|| "Unknown".to_string());
+    let os_version = System::os_version().unwrap_or_else(|| "Unknown".to_string());
+    let kernel_version = System::kernel_version().unwrap_or_else(|| "Unknown".to_string());
+    let long_os_version = System::long_os_version().unwrap_or_else(|| "Unknown".to_string());
+    let host_name = System::host_name().unwrap_or_else(|| "Unknown".to_string());
+    let cpu_brand = system
+        .cpus()
+        .first()
+        .map(|cpu| cpu.brand().trim().to_string())
+        .filter(|brand| !brand.is_empty())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let cpu_cores = system.cpus().len();
+    let total_memory_gib = system.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+
+    tracing::info!("CarbonPaper starting");
+    tracing::info!(
+        "App version={} data_dir={} logs_dir={}",
+        app_version,
+        data_dir.display(),
+        logs_root.display()
+    );
+    tracing::info!(
+        "System host={} os={} os_version={} kernel={} long_os={}",
+        host_name,
+        os_name,
+        os_version,
+        kernel_version,
+        long_os_version
+    );
+    tracing::info!(
+        "Hardware cpu=\"{}\" logical_cores={} total_memory_gib={:.2}",
+        cpu_brand,
+        cpu_cores,
+        total_memory_gib
+    );
 }

@@ -16,13 +16,13 @@
       },
       "gameMode": {
         "label": "Game Mode",
-        "description": "Automatically disable DirectML when high GPU load is detected to reduce impact on game performance",
+        "description": "When enabled will disable DML and screenshots on game launch for better game performance.",
         "requires_dml": "Requires DirectML acceleration to be enabled first",
         "active": "Active: DirectML temporarily disabled",
         "inactive": "GPU load normal",
-        "permanent": "DirectML disabled (too many switches, will restore on restart)"
-      }
-      ,
+        "permanent": "DirectML disabled (too many switches, will restore on restart)",
+        "fullscreen_paused": "Active: Non-browser fullscreen app detected, capture paused"
+      },
       "monitor": {
         "title": "Monitor Service",
         "tooltip": "The Python service handles screenshot capture, OCR text recognition, and image vectorization. When stopped, screenshots and natural language search are unavailable, but existing OCR search still works.",
@@ -73,11 +73,27 @@
         "title": "Auto-lock timeout",
         "description": "Set how long of inactivity before automatic lock requiring re-authentication.",
         "options": {
-          "5m": { "label": "5 minutes", "description": "Higher security" },
-          "15m": { "label": "15 minutes", "description": "Recommended" },
-          "1h": { "label": "1 hour", "description": "Convenient" },
-          "1d": { "label": "1 day", "description": "Lower security" },
-          "until_close": { "label": "Until closed", "description": "Not recommended", "warning": true }
+          "5m": {
+            "label": "5 minutes",
+            "description": "Higher security"
+          },
+          "15m": {
+            "label": "15 minutes",
+            "description": "Recommended"
+          },
+          "1h": {
+            "label": "1 hour",
+            "description": "Convenient"
+          },
+          "1d": {
+            "label": "1 day",
+            "description": "Lower security"
+          },
+          "until_close": {
+            "label": "Until closed",
+            "description": "Not recommended",
+            "warning": true
+          }
         },
         "current": {
           "unlocked": "Unlocked",
@@ -178,8 +194,7 @@
       "warning": {
         "title": "Warning",
         "message": "Current settings allow unlimited storage and permanent retention; snapshots may consume large disk space. Consider setting reasonable limits or retention."
-      }
-      ,
+      },
       "migration": {
         "dialog_title": "Migrate data directory",
         "error_default": "Migration failed",
@@ -478,27 +493,6 @@
     "expand": "Expand Sidebar",
     "collapse": "Collapse Sidebar"
   },
-  "dmlSetup": {
-    "title": "DirectML GPU Acceleration",
-    "subtitle": "This version supports GPU-accelerated OCR text recognition",
-    "detected_gpus": "Detected GPUs",
-    "no_gpu": "No compatible GPU detected. CPU inference will be used.",
-    "no_gpu_note": "You can change this later in Settings > Advanced.",
-    "single_gpu_recommend": "We recommend enabling DirectML acceleration for faster OCR, with Game Mode to protect gaming performance.",
-    "multi_gpu_recommend": "We recommend using the integrated GPU for OCR, leaving the discrete GPU free for games and primary applications.",
-    "enable_dml": "Enable DirectML Acceleration",
-    "enable_game_mode": "Enable Game Mode",
-    "game_mode_hint": "Automatically pauses acceleration under high GPU load",
-    "game_mode_multi_gpu_note": "Game Mode is not recommended when using an integrated GPU for OCR in a multi-GPU setup, unless both GPUs may be under load simultaneously.",
-    "tag_integrated": "Integrated",
-    "tag_discrete": "Discrete",
-    "tag_recommended": "Recommended",
-    "apply": "Apply Recommended Settings",
-    "skip": "Skip",
-    "acknowledge": "Got it",
-    "loading": "Detecting GPUs..."
-  }
-  ,
   "extensionSetup": {
     "title": "Browser Extension",
     "subtitle": "Capture browser screenshots with rich metadata",
@@ -512,8 +506,7 @@
     "done": "Done",
     "success_message": "Extension installed successfully. Enable Developer mode in your browser and load the unpacked extension from the path below.",
     "error_message": "Installation failed"
-  }
-  ,
+  },
   "clusteringSetup": {
     "title": "Organize Activity History",
     "subtitle": "Automatically group existing snapshots into tasks",
@@ -522,8 +515,7 @@
     "info_note": "You can also skip this step and manually run clustering later from the Tasks panel.",
     "apply": "Start Organizing",
     "skip": "Skip"
-  }
-  ,
+  },
   "authMask": {
     "title": "Windows Hello verification required",
     "description": "Carbon Paper uses Windows Hello to encrypt your screenshots and OCR data. Please unlock using PIN, fingerprint, or face recognition.",
@@ -538,8 +530,7 @@
       "init_failed": "Initialization failed: {{error}}",
       "generic_failed": "Verification failed: {{error}}"
     }
-  }
-  ,
+  },
   "advancedSearch": {
     "title": "Advanced",
     "search": {
@@ -590,8 +581,7 @@
       "btw, I play arknights",
       "Amiya, hear me out, I really didn't favor Pelica..."
     ]
-  }
-  ,
+  },
   "mask": {
     "debug": {
       "label": "DEBUG",
