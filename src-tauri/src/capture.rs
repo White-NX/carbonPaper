@@ -112,6 +112,7 @@ pub struct WgcCaptureSession {
     d3d_context: ID3D11DeviceContext,
     item: GraphicsCaptureItem,
     current_size: windows::Graphics::SizeInt32,
+    last_image: Option<CapturedImage>,
 }
 
 // Safety: WGC COM objects are agile, D3D11 context usage is serialized by the Mutex.
@@ -587,6 +588,7 @@ fn is_redundant(current: &DHash, history: &[DHash], threshold: u32) -> bool {
 
 // ==================== Window Screenshot (DXGI Desktop Duplication) ====================
 
+#[derive(Clone)]
 struct CapturedImage {
     jpeg_bytes: Vec<u8>,
     width: u32,
@@ -776,6 +778,7 @@ fn capture_foreground_window(
                 d3d_context,
                 item,
                 current_size: item_size,
+                last_image: None,
             });
         }
 
@@ -786,7 +789,10 @@ fn capture_foreground_window(
             Ok(f) => f,
             Err(_) => {
                 // Timeout means the window hasn't updated its content. Very common.
-                return None;
+                // DXGI used to uniformly return the last desktop frame, so we replicate it
+                // by returning the cached frame. This helps the fixed-interval polling correctly
+                // trigger OCR retries if the scene hasn't visually changed.
+                return session.last_image.clone();
             }
         };
 
@@ -839,10 +845,14 @@ fn capture_foreground_window(
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         source_texture.GetDesc(&mut desc);
 
-        // Prevent Out-Of-Bounds reads if ContentSize somehow grew beyond the pooled texture.
-        // On size change, WGC will provide a smaller cropped frame until `need_create` safely re-creates the session next tick.
-        let width = width.min(desc.Width);
-        let height = height.min(desc.Height);
+        // The canonical pattern to handle window resizing:
+        // Verification that ContentSize matches our locally allocated texture bounds.
+        // If the window grew or shrunk, ContentSize differs from the Surface (desc) dimension.
+        if width != desc.Width || height != desc.Height {
+            tracing::info!("WGC: Window content size changed ({}x{} -> {}x{}), invalidating session to force recreation.", desc.Width, desc.Height, width, height);
+            *session_guard = None;
+            return None;
+        }
 
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
@@ -921,14 +931,16 @@ fn capture_foreground_window(
                 return None;
             }
         }
-        
-        // Return without destroying session to reuse next time on the same window
-        Some(CapturedImage {
+        let captured = CapturedImage {
             jpeg_bytes: jpeg_buf,
             width: final_w,
             height: final_h,
             dynamic_image: dynamic,
-        })
+        };
+
+        session.last_image = Some(captured.clone());
+
+        Some(captured)
     }
 }
 
