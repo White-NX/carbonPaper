@@ -150,6 +150,7 @@ impl Default for CaptureState {
 }
 
 impl CaptureState {
+    /// Creates a new, default-initialized `CaptureState` instance with empty filters and caches.
     pub fn new() -> Self {
         Self {
             paused: AtomicBool::new(false),
@@ -167,6 +168,7 @@ impl CaptureState {
         }
     }
 
+    /// Loads user-defined exclusion settings (processes and titles) from the `monitor_filters.json` file.
     pub fn load_exclusion_settings(&self, data_dir: &std::path::Path) {
         let path = data_dir.join("monitor_filters.json");
         if let Ok(content) = std::fs::read_to_string(&path) {
@@ -205,6 +207,7 @@ impl CaptureState {
         }
     }
 
+    /// Saves the current exclusion settings to the `monitor_filters.json` file, using a safe temporary file renaming approach.
     pub fn save_exclusion_settings(&self, data_dir: &std::path::Path) {
         let settings = self
             .exclusion_settings
@@ -224,6 +227,7 @@ impl CaptureState {
         }
     }
 
+    /// Updates the exclusion filters in memory with new process names, window titles, or the protected window ignore flag.
     pub fn update_exclusion_settings(
         &self,
         processes: Option<Vec<String>>,
@@ -264,6 +268,8 @@ pub struct ActiveWindowInfo {
     pid: u32,
 }
 
+/// Retrieves information about the currently focused foreground window,
+/// including its handle, title, screen bounds, and the owning process ID.
 pub fn get_active_window_info() -> Option<ActiveWindowInfo> {
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -422,6 +428,7 @@ pub fn check_foreground_fullscreen() -> Option<(String, String, bool)> {
     }
 }
 
+/// Retrieves the full executable path of a process given its PID, using Windows `QueryFullProcessImageNameW`.
 pub fn get_process_path_from_pid(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
@@ -442,6 +449,7 @@ pub fn get_process_path_from_pid(pid: u32) -> Option<String> {
     }
 }
 
+/// Extracts the lowercase file name (e.g., "chrome.exe") from a full executable path.
 pub fn get_process_name_from_path(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()
