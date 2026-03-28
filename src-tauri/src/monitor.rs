@@ -1191,9 +1191,22 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                 let was_paused = capture_state.game_mode_capture_paused.load(Ordering::SeqCst);
 
                 let should_pause = match crate::capture::check_foreground_fullscreen() {
-                    Some((process_name, true)) if !process_name.is_empty() => {
-                        // Fullscreen detected — pause only if it's NOT a browser
+                    Some((process_name, _window_class, true)) if !process_name.is_empty() => {
+                        // Fullscreen detected with known process — pause only if it's NOT a browser
                         !crate::capture::is_browser_process(&process_name)
+                    }
+                    Some((process_name, window_class, true)) if process_name.is_empty() => {
+                        // Fullscreen but process name unavailable (likely elevated/protected).
+                        // Pause unless it's a known system window (desktop, taskbar, etc.)
+                        if crate::capture::is_system_window_class(&window_class) {
+                            false
+                        } else {
+                            tracing::info!(
+                                "Game mode: fullscreen window with inaccessible process (class: '{}'), treating as game",
+                                window_class
+                            );
+                            true
+                        }
                     }
                     _ => false,
                 };

@@ -17,8 +17,8 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId,
+    GetClassNameW, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId,
 };
 
 use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
@@ -293,10 +293,35 @@ pub fn is_browser_process(process_name: &str) -> bool {
     BROWSER_EXECUTABLES.iter().any(|&name| lower == name)
 }
 
+/// Known system window classes that may appear fullscreen but are not games.
+/// These are used to prevent false-positive game detection for elevated processes
+/// whose process name cannot be queried.
+const SYSTEM_FULLSCREEN_CLASSES: &[&str] = &[
+    "progman",                       // Desktop Program Manager
+    "workerw",                       // Desktop worker window
+    "shell_traywnd",                 // Taskbar
+    "shell_secondarytraywnd",        // Secondary monitor taskbar
+    "windows.ui.core.corewindow",    // UWP system windows (Start menu, Action Center)
+    "applicationframewindow",        // UWP app host frame
+    "lockapp",                       // Lock screen (Windows 10+)
+    "foregroundstaging",             // Window transition staging
+    "multitaskingviewframe",         // Alt+Tab / Task View
+    "ghost",                         // "Not Responding" ghost window
+    "tooltips_class32",              // Tooltip
+    "#32769",                        // Desktop
+    "xaml_windowedpopupclass",       // XAML popup
+];
+
+/// Check whether a window class name belongs to a known system/shell window.
+pub fn is_system_window_class(class_name: &str) -> bool {
+    let lower = class_name.to_lowercase();
+    SYSTEM_FULLSCREEN_CLASSES.iter().any(|&name| lower == name)
+}
+
 /// Detect whether the foreground window is covering the entire monitor (fullscreen).
-/// Returns `Some((process_name, is_fullscreen))` or `None` if the foreground window
-/// cannot be determined.
-pub fn check_foreground_fullscreen() -> Option<(String, bool)> {
+/// Returns `Some((process_name, window_class, is_fullscreen))` or `None` if the
+/// foreground window cannot be determined.
+pub fn check_foreground_fullscreen() -> Option<(String, String, bool)> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
@@ -311,10 +336,21 @@ pub fn check_foreground_fullscreen() -> Option<(String, bool)> {
             .map(|p| get_process_name_from_path(&p))
             .unwrap_or_default();
 
+        // Get window class name (for system window filtering)
+        let window_class = {
+            let mut buf = [0u16; 256];
+            let len = GetClassNameW(hwnd, &mut buf);
+            if len > 0 {
+                String::from_utf16_lossy(&buf[..len as usize])
+            } else {
+                String::new()
+            }
+        };
+
         // Get window rect
         let mut rect = RECT::default();
         if GetWindowRect(hwnd, &mut rect).is_err() {
-            return Some((process_name, false));
+            return Some((process_name, window_class, false));
         }
 
         // Get monitor info for the window's monitor
@@ -322,7 +358,7 @@ pub fn check_foreground_fullscreen() -> Option<(String, bool)> {
         let mut monitor_info: MONITORINFO = std::mem::zeroed();
         monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if !GetMonitorInfoW(hmonitor, &mut monitor_info).as_bool() {
-            return Some((process_name, false));
+            return Some((process_name, window_class, false));
         }
         let mon_rect = monitor_info.rcMonitor;
 
@@ -332,7 +368,7 @@ pub fn check_foreground_fullscreen() -> Option<(String, bool)> {
             && rect.right >= mon_rect.right
             && rect.bottom >= mon_rect.bottom;
 
-        Some((process_name, is_fullscreen))
+        Some((process_name, window_class, is_fullscreen))
     }
 }
 
@@ -1060,6 +1096,9 @@ pub async fn run_capture_loop(
                 break;
             }
             if capture_state.paused.load(Ordering::SeqCst) {
+                continue;
+            }
+            if capture_state.game_mode_capture_paused.load(Ordering::SeqCst) {
                 continue;
             }
         }
