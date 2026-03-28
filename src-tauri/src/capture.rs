@@ -110,7 +110,8 @@ pub struct WgcCaptureSession {
     rx: Receiver<Direct3D11CaptureFrame>,
     d3d_device: ID3D11Device,
     d3d_context: ID3D11DeviceContext,
-    _item: GraphicsCaptureItem,
+    item: GraphicsCaptureItem,
+    current_size: windows::Graphics::SizeInt32,
 }
 
 // Safety: WGC COM objects are agile, D3D11 context usage is serialized by the Mutex.
@@ -604,7 +605,15 @@ fn capture_foreground_window(
         let mut session_guard = wgc_state.lock().unwrap_or_else(|e| e.into_inner());
 
         let need_create = match session_guard.as_ref() {
-            Some(s) => s.hwnd != hwnd_raw,
+            Some(s) => {
+                if s.hwnd != hwnd_raw {
+                    true
+                } else if let Ok(size) = s.item.Size() {
+                    size.Width != s.current_size.Width || size.Height != s.current_size.Height
+                } else {
+                    true
+                }
+            },
             None => true,
         };
 
@@ -765,7 +774,8 @@ fn capture_foreground_window(
                 rx,
                 d3d_device,
                 d3d_context,
-                _item: item,
+                item,
+                current_size: item_size,
             });
         }
 
@@ -828,6 +838,11 @@ fn capture_foreground_window(
         // 5. Create staging texture to read pixels to CPU
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         source_texture.GetDesc(&mut desc);
+
+        // Prevent Out-Of-Bounds reads if ContentSize somehow grew beyond the pooled texture.
+        // On size change, WGC will provide a smaller cropped frame until `need_create` safely re-creates the session next tick.
+        let width = width.min(desc.Width);
+        let height = height.min(desc.Height);
 
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
