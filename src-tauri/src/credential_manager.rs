@@ -76,6 +76,15 @@ pub struct CredentialManagerState {
 }
 
 impl CredentialManagerState {
+    pub fn get_hmac_key(&self) -> Result<Vec<u8>, String> {
+        let guard = self.cached_master_key.lock().unwrap();
+        if let Some(key) = &*guard {
+            Ok(derive_hmac_key_from_master(key))
+        } else {
+            Err("Master key not unlocked".to_string())
+        }
+    }
+
     pub fn new(data_dir: PathBuf) -> Self {
         // 默认值
         let default = DEFAULT_SESSION_TIMEOUT_SECS as i64;
@@ -258,6 +267,14 @@ pub fn derive_db_key_from_master(master_key: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(master_key);
     hasher.update(b"CarbonPaper-SQLCipher-Key-v1");
+    hasher.finalize().to_vec()
+}
+
+/// 生成用于搜索盲索引的高强度 HMAC 密钥
+pub fn derive_hmac_key_from_master(master_key: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"CarbonPaper-HMAC-v2-");
+    hasher.update(master_key);
     hasher.finalize().to_vec()
 }
 

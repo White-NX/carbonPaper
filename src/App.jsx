@@ -22,6 +22,7 @@ import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
 import ErrorWindow from './components/ErrorWindow';
+import HmacMigrationDialog from './components/HmacMigrationDialog';
 import { getScreenshotDetails, fetchImage, deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 import { runClustering, saveClusteringResults } from './lib/task_api';
 import { checkForUpdate } from './lib/update_api';
@@ -952,7 +953,7 @@ function App() {
           onExit={() => invoke('exit_app').catch(() => { })}
         />
 
-
+        {isAuthenticated && <HmacMigrationDialog />}
 
         <ExtensionSetupWizard
           isVisible={backendStatus === 'online' && isAuthenticated && showExtensionSetup}

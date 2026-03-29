@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Search, SlidersHorizontal, Filter, CalendarRange, X, Loader2, RefreshCw, Type, Image as ImageIcon, Tag } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { searchScreenshots, fetchImage, fetchThumbnailBatch, listProcesses, getCategoriesFromDb, batchGetCategories } from '../lib/monitor_api';
 import { CATEGORY_COLORS } from '../lib/categories';
 import { ThumbnailCard, CategoryBadge } from './ThumbnailCard';
@@ -579,8 +581,49 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     setEndDate('');
   };
 
+  const [isMigrating, setIsMigrating] = useState(false);
+  useEffect(() => {
+    let mounted = true;
+    const check = async () => {
+      try {
+        const status = await invoke('storage_check_hmac_migration_status');
+        if (mounted && (status.needs_migration || status.is_running)) {
+          setIsMigrating(true);
+        }
+      } catch (e) { console.error(e); }
+    };
+    check();
+
+    let unlisten = null;
+    import('@tauri-apps/api/event').then(m => {
+      m.listen('hmac-migration-progress', () => {
+        if (mounted) setIsMigrating(true);
+      }).then(fn => unlisten = fn);
+    });
+
+    return () => { 
+      mounted = false; 
+      if (unlisten) unlisten();
+    };
+  }, []);
+
   return (
     <div className={`flex flex-col flex-1 min-h-0 w-full ${active ? 'opacity-100' : 'opacity-0 pointer-events-none'} transition-opacity duration-200`}>
+      {isMigrating && (
+        <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 flex  gap-4 items-start">
+          <div className="p-2 bg-yellow-500/20 rounded-full text-yellow-500 shrink-0">
+            <Loader2 className="w-5 h-5 animate-spin" />
+          </div>
+          <div className="flex flex-col gap-1">
+            <h3 className="text-sm font-bold text-yellow-500">
+              {t('settings.storageManagement.migration.search_unavailable_title')}
+            </h3>
+            <p className="text-xs text-ide-muted leading-relaxed max-w-2xl">
+              {t('settings.storageManagement.migration.search_unavailable_desc')}
+            </p>
+          </div>
+        </div>
+      )}
       <form className="shrink-0 border-b border-ide-border bg-ide-panel px-4 py-2.5 space-y-2" onSubmit={handleSubmit}>
         <div className="flex items-center justify-between gap-2">
           <h2 className="text-sm font-semibold text-ide-text flex items-center gap-2">

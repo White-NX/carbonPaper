@@ -196,11 +196,17 @@
         "message": "当前设置为不限制存储空间且永久保留，快照文件可能会占用大量磁盘空间。建议设置合理的存储上限或保留时间。"
       },
       "migration": {
-        "dialog_title": "迁移 data 目录",
+        "dialog_title": "数据库安全升级",
         "error_default": "迁移出错",
         "copying": "正在拷贝文件: {{copied}}/{{total}}",
         "current_file": "当前文件: {{file}}",
-        "cancel": "取消"
+        "cancel": "取消",
+        "upgrading": "正在构建安全索引...",
+        "background_tip": "您可以放心关闭此窗口。升级将在后台继续进行，搜索结果将随进度逐渐恢复。",
+        "preparing": "正在初始化迁移...",
+        "indexing_detailed": "正在构建安全索引: {{processed}} / {{total}}",
+        "search_unavailable_title": "搜索功能受限",
+        "search_unavailable_desc": "数据库正在进行安全升级，搜索索引正在重建中。在此期间，搜索结果可能不完整或暂时不可用。升级完成后将自动恢复。"
       }
     },
     "storage": {

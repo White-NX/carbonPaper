@@ -101,7 +101,11 @@ impl StorageState {
         self.migration_in_progress.load(Ordering::SeqCst)
     }
 
-    fn is_migration_cancel_requested(&self) -> bool {
+    pub fn is_migration_in_progress(&self) -> bool {
+        self.migration_in_progress.load(Ordering::SeqCst)
+    }
+
+    pub fn is_migration_cancel_requested(&self) -> bool {
         self.migration_cancel_requested.load(Ordering::SeqCst)
     }
 

@@ -56,6 +56,7 @@ impl StorageState {
             return Ok(vec![]);
         }
 
+        let hmac_key = self.credential_state.get_hmac_key()?;
         let guard = self.get_connection_named("compute_link_scores")?;
         let conn = guard.as_ref().unwrap();
 
@@ -69,7 +70,7 @@ impl StorageState {
         for link in links {
             let tokens = Self::bigram_tokenize(&link.text);
             let hashes: HashSet<String> =
-                tokens.iter().map(|t| Self::compute_hmac_hash(t)).collect();
+                tokens.iter().map(|t| Self::compute_hmac_hash(t, &hmac_key)).collect();
             all_hashes.extend(hashes.iter().cloned());
             link_tokens.push(hashes);
         }

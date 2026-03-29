@@ -399,6 +399,7 @@ class VectorStore:
         self, 
         collection_name: str = "screenshot_embeddings",
         persist_directory: str = "./chroma_db",
+        chroma_client = None,
         storage_client = None
     ):
         """
@@ -407,6 +408,7 @@ class VectorStore:
         Args:
             collection_name: ChromaDB collection name.
             persist_directory: Persistence directory.
+            chroma_client: Optional shared ChromaDB persistent client.
             storage_client: Storage client (used for encrypting plaintext data).
         """
         import chromadb
@@ -417,10 +419,13 @@ class VectorStore:
         self.storage_client = storage_client  # used for encrypting plaintext data
         
         # Initialise ChromaDB client (persistent mode)
-        self.client = chromadb.PersistentClient(
-            path=persist_directory,
-            settings=Settings(anonymized_telemetry=False)
-        )
+        if chroma_client is not None:
+            self.client = chroma_client
+        else:
+            self.client = chromadb.PersistentClient(
+                path=persist_directory,
+                settings=Settings(anonymized_telemetry=False)
+            )
         
         # Get or create collection
         self.collection = self.client.get_or_create_collection(

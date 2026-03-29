@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Image as ImageIcon, Type, Loader2, X, ChevronDown } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { searchScreenshots, fetchThumbnailBatch, fetchImage } from '../lib/monitor_api';
 
 // Simple debounce hook
@@ -116,6 +118,33 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         setShowResults(false);
     };
 
+    const [isMigrating, setIsMigrating] = useState(false);
+
+    // Active detection: check on mount and listen for progress events
+    useEffect(() => {
+        let active = true;
+        const check = async () => {
+            try {
+                const status = await invoke('storage_check_hmac_migration_status');
+                if (active && (status.needs_migration || status.is_running)) {
+                    setIsMigrating(true);
+                }
+            } catch (e) { console.error(e); }
+        };
+        check();
+
+        // Listen for progress events to catch an ongoing migration immediately
+        let unlisten = null;
+        listen('hmac-migration-progress', () => {
+            if (active) setIsMigrating(true);
+        }).then(fn => unlisten = fn);
+
+        return () => { 
+            active = false; 
+            if (unlisten) unlisten();
+        };
+    }, []);
+
     return (
         <div 
             className="relative w-[450px] z-50 pointer-events-auto" 
@@ -200,6 +229,17 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
 
             {showResults && (
                 <div className="absolute top-full mt-2 w-[450px] bg-ide-panel border border-ide-border rounded-lg shadow-2xl overflow-hidden max-h-[600px] flex flex-col">
+                    {isMigrating && (
+                        <div className="p-3 bg-yellow-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">
+                            <div className="flex items-center gap-2 text-yellow-500 text-sm font-bold">
+                                <Loader2 size={14} className="animate-spin" />
+                                {t('settings.storageManagement.migration.search_unavailable_title')}
+                            </div>
+                            <div className="text-xs text-ide-muted leading-relaxed">
+                                {t('settings.storageManagement.migration.search_unavailable_desc')}
+                            </div>
+                        </div>
+                    )}
                     <div className="overflow-y-auto custom-scrollbar">
                         {results.length > 0 ? (
                             results.map((item, index) => (
@@ -215,7 +255,10 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                             ) : loading ? (
                                 <div className="p-4 text-center text-ide-muted text-sm">{t('search.loading')}</div>
                             ) : (
-                                <div className="p-4 text-center text-ide-muted text-sm">{t('search.noContents')}</div>
+                                // Show "no contents" only if not currently showing the migration warning alone
+                                (!isMigrating || query.trim().length > 0) && (
+                                    <div className="p-4 text-center text-ide-muted text-sm">{t('search.noContents')}</div>
+                                )
                         )}
                     </div>
                 </div>
