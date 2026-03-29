@@ -14,12 +14,14 @@ export default function HmacMigrationDialog() {
     let unlisten = null;
 
     const checkAndRun = async () => {
+      let didOpen = false;
       try {
         const status = await invoke('storage_check_hmac_migration_status');
         
         if (!status.needs_migration) return;
 
         setIsOpen(true);
+        didOpen = true;
         
         unlisten = await listen('hmac-migration-progress', (event) => {
           setProgress(event.payload);
@@ -38,7 +40,7 @@ export default function HmacMigrationDialog() {
         setIsOpen(false);
       } catch (err) {
         console.error('[HMAC_MIGRATE] Error:', err);
-        if (isOpen) setError(err.toString());
+        if (didOpen) setError(err.toString());
       }
     };
 

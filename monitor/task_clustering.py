@@ -317,6 +317,8 @@ class HotColdManager:
 
     @property
     def hot_collection(self):
+        if self._client is None:
+            return None
         with self._lock:
             if not hasattr(self, "_hot_collection"):
                 self._hot_collection = self._client.get_or_create_collection(
@@ -327,6 +329,8 @@ class HotColdManager:
 
     @property
     def cold_collection(self):
+        if self._client is None:
+            return None
         with self._lock:
             if not hasattr(self, "_cold_collection"):
                 self._cold_collection = self._client.get_or_create_collection(

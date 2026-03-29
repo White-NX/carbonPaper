@@ -712,7 +712,7 @@ async fn storage_run_hmac_migration(
     }
 
     tokio::task::spawn_blocking(move || {
-        state.run_hmac_migration(move |phase, processed, total| {
+        let result = state.run_hmac_migration(move |phase, processed, total| {
             let _ = app_handle.emit(
                 "hmac-migration-progress",
                 serde_json::json!({
@@ -721,7 +721,12 @@ async fn storage_run_hmac_migration(
                     "total": total
                 }),
             );
-        })
+        });
+
+        if result.is_ok() {
+            let _ = app_handle.emit("hmac-migration-complete", ());
+        }
+        result
     })
     .await
     .map_err(|e| format!("Migration task panicked: {}", e))?

@@ -594,16 +594,22 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     };
     check();
 
-    let unlisten = null;
+    let unlistenProgress = null;
+    let unlistenComplete = null;
     import('@tauri-apps/api/event').then(m => {
       m.listen('hmac-migration-progress', () => {
         if (mounted) setIsMigrating(true);
-      }).then(fn => unlisten = fn);
+      }).then(fn => unlistenProgress = fn);
+
+      m.listen('hmac-migration-complete', () => {
+        if (mounted) setIsMigrating(false);
+      }).then(fn => unlistenComplete = fn);
     });
 
     return () => { 
       mounted = false; 
-      if (unlisten) unlisten();
+      if (unlistenProgress) unlistenProgress();
+      if (unlistenComplete) unlistenComplete();
     };
   }, []);
 

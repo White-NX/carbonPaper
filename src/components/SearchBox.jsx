@@ -134,14 +134,21 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         check();
 
         // Listen for progress events to catch an ongoing migration immediately
-        let unlisten = null;
+        let unlistenProgress = null;
         listen('hmac-migration-progress', () => {
             if (active) setIsMigrating(true);
-        }).then(fn => unlisten = fn);
+        }).then(fn => unlistenProgress = fn);
+
+        // Listen for completion to clear the warning
+        let unlistenComplete = null;
+        listen('hmac-migration-complete', () => {
+            if (active) setIsMigrating(false);
+        }).then(fn => unlistenComplete = fn);
 
         return () => { 
             active = false; 
-            if (unlisten) unlisten();
+            if (unlistenProgress) unlistenProgress();
+            if (unlistenComplete) unlistenComplete();
         };
     }, []);
 

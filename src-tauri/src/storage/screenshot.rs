@@ -1854,6 +1854,9 @@ impl StorageState {
             return Ok(());
         }
 
+        // Reset cancellation flag
+        self.migration_cancel_requested.store(false, Ordering::SeqCst);
+
         let result = self.run_hmac_migration_internal(&mut progress_callback);
 
         self.migration_in_progress.store(false, Ordering::SeqCst);
@@ -1872,15 +1875,8 @@ impl StorageState {
         // Use cached total count - instant
         let total_rows = self.ocr_row_count.load(Ordering::Relaxed) as usize;
         let hmac_key = self.credential_state.get_hmac_key()?;
-        
-        // 1. Clear existing index (Instant)
-        {
-            let guard = self.get_connection_named("hmac_migrate_init")?;
-            let conn = guard.as_ref().unwrap();
-            conn.execute("DELETE FROM blind_bitmap_index", []).ok();
-        }
 
-        // 2. Get current cursor
+        // 1. Get current cursor (Read BEFORE potential clear)
         let mut cursor: i64 = {
             let guard = self.get_connection_named("hmac_migrate_get_cursor")?;
             let conn = guard.as_ref().unwrap();
@@ -1894,13 +1890,22 @@ impl StorageState {
             .unwrap_or(0)
         };
 
+        // 2. Clear existing index only if starting from scratch (Instant)
+        if cursor == 0 {
+            tracing::info!("[HMAC_MIGRATE] Cursor is 0, clearing existing index for a fresh start.");
+            let guard = self.get_connection_named("hmac_migrate_init")?;
+            let conn = guard.as_ref().unwrap();
+            conn.execute("DELETE FROM blind_bitmap_index", []).ok();
+        } else {
+            tracing::info!("[HMAC_MIGRATE] Resuming migration from cursor: {}", cursor);
+        }
+
         // Use cursor as an instant estimate for 'processed'
         let mut processed = cursor as usize;
         progress_callback("indexing", processed, total_rows);
 
         // 3. Migration loop with explicit lock yielding
         const MIGRATE_BATCH_SIZE: i64 = 500;
-
         loop {
             if self.is_migration_cancel_requested() {
                 return Err("Cancelled".to_string());
