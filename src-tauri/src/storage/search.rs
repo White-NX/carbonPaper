@@ -12,12 +12,23 @@ use super::{SearchResult, StorageState};
 
 impl StorageState {
     /// Compute HMAC hash for blind index.
-    pub(super) fn compute_hmac_hash(text: &str) -> String {
+    pub(super) fn compute_hmac_hash(text: &str, hmac_key: &[u8]) -> String {
         type HmacSha256 = Hmac<sha2::Sha256>;
-        const HMAC_KEY: &[u8] = b"CarbonPaper-Search-HMAC-Key-v1";
 
         let mut mac =
-            HmacSha256::new_from_slice(HMAC_KEY).expect("HMAC key length should be valid");
+            HmacSha256::new_from_slice(hmac_key).expect("HMAC key length should be valid");
+        mac.update(text.as_bytes());
+        let result = mac.finalize().into_bytes();
+        hex::encode(result)
+    }
+
+    /// Compute static hash for non-sensitive dedup (e.g. icons, link sets)
+    pub(super) fn compute_static_hash(text: &str) -> String {
+        type HmacSha256 = Hmac<sha2::Sha256>;
+        const STATIC_KEY: &[u8] = b"CarbonPaper-Search-HMAC-Key-v1";
+
+        let mut mac =
+            HmacSha256::new_from_slice(STATIC_KEY).expect("HMAC key length should be valid");
         mac.update(text.as_bytes());
         let result = mac.finalize().into_bytes();
         hex::encode(result)
@@ -99,6 +110,7 @@ impl StorageState {
         end_time: Option<f64>,
         categories: Option<Vec<String>>,
     ) -> Result<Vec<SearchResult>, String> {
+        let hmac_key = self.credential_state.get_hmac_key()?;
         let mut guard = self.get_connection_named("search_text")?;
         let conn = guard.as_mut().unwrap();
 
@@ -148,7 +160,7 @@ impl StorageState {
                     for kw_tokens in &per_keyword_tokens {
                         let mut bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
                         for token in kw_tokens {
-                            let token_hash = Self::compute_hmac_hash(token);
+                            let token_hash = Self::compute_hmac_hash(token, &hmac_key);
                             let blob: Option<Vec<u8>> = conn
                                 .query_row(
                                     "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?",
@@ -481,7 +493,7 @@ impl StorageState {
                                     &r.screenshot_created_at,
                                     "%Y-%m-%d %H:%M:%S",
                                 ) {
-                                    if (nd.timestamp() as f64) < start {
+                                    if (nd.and_utc().timestamp() as f64) < start {
                                         return false;
                                     }
                                 }
@@ -491,7 +503,7 @@ impl StorageState {
                                     &r.screenshot_created_at,
                                     "%Y-%m-%d %H:%M:%S",
                                 ) {
-                                    if (nd.timestamp() as f64) > end {
+                                    if (nd.and_utc().timestamp() as f64) > end {
                                         return false;
                                     }
                                 }
@@ -700,7 +712,7 @@ impl StorageState {
         for kw_bigrams in &per_keyword_bigrams {
             let mut bitmaps: Vec<roaring::RoaringBitmap> = Vec::new();
             for token in kw_bigrams {
-                let token_hash = Self::compute_hmac_hash(token);
+                let token_hash = Self::compute_hmac_hash(token, &hmac_key);
                 let blob: Option<Vec<u8>> = conn
                     .query_row(
                         "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?",
@@ -1230,7 +1242,7 @@ impl StorageState {
                         &r.screenshot_created_at,
                         "%Y-%m-%d %H:%M:%S",
                     ) {
-                        if (nd.timestamp() as f64) < start {
+                        if (nd.and_utc().timestamp() as f64) < start {
                             return false;
                         }
                     }
@@ -1240,7 +1252,7 @@ impl StorageState {
                         &r.screenshot_created_at,
                         "%Y-%m-%d %H:%M:%S",
                     ) {
-                        if (nd.timestamp() as f64) > end {
+                        if (nd.and_utc().timestamp() as f64) > end {
                             return false;
                         }
                     }

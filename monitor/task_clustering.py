@@ -313,20 +313,47 @@ class HotColdManager:
         self._engine = ClusteringEngine()
         self._lock = threading.Lock()
 
-        # Get-or-create collections
-        self.hot_collection = chroma_client.get_or_create_collection(
-            name="task_vectors",
-            metadata={"hnsw:space": "cosine"},
-        )
-        self.cold_collection = chroma_client.get_or_create_collection(
-            name="task_centroids",
-            metadata={"hnsw:space": "cosine"},
-        )
-        logger.info(
-            "[task_clustering] HotColdManager ready — hot=%d, cold=%d",
-            self.hot_collection.count(),
-            self.cold_collection.count(),
-        )
+        logger.info("[task_clustering] HotColdManager ready (lazy loading collections)")
+
+    @property
+    def hot_collection(self):
+        if self._client is None:
+            return None
+        with self._lock:
+            if not hasattr(self, "_hot_collection"):
+                self._hot_collection = self._client.get_or_create_collection(
+                    name="task_vectors",
+                    metadata={"hnsw:space": "cosine"},
+                )
+            return self._hot_collection
+
+    @property
+    def cold_collection(self):
+        if self._client is None:
+            return None
+        with self._lock:
+            if not hasattr(self, "_cold_collection"):
+                self._cold_collection = self._client.get_or_create_collection(
+                    name="task_centroids",
+                    metadata={"hnsw:space": "cosine"},
+                )
+            return self._cold_collection
+
+    def unload_collections(self):
+        """Unload collections from memory to save HNSW overhead."""
+        with self._lock:
+            if hasattr(self, "_hot_collection"):
+                delattr(self, "_hot_collection")
+            if hasattr(self, "_cold_collection"):
+                delattr(self, "_cold_collection")
+            
+            # Try to drop from Chroma's internal cache
+            try:
+                if hasattr(self._client, "_collections"):
+                    self._client._collections.pop("task_vectors", None)
+                    self._client._collections.pop("task_centroids", None)
+            except Exception:
+                pass
 
     # ---- encrypt / decrypt helpers (mirror VectorStore pattern) ----------
 
@@ -716,6 +743,8 @@ class HotColdManager:
             finally:
                 # Always unload the model after clustering to free memory
                 self._embedder.unload()
+                # Unload collections to save HNSW memory overhead when idle
+                self.unload_collections()
 
     # ---- Scheduled re-run helper -----------------------------------------
 

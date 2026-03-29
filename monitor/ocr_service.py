@@ -30,6 +30,7 @@ class OCRService:
         vector_db_path: str = "./chroma_db",
         enable_vector_store: bool = True,
         storage_pipe: str = None,
+        chroma_client = None,
     ):
         """Initialise the OCR service.
 
@@ -37,6 +38,7 @@ class OCRService:
             vector_db_path: ChromaDB persistence directory.
             enable_vector_store: Whether to load Chinese-CLIP and ChromaDB.
             storage_pipe: Named pipe for the Rust storage service (reverse IPC).
+            chroma_client: Optional shared ChromaDB persistent client.
         """
         # Storage client (for sending data to Rust)
         self.storage_pipe = storage_pipe
@@ -64,6 +66,7 @@ class OCRService:
                 collection_name="screenshots",
                 persist_directory=vector_db_path,
                 storage_client=self.storage_client,
+                chroma_client=chroma_client,
             )
 
         # Statistics

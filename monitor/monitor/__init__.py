@@ -621,6 +621,19 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     if _server is None:
         _server = start_pipe_server(handler=_handle_command, pipe_name=pipe_name)
 
+    # --- Single Shared ChromaDB Client ---
+    try:
+        import chromadb
+        from chromadb.config import Settings as ChromaSettings
+        chroma_path = os.path.join(get_data_dir(), 'chroma_db')
+        shared_chroma_client = chromadb.PersistentClient(
+            path=chroma_path,
+            settings=ChromaSettings(anonymized_telemetry=False),
+        )
+    except Exception as e:
+        logger.error("Failed to initialize shared ChromaDB client: %s", e)
+        shared_chroma_client = None
+
     # Lazy import to avoid triggering heavy model loading before IPC is ready
     from ocr_service import OCRService
 
@@ -628,6 +641,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     _ocr_worker = OCRService(
         vector_db_path=os.path.join(get_data_dir(), 'chroma_db'),
         storage_pipe=storage_pipe,
+        chroma_client=shared_chroma_client,
     )
     _ocr_worker.start()
 
@@ -645,23 +659,21 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     # Initialise task clustering service (MiniLM + HDBSCAN)
     try:
         from task_clustering import HotColdManager, ClusteringScheduler
-        import chromadb
-        from chromadb.config import Settings as ChromaSettings
 
-        chroma_path = os.path.join(get_data_dir(), 'chroma_db')
-        chroma_client = chromadb.PersistentClient(
-            path=chroma_path,
-            settings=ChromaSettings(anonymized_telemetry=False),
-        )
-        sc = None
-        if storage_pipe:
-            from storage_client import get_storage_client
-            sc = get_storage_client()
+        if shared_chroma_client is not None:
+            sc = None
+            if storage_pipe:
+                from storage_client import get_storage_client
+                sc = get_storage_client()
 
-        _clustering_manager = HotColdManager(chroma_client, storage_client=sc)
-        _clustering_scheduler = ClusteringScheduler(_clustering_manager, storage_client=sc)
-        _clustering_scheduler.start()
-        logger.info('Task clustering service initialised')
+            _clustering_manager = HotColdManager(shared_chroma_client, storage_client=sc)
+            _clustering_scheduler = ClusteringScheduler(_clustering_manager, storage_client=sc)
+            _clustering_scheduler.start()
+            logger.info('Task clustering service initialised')
+        else:
+            logger.warning('Task clustering service skipped: shared ChromaDB client is None')
+            _clustering_manager = None
+            _clustering_scheduler = None
     except Exception as e:
         logger.warning('Task clustering service failed to initialise (non-fatal): %s', e)
         _clustering_manager = None

@@ -42,6 +42,9 @@ pub struct StorageState {
     initialized: Mutex<bool>,
     migration_cancel_requested: AtomicBool,
     migration_in_progress: AtomicBool,
+    hmac_migration_cancel_requested: AtomicBool,
+    hmac_migration_in_progress: AtomicBool,
+    lazy_indexer_shutdown: AtomicBool,
     /// Diagnostic: tracks which operation currently holds the DB mutex
     lock_holder: Mutex<&'static str>,
     /// Approximate OCR row count for O(1) IDF lookups (initialized from DB, maintained on insert/delete)
@@ -66,6 +69,9 @@ impl StorageState {
             initialized: Mutex::new(false),
             migration_cancel_requested: AtomicBool::new(false),
             migration_in_progress: AtomicBool::new(false),
+            hmac_migration_cancel_requested: AtomicBool::new(false),
+            hmac_migration_in_progress: AtomicBool::new(false),
+            lazy_indexer_shutdown: AtomicBool::new(false),
             lock_holder: Mutex::new(""),
             ocr_row_count: AtomicU64::new(0),
             dedup_migrated: AtomicBool::new(false),
@@ -101,8 +107,26 @@ impl StorageState {
         self.migration_in_progress.load(Ordering::SeqCst)
     }
 
-    fn is_migration_cancel_requested(&self) -> bool {
+    /// Request cancellation of an ongoing HMAC migration.
+    pub fn request_hmac_migration_cancel(&self) -> bool {
+        self.hmac_migration_cancel_requested.store(true, Ordering::SeqCst);
+        self.hmac_migration_in_progress.load(Ordering::SeqCst)
+    }
+
+    pub fn is_migration_in_progress(&self) -> bool {
+        self.migration_in_progress.load(Ordering::SeqCst)
+    }
+
+    pub fn is_migration_cancel_requested(&self) -> bool {
         self.migration_cancel_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn is_hmac_migration_in_progress(&self) -> bool {
+        self.hmac_migration_in_progress.load(Ordering::SeqCst)
+    }
+
+    pub fn is_hmac_migration_cancel_requested(&self) -> bool {
+        self.hmac_migration_cancel_requested.load(Ordering::SeqCst)
     }
 
     /// Acquire DB connection with caller identification for diagnostic logging.

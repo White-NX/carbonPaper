@@ -11,8 +11,8 @@ use std::sync::atomic::Ordering;
 
 use super::types::RawScreenshotRow;
 use super::{
-    DensityBucket, OcrResultInput, SaveScreenshotRequest, SaveScreenshotResponse,
-    ScreenshotRecord, StorageState,
+    DensityBucket, OcrResultInput, SaveScreenshotRequest, SaveScreenshotResponse, ScreenshotRecord,
+    StorageState,
 };
 
 impl StorageState {
@@ -68,8 +68,10 @@ impl StorageState {
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("Failed to prepare batch id lookup: {}", e))?;
-        let params: Vec<&dyn rusqlite::types::ToSql> =
-            hashes.iter().map(|h| h as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = hashes
+            .iter()
+            .map(|h| h as &dyn rusqlite::types::ToSql)
+            .collect();
 
         let rows = stmt
             .query_map(params.as_slice(), |row| {
@@ -127,7 +129,11 @@ impl StorageState {
         // Generate filename (use .enc extension to indicate encrypted file)
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("screenshot_{}.png.enc", timestamp);
-        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let screenshot_dir = self
+            .screenshot_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let image_path = screenshot_dir.join(&filename);
 
         // Save encrypted image file
@@ -228,7 +234,6 @@ impl StorageState {
 
         if let Some(ocr_results) = &request.ocr_results {
             for result in ocr_results {
-                let text_hash = Self::compute_hmac_hash(&result.text);
                 let (text_enc, text_key_encrypted) =
                     self.encrypt_payload_with_row_key(result.text.as_bytes())?;
 
@@ -238,14 +243,9 @@ impl StorageState {
                     let existing: i64 = conn
                         .query_row(
                             "SELECT COUNT(*) FROM ocr_results
-                             WHERE screenshot_id = ? AND text_hash = ?
+                             WHERE screenshot_id = ?
                              AND ABS(box_x1 - ?) < 10 AND ABS(box_y1 - ?) < 10",
-                            params![
-                                screenshot_id,
-                                &text_hash,
-                                box_coords[0][0],
-                                box_coords[0][1],
-                            ],
+                            params![screenshot_id, box_coords[0][0], box_coords[0][1],],
                             |row| row.get(0),
                         )
                         .unwrap_or(0);
@@ -255,7 +255,7 @@ impl StorageState {
                         continue;
                     }
 
-                    // Insert new OCR result with encrypted text and blind index update
+                    // Insert new OCR result with encrypted text (lazy indexing will process this later)
                     conn.execute(
                         "INSERT INTO ocr_results (
                             screenshot_id, text, text_hash, text_enc, text_key_encrypted, confidence,
@@ -265,7 +265,7 @@ impl StorageState {
                         params![
                             screenshot_id,
                             Option::<String>::None,
-                            &text_hash,
+                            "", // empty text_hash signifies unindexed/backlogged
                             text_enc,
                             text_key_encrypted,
                             result.confidence,
@@ -276,55 +276,6 @@ impl StorageState {
                         ],
                     )
                     .map_err(|e| format!("Failed to insert OCR result: {}", e))?;
-
-                    // Update blind bigram bitmap index
-                    let ocr_id = conn.last_insert_rowid();
-                    let triple_tokens = Self::bigram_tokenize(&result.text);
-                    let tx = conn
-                        .transaction()
-                        .map_err(|e| format!("Failed to start transaction: {}", e))?;
-
-                    let mut get_stmt = tx
-                        .prepare_cached(
-                            "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
-                        )
-                        .map_err(|e| format!("Failed to prepare get statement: {}", e))?;
-                    let mut put_stmt = tx.prepare_cached(
-                        "INSERT OR REPLACE INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)"
-                    ).map_err(|e| format!("Failed to prepare put statement: {}", e))?;
-
-                    for token in triple_tokens {
-                        let token_hash = Self::compute_hmac_hash(&token);
-                        let existing_blob: Option<Vec<u8>> = get_stmt
-                            .query_row(params![&token_hash], |row| row.get(0))
-                            .optional()
-                            .map_err(|e| format!("Failed to query postings_blob: {}", e))?;
-                        let mut bitmap = if let Some(blob) = existing_blob {
-                            roaring::RoaringBitmap::deserialize_from(&blob[..])
-                                .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?
-                        } else {
-                            roaring::RoaringBitmap::new()
-                        };
-
-                        bitmap.insert(ocr_id as u32);
-
-                        let mut serialized_blob = Vec::new();
-                        bitmap
-                            .serialize_into(&mut serialized_blob)
-                            .map_err(|e| format!("Failed to serialize bitmap: {}", e))?;
-
-                        put_stmt
-                            .execute(params![&token_hash, &serialized_blob])
-                            .map_err(|e| {
-                                format!("Failed to update blind bitmap index: {}", e)
-                            })?;
-                    }
-
-                    drop(put_stmt);
-                    drop(get_stmt);
-
-                    tx.commit()
-                        .map_err(|e| format!("Failed to commit bitmap index: {}", e))?;
 
                     added += 1;
                     self.ocr_row_count.fetch_add(1, Ordering::Relaxed);
@@ -384,7 +335,11 @@ impl StorageState {
         let t2 = std::time::Instant::now();
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("screenshot_{}.png.enc.pending", timestamp);
-        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let screenshot_dir = self
+            .screenshot_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let image_path = screenshot_dir.join(&filename);
 
         std::fs::write(&image_path, &encrypted_image)
@@ -396,14 +351,18 @@ impl StorageState {
         // Generate thumbnail while we still have image_data and row_key
         // Use the final path (without .pending) so thumbnail path stays valid after commit rename
         let final_image_path = {
-            let fname = image_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let fname = image_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
             if fname.ends_with(".pending") {
                 image_path.with_file_name(fname.trim_end_matches(".pending"))
             } else {
                 image_path.clone()
             }
         };
-        if let Err(e) = self.generate_thumbnail_from_data(&image_data, &final_image_path, &row_key) {
+        if let Err(e) = self.generate_thumbnail_from_data(&image_data, &final_image_path, &row_key)
+        {
             tracing::warn!("Failed to generate thumbnail during temp save: {}", e);
         }
 
@@ -572,18 +531,17 @@ impl StorageState {
         // Timing accumulators for OCR processing
         let mut total_encrypt_dur = std::time::Duration::ZERO;
         let mut total_db_insert_dur = std::time::Duration::ZERO;
-        let mut total_bitmap_dur = std::time::Duration::ZERO;
+        let total_bitmap_dur = std::time::Duration::ZERO;
 
-        // Insert OCR results (if any) and update blind bigram bitmap index
+        // Insert OCR results (if any)
         if let Some(results) = ocr_results {
             for result in results {
                 let te0 = std::time::Instant::now();
-                let text_hash = Self::compute_hmac_hash(&result.text);
                 let (text_enc, text_key_encrypted) =
                     self.encrypt_payload_with_row_key(result.text.as_bytes())?;
                 total_encrypt_dur += te0.elapsed();
 
-                // Insert OCR result
+                // Insert OCR result (lazy indexing will process this later)
                 let td0 = std::time::Instant::now();
                 conn.execute(
                     "INSERT INTO ocr_results (
@@ -594,7 +552,7 @@ impl StorageState {
                     params![
                         screenshot_id,
                         Option::<String>::None,
-                        &text_hash,
+                        "", // empty text_hash signifies unindexed/backlogged
                         text_enc,
                         text_key_encrypted,
                         result.confidence,
@@ -610,54 +568,6 @@ impl StorageState {
                 )
                 .map_err(|e| format!("Failed to insert OCR result: {}", e))?;
                 total_db_insert_dur += td0.elapsed();
-
-                let tb0 = std::time::Instant::now();
-                let ocr_id = conn.last_insert_rowid();
-                let triple_tokens = Self::bigram_tokenize(&result.text);
-                let tx = conn
-                    .transaction()
-                    .map_err(|e| format!("Failed to start transaction: {}", e))?;
-
-                let mut get_stmt = tx
-                    .prepare_cached(
-                        "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
-                    )
-                    .map_err(|e| format!("Failed to prepare get statement: {}", e))?;
-                let mut put_stmt = tx.prepare_cached(
-                    "INSERT OR REPLACE INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)"
-                ).map_err(|e| format!("Failed to prepare put statement: {}", e))?;
-
-                for token in triple_tokens {
-                    let token_hash = Self::compute_hmac_hash(&token);
-                    let existing_blob: Option<Vec<u8>> = get_stmt
-                        .query_row(params![&token_hash], |row| row.get(0))
-                        .optional()
-                        .map_err(|e| format!("Failed to query postings_blob: {}", e))?;
-                    let mut bitmap = if let Some(blob) = existing_blob {
-                        roaring::RoaringBitmap::deserialize_from(&blob[..])
-                            .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?
-                    } else {
-                        roaring::RoaringBitmap::new()
-                    };
-
-                    bitmap.insert(ocr_id as u32);
-
-                    let mut serialized_blob = Vec::new();
-                    bitmap
-                        .serialize_into(&mut serialized_blob)
-                        .map_err(|e| format!("Failed to serialize bitmap: {}", e))?;
-
-                    put_stmt
-                        .execute(params![&token_hash, &serialized_blob])
-                        .map_err(|e| format!("Failed to update blind bitmap index: {}", e))?;
-                }
-
-                drop(put_stmt);
-                drop(get_stmt);
-
-                tx.commit()
-                    .map_err(|e| format!("Failed to commit bitmap index: {}", e))?;
-                total_bitmap_dur += tb0.elapsed();
 
                 added += 1;
                 self.ocr_row_count.fetch_add(1, Ordering::Relaxed);
@@ -755,10 +665,8 @@ impl StorageState {
                 "SELECT image_hash, category FROM screenshots WHERE image_hash IN ({})",
                 placeholders.join(",")
             );
-            let params: Vec<&dyn rusqlite::ToSql> = chunk
-                .iter()
-                .map(|h| h as &dyn rusqlite::ToSql)
-                .collect();
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
 
             let mut stmt = conn
                 .prepare(&sql)
@@ -766,10 +674,7 @@ impl StorageState {
 
             let rows = stmt
                 .query_map(params.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                    ))
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
                 })
                 .map_err(|e| format!("Failed to execute batch query: {}", e))?;
 
@@ -812,7 +717,10 @@ impl StorageState {
 
         // Also remove the thumbnail (generated at the non-.pending path)
         let final_path = {
-            let fname = image_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let fname = image_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
             if fname.ends_with(".pending") {
                 image_path.with_file_name(fname.trim_end_matches(".pending"))
             } else {
@@ -1280,11 +1188,11 @@ impl StorageState {
                 let thumb = Self::thumbnail_path_for(&abs_path);
                 let _ = std::fs::remove_file(&thumb);
             }
-            let _ = self.ocr_row_count.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| Some(v.saturating_sub(ocr_count as u64)),
-            );
+            let _ = self
+                .ocr_row_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(ocr_count as u64))
+                });
             // Clean up orphaned dedup entries
             let _ = Self::cleanup_orphaned_dedup_entries(conn);
         }
@@ -1338,11 +1246,11 @@ impl StorageState {
             .map_err(|e| format!("Failed to delete screenshots: {}", e))?;
 
         if deleted > 0 {
-            let _ = self.ocr_row_count.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |v| Some(v.saturating_sub(ocr_count as u64)),
-            );
+            let _ = self
+                .ocr_row_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(ocr_count as u64))
+                });
             // Clean up orphaned dedup entries
             let _ = Self::cleanup_orphaned_dedup_entries(conn);
         }
@@ -1361,18 +1269,18 @@ impl StorageState {
     /// Canonicalize a list of visible links into a deterministic JSON string.
     /// Links are sorted by (url, text) to ensure the same set always produces the same hash.
     fn canonicalize_links(links: &[super::VisibleLink]) -> String {
-        let mut sorted: Vec<(&str, &str)> = links.iter().map(|l| (l.url.as_str(), l.text.as_str())).collect();
+        let mut sorted: Vec<(&str, &str)> = links
+            .iter()
+            .map(|l| (l.url.as_str(), l.text.as_str()))
+            .collect();
         sorted.sort();
         serde_json::to_string(&sorted).unwrap_or_default()
     }
 
     /// Get or create a page_icon dedup entry. Returns the row ID.
     /// Uses INSERT OR IGNORE + SELECT pattern for atomic upsert.
-    fn get_or_create_page_icon(
-        conn: &Connection,
-        plaintext: &str,
-    ) -> Result<i64, String> {
-        let content_hash = Self::compute_hmac_hash(plaintext);
+    fn get_or_create_page_icon(conn: &Connection, plaintext: &str) -> Result<i64, String> {
+        let content_hash = Self::compute_static_hash(plaintext);
 
         // Try to find existing entry first (fast path)
         let existing: Option<i64> = conn
@@ -1424,7 +1332,7 @@ impl StorageState {
         links: &[super::VisibleLink],
     ) -> Result<i64, String> {
         let canonical = Self::canonicalize_links(links);
-        let content_hash = Self::compute_hmac_hash(&canonical);
+        let content_hash = Self::compute_static_hash(&canonical);
 
         // Try to find existing entry first (fast path)
         let existing: Option<i64> = conn
@@ -1481,12 +1389,33 @@ impl StorageState {
         Ok(())
     }
 
+    // ==================== Dedup Migration ====================
+
+    /// Marker key in app_metadata for dedup migration completion.
+    const DEDUP_MIGRATION_DONE_KEY: &'static str = "dedup_migration_done";
+
     /// Migrate existing inline page_icon_enc / visible_links_enc data into dedup tables.
     ///
     /// Processes rows in batches: for each row with inline data but no dedup reference,
     /// decrypts the inline blob, creates/reuses a dedup entry, sets the FK, and NULLs
     /// the inline column. Safe to call multiple times (idempotent).
     pub fn migrate_inline_to_dedup(&self) -> Result<(usize, usize), String> {
+        // Check persistent completion marker
+        {
+            let guard = self.get_connection_named("dedup_migrate_check")?;
+            let conn = guard.as_ref().unwrap();
+            let done: bool = conn
+                .query_row(
+                    "SELECT 1 FROM app_metadata WHERE key = ?1",
+                    params![Self::DEDUP_MIGRATION_DONE_KEY],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if done {
+                return Ok((0, 0));
+            }
+        }
+
         const BATCH_SIZE: i64 = 100;
         let mut migrated_icons: usize = 0;
         let mut migrated_links: usize = 0;
@@ -1660,6 +1589,16 @@ impl StorageState {
             );
         }
 
+        // Migration complete, write success marker
+        {
+            let guard = self.get_connection_named("dedup_migrate_mark")?;
+            let conn = guard.as_ref().unwrap();
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
+                params![Self::DEDUP_MIGRATION_DONE_KEY],
+            );
+        }
+
         Ok((migrated_icons, migrated_links))
     }
 
@@ -1668,10 +1607,11 @@ impl StorageState {
     /// Uses compare_exchange to ensure it only runs once.
     pub fn try_dedup_migration(&self) {
         // Only run once per session
-        if self.dedup_migrated.compare_exchange(
-            false, true,
-            Ordering::SeqCst, Ordering::SeqCst,
-        ).is_err() {
+        if self
+            .dedup_migrated
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return;
         }
 
@@ -1681,7 +1621,9 @@ impl StorageState {
                 if icons > 0 || links > 0 {
                     tracing::info!(
                         "[DEDUP:MIGRATE] Completed in {:?} ({} icons, {} link_sets)",
-                        t0.elapsed(), icons, links
+                        t0.elapsed(),
+                        icons,
+                        links
                     );
                 }
             }
@@ -1693,21 +1635,18 @@ impl StorageState {
         }
     }
 
-    // ==================== Bitmap Index Migration ====================
+    // ==================== Bitmap Index Migration & Lazy Indexing ====================
 
-    /// Marker key stored in the live table after atomic swap to signal completion (legacy location).
-    const BITMAP_MIGRATION_DONE_KEY_LEGACY: &'static str = "__bitmap_migration_done__";
-    /// Marker key in app_metadata for bitmap migration completion.
-    const BITMAP_MIGRATION_DONE_KEY: &'static str = "bitmap_migration_done";
-    /// Progress key stored in the staging table (blob = 8-byte little-endian i64).
-    const STAGING_LAST_ID_KEY: &'static str = "__staging_last_id__";
-    /// Number of OCR rows to process per batch.
-    const BITMAP_MIGRATION_BATCH: i64 = 500;
+    /// Marker key in app_metadata for bitmap HMAC v2 migration completion.
+    const BITMAP_MIGRATION_DONE_KEY: &'static str = "hmac_v2_migration_done";
+    /// Cursor key to track progress of HMAC v2 migration.
+    const BITMAP_MIGRATION_CURSOR_KEY: &'static str = "hmac_v2_migration_cursor";
+    /// Number of OCR rows to process per batch for lazy indexing.
+    const LAZY_INDEXING_BATCH: i64 = 100;
 
-    /// Attempt bitmap index migration (punctuation cleanup) if not already done.
+    /// Attempt to start the lazy indexer (and check migration status).
     /// Called after user authentication succeeds.
-    pub fn try_bitmap_index_migration(&self) {
-        // Session-level guard: only run once per session
+    pub fn try_bitmap_index_migration(self: &std::sync::Arc<Self>) {
         if self
             .bitmap_index_migrated
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1716,499 +1655,423 @@ impl StorageState {
             return;
         }
 
-        let t0 = std::time::Instant::now();
-        match self.run_bitmap_index_migration() {
-            Ok(migrated) => {
-                if migrated > 0 {
-                    tracing::info!(
-                        "[BITMAP:MIGRATE] Completed in {:?} ({} OCR rows re-indexed)",
-                        t0.elapsed(),
-                        migrated
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!("[BITMAP:MIGRATE] Migration failed (non-fatal): {}", e);
-                // Reset so it can be retried next session/auth
-                self.bitmap_index_migrated.store(false, Ordering::SeqCst);
-            }
-        }
+        // Spawn a background thread to continually process lazy indexing for backlogged items
+        let self_clone = self.clone();
+        std::thread::spawn(move || {
+            self_clone.run_lazy_indexer_loop();
+        });
     }
 
-    /// Rebuild bitmap index with punctuation-free bigrams.
-    fn run_bitmap_index_migration(&self) -> Result<i64, String> {
-        // Check persistent completion marker — new location (app_metadata) first, then legacy
-        {
-            let guard = self.get_connection_named("bitmap_migrate_check")?;
-            let conn = guard.as_ref().unwrap();
-
-            let done_new: bool = conn
-                .query_row(
-                    "SELECT 1 FROM app_metadata WHERE key = ?1",
-                    params![Self::BITMAP_MIGRATION_DONE_KEY],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
-            if done_new {
-                return Ok(0);
-            }
-
-            let done_legacy: bool = conn
-                .query_row(
-                    "SELECT 1 FROM blind_bitmap_index WHERE token_hash = ?1",
-                    params![Self::BITMAP_MIGRATION_DONE_KEY_LEGACY],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
-            if done_legacy {
-                // Migrate marker to app_metadata, then clean up legacy sentinel
-                let _ = conn.execute(
-                    "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
-                    params![Self::BITMAP_MIGRATION_DONE_KEY],
-                );
-                let _ = conn.execute(
-                    "DELETE FROM blind_bitmap_index WHERE token_hash = ?1",
-                    params![Self::BITMAP_MIGRATION_DONE_KEY_LEGACY],
-                );
-                return Ok(0);
-            }
-        }
-
-        tracing::info!("[BITMAP:MIGRATE] Processing database optimization...");
-
-        // Read persisted progress from staging table
-        let mut last_id: i64 = {
-            let guard = self.get_connection_named("bitmap_migrate_progress")?;
-            let conn = guard.as_ref().unwrap();
-            Self::read_staging_last_id(conn)
-        };
-
-        let mut total_processed: i64 = 0;
-        let report_interval = std::time::Duration::from_secs(5);
-        let mut last_report = std::time::Instant::now();
-
-        // Incremental batch loop
+    /// Background loop that periodically processes unindexed ocr_results.
+    fn run_lazy_indexer_loop(&self) {
+        tracing::info!("[LAZY_INDEXER] Started background thread for lazy indexing.");
         loop {
-            // Read OCR rows (hold DB mutex briefly)
-            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
-                let guard = self.get_connection_named("bitmap_migrate_read")?;
-                let conn = guard.as_ref().unwrap();
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, text_enc, text_key_encrypted \
-                         FROM ocr_results \
-                         WHERE id > ?1 AND text_enc IS NOT NULL AND text_key_encrypted IS NOT NULL \
-                         ORDER BY id ASC LIMIT ?2",
-                    )
-                    .map_err(|e| format!("bitmap migrate prepare: {}", e))?;
-                let mapped = stmt
-                    .query_map(params![last_id, Self::BITMAP_MIGRATION_BATCH], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                        ))
-                    })
-                    .map_err(|e| format!("bitmap migrate query: {}", e))?;
-                mapped.filter_map(|r| r.ok()).collect()
-            };
-
-            // all rows processed
-            if rows.is_empty() {
+            if self.lazy_indexer_shutdown.load(Ordering::SeqCst) {
+                tracing::info!("[LAZY_INDEXER] Shutting down background thread.");
                 break;
             }
 
-            // Decrypt and tokenize
-            let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
-                std::collections::HashMap::new();
-            let mut batch_max_id: i64 = last_id;
-
-            for (ocr_id, text_enc, text_key_enc) in &rows {
-                let plaintext = match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
-                    Ok(bytes) => match String::from_utf8(bytes) {
-                        Ok(s) => s,
-                        Err(_) => continue, // skip non-utf8
-                    },
-                    Err(_) => continue, // skip rows that fail to decrypt
-                };
-
-                let bigrams = Self::bigram_tokenize(&plaintext);
-                for token in bigrams {
-                    let hash = Self::compute_hmac_hash(&token);
-                    batch_tokens
-                        .entry(hash)
-                        .or_insert_with(roaring::RoaringBitmap::new)
-                        .insert(*ocr_id as u32);
-                }
-                if *ocr_id > batch_max_id {
-                    batch_max_id = *ocr_id;
-                }
-            }
-
-            // Merge into staging table (single transaction)
-            {
-                let mut guard = self.get_connection_named("bitmap_migrate_write")?;
-                let conn = guard.as_mut().unwrap();
-                let tx = conn
-                    .transaction()
-                    .map_err(|e| format!("bitmap migrate tx: {}", e))?;
-
-                {
-                    let mut get_stmt = tx
-                        .prepare_cached(
-                            "SELECT postings_blob FROM blind_bitmap_index_staging WHERE token_hash = ?1",
-                        )
-                        .map_err(|e| format!("bitmap migrate prepare get: {}", e))?;
-                    let mut put_stmt = tx
-                        .prepare_cached(
-                            "INSERT OR REPLACE INTO blind_bitmap_index_staging (token_hash, postings_blob) VALUES (?1, ?2)",
-                        )
-                        .map_err(|e| format!("bitmap migrate prepare put: {}", e))?;
-
-                    for (hash, new_bitmap) in &batch_tokens {
-                        let existing_blob: Option<Vec<u8>> = get_stmt
-                            .query_row(params![hash], |row| row.get(0))
-                            .optional()
-                            .map_err(|e| format!("bitmap migrate get: {}", e))?;
-
-                        let merged = if let Some(blob) = existing_blob {
-                            let mut existing =
-                                roaring::RoaringBitmap::deserialize_from(&blob[..])
-                                    .map_err(|e| format!("bitmap migrate deser: {}", e))?;
-                            existing |= new_bitmap;
-                            existing
-                        } else {
-                            new_bitmap.clone()
-                        };
-
-                        let mut buf = Vec::new();
-                        merged
-                            .serialize_into(&mut buf)
-                            .map_err(|e| format!("bitmap migrate ser: {}", e))?;
-                        put_stmt
-                            .execute(params![hash, buf])
-                            .map_err(|e| format!("bitmap migrate put: {}", e))?;
-                    }
-                    drop(get_stmt);
-                    drop(put_stmt);
-                }
-
-                // Update progress marker
-                Self::write_staging_last_id(&tx, batch_max_id)?;
-
-                tx.commit()
-                    .map_err(|e| format!("bitmap migrate commit: {}", e))?;
-            }
-
-            total_processed += rows.len() as i64;
-            last_id = batch_max_id;
-
-            // Periodic progress report
-            if last_report.elapsed() >= report_interval {
-                tracing::info!(
-                    "[BITMAP:MIGRATE] Progress: {} rows optimized so far (last_id={})",
-                    total_processed,
-                    last_id
-                );
-                last_report = std::time::Instant::now();
-            }
-        }
-
-        // Process any rows added during migration, then atomically swap tables.
-        // IMPORTANT: The final "no more rows" check and table swap MUST happen
-        // under a single mutex acquisition to prevent a race where new bitmap
-        // entries are inserted between the empty check and DROP TABLE.
-        loop {
-            // Step 1: Acquire mutex, read remaining rows, release mutex
-            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
-                let guard = self.get_connection_named("bitmap_migrate_catchup")?;
-                let conn = guard.as_ref().unwrap();
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, text_enc, text_key_encrypted \
-                         FROM ocr_results \
-                         WHERE id > ?1 AND text_enc IS NOT NULL AND text_key_encrypted IS NOT NULL \
-                         ORDER BY id ASC LIMIT ?2",
-                    )
-                    .map_err(|e| format!("bitmap catchup prepare: {}", e))?;
-                let mapped = stmt
-                    .query_map(params![last_id, Self::BITMAP_MIGRATION_BATCH], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                        ))
-                    })
-                    .map_err(|e| format!("bitmap catchup query: {}", e))?;
-                mapped.filter_map(|r| r.ok()).collect()
-            };
-
-            if !rows.is_empty() {
-                // Step 2: Decrypt + tokenize OUTSIDE mutex (CPU-intensive, no DB needed)
-                let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
-                    std::collections::HashMap::new();
-                let mut batch_max_id = last_id;
-
-                for (ocr_id, text_enc, text_key_enc) in &rows {
-                    let plaintext =
-                        match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
-                            Ok(bytes) => match String::from_utf8(bytes) {
-                                Ok(s) => s,
-                                Err(_) => continue,
-                            },
-                            Err(_) => continue,
-                        };
-
-                    let bigrams = Self::bigram_tokenize(&plaintext);
-                    for token in bigrams {
-                        let hash = Self::compute_hmac_hash(&token);
-                        batch_tokens
-                            .entry(hash)
-                            .or_insert_with(roaring::RoaringBitmap::new)
-                            .insert(*ocr_id as u32);
-                    }
-                    if *ocr_id > batch_max_id {
-                        batch_max_id = *ocr_id;
-                    }
-                }
-
-                // Step 3: Write to staging (acquire mutex briefly)
-                {
-                    let mut guard =
-                        self.get_connection_named("bitmap_migrate_catchup_write")?;
-                    let conn = guard.as_mut().unwrap();
-                    let tx = conn
-                        .transaction()
-                        .map_err(|e| format!("bitmap catchup tx: {}", e))?;
-
-                    {
-                        let mut get_stmt = tx
-                            .prepare_cached(
-                                "SELECT postings_blob FROM blind_bitmap_index_staging WHERE token_hash = ?1",
-                            )
-                            .map_err(|e| format!("bitmap catchup prepare get: {}", e))?;
-                        let mut put_stmt = tx
-                            .prepare_cached(
-                                "INSERT OR REPLACE INTO blind_bitmap_index_staging (token_hash, postings_blob) VALUES (?1, ?2)",
-                            )
-                            .map_err(|e| format!("bitmap catchup prepare put: {}", e))?;
-
-                        for (hash, new_bitmap) in &batch_tokens {
-                            let existing_blob: Option<Vec<u8>> = get_stmt
-                                .query_row(params![hash], |row| row.get(0))
-                                .optional()
-                                .map_err(|e| format!("bitmap catchup get: {}", e))?;
-
-                            let merged = if let Some(blob) = existing_blob {
-                                let mut existing =
-                                    roaring::RoaringBitmap::deserialize_from(&blob[..])
-                                        .map_err(|e| format!("bitmap catchup deser: {}", e))?;
-                                existing |= new_bitmap;
-                                existing
-                            } else {
-                                new_bitmap.clone()
-                            };
-
-                            let mut buf = Vec::new();
-                            merged
-                                .serialize_into(&mut buf)
-                                .map_err(|e| format!("bitmap catchup ser: {}", e))?;
-                            put_stmt
-                                .execute(params![hash, buf])
-                                .map_err(|e| format!("bitmap catchup put: {}", e))?;
-                        }
-                        drop(get_stmt);
-                        drop(put_stmt);
-                    }
-
-                    Self::write_staging_last_id(&tx, batch_max_id)?;
-
-                    tx.commit()
-                        .map_err(|e| format!("bitmap catchup commit: {}", e))?;
-                }
-
-                total_processed += rows.len() as i64;
-                last_id = batch_max_id;
+            if !*self.initialized.lock().unwrap_or_else(|e| e.into_inner()) {
+                std::thread::sleep(std::time::Duration::from_millis(2000));
                 continue;
             }
 
-            // rows was empty — but mutex was already released after step 1,
-            // so a concurrent insert could have added rows in the gap.
-            // Step 4: FINAL — acquire mutex ONCE for re-check + swap atomically.
-            // This guarantees no rows can be inserted between the check and DROP.
-            {
-                let mut guard = self.get_connection_named("bitmap_migrate_swap")?;
-                let conn = guard.as_mut().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1000));
 
-                // Re-check for any rows inserted after step 1 released the mutex
-                let late_rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT id, text_enc, text_key_encrypted \
-                             FROM ocr_results \
-                             WHERE id > ?1 AND text_enc IS NOT NULL \
-                             AND text_key_encrypted IS NOT NULL \
-                             ORDER BY id ASC",
-                        )
-                        .map_err(|e| format!("bitmap swap recheck prepare: {}", e))?;
-                    let mapped = stmt
-                        .query_map(params![last_id], |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, Vec<u8>>(1)?,
-                                row.get::<_, Vec<u8>>(2)?,
-                            ))
-                        })
-                        .map_err(|e| format!("bitmap swap recheck query: {}", e))?;
+            // Don't do anything if migration is not done yet
+            if let Ok(needs_migrate) = self.check_hmac_migration_status() {
+                if needs_migrate {
+                    continue; // Wait until the explicit migration dialog finishes
+                }
+            }
+
+            match self.process_lazy_indexing_batch() {
+                Ok(processed) => {
+                    if processed == 0 {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[LAZY_INDEXER] Batch error: {}", e);
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
+            }
+        }
+    }
+
+    /// Process a batch of unindexed OCR results (where text_hash is empty).
+    pub fn process_lazy_indexing_batch(&self) -> Result<usize, String> {
+        let hmac_key = self.credential_state.get_hmac_key()?;
+
+        // 1. Fetch rows that have NO hash (newly captured during this version)
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+            let guard = self.get_connection_named("lazy_indexer_read")?;
+            let conn = guard.as_ref().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, text_enc, text_key_encrypted FROM ocr_results WHERE text_hash = '' ORDER BY id ASC LIMIT ?1",
+                )
+                .map_err(|e| format!("lazy prepare: {}", e))?;
+            let mapped = stmt
+                .query_map(params![Self::LAZY_INDEXING_BATCH], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|e| format!("lazy query: {}", e))?;
+            mapped.filter_map(|r| r.ok()).collect()
+        };
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        self.index_batch_internal(rows, &hmac_key)
+    }
+
+    /// Internal helper to re-index a batch of rows.
+    fn index_batch_internal(&self, rows: Vec<(i64, Vec<u8>, Vec<u8>)>, hmac_key: &[u8]) -> Result<usize, String> {
+        let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
+            std::collections::HashMap::new();
+        let mut row_hashes: Vec<(i64, String)> = Vec::new();
+
+        for (ocr_id, text_enc, text_key_enc) in &rows {
+            let plaintext = match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+
+            let text_hash = Self::compute_hmac_hash(&plaintext, hmac_key);
+            row_hashes.push((*ocr_id, text_hash));
+
+            let bigrams = Self::bigram_tokenize(&plaintext);
+            for token in bigrams {
+                let token_hash = Self::compute_hmac_hash(&token, hmac_key);
+                batch_tokens
+                    .entry(token_hash)
+                    .or_insert_with(roaring::RoaringBitmap::new)
+                    .insert(*ocr_id as u32);
+            }
+        }
+
+        // 3. Update DB
+        {
+            let mut guard = self.get_connection_named("lazy_indexer_write")?;
+            let conn = guard.as_mut().unwrap();
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("lazy tx: {}", e))?;
+
+            // Update text_hash
+            {
+                let mut upd_stmt = tx.prepare_cached(
+                    "UPDATE ocr_results SET text_hash = ?1 WHERE id = ?2"
+                ).map_err(|e| format!("lazy upd prep: {}", e))?;
+                for (id, hash) in &row_hashes {
+                    upd_stmt.execute(params![hash, id]).ok();
+                }
+            }
+
+            // Update blind_bitmap_index
+            {
+                let mut get_stmt = tx
+                    .prepare_cached(
+                        "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
+                    )
+                    .map_err(|e| format!("lazy get prep: {}", e))?;
+                let mut put_stmt = tx
+                    .prepare_cached(
+                        "INSERT OR REPLACE INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
+                    )
+                    .map_err(|e| format!("lazy put prep: {}", e))?;
+
+                for (hash, new_bitmap) in &batch_tokens {
+                    let existing_blob: Option<Vec<u8>> = get_stmt
+                        .query_row(params![hash], |row| row.get(0))
+                        .optional()
+                        .map_err(|e| format!("lazy get: {}", e))?;
+
+                    let merged = if let Some(blob) = existing_blob {
+                        let mut existing =
+                            roaring::RoaringBitmap::deserialize_from(&blob[..])
+                                .map_err(|e| format!("lazy deser: {}", e))?;
+                        existing |= new_bitmap;
+                        existing
+                    } else {
+                        new_bitmap.clone()
+                    };
+
+                    let mut buf = Vec::new();
+                    merged
+                        .serialize_into(&mut buf)
+                        .map_err(|e| format!("lazy ser: {}", e))?;
+                    put_stmt
+                        .execute(params![hash, buf])
+                        .map_err(|e| format!("lazy put: {}", e))?;
+                }
+            }
+
+            tx.commit()
+                .map_err(|e| format!("lazy commit: {}", e))?;
+        }
+
+        Ok(rows.len())
+    }
+
+    /// Check if HMAC v2 migration is needed.
+    pub fn check_hmac_migration_status(&self) -> Result<bool, String> {
+        let guard = self.get_connection_named("check_hmac_migration")?;
+        let conn = guard.as_ref().unwrap();
+        
+        // 1. Check persistent marker
+        let done: bool = conn
+            .query_row(
+                "SELECT 1 FROM app_metadata WHERE key = ?1",
+                params![Self::BITMAP_MIGRATION_DONE_KEY],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if done { return Ok(false); }
+
+        // 2. Check if there is anything to migrate (old hashes)
+        // Rows with text_hash = '' are newly captured and will be indexed by lazy indexer.
+        // We only need full migration if there are rows with EXISTING non-HMAC hashes.
+        let has_work: bool = conn
+            .query_row(
+                "SELECT 1 FROM ocr_results WHERE text_hash != '' LIMIT 1",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        
+        Ok(has_work)
+    }
+
+    /// Run full HMAC v2 migration on existing data using a cursor.
+    pub fn run_hmac_migration<F>(&self, mut progress_callback: F) -> Result<(), String>
+    where
+        F: FnMut(&str, usize, usize),
+    {
+        if self
+            .hmac_migration_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("ALREADY_RUNNING".to_string());
+        }
+
+        // Reset cancellation flag
+        self.hmac_migration_cancel_requested.store(false, Ordering::SeqCst);
+
+        let result = self.run_hmac_migration_internal(&mut progress_callback);
+
+        self.hmac_migration_in_progress.store(false, Ordering::SeqCst);
+        result
+    }
+
+    fn run_hmac_migration_internal<F>(&self, progress_callback: &mut F) -> Result<(), String>
+    where
+        F: FnMut(&str, usize, usize),
+    {
+        tracing::info!("[HMAC_MIGRATE] Starting high-concurrency cursor migration...");
+        if !self.check_hmac_migration_status()? {
+            return Ok(());
+        }
+
+        // Use cached total count - instant
+        let total_rows = self.ocr_row_count.load(Ordering::Relaxed) as usize;
+        let hmac_key = self.credential_state.get_hmac_key()?;
+
+        // 1. Get current cursor (Read BEFORE potential clear)
+        let mut cursor: i64 = {
+            let guard = self.get_connection_named("hmac_migrate_get_cursor")?;
+            let conn = guard.as_ref().unwrap();
+            conn.query_row(
+                "SELECT value FROM app_metadata WHERE key = ?1",
+                params![Self::BITMAP_MIGRATION_CURSOR_KEY],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+        };
+
+        // 2. Clear existing index only if starting from scratch (Instant)
+        if cursor == 0 {
+            tracing::info!("[HMAC_MIGRATE] Cursor is 0, clearing existing index for a fresh start.");
+            let guard = self.get_connection_named("hmac_migrate_init")?;
+            let conn = guard.as_ref().unwrap();
+            conn.execute("DELETE FROM blind_bitmap_index", []).ok();
+        } else {
+            tracing::info!("[HMAC_MIGRATE] Resuming migration from cursor: {}", cursor);
+        }
+
+        // Use cursor as an instant estimate for 'processed'
+        let mut processed = cursor as usize;
+        progress_callback("indexing", processed, total_rows);
+
+        // 3. Migration loop with explicit lock yielding
+        const MIGRATE_BATCH_SIZE: i64 = 500;
+        loop {
+            if self.is_hmac_migration_cancel_requested() {
+                return Err("Cancelled".to_string());
+            }
+
+            // CRITICAL: Scope the MutexGuard to the smallest possible area
+            let batch_result = {
+                let guard = self.get_connection_named("hmac_migrate_batch")?;
+                let conn = guard.as_ref().unwrap();
+
+                // A. FETCH
+                let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, text_enc, text_key_encrypted FROM ocr_results WHERE id > ?1 ORDER BY id ASC LIMIT ?2"
+                    ).map_err(|e| e.to_string())?;
+                    
+                    let mapped = stmt.query_map(params![cursor, MIGRATE_BATCH_SIZE], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?))
+                    }).map_err(|e| e.to_string())?;
+
                     mapped.filter_map(|r| r.ok()).collect()
                 };
 
-                // Process any late arrivals in-place under mutex.
-                // Typically 0 rows; at most 1-2 in a race scenario.
-                // decrypt_payload_with_row_key uses CNG API, not DB mutex — safe.
-                if !late_rows.is_empty() {
-                    tracing::info!(
-                        "[BITMAP:MIGRATE] Processing {} late row(s) during final swap",
-                        late_rows.len()
-                    );
+                if rows.is_empty() {
+                    Ok::<Option<(i64, usize)>, String>(None)
+                } else {
+                    let batch_len = rows.len();
+                    let last_id_in_batch = rows.last().unwrap().0;
+                    
+                    // B. INDEXING
+                    self.index_batch_internal_on_conn(conn, rows, &hmac_key)?;
+                    
+                    // C. UPDATE CURSOR
+                    conn.execute(
+                        "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
+                        params![Self::BITMAP_MIGRATION_CURSOR_KEY, last_id_in_batch.to_string()],
+                    ).ok();
 
-                    let mut batch_tokens: std::collections::HashMap<
-                        String,
-                        roaring::RoaringBitmap,
-                    > = std::collections::HashMap::new();
-
-                    for (ocr_id, text_enc, text_key_enc) in &late_rows {
-                        let plaintext =
-                            match self.decrypt_payload_with_row_key(text_enc, text_key_enc)
-                            {
-                                Ok(bytes) => match String::from_utf8(bytes) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                },
-                                Err(_) => continue,
-                            };
-
-                        let bigrams = Self::bigram_tokenize(&plaintext);
-                        for token in bigrams {
-                            let hash = Self::compute_hmac_hash(&token);
-                            batch_tokens
-                                .entry(hash)
-                                .or_insert_with(roaring::RoaringBitmap::new)
-                                .insert(*ocr_id as u32);
-                        }
-                    }
-
-                    let tx = conn
-                        .transaction()
-                        .map_err(|e| format!("bitmap swap late tx: {}", e))?;
-                    {
-                        let mut get_stmt = tx
-                            .prepare_cached(
-                                "SELECT postings_blob FROM blind_bitmap_index_staging WHERE token_hash = ?1",
-                            )
-                            .map_err(|e| format!("bitmap swap late prepare get: {}", e))?;
-                        let mut put_stmt = tx
-                            .prepare_cached(
-                                "INSERT OR REPLACE INTO blind_bitmap_index_staging (token_hash, postings_blob) VALUES (?1, ?2)",
-                            )
-                            .map_err(|e| format!("bitmap swap late prepare put: {}", e))?;
-
-                        for (hash, new_bitmap) in &batch_tokens {
-                            let existing_blob: Option<Vec<u8>> = get_stmt
-                                .query_row(params![hash], |row| row.get(0))
-                                .optional()
-                                .map_err(|e| format!("bitmap swap late get: {}", e))?;
-
-                            let merged = if let Some(blob) = existing_blob {
-                                let mut existing =
-                                    roaring::RoaringBitmap::deserialize_from(&blob[..])
-                                        .map_err(|e| {
-                                            format!("bitmap swap late deser: {}", e)
-                                        })?;
-                                existing |= new_bitmap;
-                                existing
-                            } else {
-                                new_bitmap.clone()
-                            };
-
-                            let mut buf = Vec::new();
-                            merged
-                                .serialize_into(&mut buf)
-                                .map_err(|e| format!("bitmap swap late ser: {}", e))?;
-                            put_stmt
-                                .execute(params![hash, buf])
-                                .map_err(|e| format!("bitmap swap late put: {}", e))?;
-                        }
-                        drop(get_stmt);
-                        drop(put_stmt);
-                    }
-                    tx.commit()
-                        .map_err(|e| format!("bitmap swap late commit: {}", e))?;
-
-                    total_processed += late_rows.len() as i64;
+                    Ok::<Option<(i64, usize)>, String>(Some((last_id_in_batch, batch_len)))
                 }
+                // MutexGuard 'guard' is DROPPED here automatically at the end of this block.
+            }?;
 
-                // Remove progress marker from staging before swap
-                conn.execute(
-                    "DELETE FROM blind_bitmap_index_staging WHERE token_hash = ?1",
-                    params![Self::STAGING_LAST_ID_KEY],
-                )
-                .map_err(|e| format!("bitmap swap cleanup: {}", e))?;
+            match batch_result {
+                Some((new_cursor, count)) => {
+                    cursor = new_cursor;
+                    processed += count;
+                    progress_callback("indexing", processed, total_rows);
 
-                // Atomic swap — guaranteed no concurrent inserts (mutex held)
-                conn.execute_batch(
-                    "BEGIN TRANSACTION;
-                     DROP TABLE blind_bitmap_index;
-                     ALTER TABLE blind_bitmap_index_staging RENAME TO blind_bitmap_index;
-                     COMMIT;",
-                )
-                .map_err(|e| format!("bitmap swap failed: {}", e))?;
+                    // D. YIELD - The Mutex is now FREE. UI threads and Capture threads can jump in!
+                    std::thread::sleep(std::time::Duration::from_millis(200));
 
-                // Insert completion marker into app_metadata
-                conn.execute(
-                    "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
-                    params![Self::BITMAP_MIGRATION_DONE_KEY],
-                )
-                .map_err(|e| format!("bitmap done marker insert: {}", e))?;
-            } // mutex released — swap complete
-            break;
+                    if processed % 10000 < MIGRATE_BATCH_SIZE as usize {
+                        tracing::info!("[HMAC_MIGRATE] Progress: {} / {} (ID: {})", processed, total_rows, cursor);
+                    }
+                }
+                None => break,
+            }
         }
 
-        if total_processed > 0 {
-            tracing::info!(
-                "[BITMAP:MIGRATE] Atomic swap complete. {} OCR rows re-indexed with clean bigrams.",
-                total_processed
-            );
-        }
-
-        Ok(total_processed)
-    }
-
-    /// Read the last-processed OCR id from the staging table.
-    fn read_staging_last_id(conn: &Connection) -> i64 {
-        let blob: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT postings_blob FROM blind_bitmap_index_staging WHERE token_hash = ?1",
-                params![Self::STAGING_LAST_ID_KEY],
-                |row| row.get(0),
+        // 4. Mark as done (needs its own short-lived lock)
+        {
+            let guard = self.get_connection_named("hmac_migrate_done")?;
+            let conn = guard.as_ref().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
+                params![Self::BITMAP_MIGRATION_DONE_KEY],
             )
-            .optional()
-            .ok()
-            .flatten();
-
-        match blob {
-            Some(b) if b.len() == 8 => i64::from_le_bytes(b.try_into().unwrap()),
-            _ => 0,
+            .ok();
+            conn.execute(
+                "DELETE FROM app_metadata WHERE key = ?1",
+                params![Self::BITMAP_MIGRATION_CURSOR_KEY],
+            )
+            .ok();
         }
+
+        tracing::info!("[HMAC_MIGRATE] Migration completed successfully.");
+        Ok(())
     }
 
-    /// Write the last-processed OCR id into the staging table.
-    fn write_staging_last_id(tx: &rusqlite::Transaction, id: i64) -> Result<(), String> {
-        tx.execute(
-            "INSERT OR REPLACE INTO blind_bitmap_index_staging (token_hash, postings_blob) VALUES (?1, ?2)",
-            params![Self::STAGING_LAST_ID_KEY, id.to_le_bytes().to_vec()],
-        )
-        .map_err(|e| format!("bitmap write progress: {}", e))?;
+    /// Internal helper to re-index a batch using a provided connection.
+    fn index_batch_internal_on_conn(
+        &self,
+        conn: &Connection,
+        rows: Vec<(i64, Vec<u8>, Vec<u8>)>,
+        hmac_key: &[u8],
+    ) -> Result<(), String> {
+        let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
+            std::collections::HashMap::new();
+        let mut row_hashes: Vec<(i64, String)> = Vec::new();
+
+        for (ocr_id, text_enc, text_key_enc) in &rows {
+            let plaintext = match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+
+            let text_hash = Self::compute_hmac_hash(&plaintext, hmac_key);
+            row_hashes.push((*ocr_id, text_hash));
+
+            let bigrams = Self::bigram_tokenize(&plaintext);
+            for token in bigrams {
+                let token_hash = Self::compute_hmac_hash(&token, hmac_key);
+                batch_tokens
+                    .entry(token_hash)
+                    .or_insert_with(roaring::RoaringBitmap::new)
+                    .insert(*ocr_id as u32);
+            }
+        }
+
+        // Atomic update for the batch
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        {
+            let mut upd_stmt = tx
+                .prepare_cached("UPDATE ocr_results SET text_hash = ?1 WHERE id = ?2")
+                .map_err(|e| e.to_string())?;
+            for (id, hash) in &row_hashes {
+                let _ = upd_stmt.execute(params![hash, id]);
+            }
+
+            let mut get_stmt = tx
+                .prepare_cached("SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1")
+                .map_err(|e| e.to_string())?;
+            let mut put_stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
+                )
+                .map_err(|e| e.to_string())?;
+
+            for (hash, new_bitmap) in &batch_tokens {
+                let existing_blob: Option<Vec<u8>> = get_stmt
+                    .query_row(params![hash], |row| row.get(0))
+                    .optional()
+                    .unwrap_or(None);
+                let merged = if let Some(blob) = existing_blob {
+                    if let Ok(mut existing) = roaring::RoaringBitmap::deserialize_from(&blob[..]) {
+                        existing |= new_bitmap;
+                        existing
+                    } else {
+                        new_bitmap.clone()
+                    }
+                } else {
+                    new_bitmap.clone()
+                };
+
+                let mut buf = Vec::new();
+                if merged.serialize_into(&mut buf).is_ok() {
+                    let _ = put_stmt.execute(params![hash, buf]);
+                }
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 }

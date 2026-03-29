@@ -92,6 +92,7 @@ impl StorageState {
 
     /// Shut down storage: close database connection.
     pub fn shutdown(&self) -> Result<(), String> {
+        self.lazy_indexer_shutdown.store(true, Ordering::SeqCst);
         let mut db_guard = self.db.lock().map_err(|e| format!("lock error: {}", e))?;
         if db_guard.is_some() {
             *db_guard = None;
@@ -187,6 +188,19 @@ impl StorageState {
             "#,
         )
         .map_err(|e| format!("Failed to initialize tables: {}", e))?;
+
+        // If this is a fresh install (ocr_results is empty), mark HMAC v2 migration as done.
+        // This prevents the lazy indexer from blocking on a fresh install.
+        let ocr_empty: bool = conn
+            .query_row("SELECT 1 FROM ocr_results LIMIT 1", [], |_| Ok(false))
+            .unwrap_or(true);
+        if ocr_empty {
+            conn.execute(
+                "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, ?2)",
+                ["hmac_v2_migration_done", "true"],
+            )
+            .ok();
+        }
 
         self.ensure_schema(conn)?;
 
