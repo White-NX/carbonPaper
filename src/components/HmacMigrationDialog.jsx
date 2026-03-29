@@ -11,49 +11,62 @@ export default function HmacMigrationDialog() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    let unlisten = null;
+    let unlistenProgress = null;
+    let unlistenComplete = null;
+    let isMounted = true;
 
     const checkAndRun = async () => {
       let didOpen = false;
-      let completeUnlisten = null;
       try {
         const status = await invoke('storage_check_hmac_migration_status');
         
-        if (!status.needs_migration) return;
+        if (!isMounted || !status.needs_migration) return;
 
         setIsOpen(true);
         didOpen = true;
         
-        unlisten = await listen('hmac-migration-progress', (event) => {
-          setProgress(event.payload);
+        const up = await listen('hmac-migration-progress', (event) => {
+          if (isMounted) setProgress(event.payload);
         });
+        if (!isMounted) {
+          up();
+          return;
+        }
+        unlistenProgress = up;
 
-        completeUnlisten = await listen('hmac-migration-complete', () => {
-          setIsOpen(false);
+        const uc = await listen('hmac-migration-complete', () => {
+          if (isMounted) setIsOpen(false);
         });
+        if (!isMounted) {
+          uc();
+          return;
+        }
+        unlistenComplete = uc;
 
         if (!status.is_running) {
-          await invoke('storage_run_hmac_migration');
-          setIsOpen(false);
-        } else {
-          // If already running, just wait for the complete event
-          // (which is handled by completeUnlisten above)
+          try {
+            await invoke('storage_run_hmac_migration');
+            if (isMounted) setIsOpen(false);
+          } catch (err) {
+            if (err === 'ALREADY_RUNNING') {
+              console.log('[HMAC_MIGRATE] Already running, waiting for events');
+            } else {
+              throw err;
+            }
+          }
         }
       } catch (err) {
         console.error('[HMAC_MIGRATE] Error:', err);
-        if (didOpen) setError(err.toString());
+        if (didOpen && isMounted) setError(err.toString());
       }
-
-      return () => {
-        if (unlisten) unlisten();
-        if (completeUnlisten) completeUnlisten();
-      };
     };
 
-    const cleanupPromise = checkAndRun();
+    checkAndRun();
 
     return () => {
-      cleanupPromise.then(cleanup => cleanup && cleanup());
+      isMounted = false;
+      if (unlistenProgress) unlistenProgress();
+      if (unlistenComplete) unlistenComplete();
     };
   }, []);
 
