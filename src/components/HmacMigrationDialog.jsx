@@ -48,7 +48,9 @@ export default function HmacMigrationDialog() {
             await invoke('storage_run_hmac_migration');
             if (isMounted) setIsOpen(false);
           } catch (err) {
-            if (err === 'ALREADY_RUNNING') {
+            // Tauri errors might be strings or objects. Check for both.
+            const errStr = typeof err === 'string' ? err : (err?.message || err?.toString() || '');
+            if (errStr.includes('ALREADY_RUNNING')) {
               console.log('[HMAC_MIGRATE] Already running, waiting for events');
             } else {
               throw err;
