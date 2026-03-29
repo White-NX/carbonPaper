@@ -1678,13 +1678,8 @@ impl StorageState {
 
             std::thread::sleep(std::time::Duration::from_millis(1000));
 
-            // Don't do anything if migration is not done yet
-            if let Ok(needs_migrate) = self.check_hmac_migration_status() {
-                if needs_migrate {
-                    continue; // Wait until the explicit migration dialog finishes
-                }
-            }
-
+            // Process unindexed rows (text_hash = '') even if a full migration (old hashes -> HMAC) is pending.
+            // This ensures new snapshots are searchable immediately during the migration process.
             match self.process_lazy_indexing_batch() {
                 Ok(processed) => {
                     if processed == 0 {
@@ -1902,11 +1897,10 @@ impl StorageState {
         };
 
         // 2. Clear existing index only if starting from scratch (Instant)
+        // Note: Wiping is disabled to avoid "blacking out" new snapshots indexed by the lazy indexer
+        // during long migrations. Old (non-HMAC) entries will remain but won't be hit by HMAC queries.
         if cursor == 0 {
-            tracing::info!("[HMAC_MIGRATE] Cursor is 0, clearing existing index for a fresh start.");
-            let guard = self.get_connection_named("hmac_migrate_init")?;
-            let conn = guard.as_ref().unwrap();
-            conn.execute("DELETE FROM blind_bitmap_index", []).ok();
+            tracing::info!("[HMAC_MIGRATE] Cursor is 0, starting fresh migration.");
         } else {
             tracing::info!("[HMAC_MIGRATE] Resuming migration from cursor: {}", cursor);
         }
