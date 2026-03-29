@@ -15,6 +15,7 @@ export default function HmacMigrationDialog() {
 
     const checkAndRun = async () => {
       let didOpen = false;
+      let completeUnlisten = null;
       try {
         const status = await invoke('storage_check_hmac_migration_status');
         
@@ -27,27 +28,32 @@ export default function HmacMigrationDialog() {
           setProgress(event.payload);
         });
 
+        completeUnlisten = await listen('hmac-migration-complete', () => {
+          setIsOpen(false);
+        });
+
         if (!status.is_running) {
           await invoke('storage_run_hmac_migration');
+          setIsOpen(false);
         } else {
-          try {
-            await invoke('storage_run_hmac_migration');
-          } catch (e) {
-            if (e !== 'ALREADY_RUNNING') throw e;
-          }
+          // If already running, just wait for the complete event
+          // (which is handled by completeUnlisten above)
         }
-        
-        setIsOpen(false);
       } catch (err) {
         console.error('[HMAC_MIGRATE] Error:', err);
         if (didOpen) setError(err.toString());
       }
+
+      return () => {
+        if (unlisten) unlisten();
+        if (completeUnlisten) completeUnlisten();
+      };
     };
 
-    checkAndRun();
+    const cleanupPromise = checkAndRun();
 
     return () => {
-      if (unlisten) unlisten();
+      cleanupPromise.then(cleanup => cleanup && cleanup());
     };
   }, []);
 

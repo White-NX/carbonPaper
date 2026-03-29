@@ -1666,6 +1666,16 @@ impl StorageState {
     fn run_lazy_indexer_loop(&self) {
         tracing::info!("[LAZY_INDEXER] Started background thread for lazy indexing.");
         loop {
+            if self.lazy_indexer_shutdown.load(Ordering::SeqCst) {
+                tracing::info!("[LAZY_INDEXER] Shutting down background thread.");
+                break;
+            }
+
+            if !*self.initialized.lock().unwrap_or_else(|e| e.into_inner()) {
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+                continue;
+            }
+
             std::thread::sleep(std::time::Duration::from_millis(1000));
 
             // Don't do anything if migration is not done yet
@@ -1828,11 +1838,12 @@ impl StorageState {
             .unwrap_or(false);
         if done { return Ok(false); }
 
-        // 2. Check if there is anything to migrate (old hashes or unindexed rows)
-        // We use LIMIT 1 to make this check O(1) regardless of table size
+        // 2. Check if there is anything to migrate (old hashes)
+        // Rows with text_hash = '' are newly captured and will be indexed by lazy indexer.
+        // We only need full migration if there are rows with EXISTING non-HMAC hashes.
         let has_work: bool = conn
             .query_row(
-                "SELECT 1 FROM ocr_results LIMIT 1",
+                "SELECT 1 FROM ocr_results WHERE text_hash != '' LIMIT 1",
                 [],
                 |_| Ok(true),
             )
@@ -1847,19 +1858,19 @@ impl StorageState {
         F: FnMut(&str, usize, usize),
     {
         if self
-            .migration_in_progress
+            .hmac_migration_in_progress
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Ok(());
+            return Err("ALREADY_RUNNING".to_string());
         }
 
         // Reset cancellation flag
-        self.migration_cancel_requested.store(false, Ordering::SeqCst);
+        self.hmac_migration_cancel_requested.store(false, Ordering::SeqCst);
 
         let result = self.run_hmac_migration_internal(&mut progress_callback);
 
-        self.migration_in_progress.store(false, Ordering::SeqCst);
+        self.hmac_migration_in_progress.store(false, Ordering::SeqCst);
         result
     }
 
@@ -1907,7 +1918,7 @@ impl StorageState {
         // 3. Migration loop with explicit lock yielding
         const MIGRATE_BATCH_SIZE: i64 = 500;
         loop {
-            if self.is_migration_cancel_requested() {
+            if self.is_hmac_migration_cancel_requested() {
                 return Err("Cancelled".to_string());
             }
 

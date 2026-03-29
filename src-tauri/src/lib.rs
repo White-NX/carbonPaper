@@ -690,7 +690,7 @@ async fn storage_check_hmac_migration_status(
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<HmacMigrationStatus, String> {
     let needs_migration = state.check_hmac_migration_status()?;
-    let is_running = state.is_migration_in_progress();
+    let is_running = state.is_hmac_migration_in_progress();
     
     Ok(HmacMigrationStatus {
         needs_migration,
@@ -707,13 +707,14 @@ async fn storage_run_hmac_migration(
     
     // If already running, don't start a new task, but don't return "success" either
     // This prevents the frontend from thinking it's finished
-    if state.is_migration_in_progress() {
+    if state.is_hmac_migration_in_progress() {
         return Err("ALREADY_RUNNING".to_string());
     }
 
     tokio::task::spawn_blocking(move || {
+        let app_handle_clone = app_handle.clone();
         let result = state.run_hmac_migration(move |phase, processed, total| {
-            let _ = app_handle.emit(
+            let _ = app_handle_clone.emit(
                 "hmac-migration-progress",
                 serde_json::json!({
                     "phase": phase,
@@ -723,6 +724,7 @@ async fn storage_run_hmac_migration(
             );
         });
 
+        // Only emit completion if it actually RAN and succeeded
         if result.is_ok() {
             let _ = app_handle.emit("hmac-migration-complete", ());
         }
@@ -730,6 +732,18 @@ async fn storage_run_hmac_migration(
     })
     .await
     .map_err(|e| format!("Migration task panicked: {}", e))?
+}
+
+/// Cancels an ongoing HMAC migration.
+#[tauri::command]
+async fn storage_hmac_migration_cancel(
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<serde_json::Value, String> {
+    let in_progress = state.request_hmac_migration_cancel();
+    Ok(serde_json::json!({
+        "status": if in_progress { "cancel_requested" } else { "idle" },
+        "is_running": in_progress
+    }))
 }
 
 /// Retrieves the current application policy/configuration.
@@ -1716,6 +1730,7 @@ pub fn run() {
             storage_batch_get_categories,
             storage_check_hmac_migration_status,
             storage_run_hmac_migration,
+            storage_hmac_migration_cancel,
             // 任务聚类命令
             storage_get_tasks,
             storage_get_related_screenshots,
