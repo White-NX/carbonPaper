@@ -15,10 +15,16 @@ use tokio::net::windows::named_pipe::ClientOptions;
 
 use std::os::windows::io::AsRawHandle;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::JobObjects::*;
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JobObjectCpuRateControlInformation,
+    JobObjectExtendedLimitInformation,
+};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Performance::*;
-use windows::core::Interface;
+
 
 pub struct MonitorState {
     pub process: Mutex<Option<Child>>,
@@ -98,7 +104,7 @@ use serde_json::Value;
 #[cfg(windows)]
 const ERROR_PIPE_BUSY: i32 = 231;
 
-// 生成随机的管道名和认证 token
+// 生成随机的管道名
 fn generate_random_pipe_name() -> String {
     let mut rng = rand::thread_rng();
     let random_suffix: String = (0..32)
@@ -316,19 +322,12 @@ pub async fn forward_command_to_python(
     state: &MonitorState,
     payload: Value,
 ) -> Result<Value, String> {
-    let pipe_name = {
-        let guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
-        match &*guard {
-            Some(name) => name.clone(),
-            None => return Err("Monitor not started".to_string()),
-        }
-    };
-
-    let auth_token = {
-        let guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
-        match &*guard {
-            Some(token) => token.clone(),
-            None => return Err("Monitor not authenticated".to_string()),
+    let (pipe_name, auth_token) = {
+        let pipe_guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+        let token_guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
+        match (&*pipe_guard, &*token_guard) {
+            (Some(name), Some(token)) => (name.clone(), token.clone()),
+            _ => return Err("Monitor not started".to_string()),
         }
     };
 
@@ -452,7 +451,7 @@ pub async fn start_monitor(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|e| format!("<failed to canonicalize script: {}>", e));
 
-    // 生成随机的管道名和认证 token（在外部作用域声明）
+    // 生成随机的管道名和认证 token
     let pipe_name = generate_random_pipe_name();
     let auth_token = generate_auth_token();
 
@@ -510,7 +509,7 @@ pub async fn start_monitor(
             let ocr_cache = capture_state.ocr_image_cache.clone();
 
             let mut reverse_server = ReverseIpcServer::new(&reverse_pipe_name);
-            if let Err(e) = reverse_server.start(storage_arc, ocr_cache) {
+            if let Err(e) = reverse_server.start(storage_arc, ocr_cache, app.clone()) {
                 tracing::error!("Failed to start reverse IPC server: {}", e);
             }
 
@@ -558,6 +557,7 @@ pub async fn start_monitor(
             .arg(&auth_token)
             .arg("--storage-pipe")
             .arg(&reverse_pipe_name)
+            .env("CARBON_PARENT_PID", std::process::id().to_string())
             .env("PYTHONIOENCODING", "utf-8")
             .env("PROFILING_ENABLED", "1");
 
@@ -631,7 +631,7 @@ pub async fn start_monitor(
         }
         {
             let mut guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(auth_token);
+            *guard = Some(auth_token.clone());
         }
         // 存储 Job handle 到 state 中（这样在停止时可以正确关闭）
         {

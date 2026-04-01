@@ -25,12 +25,13 @@ def main():
   parser.add_argument('--storage-pipe', type=str, help='Named pipe name for storage IPC (Rust storage service)')
   args = parser.parse_args()
 
-  # Ensure both pipe name and auth token are provided
   if not args.pipe_name or not args.auth_token:
     logger.error('--pipe-name and --auth-token arguments are required')
     return 1
 
-  logger.info(f'Starting monitor service: pipe={args.pipe_name[:30]}, token={args.auth_token[:16]}..., storage_pipe={args.storage_pipe[:30]}')
+  auth_token = args.auth_token
+
+  logger.info(f'Starting monitor service: pipe={args.pipe_name[:30]}, token={auth_token[:16]}..., storage_pipe={args.storage_pipe[:30] if args.storage_pipe else "None"}')
 
   # Initialise storage client (if a storage pipe name was provided)
   if args.storage_pipe:
@@ -39,7 +40,8 @@ def main():
     logger.info(f'Storage client initialised: {args.storage_pipe}')
 
   # Start the module (named-pipe IPC server)
-  start(_debug=False, pipe_name=args.pipe_name, auth_token=args.auth_token, storage_pipe=args.storage_pipe)
+  from monitor import start
+  start(_debug=False, pipe_name=args.pipe_name, auth_token=auth_token, storage_pipe=args.storage_pipe)
 
   # Main thread blocks until stopped via IPC or Ctrl+C
   try:

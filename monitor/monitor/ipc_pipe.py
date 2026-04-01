@@ -3,6 +3,8 @@ import json
 import datetime
 import logging
 import pywintypes
+import os
+import time as _time
 
 logger = logging.getLogger(__name__)
 import win32pipe
@@ -16,7 +18,7 @@ from typing import Callable
 
 
 def _make_security_attributes_for_current_user():
-    # Create SECURITY_ATTRIBUTES that only allow the current user to access the pipe
+    """Create SECURITY_ATTRIBUTES that only allow the current user to access the pipe."""
     sd = win32security.SECURITY_DESCRIPTOR()
     sd.Initialize()
 
@@ -43,240 +45,145 @@ def _json_default(obj):
     raise TypeError(f"Type {type(obj)} not serializable")
 
 
-def start_pipe_server(handler: Callable[[dict], dict], pipe_name: str = 'carbon_monitor_secure'):
-    """
-    Start a simple named-pipe server. For each connection, read a JSON object and write back a JSON response.
-    The pipe is created with a security descriptor that only allows the current user to connect.
-    """
-    full_pipe_name = r"\\.\pipe\%s" % pipe_name
-    sa = _make_security_attributes_for_current_user()
-
-    server = _NamedPipeServer(full_pipe_name, handler, sa)
-    server.start()
-    return server
-
-
-def start_inherited_handle_server(handler: Callable[[dict], dict], handle_value: int):
-    """Start a server using an already-created inheritable pipe HANDLE passed from parent.
-
-    `handle_value` should be the numeric Win32 HANDLE value (int). This function wraps
-    that handle and processes a single client connection on it. The parent is expected
-    to have created the pipe and set it inheritable for the child process.
-    """
-    server = _InheritedPipeServer(handle_value, handler)
-    server.start()
-    return server
-
-
-class _InheritedPipeServer:
-    def __init__(self, handle_value, handler):
-        self.handle = int(handle_value)
+class _NamedPipeServer(threading.Thread):
+    """Multi-instance named pipe server for concurrent IPC requests"""
+    def __init__(self, handler, pipe_name):
+        super().__init__(name="NamedPipeServer", daemon=True)
         self.handler = handler
-        self._thread = threading.Thread(target=self._serve_once, daemon=True)
-        self._stop = threading.Event()
-
-    def start(self):
-        self._thread.start()
-
-    def shutdown(self):
-        self._stop.set()
-
-    def _serve_once(self):
-        # The parent should have created the pipe and (optionally) already connected a client.
-        # We try to call ConnectNamedPipe; if it fails with ERROR_PIPE_CONNECTED we proceed.
-        try:
-            try:
-                win32pipe.ConnectNamedPipe(self.handle, None)
-            except pywintypes.error as e:
-                # ERROR_PIPE_CONNECTED = 535 indicates already connected
-                if getattr(e, 'winerror', None) not in (535,):
-                    raise
-
-            # Read request
-            try:
-                res, data = win32file.ReadFile(self.handle, 65536)
-                text = data.decode('utf-8').strip()
-                if text:
-                    req = json.loads(text)
-                else:
-                    req = {}
-            except Exception:
-                req = {}
-
-            try:
-                resp = self.handler(req) or {}
-            except Exception as e:
-                resp = {'error': str(e)}
-
-            out = json.dumps(resp, default=_json_default).encode('utf-8')
-            try:
-                win32file.WriteFile(self.handle, out)
-            except Exception:
-                pass
-
-        except Exception as e:
-            logger.error('Inherited pipe serve error: %s', e)
-        finally:
-            try:
-                win32file.CloseHandle(self.handle)
-            except Exception:
-                try:
-                    win32pipe.DisconnectNamedPipe(self.handle)
-                except Exception:
-                    pass
-
-
-class _NamedPipeServer:
-    def __init__(self, pipe_name, handler, security_attrs):
         self.pipe_name = pipe_name
-        self.handler = handler
-        self.security_attrs = security_attrs
-        self._thread = threading.Thread(target=self._serve_loop, daemon=True)
-        self._stop = threading.Event()
+        self.full_pipe_name = f'\\\\.\\pipe\\{pipe_name}'
+        self.stop_event = threading.Event()
+        self.security_attrs = _make_security_attributes_for_current_user()
 
-    def start(self):
-        self._thread.start()
-
-    def shutdown(self):
-        self._stop.set()
-        # TODO: Might need to connect to pipe to unblock ConnectNamedPipe?
-
-    def _client_handler(self, handle):
-        """Handle a single client connection in a separate thread"""
-        import time as _time
-        import pywintypes
-        _t0 = _time.perf_counter()
-        try:
-            # Read request — loop until the full message is received (supports large messages like process_ocr)
+    def run(self):
+        logger.info(f"NamedPipeServer starting on {self.full_pipe_name}")
+        while not self.stop_event.is_set():
             try:
-                chunks = []
-                while True:
-                    try:
-                        res, data = win32file.ReadFile(handle, 1048576)  # 1MB buffer
-                        if data:
-                            chunks.append(data)
-                        # res == 0: success, no more data for this message
-                        # res == 234 (ERROR_MORE_DATA): more data available
-                        if res == 0:
-                            break
-                    except pywintypes.error as e:
-                        # error code 109 = ERROR_BROKEN_PIPE (client disconnected)
-                        # error code 232 = ERROR_NO_DATA
-                        if e.winerror in (109, 232):
-                            break
-                        raise
-                raw = b''.join(chunks)
-                text = raw.decode('utf-8').strip()
-                if text:
-                    req = json.loads(text)
-                else:
-                    req = {}
-            except Exception as e:
-                req = {}
-
-            try:
-                resp = self.handler(req) or {}
-            except Exception as e:
-                resp = {'error': str(e)}
-
-            _t1 = _time.perf_counter()
-            _cmd = req.get('command', '?') if isinstance(req, dict) else '?'
-            if (_t1 - _t0) > 5.0:
-                logger.warning('[DIAG:PIPE-PY] handler command=%s took %.3fs', _cmd, _t1 - _t0)
-
-            out = json.dumps(resp, default=_json_default).encode('utf-8')
-            try:
-                win32file.WriteFile(handle, out)
-            except Exception:
-                pass
-
-        finally:
-            try:
-                win32file.CloseHandle(handle)
-            except Exception:
-                try:
-                    win32pipe.DisconnectNamedPipe(handle)
-                except Exception:
-                    pass
-
-    def _serve_loop(self):
-        import time as _time
-        while not self._stop.is_set():
-            try:
-                _t0 = _time.perf_counter()
+                # DACL: only current user can connect (OS-level access control)
+                # PIPE_REJECT_REMOTE_CLIENTS: block network connections
                 handle = win32pipe.CreateNamedPipe(
-                    self.pipe_name,
+                    self.full_pipe_name,
                     win32pipe.PIPE_ACCESS_DUPLEX,
-                    win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+                    win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT | win32pipe.PIPE_REJECT_REMOTE_CLIENTS,
                     win32pipe.PIPE_UNLIMITED_INSTANCES,
-                    65536,
-                    65536,
-                    0,
-                    self.security_attrs,
+                    1024 * 1024, 1024 * 1024, 0,
+                    self.security_attrs
                 )
-                _t1 = _time.perf_counter()
-                if (_t1 - _t0) > 5.0:
-                    logger.warning('[DIAG:PIPE-PY] CreateNamedPipe took %.3fs (GIL contention?)', _t1 - _t0)
-            except Exception as e:
-                logger.error('Failed to create named pipe: %s', e)
-                # Sleep a bit to avoid hot loop on error
-                import time
-                time.sleep(1)
-                continue
 
-            try:
-                try:
-                    win32pipe.ConnectNamedPipe(handle, None)
-                except pywintypes.error as e:
-                    # ERROR_PIPE_CONNECTED means a client connected before ConnectNamedPipe was called
-                    if e.winerror != 535:
-                        win32file.CloseHandle(handle)
-                        raise
+                if handle == win32file.INVALID_HANDLE_VALUE:
+                    logger.error("Failed to create named pipe instance")
+                    _time.sleep(1)
+                    continue
 
-                _t2 = _time.perf_counter()
-                if (_t2 - _t1) > 5.0:
-                    logger.warning('[DIAG:PIPE-PY] Client connected (waited %.3fs since CreateNamedPipe)', _t2 - _t1)
+                # Wait for client connection (blocking)
+                win32pipe.ConnectNamedPipe(handle, None)
 
-                # Spawn thread to handle this connection
-                t = threading.Thread(target=self._client_handler, args=(handle,))
-                t.daemon = True # Ensure client threads don't block shutdown
+                # Delegate handling to a new thread to keep server listening
+                t = threading.Thread(target=self._client_handler, args=(handle,), daemon=True)
                 t.start()
 
-            except Exception:
-                try:
-                    win32file.CloseHandle(handle)
-                except:
-                    pass
+            except Exception as e:
+                if not self.stop_event.is_set():
+                    logger.error(f"Error in NamedPipeServer loop: {e}")
+                _time.sleep(0.1)
+
+    def shutdown(self):
+        self.stop_event.set()
+
+    def _client_handler(self, handle):
+        """Handle a single client connection"""
+        import pywintypes
+        try:
+            # 1. Security Verification
+            client_pid = win32pipe.GetNamedPipeClientProcessId(handle)
+            parent_pid_env = os.environ.get('CARBON_PARENT_PID')
+            expected_pid = int(parent_pid_env) if parent_pid_env else None
+            curr_ppid = os.getppid()
+
+            is_valid = False
+            # Only allow the explicit expected PID or the direct parent process
+            if expected_pid and client_pid == expected_pid:
+                is_valid = True
+            elif client_pid == curr_ppid:
+                is_valid = True
+
+            if not is_valid:
+                logger.warning(f"[SECURITY] Rejecting PID {client_pid}. (Expected: {expected_pid}, PPID: {curr_ppid})")
+                error_resp = json.dumps({"error": f"Access denied: PID {client_pid} is not authorized"}).encode('utf-8')
+                win32file.WriteFile(handle, error_resp)
+                win32file.FlushFileBuffers(handle)
+                return
+
+            logger.debug(f"IPC client verified: PID {client_pid}")
+            # 2. Read Request
+            try:
+                # In message mode, one ReadFile typically gets the whole message.
+                # We use a 1MB buffer which is plenty for our JSON commands.
+                resp_code, data = win32file.ReadFile(handle, 1024 * 1024)
+            except pywintypes.error as e:
+                if getattr(e, 'winerror', None) == 109: # ERROR_BROKEN_PIPE
+                    return
+                raise
+
+            if not data:
+                return
+
+            payload = data.decode('utf-8').strip()
+            try:
+                req = json.loads(payload)
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON: {payload[:100]}")
+                return
+
+            # 3. Execute Command
+            # logger.info(f"Executing IPC command: {req.get('command')}")
+            result = self.handler(req)
+
+            # 4. Write Response
+            def json_serial(obj):
+                if isinstance(obj, (datetime.datetime, datetime.date)):
+                    return obj.isoformat()
+                raise TypeError(f"Type {type(obj)} not serializable")
+
+            resp_str = json.dumps(result, default=json_serial)
+            win32file.WriteFile(handle, resp_str.encode('utf-8'))
+            win32file.FlushFileBuffers(handle)
+
+        except Exception as e:
+            logger.error(f"Error handling IPC client: {e}", exc_info=True)
+        finally:
+            try:
+                # Do NOT call DisconnectNamedPipe here. 
+                # It invalidates the client's handle before they can finish reading the response.
+                # Simply closing the handle sends a proper EOF.
+                win32file.CloseHandle(handle)
+            except:
+                pass
 
 
-def send_command(pipe_name: str, payload: dict) -> dict:
-    """Send a command to the named pipe and return the response."""
-    full_pipe_name = r"\\.\pipe\%s" % pipe_name
+def start_pipe_server(handler, pipe_name):
+    server = _NamedPipeServer(handler, pipe_name)
+    server.start()
+    return server
+
+
+def send_ipc_request(pipe_name, req):
+    """Client utility"""
+    full_pipe_name = f'\\\\.\\pipe\\{pipe_name}'
     try:
         handle = win32file.CreateFile(
             full_pipe_name,
             win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-            0,
-            None,
+            0, None,
             win32file.OPEN_EXISTING,
-            0,
-            None
+            0, None
         )
-    except pywintypes.error as e:
-        if e.winerror == 2:  # ERROR_FILE_NOT_FOUND
-            raise FileNotFoundError(f"Pipe {pipe_name} not found. Is the monitor running?")
-        raise
-
-    try:
-        data = json.dumps(payload).encode('utf-8')
-        win32file.WriteFile(handle, data)
-        
-        # Read response
-        resp_code, data = win32file.ReadFile(handle, 65536)
-        text = data.decode('utf-8').strip()
-        if not text:
-            return {}
-        return json.loads(text)
+        win32pipe.SetNamedPipeHandleState(handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
+        win32file.WriteFile(handle, json.dumps(req).encode('utf-8'))
+        resp_code, data = win32file.ReadFile(handle, 1024 * 1024)
+        return json.loads(data.decode('utf-8').strip()) if data else {}
     finally:
-        win32file.CloseHandle(handle)
-
+        try:
+            win32file.CloseHandle(handle)
+        except:
+            pass
