@@ -58,6 +58,7 @@ class _NamedPipeServer(threading.Thread):
     def run(self):
         logger.info(f"NamedPipeServer starting on {self.full_pipe_name}")
         while not self.stop_event.is_set():
+            handle = None
             try:
                 # DACL: only current user can connect (OS-level access control)
                 # PIPE_REJECT_REMOTE_CLIENTS: block network connections
@@ -72,20 +73,34 @@ class _NamedPipeServer(threading.Thread):
 
                 if handle == win32file.INVALID_HANDLE_VALUE:
                     logger.error("Failed to create named pipe instance")
+                    handle = None
                     _time.sleep(1)
                     continue
 
                 # Wait for client connection (blocking)
-                win32pipe.ConnectNamedPipe(handle, None)
+                try:
+                    win32pipe.ConnectNamedPipe(handle, None)
+                except pywintypes.error as e:
+                    # ERROR_PIPE_CONNECTED (535): client connected between Create and Connect — proceed normally
+                    if getattr(e, 'winerror', None) != 535:
+                        raise
 
                 # Delegate handling to a new thread to keep server listening
                 t = threading.Thread(target=self._client_handler, args=(handle,), daemon=True)
                 t.start()
+                handle = None  # ownership transferred to _client_handler
 
             except Exception as e:
                 if not self.stop_event.is_set():
                     logger.error(f"Error in NamedPipeServer loop: {e}")
                 _time.sleep(0.1)
+            finally:
+                # Close handle if it was not handed off to a client thread
+                if handle is not None:
+                    try:
+                        win32file.CloseHandle(handle)
+                    except Exception:
+                        pass
 
     def shutdown(self):
         self.stop_event.set()

@@ -1538,7 +1538,8 @@ async fn process_ocr_inner(
     });
 
     let (auth_token, seq_no) = {
-        let token = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+        let token = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            .ok_or_else(|| "Auth token not available".to_string())?;
         let seq = monitor_state.request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         (token, seq)
     };

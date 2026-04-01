@@ -120,8 +120,17 @@ use windows::Win32::Security::{GetTokenInformation};
 use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE, PIPE_ACCESS_DUPLEX};
 
 
+/// Holds pre-built security descriptor and ACL buffers whose addresses are referenced
+/// by the SECURITY_ATTRIBUTES pointer fields. Bundling them in a struct guarantees
+/// the backing memory lives as long as the SA is in use.
+struct PipeSecurityContext {
+    sa: SECURITY_ATTRIBUTES,
+    _sd: Box<SECURITY_DESCRIPTOR>,
+    _acl_buffer: Vec<u8>,
+}
+
 /// Create SECURITY_ATTRIBUTES that only allow the current user to access the pipe.
-fn get_security_attributes() -> Result<(SECURITY_ATTRIBUTES, Vec<u8>), String> {
+fn get_security_context() -> Result<PipeSecurityContext, String> {
     unsafe {
         let mut token_handle = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
@@ -143,8 +152,6 @@ fn get_security_attributes() -> Result<(SECURITY_ATTRIBUTES, Vec<u8>), String> {
         let token_user = &*(token_buffer.as_ptr() as *const windows::Win32::Security::TOKEN_USER);
         let user_sid = token_user.User.Sid;
 
-        // Create ACL
-        // Required size: sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) + GetLengthSid(sid) - sizeof(DWORD)
         let sid_len = windows::Win32::Security::GetLengthSid(user_sid);
         let acl_size = std::mem::size_of::<ACL>() + std::mem::size_of::<windows::Win32::Security::ACCESS_ALLOWED_ACE>() + sid_len as usize - 4;
         let mut acl_buffer = vec![0u8; acl_size];
@@ -161,7 +168,6 @@ fn get_security_attributes() -> Result<(SECURITY_ATTRIBUTES, Vec<u8>), String> {
         )
         .map_err(|e| format!("AddAccessAllowedAce failed: {}", e))?;
 
-        // Create Security Descriptor
         let mut sd = Box::new(SECURITY_DESCRIPTOR::default());
         InitializeSecurityDescriptor(
             PSECURITY_DESCRIPTOR(sd.as_mut() as *mut _ as *mut _),
@@ -185,7 +191,35 @@ fn get_security_attributes() -> Result<(SECURITY_ATTRIBUTES, Vec<u8>), String> {
 
         let _ = windows::Win32::Foundation::CloseHandle(token_handle);
 
-        Ok((sa, acl_buffer))
+        Ok(PipeSecurityContext { sa, _sd: sd, _acl_buffer: acl_buffer })
+    }
+}
+
+/// Lightweight parent-PID lookup via CreateToolhelp32Snapshot (single process query).
+fn get_parent_pid(pid: u32) -> Option<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32First, Process32Next,
+        PROCESSENTRY32, TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32 {
+            dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
+            ..std::mem::zeroed()
+        };
+        if Process32First(snapshot, &mut entry).is_ok() {
+            loop {
+                if entry.th32ProcessID == pid {
+                    let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+                    return Some(entry.th32ParentProcessID);
+                }
+                if Process32Next(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+        None
     }
 }
 
@@ -225,8 +259,8 @@ impl ReverseIpcServer {
 
                 loop {
                     // 创建安全描述符
-                    let (sa, _acl_buf) = match get_security_attributes() {
-                        Ok(res) => res,
+                    let sec_ctx = match get_security_context() {
+                        Ok(ctx) => ctx,
                         Err(e) => {
                             tracing::error!("Failed to get security attributes: {}", e);
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -244,7 +278,7 @@ impl ReverseIpcServer {
                             1024 * 1024,
                             1024 * 1024,
                             0,
-                            Some(&sa),
+                            Some(&sec_ctx.sa),
                         )
                     };
 
@@ -307,7 +341,6 @@ impl ReverseIpcServer {
     }
 }
 
-use sysinfo::{Pid, System};
 
 /// 处理单个客户端连接
 async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, ocr_cache: OcrImageCache, app_handle: tauri::AppHandle) {
@@ -337,13 +370,9 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
                     is_valid = true;
                 } else {
                     // 2. 检查是否为直接后代进程 (Python multiprocessing 第一层)
-                    let mut sys = System::new();
-                    sys.refresh_processes();
-                    if let Some(proc) = sys.process(Pid::from(client_pid as usize)) {
-                        if let Some(parent_pid) = proc.parent() {
-                            if parent_pid == Pid::from(expected_pid as usize) {
-                                is_valid = true;
-                            }
+                    if let Some(ppid) = get_parent_pid(client_pid) {
+                        if ppid == expected_pid {
+                            is_valid = true;
                         }
                     }
                 }
@@ -1266,7 +1295,8 @@ async fn process_extension_ocr(
     });
 
     let (auth_token, seq_no) = {
-        let token = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+        let token = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            .ok_or_else(|| "Auth token not available".to_string())?;
         let seq = monitor_state.request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         (token, seq)
     };
