@@ -136,6 +136,15 @@ fn get_security_context() -> Result<PipeSecurityContext, String> {
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
             .map_err(|e| format!("OpenProcessToken failed: {}", e))?;
 
+        let result = get_security_context_inner(token_handle);
+        let _ = windows::Win32::Foundation::CloseHandle(token_handle);
+        result
+    }
+}
+
+/// Inner helper so that `?` returns to `get_security_context` which always closes token_handle.
+fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContext, String> {
+    unsafe {
         let mut return_length = 0u32;
         let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut return_length);
 
@@ -188,8 +197,6 @@ fn get_security_context() -> Result<PipeSecurityContext, String> {
             lpSecurityDescriptor: sd.as_mut() as *mut _ as *mut _,
             bInheritHandle: false.into(),
         };
-
-        let _ = windows::Win32::Foundation::CloseHandle(token_handle);
 
         Ok(PipeSecurityContext { sa, _sd: sd, _acl_buffer: acl_buffer })
     }

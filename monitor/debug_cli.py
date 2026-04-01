@@ -9,7 +9,7 @@ import time
 import os
 import shutil
 import argparse
-from monitor.ipc_pipe import send_command
+from monitor.ipc_pipe import send_ipc_request as send_command
 
 
 def main():
