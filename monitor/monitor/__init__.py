@@ -108,9 +108,6 @@ def _handle_command(req: dict):
     return result
 
 
-_auth_token = None
-_last_seq_no = -1
-
 def _handle_command_impl(req: dict):
     """Actual command dispatch logic."""
     global _last_seq_no

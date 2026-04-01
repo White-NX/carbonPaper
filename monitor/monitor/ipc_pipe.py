@@ -148,6 +148,9 @@ class _NamedPipeServer(threading.Thread):
                 req = json.loads(payload)
             except json.JSONDecodeError:
                 logger.error(f"Invalid JSON: {payload[:100]}")
+                error_resp = json.dumps({"error": "Invalid JSON in request"}).encode('utf-8')
+                win32file.WriteFile(handle, error_resp)
+                win32file.FlushFileBuffers(handle)
                 return
 
             # 3. Execute Command
