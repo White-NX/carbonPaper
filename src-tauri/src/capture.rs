@@ -1525,16 +1525,6 @@ async fn process_ocr_inner(
             .clone()
             .ok_or_else(|| "Monitor pipe not available".to_string())?
     };
-    let auth_token = {
-        let guard = monitor_state
-            .auth_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard
-            .clone()
-            .ok_or_else(|| "Auth token not available".to_string())?
-    };
-    let seq_no = monitor_state.request_counter.fetch_add(1, Ordering::SeqCst);
 
     // Send process_ocr command to Python with only screenshot_id (small payload).
     // Python will fetch the image via reverse IPC (get_temp_image) from in-memory cache.
@@ -1546,6 +1536,13 @@ async fn process_ocr_inner(
         "process_name": process_name,
         "timestamp": timestamp_ms,
     });
+
+    let (auth_token, seq_no) = {
+        let token = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            .ok_or_else(|| "Auth token not available".to_string())?;
+        let seq = monitor_state.request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (token, seq)
+    };
 
     let response = crate::monitor::send_ipc_request(&pipe_name, &auth_token, seq_no, req).await?;
 

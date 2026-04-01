@@ -97,7 +97,7 @@ def _find_and_extract_icon(process_name: str):
 # ---------------------------------------------------------------------------
 
 def _handle_command(req: dict):
-    """Validate auth before dispatching (with diagnostic timing)."""
+    """Dispatch command (with diagnostic timing). Security: PID verification at transport layer + auth token at application layer."""
     import time as _time
     _t0 = _time.perf_counter()
     result = _handle_command_impl(req)
@@ -588,7 +588,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         auth_token: Authentication token for IPC validation.
         storage_pipe: Storage service pipe name (Rust reverse IPC).
     """
-    global _server, _ocr_worker, _classifier, _auth_token, _last_seq_no, _storage_pipe, _clustering_manager, _clustering_scheduler
+    global _server, _ocr_worker, _classifier, _storage_pipe, _clustering_manager, _clustering_scheduler, _auth_token, _last_seq_no
 
     _auth_token = auth_token
     _last_seq_no = -1
@@ -608,17 +608,9 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         except Exception as e:
             logger.warning('Debug mode enabled but unable to write pipe-name file: %s', e)
 
-    # Prefer inherited handle from parent process (more secure)
-    handle_val = os.environ.get('CARBON_MONITOR_PIPE_HANDLE')
-    if handle_val:
-        try:
-            handle_int = int(handle_val, 0)
-            from .ipc_pipe import start_inherited_handle_server
-            _server = start_inherited_handle_server(handler=_handle_command, handle_value=handle_int)
-        except Exception as e:
-            logger.error('Failed to use inherited handle for IPC server, falling back to named pipe: %s', e)
-
+    # Use standard named pipe server with PID verification
     if _server is None:
+        from .ipc_pipe import start_pipe_server
         _server = start_pipe_server(handler=_handle_command, pipe_name=pipe_name)
 
     # --- Single Shared ChromaDB Client ---

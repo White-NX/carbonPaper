@@ -17,6 +17,9 @@ use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc;
+use std::os::windows::io::AsRawHandle;
+use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
+use windows::Win32::Foundation::HANDLE;
 
 /// Commands that Python can send to Rust via the reverse IPC named pipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +110,126 @@ impl StorageResponse {
     }
 }
 
+use windows::Win32::Security::{
+    InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL, ACL_REVISION,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+    TOKEN_QUERY, TokenUser,
+};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::Security::{GetTokenInformation};
+use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE, PIPE_ACCESS_DUPLEX};
+
+
+/// Holds pre-built security descriptor and ACL buffers whose addresses are referenced
+/// by the SECURITY_ATTRIBUTES pointer fields. Bundling them in a struct guarantees
+/// the backing memory lives as long as the SA is in use.
+struct PipeSecurityContext {
+    sa: SECURITY_ATTRIBUTES,
+    _sd: Box<SECURITY_DESCRIPTOR>,
+    _acl_buffer: Vec<u8>,
+}
+
+/// Create SECURITY_ATTRIBUTES that only allow the current user to access the pipe.
+fn get_security_context() -> Result<PipeSecurityContext, String> {
+    unsafe {
+        let mut token_handle = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
+            .map_err(|e| format!("OpenProcessToken failed: {}", e))?;
+
+        let result = get_security_context_inner(token_handle);
+        let _ = windows::Win32::Foundation::CloseHandle(token_handle);
+        result
+    }
+}
+
+/// Inner helper so that `?` returns to `get_security_context` which always closes token_handle.
+fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContext, String> {
+    unsafe {
+        let mut return_length = 0u32;
+        let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut return_length);
+
+        let mut token_buffer = vec![0u8; return_length as usize];
+        GetTokenInformation(
+            token_handle,
+            TokenUser,
+            Some(token_buffer.as_mut_ptr() as *mut _),
+            return_length,
+            &mut return_length,
+        )
+        .map_err(|e| format!("GetTokenInformation failed: {}", e))?;
+
+        let token_user = &*(token_buffer.as_ptr() as *const windows::Win32::Security::TOKEN_USER);
+        let user_sid = token_user.User.Sid;
+
+        let sid_len = windows::Win32::Security::GetLengthSid(user_sid);
+        let acl_size = std::mem::size_of::<ACL>() + std::mem::size_of::<windows::Win32::Security::ACCESS_ALLOWED_ACE>() + sid_len as usize - 4;
+        let mut acl_buffer = vec![0u8; acl_size];
+        let p_acl = acl_buffer.as_mut_ptr() as *mut ACL;
+
+        windows::Win32::Security::InitializeAcl(p_acl, acl_size as u32, windows::Win32::Security::ACE_REVISION(ACL_REVISION.0 as u32))
+            .map_err(|e| format!("InitializeAcl failed: {}", e))?;
+
+        windows::Win32::Security::AddAccessAllowedAce(
+            p_acl,
+            windows::Win32::Security::ACE_REVISION(ACL_REVISION.0 as u32),
+            (FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0) as u32,
+            user_sid,
+        )
+        .map_err(|e| format!("AddAccessAllowedAce failed: {}", e))?;
+
+        let mut sd = Box::new(SECURITY_DESCRIPTOR::default());
+        InitializeSecurityDescriptor(
+            PSECURITY_DESCRIPTOR(sd.as_mut() as *mut _ as *mut _),
+            windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION,
+        )
+        .map_err(|e| format!("InitializeSecurityDescriptor failed: {}", e))?;
+
+        SetSecurityDescriptorDacl(
+            PSECURITY_DESCRIPTOR(sd.as_mut() as *mut _ as *mut _),
+            true,
+            Some(p_acl),
+            false,
+        )
+        .map_err(|e| format!("SetSecurityDescriptorDacl failed: {}", e))?;
+
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.as_mut() as *mut _ as *mut _,
+            bInheritHandle: false.into(),
+        };
+
+        Ok(PipeSecurityContext { sa, _sd: sd, _acl_buffer: acl_buffer })
+    }
+}
+
+/// Lightweight parent-PID lookup via CreateToolhelp32Snapshot (single process query).
+fn get_parent_pid(pid: u32) -> Option<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32First, Process32Next,
+        PROCESSENTRY32, TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32 {
+            dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
+            ..std::mem::zeroed()
+        };
+        if Process32First(snapshot, &mut entry).is_ok() {
+            loop {
+                if entry.th32ProcessID == pid {
+                    let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+                    return Some(entry.th32ParentProcessID);
+                }
+                if Process32Next(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snapshot);
+        None
+    }
+}
+
 /// Named pipe server for Python-to-Rust reverse IPC (storage requests).
 pub struct ReverseIpcServer {
     pipe_name: String,
@@ -122,7 +245,7 @@ impl ReverseIpcServer {
     }
     
     /// Start the named pipe server that listens for Python storage requests.
-    pub fn start(&mut self, storage: Arc<StorageState>, ocr_cache: OcrImageCache) -> Result<(), String> {
+    pub fn start(&mut self, storage: Arc<StorageState>, ocr_cache: OcrImageCache, app_handle: tauri::AppHandle) -> Result<(), String> {
         let pipe_name = self.pipe_name.clone();
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
@@ -139,18 +262,48 @@ impl ReverseIpcServer {
 
             rt.block_on(async move {
                 let full_pipe_name = format!(r"\\.\pipe\{}", pipe_name);
+                let wide_pipe_name: Vec<u16> = full_pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
 
                 loop {
-                    // 创建管道服务器
-                    let server = match ServerOptions::new()
-                        .first_pipe_instance(false)
-                        .create(&full_pipe_name)
-                    {
-                        Ok(s) => s,
+                    // 创建安全描述符
+                    let sec_ctx = match get_security_context() {
+                        Ok(ctx) => ctx,
                         Err(e) => {
-                            tracing::error!("Failed to create pipe server: {}", e);
+                            tracing::error!("Failed to get security attributes: {}", e);
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                             continue;
+                        }
+                    };
+
+                    // 应用安全描述符和 PIPE_REJECT_REMOTE_CLIENTS
+                    let handle = unsafe {
+                        windows::Win32::System::Pipes::CreateNamedPipeW(
+                            windows::core::PCWSTR(wide_pipe_name.as_ptr()),
+                            PIPE_ACCESS_DUPLEX | windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED,
+                            windows::Win32::System::Pipes::PIPE_TYPE_MESSAGE | windows::Win32::System::Pipes::PIPE_READMODE_MESSAGE | windows::Win32::System::Pipes::PIPE_WAIT | windows::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS,
+                            windows::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES,
+                            1024 * 1024,
+                            1024 * 1024,
+                            0,
+                            Some(&sec_ctx.sa),
+                        )
+                    };
+
+                    if handle.is_invalid() {
+                        tracing::error!("Failed to create pipe via Win32 API: {:?}", unsafe { windows::Win32::Foundation::GetLastError() });
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+
+                    // 将 Raw Handle 转换为 tokio NamedPipeServer
+                    let server = unsafe {
+                        match NamedPipeServer::from_raw_handle(handle.0 as *mut _) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("Failed to convert raw handle to NamedPipeServer: {}", e);
+                                let _ = windows::Win32::Foundation::CloseHandle(handle);
+                                continue;
+                            }
                         }
                     };
 
@@ -169,8 +322,9 @@ impl ReverseIpcServer {
                             // 处理客户端请求
                             let storage_clone = storage.clone();
                             let ocr_cache_clone = ocr_cache.clone();
+                            let app_clone = app_handle.clone();
                             tokio::spawn(async move {
-                                handle_client(server, storage_clone, ocr_cache_clone).await;
+                                handle_client(server, storage_clone, ocr_cache_clone, app_clone).await;
                             });
                         }
                     }
@@ -194,8 +348,59 @@ impl ReverseIpcServer {
     }
 }
 
+
 /// 处理单个客户端连接
-async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, ocr_cache: OcrImageCache) {
+async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, ocr_cache: OcrImageCache, app_handle: tauri::AppHandle) {
+    // 安全校验：验证客户端 PID
+    let client_pid_raw = unsafe {
+        let mut pid: u32 = 0;
+        let handle = HANDLE(server.as_raw_handle() as *mut _);
+        if GetNamedPipeClientProcessId(handle, &mut pid).is_ok() {
+            Some(pid)
+        } else {
+            None
+        }
+    };
+
+    match client_pid_raw {
+        Some(client_pid) => {
+            let monitor_state = app_handle.state::<MonitorState>();
+            let expected_pid_raw = {
+                let guard = monitor_state.process.lock().unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().map(|child| child.id())
+            };
+
+            if let Some(expected_pid) = expected_pid_raw {
+                let mut is_valid = false;
+                // 1. 直接匹配 (Monitor 进程)
+                if client_pid == expected_pid {
+                    is_valid = true;
+                } else {
+                    // 2. 检查是否为直接后代进程 (Python multiprocessing 第一层)
+                    if let Some(ppid) = get_parent_pid(client_pid) {
+                        if ppid == expected_pid {
+                            is_valid = true;
+                        }
+                    }
+                }
+
+                if !is_valid {
+                    tracing::warn!("Illegal access attempt to Reverse IPC from PID {} (not authorized)", client_pid);
+                    let err_resp = serde_json::json!({"error": format!("Access denied: PID {} is not authorized", client_pid)});
+                    let _ = server.write_all(err_resp.to_string().as_bytes()).await;
+                    return;
+                }
+            } else {
+                tracing::warn!("Reverse IPC connection received but monitor process is not registered");
+                return;
+            }
+        }
+        None => {
+            tracing::error!("Failed to get client PID from reverse IPC pipe");
+            return;
+        }
+    }
+
     // 读取请求 - 使用循环读取直到管道关闭或超时
     // 因为图片 Base64 数据可能很大（数 MB），单次 read 可能无法读取完整数据
     let mut buf = Vec::with_capacity(4 * 1024 * 1024); // 预分配 4MB
@@ -1086,11 +1291,6 @@ async fn process_extension_ocr(
         let guard = monitor_state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
         guard.clone().ok_or_else(|| "Monitor pipe not available".to_string())?
     };
-    let auth_token = {
-        let guard = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
-        guard.clone().ok_or_else(|| "Auth token not available".to_string())?
-    };
-    let seq_no = monitor_state.request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let req = serde_json::json!({
         "command": "process_ocr",
@@ -1100,6 +1300,13 @@ async fn process_extension_ocr(
         "process_name": process_name,
         "timestamp": timestamp_ms,
     });
+
+    let (auth_token, seq_no) = {
+        let token = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            .ok_or_else(|| "Auth token not available".to_string())?;
+        let seq = monitor_state.request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        (token, seq)
+    };
 
     let response = crate::monitor::send_ipc_request(&pipe_name, &auth_token, seq_no, req).await?;
 
