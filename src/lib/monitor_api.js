@@ -463,7 +463,7 @@ export const migratePlaintextFiles = async () => {
 /**
  * 删除所有明文截图文件（不迁移，直接删除）
  * 需要认证
- * @returns {Promise<{status: string, deleted_count: number}>}
+ * @returns {Promise<{status: string, deleted: number}>}
  */
 export const deletePlaintextFiles = async () => {
     return withAuth(async () => {

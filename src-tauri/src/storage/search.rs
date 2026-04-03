@@ -23,7 +23,7 @@ impl StorageState {
     }
 
     /// Compute static hash for non-sensitive dedup (e.g. icons, link sets)
-    pub(super) fn compute_static_hash(text: &str) -> String {
+    pub(crate) fn compute_static_hash(text: &str) -> String {
         type HmacSha256 = Hmac<sha2::Sha256>;
         const STATIC_KEY: &[u8] = b"CarbonPaper-Search-HMAC-Key-v1";
 
@@ -71,7 +71,7 @@ impl StorageState {
     }
 
     /// Bigram tokenization (punctuation filtered).
-    pub(super) fn bigram_tokenize(text: &str) -> HashSet<String> {
+    pub(crate) fn bigram_tokenize(text: &str) -> HashSet<String> {
         let chars: Vec<char> = text
             .chars()
             .filter(|c| c.is_alphanumeric() || Self::is_cjk(*c))

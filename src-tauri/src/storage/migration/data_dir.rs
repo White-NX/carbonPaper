@@ -2,34 +2,12 @@
 
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use tauri::AppHandle;
 use tauri::Emitter;
 use walkdir::WalkDir;
 
-use super::StorageState;
-
-/// RAII guard that resets migration flags when dropped.
-struct MigrationRunGuard<'a> {
-    in_progress: &'a AtomicBool,
-    cancel_requested: &'a AtomicBool,
-}
-
-impl<'a> MigrationRunGuard<'a> {
-    fn new(in_progress: &'a AtomicBool, cancel_requested: &'a AtomicBool) -> Self {
-        Self {
-            in_progress,
-            cancel_requested,
-        }
-    }
-}
-
-impl Drop for MigrationRunGuard<'_> {
-    fn drop(&mut self) {
-        self.in_progress.store(false, Ordering::SeqCst);
-        self.cancel_requested.store(false, Ordering::SeqCst);
-    }
-}
+use super::{MigrationRunGuard, super::StorageState};
 
 impl StorageState {
     /// Rollback a partial migration by removing copied files and created directories.

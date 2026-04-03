@@ -35,7 +35,7 @@ impl StorageState {
         Ok((encrypted_data, encrypted_key))
     }
 
-    pub(super) fn decrypt_payload_with_row_key(
+    pub(crate) fn decrypt_payload_with_row_key(
         &self,
         encrypted_data: &[u8],
         encrypted_key: &[u8],

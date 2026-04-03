@@ -8,8 +8,7 @@
 mod encryption;
 mod image_io;
 mod link_scoring;
-mod migration;
-mod plaintext;
+pub mod migration;
 mod policy;
 mod process;
 mod schema;

@@ -512,7 +512,6 @@ fn has_pii(entities: &[PiiEntity]) -> bool {
 const CENSORED_LABEL: &str = "[censored]";
 
 /// Decode percent-encoded URL to UTF-8 for sensitive content checking.
-/// e.g. `https://zh.wikipedia.org/wiki/%E5%85%AD%E5%9B%9B` → `…/六四`
 fn decode_url_for_filter(url: &str) -> String {
     percent_decode_str(url).decode_utf8_lossy().into_owned()
 }

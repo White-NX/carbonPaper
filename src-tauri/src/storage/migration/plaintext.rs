@@ -9,7 +9,7 @@ use rusqlite::params;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::{MigrationResult, StorageState};
+use super::super::{MigrationResult, StorageState};
 
 impl StorageState {
     /// Scan and encrypt all plaintext screenshot files.

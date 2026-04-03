@@ -25,7 +25,7 @@ fn main() {
                     .zip(dst_meta.modified().ok())
                     .map(|(s, d)| s > d)
                     .unwrap_or(true);
-                !(same_size && !src_newer)
+                !same_size || src_newer
             }
             (Ok(_), Err(_)) => true,
             _ => true,
