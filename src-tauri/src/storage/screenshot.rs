@@ -154,8 +154,7 @@ impl StorageState {
         let metadata_json = request
             .metadata
             .as_ref()
-            .map(|m| serde_json::to_string(m).ok())
-            .flatten();
+            .and_then(|m| serde_json::to_string(m).ok());
         let window_title_enc = match &request.window_title {
             Some(value) => Some(
                 encrypt_with_master_key(&row_key, value.as_bytes())
@@ -375,8 +374,7 @@ impl StorageState {
         let metadata_json = request
             .metadata
             .as_ref()
-            .map(|m| serde_json::to_string(m).ok())
-            .flatten();
+            .and_then(|m| serde_json::to_string(m).ok());
 
         let window_title_enc = match &request.window_title {
             Some(value) => Some(
@@ -805,7 +803,7 @@ impl StorageState {
                 .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
             let rows: Vec<RawScreenshotRow> = stmt
-                .query_map([], |row| RawScreenshotRow::from_row(row))
+                .query_map([], RawScreenshotRow::from_row)
                 .map_err(|e| format!("Failed to execute query: {}", e))?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -953,7 +951,7 @@ impl StorageState {
                 .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
             let rows: Vec<RawScreenshotRow> = stmt
-                .query_map([], |row| RawScreenshotRow::from_row(row))
+                .query_map([], RawScreenshotRow::from_row)
                 .map_err(|e| format!("Failed to execute query: {}", e))?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -1047,8 +1045,7 @@ impl StorageState {
             let guard = self.get_connection_named("get_screenshot_by_image_path")?;
             let conn = guard.as_ref().unwrap();
 
-            let (where_clause, param_value): (&str, String) = if path.starts_with("memory://") {
-                let hash = &path["memory://".len()..];
+            let (where_clause, param_value): (&str, String) = if let Some(hash) = path.strip_prefix("memory://") {
                 ("WHERE s.image_hash = ?", hash.to_string())
             } else {
                 ("WHERE s.image_path = ?", path.to_string())

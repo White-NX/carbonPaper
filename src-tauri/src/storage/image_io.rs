@@ -15,9 +15,8 @@ impl StorageState {
             let guard = self.get_connection_named("read_image")?;
             let conn = guard.as_ref().unwrap();
 
-            if path.starts_with("memory://") {
+            if let Some(hash) = path.strip_prefix("memory://") {
                 // 旧数据兼容：从 memory:// 中提取 hash 查找
-                let hash = &path["memory://".len()..];
                 let result: Option<(Option<Vec<u8>>, String)> = conn
                     .query_row(
                         "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ?",
@@ -93,8 +92,7 @@ impl StorageState {
             let guard = self.get_connection_named("read_thumbnail")?;
             let conn = guard.as_ref().unwrap();
 
-            if path.starts_with("memory://") {
-                let hash = &path["memory://".len()..];
+            if let Some(hash) = path.strip_prefix("memory://") {
                 let result: Option<(Option<Vec<u8>>, String)> = conn
                     .query_row(
                         "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ?",
@@ -167,8 +165,7 @@ impl StorageState {
             let guard = self.get_connection_named("ensure_thumbnail_cached")?;
             let conn = guard.as_ref().unwrap();
 
-            if path.starts_with("memory://") {
-                let hash = &path["memory://".len()..];
+            if let Some(hash) = path.strip_prefix("memory://") {
                 let result: Option<(Option<Vec<u8>>, String)> = conn
                     .query_row(
                         "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ?",

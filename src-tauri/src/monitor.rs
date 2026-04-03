@@ -648,24 +648,22 @@ pub async fn start_monitor(
         if let Some(out) = child.stdout.take() {
             std::thread::spawn(move || {
                 let reader = BufReader::new(out);
-                for line in reader.lines() {
-                    if let Ok(l) = line {
-                        {
-                            let mut cache =
-                                stdout_cache_clone.lock().unwrap_or_else(|e| e.into_inner());
-                            cache.push(l.clone());
-                            if cache.len() > STARTUP_LOG_TAIL_LINES {
-                                let overflow = cache.len() - STARTUP_LOG_TAIL_LINES;
-                                cache.drain(0..overflow);
-                            }
+                for l in reader.lines().flatten() {
+                    {
+                        let mut cache =
+                            stdout_cache_clone.lock().unwrap_or_else(|e| e.into_inner());
+                        cache.push(l.clone());
+                        if cache.len() > STARTUP_LOG_TAIL_LINES {
+                            let overflow = cache.len() - STARTUP_LOG_TAIL_LINES;
+                            cache.drain(0..overflow);
                         }
-                        // Print to console as well as emit to frontend, so logs are visible in terminal
-                        tracing::info!(target: "monitor.stdout", "{}", l);
-                        let _ = app_clone.emit(
-                            "monitor-log",
-                            serde_json::json!({"source":"stdout","line": l}),
-                        );
                     }
+                    // Print to console as well as emit to frontend, so logs are visible in terminal
+                    tracing::info!(target: "monitor.stdout", "{}", l);
+                    let _ = app_clone.emit(
+                        "monitor-log",
+                        serde_json::json!({"source":"stdout","line": l}),
+                    );
                 }
             });
         }
@@ -675,35 +673,33 @@ pub async fn start_monitor(
         if let Some(err) = child.stderr.take() {
             std::thread::spawn(move || {
                 let reader = BufReader::new(err);
-                for line in reader.lines() {
-                    if let Ok(l) = line {
-                        {
-                            let mut cache =
-                                stderr_cache_clone.lock().unwrap_or_else(|e| e.into_inner());
-                            cache.push(l.clone());
-                            if cache.len() > STARTUP_LOG_TAIL_LINES {
-                                let overflow = cache.len() - STARTUP_LOG_TAIL_LINES;
-                                cache.drain(0..overflow);
-                            }
+                for l in reader.lines().flatten() {
+                    {
+                        let mut cache =
+                            stderr_cache_clone.lock().unwrap_or_else(|e| e.into_inner());
+                        cache.push(l.clone());
+                        if cache.len() > STARTUP_LOG_TAIL_LINES {
+                            let overflow = cache.len() - STARTUP_LOG_TAIL_LINES;
+                            cache.drain(0..overflow);
                         }
-                        // Parse Python log level from format "[LEVEL] ..." and use matching tracing macro
-                        if l.starts_with("[DEBUG]") {
-                            tracing::debug!(target: "monitor.stderr", "{}", l);
-                        } else if l.starts_with("[INFO]") {
-                            tracing::info!(target: "monitor.stderr", "{}", l);
-                        } else if l.starts_with("[ERROR]") || l.starts_with("[CRITICAL]") {
-                            tracing::error!(target: "monitor.stderr", "{}", l);
-                        } else if l.starts_with("[WARNING]") {
-                            tracing::warn!(target: "monitor.stderr", "{}", l);
-                        } else {
-                            // Unrecognized format (e.g. raw Python tracebacks) — default to warn
-                            tracing::warn!(target: "monitor.stderr", "{}", l);
-                        }
-                        let _ = app_clone.emit(
-                            "monitor-log",
-                            serde_json::json!({"source":"stderr","line": l}),
-                        );
                     }
+                    // Parse Python log level from format "[LEVEL] ..." and use matching tracing macro
+                    if l.starts_with("[DEBUG]") {
+                        tracing::debug!(target: "monitor.stderr", "{}", l);
+                    } else if l.starts_with("[INFO]") {
+                        tracing::info!(target: "monitor.stderr", "{}", l);
+                    } else if l.starts_with("[ERROR]") || l.starts_with("[CRITICAL]") {
+                        tracing::error!(target: "monitor.stderr", "{}", l);
+                    } else if l.starts_with("[WARNING]") {
+                        tracing::warn!(target: "monitor.stderr", "{}", l);
+                    } else {
+                        // Unrecognized format (e.g. raw Python tracebacks) — default to warn
+                        tracing::warn!(target: "monitor.stderr", "{}", l);
+                    }
+                    let _ = app_clone.emit(
+                        "monitor-log",
+                        serde_json::json!({"source":"stderr","line": l}),
+                    );
                 }
             });
         }
@@ -1045,26 +1041,21 @@ pub fn enumerate_gpus_internal() -> Result<Vec<serde_json::Value>, String> {
 
         let mut gpus = Vec::new();
         let mut i: u32 = 0;
-        loop {
-            match factory.EnumAdapters1(i) {
-                Ok(adapter) => {
-                    let desc = adapter
-                        .GetDesc1()
-                        .map_err(|e| format!("Failed to get adapter desc: {:?}", e))?;
-                    // 排除软件渲染器
-                    if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
-                        let name = String::from_utf16_lossy(
-                            &desc.Description[..desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len())],
-                        );
-                        gpus.push(serde_json::json!({
-                            "id": i,
-                            "name": name.trim().to_string(),
-                        }));
-                    }
-                    i += 1;
-                }
-                Err(_) => break,
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            let desc = adapter
+                .GetDesc1()
+                .map_err(|e| format!("Failed to get adapter desc: {:?}", e))?;
+            // 排除软件渲染器
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
+                let name = String::from_utf16_lossy(
+                    &desc.Description[..desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len())],
+                );
+                gpus.push(serde_json::json!({
+                    "id": i,
+                    "name": name.trim().to_string(),
+                }));
             }
+            i += 1;
         }
         Ok(gpus)
     }

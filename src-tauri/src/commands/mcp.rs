@@ -19,8 +19,7 @@ pub async fn mcp_set_enabled(
     if enabled {
         let mut policy = storage_state.load_policy()?;
         let existing_token = policy.get("mcp_token_encrypted").and_then(|v| v.as_str());
-        let (token_plaintext, is_new_token) = if existing_token.is_some() {
-            let encrypted_b64 = existing_token.unwrap();
+        let (token_plaintext, is_new_token) = if let Some(encrypted_b64) = existing_token {
             let token = mcp_server::decrypt_token(&credential_state, encrypted_b64)?;
             (token, false)
         } else {

@@ -44,6 +44,12 @@ pub struct McpRuntimeState {
     idle_check_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+impl Default for McpRuntimeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl McpRuntimeState {
     pub fn new() -> Self {
         Self {
@@ -187,7 +193,7 @@ async fn handle_mcp(
         "tools/call" => handle_tools_call(&state, req.id, req.params).await,
         other => {
             tracing::warn!("MCP unknown method: {}", other);
-            JsonRpcResponse::error(req.id, -32601, format!("Method not found"))
+            JsonRpcResponse::error(req.id, -32601, "Method not found".to_string())
         }
     };
 
@@ -655,9 +661,9 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
                     // remove_paragraph → replace with [censored]
                     // mask → character-level mask (█)
                     let title_sensitive = r.window_title.as_ref()
-                        .map_or(false, |t| filter.contains_sensitive(t));
+                        .is_some_and(|t| filter.contains_sensitive(t));
                     let url_sensitive = r.page_url.as_ref()
-                        .map_or(false, |u| filter.contains_sensitive(&decode_url_for_filter(u)));
+                        .is_some_and(|u| filter.contains_sensitive(&decode_url_for_filter(u)));
 
                     if title_sensitive || url_sensitive {
                         match filter_mode.as_str() {
@@ -773,7 +779,7 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
 
     // Presidio second-pass (tier 2)
     let has_content = !ocr_results.is_empty()
-        || r.visible_links.as_ref().map_or(false, |l| !l.is_empty())
+        || r.visible_links.as_ref().is_some_and(|l| !l.is_empty())
         || r.window_title.is_some()
         || r.page_url.is_some();
     if presidio_enabled && has_content {

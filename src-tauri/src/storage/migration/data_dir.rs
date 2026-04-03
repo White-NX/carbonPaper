@@ -28,13 +28,13 @@ impl StorageState {
     fn restore_source_and_reinitialize(
         &self,
         app_handle: &AppHandle,
-        src: &PathBuf,
+        src: &std::path::Path,
         message: String,
         cancelled: bool,
     ) -> Result<serde_json::Value, String> {
         {
             let mut data_guard = self.data_dir.lock().unwrap_or_else(|e| e.into_inner());
-            *data_guard = src.clone();
+            *data_guard = src.to_path_buf();
             let mut ss_guard = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner());
             *ss_guard = src.join("screenshots");
         }

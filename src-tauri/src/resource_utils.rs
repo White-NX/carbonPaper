@@ -5,11 +5,7 @@ use tauri::{AppHandle, Manager};
 /// Strips the Windows extended-length prefix "\\\\?\\" if present.
 pub fn normalize_path_for_command(path: &std::path::Path) -> String {
     let s = path.as_os_str().to_string_lossy().to_string();
-    if s.starts_with("\\\\?\\") {
-        s[4..].to_string()
-    } else {
-        s
-    }
+    s.strip_prefix("\\\\?\\").unwrap_or(&s).to_string()
 }
 
 /// Construct a path under the app's resource directory by joining `filename` to the resource dir.

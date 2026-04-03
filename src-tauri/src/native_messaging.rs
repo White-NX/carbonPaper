@@ -68,7 +68,7 @@ fn write_nm_manifest(extension_ids: &[&str]) -> Result<PathBuf, String> {
 }
 
 /// Register NM host in Windows Registry for a specific browser
-fn register_nm_host(reg_key_path: &str, manifest_path: &PathBuf) -> Result<(), String> {
+fn register_nm_host(reg_key_path: &str, manifest_path: &std::path::Path) -> Result<(), String> {
     use winreg::enums::*;
     use winreg::RegKey;
 

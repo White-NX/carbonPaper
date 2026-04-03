@@ -176,6 +176,18 @@ impl StorageState {
                     }
                 };
 
+                // If empty, just NULL out the inline column and continue
+                if links.is_empty() {
+                    if let Err(e) = conn.execute(
+                        "UPDATE screenshots SET visible_links_enc = NULL WHERE id = ?",
+                        params![id],
+                    ) {
+                        tracing::warn!("migrate_inline_to_dedup: failed to clear empty links for id={}: {}", id, e);
+                        has_errors = true;
+                    }
+                    continue;
+                }
+
                 // Create or reuse link_set entry
                 match Self::get_or_create_link_set_id(conn, &links) {
                     Ok(link_set_id) => {

@@ -263,6 +263,7 @@ pub fn decrypt_from_base64_with_master_key(master_key: &[u8], encrypted_base64: 
 }
 
 /// 生成用于 SQLCipher 的数据库密钥
+#[allow(dead_code)]
 pub fn derive_db_key_from_master(master_key: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(master_key);
@@ -449,6 +450,7 @@ mod windows_impl {
     }
 
     /// 通过 Windows Hello 解锁并缓存主密钥
+    #[allow(dead_code)]
     pub async fn unlock_master_key(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
         if let Some(key) = get_cached_master_key(state) {
             return Ok(key);

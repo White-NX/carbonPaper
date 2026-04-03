@@ -112,7 +112,7 @@ pub fn storage_migration_cancel(state: tauri::State<'_, Arc<StorageState>>) -> s
     let in_progress = state.request_migration_cancel();
     serde_json::json!({
         "status": if in_progress { "cancel_requested" } else { "idle" },
-        "is_running": in_progress
+        "in_progress": in_progress
     })
 }
 

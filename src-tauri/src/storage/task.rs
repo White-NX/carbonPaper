@@ -191,7 +191,7 @@ impl StorageState {
             // Compute composite relevance score:
             //   score = snapshot_count * min(duration_hours, 720) / 720 * 1 / (hours_since_last_active + 1)
             let duration_hours = match (task.start_time, task.end_time) {
-                (Some(s), Some(e)) => ((e - s) / 3600.0).max(0.0).min(720.0),
+                (Some(s), Some(e)) => ((e - s) / 3600.0).clamp(0.0, 720.0),
                 _ => 0.0,
             };
             let hours_since_active = match task.end_time {
