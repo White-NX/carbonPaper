@@ -85,7 +85,7 @@ pub async fn storage_migrate_plaintext(
         .map_err(|e| format!("Task join error: {:?}", e))??;
 
     Ok(serde_json::json!({
-        "total": res.total_files,
+        "total_files": res.total_files,
         "migrated": res.migrated,
         "skipped": res.skipped,
         "errors": res.errors
