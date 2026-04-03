@@ -199,8 +199,8 @@ async function captureCurrentTab(retry = 0) {
     if (e.message?.includes('user may be dragging a tab') && retry < MAX_RETRY) {
       // This is a known Chrome bug.
       // We can retry after a short delay.
-      console.warn(`[CarbonPaper] Capture failed due to dragging state, retrying (${nextRetry}): `, e.message);
       const nextRetry = retry + 1;
+      console.warn(`[CarbonPaper] Capture failed due to dragging state, retrying (${nextRetry}): `, e.message);
       setTimeout(() => captureCurrentTab(nextRetry), 500);
       return;
     }
