@@ -7,10 +7,18 @@ const NM_HOST_NAME = 'com.carbonpaper.nmh';
 const MAX_RETRY = 30;
 
 let nmPort = null;
-let isEnabled = true;
+// Conservative default: do not connect until persisted state is loaded.
+let isEnabled = false;
+let settingsLoaded = false;
 let isConnected = false;
 let reconnectTimer = null;
 let lastCaptureHash = null;
+
+function ensureNativeConnection(reason = 'unknown') {
+  if (!settingsLoaded || !isEnabled || isConnected) return;
+  console.log('[CarbonPaper] Ensuring NMH connection, reason:', reason);
+  connectNative();
+}
 
 // Detect browser process name
 function getBrowserName() {
@@ -26,11 +34,15 @@ function scheduleReconnect(delayMs = 5000) {
   if (reconnectTimer !== null) return; // already scheduled
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    connectNative();
+    ensureNativeConnection('scheduleReconnect');
   }, delayMs);
 }
 
 function connectNative() {
+  if (!settingsLoaded || !isEnabled) {
+    return;
+  }
+
   // Cancel any pending scheduled reconnection — we're connecting now
   if (reconnectTimer !== null) {
     clearTimeout(reconnectTimer);
@@ -187,8 +199,8 @@ async function captureCurrentTab(retry = 0) {
     if (e.message?.includes('user may be dragging a tab') && retry < MAX_RETRY) {
       // This is a known Chrome bug.
       // We can retry after a short delay.
-      console.warn(`[CarbonPaper] Capture failed due to dragging state, retrying (${nextRetry}): `, e.message);
       const nextRetry = retry + 1;
+      console.warn(`[CarbonPaper] Capture failed due to dragging state, retrying (${nextRetry}): `, e.message);
       setTimeout(() => captureCurrentTab(nextRetry), 500);
       return;
     }
@@ -234,21 +246,56 @@ async function fetchAsBase64(url) {
 
 // Load saved state
 chrome.storage.local.get(['enabled'], (result) => {
+  settingsLoaded = true;
   isEnabled = result.enabled !== false; // Default to true
   if (isEnabled) {
     connectNative();
+  } else {
+    // Defensive cleanup if a stale worker state ever left a connection open.
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (nmPort) {
+      try { nmPort.disconnect(); } catch (e) { /* ignore */ }
+      nmPort = null;
+      isConnected = false;
+    }
+  }
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  ensureNativeConnection('runtime.onStartup');
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  ensureNativeConnection('runtime.onInstalled');
+});
+
+chrome.tabs.onActivated.addListener(() => {
+  ensureNativeConnection('tabs.onActivated');
+});
+
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId !== chrome.windows.WINDOW_ID_NONE) {
+    ensureNativeConnection('windows.onFocusChanged');
   }
 });
 
 // Listen for state changes from popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'setEnabled') {
+    settingsLoaded = true;
     isEnabled = message.enabled;
     chrome.storage.local.set({ enabled: isEnabled });
 
     if (isEnabled) {
       connectNative();
     } else {
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       if (nmPort) {
         try { nmPort.disconnect(); } catch (e) { /* ignore */ }
         nmPort = null;
@@ -263,7 +310,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       connected: isConnected
     });
 
-    if (isEnabled && !isConnected) {
+    if (settingsLoaded && isEnabled && !isConnected) {
       console.warn('[CarbonPaper] Status requested but main process is not connected. Attempting to reconnect...');
       connectNative();
     }
