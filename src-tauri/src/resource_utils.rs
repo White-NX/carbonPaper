@@ -44,6 +44,7 @@ pub fn file_in_local_appdata() -> Option<PathBuf> {
 
 /// Check whether a file or directory actually exists inside the user's Local AppData\CarbonPaper directory.
 /// Returns `Some(PathBuf)` only when the file exists on disk.
+#[allow(dead_code)]
 pub fn find_existing_file_in_appdata(filename: &str) -> Option<PathBuf> {
     if let Some(appdata_dir) = file_in_local_appdata() {
         let candidate = appdata_dir.join(filename);

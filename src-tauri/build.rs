@@ -115,9 +115,9 @@ fn main() {
     fn copy_if_exists(src: &Path, dst: &Path) {
         if src.exists() && src.is_file() {
             copy_file_if_needed(src, dst);
-            println!("cargo:warning=Included file: {:?} -> {:?}", src, dst);
+            eprintln!("Included file: {:?} -> {:?}", src, dst);
         } else {
-            println!("cargo:warning=File not found: {:?}; skipping copy", src);
+            eprintln!("Optional file not found: {:?}; skipping copy", src);
         }
     }
 
@@ -149,7 +149,7 @@ fn main() {
                 copy_file_if_needed(src_path, &dest_path);
             }
         }
-        println!("cargo:warning=Included compliance_process directory");
+        eprintln!("Included compliance_process directory");
     }
 
     // --- 8. 复制 browser-extension 目录到 pre-bundle ---
@@ -169,7 +169,7 @@ fn main() {
                 copy_file_if_needed(src_path, &dest_path);
             }
         }
-        println!("cargo:warning=Included browser-extension directory");
+        eprintln!("Included browser-extension directory");
     }
 
     // --- 9. 告诉 Tauri 需要重新运行此脚本 ---

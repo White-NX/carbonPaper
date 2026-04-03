@@ -24,6 +24,7 @@ use windows::Win32::Foundation::HANDLE;
 /// Commands that Python can send to Rust via the reverse IPC named pipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command")]
+#[allow(dead_code)]
 pub enum StorageCommand {
     /// Save a screenshot with image data, metadata, and optional OCR results.
     #[serde(rename = "save_screenshot")]
@@ -881,6 +882,7 @@ pub fn generate_nmh_auth_token(data_dir: &std::path::Path) -> Result<String, Str
 }
 
 /// Read the NMH auth token from the data dir.
+#[allow(dead_code)]
 pub fn read_nmh_auth_token(data_dir: &PathBuf) -> Result<String, String> {
     let token_path = data_dir.join("nmh_auth_token");
     std::fs::read_to_string(&token_path)
@@ -964,6 +966,7 @@ impl NmhPipeServer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.try_send(());

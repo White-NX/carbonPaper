@@ -85,6 +85,7 @@ fn register_nm_host(reg_key_path: &str, manifest_path: &std::path::Path) -> Resu
 }
 
 /// Unregister NM host from Windows Registry
+#[allow(dead_code)]
 fn unregister_nm_host(reg_key_path: &str) -> Result<(), String> {
     use winreg::enums::*;
     use winreg::RegKey;
