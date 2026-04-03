@@ -7,13 +7,15 @@ const NM_HOST_NAME = 'com.carbonpaper.nmh';
 const MAX_RETRY = 30;
 
 let nmPort = null;
-let isEnabled = true;
+// Conservative default: do not connect until persisted state is loaded.
+let isEnabled = false;
+let settingsLoaded = false;
 let isConnected = false;
 let reconnectTimer = null;
 let lastCaptureHash = null;
 
 function ensureNativeConnection(reason = 'unknown') {
-  if (!isEnabled || isConnected) return;
+  if (!settingsLoaded || !isEnabled || isConnected) return;
   console.log('[CarbonPaper] Ensuring NMH connection, reason:', reason);
   connectNative();
 }
@@ -32,11 +34,15 @@ function scheduleReconnect(delayMs = 5000) {
   if (reconnectTimer !== null) return; // already scheduled
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    connectNative();
+    ensureNativeConnection('scheduleReconnect');
   }, delayMs);
 }
 
 function connectNative() {
+  if (!settingsLoaded || !isEnabled) {
+    return;
+  }
+
   // Cancel any pending scheduled reconnection — we're connecting now
   if (reconnectTimer !== null) {
     clearTimeout(reconnectTimer);
@@ -240,9 +246,21 @@ async function fetchAsBase64(url) {
 
 // Load saved state
 chrome.storage.local.get(['enabled'], (result) => {
+  settingsLoaded = true;
   isEnabled = result.enabled !== false; // Default to true
   if (isEnabled) {
     connectNative();
+  } else {
+    // Defensive cleanup if a stale worker state ever left a connection open.
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (nmPort) {
+      try { nmPort.disconnect(); } catch (e) { /* ignore */ }
+      nmPort = null;
+      isConnected = false;
+    }
   }
 });
 
@@ -267,12 +285,17 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 // Listen for state changes from popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'setEnabled') {
+    settingsLoaded = true;
     isEnabled = message.enabled;
     chrome.storage.local.set({ enabled: isEnabled });
 
     if (isEnabled) {
       connectNative();
     } else {
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       if (nmPort) {
         try { nmPort.disconnect(); } catch (e) { /* ignore */ }
         nmPort = null;
@@ -287,7 +310,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       connected: isConnected
     });
 
-    if (isEnabled && !isConnected) {
+    if (settingsLoaded && isEnabled && !isConnected) {
       console.warn('[CarbonPaper] Status requested but main process is not connected. Attempting to reconnect...');
       connectNative();
     }
