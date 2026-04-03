@@ -12,6 +12,12 @@ let isConnected = false;
 let reconnectTimer = null;
 let lastCaptureHash = null;
 
+function ensureNativeConnection(reason = 'unknown') {
+  if (!isEnabled || isConnected) return;
+  console.log('[CarbonPaper] Ensuring NMH connection, reason:', reason);
+  connectNative();
+}
+
 // Detect browser process name
 function getBrowserName() {
   const ua = navigator.userAgent;
@@ -237,6 +243,24 @@ chrome.storage.local.get(['enabled'], (result) => {
   isEnabled = result.enabled !== false; // Default to true
   if (isEnabled) {
     connectNative();
+  }
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  ensureNativeConnection('runtime.onStartup');
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  ensureNativeConnection('runtime.onInstalled');
+});
+
+chrome.tabs.onActivated.addListener(() => {
+  ensureNativeConnection('tabs.onActivated');
+});
+
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId !== chrome.windows.WINDOW_ID_NONE) {
+    ensureNativeConnection('windows.onFocusChanged');
   }
 });
 
