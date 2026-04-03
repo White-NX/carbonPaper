@@ -23,7 +23,7 @@ impl StorageState {
     }
 
     /// Compute static hash for non-sensitive dedup (e.g. icons, link sets)
-    pub(super) fn compute_static_hash(text: &str) -> String {
+    pub(crate) fn compute_static_hash(text: &str) -> String {
         type HmacSha256 = Hmac<sha2::Sha256>;
         const STATIC_KEY: &[u8] = b"CarbonPaper-Search-HMAC-Key-v1";
 
@@ -71,7 +71,7 @@ impl StorageState {
     }
 
     /// Bigram tokenization (punctuation filtered).
-    pub(super) fn bigram_tokenize(text: &str) -> HashSet<String> {
+    pub(crate) fn bigram_tokenize(text: &str) -> HashSet<String> {
         let chars: Vec<char> = text
             .chars()
             .filter(|c| c.is_alphanumeric() || Self::is_cjk(*c))
@@ -387,7 +387,7 @@ impl StorageState {
                         })
                         .map_err(|e| format!("Failed to execute search query: {}", e))?
                         .filter_map(|r| r.ok())
-                        .filter_map(
+                        .map(
                             |(
                                 screenshot_id,
                                 id,
@@ -450,7 +450,7 @@ impl StorageState {
                                     _ => None,
                                 };
 
-                                Some(SearchResult {
+                                SearchResult {
                                     id,
                                     screenshot_id,
                                     text: text.unwrap_or_default(),
@@ -462,7 +462,7 @@ impl StorageState {
                                     category,
                                     created_at,
                                     screenshot_created_at,
-                                })
+                                }
                             },
                         )
                         .collect();
@@ -607,74 +607,74 @@ impl StorageState {
                 })
                 .map_err(|e| format!("Failed to execute search query: {}", e))?
                 .filter_map(|r| r.ok())
-                .filter_map(
-                    |(
-                        screenshot_id,
-                        id,
-                        text_enc,
-                        text_key_enc,
-                        confidence,
-                        box_coords,
-                        image_path,
-                        window_title_enc,
-                        process_name_enc,
-                        screenshot_key_enc,
-                        created_at,
-                        screenshot_created_at,
-                        category,
-                    )| {
-                        let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
-                            (Some(data), Some(key)) => self
-                                .decrypt_payload_with_row_key(data, key)
-                                .ok()
-                                .and_then(|v| String::from_utf8(v).ok()),
-                            _ => None,
-                        };
+                        .map(
+                            |(
+                                screenshot_id,
+                                id,
+                                text_enc,
+                                text_key_enc,
+                                confidence,
+                                box_coords,
+                                image_path,
+                                window_title_enc,
+                                process_name_enc,
+                                screenshot_key_enc,
+                                created_at,
+                                screenshot_created_at,
+                                category,
+                            )| {
+                                let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
+                                    (Some(data), Some(key)) => self
+                                        .decrypt_payload_with_row_key(data, key)
+                                        .ok()
+                                        .and_then(|v| String::from_utf8(v).ok()),
+                                    _ => None,
+                                };
 
-                        let screenshot_key = match screenshot_key_cache.get(&screenshot_id) {
-                            Some(key) => Some(key.clone()),
-                            None => match screenshot_key_enc.as_ref() {
-                                Some(enc) => {
-                                    let key = decrypt_row_key_with_cng(enc).ok();
-                                    if let Some(ref k) = key {
-                                        screenshot_key_cache.insert(screenshot_id, k.clone());
-                                    }
-                                    key
+                                let screenshot_key = match screenshot_key_cache.get(&screenshot_id) {
+                                    Some(key) => Some(key.clone()),
+                                    None => match screenshot_key_enc.as_ref() {
+                                        Some(enc) => {
+                                            let key = decrypt_row_key_with_cng(enc).ok();
+                                            if let Some(ref k) = key {
+                                                screenshot_key_cache.insert(screenshot_id, k.clone());
+                                            }
+                                            key
+                                        }
+                                        None => None,
+                                    },
+                                };
+
+                                let window_title =
+                                    match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
+                                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                                            .ok()
+                                            .and_then(|v| String::from_utf8(v).ok()),
+                                        _ => None,
+                                    };
+                                let process_name =
+                                    match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
+                                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                                            .ok()
+                                            .and_then(|v| String::from_utf8(v).ok()),
+                                        _ => None,
+                                    };
+
+                                SearchResult {
+                                    id,
+                                    screenshot_id,
+                                    text: text.unwrap_or_default(),
+                                    confidence,
+                                    box_coords,
+                                    image_path,
+                                    window_title,
+                                    process_name,
+                                    category,
+                                    created_at,
+                                    screenshot_created_at,
                                 }
-                                None => None,
                             },
-                        };
-
-                        let window_title =
-                            match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
-                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                    .ok()
-                                    .and_then(|v| String::from_utf8(v).ok()),
-                                _ => None,
-                            };
-                        let process_name =
-                            match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
-                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                    .ok()
-                                    .and_then(|v| String::from_utf8(v).ok()),
-                                _ => None,
-                            };
-
-                        Some(SearchResult {
-                            id,
-                            screenshot_id,
-                            text: text.unwrap_or_default(),
-                            confidence,
-                            box_coords,
-                            image_path,
-                            window_title,
-                            process_name,
-                            category,
-                            created_at,
-                            screenshot_created_at,
-                        })
-                    },
-                )
+                        )
                 .collect();
 
             for (_, mut key) in screenshot_key_cache.into_iter() {
@@ -895,74 +895,74 @@ impl StorageState {
                 })
                 .map_err(|e| format!("Failed to execute search query: {}", e))?
                 .filter_map(|r| r.ok())
-                .filter_map(
-                    |(
-                        screenshot_id,
-                        id,
-                        text_enc,
-                        text_key_enc,
-                        confidence,
-                        box_coords,
-                        image_path,
-                        window_title_enc,
-                        process_name_enc,
-                        screenshot_key_enc,
-                        created_at,
-                        screenshot_created_at,
-                        category,
-                    )| {
-                        let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
-                            (Some(data), Some(key)) => self
-                                .decrypt_payload_with_row_key(data, key)
-                                .ok()
-                                .and_then(|v| String::from_utf8(v).ok()),
-                            _ => None,
-                        };
+                        .map(
+                            |(
+                                screenshot_id,
+                                id,
+                                text_enc,
+                                text_key_enc,
+                                confidence,
+                                box_coords,
+                                image_path,
+                                window_title_enc,
+                                process_name_enc,
+                                screenshot_key_enc,
+                                created_at,
+                                screenshot_created_at,
+                                category,
+                            )| {
+                                let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
+                                    (Some(data), Some(key)) => self
+                                        .decrypt_payload_with_row_key(data, key)
+                                        .ok()
+                                        .and_then(|v| String::from_utf8(v).ok()),
+                                    _ => None,
+                                };
 
-                        let screenshot_key = match screenshot_key_cache.get(&screenshot_id) {
-                            Some(key) => Some(key.clone()),
-                            None => match screenshot_key_enc.as_ref() {
-                                Some(enc) => {
-                                    let key = decrypt_row_key_with_cng(enc).ok();
-                                    if let Some(ref k) = key {
-                                        screenshot_key_cache.insert(screenshot_id, k.clone());
-                                    }
-                                    key
+                                let screenshot_key = match screenshot_key_cache.get(&screenshot_id) {
+                                    Some(key) => Some(key.clone()),
+                                    None => match screenshot_key_enc.as_ref() {
+                                        Some(enc) => {
+                                            let key = decrypt_row_key_with_cng(enc).ok();
+                                            if let Some(ref k) = key {
+                                                screenshot_key_cache.insert(screenshot_id, k.clone());
+                                            }
+                                            key
+                                        }
+                                        None => None,
+                                    },
+                                };
+
+                                let window_title =
+                                    match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
+                                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                                            .ok()
+                                            .and_then(|v| String::from_utf8(v).ok()),
+                                        _ => None,
+                                    };
+                                let process_name =
+                                    match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
+                                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                                            .ok()
+                                            .and_then(|v| String::from_utf8(v).ok()),
+                                        _ => None,
+                                    };
+
+                                SearchResult {
+                                    id,
+                                    screenshot_id,
+                                    text: text.unwrap_or_default(),
+                                    confidence,
+                                    box_coords,
+                                    image_path,
+                                    window_title,
+                                    process_name,
+                                    category,
+                                    created_at,
+                                    screenshot_created_at,
                                 }
-                                None => None,
                             },
-                        };
-
-                        let window_title =
-                            match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
-                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                    .ok()
-                                    .and_then(|v| String::from_utf8(v).ok()),
-                                _ => None,
-                            };
-                        let process_name =
-                            match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
-                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                    .ok()
-                                    .and_then(|v| String::from_utf8(v).ok()),
-                                _ => None,
-                            };
-
-                        Some(SearchResult {
-                            id,
-                            screenshot_id,
-                            text: text.unwrap_or_default(),
-                            confidence,
-                            box_coords,
-                            image_path,
-                            window_title,
-                            process_name,
-                            category,
-                            created_at,
-                            screenshot_created_at,
-                        })
-                    },
-                )
+                        )
                 .collect();
 
             for (_, mut key) in screenshot_key_cache.into_iter() {

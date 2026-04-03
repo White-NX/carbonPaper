@@ -1,7 +1,7 @@
 //! Screenshot CRUD operations (save, get, delete, commit, abort).
 
 use crate::credential_manager::{
-    decrypt_row_key_with_cng, decrypt_with_master_key, encrypt_row_key_with_cng,
+    encrypt_row_key_with_cng,
     encrypt_with_master_key,
 };
 use chrono::{DateTime, Utc};
@@ -154,8 +154,7 @@ impl StorageState {
         let metadata_json = request
             .metadata
             .as_ref()
-            .map(|m| serde_json::to_string(m).ok())
-            .flatten();
+            .and_then(|m| serde_json::to_string(m).ok());
         let window_title_enc = match &request.window_title {
             Some(value) => Some(
                 encrypt_with_master_key(&row_key, value.as_bytes())
@@ -188,11 +187,11 @@ impl StorageState {
 
         // Use dedup tables for page_icon and visible_links
         let page_icon_id: Option<i64> = match &request.page_icon {
-            Some(value) if !value.is_empty() => Some(Self::get_or_create_page_icon(conn, value)?),
+            Some(value) if !value.is_empty() => Some(Self::get_or_create_page_icon_id(conn, value)?),
             _ => None,
         };
         let link_set_id: Option<i64> = match &request.visible_links {
-            Some(links) if !links.is_empty() => Some(Self::get_or_create_link_set(conn, links)?),
+            Some(links) if !links.is_empty() => Some(Self::get_or_create_link_set_id(conn, links)?),
             _ => None,
         };
 
@@ -375,8 +374,7 @@ impl StorageState {
         let metadata_json = request
             .metadata
             .as_ref()
-            .map(|m| serde_json::to_string(m).ok())
-            .flatten();
+            .and_then(|m| serde_json::to_string(m).ok());
 
         let window_title_enc = match &request.window_title {
             Some(value) => Some(
@@ -410,11 +408,11 @@ impl StorageState {
 
         // Use dedup tables for page_icon and visible_links
         let page_icon_id: Option<i64> = match &request.page_icon {
-            Some(value) if !value.is_empty() => Some(Self::get_or_create_page_icon(conn, value)?),
+            Some(value) if !value.is_empty() => Some(Self::get_or_create_page_icon_id(conn, value)?),
             _ => None,
         };
         let link_set_id: Option<i64> = match &request.visible_links {
-            Some(links) if !links.is_empty() => Some(Self::get_or_create_link_set(conn, links)?),
+            Some(links) if !links.is_empty() => Some(Self::get_or_create_link_set_id(conn, links)?),
             _ => None,
         };
 
@@ -805,7 +803,7 @@ impl StorageState {
                 .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
             let rows: Vec<RawScreenshotRow> = stmt
-                .query_map([], |row| RawScreenshotRow::from_row(row))
+                .query_map([], RawScreenshotRow::from_row)
                 .map_err(|e| format!("Failed to execute query: {}", e))?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -859,7 +857,7 @@ impl StorageState {
     }
 
     /// Get screenshot density (counts per time bucket) within a time range.
-    /// No decryption or joins — extremely fast index-only scan.
+    /// No decryption or joins - extremely fast index-only scan.
     pub fn get_screenshot_density(
         &self,
         start_ts: f64,
@@ -953,7 +951,7 @@ impl StorageState {
                 .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
             let rows: Vec<RawScreenshotRow> = stmt
-                .query_map([], |row| RawScreenshotRow::from_row(row))
+                .query_map([], RawScreenshotRow::from_row)
                 .map_err(|e| format!("Failed to execute query: {}", e))?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -1047,8 +1045,7 @@ impl StorageState {
             let guard = self.get_connection_named("get_screenshot_by_image_path")?;
             let conn = guard.as_ref().unwrap();
 
-            let (where_clause, param_value): (&str, String) = if path.starts_with("memory://") {
-                let hash = &path["memory://".len()..];
+            let (where_clause, param_value): (&str, String) = if let Some(hash) = path.strip_prefix("memory://") {
                 ("WHERE s.image_hash = ?", hash.to_string())
             } else {
                 ("WHERE s.image_path = ?", path.to_string())
@@ -1279,7 +1276,7 @@ impl StorageState {
 
     /// Get or create a page_icon dedup entry. Returns the row ID.
     /// Uses INSERT OR IGNORE + SELECT pattern for atomic upsert.
-    fn get_or_create_page_icon(conn: &Connection, plaintext: &str) -> Result<i64, String> {
+    pub(crate) fn get_or_create_page_icon_id(conn: &Connection, plaintext: &str) -> Result<i64, String> {
         let content_hash = Self::compute_static_hash(plaintext);
 
         // Try to find existing entry first (fast path)
@@ -1327,7 +1324,7 @@ impl StorageState {
     }
 
     /// Get or create a link_set dedup entry. Returns the row ID.
-    fn get_or_create_link_set(
+    pub(crate) fn get_or_create_link_set_id(
         conn: &Connection,
         links: &[super::VisibleLink],
     ) -> Result<i64, String> {
@@ -1386,686 +1383,6 @@ impl StorageState {
              DELETE FROM link_sets WHERE id NOT IN (SELECT DISTINCT link_set_id FROM screenshots WHERE link_set_id IS NOT NULL);"
         )
         .map_err(|e| format!("Failed to cleanup orphaned dedup entries: {}", e))?;
-        Ok(())
-    }
-
-    // ==================== Dedup Migration ====================
-
-    /// Marker key in app_metadata for dedup migration completion.
-    const DEDUP_MIGRATION_DONE_KEY: &'static str = "dedup_migration_done";
-
-    /// Migrate existing inline page_icon_enc / visible_links_enc data into dedup tables.
-    ///
-    /// Processes rows in batches: for each row with inline data but no dedup reference,
-    /// decrypts the inline blob, creates/reuses a dedup entry, sets the FK, and NULLs
-    /// the inline column. Safe to call multiple times (idempotent).
-    pub fn migrate_inline_to_dedup(&self) -> Result<(usize, usize), String> {
-        // Check persistent completion marker
-        {
-            let guard = self.get_connection_named("dedup_migrate_check")?;
-            let conn = guard.as_ref().unwrap();
-            let done: bool = conn
-                .query_row(
-                    "SELECT 1 FROM app_metadata WHERE key = ?1",
-                    params![Self::DEDUP_MIGRATION_DONE_KEY],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
-            if done {
-                return Ok((0, 0));
-            }
-        }
-
-        const BATCH_SIZE: i64 = 100;
-        let mut migrated_icons: usize = 0;
-        let mut migrated_links: usize = 0;
-
-        loop {
-            let mut guard = self.get_connection_named("migrate_inline_to_dedup")?;
-            let conn = guard.as_mut().unwrap();
-
-            // Fetch a batch of rows that still have inline page_icon_enc but no dedup ref
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, page_icon_enc, content_key_encrypted
-                     FROM screenshots
-                     WHERE page_icon_enc IS NOT NULL AND page_icon_id IS NULL
-                     LIMIT ?",
-                )
-                .map_err(|e| format!("Failed to prepare migration query (icons): {}", e))?;
-
-            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt
-                .query_map(params![BATCH_SIZE], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })
-                .map_err(|e| format!("Failed to query migration rows (icons): {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            if rows.is_empty() {
-                break;
-            }
-
-            for (id, icon_enc, content_key_enc) in &rows {
-                // Decrypt inline data using the screenshot's row key
-                let row_key = match decrypt_row_key_with_cng(content_key_enc) {
-                    Ok(k) => k,
-                    Err(_) => {
-                        tracing::warn!("migrate_inline_to_dedup: failed to decrypt row key for screenshot id={}", id);
-                        continue;
-                    }
-                };
-                let plaintext = match decrypt_with_master_key(&row_key, icon_enc) {
-                    Ok(d) => match String::from_utf8(d) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                };
-
-                if plaintext.is_empty() {
-                    // Just NULL the inline column for empty values
-                    let _ = conn.execute(
-                        "UPDATE screenshots SET page_icon_enc = NULL WHERE id = ?",
-                        params![id],
-                    );
-                    continue;
-                }
-
-                // Create/reuse dedup entry and update screenshot
-                match Self::get_or_create_page_icon(conn, &plaintext) {
-                    Ok(icon_id) => {
-                        conn.execute(
-                            "UPDATE screenshots SET page_icon_id = ?, page_icon_enc = NULL WHERE id = ?",
-                            params![icon_id, id],
-                        )
-                        .map_err(|e| format!("Failed to update screenshot {}: {}", id, e))?;
-                        migrated_icons += 1;
-                    }
-                    Err(e) => {
-                        tracing::warn!("migrate_inline_to_dedup: failed to create page_icon for screenshot id={}: {}", id, e);
-                    }
-                }
-            }
-
-            // If we got fewer than BATCH_SIZE, we're done
-            if (rows.len() as i64) < BATCH_SIZE {
-                break;
-            }
-        }
-
-        // Now migrate visible_links_enc
-        loop {
-            let mut guard = self.get_connection_named("migrate_inline_to_dedup")?;
-            let conn = guard.as_mut().unwrap();
-
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, visible_links_enc, content_key_encrypted
-                     FROM screenshots
-                     WHERE visible_links_enc IS NOT NULL AND link_set_id IS NULL
-                     LIMIT ?",
-                )
-                .map_err(|e| format!("Failed to prepare migration query (links): {}", e))?;
-
-            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt
-                .query_map(params![BATCH_SIZE], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })
-                .map_err(|e| format!("Failed to query migration rows (links): {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            if rows.is_empty() {
-                break;
-            }
-
-            for (id, links_enc, content_key_enc) in &rows {
-                let row_key = match decrypt_row_key_with_cng(content_key_enc) {
-                    Ok(k) => k,
-                    Err(_) => {
-                        tracing::warn!("migrate_inline_to_dedup: failed to decrypt row key for screenshot id={}", id);
-                        continue;
-                    }
-                };
-                let plaintext = match decrypt_with_master_key(&row_key, links_enc) {
-                    Ok(d) => match String::from_utf8(d) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                };
-
-                if plaintext.is_empty() {
-                    let _ = conn.execute(
-                        "UPDATE screenshots SET visible_links_enc = NULL WHERE id = ?",
-                        params![id],
-                    );
-                    continue;
-                }
-
-                // Parse links JSON
-                let links: Vec<super::VisibleLink> = match serde_json::from_str(&plaintext) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        tracing::warn!("migrate_inline_to_dedup: failed to parse visible_links JSON for screenshot id={}", id);
-                        continue;
-                    }
-                };
-
-                if links.is_empty() {
-                    let _ = conn.execute(
-                        "UPDATE screenshots SET visible_links_enc = NULL WHERE id = ?",
-                        params![id],
-                    );
-                    continue;
-                }
-
-                match Self::get_or_create_link_set(conn, &links) {
-                    Ok(set_id) => {
-                        conn.execute(
-                            "UPDATE screenshots SET link_set_id = ?, visible_links_enc = NULL WHERE id = ?",
-                            params![set_id, id],
-                        )
-                        .map_err(|e| format!("Failed to update screenshot {}: {}", id, e))?;
-                        migrated_links += 1;
-                    }
-                    Err(e) => {
-                        tracing::warn!("migrate_inline_to_dedup: failed to create link_set for screenshot id={}: {}", id, e);
-                    }
-                }
-            }
-
-            if (rows.len() as i64) < BATCH_SIZE {
-                break;
-            }
-        }
-
-        if migrated_icons > 0 || migrated_links > 0 {
-            tracing::info!(
-                "[DEDUP:MIGRATE] Migrated {} page_icons, {} link_sets from inline to dedup tables",
-                migrated_icons,
-                migrated_links
-            );
-        }
-
-        // Migration complete, write success marker
-        {
-            let guard = self.get_connection_named("dedup_migrate_mark")?;
-            let conn = guard.as_ref().unwrap();
-            let _ = conn.execute(
-                "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
-                params![Self::DEDUP_MIGRATION_DONE_KEY],
-            );
-        }
-
-        Ok((migrated_icons, migrated_links))
-    }
-
-    /// Attempt dedup migration if not already done this session.
-    /// Should be called after user authentication succeeds.
-    /// Uses compare_exchange to ensure it only runs once.
-    pub fn try_dedup_migration(&self) {
-        // Only run once per session
-        if self
-            .dedup_migrated
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-
-        let t0 = std::time::Instant::now();
-        match self.migrate_inline_to_dedup() {
-            Ok((icons, links)) => {
-                if icons > 0 || links > 0 {
-                    tracing::info!(
-                        "[DEDUP:MIGRATE] Completed in {:?} ({} icons, {} link_sets)",
-                        t0.elapsed(),
-                        icons,
-                        links
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!("[DEDUP:MIGRATE] Migration failed (non-fatal): {}", e);
-                // Reset flag so it can be retried on next auth
-                self.dedup_migrated.store(false, Ordering::SeqCst);
-            }
-        }
-    }
-
-    // ==================== Bitmap Index Migration & Lazy Indexing ====================
-
-    /// Marker key in app_metadata for bitmap HMAC v2 migration completion.
-    const BITMAP_MIGRATION_DONE_KEY: &'static str = "hmac_v2_migration_done";
-    /// Cursor key to track progress of HMAC v2 migration.
-    const BITMAP_MIGRATION_CURSOR_KEY: &'static str = "hmac_v2_migration_cursor";
-    /// Number of OCR rows to process per batch for lazy indexing.
-    const LAZY_INDEXING_BATCH: i64 = 100;
-
-    /// Attempt to start the lazy indexer (and check migration status).
-    /// Called after user authentication succeeds.
-    pub fn try_bitmap_index_migration(self: &std::sync::Arc<Self>) {
-        if self
-            .bitmap_index_migrated
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-
-        // Spawn a background thread to continually process lazy indexing for backlogged items
-        let self_clone = self.clone();
-        std::thread::spawn(move || {
-            self_clone.run_lazy_indexer_loop();
-        });
-    }
-
-    /// Background loop that periodically processes unindexed ocr_results.
-    fn run_lazy_indexer_loop(&self) {
-        tracing::info!("[LAZY_INDEXER] Started background thread for lazy indexing.");
-        loop {
-            if self.lazy_indexer_shutdown.load(Ordering::SeqCst) {
-                tracing::info!("[LAZY_INDEXER] Shutting down background thread.");
-                break;
-            }
-
-            if !*self.initialized.lock().unwrap_or_else(|e| e.into_inner()) {
-                std::thread::sleep(std::time::Duration::from_millis(2000));
-                continue;
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-
-            // Process unindexed rows (text_hash = '') even if a full migration (old hashes -> HMAC) is pending.
-            // This ensures new snapshots are searchable immediately during the migration process.
-            match self.process_lazy_indexing_batch() {
-                Ok(processed) => {
-                    if processed == 0 {
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("[LAZY_INDEXER] Batch error: {}", e);
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                }
-            }
-        }
-    }
-
-    /// Process a batch of unindexed OCR results (where text_hash is empty).
-    pub fn process_lazy_indexing_batch(&self) -> Result<usize, String> {
-        let hmac_key = self.credential_state.get_hmac_key()?;
-
-        // 1. Fetch rows that have NO hash (newly captured during this version)
-        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
-            let guard = self.get_connection_named("lazy_indexer_read")?;
-            let conn = guard.as_ref().unwrap();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, text_enc, text_key_encrypted FROM ocr_results WHERE text_hash = '' ORDER BY id ASC LIMIT ?1",
-                )
-                .map_err(|e| format!("lazy prepare: {}", e))?;
-            let mapped = stmt
-                .query_map(params![Self::LAZY_INDEXING_BATCH], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                    ))
-                })
-                .map_err(|e| format!("lazy query: {}", e))?;
-            mapped.filter_map(|r| r.ok()).collect()
-        };
-
-        if rows.is_empty() {
-            return Ok(0);
-        }
-
-        self.index_batch_internal(rows, &hmac_key)
-    }
-
-    /// Internal helper to re-index a batch of rows.
-    fn index_batch_internal(&self, rows: Vec<(i64, Vec<u8>, Vec<u8>)>, hmac_key: &[u8]) -> Result<usize, String> {
-        let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
-            std::collections::HashMap::new();
-        let mut row_hashes: Vec<(i64, String)> = Vec::new();
-
-        for (ocr_id, text_enc, text_key_enc) in &rows {
-            let plaintext = match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                },
-                Err(_) => continue,
-            };
-
-            let text_hash = Self::compute_hmac_hash(&plaintext, hmac_key);
-            row_hashes.push((*ocr_id, text_hash));
-
-            let bigrams = Self::bigram_tokenize(&plaintext);
-            for token in bigrams {
-                let token_hash = Self::compute_hmac_hash(&token, hmac_key);
-                batch_tokens
-                    .entry(token_hash)
-                    .or_insert_with(roaring::RoaringBitmap::new)
-                    .insert(*ocr_id as u32);
-            }
-        }
-
-        // 3. Update DB
-        {
-            let mut guard = self.get_connection_named("lazy_indexer_write")?;
-            let conn = guard.as_mut().unwrap();
-            let tx = conn
-                .transaction()
-                .map_err(|e| format!("lazy tx: {}", e))?;
-
-            // Update text_hash
-            {
-                let mut upd_stmt = tx.prepare_cached(
-                    "UPDATE ocr_results SET text_hash = ?1 WHERE id = ?2"
-                ).map_err(|e| format!("lazy upd prep: {}", e))?;
-                for (id, hash) in &row_hashes {
-                    upd_stmt.execute(params![hash, id]).ok();
-                }
-            }
-
-            // Update blind_bitmap_index
-            {
-                let mut get_stmt = tx
-                    .prepare_cached(
-                        "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
-                    )
-                    .map_err(|e| format!("lazy get prep: {}", e))?;
-                let mut put_stmt = tx
-                    .prepare_cached(
-                        "INSERT OR REPLACE INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
-                    )
-                    .map_err(|e| format!("lazy put prep: {}", e))?;
-
-                for (hash, new_bitmap) in &batch_tokens {
-                    let existing_blob: Option<Vec<u8>> = get_stmt
-                        .query_row(params![hash], |row| row.get(0))
-                        .optional()
-                        .map_err(|e| format!("lazy get: {}", e))?;
-
-                    let merged = if let Some(blob) = existing_blob {
-                        let mut existing =
-                            roaring::RoaringBitmap::deserialize_from(&blob[..])
-                                .map_err(|e| format!("lazy deser: {}", e))?;
-                        existing |= new_bitmap;
-                        existing
-                    } else {
-                        new_bitmap.clone()
-                    };
-
-                    let mut buf = Vec::new();
-                    merged
-                        .serialize_into(&mut buf)
-                        .map_err(|e| format!("lazy ser: {}", e))?;
-                    put_stmt
-                        .execute(params![hash, buf])
-                        .map_err(|e| format!("lazy put: {}", e))?;
-                }
-            }
-
-            tx.commit()
-                .map_err(|e| format!("lazy commit: {}", e))?;
-        }
-
-        Ok(rows.len())
-    }
-
-    /// Check if HMAC v2 migration is needed.
-    pub fn check_hmac_migration_status(&self) -> Result<bool, String> {
-        let guard = self.get_connection_named("check_hmac_migration")?;
-        let conn = guard.as_ref().unwrap();
-        
-        // 1. Check persistent marker
-        let done: bool = conn
-            .query_row(
-                "SELECT 1 FROM app_metadata WHERE key = ?1",
-                params![Self::BITMAP_MIGRATION_DONE_KEY],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        if done { return Ok(false); }
-
-        // 2. Check if there is anything to migrate (old hashes)
-        // Rows with text_hash = '' are newly captured and will be indexed by lazy indexer.
-        // We only need full migration if there are rows with EXISTING non-HMAC hashes.
-        let has_work: bool = conn
-            .query_row(
-                "SELECT 1 FROM ocr_results WHERE text_hash != '' LIMIT 1",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        
-        Ok(has_work)
-    }
-
-    /// Run full HMAC v2 migration on existing data using a cursor.
-    pub fn run_hmac_migration<F>(&self, mut progress_callback: F) -> Result<(), String>
-    where
-        F: FnMut(&str, usize, usize),
-    {
-        if self
-            .hmac_migration_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err("ALREADY_RUNNING".to_string());
-        }
-
-        // Reset cancellation flag
-        self.hmac_migration_cancel_requested.store(false, Ordering::SeqCst);
-
-        let result = self.run_hmac_migration_internal(&mut progress_callback);
-
-        self.hmac_migration_in_progress.store(false, Ordering::SeqCst);
-        result
-    }
-
-    fn run_hmac_migration_internal<F>(&self, progress_callback: &mut F) -> Result<(), String>
-    where
-        F: FnMut(&str, usize, usize),
-    {
-        tracing::info!("[HMAC_MIGRATE] Starting high-concurrency cursor migration...");
-        if !self.check_hmac_migration_status()? {
-            return Ok(());
-        }
-
-        // Use cached total count - instant
-        let total_rows = self.ocr_row_count.load(Ordering::Relaxed) as usize;
-        let hmac_key = self.credential_state.get_hmac_key()?;
-
-        // 1. Get current cursor (Read BEFORE potential clear)
-        let mut cursor: i64 = {
-            let guard = self.get_connection_named("hmac_migrate_get_cursor")?;
-            let conn = guard.as_ref().unwrap();
-            conn.query_row(
-                "SELECT value FROM app_metadata WHERE key = ?1",
-                params![Self::BITMAP_MIGRATION_CURSOR_KEY],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-        };
-
-        // 2. Clear existing index only if starting from scratch (Instant)
-        // Note: Wiping is disabled to avoid "blacking out" new snapshots indexed by the lazy indexer
-        // during long migrations. Old (non-HMAC) entries will remain but won't be hit by HMAC queries.
-        if cursor == 0 {
-            tracing::info!("[HMAC_MIGRATE] Cursor is 0, starting fresh migration.");
-        } else {
-            tracing::info!("[HMAC_MIGRATE] Resuming migration from cursor: {}", cursor);
-        }
-
-        // Use cursor as an instant estimate for 'processed'
-        let mut processed = cursor as usize;
-        progress_callback("indexing", processed, total_rows);
-
-        // 3. Migration loop with explicit lock yielding
-        const MIGRATE_BATCH_SIZE: i64 = 500;
-        loop {
-            if self.is_hmac_migration_cancel_requested() {
-                return Err("Cancelled".to_string());
-            }
-
-            // CRITICAL: Scope the MutexGuard to the smallest possible area
-            let batch_result = {
-                let guard = self.get_connection_named("hmac_migrate_batch")?;
-                let conn = guard.as_ref().unwrap();
-
-                // A. FETCH
-                let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = {
-                    let mut stmt = conn.prepare(
-                        "SELECT id, text_enc, text_key_encrypted FROM ocr_results WHERE id > ?1 ORDER BY id ASC LIMIT ?2"
-                    ).map_err(|e| e.to_string())?;
-                    
-                    let mapped = stmt.query_map(params![cursor, MIGRATE_BATCH_SIZE], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?))
-                    }).map_err(|e| e.to_string())?;
-
-                    mapped.filter_map(|r| r.ok()).collect()
-                };
-
-                if rows.is_empty() {
-                    Ok::<Option<(i64, usize)>, String>(None)
-                } else {
-                    let batch_len = rows.len();
-                    let last_id_in_batch = rows.last().unwrap().0;
-                    
-                    // B. INDEXING
-                    self.index_batch_internal_on_conn(conn, rows, &hmac_key)?;
-                    
-                    // C. UPDATE CURSOR
-                    conn.execute(
-                        "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
-                        params![Self::BITMAP_MIGRATION_CURSOR_KEY, last_id_in_batch.to_string()],
-                    ).ok();
-
-                    Ok::<Option<(i64, usize)>, String>(Some((last_id_in_batch, batch_len)))
-                }
-                // MutexGuard 'guard' is DROPPED here automatically at the end of this block.
-            }?;
-
-            match batch_result {
-                Some((new_cursor, count)) => {
-                    cursor = new_cursor;
-                    processed += count;
-                    progress_callback("indexing", processed, total_rows);
-
-                    // D. YIELD - The Mutex is now FREE. UI threads and Capture threads can jump in!
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-
-                    if processed % 10000 < MIGRATE_BATCH_SIZE as usize {
-                        tracing::info!("[HMAC_MIGRATE] Progress: {} / {} (ID: {})", processed, total_rows, cursor);
-                    }
-                }
-                None => break,
-            }
-        }
-
-        // 4. Mark as done (needs its own short-lived lock)
-        {
-            let guard = self.get_connection_named("hmac_migrate_done")?;
-            let conn = guard.as_ref().unwrap();
-            conn.execute(
-                "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, '1')",
-                params![Self::BITMAP_MIGRATION_DONE_KEY],
-            )
-            .ok();
-            conn.execute(
-                "DELETE FROM app_metadata WHERE key = ?1",
-                params![Self::BITMAP_MIGRATION_CURSOR_KEY],
-            )
-            .ok();
-        }
-
-        tracing::info!("[HMAC_MIGRATE] Migration completed successfully.");
-        Ok(())
-    }
-
-    /// Internal helper to re-index a batch using a provided connection.
-    fn index_batch_internal_on_conn(
-        &self,
-        conn: &Connection,
-        rows: Vec<(i64, Vec<u8>, Vec<u8>)>,
-        hmac_key: &[u8],
-    ) -> Result<(), String> {
-        let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
-            std::collections::HashMap::new();
-        let mut row_hashes: Vec<(i64, String)> = Vec::new();
-
-        for (ocr_id, text_enc, text_key_enc) in &rows {
-            let plaintext = match self.decrypt_payload_with_row_key(text_enc, text_key_enc) {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                },
-                Err(_) => continue,
-            };
-
-            let text_hash = Self::compute_hmac_hash(&plaintext, hmac_key);
-            row_hashes.push((*ocr_id, text_hash));
-
-            let bigrams = Self::bigram_tokenize(&plaintext);
-            for token in bigrams {
-                let token_hash = Self::compute_hmac_hash(&token, hmac_key);
-                batch_tokens
-                    .entry(token_hash)
-                    .or_insert_with(roaring::RoaringBitmap::new)
-                    .insert(*ocr_id as u32);
-            }
-        }
-
-        // Atomic update for the batch
-        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-        {
-            let mut upd_stmt = tx
-                .prepare_cached("UPDATE ocr_results SET text_hash = ?1 WHERE id = ?2")
-                .map_err(|e| e.to_string())?;
-            for (id, hash) in &row_hashes {
-                let _ = upd_stmt.execute(params![hash, id]);
-            }
-
-            let mut get_stmt = tx
-                .prepare_cached("SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1")
-                .map_err(|e| e.to_string())?;
-            let mut put_stmt = tx
-                .prepare_cached(
-                    "INSERT OR REPLACE INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
-                )
-                .map_err(|e| e.to_string())?;
-
-            for (hash, new_bitmap) in &batch_tokens {
-                let existing_blob: Option<Vec<u8>> = get_stmt
-                    .query_row(params![hash], |row| row.get(0))
-                    .optional()
-                    .unwrap_or(None);
-                let merged = if let Some(blob) = existing_blob {
-                    if let Ok(mut existing) = roaring::RoaringBitmap::deserialize_from(&blob[..]) {
-                        existing |= new_bitmap;
-                        existing
-                    } else {
-                        new_bitmap.clone()
-                    }
-                } else {
-                    new_bitmap.clone()
-                };
-
-                let mut buf = Vec::new();
-                if merged.serialize_into(&mut buf).is_ok() {
-                    let _ = put_stmt.execute(params![hash, buf]);
-                }
-            }
-        }
-        tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 }

@@ -104,7 +104,7 @@ fn probe_python_command(cmd: &str, args: &[&str]) -> Option<(String, String)> {
     Some((version, executable))
 }
 
-fn probe_python_executable(python_exe_path: &PathBuf) -> Option<String> {
+fn probe_python_executable(python_exe_path: &Path) -> Option<String> {
     let mut cmd_proc = std::process::Command::new(normalize_path_for_command(python_exe_path));
     cmd_proc.arg("-c").arg("import sys; print(sys.version.split()[0])");
     #[cfg(windows)]
@@ -145,16 +145,14 @@ fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
                         if let Ok(install_path_key) = version_key.open_subkey("InstallPath") {
                             if let Ok(install_dir) = install_path_key.get_value::<String, _>("") {
                                 let python_exe_path = PathBuf::from(install_dir).join("python.exe");
-                                if python_exe_path.is_file() {
-                                    if probe_python_executable(&python_exe_path).is_some() {
-                                        tracing::info!(
-                                            "Verified python.exe matches {} at: {:?}",
-                                            REQUIRED_PYTHON_VERSION,
-                                            python_exe_path
-                                        );
-                                        // 找到了，立即成功返回
-                                        return Ok(python_exe_path.display().to_string());
-                                    }
+                                if python_exe_path.is_file() && probe_python_executable(&python_exe_path).is_some() {
+                                    tracing::info!(
+                                        "Verified python.exe matches {} at: {:?}",
+                                        REQUIRED_PYTHON_VERSION,
+                                        python_exe_path
+                                    );
+                                    // 找到了，立即成功返回
+                                    return Ok(python_exe_path.display().to_string());
                                 }
                             }
                         }
@@ -195,8 +193,8 @@ pub fn check_python_status() -> Result<String, String> {
 
     // 尝试从注册表中查找 Python 3.12.x
     match find_python_3_12_from_registry() {
-        Ok(path) => return Ok(path),
-        Err(_e) => return Ok("".to_string()),
+        Ok(path) => Ok(path),
+        Err(_e) => Ok("".to_string()),
     }
 }
 
@@ -283,10 +281,7 @@ fn run_elevated_hidden_cmd(file: &str, args: &[String]) -> io::Result<std::proce
     }
     match cmd.status() {
         Ok(s) => Ok(s),
-        Err(e) => Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("runas failed: {}", e),
-        )),
+        Err(e) => Err(io::Error::other(format!("runas failed: {}", e))),
     }
 }
 
@@ -493,8 +488,7 @@ fn perform_install_python_venv(
                 e
             )
             .ok();
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("Failed to run '{} -m venv': {}", python_cmd, e),
             )
         })?;
@@ -631,26 +625,14 @@ fn perform_install_python_venv(
     let app_clone = app_for_threads.clone();
     let stdout_handle = thread::spawn(move || {
         let reader = BufReader::new(stdout);
-        for line_res in reader.lines() {
-            match line_res {
-                Ok(line) => {
-                    if let Ok(arc_file) = log_clone.lock() {
-                        if let Ok(mut f) = arc_file.as_ref().lock() {
-                            let _ = writeln!(&mut *f, "{}", line);
-                            let _ = f.flush();
-                        }
-                    }
-                    let _ = app_clone.emit("install-log", json!({"source":"pip","line": line}));
-                }
-                Err(e) => {
-                    if let Ok(arc_file) = log_clone.lock() {
-                        if let Ok(mut f) = arc_file.as_ref().lock() {
-                            let _ = writeln!(&mut *f, "Error reading pip stdout: {}", e);
-                            let _ = f.flush();
-                        }
-                    }
+        for line in reader.lines().flatten() {
+            if let Ok(arc_file) = log_clone.lock() {
+                if let Ok(mut f) = arc_file.as_ref().lock() {
+                    let _ = writeln!(&mut *f, "{}", line);
+                    let _ = f.flush();
                 }
             }
+            let _ = app_clone.emit("install-log", json!({"source":"pip","line": line}));
         }
     });
 

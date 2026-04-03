@@ -263,6 +263,7 @@ pub fn decrypt_from_base64_with_master_key(master_key: &[u8], encrypted_base64: 
 }
 
 /// 生成用于 SQLCipher 的数据库密钥
+#[allow(dead_code)]
 pub fn derive_db_key_from_master(master_key: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(master_key);
@@ -449,6 +450,7 @@ mod windows_impl {
     }
 
     /// 通过 Windows Hello 解锁并缓存主密钥
+    #[allow(dead_code)]
     pub async fn unlock_master_key(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
         if let Some(key) = get_cached_master_key(state) {
             return Ok(key);
@@ -524,6 +526,7 @@ pub fn ensure_master_key_created(state: &CredentialManagerState) -> Result<(), C
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub async fn ensure_master_key_ready(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
     if let Some(key) = get_cached_master_key(state) {
         return Ok(key);
@@ -559,6 +562,7 @@ pub async fn ensure_master_key_ready(state: &CredentialManagerState) -> Result<V
 }
 
 /// 检查是否需要认证
+#[allow(dead_code)]
 fn ensure_session_valid(state: &CredentialManagerState) -> Result<(), CredentialError> {
     if !state.is_session_valid() {
         return Err(CredentialError::AuthRequired);
@@ -572,6 +576,7 @@ pub fn get_cached_master_key(state: &CredentialManagerState) -> Option<Vec<u8>> 
 }
 
 /// 获取缓存的数据库密钥
+#[allow(dead_code)]
 pub fn get_cached_db_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
     state.cached_db_key.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
@@ -582,6 +587,7 @@ pub fn get_cached_public_key(state: &CredentialManagerState) -> Option<Vec<u8>> 
 }
 
 /// 获取或创建数据库密钥（同步版本，用于数据库初始化）
+#[allow(dead_code)]
 pub fn get_or_create_db_key_sync(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
     // 先检查缓存
     if let Some(key) = get_cached_db_key(state) {
@@ -605,6 +611,7 @@ pub fn get_or_create_db_key_sync(state: &CredentialManagerState) -> Result<Vec<u
 }
 
 /// 获取或创建主密钥（同步版本）
+#[allow(dead_code)]
 pub fn get_or_create_master_key_sync(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
     if let Some(key) = get_cached_master_key(state) {
         return Ok(key);

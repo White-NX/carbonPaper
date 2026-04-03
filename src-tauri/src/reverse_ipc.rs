@@ -24,6 +24,7 @@ use windows::Win32::Foundation::HANDLE;
 /// Commands that Python can send to Rust via the reverse IPC named pipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command")]
+#[allow(dead_code)]
 pub enum StorageCommand {
     /// Save a screenshot with image data, metadata, and optional OCR results.
     #[serde(rename = "save_screenshot")]
@@ -166,13 +167,13 @@ fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContex
         let mut acl_buffer = vec![0u8; acl_size];
         let p_acl = acl_buffer.as_mut_ptr() as *mut ACL;
 
-        windows::Win32::Security::InitializeAcl(p_acl, acl_size as u32, windows::Win32::Security::ACE_REVISION(ACL_REVISION.0 as u32))
+        windows::Win32::Security::InitializeAcl(p_acl, acl_size as u32, windows::Win32::Security::ACE_REVISION(ACL_REVISION.0))
             .map_err(|e| format!("InitializeAcl failed: {}", e))?;
 
         windows::Win32::Security::AddAccessAllowedAce(
             p_acl,
-            windows::Win32::Security::ACE_REVISION(ACL_REVISION.0 as u32),
-            (FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0) as u32,
+            windows::Win32::Security::ACE_REVISION(ACL_REVISION.0),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
             user_sid,
         )
         .map_err(|e| format!("AddAccessAllowedAce failed: {}", e))?;
@@ -297,7 +298,7 @@ impl ReverseIpcServer {
 
                     // 将 Raw Handle 转换为 tokio NamedPipeServer
                     let server = unsafe {
-                        match NamedPipeServer::from_raw_handle(handle.0 as *mut _) {
+                        match NamedPipeServer::from_raw_handle(handle.0) {
                             Ok(s) => s,
                             Err(e) => {
                                 tracing::error!("Failed to convert raw handle to NamedPipeServer: {}", e);
@@ -867,7 +868,7 @@ fn get_current_user_sid() -> Result<String, String> {
 }
 
 /// Generate a random 32-byte auth token and write it to the data dir.
-pub fn generate_nmh_auth_token(data_dir: &PathBuf) -> Result<String, String> {
+pub fn generate_nmh_auth_token(data_dir: &std::path::Path) -> Result<String, String> {
     let mut token_bytes = vec![0u8; 32];
     rand::thread_rng().fill_bytes(&mut token_bytes);
     let token = hex::encode(&token_bytes);
@@ -881,6 +882,7 @@ pub fn generate_nmh_auth_token(data_dir: &PathBuf) -> Result<String, String> {
 }
 
 /// Read the NMH auth token from the data dir.
+#[allow(dead_code)]
 pub fn read_nmh_auth_token(data_dir: &PathBuf) -> Result<String, String> {
     let token_path = data_dir.join("nmh_auth_token");
     std::fs::read_to_string(&token_path)
@@ -964,6 +966,7 @@ impl NmhPipeServer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.try_send(());

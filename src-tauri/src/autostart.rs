@@ -70,7 +70,7 @@ fn set_autostart_windows(enabled: bool) -> Result<bool, String> {
 pub fn get_autostart_status() -> Result<bool, String> {
     #[cfg(windows)]
     {
-        return read_run_value().map(|v| v.is_some());
+        read_run_value().map(|v| v.is_some())
     }
 
     #[cfg(not(windows))]
@@ -84,7 +84,7 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
     #[cfg(windows)]
     {
         let _ = app;
-        return set_autostart_windows(enabled);
+        set_autostart_windows(enabled)
     }
 
     #[cfg(not(windows))]

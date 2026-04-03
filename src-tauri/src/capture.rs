@@ -106,7 +106,7 @@ impl Default for ExclusionSettings {
 pub struct WgcCaptureSession {
     hwnd: isize,
     _session: GraphicsCaptureSession,
-    frame_pool: Direct3D11CaptureFramePool,
+    _frame_pool: Direct3D11CaptureFramePool,
     rx: Receiver<Direct3D11CaptureFrame>,
     d3d_device: ID3D11Device,
     d3d_context: ID3D11DeviceContext,
@@ -137,7 +137,6 @@ pub struct CaptureState {
     pub ocr_queue_max_size: AtomicU32,
     pub capture_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     pub ocr_image_cache: OcrImageCache,
-    pub focus_window: Mutex<Option<ActiveWindowInfo>>,
     pub wgc_state: Mutex<Option<WgcCaptureSession>>,
     /// Game mode: capture paused because a non-browser fullscreen app is in the foreground
     pub game_mode_capture_paused: AtomicBool,
@@ -162,7 +161,6 @@ impl CaptureState {
             ocr_queue_max_size: AtomicU32::new(1),
             capture_task: Mutex::new(None),
             ocr_image_cache: Arc::new(Mutex::new(HashMap::new())),
-            focus_window: Mutex::new(None),
             wgc_state: Mutex::new(None),
             game_mode_capture_paused: AtomicBool::new(false),
         }
@@ -780,7 +778,7 @@ fn capture_foreground_window(
             *session_guard = Some(WgcCaptureSession {
                 hwnd: hwnd_raw,
                 _session: session,
-                frame_pool,
+                _frame_pool: frame_pool,
                 rx,
                 d3d_device,
                 d3d_context,
@@ -1045,7 +1043,7 @@ fn extract_process_icon_base64(exe_path: &str) -> Option<String> {
                 biHeight: -size, // top-down
                 biPlanes: 1,
                 biBitCount: 32,
-                biCompression: BI_RGB.0 as u32,
+                biCompression: BI_RGB.0,
                 ..Default::default()
             },
             ..Default::default()

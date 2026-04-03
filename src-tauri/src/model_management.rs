@@ -1,4 +1,4 @@
-use crate::resource_utils::{file_in_local_appdata, file_in_resources, find_existing_file_in_resources, get_log_path};
+use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources, get_log_path};
 use anyhow::{anyhow, Context, Result};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::json;
@@ -170,10 +170,7 @@ fn run_aria2_and_emit_blocking(
             let _ = writeln!(&mut *f, "Failed waiting for aria2c process: {}", e);
             let _ = f.flush();
         }
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed waiting for aria2c: {}", e),
-        )
+        std::io::Error::other(format!("Failed waiting for aria2c: {}", e))
     })?;
 
     // 等待读取线程结束
@@ -205,7 +202,7 @@ async fn perform_download_hf_repo(
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut handles = Vec::with_capacity(files.len());
 
-    print!("Starting download of {} files from repo {}...\n", files.len(), repo);
+    println!("Starting download of {} files from repo {}...", files.len(), repo);
 
     // 如果 repo 字符串需要在循环中使用且原函数没有对其所有权的处理，
     // 在这里由于 build_file_url 是在 spawn 之前调用的，直接使用 &str 是安全的。

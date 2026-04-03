@@ -5,11 +5,7 @@ use tauri::{AppHandle, Manager};
 /// Strips the Windows extended-length prefix "\\\\?\\" if present.
 pub fn normalize_path_for_command(path: &std::path::Path) -> String {
     let s = path.as_os_str().to_string_lossy().to_string();
-    if s.starts_with("\\\\?\\") {
-        s[4..].to_string()
-    } else {
-        s
-    }
+    s.strip_prefix("\\\\?\\").unwrap_or(&s).to_string()
 }
 
 /// Construct a path under the app's resource directory by joining `filename` to the resource dir.
@@ -48,6 +44,7 @@ pub fn file_in_local_appdata() -> Option<PathBuf> {
 
 /// Check whether a file or directory actually exists inside the user's Local AppData\CarbonPaper directory.
 /// Returns `Some(PathBuf)` only when the file exists on disk.
+#[allow(dead_code)]
 pub fn find_existing_file_in_appdata(filename: &str) -> Option<PathBuf> {
     if let Some(appdata_dir) = file_in_local_appdata() {
         let candidate = appdata_dir.join(filename);

@@ -40,7 +40,7 @@ pub struct AnalysisOverview {
     pub storage: StorageStats,
 }
 
-struct StorageCache {
+pub struct StorageCache {
     cached_at: Instant,
     stats: StorageStats,
 }
