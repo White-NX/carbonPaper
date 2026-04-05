@@ -32,6 +32,14 @@ pub async fn storage_get_startup_vacuum_status(
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<StartupVacuumStatus, String> {
     let in_progress = state.is_startup_vacuum_in_progress();
+    if in_progress {
+        // Avoid touching the DB mutex while VACUUM holds it.
+        return Ok(StartupVacuumStatus {
+            needs_vacuum: true,
+            in_progress,
+        });
+    }
+
     let needs_vacuum = state.check_startup_vacuum_needed()?;
 
     Ok(StartupVacuumStatus {
