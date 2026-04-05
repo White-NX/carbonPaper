@@ -864,21 +864,26 @@ class ClusteringScheduler:
             now = time.time()
             elapsed = now - self._last_run
             if elapsed >= self._interval_secs:
-                self._do_run()
+                did_run = self._do_run()
+                if not did_run:
+                    # Back off to avoid busy-spin when run is skipped/failed
+                    # (e.g. model unavailable, concurrent run, exception path).
+                    self._stop_event.wait(timeout=60.0)
                 continue
 
             # Wait until the next due time (bounded to keep stop/config updates responsive).
             remaining = max(1.0, self._interval_secs - elapsed)
             self._stop_event.wait(timeout=min(60.0, remaining))
 
-    def _do_run(self):
-        """Execute one clustering run."""
+    def _do_run(self) -> bool:
+        """Execute one clustering run. Returns True only on successful completion."""
         if self._running:
-            return
+            return False
         if not TaskEmbedder.is_model_available():
             logger.debug("Skipping scheduled clustering: MiniLM model not downloaded")
-            return
+            return False
         self._running = True
+        success = False
         try:
             logger.info("Scheduled clustering run starting …")
             result = self._manager.run_clustering(auto_compress=True)
@@ -888,10 +893,12 @@ class ClusteringScheduler:
             logger.info("Scheduled clustering run complete: %s", {
                 k: v for k, v in result.items() if k != "clusters"
             })
+            success = True
         except Exception as e:
             logger.error("Scheduled clustering run failed: %s", e)
         finally:
             self._running = False
+        return success
 
     def run_now(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> Dict[str, Any]:
         """Manually trigger a clustering run (blocking)."""
