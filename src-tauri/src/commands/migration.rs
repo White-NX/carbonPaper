@@ -8,6 +8,12 @@ pub struct HmacMigrationStatus {
     pub is_running: bool,
 }
 
+#[derive(serde::Serialize)]
+pub struct StartupVacuumStatus {
+    pub needs_vacuum: bool,
+    pub in_progress: bool,
+}
+
 #[tauri::command]
 pub async fn storage_check_hmac_migration_status(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -19,6 +25,71 @@ pub async fn storage_check_hmac_migration_status(
         needs_migration,
         is_running,
     })
+}
+
+#[tauri::command]
+pub async fn storage_get_startup_vacuum_status(
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<StartupVacuumStatus, String> {
+    let in_progress = state.is_startup_vacuum_in_progress();
+    if in_progress {
+        // Avoid touching the DB mutex while VACUUM holds it.
+        return Ok(StartupVacuumStatus {
+            needs_vacuum: true,
+            in_progress,
+        });
+    }
+
+    let needs_vacuum = state.check_startup_vacuum_needed()?;
+
+    Ok(StartupVacuumStatus {
+        needs_vacuum,
+        in_progress,
+    })
+}
+
+#[tauri::command]
+pub async fn storage_run_startup_vacuum_if_needed(
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+
+    tokio::task::spawn_blocking(move || match state.run_startup_vacuum_if_needed() {
+        Ok(ran) => Ok(serde_json::json!({
+            "ran": ran,
+            "already_done": !ran,
+            "already_running": false
+        })),
+        Err(e) if e == "ALREADY_RUNNING" => Ok(serde_json::json!({
+            "ran": false,
+            "already_done": false,
+            "already_running": true
+        })),
+        Err(e) => Err(e),
+    })
+    .await
+    .map_err(|e| format!("VACUUM task panicked: {}", e))?
+}
+
+#[tauri::command]
+pub async fn storage_run_manual_vacuum(
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+
+    tokio::task::spawn_blocking(move || match state.run_manual_vacuum() {
+        Ok(()) => Ok(serde_json::json!({
+            "ok": true,
+            "already_running": false
+        })),
+        Err(e) if e == "ALREADY_RUNNING" => Ok(serde_json::json!({
+            "ok": false,
+            "already_running": true
+        })),
+        Err(e) => Err(e),
+    })
+    .await
+    .map_err(|e| format!("Manual VACUUM task panicked: {}", e))?
 }
 
 #[tauri::command]

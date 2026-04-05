@@ -23,6 +23,7 @@ import TopBar from './components/TopBar';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
 import ErrorWindow from './components/ErrorWindow';
 import HmacMigrationDialog from './components/HmacMigrationDialog';
+import StartupVacuumDialog from './components/StartupVacuumDialog';
 import { getScreenshotDetails, fetchImage, deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 import { runClustering, saveClusteringResults } from './lib/task_api';
 import { checkForUpdate } from './lib/update_api';
@@ -952,6 +953,8 @@ function App() {
           onRestart={() => invoke('restart_app').catch(() => { })}
           onExit={() => invoke('exit_app').catch(() => { })}
         />
+
+        <StartupVacuumDialog />
 
         {isAuthenticated && <HmacMigrationDialog />}
 

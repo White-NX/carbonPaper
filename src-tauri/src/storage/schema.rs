@@ -3,7 +3,7 @@
 use crate::credential_manager::{
     derive_db_key_from_public_key, get_cached_public_key, load_public_key_from_file,
 };
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::sync::atomic::Ordering;
 
 use super::StorageState;
@@ -55,6 +55,7 @@ impl StorageState {
         // Initialize table schema
         let t3 = std::time::Instant::now();
         self.init_tables(&conn)?;
+        Self::set_auto_vacuum_incremental(&conn)?;
         let tables_dur = t3.elapsed();
 
         *self.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn);
@@ -205,6 +206,127 @@ impl StorageState {
         self.ensure_schema(conn)?;
 
         Ok(())
+    }
+
+    const AUTO_VACUUM_SENTINEL_PREFIX: &'static str = "auto_vacuum_incremental_done_v";
+
+    fn startup_vacuum_sentinel_key() -> String {
+        format!(
+            "{}{}",
+            Self::AUTO_VACUUM_SENTINEL_PREFIX,
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+
+    fn set_auto_vacuum_incremental(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")
+            .map_err(|e| format!("Failed to set PRAGMA auto_vacuum=INCREMENTAL: {}", e))
+    }
+
+    fn is_startup_vacuum_pending(conn: &Connection) -> bool {
+        let sentinel_key = Self::startup_vacuum_sentinel_key();
+        let done: bool = conn
+            .query_row(
+                "SELECT 1 FROM app_metadata WHERE key = ?1",
+                params![sentinel_key],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        !done
+    }
+
+    pub fn check_startup_vacuum_needed(&self) -> Result<bool, String> {
+        let guard = self.get_connection_named("startup_vacuum_check")?;
+        let conn = guard.as_ref().unwrap();
+        Self::set_auto_vacuum_incremental(conn)?;
+        Ok(Self::is_startup_vacuum_pending(conn))
+    }
+
+    /// Run the versioned one-time full VACUUM if needed.
+    pub fn run_startup_vacuum_if_needed(&self) -> Result<bool, String> {
+        if self
+            .startup_vacuum_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("ALREADY_RUNNING".to_string());
+        }
+
+        let result = (|| {
+            let guard = self.get_connection_named("startup_vacuum_run")?;
+            let conn = guard.as_ref().unwrap();
+            Self::set_auto_vacuum_incremental(conn)?;
+
+            if !Self::is_startup_vacuum_pending(conn) {
+                return Ok(false);
+            }
+
+            let version = env!("CARGO_PKG_VERSION");
+            let sentinel_key = Self::startup_vacuum_sentinel_key();
+
+            tracing::info!(
+                "[DB] First startup for version {}, running full VACUUM for incremental auto_vacuum",
+                version
+            );
+            conn.execute_batch("VACUUM;").map_err(|e| {
+                format!(
+                    "Failed to run full VACUUM for incremental auto_vacuum: {}",
+                    e
+                )
+            })?;
+
+            conn.execute(
+                "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, ?2)",
+                params![sentinel_key, version],
+            )
+            .map_err(|e| format!("Failed to write auto_vacuum sentinel: {}", e))?;
+
+            Ok(true)
+        })();
+
+        self.startup_vacuum_in_progress
+            .store(false, Ordering::SeqCst);
+
+        result
+    }
+
+    /// Run full VACUUM manually from UI.
+    ///
+    /// Also writes current-version sentinel so next startup does not re-run
+    /// the one-time startup VACUUM.
+    pub fn run_manual_vacuum(&self) -> Result<(), String> {
+        if self
+            .startup_vacuum_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("ALREADY_RUNNING".to_string());
+        }
+
+        let result = (|| {
+            let guard = self.get_connection_named("manual_vacuum_run")?;
+            let conn = guard.as_ref().unwrap();
+            Self::set_auto_vacuum_incremental(conn)?;
+
+            tracing::info!("[DB] Manual VACUUM started from settings");
+            conn.execute_batch("VACUUM;")
+                .map_err(|e| format!("Failed to run manual VACUUM: {}", e))?;
+
+            let version = env!("CARGO_PKG_VERSION");
+            let sentinel_key = Self::startup_vacuum_sentinel_key();
+            conn.execute(
+                "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
+                params![sentinel_key, version],
+            )
+            .map_err(|e| format!("Failed to update auto_vacuum sentinel after manual VACUUM: {}", e))?;
+
+            Ok(())
+        })();
+
+        self.startup_vacuum_in_progress
+            .store(false, Ordering::SeqCst);
+
+        result
     }
 
     /// Ensure backward compatibility by adding missing columns to existing tables.

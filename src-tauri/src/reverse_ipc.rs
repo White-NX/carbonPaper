@@ -276,12 +276,13 @@ impl ReverseIpcServer {
                         }
                     };
 
-                    // 应用安全描述符和 PIPE_REJECT_REMOTE_CLIENTS
+                    // 应用安全描述符和 PIPE_REJECT_REMOTE_CLIENTS。
+                    // Use byte-mode pipes for robust streaming of large JSON payloads.
                     let handle = unsafe {
                         windows::Win32::System::Pipes::CreateNamedPipeW(
                             windows::core::PCWSTR(wide_pipe_name.as_ptr()),
                             PIPE_ACCESS_DUPLEX | windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED,
-                            windows::Win32::System::Pipes::PIPE_TYPE_MESSAGE | windows::Win32::System::Pipes::PIPE_READMODE_MESSAGE | windows::Win32::System::Pipes::PIPE_WAIT | windows::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS,
+                            windows::Win32::System::Pipes::PIPE_TYPE_BYTE | windows::Win32::System::Pipes::PIPE_READMODE_BYTE | windows::Win32::System::Pipes::PIPE_WAIT | windows::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS,
                             windows::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES,
                             1024 * 1024,
                             1024 * 1024,
@@ -402,10 +403,11 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
         }
     }
 
-    // 读取请求 - 使用循环读取直到管道关闭或超时
-    // 因为图片 Base64 数据可能很大（数 MB），单次 read 可能无法读取完整数据
+    // 读取请求 - 使用循环读取直到 JSON 完整或超时
+    // 因为图片 Base64 数据可能很大（数 MB），且数据可能分片到达
     let mut buf = Vec::with_capacity(4 * 1024 * 1024); // 预分配 4MB
     let mut temp_buf = vec![0u8; 64 * 1024]; // 64KB 临时缓冲区
+    let mut read_end_reason: Option<String> = None;
     
     // 设置读取超时
     let read_timeout = tokio::time::Duration::from_secs(30);
@@ -414,6 +416,7 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
     loop {
         if start_time.elapsed() > read_timeout {
             tracing::warn!("Read timeout after {} bytes", buf.len());
+            read_end_reason = Some(String::from("overall_timeout"));
             break;
         }
         
@@ -423,25 +426,11 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
         ).await {
             Ok(Ok(0)) => {
                 // 连接已关闭，数据读取完成
+                read_end_reason = Some(String::from("peer_closed"));
                 break;
             }
             Ok(Ok(n)) => {
                 buf.extend_from_slice(&temp_buf[..n]);
-                // 如果读取的数据小于缓冲区，可能已经读完
-                if n < temp_buf.len() {
-                    // 再等一小会看看是否还有数据
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_millis(100),
-                        server.read(&mut temp_buf)
-                    ).await {
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(more)) => {
-                            buf.extend_from_slice(&temp_buf[..more]);
-                        }
-                        _ => break,
-                    }
-                }
                 // 限制最大数据量为 16MB
                 if buf.len() > 16 * 1024 * 1024 {
                     tracing::error!("Request too large: {} bytes", buf.len());
@@ -450,18 +439,31 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
                     let _ = server.write_all(&response_bytes).await;
                     return;
                 }
+
+                // 仅在 JSON 已完整时结束读取，避免分片导致的截断解析
+                if serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                    read_end_reason = Some(String::from("json_complete"));
+                    break;
+                }
             }
             Ok(Err(e)) => {
                 // 检查是否是 "管道已结束" 错误（正常情况，客户端已发送完数据）
                 let is_pipe_ended = e.raw_os_error() == Some(109); // ERROR_BROKEN_PIPE
                 if !is_pipe_ended {
                     tracing::error!("Read error: {}", e);
+                    read_end_reason = Some(format!("read_error:{}", e));
+                } else {
+                    read_end_reason = Some(String::from("broken_pipe_109"));
                 }
                 break;
             }
             Err(_) => {
-                // 超时，可能数据已读取完成
-                break;
+                // 单次 read 超时：若已有完整 JSON 则继续处理，否则继续等到全局超时
+                if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                    read_end_reason = Some(String::from("single_read_timeout_but_json_complete"));
+                    break;
+                }
+                continue;
             }
         }
     }
@@ -470,12 +472,15 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
         return;
     }
     
-    let request_str = String::from_utf8_lossy(&buf);
-    
     // 解析请求
-    let response = match serde_json::from_str::<serde_json::Value>(&request_str) {
+    let response = match serde_json::from_slice::<serde_json::Value>(&buf) {
         Ok(req) => process_request(&req, &storage, &ocr_cache),
-        Err(e) => StorageResponse::error(&format!("Invalid JSON: {}", e)),
+        Err(e) => StorageResponse::error(&format!(
+            "Invalid JSON: {} (bytes={}, reason={})",
+            e,
+            buf.len(),
+            read_end_reason.as_deref().unwrap_or("unknown")
+        )),
     };
     
     // 发送响应
@@ -993,10 +998,12 @@ async fn handle_nmh_client(
     let mut temp_buf = vec![0u8; 64 * 1024];
     let read_timeout = tokio::time::Duration::from_secs(30);
     let start_time = tokio::time::Instant::now();
+    let mut read_end_reason: Option<String> = None;
 
     loop {
         if start_time.elapsed() > read_timeout {
             tracing::warn!("NMH read timeout after {} bytes", buf.len());
+            read_end_reason = Some(String::from("overall_timeout"));
             break;
         }
 
@@ -1004,34 +1011,40 @@ async fn handle_nmh_client(
             tokio::time::Duration::from_millis(500),
             server.read(&mut temp_buf)
         ).await {
-            Ok(Ok(0)) => break,
+            Ok(Ok(0)) => {
+                read_end_reason = Some(String::from("peer_closed"));
+                break;
+            }
             Ok(Ok(n)) => {
                 buf.extend_from_slice(&temp_buf[..n]);
-                if n < temp_buf.len() {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_millis(100),
-                        server.read(&mut temp_buf)
-                    ).await {
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(more)) => buf.extend_from_slice(&temp_buf[..more]),
-                        _ => break,
-                    }
-                }
                 if buf.len() > 16 * 1024 * 1024 {
                     let response = StorageResponse::error("Request too large (max 16MB)");
                     let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
                     let _ = server.write_all(&response_bytes).await;
                     return;
                 }
+
+                if serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                    read_end_reason = Some(String::from("json_complete"));
+                    break;
+                }
             }
             Ok(Err(e)) => {
                 if e.raw_os_error() != Some(109) {
                     tracing::error!("NMH read error: {}", e);
+                    read_end_reason = Some(format!("read_error:{}", e));
+                } else {
+                    read_end_reason = Some(String::from("broken_pipe_109"));
                 }
                 break;
             }
-            Err(_) => break,
+            Err(_) => {
+                if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                    read_end_reason = Some(String::from("single_read_timeout_but_json_complete"));
+                    break;
+                }
+                continue;
+            }
         }
     }
 
@@ -1039,9 +1052,7 @@ async fn handle_nmh_client(
         return;
     }
 
-    let request_str = String::from_utf8_lossy(&buf);
-
-    let response = match serde_json::from_str::<serde_json::Value>(&request_str) {
+    let response = match serde_json::from_slice::<serde_json::Value>(&buf) {
         Ok(req) => {
             // Validate auth token
             let provided_token = req.get("auth_token").and_then(|t| t.as_str()).unwrap_or("");
@@ -1052,7 +1063,12 @@ async fn handle_nmh_client(
                 process_nmh_request(&req, storage.clone(), capture_state.clone(), app_handle.clone()).await
             }
         }
-        Err(e) => StorageResponse::error(&format!("Invalid JSON: {}", e)),
+        Err(e) => StorageResponse::error(&format!(
+            "Invalid JSON: {} (bytes={}, reason={})",
+            e,
+            buf.len(),
+            read_end_reason.as_deref().unwrap_or("unknown")
+        )),
     };
 
     let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
