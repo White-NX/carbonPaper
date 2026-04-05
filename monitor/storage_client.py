@@ -295,6 +295,14 @@ class StorageClient:
             'limit': limit,
         })
 
+    def is_session_valid(self) -> bool:
+        """Check whether the Rust credential session is currently unlocked."""
+        response = self._send_request({'command': 'get_auth_status'})
+        if response.get('status') == 'success':
+            data = response.get('data', {})
+            return bool(data.get('session_valid', False))
+        return False
+
     def screenshot_exists(self, image_hash: str) -> bool:
         """
         Check whether a screenshot already exists.

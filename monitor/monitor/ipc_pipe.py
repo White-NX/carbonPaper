@@ -108,6 +108,7 @@ class _NamedPipeServer(threading.Thread):
     def _client_handler(self, handle):
         """Handle a single client connection"""
         import pywintypes
+        handler_started = _time.perf_counter()
         try:
             # 1. Security Verification
             client_pid = win32pipe.GetNamedPipeClientProcessId(handle)
@@ -153,9 +154,32 @@ class _NamedPipeServer(threading.Thread):
                 win32file.FlushFileBuffers(handle)
                 return
 
+            command = req.get('command')
+            is_process_ocr = command == 'process_ocr'
+            if is_process_ocr:
+                logger.debug(
+                    '[DIAG:PIPE] request received command=%s bytes=%s from_pid=%s',
+                    command,
+                    len(payload),
+                    client_pid,
+                )
+
             # 3. Execute Command
-            # logger.info(f"Executing IPC command: {req.get('command')}")
+            exec_started = _time.perf_counter()
             result = self.handler(req)
+            handler_elapsed = _time.perf_counter() - exec_started
+            if handler_elapsed >= 3.0:
+                logger.warning(
+                    '[DIAG:PIPE] slow handler command=%s exec=%.3fs',
+                    command,
+                    handler_elapsed,
+                )
+            elif is_process_ocr:
+                logger.debug(
+                    '[DIAG:PIPE] handler finished command=%s in %.3fs',
+                    command,
+                    handler_elapsed,
+                )
 
             # 4. Write Response
             def json_serial(obj):
@@ -163,9 +187,18 @@ class _NamedPipeServer(threading.Thread):
                     return obj.isoformat()
                 raise TypeError(f"Type {type(obj)} not serializable")
 
+            write_started = _time.perf_counter()
             resp_str = json.dumps(result, default=json_serial)
             win32file.WriteFile(handle, resp_str.encode('utf-8'))
             win32file.FlushFileBuffers(handle)
+            if is_process_ocr:
+                logger.debug(
+                    '[DIAG:PIPE] response sent command=%s write=%.3fs total=%.3fs resp_bytes=%s',
+                    command,
+                    _time.perf_counter() - write_started,
+                    _time.perf_counter() - handler_started,
+                    len(resp_str),
+                )
 
         except Exception as e:
             logger.error(f"Error handling IPC client: {e}", exc_info=True)

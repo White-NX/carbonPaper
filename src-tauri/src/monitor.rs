@@ -180,6 +180,23 @@ pub async fn send_ipc_request(
     seq_no: u64,
     mut req: Value,
 ) -> Result<Value, String> {
+    let command_name = req
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>")
+        .to_string();
+    let is_process_ocr = command_name == "process_ocr";
+    let ipc_started = std::time::Instant::now();
+
+    if is_process_ocr {
+        tracing::debug!(
+            "[DIAG:IPC] start command={} seq_no={} pipe={}",
+            command_name,
+            seq_no,
+            pipe_name
+        );
+    }
+
     // 在请求中添加认证信息
     if let Some(obj) = req.as_object_mut() {
         obj.insert(
@@ -189,23 +206,98 @@ pub async fn send_ipc_request(
         obj.insert("_seq_no".to_string(), Value::Number(seq_no.into()));
     }
 
-    let mut client = connect_to_pipe(pipe_name).await?;
+    let mut client = match connect_to_pipe(pipe_name).await {
+        Ok(client) => {
+            if is_process_ocr {
+                tracing::debug!(
+                    "[DIAG:IPC] connected command={} seq_no={} elapsed={}ms",
+                    command_name,
+                    seq_no,
+                    ipc_started.elapsed().as_millis()
+                );
+            }
+            client
+        }
+        Err(e) => {
+            if is_process_ocr {
+                tracing::error!(
+                    "[DIAG:IPC] connect failed command={} seq_no={} elapsed={}ms error={}",
+                    command_name,
+                    seq_no,
+                    ipc_started.elapsed().as_millis(),
+                    e
+                );
+            }
+            return Err(e);
+        }
+    };
 
     let req_bytes = req.to_string().into_bytes();
     if let Err(e) = client.write_all(&req_bytes).await {
+        if is_process_ocr {
+            tracing::error!(
+                "[DIAG:IPC] write failed command={} seq_no={} elapsed={}ms error={}",
+                command_name,
+                seq_no,
+                ipc_started.elapsed().as_millis(),
+                e
+            );
+        }
         return Err(format!("Write error: {}", e));
+    }
+
+    if is_process_ocr {
+        tracing::debug!(
+            "[DIAG:IPC] write done command={} seq_no={} request_bytes={} elapsed={}ms",
+            command_name,
+            seq_no,
+            req_bytes.len(),
+            ipc_started.elapsed().as_millis()
+        );
     }
 
     let mut buf = Vec::new();
     match client.read_to_end(&mut buf).await {
         Ok(_) => {
+            if is_process_ocr {
+                let elapsed_ms = ipc_started.elapsed().as_millis();
+                tracing::debug!(
+                    "[DIAG:IPC] read done command={} seq_no={} response_bytes={} elapsed={}ms",
+                    command_name,
+                    seq_no,
+                    buf.len(),
+                    elapsed_ms
+                );
+            }
             let resp_str = String::from_utf8_lossy(&buf);
             match serde_json::from_str::<Value>(&resp_str) {
                 Ok(v) => Ok(v),
-                Err(e) => Err(format!("Invalid JSON response: {}. Data: {}", e, resp_str)),
+                Err(e) => {
+                    if is_process_ocr {
+                        tracing::error!(
+                            "[DIAG:IPC] invalid json command={} seq_no={} elapsed={}ms error={}",
+                            command_name,
+                            seq_no,
+                            ipc_started.elapsed().as_millis(),
+                            e
+                        );
+                    }
+                    Err(format!("Invalid JSON response: {}. Data: {}", e, resp_str))
+                }
             }
         }
-        Err(e) => Err(format!("Read error: {}", e)),
+        Err(e) => {
+            if is_process_ocr {
+                tracing::error!(
+                    "[DIAG:IPC] read failed command={} seq_no={} elapsed={}ms error={}",
+                    command_name,
+                    seq_no,
+                    ipc_started.elapsed().as_millis(),
+                    e
+                );
+            }
+            Err(format!("Read error: {}", e))
+        }
     }
 }
 
