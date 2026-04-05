@@ -564,6 +564,12 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                 "error_count": error_count
             }))
         }
+
+        "get_auth_status" => {
+            StorageResponse::success(serde_json::json!({
+                "session_valid": storage.is_session_valid()
+            }))
+        }
         
         "screenshot_exists" => {
             let image_hash = req.get("image_hash").and_then(|h| h.as_str()).unwrap_or("");

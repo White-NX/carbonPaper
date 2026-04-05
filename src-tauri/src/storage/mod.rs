@@ -154,4 +154,9 @@ impl StorageState {
         }
         Ok(guard)
     }
+
+    /// Returns whether the current credential session is unlocked/valid.
+    pub fn is_session_valid(&self) -> bool {
+        self.credential_state.is_session_valid()
+    }
 }

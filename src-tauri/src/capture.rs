@@ -1451,9 +1451,19 @@ async fn process_ocr_async(
     process_name: String,
     timestamp_ms: i64,
 ) {
-    capture_state
+    const OCR_ASYNC_WARN_MS: u128 = 60_000;
+    let in_flight_after_inc = capture_state
         .in_flight_ocr_count
-        .fetch_add(1, Ordering::SeqCst);
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+
+    let task_started = std::time::Instant::now();
+    tracing::debug!(
+        "[DIAG:CAPTURE] process_ocr_async start screenshot_id={} in_flight={} process={}",
+        screenshot_id,
+        in_flight_after_inc,
+        process_name
+    );
 
     // Store JPEG bytes in in-memory cache so Python can fetch via get_temp_image
     // without triggering CNG decryption (Windows Hello PIN).
@@ -1498,9 +1508,27 @@ async fn process_ocr_async(
         }
     }
 
-    capture_state
+    let in_flight_after_dec = capture_state
         .in_flight_ocr_count
-        .fetch_sub(1, Ordering::SeqCst);
+        .fetch_sub(1, Ordering::SeqCst)
+        .saturating_sub(1);
+
+    let total_ms = task_started.elapsed().as_millis();
+    if total_ms >= OCR_ASYNC_WARN_MS {
+        tracing::warn!(
+            "[DIAG:CAPTURE] process_ocr_async slow screenshot_id={} total={}ms in_flight_after={}",
+            screenshot_id,
+            total_ms,
+            in_flight_after_dec
+        );
+    } else {
+        tracing::debug!(
+            "[DIAG:CAPTURE] process_ocr_async end screenshot_id={} total={}ms in_flight_after={}",
+            screenshot_id,
+            total_ms,
+            in_flight_after_dec
+        );
+    }
 }
 
 async fn process_ocr_inner(
@@ -1513,6 +1541,11 @@ async fn process_ocr_inner(
     process_name: &str,
     timestamp_ms: i64,
 ) -> Result<(), String> {
+    const OCR_IPC_ROUNDTRIP_WARN_MS: u128 = 60_000;
+    const COMMIT_SLOW_WARN_MS: u128 = 2_000;
+
+    let cmd_started = std::time::Instant::now();
+
     // Get pipe info for sending to Python
     let pipe_name = {
         let guard = monitor_state
@@ -1542,7 +1575,34 @@ async fn process_ocr_inner(
         (token, seq)
     };
 
+    tracing::debug!(
+        "[DIAG:CAPTURE] process_ocr IPC send screenshot_id={} seq_no={} pipe={}",
+        screenshot_id,
+        seq_no,
+        pipe_name
+    );
+
+    let ipc_started = std::time::Instant::now();
     let response = crate::monitor::send_ipc_request(&pipe_name, &auth_token, seq_no, req).await?;
+
+    let ipc_ms = ipc_started.elapsed().as_millis();
+    // NOTE: This is IPC roundtrip time and includes Python OCR inference + post-processing.
+    // Use a high threshold to avoid mislabeling normal OCR cost as transport slowness.
+    if ipc_ms >= OCR_IPC_ROUNDTRIP_WARN_MS {
+        tracing::warn!(
+            "[DIAG:CAPTURE] process_ocr IPC roundtrip very slow screenshot_id={} seq_no={} elapsed={}ms",
+            screenshot_id,
+            seq_no,
+            ipc_ms
+        );
+    } else {
+        tracing::debug!(
+            "[DIAG:CAPTURE] process_ocr IPC recv screenshot_id={} seq_no={} elapsed={}ms",
+            screenshot_id,
+            seq_no,
+            ipc_ms
+        );
+    }
 
     // Check response
     if let Some(error) = response.get("error").and_then(|v| v.as_str()) {
@@ -1562,12 +1622,38 @@ async fn process_ocr_inner(
     let category_confidence = response.get("category_confidence").and_then(|v| v.as_f64());
 
     // Commit screenshot with OCR results and category
+    let commit_started = std::time::Instant::now();
+    tracing::debug!(
+        "[DIAG:CAPTURE] commit_screenshot start screenshot_id={} ocr_results={} category={}",
+        screenshot_id,
+        ocr_results.as_ref().map(|r| r.len()).unwrap_or(0),
+        category.as_deref().unwrap_or("")
+    );
+
     storage.commit_screenshot(
         screenshot_id,
         ocr_results.as_ref(),
         category.as_deref(),
         category_confidence,
     )?;
+
+    let commit_ms = commit_started.elapsed().as_millis();
+    let total_ms = cmd_started.elapsed().as_millis();
+    if commit_ms >= COMMIT_SLOW_WARN_MS {
+        tracing::warn!(
+            "[DIAG:CAPTURE] commit_screenshot slow screenshot_id={} commit={}ms total={}ms",
+            screenshot_id,
+            commit_ms,
+            total_ms
+        );
+    } else {
+        tracing::debug!(
+            "[DIAG:CAPTURE] commit_screenshot done screenshot_id={} commit={}ms total={}ms",
+            screenshot_id,
+            commit_ms,
+            total_ms
+        );
+    }
 
     tracing::debug!(
         "Screenshot {} committed with {} OCR results",

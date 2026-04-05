@@ -311,7 +311,9 @@ class HotColdManager:
         self._storage_client = storage_client
         self._embedder = TaskEmbedder()
         self._engine = ClusteringEngine()
-        self._lock = threading.Lock()
+        # run_clustering calls helpers/properties that also acquire this lock.
+        # Use RLock to avoid self-deadlock on nested acquisitions.
+        self._lock = threading.RLock()
 
         logger.info("[task_clustering] HotColdManager ready (lazy loading collections)")
 
@@ -857,23 +859,31 @@ class ClusteringScheduler:
         logger.info("Clustering scheduler stopped")
 
     def _loop(self):
-        """Scheduler loop — check every 60s whether it's time to re-run."""
+        """Scheduler loop — run when due based on (last_run + interval)."""
         while not self._stop_event.is_set():
             now = time.time()
             elapsed = now - self._last_run
             if elapsed >= self._interval_secs:
-                self._do_run()
-            # Sleep in small increments so stop is responsive
-            self._stop_event.wait(timeout=60)
+                did_run = self._do_run()
+                if not did_run:
+                    # Back off to avoid busy-spin when run is skipped/failed
+                    # (e.g. model unavailable, concurrent run, exception path).
+                    self._stop_event.wait(timeout=60.0)
+                continue
 
-    def _do_run(self):
-        """Execute one clustering run."""
+            # Wait until the next due time (bounded to keep stop/config updates responsive).
+            remaining = max(1.0, self._interval_secs - elapsed)
+            self._stop_event.wait(timeout=min(60.0, remaining))
+
+    def _do_run(self) -> bool:
+        """Execute one clustering run. Returns True only on successful completion."""
         if self._running:
-            return
+            return False
         if not TaskEmbedder.is_model_available():
             logger.debug("Skipping scheduled clustering: MiniLM model not downloaded")
-            return
+            return False
         self._running = True
+        success = False
         try:
             logger.info("Scheduled clustering run starting …")
             result = self._manager.run_clustering(auto_compress=True)
@@ -883,10 +893,12 @@ class ClusteringScheduler:
             logger.info("Scheduled clustering run complete: %s", {
                 k: v for k, v in result.items() if k != "clusters"
             })
+            success = True
         except Exception as e:
             logger.error("Scheduled clustering run failed: %s", e)
         finally:
             self._running = False
+        return success
 
     def run_now(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> Dict[str, Any]:
         """Manually trigger a clustering run (blocking)."""

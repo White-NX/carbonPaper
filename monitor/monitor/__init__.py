@@ -19,20 +19,110 @@ import uuid
 import base64
 import json
 import logging
+import time
+import threading
 
 logger = logging.getLogger(__name__)
+
+PROCESS_OCR_SLOW_STAGE_SECS = 3.0
+PROCESS_OCR_SLOW_TOTAL_SECS = 20.0
+CLUSTERING_AUTH_POLL_INTERVAL_SECS = 2.0
 
 _server = None
 _ocr_worker = None          # OCRService instance
 _classifier = None           # ClassificationService instance
 _clustering_manager = None   # HotColdManager instance
 _clustering_scheduler = None # ClusteringScheduler instance
+_clustering_scheduler_active = False  # whether scheduler thread is currently active
+_last_clustering_auth_check = 0.0
+_last_clustering_session_valid = False
+_clustering_auth_monitor_thread = None
+_clustering_auth_gate_lock = threading.Lock()
 _auth_token = None           # Auth token for IPC validation
 _last_seq_no = -1            # Last processed sequence number
 _storage_pipe = None         # Storage service pipe name
 
 # Cache for dynamically extracted icons by process name
 _dynamic_icon_cache = {}
+
+
+def _is_storage_session_valid(force: bool = False) -> bool:
+    """Return whether Rust credential session is unlocked (cached for a short period)."""
+    global _last_clustering_auth_check, _last_clustering_session_valid
+
+    if _storage_pipe is None:
+        # No storage IPC configured: treat as available to avoid disabling clustering.
+        return True
+
+    now = time.perf_counter()
+    if (not force) and (now - _last_clustering_auth_check < CLUSTERING_AUTH_POLL_INTERVAL_SECS):
+        return _last_clustering_session_valid
+
+    _last_clustering_auth_check = now
+    try:
+        from storage_client import get_storage_client
+        sc = get_storage_client()
+        if not sc:
+            _last_clustering_session_valid = False
+            return False
+        _last_clustering_session_valid = bool(sc.is_session_valid())
+        return _last_clustering_session_valid
+    except Exception as exc:
+        logger.debug('Failed to query storage auth status: %s', exc)
+        _last_clustering_session_valid = False
+        return False
+
+
+def _sync_clustering_scheduler_auth_gate(force: bool = False) -> bool:
+    """Start/stop clustering scheduler based on current auth unlock state."""
+    global _clustering_scheduler_active
+
+    if not _clustering_scheduler:
+        return False
+
+    with _clustering_auth_gate_lock:
+        session_valid = _is_storage_session_valid(force=force)
+
+        if session_valid and not _clustering_scheduler_active:
+            try:
+                _clustering_scheduler.start()
+                _clustering_scheduler_active = True
+                logger.info('Task clustering scheduler enabled (session unlocked)')
+            except Exception as exc:
+                logger.warning('Failed to start clustering scheduler: %s', exc)
+                _clustering_scheduler_active = False
+        elif (not session_valid) and _clustering_scheduler_active:
+            try:
+                _clustering_scheduler.stop()
+            except Exception as exc:
+                logger.warning('Failed to stop clustering scheduler: %s', exc)
+            _clustering_scheduler_active = False
+            logger.info('Task clustering scheduler disabled (session locked)')
+
+    return session_valid
+
+
+def _start_clustering_auth_monitor():
+    """Start background auth monitor so OCR hot path does not perform IPC checks."""
+    global _clustering_auth_monitor_thread
+
+    if _clustering_auth_monitor_thread and _clustering_auth_monitor_thread.is_alive():
+        return
+
+    def _worker():
+        while not stop_event.is_set():
+            try:
+                _sync_clustering_scheduler_auth_gate(force=True)
+            except Exception as exc:
+                logger.debug('Clustering auth monitor tick failed: %s', exc)
+            stop_event.wait(timeout=CLUSTERING_AUTH_POLL_INTERVAL_SECS)
+
+    _clustering_auth_monitor_thread = threading.Thread(
+        target=_worker,
+        name='clustering-auth-monitor',
+        daemon=True,
+    )
+    _clustering_auth_monitor_thread.start()
 
 
 def _delete_vectors_by_hashes(image_hashes):
@@ -151,10 +241,13 @@ def _handle_command_impl(req: dict):
         return {'status': 'stopped'}
 
     if cmd == 'status':
+        clustering_unlocked = _sync_clustering_scheduler_auth_gate(force=False)
         status = {
             'paused': paused_event.is_set(),
             'stopped': stop_event.is_set(),
             'interval': INTERVAL,
+            'clustering_auth_unlocked': clustering_unlocked,
+            'clustering_scheduler_active': _clustering_scheduler_active,
         }
         if _ocr_worker:
             status['ocr_stats'] = _ocr_worker.get_stats()
@@ -257,14 +350,24 @@ def _handle_command_impl(req: dict):
         if not _ocr_worker:
             return {'error': 'OCR service not initialised'}
 
+        cmd_started = time.perf_counter()
+        logger.debug(
+            '[DIAG:process_ocr] start screenshot_id=%s image_hash=%s process=%s',
+            screenshot_id,
+            req.get('image_hash', ''),
+            req.get('process_name', ''),
+        )
+
         try:
             from PIL import Image
             import io as _io
             from storage_client import get_storage_client
 
             # Fetch decrypted image from Rust via reverse IPC
+            t_fetch = time.perf_counter()
             sc = get_storage_client()
             if not sc:
+                logger.error('[DIAG:process_ocr] screenshot_id=%s storage client unavailable', screenshot_id)
                 return {'error': 'Storage client not available'}
 
             resp = sc._send_request({
@@ -273,18 +376,69 @@ def _handle_command_impl(req: dict):
             })
 
             if resp.get('status') != 'success':
+                logger.error(
+                    '[DIAG:process_ocr] screenshot_id=%s get_temp_image failed in %.3fs: %s',
+                    screenshot_id,
+                    time.perf_counter() - t_fetch,
+                    resp.get('error', 'unknown'),
+                )
                 return {'error': f"Failed to fetch image: {resp.get('error', 'unknown')}"}
 
             image_data_b64 = resp.get('data', {}).get('image_data')
             if not image_data_b64:
+                logger.error(
+                    '[DIAG:process_ocr] screenshot_id=%s get_temp_image returned empty payload in %.3fs',
+                    screenshot_id,
+                    time.perf_counter() - t_fetch,
+                )
                 return {'error': 'No image data returned from storage'}
 
+            fetch_elapsed = time.perf_counter() - t_fetch
+            logger.debug(
+                '[DIAG:process_ocr] screenshot_id=%s temp image fetched in %.3fs payload_b64_len=%s',
+                screenshot_id,
+                fetch_elapsed,
+                len(image_data_b64),
+            )
+            if fetch_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
+                logger.warning(
+                    '[DIAG:process_ocr] screenshot_id=%s slow get_temp_image fetch=%.3fs',
+                    screenshot_id,
+                    fetch_elapsed,
+                )
+
+            t_decode = time.perf_counter()
             image_bytes = base64.b64decode(image_data_b64)
             image_pil = Image.open(_io.BytesIO(image_bytes))
+            decode_elapsed = time.perf_counter() - t_decode
+            logger.debug(
+                '[DIAG:process_ocr] screenshot_id=%s image decoded in %.3fs bytes=%s mode=%s size=%s',
+                screenshot_id,
+                decode_elapsed,
+                len(image_bytes),
+                getattr(image_pil, 'mode', ''),
+                getattr(image_pil, 'size', ''),
+            )
 
             # Run OCR
+            t_ocr = time.perf_counter()
             ocr_results = _ocr_worker.ocr_engine.recognize(image_pil)
             filtered = [r for r in ocr_results if r.get('confidence', 0) >= 0.5]
+            ocr_elapsed = time.perf_counter() - t_ocr
+            logger.debug(
+                '[DIAG:process_ocr] screenshot_id=%s ocr finished in %.3fs raw_blocks=%s filtered_blocks=%s',
+                screenshot_id,
+                ocr_elapsed,
+                len(ocr_results),
+                len(filtered),
+            )
+            if ocr_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
+                logger.warning(
+                    '[DIAG:process_ocr] screenshot_id=%s slow ocr=%.3fs raw_blocks=%s',
+                    screenshot_id,
+                    ocr_elapsed,
+                    len(ocr_results),
+                )
 
             # Update stats
             _ocr_worker.stats['processed_count'] += 1
@@ -296,6 +450,7 @@ def _handle_command_impl(req: dict):
             if _ocr_worker.enable_vector_store and _ocr_worker.vector_store:
                 if ocr_text.strip():
                     try:
+                        t_vector = time.perf_counter()
                         _ocr_worker.vector_store.add_image(
                             image_path=f"memory://{image_hash}",
                             image=image_pil,
@@ -306,14 +461,38 @@ def _handle_command_impl(req: dict):
                             },
                             ocr_text=ocr_text,
                         )
+                        vector_elapsed = time.perf_counter() - t_vector
+                        logger.debug(
+                            '[DIAG:process_ocr] screenshot_id=%s vector_store.add_image done in %.3fs text_len=%s',
+                            screenshot_id,
+                            vector_elapsed,
+                            len(ocr_text),
+                        )
+                        if vector_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
+                            logger.warning(
+                                '[DIAG:process_ocr] screenshot_id=%s slow vector_store.add_image=%.3fs text_len=%s',
+                                screenshot_id,
+                                vector_elapsed,
+                                len(ocr_text),
+                            )
                     except Exception as ve:
                         logger.warning('Vector store add failed: %s', ve)
+                else:
+                    logger.debug('[DIAG:process_ocr] screenshot_id=%s vector store skipped (empty text)', screenshot_id)
+            else:
+                logger.debug(
+                    '[DIAG:process_ocr] screenshot_id=%s vector store unavailable enabled=%s has_store=%s',
+                    screenshot_id,
+                    bool(getattr(_ocr_worker, 'enable_vector_store', False)),
+                    bool(getattr(_ocr_worker, 'vector_store', None)),
+                )
 
             # Classify screenshot
             category = None
             category_confidence = None
             if _classifier:
                 try:
+                    t_classify = time.perf_counter()
                     window_title = req.get('window_title', '')
                     process_name = req.get('process_name', '')
                     category, category_confidence = _classifier.classify(
@@ -322,12 +501,30 @@ def _handle_command_impl(req: dict):
                         process_name=process_name,
                     )
                     category_confidence = round(category_confidence, 4)
+                    classify_elapsed = time.perf_counter() - t_classify
+                    logger.debug(
+                        '[DIAG:process_ocr] screenshot_id=%s classify done in %.3fs category=%s confidence=%s',
+                        screenshot_id,
+                        classify_elapsed,
+                        category,
+                        category_confidence,
+                    )
+                    if classify_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
+                        logger.warning(
+                            '[DIAG:process_ocr] screenshot_id=%s slow classify=%.3fs',
+                            screenshot_id,
+                            classify_elapsed,
+                        )
                 except Exception as ce:
                     logger.warning('Classification failed: %s', ce)
+            else:
+                logger.debug('[DIAG:process_ocr] screenshot_id=%s classify skipped (no classifier)', screenshot_id)
 
             # Add to task clustering hot layer (non-blocking, best-effort)
-            if _clustering_manager:
+            clustering_allowed = _clustering_scheduler_active and _last_clustering_session_valid
+            if _clustering_manager and clustering_allowed:
                 try:
+                    t_cluster = time.perf_counter()
                     _clustering_manager.add_snapshot(
                         screenshot_id=screenshot_id,
                         process_name=req.get('process_name', ''),
@@ -336,8 +533,24 @@ def _handle_command_impl(req: dict):
                         timestamp=req.get('timestamp', 0),
                         category=category or '',
                     )
+                    cluster_elapsed = time.perf_counter() - t_cluster
+                    logger.debug(
+                        '[DIAG:process_ocr] screenshot_id=%s clustering add done in %.3fs',
+                        screenshot_id,
+                        cluster_elapsed,
+                    )
+                    if cluster_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
+                        logger.warning(
+                            '[DIAG:process_ocr] screenshot_id=%s slow clustering add=%.3fs',
+                            screenshot_id,
+                            cluster_elapsed,
+                        )
                 except Exception as te:
                     logger.warning('Task vector add failed: %s', te)
+            elif _clustering_manager and not clustering_allowed:
+                logger.debug('[DIAG:process_ocr] screenshot_id=%s clustering skipped (session locked)', screenshot_id)
+            else:
+                logger.debug('[DIAG:process_ocr] screenshot_id=%s clustering skipped (no manager)', screenshot_id)
 
             result = {
                 'status': 'success',
@@ -346,9 +559,28 @@ def _handle_command_impl(req: dict):
             if category:
                 result['category'] = category
                 result['category_confidence'] = category_confidence
+            total_elapsed = time.perf_counter() - cmd_started
+            logger.info(
+                '[DIAG:process_ocr] success screenshot_id=%s total=%.3fs returned_blocks=%s',
+                screenshot_id,
+                total_elapsed,
+                len(filtered),
+            )
+            if total_elapsed >= PROCESS_OCR_SLOW_TOTAL_SECS:
+                logger.warning(
+                    '[DIAG:process_ocr] screenshot_id=%s very slow total=%.3fs',
+                    screenshot_id,
+                    total_elapsed,
+                )
             return result
         except Exception as e:
-            logger.error('process_ocr failed: %s', e)
+            logger.error(
+                '[DIAG:process_ocr] failed screenshot_id=%s total=%.3fs error=%s',
+                screenshot_id,
+                time.perf_counter() - cmd_started,
+                e,
+                exc_info=True,
+            )
             _ocr_worker.stats['failed_count'] += 1
             return {'error': str(e)}
 
@@ -521,6 +753,8 @@ def _handle_command_impl(req: dict):
     if cmd == 'run_clustering':
         if not _clustering_scheduler:
             return {'error': 'Clustering service not initialised'}
+        if not _sync_clustering_scheduler_auth_gate(force=True):
+            return {'error': 'AUTH_REQUIRED: clustering requires unlocked session'}
         start_time = req.get('start_time')
         end_time = req.get('end_time')
         try:
@@ -560,6 +794,8 @@ def _handle_command_impl(req: dict):
     if cmd == 'get_tasks':
         if not _clustering_manager:
             return {'error': 'Clustering service not initialised'}
+        if not _sync_clustering_scheduler_auth_gate(force=True):
+            return {'error': 'AUTH_REQUIRED: clustering requires unlocked session'}
         try:
             last = _clustering_scheduler.get_last_result() if _clustering_scheduler else None
             hot_clusters = last.get('clusters', []) if last else []
@@ -588,11 +824,15 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         auth_token: Authentication token for IPC validation.
         storage_pipe: Storage service pipe name (Rust reverse IPC).
     """
-    global _server, _ocr_worker, _classifier, _storage_pipe, _clustering_manager, _clustering_scheduler, _auth_token, _last_seq_no
+    global _server, _ocr_worker, _classifier, _storage_pipe, _clustering_manager, _clustering_scheduler, _clustering_scheduler_active, _clustering_auth_monitor_thread, _auth_token, _last_seq_no, _last_clustering_auth_check, _last_clustering_session_valid
 
     _auth_token = auth_token
     _last_seq_no = -1
     _storage_pipe = storage_pipe
+    _clustering_scheduler_active = False
+    _clustering_auth_monitor_thread = None
+    _last_clustering_auth_check = 0.0
+    _last_clustering_session_valid = False
 
     if not pipe_name:
         pipe_name = os.environ.get('CARBON_MONITOR_PIPE')
@@ -660,16 +900,21 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
 
             _clustering_manager = HotColdManager(shared_chroma_client, storage_client=sc)
             _clustering_scheduler = ClusteringScheduler(_clustering_manager, storage_client=sc)
-            _clustering_scheduler.start()
-            logger.info('Task clustering service initialised')
+            unlocked = _sync_clustering_scheduler_auth_gate(force=True)
+            _start_clustering_auth_monitor()
+            logger.info('Task clustering service initialised (scheduler_active=%s unlocked=%s)', _clustering_scheduler_active, unlocked)
         else:
             logger.warning('Task clustering service skipped: shared ChromaDB client is None')
             _clustering_manager = None
             _clustering_scheduler = None
+            _clustering_scheduler_active = False
+            _clustering_auth_monitor_thread = None
     except Exception as e:
         logger.warning('Task clustering service failed to initialise (non-fatal): %s', e)
         _clustering_manager = None
         _clustering_scheduler = None
+        _clustering_scheduler_active = False
+        _clustering_auth_monitor_thread = None
 
     # NOTE: Screenshot capture loop is handled by Rust (capture.rs).
     # Python only provides OCR via the 'process_ocr' IPC command.
@@ -679,12 +924,16 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
 
 def stop():
     """Shut down the OCR service and IPC server."""
+    global _clustering_scheduler_active, _clustering_auth_monitor_thread
     stop_event.set()
     if _clustering_scheduler:
         try:
             _clustering_scheduler.stop()
         except Exception:
             pass
+    _clustering_scheduler_active = False
+    if _clustering_auth_monitor_thread:
+        _clustering_auth_monitor_thread = None
     if _ocr_worker:
         try:
             _ocr_worker.stop()
