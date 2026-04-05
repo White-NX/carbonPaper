@@ -54,6 +54,8 @@ pub struct StorageState {
     bitmap_index_migrated: AtomicBool,
     /// Whether thumbnail warmup has already completed this session
     pub(crate) thumbnail_warmup_done: AtomicBool,
+    /// Whether startup VACUUM is currently running
+    startup_vacuum_in_progress: AtomicBool,
 }
 
 impl StorageState {
@@ -76,6 +78,7 @@ impl StorageState {
             dedup_migrated: AtomicBool::new(false),
             bitmap_index_migrated: AtomicBool::new(false),
             thumbnail_warmup_done: AtomicBool::new(false),
+            startup_vacuum_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -126,6 +129,10 @@ impl StorageState {
 
     pub fn is_hmac_migration_cancel_requested(&self) -> bool {
         self.hmac_migration_cancel_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn is_startup_vacuum_in_progress(&self) -> bool {
+        self.startup_vacuum_in_progress.load(Ordering::SeqCst)
     }
 
     /// Acquire DB connection with caller identification for diagnostic logging.

@@ -94,18 +94,36 @@ class StorageClient:
                     None
                 )
                 
-                # Send request (write large data in chunks)
+                # Send request (write large data in chunks).
+                # Named pipes can report partial writes; always advance by actual bytes written.
                 request_bytes = json.dumps(request).encode('utf-8')
                 chunk_size = 64 * 1024  # 64KB chunks
                 offset = 0
-                
+
                 while offset < len(request_bytes):
                     chunk = request_bytes[offset:offset + chunk_size]
-                    win32file.WriteFile(handle, chunk)
-                    offset += len(chunk)
+                    chunk_offset = 0
+
+                    while chunk_offset < len(chunk):
+                        _, written = win32file.WriteFile(handle, chunk[chunk_offset:])
+                        if not isinstance(written, int) or written <= 0:
+                            raise RuntimeError("Named pipe write returned no progress")
+                        chunk_offset += written
+
+                    offset += chunk_offset
                 
-                # Flush pipe to ensure all data has been sent
-                win32file.FlushFileBuffers(handle)
+                # Flush pipe to ensure all data has been sent.
+                # In request/response mode the server may close quickly after handling
+                # the request, so broken-pipe style flush errors can be benign.
+                try:
+                    win32file.FlushFileBuffers(handle)
+                except pywintypes.error as e:
+                    if e.winerror not in (109, 232):
+                        raise
+                    logger.debug(
+                        "[storage_client] FlushFileBuffers returned %s; continue reading response",
+                        e.winerror,
+                    )
                 
                 # Read response (supports chunked reads for large responses)
                 response_bytes = b''
@@ -260,6 +278,14 @@ class StorageClient:
             'command': 'decrypt_many_from_chromadb',
             'encrypted_list': pending_values
         })
+
+        error_message = str(response.get('error', ''))
+        if response.get('status') != 'success' and 'Invalid JSON' in error_message:
+            logger.warning("[storage_client] Batch decryption got Invalid JSON, retrying once")
+            response = self._send_request({
+                'command': 'decrypt_many_from_chromadb',
+                'encrypted_list': pending_values
+            })
 
         if response.get('status') == 'success':
             data = response.get('data', {})

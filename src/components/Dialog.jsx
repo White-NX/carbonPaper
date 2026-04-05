@@ -10,11 +10,13 @@ export function Dialog({
   children, 
   className,
   contentClassName,
-  maxWidth = 'max-w-lg'
+  maxWidth = 'max-w-lg',
+  disableClose = false,
+  hideCloseButton = false,
 }) {
   useEffect(() => {
     const handleEscape = (e) => {
-      if (e.key === 'Escape') onClose();
+      if (!disableClose && e.key === 'Escape') onClose();
     };
 
     if (isOpen) {
@@ -26,14 +28,14 @@ export function Dialog({
       document.removeEventListener('keydown', handleEscape);
       document.body.style.overflow = 'unset';
     };
-  }, [isOpen, onClose]);
+  }, [isOpen, onClose, disableClose]);
 
   if (!isOpen) return null;
 
   return (
     <div 
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200"
-      onClick={onClose}
+      onClick={disableClose ? undefined : onClose}
     >
       <div 
         className={cn(
@@ -47,12 +49,14 @@ export function Dialog({
           <h3 className="text-sm font-semibold uppercase tracking-wide text-ide-muted select-none">
             {title}
           </h3>
-          <button 
-            onClick={onClose}
-            className="text-ide-muted hover:text-ide-text transition-colors p-1 hover:bg-ide-hover rounded"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          {!hideCloseButton && !disableClose && (
+            <button 
+              onClick={onClose}
+              className="text-ide-muted hover:text-ide-text transition-colors p-1 hover:bg-ide-hover rounded"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          )}
         </div>
 
         <div className={cn("min-h-0 flex-1 overflow-y-auto", contentClassName)}>
@@ -71,4 +75,6 @@ Dialog.propTypes = {
   className: PropTypes.string,
   contentClassName: PropTypes.string,
   maxWidth: PropTypes.string,
+  disableClose: PropTypes.bool,
+  hideCloseButton: PropTypes.bool,
 };
