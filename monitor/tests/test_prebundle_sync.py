@@ -10,6 +10,11 @@ def test_storage_client_source_matches_prebundle_copy():
     source = root / "monitor" / "storage_client.py"
     prebundle = root / "src-tauri" / "pre-bundle" / "monitor" / "storage_client.py"
 
+    assert prebundle.exists(), (
+        "Missing pre-bundle copy: run Rust build/tests first so src-tauri/build.rs "
+        "can generate src-tauri/pre-bundle/monitor/storage_client.py"
+    )
+
     source_text = _normalise_text(source.read_text(encoding="utf-8"))
     prebundle_text = _normalise_text(prebundle.read_text(encoding="utf-8"))
 
