@@ -1,0 +1,42 @@
+name: Backend Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  backend-fast:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r monitor/requirements-test.txt
+
+      - name: Run Python regression tests
+        run: python -m pytest monitor/tests/test_storage_client_ipc.py monitor/tests/test_storage_client_error_paths.py monitor/tests/test_task_clustering_concurrency.py monitor/tests/test_task_clustering_scheduler_paths.py monitor/tests/test_monitor_command_dispatch.py monitor/tests/test_ipc_pipe_request_integrity.py monitor/tests/test_ipc_pipe_auth_guard.py -q --timeout=15
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Run pre-bundle sync test
+        run: python -m pytest monitor/tests/test_prebundle_sync.py -q --timeout=15

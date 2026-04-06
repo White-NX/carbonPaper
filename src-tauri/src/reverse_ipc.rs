@@ -407,66 +407,61 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
     // 因为图片 Base64 数据可能很大（数 MB），且数据可能分片到达
     let mut buf = Vec::with_capacity(4 * 1024 * 1024); // 预分配 4MB
     let mut temp_buf = vec![0u8; 64 * 1024]; // 64KB 临时缓冲区
-    let mut read_end_reason: Option<String> = None;
-    
-    // 设置读取超时
-    let read_timeout = tokio::time::Duration::from_secs(30);
-    let start_time = tokio::time::Instant::now();
-    
-    loop {
-        if start_time.elapsed() > read_timeout {
-            tracing::warn!("Read timeout after {} bytes", buf.len());
-            read_end_reason = Some(String::from("overall_timeout"));
-            break;
-        }
-        
-        match tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            server.read(&mut temp_buf)
-        ).await {
-            Ok(Ok(0)) => {
-                // 连接已关闭，数据读取完成
-                read_end_reason = Some(String::from("peer_closed"));
-                break;
-            }
-            Ok(Ok(n)) => {
-                buf.extend_from_slice(&temp_buf[..n]);
-                // 限制最大数据量为 16MB
-                if buf.len() > 16 * 1024 * 1024 {
-                    tracing::error!("Request too large: {} bytes", buf.len());
-                    let response = StorageResponse::error("Request too large (max 16MB)");
-                    let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-                    let _ = server.write_all(&response_bytes).await;
-                    return;
-                }
+    let read_end_reason = {
+        // 设置读取超时
+        let read_timeout = tokio::time::Duration::from_secs(30);
+        let start_time = tokio::time::Instant::now();
 
-                // 仅在 JSON 已完整时结束读取，避免分片导致的截断解析
-                if serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
-                    read_end_reason = Some(String::from("json_complete"));
-                    break;
-                }
+        loop {
+            if start_time.elapsed() > read_timeout {
+                tracing::warn!("Read timeout after {} bytes", buf.len());
+                break String::from("overall_timeout");
             }
-            Ok(Err(e)) => {
-                // 检查是否是 "管道已结束" 错误（正常情况，客户端已发送完数据）
-                let is_pipe_ended = e.raw_os_error() == Some(109); // ERROR_BROKEN_PIPE
-                if !is_pipe_ended {
-                    tracing::error!("Read error: {}", e);
-                    read_end_reason = Some(format!("read_error:{}", e));
-                } else {
-                    read_end_reason = Some(String::from("broken_pipe_109"));
+
+            match tokio::time::timeout(
+                tokio::time::Duration::from_millis(500),
+                server.read(&mut temp_buf)
+            ).await {
+                Ok(Ok(0)) => {
+                    // 连接已关闭，数据读取完成
+                    break String::from("peer_closed");
                 }
-                break;
-            }
-            Err(_) => {
-                // 单次 read 超时：若已有完整 JSON 则继续处理，否则继续等到全局超时
-                if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
-                    read_end_reason = Some(String::from("single_read_timeout_but_json_complete"));
-                    break;
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&temp_buf[..n]);
+                    // 限制最大数据量为 16MB
+                    if buf.len() > 16 * 1024 * 1024 {
+                        tracing::error!("Request too large: {} bytes", buf.len());
+                        let response = StorageResponse::error("Request too large (max 16MB)");
+                        let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+                        let _ = server.write_all(&response_bytes).await;
+                        return;
+                    }
+
+                    // 仅在 JSON 已完整时结束读取，避免分片导致的截断解析
+                    if serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                        break String::from("json_complete");
+                    }
                 }
-                continue;
+                Ok(Err(e)) => {
+                    // 检查是否是 "管道已结束" 错误（正常情况，客户端已发送完数据）
+                    let is_pipe_ended = e.raw_os_error() == Some(109); // ERROR_BROKEN_PIPE
+                    if !is_pipe_ended {
+                        tracing::error!("Read error: {}", e);
+                        break format!("read_error:{}", e);
+                    } else {
+                        break String::from("broken_pipe_109");
+                    }
+                }
+                Err(_) => {
+                    // 单次 read 超时：若已有完整 JSON 则继续处理，否则继续等到全局超时
+                    if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                        break String::from("single_read_timeout_but_json_complete");
+                    }
+                    continue;
+                }
             }
         }
-    }
+    };
     
     if buf.is_empty() {
         return;
@@ -479,7 +474,7 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
             "Invalid JSON: {} (bytes={}, reason={})",
             e,
             buf.len(),
-            read_end_reason.as_deref().unwrap_or("unknown")
+            read_end_reason
         )),
     };
     
@@ -998,55 +993,50 @@ async fn handle_nmh_client(
     let mut temp_buf = vec![0u8; 64 * 1024];
     let read_timeout = tokio::time::Duration::from_secs(30);
     let start_time = tokio::time::Instant::now();
-    let mut read_end_reason: Option<String> = None;
-
-    loop {
-        if start_time.elapsed() > read_timeout {
-            tracing::warn!("NMH read timeout after {} bytes", buf.len());
-            read_end_reason = Some(String::from("overall_timeout"));
-            break;
-        }
-
-        match tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            server.read(&mut temp_buf)
-        ).await {
-            Ok(Ok(0)) => {
-                read_end_reason = Some(String::from("peer_closed"));
-                break;
+    let read_end_reason = {
+        loop {
+            if start_time.elapsed() > read_timeout {
+                tracing::warn!("NMH read timeout after {} bytes", buf.len());
+                break String::from("overall_timeout");
             }
-            Ok(Ok(n)) => {
-                buf.extend_from_slice(&temp_buf[..n]);
-                if buf.len() > 16 * 1024 * 1024 {
-                    let response = StorageResponse::error("Request too large (max 16MB)");
-                    let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-                    let _ = server.write_all(&response_bytes).await;
-                    return;
-                }
 
-                if serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
-                    read_end_reason = Some(String::from("json_complete"));
-                    break;
+            match tokio::time::timeout(
+                tokio::time::Duration::from_millis(500),
+                server.read(&mut temp_buf)
+            ).await {
+                Ok(Ok(0)) => {
+                    break String::from("peer_closed");
                 }
-            }
-            Ok(Err(e)) => {
-                if e.raw_os_error() != Some(109) {
-                    tracing::error!("NMH read error: {}", e);
-                    read_end_reason = Some(format!("read_error:{}", e));
-                } else {
-                    read_end_reason = Some(String::from("broken_pipe_109"));
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&temp_buf[..n]);
+                    if buf.len() > 16 * 1024 * 1024 {
+                        let response = StorageResponse::error("Request too large (max 16MB)");
+                        let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+                        let _ = server.write_all(&response_bytes).await;
+                        return;
+                    }
+
+                    if serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                        break String::from("json_complete");
+                    }
                 }
-                break;
-            }
-            Err(_) => {
-                if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
-                    read_end_reason = Some(String::from("single_read_timeout_but_json_complete"));
-                    break;
+                Ok(Err(e)) => {
+                    if e.raw_os_error() != Some(109) {
+                        tracing::error!("NMH read error: {}", e);
+                        break format!("read_error:{}", e);
+                    } else {
+                        break String::from("broken_pipe_109");
+                    }
                 }
-                continue;
+                Err(_) => {
+                    if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                        break String::from("single_read_timeout_but_json_complete");
+                    }
+                    continue;
+                }
             }
         }
-    }
+    };
 
     if buf.is_empty() {
         return;
@@ -1067,7 +1057,7 @@ async fn handle_nmh_client(
             "Invalid JSON: {} (bytes={}, reason={})",
             e,
             buf.len(),
-            read_end_reason.as_deref().unwrap_or("unknown")
+            read_end_reason
         )),
     };
 
@@ -1428,5 +1418,98 @@ mod tests {
         let name1 = generate_reverse_pipe_name();
         let name2 = generate_reverse_pipe_name();
         assert_ne!(name1, name2, "Two generated pipe names should be different");
+    }
+
+    #[test]
+    fn test_storage_command_deserialize_save_screenshot_temp() {
+        let payload = serde_json::json!({
+            "command": "save_screenshot_temp",
+            "image_data": "base64",
+            "image_hash": "h123",
+            "width": 1920,
+            "height": 1080,
+            "window_title": "Editor",
+            "process_name": "code.exe",
+            "metadata": {"k": "v"}
+        });
+
+        let cmd: StorageCommand = serde_json::from_value(payload).unwrap();
+        match cmd {
+            StorageCommand::SaveScreenshotTemp { image_hash, width, height, .. } => {
+                assert_eq!(image_hash, "h123");
+                assert_eq!(width, 1920);
+                assert_eq!(height, 1080);
+            }
+            _ => panic!("expected SaveScreenshotTemp"),
+        }
+    }
+
+    #[test]
+    fn test_storage_command_deserialize_commit_screenshot() {
+        let payload = serde_json::json!({
+            "command": "commit_screenshot",
+            "screenshot_id": "42",
+            "ocr_results": []
+        });
+
+        let cmd: StorageCommand = serde_json::from_value(payload).unwrap();
+        match cmd {
+            StorageCommand::CommitScreenshot { screenshot_id, ocr_results } => {
+                assert_eq!(screenshot_id, "42");
+                assert!(ocr_results.is_some());
+            }
+            _ => panic!("expected CommitScreenshot"),
+        }
+    }
+
+    #[test]
+    fn test_storage_command_unknown_tag_rejected() {
+        let payload = serde_json::json!({
+            "command": "list_screenshots_for_clustering",
+            "start_ts": 0,
+            "end_ts": 1
+        });
+
+        let result: Result<StorageCommand, _> = serde_json::from_value(payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decrypt_many_response_contract_shape() {
+        let resp = StorageResponse::success(serde_json::json!({
+            "decrypted_list": ["plain-1", "plain-2"],
+            "error_count": 0
+        }));
+        let as_value = serde_json::to_value(resp).unwrap();
+
+        assert_eq!(as_value["status"], "success");
+        assert!(as_value["data"]["decrypted_list"].is_array());
+        assert!(as_value["data"]["error_count"].is_number());
+    }
+
+    #[test]
+    fn test_list_screenshots_response_contract_shape() {
+        let resp = StorageResponse::success(serde_json::json!({
+            "screenshots": [
+                {
+                    "id": 1,
+                    "process_name": "code.exe",
+                    "window_title": "Editor",
+                    "ocr_text": "hello",
+                    "timestamp": 123.0,
+                    "category": "Development"
+                }
+            ],
+            "total": 1
+        }));
+        let as_value = serde_json::to_value(resp).unwrap();
+
+        assert_eq!(as_value["status"], "success");
+        assert!(as_value["data"]["screenshots"].is_array());
+        assert!(as_value["data"]["total"].is_number());
+        let first = &as_value["data"]["screenshots"][0];
+        assert!(first.get("process_name").is_some());
+        assert!(first.get("window_title").is_some());
+        assert!(first.get("ocr_text").is_some());
     }
 }

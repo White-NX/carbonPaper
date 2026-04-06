@@ -120,6 +120,23 @@ fn generate_auth_token() -> String {
         .collect()
 }
 
+fn inject_ipc_auth(mut req: Value, auth_token: &str, seq_no: u64) -> Value {
+    if let Some(obj) = req.as_object_mut() {
+        obj.insert(
+            "_auth_token".to_string(),
+            Value::String(auth_token.to_string()),
+        );
+        obj.insert("_seq_no".to_string(), Value::Number(seq_no.into()));
+    }
+    req
+}
+
+fn parse_ipc_response(bytes: &[u8]) -> Result<Value, String> {
+    let resp_str = String::from_utf8_lossy(bytes);
+    serde_json::from_str::<Value>(&resp_str)
+        .map_err(|e| format!("Invalid JSON response: {}. Data: {}", e, resp_str))
+}
+
 // 内部函数：尝试连接到管道，支持重试
 async fn connect_to_pipe(
     pipe_name: &str,
@@ -178,8 +195,10 @@ pub async fn send_ipc_request(
     pipe_name: &str,
     auth_token: &str,
     seq_no: u64,
-    mut req: Value,
+    req: Value,
 ) -> Result<Value, String> {
+    let req = inject_ipc_auth(req, auth_token, seq_no);
+
     let command_name = req
         .get("command")
         .and_then(|v| v.as_str())
@@ -195,15 +214,6 @@ pub async fn send_ipc_request(
             seq_no,
             pipe_name
         );
-    }
-
-    // 在请求中添加认证信息
-    if let Some(obj) = req.as_object_mut() {
-        obj.insert(
-            "_auth_token".to_string(),
-            Value::String(auth_token.to_string()),
-        );
-        obj.insert("_seq_no".to_string(), Value::Number(seq_no.into()));
     }
 
     let mut client = match connect_to_pipe(pipe_name).await {
@@ -269,8 +279,7 @@ pub async fn send_ipc_request(
                     elapsed_ms
                 );
             }
-            let resp_str = String::from_utf8_lossy(&buf);
-            match serde_json::from_str::<Value>(&resp_str) {
+            match parse_ipc_response(&buf) {
                 Ok(v) => Ok(v),
                 Err(e) => {
                     if is_process_ocr {
@@ -282,7 +291,7 @@ pub async fn send_ipc_request(
                             e
                         );
                     }
-                    Err(format!("Invalid JSON response: {}. Data: {}", e, resp_str))
+                    Err(e)
                 }
             }
         }
@@ -1433,5 +1442,42 @@ pub fn stop_game_mode_monitor(app: &AppHandle) {
         }));
     }
     tracing::info!("Game mode: monitor stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inject_ipc_auth_for_object_payload() {
+        let req = serde_json::json!({"command": "status"});
+        let enriched = inject_ipc_auth(req, "token-abc", 99);
+
+        assert_eq!(enriched["command"], "status");
+        assert_eq!(enriched["_auth_token"], "token-abc");
+        assert_eq!(enriched["_seq_no"], 99);
+    }
+
+    #[test]
+    fn test_inject_ipc_auth_for_non_object_payload() {
+        let req = serde_json::json!(["status"]);
+        let enriched = inject_ipc_auth(req.clone(), "token-abc", 99);
+        assert_eq!(enriched, req);
+    }
+
+    #[test]
+    fn test_parse_ipc_response_success() {
+        let bytes = br#"{"status":"success","data":{"ok":true}}"#;
+        let parsed = parse_ipc_response(bytes).unwrap();
+        assert_eq!(parsed["status"], "success");
+        assert_eq!(parsed["data"]["ok"], true);
+    }
+
+    #[test]
+    fn test_parse_ipc_response_invalid_json() {
+        let bytes = br#"{"status":"success""#;
+        let err = parse_ipc_response(bytes).unwrap_err();
+        assert!(err.contains("Invalid JSON response"));
+    }
 }
 
