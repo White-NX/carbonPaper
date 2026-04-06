@@ -2,13 +2,22 @@
 import sys, os, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from monitor.monitor.presidio_zh_recognizers import (
-    ChineseIdCardRecognizer, ChinesePhoneRecognizer,
-    ChineseBankCardRecognizer, ChineseNameRecognizer,
-    ChineseAddressRecognizer, _validate_id_checksum,
-    _validate_id_15, _validate_luhn, get_zh_recognizers,
-)
-from monitor.monitor.presidio_service import normalize_ocr_text, _remap_entities
+try:
+    from monitor.monitor.presidio_zh_recognizers import (
+        ChineseIdCardRecognizer, ChinesePhoneRecognizer,
+        ChineseBankCardRecognizer, ChineseNameRecognizer,
+        ChineseAddressRecognizer, _validate_id_checksum,
+        _validate_id_15, _validate_luhn, get_zh_recognizers,
+    )
+    from monitor.monitor.presidio_service import normalize_ocr_text, _remap_entities
+except ModuleNotFoundError:
+    from monitor.presidio_zh_recognizers import (
+        ChineseIdCardRecognizer, ChinesePhoneRecognizer,
+        ChineseBankCardRecognizer, ChineseNameRecognizer,
+        ChineseAddressRecognizer, _validate_id_checksum,
+        _validate_id_15, _validate_luhn, get_zh_recognizers,
+    )
+    from monitor.presidio_service import normalize_ocr_text, _remap_entities
 
 _W = [7,9,10,5,8,4,2,1,6,3,7,9,10,5,8,4,2]
 def _mk18(p): return p + "10X98765432"[sum(int(p[i])*_W[i] for i in range(17))%11]
@@ -141,7 +150,10 @@ class TestSampleText(unittest.TestCase):
                 raise unittest.SkipTest('no zh spaCy model installed')
         except ImportError:
             raise unittest.SkipTest('spacy not installed')
-        from monitor.monitor.presidio_service import PresidioService
+        try:
+            from monitor.monitor.presidio_service import PresidioService
+        except ModuleNotFoundError:
+            from monitor.presidio_service import PresidioService
         cls.svc = PresidioService.get_instance()
         cls.svc.initialize('zh')
 
@@ -245,7 +257,10 @@ class TestPresidioIntegration(unittest.TestCase):
             import spacy; spacy.load('zh_core_web_trf')
         except Exception:
             raise unittest.SkipTest('zh_core_web_trf not installed')
-        from monitor.monitor.presidio_service import PresidioService
+        try:
+            from monitor.monitor.presidio_service import PresidioService
+        except ModuleNotFoundError:
+            from monitor.presidio_service import PresidioService
         cls.svc = PresidioService.get_instance()
         cls.svc.initialize('zh')
     def test_full_pipeline(self):

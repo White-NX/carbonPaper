@@ -17,6 +17,58 @@ import ntsecuritycon
 from typing import Callable
 
 
+MAX_PIPE_MESSAGE_BYTES = 16 * 1024 * 1024
+
+
+def _is_authorized_client_pid(client_pid: int, expected_pid: int | None, curr_ppid: int) -> bool:
+    """Return whether a named-pipe client PID is authorized."""
+    if expected_pid and client_pid == expected_pid:
+        return True
+    if client_pid == curr_ppid:
+        return True
+    return False
+
+
+def _read_complete_json_message(handle, chunk_size=1024 * 1024, max_bytes=MAX_PIPE_MESSAGE_BYTES):
+    """Read a complete JSON message from a named pipe handle.
+
+    Supports PIPE_TYPE_MESSAGE fragmentation via ERROR_MORE_DATA (234).
+    Returns decoded payload string, or None if no data was read.
+    """
+    chunks = []
+    total = 0
+
+    while True:
+        try:
+            resp_code, data = win32file.ReadFile(handle, chunk_size)
+        except pywintypes.error as e:
+            if getattr(e, 'winerror', None) == 109:  # ERROR_BROKEN_PIPE
+                break
+            raise
+
+        if data:
+            chunks.append(data)
+            total += len(data)
+            if total > max_bytes:
+                raise ValueError(f"Request too large (max {max_bytes} bytes)")
+
+        # 234 means there is still unread remainder for this message.
+        if resp_code == 234:
+            continue
+        if resp_code == 0:
+            break
+
+        raise RuntimeError(f"ReadFile returned unexpected status code: {resp_code}")
+
+    if not chunks:
+        return None
+
+    payload = b"".join(chunks).decode('utf-8').strip()
+    if not payload:
+        return None
+    return payload
+
+
 def _make_security_attributes_for_current_user():
     """Create SECURITY_ATTRIBUTES that only allow the current user to access the pipe."""
     sd = win32security.SECURITY_DESCRIPTOR()
@@ -116,12 +168,7 @@ class _NamedPipeServer(threading.Thread):
             expected_pid = int(parent_pid_env) if parent_pid_env else None
             curr_ppid = os.getppid()
 
-            is_valid = False
-            # Only allow the explicit expected PID or the direct parent process
-            if expected_pid and client_pid == expected_pid:
-                is_valid = True
-            elif client_pid == curr_ppid:
-                is_valid = True
+            is_valid = _is_authorized_client_pid(client_pid, expected_pid, curr_ppid)
 
             if not is_valid:
                 logger.warning(f"[SECURITY] Rejecting PID {client_pid}. (Expected: {expected_pid}, PPID: {curr_ppid})")
@@ -133,18 +180,21 @@ class _NamedPipeServer(threading.Thread):
             logger.debug(f"IPC client verified: PID {client_pid}")
             # 2. Read Request
             try:
-                # In message mode, one ReadFile typically gets the whole message.
-                # We use a 1MB buffer which is plenty for our JSON commands.
-                resp_code, data = win32file.ReadFile(handle, 1024 * 1024)
+                payload = _read_complete_json_message(handle)
+            except ValueError as e:
+                logger.error(str(e))
+                error_resp = json.dumps({"error": str(e)}).encode('utf-8')
+                win32file.WriteFile(handle, error_resp)
+                win32file.FlushFileBuffers(handle)
+                return
             except pywintypes.error as e:
                 if getattr(e, 'winerror', None) == 109: # ERROR_BROKEN_PIPE
                     return
                 raise
 
-            if not data:
+            if not payload:
                 return
 
-            payload = data.decode('utf-8').strip()
             try:
                 req = json.loads(payload)
             except json.JSONDecodeError:
@@ -231,8 +281,8 @@ def send_ipc_request(pipe_name, req):
         )
         win32pipe.SetNamedPipeHandleState(handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
         win32file.WriteFile(handle, json.dumps(req).encode('utf-8'))
-        resp_code, data = win32file.ReadFile(handle, 1024 * 1024)
-        return json.loads(data.decode('utf-8').strip()) if data else {}
+        payload = _read_complete_json_message(handle)
+        return json.loads(payload) if payload else {}
     finally:
         try:
             win32file.CloseHandle(handle)
