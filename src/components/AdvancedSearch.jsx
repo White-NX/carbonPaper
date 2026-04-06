@@ -376,9 +376,11 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     setLoading(false);
     setLoadingMore(false);
     offsetRef.current = 0;
-    setMode(nextMode);
+    if (searchMode === undefined) {
+      setMode(nextMode);
+    }
     onSearchModeChange?.(nextMode);
-  }, [onSearchModeChange, mode]);
+  }, [onSearchModeChange, mode, searchMode]);
 
   useEffect(() => {
     if (searchMode === undefined || searchMode === mode) return;

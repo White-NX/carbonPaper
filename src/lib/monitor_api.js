@@ -6,7 +6,7 @@ export { requestAuth, checkAuthSession };
 export { initAuthListeners, lockSession } from './auth_api';
 
 // Simple request queue to limit concurrent pipe connections
-class RequestQueue {
+export class RequestQueue {
     constructor(maxConcurrent = 3, maxPending = 200) {
         this.maxConcurrent = maxConcurrent;
         this.maxPending = maxPending;
