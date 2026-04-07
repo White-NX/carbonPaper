@@ -7,6 +7,8 @@ try:
 except ImportError:
     pass
 
+import os
+
 from logging_config import setup_logging
 setup_logging()
 
@@ -15,6 +17,33 @@ logger = logging.getLogger(__name__)
 
 from monitor import start, stop, stop_event
 import argparse
+
+
+def _setup_debugpy_if_enabled():
+  if os.getenv('CP_DEBUGPY') != '1':
+    return
+
+  try:
+    import debugpy
+
+    host = os.getenv('CP_DEBUGPY_HOST', '127.0.0.1')
+    port = int(os.getenv('CP_DEBUGPY_PORT', '5678'))
+    wait_for_client = os.getenv('CP_DEBUGPY_WAIT') == '1'
+
+    debugpy.listen((host, port))
+    # Marker for VS Code serverReadyAction to auto-start Python attach.
+    print(f'[CP_DEBUGPY_READY] {host}:{port}', flush=True)
+    logger.info(f'debugpy listening on {host}:{port}')
+
+    if wait_for_client:
+      logger.info('Waiting for Python debugger client attach...')
+      debugpy.wait_for_client()
+      logger.info('Python debugger attached.')
+  except Exception as e:
+    logger.warning(f'debugpy init skipped: {e}')
+
+
+_setup_debugpy_if_enabled()
 
 
 def main():
