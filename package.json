@@ -7,6 +7,10 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "test:frontend": "vitest run",
+    "test:frontend:watch": "vitest",
+    "test:frontend:coverage": "vitest run --coverage",
+    "test:frontend:ci": "vitest run --coverage --reporter=dot",
     "test:python": "python -m pytest monitor/tests -q --timeout=15",
     "test:python:regression": "python -m pytest monitor/tests/test_storage_client_ipc.py monitor/tests/test_storage_client_error_paths.py monitor/tests/test_task_clustering_concurrency.py monitor/tests/test_task_clustering_scheduler_paths.py monitor/tests/test_monitor_command_dispatch.py monitor/tests/test_ipc_pipe_request_integrity.py monitor/tests/test_ipc_pipe_auth_guard.py -q --timeout=15",
     "test:python:prebundle-sync": "python -m pytest monitor/tests/test_prebundle_sync.py -q --timeout=15",
@@ -39,16 +43,22 @@
     "tailwind-merge": "^2.5.2"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.8.0",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
     "@tauri-apps/cli": "^2",
     "@types/react": "^18.3.1",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "@vitest/coverage-v8": "^2.1.9",
     "autoprefixer": "^10.4.20",
     "i18next-parser": "^9.3.0",
     "i18next-scanner": "^3.2.0",
+    "jsdom": "^26.1.0",
     "jscodeshift": "^0.14.0",
     "tailwindcss": "^3.4.16",
     "typescript": "~5.6.2",
+    "vitest": "^2.1.9",
     "vite": "^6.4.2"
   }
 }

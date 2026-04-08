@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 // @ts-expect-error process is a nodejs global
@@ -36,6 +36,24 @@ function getPackageName(id: string): string | null {
 // https://vitejs.dev/config/
 export default defineConfig(async () => ({
   plugins: [react()],
+  test: {
+    globals: true,
+    environment: "jsdom",
+    setupFiles: ["./src/tests/setup.js"],
+    include: ["src/**/*.test.{js,jsx,ts,tsx}"],
+    exclude: ["node_modules", "dist", "src-tauri", "monitor"],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "html"],
+      include: ["src/lib/**/*.js", "src/components/settings/filterUtils.js"],
+      thresholds: {
+        lines: 35,
+        functions: 35,
+        statements: 35,
+        branches: 25,
+      },
+    },
+  },
   build: {
     rollupOptions: {
       output: {
