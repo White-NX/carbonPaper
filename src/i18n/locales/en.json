@@ -200,6 +200,7 @@
         "error_default": "Migration error",
         "copying": "Copying files: {{copied}}/{{total}}",
         "current_file": "Current: {{file}}",
+        "completed": "Completed",
         "cancel": "Cancel",
         "upgrading": "Upgrading secure index...",
         "background_tip": "You can safely close this window. The upgrade will continue in the background, and search results will gradually populate.",
@@ -207,6 +208,37 @@
         "indexing_detailed": "Upgrading secure index: {{processed}} / {{total}}",
         "search_unavailable_title": "Search Limited",
         "search_unavailable_desc": "The database is undergoing a security upgrade and the search index is being rebuilt. During this time, search results may be incomplete or temporarily unavailable. Normal service will resume automatically once the upgrade completes."
+      },
+      "deleteConfirm": {
+        "title": "Confirm deletion",
+        "messageSelected": "Delete the selected {{count}} screenshots? They will be hidden immediately, and cleanup will run in the background.",
+        "messageMonth": "Delete screenshots of {{processName}} in {{month}}? They will be hidden immediately, and cleanup will run in the background.",
+        "messageProcess": "Delete all screenshots of {{processName}}? They will be hidden immediately, and cleanup will run in the background.",
+        "confirmDefault": "Delete",
+        "cancel": "Cancel"
+      },
+      "processDetails": {
+        "title": "Storage by Process",
+        "description": "View process share, monthly thumbnails, then select and delete",
+        "distributionTitle": "Process distribution",
+        "totalScreenshots": "Total {{count}} screenshots",
+        "noStats": "No process statistics available",
+        "unknownProcess": "Unknown process",
+        "others": "Others",
+        "itemSummary": "{{count}} shots · {{percent}}%",
+        "queueRunning": "Background cleanup: OCR {{ocr}}, screenshots {{screenshots}}",
+        "back": "Back",
+        "detailSubtitle": "Monthly thumbnail pagination",
+        "deleteProcess": "Delete process screenshots",
+        "deleteMonth": "Delete this month",
+        "deleteSelected": "Delete {{count}} screenshots",
+        "deleting": "Processing",
+        "loading": "Loading...",
+        "empty": "No screenshots available for this process",
+        "selected": "Selected",
+        "prevPage": "Previous",
+        "page": "Page {{page}}",
+        "nextPage": "Next"
       }
     },
     "storage": {
@@ -470,7 +502,12 @@
     "noContents": "No Contents",
     "noTextContent": "No text content",
     "unknownProcess": "Unknown Process",
-    "matchScore": "Match Score"
+    "matchScore": "Match Score",
+    "task": {
+      "summaryPlaceholder": "Cleanup in progress ({{progress}}%)",
+      "runningTitle": "Background cleanup is running",
+      "runningDesc": "Progress {{progress}}%, pending OCR {{ocr}}, screenshots {{screenshots}}."
+    }
   },
   "sidebar": {
     "details": {

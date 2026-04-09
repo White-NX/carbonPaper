@@ -41,6 +41,152 @@ const MENU_ID_QUIT: &str = "quit";
 
 pub static IS_UPDATING: AtomicBool = AtomicBool::new(false);
 
+async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
+    const OCR_BATCH_SIZE: i64 = 500;
+    const SCREENSHOT_BATCH_SIZE: i64 = 100;
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let storage = app_handle.state::<Arc<StorageState>>().inner().clone();
+
+        let ocr_processed = match tokio::task::spawn_blocking({
+            let storage = storage.clone();
+            move || storage.process_ocr_delete_queue_batch(OCR_BATCH_SIZE)
+        })
+        .await
+        {
+            Ok(Ok(count)) => count,
+            Ok(Err(e)) => {
+                tracing::warn!("[DELETE_QUEUE] OCR batch cleanup failed: {}", e);
+                0
+            }
+            Err(e) => {
+                tracing::warn!("[DELETE_QUEUE] OCR cleanup join error: {:?}", e);
+                0
+            }
+        };
+
+        let screenshot_candidates = match tokio::task::spawn_blocking({
+            let storage = storage.clone();
+            move || storage.fetch_screenshot_delete_candidates(SCREENSHOT_BATCH_SIZE)
+        })
+        .await
+        {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => {
+                tracing::warn!("[DELETE_QUEUE] Screenshot queue read failed: {}", e);
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!("[DELETE_QUEUE] Screenshot queue join error: {:?}", e);
+                Vec::new()
+            }
+        };
+
+        let mut finalized_screenshots = 0usize;
+        if !screenshot_candidates.is_empty() {
+            let image_hashes: Vec<String> = screenshot_candidates
+                .iter()
+                .map(|item| item.image_hash.clone())
+                .collect();
+
+            if !image_hashes.is_empty() {
+                let monitor_state = app_handle.state::<MonitorState>();
+                let payload = serde_json::json!({
+                    "command": "delete_by_time_range",
+                    "image_hashes": image_hashes,
+                });
+                if let Err(e) = monitor::forward_command_to_python(&monitor_state, payload).await {
+                    tracing::warn!("[DELETE_QUEUE] Vector cleanup failed: {}", e);
+                }
+            }
+
+            let data_dir = storage
+                .data_dir
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+
+            for item in &screenshot_candidates {
+                let path = std::path::Path::new(&item.image_path);
+                let abs_path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    data_dir.join(path)
+                };
+
+                if let Err(e) = std::fs::remove_file(&abs_path) {
+                    let not_found = e.kind() == std::io::ErrorKind::NotFound;
+                    if !not_found {
+                        tracing::debug!(
+                            "[DELETE_QUEUE] Failed to remove image file {}: {}",
+                            abs_path.display(),
+                            e
+                        );
+                    }
+                }
+
+                let thumb_path = StorageState::thumbnail_path_for(&abs_path);
+                if let Err(e) = std::fs::remove_file(&thumb_path) {
+                    let not_found = e.kind() == std::io::ErrorKind::NotFound;
+                    if !not_found {
+                        tracing::debug!(
+                            "[DELETE_QUEUE] Failed to remove thumbnail {}: {}",
+                            thumb_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+
+            let ids: Vec<i64> = screenshot_candidates.iter().map(|item| item.id).collect();
+            finalized_screenshots = match tokio::task::spawn_blocking({
+                let storage = storage.clone();
+                move || storage.finalize_screenshot_delete_batch(&ids)
+            })
+            .await
+            {
+                Ok(Ok(count)) => count,
+                Ok(Err(e)) => {
+                    tracing::warn!("[DELETE_QUEUE] Screenshot finalize failed: {}", e);
+                    0
+                }
+                Err(e) => {
+                    tracing::warn!("[DELETE_QUEUE] Screenshot finalize join error: {:?}", e);
+                    0
+                }
+            };
+        }
+
+        let vacuum_ran = match tokio::task::spawn_blocking({
+            let storage = storage.clone();
+            move || storage.run_incremental_vacuum_if_idle(500, 500)
+        })
+        .await
+        {
+            Ok(Ok(ran)) => ran,
+            Ok(Err(e)) => {
+                tracing::warn!("[DELETE_QUEUE] incremental_vacuum check failed: {}", e);
+                false
+            }
+            Err(e) => {
+                tracing::warn!("[DELETE_QUEUE] incremental_vacuum join error: {:?}", e);
+                false
+            }
+        };
+
+        if ocr_processed > 0 || finalized_screenshots > 0 || vacuum_ran {
+            tracing::info!(
+                "[DELETE_QUEUE] cycle complete: ocr_processed={}, screenshots_finalized={}, vacuum_ran={}",
+                ocr_processed,
+                finalized_screenshots,
+                vacuum_ran
+            );
+        }
+    }
+}
+
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let app_handle = app.handle().clone();
 
@@ -252,6 +398,11 @@ pub fn run() {
                         std::thread::spawn(move || {
                             StorageState::backfill_plaintext_process_names(storage_clone);
                         });
+
+                        let app_handle_cleanup = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            run_delete_queue_maintenance_loop(app_handle_cleanup).await;
+                        });
                     }
                 } else {
                     tracing::error!("Storage initialization deferred: public key unavailable");
@@ -357,6 +508,11 @@ pub fn run() {
             commands::storage::storage_delete_screenshot,
             commands::storage::storage_delete_by_time_range,
             commands::storage::storage_list_processes,
+            commands::storage::storage_get_process_stats,
+            commands::storage::storage_get_process_monthly_thumbnails,
+            commands::storage::storage_soft_delete,
+            commands::storage::storage_soft_delete_screenshots,
+            commands::storage::storage_get_delete_queue_status,
             commands::storage::storage_save_screenshot,
             commands::storage::storage_set_policy,
             commands::storage::storage_get_policy,

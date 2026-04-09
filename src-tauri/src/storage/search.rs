@@ -120,7 +120,10 @@ impl StorageState {
         let category_screenshot_ids: Option<std::collections::HashSet<i64>> = match &categories {
             Some(cats) if !cats.is_empty() => {
                 let placeholders = cats.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
-                let sql = format!("SELECT id FROM screenshots WHERE category IN ({})", placeholders);
+                let sql = format!(
+                    "SELECT id FROM screenshots WHERE is_deleted = 0 AND category IN ({})",
+                    placeholders
+                );
                 let cat_params: Vec<&dyn rusqlite::ToSql> = cats.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
                 let mut stmt = conn.prepare(&sql).map_err(|e| format!("Failed to query category filter: {}", e))?;
                 let ids: std::collections::HashSet<i64> = stmt
@@ -212,7 +215,7 @@ impl StorageState {
                                 let placeholders =
                                     chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
                                 let sql = format!(
-                                    "SELECT DISTINCT screenshot_id FROM ocr_results WHERE id IN ({})",
+                                    "SELECT DISTINCT screenshot_id FROM ocr_results WHERE id IN ({}) AND is_deleted = 0",
                                     placeholders
                                 );
                                 let params: Vec<&dyn rusqlite::ToSql> = chunk
@@ -276,7 +279,10 @@ impl StorageState {
                             for chunk in ids.chunks(500) {
                                 if filtered_ids.len() >= needed { break; }
                                 let placeholders = chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
-                                let sql = format!("SELECT id, screenshot_id FROM ocr_results WHERE id IN ({})", placeholders);
+                                let sql = format!(
+                                    "SELECT id, screenshot_id FROM ocr_results WHERE id IN ({}) AND is_deleted = 0",
+                                    placeholders
+                                );
                                 let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
                                 let mut stmt = conn.prepare(&sql).map_err(|e| format!("Failed to filter by category: {}", e))?;
                                 let mut chunk_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
@@ -324,8 +330,10 @@ impl StorageState {
                                     s.category
                              FROM ocr_results r
                              JOIN screenshots s ON r.screenshot_id = s.id
-                             WHERE s.id IN ({})
-                               AND r.id = (SELECT MAX(r2.id) FROM ocr_results r2 WHERE r2.screenshot_id = s.id)
+                                                         WHERE s.id IN ({})
+                                                             AND s.is_deleted = 0
+                                                             AND r.is_deleted = 0
+                                                             AND r.id = (SELECT MAX(r2.id) FROM ocr_results r2 WHERE r2.screenshot_id = s.id AND r2.is_deleted = 0)
                              ORDER BY s.created_at DESC",
                             placeholders.join(",")
                         )
@@ -340,7 +348,9 @@ impl StorageState {
                                     s.category
                              FROM ocr_results r
                              JOIN screenshots s ON r.screenshot_id = s.id
-                             WHERE r.id IN ({})
+                                                         WHERE r.id IN ({})
+                                                             AND r.is_deleted = 0
+                                                             AND s.is_deleted = 0
                              ORDER BY s.created_at DESC, r.id DESC",
                             placeholders.join(",")
                         )
@@ -528,7 +538,10 @@ impl StorageState {
                  JOIN screenshots s ON r.screenshot_id = s.id",
             );
 
-            let mut where_clauses: Vec<String> = Vec::new();
+            let mut where_clauses: Vec<String> = vec![
+                "s.is_deleted = 0".to_string(),
+                "r.is_deleted = 0".to_string(),
+            ];
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
             if let Some(start) = start_time {
@@ -780,7 +793,7 @@ impl StorageState {
                     let placeholders =
                         chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
                     let sql = format!(
-                        "SELECT DISTINCT screenshot_id FROM ocr_results WHERE id IN ({})",
+                        "SELECT DISTINCT screenshot_id FROM ocr_results WHERE id IN ({}) AND is_deleted = 0",
                         placeholders
                     );
                     let params: Vec<&dyn rusqlite::ToSql> =
@@ -845,8 +858,10 @@ impl StorageState {
                         s.category
                  FROM ocr_results r
                  JOIN screenshots s ON r.screenshot_id = s.id
-                 WHERE s.id IN ({})
-                   AND r.id = (SELECT MAX(r2.id) FROM ocr_results r2 WHERE r2.screenshot_id = s.id)
+                                 WHERE s.id IN ({})
+                                     AND s.is_deleted = 0
+                                     AND r.is_deleted = 0
+                                     AND r.id = (SELECT MAX(r2.id) FROM ocr_results r2 WHERE r2.screenshot_id = s.id AND r2.is_deleted = 0)
                  ORDER BY s.created_at DESC",
                 placeholders
             );
@@ -1046,7 +1061,10 @@ impl StorageState {
             for chunk in ids.chunks(500) {
                 if filtered_ids.len() >= needed { break; }
                 let placeholders = chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
-                let sql = format!("SELECT id, screenshot_id FROM ocr_results WHERE id IN ({})", placeholders);
+                let sql = format!(
+                    "SELECT id, screenshot_id FROM ocr_results WHERE id IN ({}) AND is_deleted = 0",
+                    placeholders
+                );
                 let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
                 let mut stmt = conn.prepare(&sql).map_err(|e| format!("Failed to filter by category: {}", e))?;
                 let mut chunk_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
@@ -1091,7 +1109,9 @@ impl StorageState {
                     s.category
              FROM ocr_results r
              JOIN screenshots s ON r.screenshot_id = s.id
-             WHERE r.id IN ({})
+                         WHERE r.id IN ({})
+                             AND r.is_deleted = 0
+                             AND s.is_deleted = 0
              ORDER BY s.created_at DESC, r.id DESC",
             placeholders.join(",")
         );

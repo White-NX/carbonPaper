@@ -902,7 +902,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
             })()}
             
             <div className="absolute top-0 bottom-0 left-1/2 w-px bg-ide-accent opacity-50 pointer-events-none z-0"></div>
-            
+
              {/* Timeline Toolbar */}
             <div className="absolute bottom-2 right-2 flex items-center gap-1 z-50">
                 {toolbarExpanded && (

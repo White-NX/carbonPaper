@@ -414,6 +414,79 @@ pub async fn storage_list_processes(
 }
 
 #[tauri::command]
+pub async fn storage_get_process_stats(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<Vec<storage::ProcessStorageStat>, String> {
+    check_auth_required(&credential_state)?;
+
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || state.get_process_stats())
+        .await
+        .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+#[tauri::command]
+pub async fn storage_get_process_monthly_thumbnails(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    process_name: String,
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<storage::ProcessMonthlyThumbnailPage, String> {
+    check_auth_required(&credential_state)?;
+
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        state.get_process_monthly_thumbnails(&process_name, page.unwrap_or(0), page_size.unwrap_or(60))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+#[tauri::command]
+pub async fn storage_soft_delete(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    process_name: String,
+    month: Option<String>,
+) -> Result<storage::SoftDeleteResult, String> {
+    check_auth_required(&credential_state)?;
+
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || state.soft_delete_process_month(&process_name, month.as_deref()))
+        .await
+        .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+#[tauri::command]
+pub async fn storage_soft_delete_screenshots(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    screenshot_ids: Vec<i64>,
+) -> Result<storage::SoftDeleteScreenshotsResult, String> {
+    check_auth_required(&credential_state)?;
+
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || state.soft_delete_screenshots(&screenshot_ids))
+        .await
+        .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+#[tauri::command]
+pub async fn storage_get_delete_queue_status(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<storage::DeleteQueueStatus, String> {
+    check_auth_required(&credential_state)?;
+
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || state.get_delete_queue_status())
+        .await
+        .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+#[tauri::command]
 pub async fn storage_save_screenshot(
     state: tauri::State<'_, Arc<StorageState>>,
     request: storage::SaveScreenshotRequest,

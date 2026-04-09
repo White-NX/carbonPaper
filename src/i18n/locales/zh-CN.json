@@ -200,6 +200,7 @@
         "error_default": "迁移出错",
         "copying": "正在拷贝文件: {{copied}}/{{total}}",
         "current_file": "当前文件: {{file}}",
+        "completed": "完成",
         "cancel": "取消",
         "upgrading": "正在构建安全索引...",
         "background_tip": "您可以放心关闭此窗口。升级将在后台继续进行，搜索结果将随进度逐渐恢复。",
@@ -207,6 +208,37 @@
         "indexing_detailed": "正在构建安全索引: {{processed}} / {{total}}",
         "search_unavailable_title": "搜索功能受限",
         "search_unavailable_desc": "数据库正在进行安全升级，搜索索引正在重建中。在此期间，搜索结果可能不完整或暂时不可用。升级完成后将自动恢复。"
+      },
+      "deleteConfirm": {
+        "title": "确认删除",
+        "messageSelected": "确认删除已选择的 {{count}} 个快照吗？该操作会立即隐藏数据，后台会异步清理。",
+        "messageMonth": "确认删除 {{processName}} 在 {{month}} 的快照吗？该操作会立即隐藏数据，后台会异步清理。",
+        "messageProcess": "确认删除 {{processName}} 的全部快照吗？该操作会立即隐藏数据，后台会异步清理。",
+        "confirmDefault": "删除",
+        "cancel": "取消"
+      },
+      "processDetails": {
+        "title": "按进程存储详情",
+        "description": "查看进程占比、按月缩略图，选择并删除",
+        "distributionTitle": "进程分布",
+        "totalScreenshots": "总计 {{count}} 张快照",
+        "noStats": "暂无进程统计数据",
+        "unknownProcess": "未知进程",
+        "others": "其他",
+        "itemSummary": "{{count}} 张 · {{percent}}%",
+        "queueRunning": "后台清理中：OCR {{ocr}} 条，截图 {{screenshots}} 条",
+        "back": "返回",
+        "detailSubtitle": "按月缩略图分页",
+        "deleteProcess": "删除该进程快照",
+        "deleteMonth": "删除本月快照",
+        "deleteSelected": "删除 {{count}} 个快照",
+        "deleting": "处理中",
+        "loading": "加载中...",
+        "empty": "该进程暂无可展示快照",
+        "selected": "已选",
+        "prevPage": "上一页",
+        "page": "第 {{page}} 页",
+        "nextPage": "下一页"
       }
     },
     "storage": {
@@ -472,7 +504,12 @@
     "noContents": "无内容",
     "noTextContent": "无文本内容",
     "unknownProcess": "未知进程",
-    "matchScore": "匹配分数"
+    "matchScore": "匹配分数",
+    "task": {
+      "summaryPlaceholder": "清理任务进行中 ({{progress}}%)",
+      "runningTitle": "后台清理任务正在运行",
+      "runningDesc": "当前进度 {{progress}}%，待处理 OCR {{ocr}} 条，截图 {{screenshots}} 条。"
+    }
   },
   "sidebar": {
     "details": {
