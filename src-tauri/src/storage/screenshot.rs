@@ -1603,17 +1603,14 @@ impl StorageState {
             }
         }
 
-        let mut hard_deleted = 0usize;
         for chunk in queue_ids.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
             let sql_delete_ocr = format!("DELETE FROM ocr_results WHERE id IN ({})", placeholders);
             let params_ocr: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-            let deleted = tx
-                .execute(&sql_delete_ocr, params_ocr.as_slice())
+            tx.execute(&sql_delete_ocr, params_ocr.as_slice())
                 .map_err(|e| format!("Failed to hard-delete OCR rows: {}", e))?;
-            hard_deleted += deleted;
 
             let sql_delete_queue =
                 format!("DELETE FROM delete_queue_ocr WHERE id IN ({})", placeholders);
@@ -1625,14 +1622,8 @@ impl StorageState {
 
         tx.commit()
             .map_err(|e| format!("Failed to commit OCR cleanup: {}", e))?;
-
-        if hard_deleted > 0 {
-            let _ = self
-                .ocr_row_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(hard_deleted as u64))
-                });
-        }
+        // `ocr_row_count` is adjusted on soft-delete when rows become inactive.
+        // Hard-delete queue processing is physical cleanup only and must not decrement again.
 
         Ok(queue_ids.len())
     }
