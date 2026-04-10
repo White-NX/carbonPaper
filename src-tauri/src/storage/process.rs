@@ -2,7 +2,9 @@
 
 use crate::credential_manager::{decrypt_row_key_with_cng, decrypt_with_master_key};
 
-use super::StorageState;
+use super::{
+    ProcessMonthlyThumbnailItem, ProcessMonthlyThumbnailPage, ProcessStorageStat, StorageState,
+};
 
 impl StorageState {
     /// List distinct process names with counts (two-phase: SQL aggregation + offline decryption).
@@ -22,7 +24,8 @@ impl StorageState {
             let mut stmt = conn
                 .prepare(
                     "SELECT process_name, COUNT(*) FROM screenshots
-                 WHERE process_name IS NOT NULL AND process_name != ''
+                                 WHERE is_deleted = 0
+                                     AND process_name IS NOT NULL AND process_name != ''
                  GROUP BY process_name",
                 )
                 .map_err(|e| format!("Failed to prepare query: {}", e))?;
@@ -39,7 +42,9 @@ impl StorageState {
             let mut enc_stmt = conn
                 .prepare(
                     "SELECT process_name_enc, content_key_encrypted FROM screenshots
-                 WHERE process_name IS NULL AND process_name_enc IS NOT NULL",
+                                 WHERE is_deleted = 0
+                                     AND process_name IS NULL
+                                     AND process_name_enc IS NOT NULL",
                 )
                 .map_err(|e| format!("Failed to prepare enc query: {}", e))?;
             let enc_rows: Vec<_> = enc_stmt
@@ -107,5 +112,94 @@ impl StorageState {
         }
 
         Ok(results)
+    }
+
+    /// Get screenshot count stats by process with percentage distribution.
+    pub fn get_process_stats(&self) -> Result<Vec<ProcessStorageStat>, String> {
+        let grouped = self.list_distinct_processes()?;
+        let total: i64 = grouped.iter().map(|(_, count)| *count).sum();
+
+        let stats = grouped
+            .into_iter()
+            .map(|(process_name, screenshot_count)| {
+                let percentage = if total > 0 {
+                    (screenshot_count as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                ProcessStorageStat {
+                    process_name,
+                    screenshot_count,
+                    percentage,
+                }
+            })
+            .collect();
+
+        Ok(stats)
+    }
+
+    /// Get paged screenshot thumbnails for a process, annotated with month key (YYYY-MM).
+    pub fn get_process_monthly_thumbnails(
+        &self,
+        process_name: &str,
+        page: i64,
+        page_size: i64,
+    ) -> Result<ProcessMonthlyThumbnailPage, String> {
+        let safe_page = page.max(0);
+        let safe_page_size = page_size.clamp(1, 200);
+        let offset = safe_page * safe_page_size;
+
+        let guard = self.get_connection_named("get_process_monthly_thumbnails")?;
+        let conn = guard.as_ref().unwrap();
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM screenshots WHERE is_deleted = 0 AND process_name = ?1",
+                [process_name],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to count process screenshots: {}", e))?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, image_path, created_at, strftime('%s', created_at) AS ts, strftime('%Y-%m', created_at) AS month_key
+                 FROM screenshots
+                 WHERE is_deleted = 0 AND process_name = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(|e| format!("Failed to prepare monthly thumbnails query: {}", e))?;
+
+        let items: Vec<ProcessMonthlyThumbnailItem> = stmt
+            .query_map([&process_name as &dyn rusqlite::ToSql, &safe_page_size, &offset], |row| {
+                let ts_raw: Option<String> = row.get(3)?;
+                let timestamp = ts_raw.and_then(|v| v.parse::<i64>().ok());
+                Ok(ProcessMonthlyThumbnailItem {
+                    screenshot_id: row.get(0)?,
+                    image_path: row.get(1)?,
+                    created_at: row.get(2)?,
+                    timestamp,
+                    month: row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "unknown".to_string()),
+                })
+            })
+            .map_err(|e| format!("Failed to execute monthly thumbnails query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let next_page = if (offset + items.len() as i64) < total {
+            Some(safe_page + 1)
+        } else {
+            None
+        };
+
+        Ok(ProcessMonthlyThumbnailPage {
+            process_name: process_name.to_string(),
+            page: safe_page,
+            page_size: safe_page_size,
+            total,
+            items,
+            next_page,
+        })
     }
 }

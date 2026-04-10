@@ -19,7 +19,7 @@ impl StorageState {
                 // 旧数据兼容：从 memory:// 中提取 hash 查找
                 let result: Option<(Option<Vec<u8>>, String)> = conn
                     .query_row(
-                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ?",
+                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ? AND is_deleted = 0",
                         [hash],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
@@ -32,7 +32,7 @@ impl StorageState {
                 // 正常路径查找（原有逻辑）
                 let key: Option<Vec<u8>> = conn
                     .query_row(
-                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ?",
+                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ? AND is_deleted = 0",
                         [path],
                         |row| row.get(0),
                     )
@@ -95,7 +95,7 @@ impl StorageState {
             if let Some(hash) = path.strip_prefix("memory://") {
                 let result: Option<(Option<Vec<u8>>, String)> = conn
                     .query_row(
-                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ?",
+                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ? AND is_deleted = 0",
                         [hash],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
@@ -107,7 +107,7 @@ impl StorageState {
             } else {
                 let key: Option<Vec<u8>> = conn
                     .query_row(
-                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ?",
+                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ? AND is_deleted = 0",
                         [path],
                         |row| row.get(0),
                     )
@@ -168,7 +168,7 @@ impl StorageState {
             if let Some(hash) = path.strip_prefix("memory://") {
                 let result: Option<(Option<Vec<u8>>, String)> = conn
                     .query_row(
-                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ?",
+                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ? AND is_deleted = 0",
                         [hash],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
@@ -180,7 +180,7 @@ impl StorageState {
             } else {
                 let key: Option<Vec<u8>> = conn
                     .query_row(
-                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ?",
+                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ? AND is_deleted = 0",
                         [path],
                         |row| row.get(0),
                     )
@@ -236,7 +236,7 @@ impl StorageState {
             for chunk in ids.chunks(500) {
                 let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
                 let sql = format!(
-                    "SELECT id, image_path FROM screenshots WHERE id IN ({})",
+                    "SELECT id, image_path FROM screenshots WHERE is_deleted = 0 AND id IN ({})",
                     placeholders.join(",")
                 );
                 let params: Vec<&dyn rusqlite::ToSql> = chunk
@@ -319,7 +319,7 @@ impl StorageState {
             for chunk in paths.chunks(500) {
                 let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
                 let sql = format!(
-                    "SELECT image_path, content_key_encrypted FROM screenshots WHERE image_path IN ({})",
+                    "SELECT image_path, content_key_encrypted FROM screenshots WHERE is_deleted = 0 AND image_path IN ({})",
                     placeholders.join(",")
                 );
                 let params: Vec<&dyn rusqlite::ToSql> = chunk

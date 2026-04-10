@@ -345,6 +345,60 @@ export const listProcesses = async () => {
     }
 };
 
+export const getProcessStorageStats = async () => {
+    try {
+        return await withAuth(async () => {
+            const stats = await invoke('storage_get_process_stats');
+            return stats || [];
+        });
+    } catch (e) {
+        console.error('Failed to get process storage stats', e);
+        return [];
+    }
+};
+
+export const getProcessMonthlyThumbnails = async (processName, page = 0, pageSize = 60) => {
+    return withAuth(async () => {
+        const response = await invoke('storage_get_process_monthly_thumbnails', {
+            processName,
+            page,
+            pageSize,
+        });
+        return response || null;
+    });
+};
+
+export const softDeleteProcessMonth = async (processName, month = null) => {
+    return withAuth(async () => {
+        const response = await invoke('storage_soft_delete', {
+            processName,
+            month,
+        });
+        return response;
+    });
+};
+
+export const softDeleteScreenshots = async (screenshotIds = []) => {
+    return withAuth(async () => {
+        const response = await invoke('storage_soft_delete_screenshots', {
+            screenshotIds,
+        });
+        return response;
+    });
+};
+
+export const getSoftDeleteQueueStatus = async () => {
+    try {
+        return await withAuth(async () => {
+            const status = await invoke('storage_get_delete_queue_status');
+            return status || { pending_screenshots: 0, pending_ocr: 0, running: false };
+        });
+    } catch (e) {
+        console.warn('Failed to get soft delete queue status', e);
+        return { pending_screenshots: 0, pending_ocr: 0, running: false };
+    }
+};
+
 export const getScreenshotDetails = async (id, path = null) => {
     try {
         // 直接使用 Rust 存储层 API

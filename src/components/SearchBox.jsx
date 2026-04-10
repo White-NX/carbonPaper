@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Image as ImageIcon, Type, Loader2, X, ChevronDown } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { searchScreenshots, fetchThumbnailBatch, fetchImage } from '../lib/monitor_api';
+import { searchScreenshots, fetchThumbnailBatch, fetchImage, getSoftDeleteQueueStatus } from '../lib/monitor_api';
 
 // Simple debounce hook
 function useDebounce(value, delay) {
@@ -119,6 +119,27 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     };
 
     const [isMigrating, setIsMigrating] = useState(false);
+    const [deleteQueueStatus, setDeleteQueueStatus] = useState({
+        pending_screenshots: 0,
+        pending_ocr: 0,
+        running: false,
+    });
+    const [deleteQueuePeak, setDeleteQueuePeak] = useState(0);
+
+    const pendingDeleteTotal = Number(deleteQueueStatus?.pending_ocr || 0) + Number(deleteQueueStatus?.pending_screenshots || 0);
+    const hasDeleteTask = Boolean(deleteQueueStatus?.running) || pendingDeleteTotal > 120;
+    const deleteProgress = (() => {
+        if (!hasDeleteTask) return 0;
+        if (pendingDeleteTotal <= 0) return 100;
+        if (deleteQueuePeak <= 0) return 0;
+        const ratio = ((deleteQueuePeak - pendingDeleteTotal) / deleteQueuePeak) * 100;
+        return Math.max(0, Math.min(100, ratio));
+    })();
+    const progressFillPercent = hasDeleteTask
+        ? (deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress))
+        : 0;
+
+    const taskSummaryPlaceholder = t('search.task.summaryPlaceholder', { progress: Math.round(deleteProgress) });
 
     // Active detection: check on mount and listen for progress events
     useEffect(() => {
@@ -152,6 +173,37 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         };
     }, []);
 
+    useEffect(() => {
+        let cancelled = false;
+        const loadQueueStatus = async () => {
+            try {
+                const status = await getSoftDeleteQueueStatus();
+                if (cancelled) return;
+                setDeleteQueueStatus(status || { pending_screenshots: 0, pending_ocr: 0, running: false });
+            } catch {
+                if (cancelled) return;
+                setDeleteQueueStatus({ pending_screenshots: 0, pending_ocr: 0, running: false });
+            }
+        };
+
+        loadQueueStatus();
+        const timer = setInterval(loadQueueStatus, 4000);
+        return () => {
+            cancelled = true;
+            clearInterval(timer);
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!hasDeleteTask) {
+            setDeleteQueuePeak(0);
+            return;
+        }
+        if (pendingDeleteTotal > 0) {
+            setDeleteQueuePeak((prev) => Math.max(prev, pendingDeleteTotal));
+        }
+    }, [hasDeleteTask, pendingDeleteTotal]);
+
     return (
         <div 
             className="relative w-[450px] z-50 pointer-events-auto" 
@@ -159,8 +211,14 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             onClick={(e) => e.stopPropagation()}
             data-keep-selection="true"
         >
-            <div className="flex items-center bg-ide-panel rounded-md border border-ide-border focus-within:border-ide-accent focus-within:ring-1 focus-within:ring-ide-accent transition-all shadow-sm">
-                <div className="relative flex items-center border-r border-ide-border mr-2">
+            <div className="relative flex items-center bg-ide-panel rounded-md border border-ide-border focus-within:border-ide-accent focus-within:ring-1 focus-within:ring-ide-accent transition-all shadow-sm overflow-hidden">
+                {hasDeleteTask && (
+                    <div
+                        className="pointer-events-none absolute inset-y-0 left-0 bg-sky-500/35 dark:bg-sky-400/20 transition-all duration-500"
+                        style={{ width: `${progressFillPercent}%` }}
+                    />
+                )}
+                <div className="relative z-10 flex items-center border-r border-ide-border mr-2">
                 <button
                     className={`p-2 text-ide-muted hover:text-ide-text transition-colors ${backendOnline === false && mode === 'ocr' ? 'opacity-50 cursor-not-allowed' : ''}`}
                     onClick={() => { if (backendOnline === false && mode === 'ocr') return; userInteractionRef.current = true; setMode(mode === 'ocr' ? 'nl' : 'ocr'); }}
@@ -208,8 +266,8 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             <input
                 ref={inputRef}
                 type="text"
-                className="bg-transparent border-none outline-none text-ide-text text-sm w-full h-8 px-3 placeholder-ide-muted"
-                placeholder={mode === 'ocr' ? t('search.placeholder.ocr') : t('search.placeholder.nl')}
+                className="relative z-10 bg-transparent border-none outline-none text-ide-text text-sm w-full h-8 px-3 placeholder-ide-muted"
+                placeholder={hasDeleteTask ? taskSummaryPlaceholder : (mode === 'ocr' ? t('search.placeholder.ocr') : t('search.placeholder.nl'))}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onFocus={() => setShowResults(true)}
@@ -224,10 +282,10 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 }}
             />
             {loading ? (
-                <Loader2 size={16} className="animate-spin text-ide-muted mr-2" />
+                <Loader2 size={16} className="relative z-10 animate-spin text-ide-muted mr-2" />
             ) : (
                 query && (
-                    <button onClick={() => setQuery('')} className="p-1 mr-2 text-ide-muted hover:text-ide-text">
+                    <button onClick={() => setQuery('')} className="relative z-10 p-1 mr-2 text-ide-muted hover:text-ide-text">
                         <X size={14} />
                     </button>
                 )
@@ -236,6 +294,21 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
 
             {showResults && (
                 <div className="absolute top-full mt-2 w-[450px] bg-ide-panel border border-ide-border rounded-lg shadow-2xl overflow-hidden max-h-[600px] flex flex-col">
+                    {hasDeleteTask && (
+                        <div className="p-3 bg-sky-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">
+                            <div className="flex items-center gap-2 text-sky-500 text-sm font-bold">
+                                <Loader2 size={14} className="animate-spin" />
+                                {t('search.task.runningTitle')}
+                            </div>
+                            <div className="text-xs text-ide-muted leading-relaxed">
+                                {t('search.task.runningDesc', {
+                                    progress: Math.round(deleteProgress),
+                                    ocr: deleteQueueStatus.pending_ocr || 0,
+                                    screenshots: deleteQueueStatus.pending_screenshots || 0,
+                                })}
+                            </div>
+                        </div>
+                    )}
                     {isMigrating && (
                         <div className="p-3 bg-yellow-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">
                             <div className="flex items-center gap-2 text-yellow-500 text-sm font-bold">
@@ -275,6 +348,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
 }
 
 function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
+    const { t } = useTranslation();
     const [imgSrc, setImgSrc] = useState(preloadedSrc);
     const [loadFailed, setLoadFailed] = useState(false);
 
@@ -310,7 +384,7 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
     // Highlighting logic for OCR
     const renderOCRText = () => {
         const text = mode === 'nl' ? item.ocr_text : item.text;
-        if (!text) return <span className="text-ide-muted italic">No text content</span>;
+        if (!text) return <span className="text-ide-muted italic">{t('search.noTextContent')}</span>;
 
         if (mode === 'nl') {
             return <span className="text-ide-muted font-light">{text.length > 150 ? text.substring(0, 150) + '...' : text}</span>;
@@ -360,7 +434,7 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
             </div>
             <div className="flex-1 min-w-0 flex flex-col gap-1 py-0.5">
                 <div className="text-sm text-ide-text truncate font-bold flex items-baseline">
-                    <span className="text-ide-accent mr-2">{processName || 'Unknown Process'}</span>
+                    <span className="text-ide-accent mr-2">{processName || t('search.unknownProcess')}</span>
                 </div>
                 {windowTitle && (
                     <div className="text-xs text-ide-muted truncate mb-1">
@@ -372,7 +446,7 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
                 </div>
                 {mode === 'nl' && (
                     <div className="text-[10px] text-ide-muted mt-auto pt-1">
-                        Match Score: {(item.similarity || 0).toFixed(2)}
+                        {t('search.matchScore')}: {(item.similarity || 0).toFixed(2)}
                     </div>
                 )}
             </div>

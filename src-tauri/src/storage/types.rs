@@ -292,6 +292,75 @@ pub struct DensityBucket {
     pub count: i64,
 }
 
+/// Storage statistics grouped by process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessStorageStat {
+    pub process_name: String,
+    pub screenshot_count: i64,
+    pub percentage: f64,
+}
+
+/// A lightweight screenshot record for process/month archive views.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessMonthlyThumbnailItem {
+    pub screenshot_id: i64,
+    pub image_path: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<i64>,
+    pub month: String,
+}
+
+/// Paged response for process/month screenshot thumbnails.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessMonthlyThumbnailPage {
+    pub process_name: String,
+    pub page: i64,
+    pub page_size: i64,
+    pub total: i64,
+    pub items: Vec<ProcessMonthlyThumbnailItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_page: Option<i64>,
+}
+
+/// Soft delete enqueue result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoftDeleteResult {
+    pub process_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub month: Option<String>,
+    pub screenshots_marked: i64,
+    pub ocr_marked: i64,
+    pub queued_screenshots: i64,
+    pub queued_ocr: i64,
+}
+
+/// Soft delete enqueue result for selected screenshot IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoftDeleteScreenshotsResult {
+    pub requested: i64,
+    pub screenshots_marked: i64,
+    pub ocr_marked: i64,
+    pub queued_screenshots: i64,
+    pub queued_ocr: i64,
+}
+
+/// Background delete queue status for UI polling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteQueueStatus {
+    pub pending_screenshots: i64,
+    pub pending_ocr: i64,
+    pub running: bool,
+}
+
+/// Internal batch row for screenshot queue processing.
+#[derive(Debug, Clone)]
+pub struct QueueScreenshotCandidate {
+    pub id: i64,
+    pub image_hash: String,
+    pub image_path: String,
+}
+
 /// Migration statistics result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationResult {

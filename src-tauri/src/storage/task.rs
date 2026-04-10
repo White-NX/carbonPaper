@@ -237,7 +237,7 @@ impl StorageState {
                      s.window_title_enc, s.process_name_enc, s.content_key_encrypted \
                      FROM task_assignments ta \
                      JOIN screenshots s ON s.id = ta.screenshot_id \
-                     WHERE ta.task_id = ? \
+                     WHERE ta.task_id = ? AND s.is_deleted = 0 \
                      ORDER BY s.created_at DESC \
                      LIMIT ? OFFSET ?",
                 )
@@ -316,8 +316,9 @@ impl StorageState {
             .query_row(
                 "SELECT t.id, t.label, t.auto_label \
                  FROM task_assignments ta \
+                 JOIN screenshots s ON s.id = ta.screenshot_id \
                  JOIN tasks t ON t.id = ta.task_id \
-                 WHERE ta.screenshot_id = ? \
+                 WHERE ta.screenshot_id = ? AND s.is_deleted = 0 \
                  LIMIT 1",
                 params![screenshot_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -346,7 +347,7 @@ impl StorageState {
                      s.window_title_enc, s.process_name_enc, s.content_key_encrypted \
                      FROM task_assignments ta \
                      JOIN screenshots s ON s.id = ta.screenshot_id \
-                     WHERE ta.task_id = ? AND ta.screenshot_id != ? \
+                     WHERE ta.task_id = ? AND ta.screenshot_id != ? AND s.is_deleted = 0 \
                      ORDER BY s.created_at DESC \
                      LIMIT ?",
                 )

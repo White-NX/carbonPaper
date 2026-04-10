@@ -18,7 +18,7 @@ export function CategoryBadge({ category }) {
   );
 }
 
-export function ThumbnailCard({ item, onSelect, preloadedSrc = null }) {
+export function ThumbnailCard({ item, onSelect, preloadedSrc = null, footerText = null, footerPersistent = false }) {
   const { t } = useTranslation();
   const [imageSrc, setImageSrc] = useState(preloadedSrc);
   const [loadingImage, setLoadingImage] = useState(!preloadedSrc);
@@ -50,6 +50,8 @@ export function ThumbnailCard({ item, onSelect, preloadedSrc = null }) {
   const processName = item.process_name || item.metadata?.process_name;
   const similarity = item.similarity;
   const categoryValue = item.category || item.metadata?.category || null;
+  const footerPrimary = footerText || processName || t('advancedSearch.unknown');
+  const overlayVisibilityClass = footerPersistent ? 'opacity-100' : 'opacity-0 group-hover:opacity-100';
 
   const normalizedItem = {
     ...item,
@@ -59,7 +61,7 @@ export function ThumbnailCard({ item, onSelect, preloadedSrc = null }) {
 
   return (
     <button
-      className="group relative aspect-video overflow-hidden rounded border
+      className="group relative block w-full aspect-video overflow-hidden rounded border
                  border-ide-border bg-ide-panel hover:border-ide-accent/70
                  transition focus-visible:outline-none focus-visible:ring-2
                  focus-visible:ring-ide-accent/60"
@@ -84,11 +86,9 @@ export function ThumbnailCard({ item, onSelect, preloadedSrc = null }) {
           <CategoryBadge category={categoryValue} />
         </div>
       )}
-      <div className="pointer-events-none absolute inset-0 flex flex-col justify-end
-                      bg-gradient-to-t from-black/60 to-transparent opacity-0
-                      transition group-hover:opacity-100 p-2">
-        <span className="text-xs text-white font-semibold truncate">{processName || t('advancedSearch.unknown')}</span>
-        {similarity !== undefined && (
+      <div className={`pointer-events-none absolute inset-0 flex flex-col justify-end bg-gradient-to-t from-black/60 to-transparent transition p-2 ${overlayVisibilityClass}`}>
+        <span className="text-xs text-white font-semibold truncate">{footerPrimary}</span>
+        {similarity !== undefined && !footerPersistent && (
             <span className="text-[10px] text-white/80">
             {t('advancedSearch.similarity', { score: similarity.toFixed(2) })}
           </span>

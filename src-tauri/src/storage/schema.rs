@@ -125,7 +125,9 @@ impl StorageState {
                 window_title_enc BLOB,
                 process_name_enc BLOB,
                 metadata_enc BLOB,
-                content_key_encrypted BLOB
+                content_key_encrypted BLOB,
+                -- Soft delete marker (1 = pending physical cleanup)
+                is_deleted INTEGER NOT NULL DEFAULT 0
             );
 
             -- OCR results
@@ -142,7 +144,17 @@ impl StorageState {
                 box_x3 REAL, box_y3 REAL,
                 box_x4 REAL, box_y4 REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_deleted INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
+            );
+
+            -- Deferred physical cleanup queues
+            CREATE TABLE IF NOT EXISTS delete_queue_screenshots (
+                id INTEGER PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS delete_queue_ocr (
+                id INTEGER PRIMARY KEY
             );
 
             -- Blind bigram bitmap index table (stores postings as RoaringBitmap)
@@ -335,12 +347,14 @@ impl StorageState {
         Self::add_column_if_missing(conn, "screenshots", "process_name_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "screenshots", "metadata_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "screenshots", "content_key_encrypted", "BLOB")?;
+        Self::add_column_if_missing(conn, "screenshots", "is_deleted", "INTEGER NOT NULL DEFAULT 0")?;
         // Add status and committed_at for two-phase screenshot lifecycle
         Self::add_column_if_missing(conn, "screenshots", "status", "TEXT")?;
         Self::add_column_if_missing(conn, "screenshots", "committed_at", "TIMESTAMP")?;
 
         Self::add_column_if_missing(conn, "ocr_results", "text_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "ocr_results", "text_key_encrypted", "BLOB")?;
+        Self::add_column_if_missing(conn, "ocr_results", "is_deleted", "INTEGER NOT NULL DEFAULT 0")?;
 
         // Browser extension metadata columns
         Self::add_column_if_missing(conn, "screenshots", "source", "TEXT")?;
@@ -407,6 +421,35 @@ impl StorageState {
             )
             "#,
         )?;
+
+        Self::create_table_if_missing(
+            conn,
+            "delete_queue_screenshots",
+            r#"
+            CREATE TABLE IF NOT EXISTS delete_queue_screenshots (
+                id INTEGER PRIMARY KEY
+            )
+            "#,
+        )?;
+
+        Self::create_table_if_missing(
+            conn,
+            "delete_queue_ocr",
+            r#"
+            CREATE TABLE IF NOT EXISTS delete_queue_ocr (
+                id INTEGER PRIMARY KEY
+            )
+            "#,
+        )?;
+
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_screenshots_deleted_created_at ON screenshots(is_deleted, created_at);
+            CREATE INDEX IF NOT EXISTS idx_screenshots_process_deleted_created_at ON screenshots(process_name, is_deleted, created_at);
+            CREATE INDEX IF NOT EXISTS idx_ocr_deleted_screenshot ON ocr_results(is_deleted, screenshot_id);
+            "#,
+        )
+        .map_err(|e| format!("Failed to create soft-delete indexes: {}", e))?;
 
         Ok(())
     }
