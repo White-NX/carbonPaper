@@ -562,10 +562,10 @@
     "skip": "跳过"
   },
   "authMask": {
-    "title": "需要 Windows Hello 验证",
-    "description": "Carbon Paper 使用 Windows Hello 加密您的屏幕截图和 OCR 数据，请通过 PIN、指纹或面部识别来解锁。",
+    "title": "已锁定",
+    "description": "Carbonpaper 使用 CNG 加密您的屏幕截图和 OCR 数据，请通过 PIN 来解锁。",
     "authenticating": "正在验证...",
-    "unlock_button": "使用 Windows Hello 解锁",
+    "unlock_button": "通过验证解锁",
     "encrypted_label": "数据已被加密",
     "errors": {
       "verify_failed": "验证失败，请重试",

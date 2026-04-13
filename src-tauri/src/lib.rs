@@ -44,11 +44,43 @@ pub static IS_UPDATING: AtomicBool = AtomicBool::new(false);
 async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
     const OCR_BATCH_SIZE: i64 = 500;
     const SCREENSHOT_BATCH_SIZE: i64 = 100;
+    const POLICY_CHECK_INTERVAL_SECS: u64 = 60;
+
+    let mut last_policy_check =
+        std::time::Instant::now() - std::time::Duration::from_secs(POLICY_CHECK_INTERVAL_SECS);
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         let storage = app_handle.state::<Arc<StorageState>>().inner().clone();
+
+        let policy_pruned = if last_policy_check.elapsed()
+            >= std::time::Duration::from_secs(POLICY_CHECK_INTERVAL_SECS)
+        {
+            last_policy_check = std::time::Instant::now();
+            match tokio::task::spawn_blocking({
+                let storage = storage.clone();
+                move || storage.enforce_snapshot_storage_policy_once()
+            })
+            .await
+            {
+                Ok(Ok(Some(summary))) => {
+                    tracing::info!("[POLICY] {}", summary);
+                    true
+                }
+                Ok(Ok(None)) => false,
+                Ok(Err(e)) => {
+                    tracing::warn!("[POLICY] enforce failed: {}", e);
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!("[POLICY] enforce join error: {:?}", e);
+                    false
+                }
+            }
+        } else {
+            false
+        };
 
         let ocr_processed = match tokio::task::spawn_blocking({
             let storage = storage.clone();
@@ -176,9 +208,10 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
             }
         };
 
-        if ocr_processed > 0 || finalized_screenshots > 0 || vacuum_ran {
+        if ocr_processed > 0 || finalized_screenshots > 0 || vacuum_ran || policy_pruned {
             tracing::info!(
-                "[DELETE_QUEUE] cycle complete: ocr_processed={}, screenshots_finalized={}, vacuum_ran={}",
+                "[DELETE_QUEUE] cycle complete: policy_pruned={}, ocr_processed={}, screenshots_finalized={}, vacuum_ran={}",
+                policy_pruned,
                 ocr_processed,
                 finalized_screenshots,
                 vacuum_ran

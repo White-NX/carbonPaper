@@ -149,6 +149,65 @@ body {
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.06);
 }
 
+/* 主预览区背景装饰 */
+.main-preview-surface {
+  background:
+    radial-gradient(900px 380px at 102% -10%, rgba(37, 99, 235, 0.08), transparent 62%),
+    radial-gradient(620px 300px at -8% 108%, rgba(16, 185, 129, 0.07), transparent 58%),
+    var(--ide-bg);
+}
+
+.dark .main-preview-surface {
+  background:
+    radial-gradient(900px 380px at 102% -10%, rgba(0, 122, 204, 0.22), transparent 62%),
+    radial-gradient(620px 300px at -8% 108%, rgba(56, 189, 248, 0.14), transparent 58%),
+    var(--ide-bg);
+}
+
+.main-preview-orb {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(42px);
+}
+
+.main-preview-orb--a {
+  top: -130px;
+  right: -40px;
+  width: 300px;
+  height: 300px;
+  background: rgba(37, 99, 235, 0.2);
+}
+
+.main-preview-orb--b {
+  left: -60px;
+  bottom: -90px;
+  width: 220px;
+  height: 220px;
+  background: rgba(16, 185, 129, 0.18);
+}
+
+.dark .main-preview-orb--a {
+  background: rgba(0, 122, 204, 0.3);
+}
+
+.dark .main-preview-orb--b {
+  background: rgba(56, 189, 248, 0.24);
+}
+
+.main-preview-grid {
+  position: absolute;
+  inset: 0;
+  opacity: 0.2;
+  background-image:
+    linear-gradient(to right, var(--ide-border) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--ide-border) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.dark .main-preview-grid {
+  opacity: 0.12;
+}
+
 
 ::selection {
   background: rgba(93, 224, 255, 0.35);

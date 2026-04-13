@@ -1477,6 +1477,67 @@ impl StorageState {
         })
     }
 
+    /// Select oldest screenshots until the estimated reclaim size reaches target bytes.
+    ///
+    /// Returns `(ids, estimated_reclaim_bytes)`.
+    pub fn select_oldest_screenshots_for_reclaim(
+        &self,
+        target_reclaim_bytes: u64,
+        max_candidates: i64,
+    ) -> Result<(Vec<i64>, u64), String> {
+        if target_reclaim_bytes == 0 || max_candidates <= 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let safe_limit = max_candidates.clamp(1, 20_000);
+
+        let rows: Vec<(i64, String)> = {
+            let guard = self.get_connection_named("select_oldest_screenshots_for_reclaim")?;
+            let conn = guard.as_ref().unwrap();
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, image_path
+                     FROM screenshots
+                     WHERE is_deleted = 0
+                     ORDER BY created_at ASC
+                     LIMIT ?1",
+                )
+                .map_err(|e| format!("Failed to prepare reclaim candidate query: {}", e))?;
+
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([safe_limit], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| format!("Failed to load reclaim candidates: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            rows
+        };
+
+        let mut selected_ids = Vec::new();
+        let mut estimated_reclaim_bytes = 0u64;
+
+        for (id, image_path) in rows {
+            let abs_path = self.resolve_image_path(&image_path);
+            let image_bytes = std::fs::metadata(&abs_path).map(|m| m.len()).unwrap_or(0);
+            let thumb_path = Self::thumbnail_path_for(&abs_path);
+            let thumb_bytes = std::fs::metadata(&thumb_path).map(|m| m.len()).unwrap_or(0);
+            let row_bytes = image_bytes.saturating_add(thumb_bytes);
+
+            if row_bytes == 0 {
+                continue;
+            }
+
+            selected_ids.push(id);
+            estimated_reclaim_bytes = estimated_reclaim_bytes.saturating_add(row_bytes);
+            if estimated_reclaim_bytes >= target_reclaim_bytes {
+                break;
+            }
+        }
+
+        Ok((selected_ids, estimated_reclaim_bytes))
+    }
+
     /// Fetch pending counts in delete queues.
     pub fn get_delete_queue_status(&self) -> Result<DeleteQueueStatus, String> {
         let guard = self.get_connection_named("get_delete_queue_status")?;
