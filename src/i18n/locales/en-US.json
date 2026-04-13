@@ -1,0 +1,770 @@
+{
+  "settings": {
+    "general": {
+      "title": "通用选项",
+      "language": {
+        "label": "语言",
+        "description": "选择界面显示语言。"
+      },
+      "telemetry": {
+        "label": "允许发送遥测诊断数据",
+        "description": "允许程序将不包含隐私数据的错误日志上传至遥测服务器。"
+      },
+      "powerSaving": {
+        "label": "节能模式",
+        "description": "使用电池供电时自动暂停 Python 子服务，插入电源后自动恢复运行。"
+      },
+      "gameMode": {
+        "label": "游戏模式",
+        "description": "启用后将在游戏启动时禁用DML和截图以获得更好的游戏性能。",
+        "requires_dml": "需要先启用 DirectML 加速",
+        "active": "已激活：DirectML 已临时关闭",
+        "inactive": "GPU 负载正常",
+        "permanent": "DirectML 已关闭（频繁切换，将在重启后恢复）",
+        "fullscreen_paused": "已激活：检测到全屏非浏览器程序，截图已暂停"
+      },
+      "monitor": {
+        "title": "Python 子服务",
+        "tooltip": "Python 子服务负责 OCR 识别和图像向量化等后台任务。关闭后截图循环将停止，自然语言搜索将不可用，但已有的 OCR 搜索仍可正常使用。",
+        "status": "状态：{{status}}",
+        "status_label": "状态：",
+        "description": "控制后台的 Python 子服务。",
+        "starting": "正在启动...",
+        "start": "启动服务",
+        "resume": "继续",
+        "pause": "暂停",
+        "stop": "停止",
+        "restart": "重启",
+        "power_saving_blocked": "节电模式已激活，无法启动子服务。请接入电源后重试。",
+        "autoStart": {
+          "label": "启动时自动子服务",
+          "description": "开启后应用启动时会自动尝试拉起 Python 子服务。",
+          "tooltip": "应用启动后自动运行 Python 子服务。"
+        },
+        "autoLaunch": {
+          "label": "开机自启动",
+          "description": "写入注册表 HKLM，可能需要管理员确认。",
+          "reading": "正在读取开机自启动状态...",
+          "enabledMessage": "已开启：电脑开机后自动启动 CarbonPaper",
+          "disabledMessage": "未开启：不会随系统启动",
+          "enable": "开启开机自启",
+          "disable": "关闭开机自启"
+        }
+      }
+    },
+    "title": "设置",
+    "tabs": {
+      "general": "通用",
+      "language": "语言",
+      "security": "安全",
+      "advanced": "高级",
+      "analysis": "存储管理",
+      "about": "关于",
+      "extension": "浏览器扩展",
+      "ai_embedding": "人工智能嵌入"
+    },
+    "security": {
+      "protection": {
+        "title": "数据受到 Windows CNG 保护",
+        "description": "您的快照数据已使用 Windows CNG 管理的凭据加密。只有通过您的授权才能访问数据。"
+      },
+      "unlock_label": "解锁有效期",
+      "session": {
+        "title": "自动锁定时间",
+        "description": "设置在用户无操作多长时间后自动锁定并需要重新验证",
+        "options": {
+          "5m": {
+            "label": "5 分钟",
+            "description": "较高安全性"
+          },
+          "15m": {
+            "label": "15 分钟",
+            "description": "推荐"
+          },
+          "1h": {
+            "label": "1 小时",
+            "description": "方便使用"
+          },
+          "1d": {
+            "label": "1 天",
+            "description": "较低安全性"
+          },
+          "until_close": {
+            "label": "直到关闭",
+            "description": "不推荐",
+            "warning": true
+          }
+        },
+        "current": {
+          "unlocked": "已解锁",
+          "locked": "已锁定",
+          "label": "当前会话："
+        },
+        "lock_now": "立即锁定",
+        "locking": "锁定中..."
+      }
+    },
+    "advanced": {
+      "loading": "加载中...",
+      "warning": "这些设置可能会影响监控服务的性能和稳定性，甚至影响操作系统整体性能。请谨慎调整。",
+      "quick_restart": "快速重启",
+      "cpu": {
+        "title": "Python 子进程 CPU 限制",
+        "label": "限制 CPU 占用率",
+        "description": "限制 OCR 和向量化处理使用的 CPU 资源，避免影响系统性能",
+        "percent_label": "CPU 限制百分比",
+        "changed_notice": "CPU 限制更改将在下次启动监控服务时生效"
+      },
+      "ocr": {
+        "title": "OCR 处理队列",
+        "pause_label": "OCR 队列有任务时暂停截图",
+        "pause_desc": "开启后，当 OCR 队列中有未处理任务时将暂停截图，减少资源占用",
+        "queue_limit_label": "限制 OCR 任务队列大小",
+        "queue_limit_desc": "超过此大小时，暂停所有截图直到队列消化",
+        "max_queue_label": "最大队列大小",
+        "info": "OCR 队列设置会即时生效，无需重启监控服务"
+      },
+      "dml": {
+        "title": "OCR 推理加速",
+        "label": "使用 DirectML 进行推理",
+        "description": "启用后将使用 GPU 进行 OCR 推理加速，需要 DirectX 12 兼容的显卡。",
+        "notice": "注意：在主要 GPU 上运行 DirectML 可能会影响游戏性能。",
+        "changed_notice": "DirectML 设置将在下次启动监控服务时生效",
+        "gpu_select": "选择 GPU 设备",
+        "gpu_loading": "正在检测 GPU...",
+        "gpu_none": "未检测到兼容的 GPU"
+      },
+      "clustering": {
+        "title": "任务聚类",
+        "interval_label": "自动聚类间隔",
+        "interval_desc": "设置后台自动运行任务聚类的时间间隔",
+        "info": "任务聚类会自动将相似的活动分组为长期任务。使用 MiniLM-L12 模型编码文本，模型在聚类完成后会自动卸载以释放内存。",
+        "intervals": {
+          "1d": "每天",
+          "1w": "每周",
+          "1m": "每月",
+          "6m": "每半年"
+        }
+      }
+    },
+    "storageManagement": {
+      "title": "存储管理",
+      "description": "管理快照存储空间与数据保留策略",
+      "refresh": "刷新",
+      "overview": {
+        "title": "存储空间概览",
+        "program_used": "程序占用",
+        "disk_used": "硬盘总占用",
+        "path": "{{path}}"
+      },
+      "last_updated": "更新时间: {{time}}",
+      "storagePath": {
+        "label": "存储位置",
+        "description": "选择和迁移快照和数据库的存储目录",
+        "changing": "处理中...",
+        "changeTitle": "修改存储位置",
+        "selectedPath": "已选择新的存储目录：",
+        "migrateQuestion": "是否将现有数据文件迁移到新目录？",
+        "cancel": "取消迁移",
+        "applyPath": "仅修改路径",
+        "migrateAndApply": "迁移并修改"
+      },
+      "storageLimit": {
+        "label": "快照存储空间上限",
+        "description": "超出后将自动删除最旧的快照",
+        "options": {
+          "10": "10 GB",
+          "20": "20 GB",
+          "50": "50 GB",
+          "120": "120 GB",
+          "unlimited": "不限制"
+        }
+      },
+      "retention": {
+        "label": "快照保留时间",
+        "description": "超过保留时间的快照将被自动清理",
+        "options": {
+          "1month": "1 个月",
+          "6months": "6 个月",
+          "1year": "1 年",
+          "2years": "2 年",
+          "permanent": "永久"
+        }
+      },
+      "warning": {
+        "title": "警告",
+        "message": "当前设置为不限制存储空间且永久保留，快照文件可能会占用大量磁盘空间。建议设置合理的存储上限或保留时间。"
+      },
+      "migration": {
+        "dialog_title": "数据库安全升级",
+        "error_default": "迁移出错",
+        "copying": "正在拷贝文件: {{copied}}/{{total}}",
+        "current_file": "当前文件: {{file}}",
+        "completed": "完成",
+        "cancel": "取消",
+        "upgrading": "正在构建安全索引...",
+        "background_tip": "您可以放心关闭此窗口。升级将在后台继续进行，搜索结果将随进度逐渐恢复。",
+        "preparing": "正在初始化迁移...",
+        "indexing_detailed": "正在构建安全索引: {{processed}} / {{total}}",
+        "search_unavailable_title": "搜索功能受限",
+        "search_unavailable_desc": "数据库正在进行安全升级，搜索索引正在重建中。在此期间，搜索结果可能不完整或暂时不可用。升级完成后将自动恢复。"
+      },
+      "deleteConfirm": {
+        "title": "确认删除",
+        "messageSelected": "确认删除已选择的 {{count}} 个快照吗？该操作会立即隐藏数据，后台会异步清理。",
+        "messageMonth": "确认删除 {{processName}} 在 {{month}} 的快照吗？该操作会立即隐藏数据，后台会异步清理。",
+        "messageProcess": "确认删除 {{processName}} 的全部快照吗？该操作会立即隐藏数据，后台会异步清理。",
+        "confirmDefault": "删除",
+        "cancel": "取消"
+      },
+      "processDetails": {
+        "title": "按进程存储详情",
+        "description": "查看进程占比、按月缩略图，选择并删除",
+        "distributionTitle": "进程分布",
+        "totalScreenshots": "总计 {{count}} 张快照",
+        "noStats": "暂无进程统计数据",
+        "unknownProcess": "未知进程",
+        "others": "其他",
+        "itemSummary": "{{count}} 张 · {{percent}}%",
+        "queueRunning": "后台清理中：OCR {{ocr}} 条，截图 {{screenshots}} 条",
+        "back": "返回",
+        "detailSubtitle": "按月缩略图分页",
+        "deleteProcess": "删除该进程快照",
+        "deleteMonth": "删除本月快照",
+        "deleteSelected": "删除 {{count}} 个快照",
+        "deleting": "处理中",
+        "loading": "加载中...",
+        "empty": "该进程暂无可展示快照",
+        "selected": "已选",
+        "prevPage": "上一页",
+        "page": "第 {{page}} 页",
+        "nextPage": "下一页"
+      }
+    },
+    "storage": {
+      "models": "模型",
+      "images": "图片",
+      "database": "数据库",
+      "other": "程序依赖"
+    },
+    "captureFilters": {
+      "title": "捕获过滤规则",
+      "processes": {
+        "label": "按进程名称忽略",
+        "placeholder": "chrome.exe, obs64.exe",
+        "hint": "按进程可执行名匹配，自动转为小写。"
+      },
+      "titles": {
+        "label": "按窗口名关键词忽略",
+        "placeholder": "内部系统, 私人窗口",
+        "hint": "包含匹配，忽略大小写。"
+      },
+      "empty": "暂无规则",
+      "add": "添加",
+      "remove": "移除",
+      "ignoreProtected": {
+        "label": "不捕获受保护的窗口",
+        "description": "关闭后，将尝试捕获设置了屏幕保护属性的窗口。"
+      },
+      "save": "保存过滤规则",
+      "quickDelete": {
+        "title": "快速删除记录",
+        "description": "快速删除指定时间范围内的所有截图和OCR记录。此操作不可撤销。",
+        "options": {
+          "5min": "5 分钟",
+          "30min": "30 分钟",
+          "1hour": "1 小时",
+          "today": "今天"
+        },
+        "button": "{{label}}内",
+        "confirmTitle": "确认？",
+        "yes": "是",
+        "no": "否"
+      }
+    },
+    "delete": {
+      "failure": ""
+    },
+    "save_filters": {
+      "synced": "",
+      "saved_local_not_running": "",
+      "saved_local_unsupported": "",
+      "saved_local_sync_failed": ""
+    },
+    "autolaunch": {
+      "read_error": "",
+      "enabled": "",
+      "disabled": "",
+      "action_failed": ""
+    },
+    "analysis": {
+      "load_failed": ""
+    },
+    "extension": {
+      "title": "浏览器扩展",
+      "description": "管理 CarbonPaper 浏览器扩展",
+      "chrome": {
+        "label": "添加到 Chrome",
+        "registered": "已注册",
+        "registering": "注册中..."
+      },
+      "edge": {
+        "label": "添加到 Edge",
+        "registered": "已注册",
+        "registering": "注册中..."
+      },
+      "status": {
+        "registered": "已注册",
+        "not_registered": "未注册"
+      },
+      "enhance": {
+        "label": "扩展增强",
+        "description": "启用后，浏览器扩展将接管该浏览器的截图捕获，提供更丰富的元数据（页面 URL、标题、网站图标、链接）。自带的截图循环将跳过该浏览器的 OCR 处理。",
+        "chrome": "启用 Chrome 扩展增强",
+        "edge": "启用 Edge 扩展增强"
+      },
+      "success": "扩展安装成功。请在浏览器中启用该未打包扩展。",
+      "error": "安装失败：{{error}}",
+      "help": "点击按钮后，请在浏览器扩展管理页面中加载显示路径的未打包扩展。",
+      "tutorial": {
+        "title": "安装步骤",
+        "step1": "点击上方对应浏览器（Chrome 或 Edge）的安装按钮。",
+        "step2": "打开浏览器扩展页面，启用「开发者模式」。",
+        "step3": "点击「加载已解压的扩展程序」，选择安装后显示的扩展文件夹。",
+        "step4": "CarbonPaper 扩展图标将出现在浏览器工具栏中。"
+      }
+    },
+    "ai_embedding": {
+      "title": "人工智能嵌入",
+      "description": "管理人工智能嵌入服务",
+      "mcp_service": "MCP 服务",
+      "mcp_description": "启用后将启动本地 MCP 服务，允许 AI 工具连接获取快照数据（截图元数据、OCR 文本、任务聚类信息）。请注意隐私安全风险，确保只授权可信的 AI 工具连接。",
+      "enable_label": "MCP 服务",
+      "privacy_warning": {
+        "title": "隐私安全警告",
+        "message": "启用此功能后，您的快照数据（包括截图元数据、OCR 文本、任务聚类信息）将通过本地 HTTP 服务对外暴露。虽然服务仅绑定 localhost 且需要令牌认证，但本机上运行的任何程序都有可能访问这些数据。\n\n请确认您理解此风险并自愿启用。",
+        "confirm_prompt": "请输入以下文本以确认：",
+        "confirm_text": "我已阅读警告并且我接受可能的暴露风险",
+        "confirm_button": "确认启用",
+        "cancel_button": "取消"
+      },
+      "token": {
+        "title": "授权令牌",
+        "description": "AI 工具连接时需要使用此令牌进行身份验证。",
+        "show_once_warning": "此令牌仅显示一次，关闭后无法再次查看。请立即复制并保存。",
+        "copy": "复制",
+        "copied": "已复制",
+        "reset": "重置令牌",
+        "reset_confirm_title": "重置授权令牌",
+        "reset_confirm_message": "重置令牌将使所有已配置的 AI 工具连接失效，需要重新配置。确定继续？"
+      },
+      "status": {
+        "running": "服务运行中",
+        "stopped": "服务已停止",
+        "port_label": "端口",
+        "auth_required": "需要先在应用中完成 Windows Hello 认证才能处理数据请求"
+      },
+      "connection_info": {
+        "title": "连接信息",
+        "endpoint": "端点",
+        "auth_header": "认证头"
+      },
+      "content_filter": {
+        "title": "内容过滤",
+        "description": "基于合规规则过滤 MCP 服务返回结果中的标记内容。",
+        "level_label": "基于关键词的合规化保护",
+        "levels": {
+          "standard": {
+            "title": "标准保护",
+            "description": "过滤可能触发 AI 提供商审核的内容，防止账户被标记或数据被人工审查。"
+          },
+          "minimal": {
+            "title": "最小过滤",
+            "description": "仅过滤可能导致 API 请求被拒绝的内容。"
+          },
+          "off": {
+            "title": "关闭",
+            "description": "所有截屏内容均可能发送至 AI 提供商。"
+          },
+          "custom": {
+            "title": "自定义",
+            "description": "过滤类别已被手动修改。"
+          }
+        },
+        "advanced_toggle": "高级选项",
+        "filter_mode": {
+          "label": "过滤方式",
+          "reject": {
+            "title": "拒绝整个快照",
+            "description": "检测到敏感内容时，拒绝返回整个快照请求。"
+          },
+          "remove_paragraph": {
+            "title": "去除敏感段落",
+            "description": "移除包含敏感词的 OCR 文本段落，快照的其余内容仍然返回。"
+          },
+          "mask": {
+            "title": "隐去敏感词（不建议）",
+            "description": "使用 █ 字符替换敏感词，快照和周围文本仍然返回。"
+          }
+        },
+        "categories": {
+          "cat_01": "垃圾信息 / 推广",
+          "cat_02": "法律合规",
+          "cat_03": "地区合规",
+          "cat_04": "NSFW 内容",
+          "cat_05": "可能触发安全审查的内容"
+        },
+        "pii": {
+          "title": "个人信息检测",
+          "description": "使用 NLP 模型从 MCP 响应中检测并过滤个人身份信息（姓名、手机号、身份证号等）。",
+          "toggle_label": "启用个人信息检测",
+          "model_status": "模型状态",
+          "model_installed": "已安装",
+          "model_not_installed": "未安装",
+          "model_download": "下载",
+          "model_downloading": "下载中...",
+          "model_active": "当前使用",
+          "model_note": "当前使用的模型会跟随语言设置自动切换",
+          "recheck": "重新检测",
+          "entity_types_label": "检测的信息类型",
+          "entity_types": {
+            "PHONE_NUMBER": "手机号码",
+            "CN_ID_CARD": "身份证号码",
+            "EMAIL_ADDRESS": "电子邮箱",
+            "CN_BANK_CARD": "银行卡号",
+            "ADDRESS": "地址"
+          }
+        }
+      }
+    }
+  },
+  "delete": {
+    "failure": "删除失败: {{error}}",
+    "success": "成功删除 {{count}} 条记录"
+  },
+  "save_filters": {
+    "synced": "已保存并同步到监控服务",
+    "saved_local_not_running": "已保存到本地，监控服务未启动，启动后会自动同步",
+    "saved_local_unsupported": "已保存到本地，但当前运行的监控进程不支持过滤命令，请重启监控服务",
+    "saved_local_sync_failed": "已保存到本地，同步失败：{{error}}"
+  },
+  "autolaunch": {
+    "read_error": "读取开机自启动状态失败",
+    "enabled": "已写入开机启动项",
+    "disabled": "已移除开机启动项",
+    "action_failed": "操作失败：{{error}}"
+  },
+  "analysis": {
+    "load_failed": "加载分析数据失败：{{error}}"
+  },
+  "topbar": {
+    "settings": "设置",
+    "hideToTray": "隐藏到托盘",
+    "service": {
+      "running": "运行中",
+      "paused": "已暂停",
+      "starting": "启动中...",
+      "offline": "离线"
+    }
+  },
+  "previewAction": {
+    "deleteNowTitle": "立即删除此记录",
+    "delete": "删除",
+    "moreDeleteOptions": "更多删除选项",
+    "deleteThisRecord": "删除此记录",
+    "deleteNearby5min": "删除附近5分钟内的记录",
+    "openUrlTitle": "打开 URL: {{url}}",
+    "noUrlDetected": "未检测到 URL",
+    "more": "更多",
+    "showOcr": "显示OCR内容",
+    "alpha": "alpha"
+  },
+  "search": {
+    "switchToNL": "切换到自然语言搜索",
+    "switchToOCR": "切换到 OCR 搜索",
+    "selectMode": "选择搜索模式",
+    "nl": {
+      "disabled_hint": "需要 Python 服务运行中"
+    },
+    "mode": {
+      "ocr": {
+        "title": "OCR 关键词搜索模式",
+        "description": "通过识别屏幕截图中的文字进行精确匹配搜索"
+      },
+      "nl": {
+        "title": "自然语言搜索模式",
+        "description": "描述图片画面内容、场景或物体进行语义模糊搜索"
+      }
+    },
+    "placeholder": {
+      "ocr": "在截图中搜索文本...",
+      "nl": "描述图片内容..."
+    },
+    "loading": "加载中...",
+    "noContents": "无内容",
+    "noTextContent": "无文本内容",
+    "unknownProcess": "未知进程",
+    "matchScore": "匹配分数",
+    "task": {
+      "summaryPlaceholder": "清理任务进行中 ({{progress}}%)",
+      "runningTitle": "后台清理任务正在运行",
+      "runningDesc": "当前进度 {{progress}}%，待处理 OCR {{ocr}} 条，截图 {{screenshots}} 条。"
+    }
+  },
+  "sidebar": {
+    "details": {
+      "title": "详情"
+    },
+    "labels": {
+      "process": "进程",
+      "window": "窗口",
+      "time": "时间",
+      "category": "分类",
+      "uncategorized": "未分类"
+    },
+    "links": {
+      "title": "页面上的链接",
+      "currentPage": "当前页面"
+    },
+    "related": {
+      "title": "可能相关的快照"
+    },
+    "empty": "从时间线中选择一个事件以查看详情。"
+  },
+  "activityBar": {
+    "preview": "预览",
+    "advancedSearch": "高级搜索",
+    "tasks": "长期任务",
+    "expand": "展开侧栏",
+    "collapse": "收起侧栏"
+  },
+  "extensionSetup": {
+    "title": "浏览器扩展",
+    "subtitle": "捕获浏览器截图并附带丰富的元数据",
+    "description": "CarbonPaper 浏览器扩展可以捕获浏览器视口截图，并附带页面元数据（URL、标题、可见链接）。选择你使用的浏览器来安装扩展。",
+    "select_browser": "选择要安装的浏览器",
+    "chrome": "Google Chrome",
+    "edge": "Microsoft Edge",
+    "installing": "安装中...",
+    "apply": "安装扩展",
+    "skip": "跳过",
+    "done": "完成",
+    "success_message": "扩展安装成功。请在浏览器中启用开发者模式，然后从以下路径加载已解压的扩展。",
+    "error_message": "安装失败"
+  },
+  "clusteringSetup": {
+    "title": "整理活动记录",
+    "subtitle": "将已有的截图快照自动归类为任务",
+    "description": "新版本支持将你积累的截图快照按活动内容自动聚类为「任务」，帮助你按主题回顾和整理历史工作记录。",
+    "delay_hint": "确认后将在 1 分钟后于后台自动执行聚类（等待嵌入模型加载完成），期间你可以正常使用应用。",
+    "info_note": "你也可以跳过此步骤，之后随时在「任务」面板中手动执行聚类。",
+    "apply": "开始整理",
+    "skip": "跳过"
+  },
+  "authMask": {
+    "title": "需要 Windows Hello 验证",
+    "description": "Carbon Paper 使用 Windows Hello 加密您的屏幕截图和 OCR 数据，请通过 PIN、指纹或面部识别来解锁。",
+    "authenticating": "正在验证...",
+    "unlock_button": "使用 Windows Hello 解锁",
+    "encrypted_label": "数据已被加密",
+    "errors": {
+      "verify_failed": "验证失败，请重试",
+      "cancelled": "您取消了验证",
+      "not_available": "Windows Hello 不可用，请在系统设置中启用",
+      "initializing": "正在初始化安全凭据...",
+      "init_failed": "初始化失败：{{error}}",
+      "generic_failed": "验证失败：{{error}}"
+    }
+  },
+  "advancedSearch": {
+    "title": "ADVANCED",
+    "search": {
+      "placeholder_ocr": "在截图中搜索文本...",
+      "placeholder_nl": "描述图片内容...",
+      "go": "搜索",
+      "searching": "搜索中...",
+      "enter_keyword": "输入关键词或选择筛选器开始。",
+      "press_enter": "在顶部搜索框按回车可快速跳转到此处。",
+      "did_you_know": "你知道吗：{{msg}}",
+      "no_results": "未找到匹配结果",
+      "adjust": "调整筛选或尝试其他关键词。"
+    },
+    "modes": {
+      "ocr": "OCR 模式",
+      "nl": "自然语言"
+    },
+    "processes": {
+      "all": "所有进程",
+      "label": "进程",
+      "select": "选择进程",
+      "clear": "清除",
+      "no_data": "无进程数据",
+      "count": "{{count}} 个进程"
+    },
+    "categories": {
+      "all": "所有分类",
+      "select": "选择分类",
+      "clear": "清除",
+      "no_data": "无分类数据",
+      "count": "{{count}} 个分类"
+    },
+    "filters": {
+      "reset": "重置"
+    },
+    "nl_notice": "使用自然语言图像搜索得到的结果可能并不准确。",
+    "no_image": "无图像",
+    "unknown": "未知",
+    "no_ocr_text": "无 OCR 文本",
+    "similarity": "相似度：{{score}}",
+    "loading_more": "加载更多结果...",
+    "scroll_load": "滚动以加载更多…",
+    "no_more": "没有更多结果",
+    "rotating": [
+      "此程序目前只是一个玩具！",
+      "迷迭香真的很可爱！",
+      "使用 LLM 的搜索会在将来加入！",
+      "我是皱皮",
+      "阿米娅你听我解释，我真的没有偏向佩丽卡！"
+    ]
+  },
+  "mask": {
+    "debug": {
+      "label": "调试",
+      "none": "(无)",
+      "online": "在线（隐藏遮罩）",
+      "offline": "后端：离线",
+      "waiting": "后端：等待中",
+      "venv1": "Venv：步骤 1",
+      "venv2": "Venv：步骤 2",
+      "venv3": "Venv：步骤 3",
+      "nopython": "首次运行（无 Python）"
+    },
+    "backend_shutdown": {
+      "title": "后台 Python 服务已停止",
+      "description": "请启用后台服务以继续使用应用。"
+    },
+    "start": {
+      "starting": "正在启动...",
+      "start_service": "启动 OCR 服务",
+      "waiting": "正在等待 IPC 启动..."
+    },
+    "venv": {
+      "step1": {
+        "title": "安装 Python v{{version}}",
+        "subtitle": "当前步骤：1 / 3 — 选择或安装系统 Python"
+      },
+      "pythonPath": {
+        "label": "Python 可执行文件路径",
+        "placeholder": "例如: C:\\Python310\\python.exe 或者粘贴自定义路径"
+      },
+      "choose": "选择",
+      "auto_install": {
+        "log_start": "正在自动安装 Python...",
+        "success": "安装成功。",
+        "finished": "自动安装流程已结束。"
+      },
+      "discovered_label": "自动发现的 Python 版本（你可以在此选择一个）",
+      "unsupported": "不受支持",
+      "not_found": "未发现 Python",
+      "note": "不知道什么是 Python？别担心，我们可以帮你自动安装。安装完成后程序将关闭，需要手动重启。",
+      "installing": "安装中...",
+      "auto_install_button": "自动安装 Python",
+      "install_logs": "安装日志",
+      "install_failed": "安装失败：{{error}}",
+      "next": "下一步",
+      "step2": {
+        "title": "安装必要依赖",
+        "subtitle": "当前步骤：2 / 3 — 创建 venv 并自动安装 requirements 以及模型文件",
+        "disk_note": "安装会自动进行，占用大约 1.7GB 硬盘空间，耗时视网络和设备性能而定。",
+        "log_start": "开始执行安装：创建 venv 并安装必要依赖...",
+        "using_python": "使用 Python 路径: {{path}}",
+        "using_python_default": "(未指定，将使用默认路径)",
+        "download_models": "开始下载模型文件...",
+        "download_bge": "开始下载分类模型 (BGE-small-zh-v1.5)...",
+        "download_minilm": "开始下载聚类模型 (MiniLM-L12-v2)...",
+        "deps_complete": "所有依赖安装完成。",
+        "install_logs": "安装日志",
+        "install_failed": "安装失败",
+        "deps_failed": "失败：{{error}}",
+        "retry": "重试",
+        "running": "安装正在进行中",
+        "complete": "完成"
+      }
+    },
+    "first_run": {
+      "title": "需要首次设置",
+      "description": "应用需要安装必要的运行环境",
+      "install_button": "安装环境"
+    },
+    "deps_update": {
+      "title": "正在更新依赖",
+      "subtitle": "检测到依赖版本变更，正在自动同步更新...",
+      "syncing": "正在同步依赖...",
+      "failed": "依赖更新失败：{{error}}",
+      "retry": "重试"
+    },
+    "model_download": {
+      "title": "正在下载模型文件",
+      "subtitle": "检测到模型文件缺失，正在自动下载...",
+      "syncing": "正在下载...",
+      "failed": "下载失败：{{error}}",
+      "retry": "重试",
+      "downloading_clip": "正在下载 Chinese-CLIP 模型...",
+      "downloading_bge": "正在下载分类模型 (BGE-small-zh-v1.5)...",
+      "downloading_minilm": "正在下载聚类模型 (MiniLM-L12-v2)...",
+      "complete": "模型下载完成。"
+    }
+  },
+  "tasks": {
+    "title": "长期任务",
+    "unnamed": "未命名任务",
+    "rename": "重命名",
+    "delete": "删除",
+    "merge": "合并",
+    "mergeMode": "合并模式",
+    "cancel": "取消",
+    "refresh": "刷新",
+    "runClustering": "运行聚类",
+    "lastRun": "上次运行",
+    "never": "从未运行",
+    "empty": "暂无任务",
+    "emptyHint": "运行聚类以自动发现长期任务",
+    "selectHint": "选择一个任务查看详情",
+    "snapshots": "张快照",
+    "noScreenshots": "暂无关联快照",
+    "noData": "没有足够的数据用于聚类，请积累更多快照后再试",
+    "modelMissing": "聚类模型 (MiniLM-L12) 未下载，请在 设置 > 关于 中下载模型",
+    "showInactive": "显示不活跃任务",
+    "hideInactive": "隐藏不活跃任务",
+    "inactiveTasks": "不活跃",
+    "showEntertainment": "显示娱乐任务",
+    "hideEntertainment": "隐藏娱乐任务",
+    "entertainmentTasks": "娱乐",
+    "showSocial": "显示社交任务",
+    "hideSocial": "隐藏社交任务",
+    "socialTasks": "社交"
+  },
+  "errorWindow": {
+    "title": "程序出现关键错误",
+    "unknownError": "未知错误",
+    "feedbackTitle": "如何反馈？",
+    "feedbackIssue": "请前往以下地址提出问题：",
+    "logLocation": "日志位置：",
+    "restart": "重启 CarbonPaper",
+    "exit": "退出",
+    "switchToNormal": "切换到正常模式",
+    "switchToXibao": "切换到喜报模式",
+    "triggerTest": "触发测试错误窗口"
+  },
+  "timeline": {
+    "month": "1月",
+    "week": "1周",
+    "today": "当日",
+    "zoomMonth": "缩放到1个月",
+    "zoomWeek": "缩放到1周",
+    "zoomToday": "缩放到当日",
+    "collapse": "收起",
+    "expandQuickZoom": "展开快速缩放",
+    "jumpToNow": "跳转到现在"
+  }
+}
