@@ -305,7 +305,7 @@ function App() {
     }
     if (permissionGranted) {
       sendNotification({
-        title: 'Carbon Paper',
+        title: 'Carbonpaper',
         body: '程序已最小化到系统托盘，点击托盘图标可恢复窗口'
       });
     }

@@ -91,7 +91,13 @@ export default function MainArea({
   return (
     <section className="flex flex-col bg-ide-bg overflow-hidden relative flex-1">
       <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-        <div className={`${activeTab === 'preview' ? 'flex' : 'hidden'} flex-1 items-center justify-center bg-grid-pattern bg-[length:20px_20px] p-4 overflow-hidden relative min-w-0 min-h-0`}>
+        <div className={`${activeTab === 'preview' ? 'flex' : 'hidden'} main-preview-surface flex-1 items-center justify-center p-4 overflow-hidden relative min-w-0 min-h-0`}>
+          <div className="pointer-events-none absolute inset-0" aria-hidden="true">
+            <div className="main-preview-orb main-preview-orb--a" />
+            <div className="main-preview-orb main-preview-orb--b" />
+            <div className="main-preview-grid" />
+          </div>
+
           {selectedImageSrc ? (
             <div className="shadow-xl max-w-full max-h-full">
               <InspectorImage
@@ -110,10 +116,19 @@ export default function MainArea({
                 </>
               ) : (
                 <div className="flex flex-col items-center gap-1 text-center">
-                  <span>{selectedEvent ? (lastError || "Image not found on disk") : "No image selected"}</span>
+                  <span>{selectedEvent ? (lastError || "Image not found on disk") : ""}</span>
                   {selectedEvent && <span className="text-xs opacity-50 font-mono">ID: {selectedEvent.id}</span>}
                 </div>
               )}
+            </div>
+          )}
+
+          {!selectedEvent && !selectedImageSrc && !isLoadingDetails && (
+            <div className="pointer-events-none absolute left-8 bottom-10 text-left select-none">
+              <div className="text-ide-text opacity-85 text-[clamp(4.2rem,7vw,5.8rem)] leading-none font-black tracking-tight">Carbonpaper</div>
+              <div className="mt-1.5 text-base md:text-lg font-medium text-ide-muted mx-3">
+                Under <span className="font-semibold text-ide-text opacity-90">GPL-3</span> Licence
+              </div>
             </div>
           )}
 

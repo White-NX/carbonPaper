@@ -72,7 +72,7 @@ export default function TopBar({
       <div className="flex items-center gap-4 pointer-events-none">
         <div className="flex items-center gap-2 text-ide-accent">
           <Terminal className="w-5 h-5" />
-          <span className="font-bold tracking-tight">Carbon Paper</span>
+          <span className="font-bold tracking-tight">Carbonpaper</span>
         </div>
         <span className="px-3 py-1 rounded-full border border-ide-border text-xs font-mono text-ide-muted">
           {APP_VERSION}

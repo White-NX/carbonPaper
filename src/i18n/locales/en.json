@@ -560,10 +560,10 @@
     "skip": "Skip"
   },
   "authMask": {
-    "title": "Windows Hello verification required",
-    "description": "Carbon Paper uses Windows Hello to encrypt your screenshots and OCR data. Please unlock using PIN, fingerprint, or face recognition.",
+    "title": "Program is Locked",
+    "description": "",
     "authenticating": "Authenticating...",
-    "unlock_button": "Unlock with Windows Hello",
+    "unlock_button": "Unlock with PIN",
     "encrypted_label": "Data is encrypted",
     "errors": {
       "verify_failed": "Verification failed, please try again",
