@@ -1516,6 +1516,7 @@ impl StorageState {
 
         let mut selected_ids = Vec::new();
         let mut estimated_reclaim_bytes = 0u64;
+        let mut zombie_ids = Vec::new();
 
         for (id, image_path) in rows {
             let abs_path = self.resolve_image_path(&image_path);
@@ -1525,6 +1526,7 @@ impl StorageState {
             let row_bytes = image_bytes.saturating_add(thumb_bytes);
 
             if row_bytes == 0 {
+                zombie_ids.push(id);
                 continue;
             }
 
@@ -1532,6 +1534,22 @@ impl StorageState {
             estimated_reclaim_bytes = estimated_reclaim_bytes.saturating_add(row_bytes);
             if estimated_reclaim_bytes >= target_reclaim_bytes {
                 break;
+            }
+        }
+
+        if !zombie_ids.is_empty() {
+            match self.soft_delete_screenshots(&zombie_ids) {
+                Ok(result) => {
+                    tracing::info!(
+                        "[POLICY] soft-deleted zombie screenshots: marked={}, queued_screenshots={}, queued_ocr={}",
+                        result.screenshots_marked,
+                        result.queued_screenshots,
+                        result.queued_ocr
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("[POLICY] failed to soft-delete zombie screenshots: {}", e);
+                }
             }
         }
 
