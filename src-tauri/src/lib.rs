@@ -25,12 +25,13 @@ use credential_manager::CredentialManagerState;
 use monitor::MonitorState;
 use sensitive_filter::SensitiveFilterState;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use storage::StorageState;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Emitter;
 use tauri::Manager;
+use tauri_plugin_notification::NotificationExt;
 use window_vibrancy::apply_acrylic;
 
 const MENU_ID_OPEN: &str = "open";
@@ -40,6 +41,21 @@ const MENU_ID_RESTART: &str = "restart";
 const MENU_ID_QUIT: &str = "quit";
 
 pub static IS_UPDATING: AtomicBool = AtomicBool::new(false);
+
+// 轻量模式状态管理
+pub struct LightweightModeState {
+    pub is_lightweight: Mutex<bool>,
+    pub auto_switch_timer: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+impl LightweightModeState {
+    pub fn new() -> Self {
+        Self {
+            is_lightweight: Mutex::new(false),
+            auto_switch_timer: Mutex::new(None),
+        }
+    }
+}
 
 async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
     const OCR_BATCH_SIZE: i64 = 500;
@@ -236,12 +252,38 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(icon) = app.default_window_icon().cloned() {
         tray_builder = tray_builder.icon(icon);
     }
-    tray_builder
+    let tray = tray_builder
         .on_menu_event(|app, event| match event.id.as_ref() {
             MENU_ID_OPEN => {
+                // 取消自动切换定时器
+                cancel_auto_lightweight_timer(app);
+
+                // 检查窗口是否存在
                 if let Some(window) = app.get_webview_window("main") {
+                    // 窗口存在，显示并聚焦
                     let _ = window.show();
                     let _ = window.set_focus();
+                } else {
+                    // 窗口不存在（轻量模式），重建窗口
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        match create_main_window(&app_handle) {
+                            Ok(()) => {
+                                // 更新轻量模式状态
+                                let lightweight_state = app_handle.state::<Arc<LightweightModeState>>();
+                                *lightweight_state.is_lightweight.lock().unwrap() = false;
+                                tracing::info!("Window recreated from lightweight mode");
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to create main window: {}", e);
+                                let _ = app_handle.notification()
+                                    .builder()
+                                    .title("CarbonPaper")
+                                    .body(&format!("无法打开界面: {}", e))
+                                    .show();
+                            }
+                        }
+                    });
                 }
             }
             MENU_ID_PAUSE => {
@@ -283,6 +325,9 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         })
         .build(&app_handle)?;
 
+    // 将托盘图标保存到应用状态中，防止被释放
+    app.manage(tray);
+
     Ok(())
 }
 
@@ -317,16 +362,144 @@ pub fn get_data_dir() -> std::path::PathBuf {
         .join("data")
 }
 
+// 动态创建主窗口
+pub fn create_main_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::WebviewWindowBuilder;
+
+    tracing::info!("Creating main window");
+
+    let window = WebviewWindowBuilder::new(
+        app,
+        "main",
+        tauri::WebviewUrl::App("index.html".into())
+    )
+    .title("carbonpaper")
+    .inner_size(1300.0, 750.0)
+    .decorations(false)
+    .transparent(true)
+    .visible(true)
+    .build()?;
+
+    // 应用 Acrylic 效果
+    let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
+
+    // 设置窗口事件处理
+    let app_handle = app.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            if error_window::HAS_CRITICAL_ERROR.load(Ordering::Relaxed) {
+                std::process::exit(1);
+            }
+            if !IS_UPDATING.load(Ordering::Relaxed) {
+                api.prevent_close();
+                if let Some(w) = app_handle.get_webview_window("main") {
+                    let _ = w.hide();
+                    let _ = app_handle.emit("app-hidden", ());
+
+                    // 启动自动切换定时器
+                    start_auto_lightweight_timer(app_handle.clone());
+                }
+            }
+        }
+    });
+
+    tracing::info!("Main window created successfully");
+    Ok(())
+}
+
+// 启动自动切换到轻量模式的定时器
+fn start_auto_lightweight_timer(app: tauri::AppHandle) {
+    // 检查是否启用自动切换
+    let auto_enabled = registry_config::get_bool("auto_lightweight_enabled").unwrap_or(false);
+    if !auto_enabled {
+        return;
+    }
+
+    let delay_minutes = registry_config::get_u32("auto_lightweight_delay_minutes").unwrap_or(5);
+
+    tracing::info!("Starting auto-lightweight timer: {} minutes", delay_minutes);
+
+    let lightweight_state = app.state::<Arc<LightweightModeState>>();
+
+    // 取消之前的定时器（如果有）
+    if let Some(old_timer) = lightweight_state.auto_switch_timer.lock().unwrap().take() {
+        old_timer.abort();
+    }
+
+    // 启动新定时器
+    let app_clone = app.clone();
+    let timer = tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(delay_minutes as u64 * 60)).await;
+
+        tracing::info!("Auto-lightweight timer expired, checking window state");
+
+        // 检查窗口是否仍然隐藏
+        if let Some(window) = app_clone.get_webview_window("main") {
+            if !window.is_visible().unwrap_or(true) {
+                tracing::info!("Window still hidden, switching to lightweight mode");
+
+                // 销毁窗口
+                if let Err(e) = window.destroy() {
+                    tracing::error!("Failed to destroy window: {}", e);
+                    return;
+                }
+
+                // 更新状态
+                let lightweight_state = app_clone.state::<Arc<LightweightModeState>>();
+                *lightweight_state.is_lightweight.lock().unwrap() = true;
+
+                // 发送通知
+                let _ = app_clone.notification()
+                    .builder()
+                    .title("CarbonPaper")
+                    .body("已自动切换到轻量模式以节省内存")
+                    .show();
+
+                tracing::info!("Successfully switched to lightweight mode");
+            } else {
+                tracing::info!("Window is visible, canceling auto-lightweight");
+            }
+        }
+    });
+
+    // 保存定时器句柄
+    *lightweight_state.auto_switch_timer.lock().unwrap() = Some(timer);
+}
+
+// 取消自动切换定时器
+fn cancel_auto_lightweight_timer(app: &tauri::AppHandle) {
+    let lightweight_state = app.state::<Arc<LightweightModeState>>();
+    let mut timer_guard = lightweight_state.auto_switch_timer.lock().unwrap();
+    if let Some(timer) = timer_guard.take() {
+        timer.abort();
+        tracing::info!("Auto-lightweight timer canceled");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let data_dir = get_data_dir();
     let _log_guard = logging::init_logging(&data_dir);
+
+    // 检查是否应该隐藏启动
+    let start_hidden = std::env::var("CARBONPAPER_START_HIDDEN").is_ok()
+        || registry_config::get_bool("start_with_window_hidden").unwrap_or(false);
+
+    if start_hidden {
+        tracing::info!("Starting in lightweight mode (window hidden)");
+    }
 
     let credential_state = Arc::new(CredentialManagerState::new(data_dir.clone()));
     let storage_state = Arc::new(StorageState::new(
         data_dir.clone(),
         credential_state.clone(),
     ));
+    let lightweight_state = Arc::new(LightweightModeState::new());
+
+    // 如果隐藏启动，标记为轻量模式
+    if start_hidden {
+        *lightweight_state.is_lightweight.lock().unwrap() = true;
+    }
 
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -340,6 +513,7 @@ pub fn run() {
         .manage(Arc::new(SensitiveFilterState::default()))
         .manage(credential_state)
         .manage(storage_state)
+        .manage(lightweight_state.clone())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
@@ -350,20 +524,32 @@ pub fn run() {
                         api.prevent_close();
                         let _ = window.hide();
                         let _ = window.app_handle().emit("app-hidden", ());
+
+                        // 启动自动切换定时器
+                        start_auto_lightweight_timer(window.app_handle().clone());
                     }
                 }
             }
         })
         .setup({
             let data_dir = data_dir.clone();
+            let start_hidden = start_hidden;
             move |app| {
                 error_window::set_app_handle(app.handle().clone());
                 error_window::install_panic_hook();
 
                 build_tray(app)?;
 
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
+                // 只有非隐藏启动时才应用 acrylic 效果
+                if !start_hidden {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
+                    }
+                } else {
+                    // 隐藏启动：隐藏窗口
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
                 }
 
                 analysis::start_memory_sampler(app.handle().clone());
@@ -516,6 +702,18 @@ pub fn run() {
 
                 python::auto_install_spacy_models(app.handle().clone());
 
+                // 轻量模式下自动启动监控
+                if start_hidden && registry_config::get_bool("lightweight_auto_start_monitor").unwrap_or(true) {
+                    let app_handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app_handle.state::<MonitorState>();
+                        let app_handle_clone = app_handle.clone();
+                        if let Err(e) = monitor::start_monitor(state, app_handle_clone).await {
+                            tracing::error!("Failed to auto-start monitor: {}", e);
+                        }
+                    });
+                }
+
                 Ok(())
             }
         })
@@ -636,21 +834,34 @@ pub fn run() {
             commands::utility::trigger_test_error,
             commands::utility::exit_app,
             commands::utility::frontend_log,
+            // 轻量模式命令
+            commands::utility::switch_to_lightweight_mode,
+            commands::utility::switch_to_standard_mode,
+            commands::utility::get_lightweight_status,
+            commands::utility::get_lightweight_config,
+            commands::utility::set_lightweight_config,
         ]);
 
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ = app
-                .get_webview_window("main")
-                .expect("no main window")
-                .set_focus();
-        }));
+        if !start_hidden {
+            builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_focus();
+                }
+            }));
+        }
     }
 
     builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            // 阻止应用在所有窗口关闭时退出
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }
 
 pub fn run_silent_install() {

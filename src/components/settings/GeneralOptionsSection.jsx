@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Circle } from 'lucide-react';
+import { getLightweightConfig, setLightweightConfig, switchToLightweightMode } from '../../lib/lightweight_api';
 
 export default function GeneralOptionsSection({
   lowResolutionAnalysis,
@@ -19,6 +20,17 @@ export default function GeneralOptionsSection({
   const [fullscreenPaused, setFullscreenPaused] = useState(false);
   const [useDml, setUseDml] = useState(false);
   const [gameModeLoading, setGameModeLoading] = useState(true);
+
+  // 轻量模式状态
+  const [lightweightConfig, setLightweightConfigState] = useState({
+    start_with_window_hidden: false,
+    auto_lightweight_enabled: false,
+    auto_lightweight_delay_minutes: 5,
+  });
+
+  useEffect(() => {
+    getLightweightConfig().then(setLightweightConfigState).catch(console.error);
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -61,6 +73,25 @@ export default function GeneralOptionsSection({
     } catch (err) {
       console.error('Failed to toggle game mode:', err);
       setGameModeEnabled(!next);
+    }
+  };
+
+  const handleLightweightConfigChange = async (key, value) => {
+    const newConfig = { ...lightweightConfig, [key]: value };
+    setLightweightConfigState(newConfig);
+    try {
+      await setLightweightConfig(newConfig);
+    } catch (error) {
+      console.error('Failed to save lightweight config:', error);
+    }
+  };
+
+  const handleSwitchToLightweight = async () => {
+    try {
+      await switchToLightweightMode();
+      // 窗口将被销毁，此代码不会执行
+    } catch (error) {
+      console.error('Failed to switch to lightweight mode:', error);
     }
   };
 
@@ -153,6 +184,76 @@ export default function GeneralOptionsSection({
               className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${gameModeEnabled ? 'translate-x-5' : 'translate-x-0.5'
                 }`}
             />
+          </button>
+        </div>
+
+        {/* 轻量模式 */}
+        <div className="w-full h-px bg-ide-border/50" />
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.lightweightMode.startHidden.label')}</label>
+            <p className="text-xs text-ide-muted">
+              {t('settings.general.lightweightMode.startHidden.description')}
+            </p>
+          </div>
+          <button
+            onClick={() => handleLightweightConfigChange('start_with_window_hidden', !lightweightConfig.start_with_window_hidden)}
+            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${lightweightConfig.start_with_window_hidden ? 'bg-ide-accent' : 'bg-ide-border'}`}
+          >
+            <div
+              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${lightweightConfig.start_with_window_hidden ? 'translate-x-5' : 'translate-x-0.5'}`}
+            />
+          </button>
+        </div>
+
+        <div className="w-full h-px bg-ide-border/50" />
+
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex-1">
+            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.lightweightMode.autoSwitch.label')}</label>
+            <p className="text-xs text-ide-muted">
+              {t('settings.general.lightweightMode.autoSwitch.description')}
+            </p>
+            {lightweightConfig.auto_lightweight_enabled && (
+              <div className="flex items-center gap-2 mt-2">
+                <span className="text-xs text-ide-muted">{t('settings.general.lightweightMode.autoSwitch.delayLabel')}</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="60"
+                  value={lightweightConfig.auto_lightweight_delay_minutes}
+                  onChange={(e) => handleLightweightConfigChange('auto_lightweight_delay_minutes', parseInt(e.target.value))}
+                  className="w-16 px-2 py-1 bg-ide-panel border border-ide-border rounded text-ide-text text-xs"
+                />
+                <span className="text-xs text-ide-muted">{t('settings.general.lightweightMode.autoSwitch.delayUnit')}</span>
+              </div>
+            )}
+          </div>
+          <button
+            onClick={() => handleLightweightConfigChange('auto_lightweight_enabled', !lightweightConfig.auto_lightweight_enabled)}
+            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${lightweightConfig.auto_lightweight_enabled ? 'bg-ide-accent' : 'bg-ide-border'}`}
+          >
+            <div
+              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${lightweightConfig.auto_lightweight_enabled ? 'translate-x-5' : 'translate-x-0.5'}`}
+            />
+          </button>
+        </div>
+
+        <div className="w-full h-px bg-ide-border/50" />
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.lightweightMode.switchNow.label')}</label>
+            <p className="text-xs text-ide-muted">
+              {t('settings.general.lightweightMode.switchNow.description')}
+            </p>
+          </div>
+          <button
+            onClick={handleSwitchToLightweight}
+            className="px-3 py-1.5 bg-ide-panel border border-ide-border rounded text-ide-text text-sm hover:bg-ide-bg transition-colors"
+          >
+            {t('settings.general.lightweightMode.switchNow.button')}
           </button>
         </div>
 

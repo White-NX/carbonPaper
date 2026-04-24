@@ -40,9 +40,17 @@ fn set_autostart_windows(enabled: bool) -> Result<bool, String> {
         .to_string_lossy()
         .to_string()
         .replace('"', "");
-    let run_value = format!("\"{}\" --autostart", exe_path);
 
     if enabled {
+        // 检查是否应该隐藏启动
+        let start_hidden = crate::registry_config::get_bool("start_with_window_hidden").unwrap_or(false);
+
+        let run_value = if start_hidden {
+            format!("\"{}\" --autostart --hidden", exe_path)
+        } else {
+            format!("\"{}\" --autostart", exe_path)
+        };
+
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (subkey, _) = hkcu
             .create_subkey(RUN_KEY)

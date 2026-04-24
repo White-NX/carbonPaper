@@ -1,7 +1,8 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Manager;
-use crate::{IS_UPDATING, registry_config, monitor, capture::CaptureState, monitor::MonitorState, storage::StorageState};
+use tauri_plugin_notification::NotificationExt;
+use crate::{IS_UPDATING, registry_config, monitor, capture::CaptureState, monitor::MonitorState, storage::StorageState, LightweightModeState};
 
 #[tauri::command]
 pub fn frontend_log(level: String, message: String) {
@@ -200,4 +201,102 @@ pub fn get_game_mode_status(app: tauri::AppHandle) -> serde_json::Value {
         "permanent": permanent,
         "fullscreen_paused": fullscreen_paused,
     })
+}
+
+// ==================== 轻量模式相关命令 ====================
+
+/// 切换到轻量模式：销毁主窗口
+#[tauri::command]
+pub async fn switch_to_lightweight_mode(
+    app: tauri::AppHandle,
+    lightweight_state: tauri::State<'_, Arc<LightweightModeState>>,
+) -> Result<(), String> {
+    tracing::info!("Switching to lightweight mode");
+
+    // 取消自动切换定时器（如果有）
+    if let Some(timer) = lightweight_state.auto_switch_timer.lock().unwrap().take() {
+        timer.abort();
+    }
+
+    // 销毁主窗口
+    if let Some(window) = app.get_webview_window("main") {
+        window.destroy().map_err(|e| e.to_string())?;
+        tracing::info!("Main window destroyed");
+    }
+
+    // 标记为轻量模式
+    *lightweight_state.is_lightweight.lock().unwrap() = true;
+
+    // 发送通知
+    app.notification()
+        .builder()
+        .title("CarbonPaper")
+        .body("已切换到轻量模式，通过托盘菜单可重新打开界面")
+        .show()
+        .ok();
+
+    Ok(())
+}
+
+/// 切换到标准模式：重建主窗口
+#[tauri::command]
+pub async fn switch_to_standard_mode(
+    app: tauri::AppHandle,
+    lightweight_state: tauri::State<'_, Arc<LightweightModeState>>,
+) -> Result<(), String> {
+    tracing::info!("Switching to standard mode");
+
+    // 取消自动切换定时器（如果有）
+    if let Some(timer) = lightweight_state.auto_switch_timer.lock().unwrap().take() {
+        timer.abort();
+    }
+
+    // 检查窗口是否已存在
+    if app.get_webview_window("main").is_some() {
+        return Err("Window already exists".to_string());
+    }
+
+    // 重建窗口
+    crate::create_main_window(&app).map_err(|e| e.to_string())?;
+
+    // 标记为标准模式
+    *lightweight_state.is_lightweight.lock().unwrap() = false;
+
+    Ok(())
+}
+
+/// 获取当前轻量模式状态
+#[tauri::command]
+pub fn get_lightweight_status(
+    lightweight_state: tauri::State<'_, Arc<LightweightModeState>>,
+) -> Result<bool, String> {
+    Ok(*lightweight_state.is_lightweight.lock().unwrap())
+}
+
+/// 获取轻量模式配置
+#[tauri::command]
+pub fn get_lightweight_config() -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "start_with_window_hidden": registry_config::get_bool("start_with_window_hidden").unwrap_or(false),
+        "auto_lightweight_enabled": registry_config::get_bool("auto_lightweight_enabled").unwrap_or(false),
+        "auto_lightweight_delay_minutes": registry_config::get_u32("auto_lightweight_delay_minutes").unwrap_or(5),
+    }))
+}
+
+/// 设置轻量模式配置
+#[tauri::command]
+pub fn set_lightweight_config(config: serde_json::Value) -> Result<(), String> {
+    if let Some(start_hidden) = config.get("start_with_window_hidden").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("start_with_window_hidden", start_hidden)?;
+    }
+
+    if let Some(auto_enabled) = config.get("auto_lightweight_enabled").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("auto_lightweight_enabled", auto_enabled)?;
+    }
+
+    if let Some(delay) = config.get("auto_lightweight_delay_minutes").and_then(|v| v.as_u64()) {
+        registry_config::set_u32("auto_lightweight_delay_minutes", delay as u32)?;
+    }
+
+    Ok(())
 }

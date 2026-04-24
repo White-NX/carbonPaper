@@ -25,6 +25,7 @@ export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggl
             <button
               key={id}
               type="button"
+              data-tauri-drag-region="false"
               onClick={() => setActiveTab(id)}
               title={!expanded ? t(i18nKey) : undefined}
               className={`relative flex items-center gap-3 h-10 cursor-pointer transition-colors overflow-hidden ${
@@ -52,6 +53,7 @@ export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggl
       <div className="border-t border-ide-border">
         <button
           type="button"
+          data-tauri-drag-region="false"
           onClick={onToggleExpand}
           title={expanded ? t('activityBar.collapse') : t('activityBar.expand')}
           className={`flex items-center gap-3 h-10 w-full cursor-pointer text-ide-muted hover:text-ide-text hover:bg-ide-hover transition-colors ${

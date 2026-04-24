@@ -934,6 +934,7 @@ fn spawn_capture_loop(app: &AppHandle) {
     capture_state.stopped.store(false, Ordering::SeqCst);
     capture_state.paused.store(false, Ordering::SeqCst);
     capture_state.in_flight_ocr_count.store(0, Ordering::SeqCst);
+    capture_state.clear_wgc_session("spawn_capture_loop_reset");
 
     // Load exclusion settings from disk
     {
@@ -1001,6 +1002,9 @@ pub async fn stop_monitor(
             handle.abort();
         }
     }
+
+    // Explicitly release WGC/D3D capture resources even when capture task is force-aborted.
+    capture_state.clear_wgc_session("stop_monitor");
 
     // Wait for in-flight OCR tasks to complete (with timeout)
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);

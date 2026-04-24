@@ -23,6 +23,23 @@
         "permanent": "DirectML disabled (too many switches, will restore on restart)",
         "fullscreen_paused": "Active: Non-browser fullscreen app detected, capture paused"
       },
+      "lightweightMode": {
+        "startHidden": {
+          "label": "Start with Hidden Window (Lightweight Mode)",
+          "description": "Start without showing the UI, run background services only, accessible via tray menu"
+        },
+        "autoSwitch": {
+          "label": "Auto-switch to Lightweight Mode",
+          "description": "Automatically switch to lightweight mode after window closes to save memory",
+          "delayLabel": "Delay:",
+          "delayUnit": "minutes"
+        },
+        "switchNow": {
+          "label": "Switch to Lightweight Mode Now",
+          "description": "Close UI and free memory, can reopen via tray menu",
+          "button": "Switch"
+        }
+      },
       "monitor": {
         "title": "Monitor Service",
         "tooltip": "The Python service handles screenshot capture, OCR text recognition, and image vectorization. When stopped, screenshots and natural language search are unavailable, but existing OCR search still works.",
