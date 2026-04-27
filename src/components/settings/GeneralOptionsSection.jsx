@@ -223,7 +223,23 @@ export default function GeneralOptionsSection({
                   min="1"
                   max="60"
                   value={lightweightConfig.auto_lightweight_delay_minutes}
-                  onChange={(e) => handleLightweightConfigChange('auto_lightweight_delay_minutes', parseInt(e.target.value))}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value, 10);
+                    // 只有当值是有效数字时才更新，否则使用默认值 5
+                    if (!isNaN(val) && val >= 1 && val <= 60) {
+                      handleLightweightConfigChange('auto_lightweight_delay_minutes', val);
+                    } else if (e.target.value === '') {
+                      // 如果用户清空输入框，暂时不更新状态，等待用户输入
+                      // 但为了避免显示 NaN，我们保持当前值
+                    }
+                  }}
+                  onBlur={(e) => {
+                    // 失焦时，如果值无效，恢复为默认值 5
+                    const val = parseInt(e.target.value, 10);
+                    if (isNaN(val) || val < 1 || val > 60) {
+                      handleLightweightConfigChange('auto_lightweight_delay_minutes', 5);
+                    }
+                  }}
                   className="w-16 px-2 py-1 bg-ide-panel border border-ide-border rounded text-ide-text text-xs"
                 />
                 <span className="text-xs text-ide-muted">{t('settings.general.lightweightMode.autoSwitch.delayUnit')}</span>
