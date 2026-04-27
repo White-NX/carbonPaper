@@ -42,14 +42,9 @@ fn set_autostart_windows(enabled: bool) -> Result<bool, String> {
         .replace('"', "");
 
     if enabled {
-        // 检查是否应该隐藏启动
-        let start_hidden = crate::registry_config::get_bool("start_with_window_hidden").unwrap_or(false);
-
-        let run_value = if start_hidden {
-            format!("\"{}\" --autostart --hidden", exe_path)
-        } else {
-            format!("\"{}\" --autostart", exe_path)
-        };
+        // 不在命令行中包含 --hidden 参数，因为 lib.rs 会在运行时检查注册表值 start_with_window_hidden
+        // 这样可以避免自动启动项与配置不同步的问题
+        let run_value = format!("\"{}\" --autostart", exe_path);
 
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (subkey, _) = hkcu
