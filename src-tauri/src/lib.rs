@@ -383,26 +383,6 @@ pub fn create_main_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::err
     // 应用 Acrylic 效果
     let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
 
-    // 设置窗口事件处理
-    let app_handle = app.clone();
-    window.on_window_event(move |event| {
-        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-            if error_window::HAS_CRITICAL_ERROR.load(Ordering::Relaxed) {
-                std::process::exit(1);
-            }
-            if !IS_UPDATING.load(Ordering::Relaxed) {
-                api.prevent_close();
-                if let Some(w) = app_handle.get_webview_window("main") {
-                    let _ = w.hide();
-                    let _ = app_handle.emit("app-hidden", ());
-
-                    // 启动自动切换定时器
-                    start_auto_lightweight_timer(app_handle.clone());
-                }
-            }
-        }
-    });
-
     tracing::info!("Main window created successfully");
     Ok(())
 }
@@ -546,9 +526,13 @@ pub fn run() {
                         let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
                     }
                 } else {
-                    // 隐藏启动：隐藏窗口
+                    // 隐藏启动：销毁窗口以实现真正的轻量模式，释放 WebView 内存
                     if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.hide();
+                        if let Err(e) = window.destroy() {
+                            tracing::warn!("Failed to destroy window on hidden start: {}", e);
+                        } else {
+                            tracing::info!("Main window destroyed for lightweight mode");
+                        }
                     }
                 }
 
@@ -844,13 +828,24 @@ pub fn run() {
 
     #[cfg(desktop)]
     {
-        if !start_hidden {
-            builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_focus();
+        // 单实例保护应该始终启用，无论窗口是否隐藏
+        // 这样可以防止多个实例竞争共享资源（SQLite、命名管道等）
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // 如果窗口存在，聚焦它
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+                let _ = window.show();
+                let _ = window.unminimize();
+            } else {
+                // 如果窗口不存在（轻量模式），切换回标准模式
+                if let Some(lightweight_state) = app.try_state::<Arc<LightweightModeState>>() {
+                    if *lightweight_state.is_lightweight.lock().unwrap() {
+                        let _ = crate::create_main_window(&app);
+                        *lightweight_state.is_lightweight.lock().unwrap() = false;
+                    }
                 }
-            }));
-        }
+            }
+        }));
     }
 
     builder
