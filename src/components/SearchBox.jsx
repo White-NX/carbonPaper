@@ -205,8 +205,8 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     }, [hasDeleteTask, pendingDeleteTotal]);
 
     return (
-        <div 
-            className="relative w-[450px] z-50 pointer-events-auto" 
+        <div
+            className="relative w-[450px] z-50 pointer-events-auto"
             ref={wrapperRef}
             onClick={(e) => e.stopPropagation()}
             data-keep-selection="true"
@@ -221,46 +221,27 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 <div className="relative z-10 flex items-center border-r border-ide-border mr-2">
                 <button
                     className={`p-2 text-ide-muted hover:text-ide-text transition-colors ${backendOnline === false && mode === 'ocr' ? 'opacity-50 cursor-not-allowed' : ''}`}
-                    onClick={() => { if (backendOnline === false && mode === 'ocr') return; userInteractionRef.current = true; setMode(mode === 'ocr' ? 'nl' : 'ocr'); }}
+                    onClick={() => {
+                        // 如果后端离线且当前是 OCR 模式，不允许切换到 NL 模式
+                        if (backendOnline === false && mode === 'ocr') return;
+                        userInteractionRef.current = true;
+                        setMode(mode === 'ocr' ? 'nl' : 'ocr');
+                    }}
                     title={backendOnline === false && mode === 'ocr' ? t('search.nl.disabled_hint') : (mode === 'ocr' ? t('search.switchToNL') : t('search.switchToOCR'))}
                 >
                     {mode === 'ocr' ? <Type size={16} /> : <ImageIcon size={16} />}
                 </button>
                 <button
                     className="p-2 pl-0 text-ide-muted hover:text-ide-text transition-colors"
-                    onClick={(e) => { e.stopPropagation(); setShowModeMenu(!showModeMenu); }}
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        console.log('ChevronDown clicked, current showModeMenu:', showModeMenu);
+                        setShowModeMenu(!showModeMenu);
+                    }}
                     title={t('search.selectMode')}
                 >
                     <ChevronDown size={14} />
                 </button>
-                {showModeMenu && (
-                    <div className="absolute top-full left-0 mt-2 w-72 bg-ide-panel border border-ide-border rounded-md shadow-xl z-[60] p-1 flex flex-col gap-1">
-                        <button
-                            className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'ocr' ? 'bg-ide-active border border-ide-border' : ''}`}
-                            onClick={() => { userInteractionRef.current = true; setMode('ocr'); setShowModeMenu(false); }}
-                        >
-                            <div className="mt-1 text-ide-accent"><Type size={18} /></div>
-                            <div>
-                                <div className="text-sm font-bold text-ide-text">{t('search.mode.ocr.title')}</div>
-                                <div className="text-xs text-ide-muted leading-relaxed">{t('search.mode.ocr.description')}</div>
-                            </div>
-                        </button>
-                        <button
-                            className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'nl' ? 'bg-ide-active border border-ide-border' : ''} ${backendOnline === false ? 'opacity-50 cursor-not-allowed' : ''}`}
-                            onClick={() => { if (backendOnline === false) return; userInteractionRef.current = true; setMode('nl'); setShowModeMenu(false); }}
-                            title={backendOnline === false ? t('search.nl.disabled_hint') : ''}
-                        >
-                            <div className="mt-1 text-ide-success"><ImageIcon size={18} /></div>
-                            <div>
-                                <div className="text-sm font-bold text-ide-text">{t('search.mode.nl.title')}</div>
-                                <div className="text-xs text-ide-muted leading-relaxed">
-                                    {t('search.mode.nl.description')}
-                                    {backendOnline === false && <span className="block text-xs text-red-400 mt-1">{t('search.nl.disabled_hint')}</span>}
-                                </div>
-                            </div>
-                        </button>
-                    </div>
-                )}
             </div>
 
             <input
@@ -291,6 +272,35 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 )
             )}
             </div>
+
+            {showModeMenu && (
+                <div className="absolute top-full left-0 mt-2 w-72 bg-ide-panel border border-ide-border rounded-md shadow-xl z-[60] p-1 flex flex-col gap-1">
+                    <button
+                        className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'ocr' ? 'bg-ide-active border border-ide-border' : ''}`}
+                        onClick={() => { userInteractionRef.current = true; setMode('ocr'); setShowModeMenu(false); }}
+                    >
+                        <div className="mt-1 text-ide-accent"><Type size={18} /></div>
+                        <div>
+                            <div className="text-sm font-bold text-ide-text">{t('search.mode.ocr.title')}</div>
+                            <div className="text-xs text-ide-muted leading-relaxed">{t('search.mode.ocr.description')}</div>
+                        </div>
+                    </button>
+                    <button
+                        className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'nl' ? 'bg-ide-active border border-ide-border' : ''} ${backendOnline === false ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        onClick={() => { if (backendOnline === false) return; userInteractionRef.current = true; setMode('nl'); setShowModeMenu(false); }}
+                        title={backendOnline === false ? t('search.nl.disabled_hint') : ''}
+                    >
+                        <div className="mt-1 text-ide-success"><ImageIcon size={18} /></div>
+                        <div>
+                            <div className="text-sm font-bold text-ide-text">{t('search.mode.nl.title')}</div>
+                            <div className="text-xs text-ide-muted leading-relaxed">
+                                {t('search.mode.nl.description')}
+                                {backendOnline === false && <span className="block text-xs text-red-400 mt-1">{t('search.nl.disabled_hint')}</span>}
+                            </div>
+                        </div>
+                    </button>
+                </div>
+            )}
 
             {showResults && (
                 <div className="absolute top-full mt-2 w-[450px] bg-ide-panel border border-ide-border rounded-lg shadow-2xl overflow-hidden max-h-[600px] flex flex-col">

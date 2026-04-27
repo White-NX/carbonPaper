@@ -40,9 +40,12 @@ fn set_autostart_windows(enabled: bool) -> Result<bool, String> {
         .to_string_lossy()
         .to_string()
         .replace('"', "");
-    let run_value = format!("\"{}\" --autostart", exe_path);
 
     if enabled {
+        // 不在命令行中包含 --hidden 参数，因为 lib.rs 会在运行时检查注册表值 start_with_window_hidden
+        // 这样可以避免自动启动项与配置不同步的问题
+        let run_value = format!("\"{}\" --autostart", exe_path);
+
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (subkey, _) = hkcu
             .create_subkey(RUN_KEY)

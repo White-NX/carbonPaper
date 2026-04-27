@@ -23,6 +23,23 @@
         "permanent": "DirectML 已关闭（频繁切换，将在重启后恢复）",
         "fullscreen_paused": "已激活：检测到全屏非浏览器程序，截图已暂停"
       },
+      "lightweightMode": {
+        "startHidden": {
+          "label": "启动时隐藏窗口（轻量模式启动）",
+          "description": "启动时不显示界面，仅运行后台服务，可通过托盘菜单打开界面"
+        },
+        "autoSwitch": {
+          "label": "自动切换到轻量模式",
+          "description": "窗口关闭后自动切换到轻量模式以节省内存",
+          "delayLabel": "延迟时间：",
+          "delayUnit": "分钟"
+        },
+        "switchNow": {
+          "label": "立即切换到轻量模式",
+          "description": "关闭界面并释放内存，可通过托盘菜单重新打开",
+          "button": "切换"
+        }
+      },
       "monitor": {
         "title": "Python 子服务",
         "tooltip": "Python 子服务负责 OCR 识别和图像向量化等后台任务。关闭后截图循环将停止，自然语言搜索将不可用，但已有的 OCR 搜索仍可正常使用。",

@@ -22,7 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use windows::core::{Interface, IInspectable};
-use windows::Foundation::TypedEventHandler;
+use windows::Foundation::{EventRegistrationToken, IClosable, TypedEventHandler};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession, Direct3D11CaptureFrame
 };
@@ -105,11 +105,13 @@ impl Default for ExclusionSettings {
 
 pub struct WgcCaptureSession {
     hwnd: isize,
-    _session: GraphicsCaptureSession,
-    _frame_pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+    frame_pool: Direct3D11CaptureFramePool,
+    frame_arrived_token: Option<EventRegistrationToken>,
     rx: Receiver<Direct3D11CaptureFrame>,
     d3d_device: ID3D11Device,
     d3d_context: ID3D11DeviceContext,
+    winrt_device: IDirect3DDevice,
     item: GraphicsCaptureItem,
     current_size: windows::Graphics::SizeInt32,
     last_image: Option<CapturedImage>,
@@ -117,6 +119,36 @@ pub struct WgcCaptureSession {
 
 // Safety: WGC COM objects are agile, D3D11 context usage is serialized by the Mutex.
 unsafe impl Send for WgcCaptureSession {}
+
+impl WgcCaptureSession {
+    fn teardown(&mut self) {
+        if let Some(token) = self.frame_arrived_token.take() {
+            if let Err(e) = self.frame_pool.RemoveFrameArrived(token) {
+                tracing::debug!("WGC: RemoveFrameArrived failed during teardown: {:?}", e);
+            }
+        }
+
+        if let Ok(closable) = self.session.cast::<IClosable>() {
+            if let Err(e) = closable.Close() {
+                tracing::debug!("WGC: closing GraphicsCaptureSession failed: {:?}", e);
+            }
+        }
+        if let Ok(closable) = self.frame_pool.cast::<IClosable>() {
+            if let Err(e) = closable.Close() {
+                tracing::debug!("WGC: closing Direct3D11CaptureFramePool failed: {:?}", e);
+            }
+        }
+
+        self.last_image = None;
+        while self.rx.try_recv().is_ok() {}
+    }
+}
+
+impl Drop for WgcCaptureSession {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
 
 // ==================== Capture State ====================
 
@@ -164,6 +196,15 @@ impl CaptureState {
             wgc_state: Mutex::new(None),
             game_mode_capture_paused: AtomicBool::new(false),
         }
+    }
+
+    /// Explicitly drops the current WGC session and releases capture resources.
+    pub fn clear_wgc_session(&self, reason: &str) {
+        let mut guard = self.wgc_state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            tracing::info!("WGC: clearing capture session ({})", reason);
+        }
+        *guard = None;
     }
 
     /// Loads user-defined exclusion settings (processes and titles) from the `monitor_filters.json` file.
@@ -626,61 +667,80 @@ fn capture_foreground_window(
         };
 
         if need_create {
+            let reused_devices = session_guard.as_ref().map(|s| {
+                (
+                    s.d3d_device.clone(),
+                    s.d3d_context.clone(),
+                    s.winrt_device.clone(),
+                )
+            });
+
             if session_guard.is_some() {
                 tracing::info!("WGC: window changed, recreating session");
             }
-            // 1. Create D3D11 device
-            let mut d3d_device: Option<ID3D11Device> = None;
-            let mut d3d_context: Option<ID3D11DeviceContext> = None;
-            let mut feature_level = D3D_FEATURE_LEVEL_11_0;
 
-            let hr = D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                None,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut d3d_device),
-                Some(&mut feature_level),
-                Some(&mut d3d_context),
-            );
+            // Explicitly drop previous session first so event handlers/pools are torn down.
+            *session_guard = None;
 
-            if hr.is_err() {
-                tracing::warn!("D3D11CreateDevice failed: {:?}", hr);
-                *session_guard = None;
-                return None;
-            }
-            
-            let d3d_device = d3d_device.unwrap();
-            let d3d_context = d3d_context.unwrap();
+            // 1. Reuse existing D3D device/context when possible.
+            let (d3d_device, d3d_context, winrt_device) =
+                if let Some((d3d_device, d3d_context, winrt_device)) = reused_devices {
+                    (d3d_device, d3d_context, winrt_device)
+                } else {
+                    let mut d3d_device: Option<ID3D11Device> = None;
+                    let mut d3d_context: Option<ID3D11DeviceContext> = None;
+                    let mut feature_level = D3D_FEATURE_LEVEL_11_0;
 
-            let dxgi_device: IDXGIDevice = match d3d_device.cast() {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("Failed to cast D3D11Device to DXGIDevice: {:?}", e);
-                    *session_guard = None;
-                    return None;
-                }
-            };
-            
-            let inspectable = match CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) {
-                Ok(i) => i,
-                Err(e) => {
-                    tracing::warn!("CreateDirect3D11DeviceFromDXGIDevice failed: {:?}", e);
-                    *session_guard = None;
-                    return None;
-                }
-            };
-            
-            let device: IDirect3DDevice = match inspectable.cast() {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("Failed to cast inspectable to IDirect3DDevice: {:?}", e);
-                    *session_guard = None;
-                    return None;
-                }
-            };
+                    let hr = D3D11CreateDevice(
+                        None,
+                        D3D_DRIVER_TYPE_HARDWARE,
+                        None,
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                        Some(&[D3D_FEATURE_LEVEL_11_0]),
+                        D3D11_SDK_VERSION,
+                        Some(&mut d3d_device),
+                        Some(&mut feature_level),
+                        Some(&mut d3d_context),
+                    );
+
+                    if hr.is_err() {
+                        tracing::warn!("D3D11CreateDevice failed: {:?}", hr);
+                        *session_guard = None;
+                        return None;
+                    }
+
+                    let d3d_device = d3d_device.unwrap();
+                    let d3d_context = d3d_context.unwrap();
+
+                    let dxgi_device: IDXGIDevice = match d3d_device.cast() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!("Failed to cast D3D11Device to DXGIDevice: {:?}", e);
+                            *session_guard = None;
+                            return None;
+                        }
+                    };
+
+                    let inspectable = match CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) {
+                        Ok(i) => i,
+                        Err(e) => {
+                            tracing::warn!("CreateDirect3D11DeviceFromDXGIDevice failed: {:?}", e);
+                            *session_guard = None;
+                            return None;
+                        }
+                    };
+
+                    let winrt_device: IDirect3DDevice = match inspectable.cast() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!("Failed to cast inspectable to IDirect3DDevice: {:?}", e);
+                            *session_guard = None;
+                            return None;
+                        }
+                    };
+
+                    (d3d_device, d3d_context, winrt_device)
+                };
 
             // 2. Create GraphicsCaptureItem
             let interop = match windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>() {
@@ -691,7 +751,7 @@ fn capture_foreground_window(
                     return None;
                 }
             };
-            
+
             let hwnd = HWND(hwnd_raw as *mut _);
             let item: GraphicsCaptureItem = match interop.CreateForWindow(hwnd) {
                 Ok(i) => i,
@@ -719,10 +779,10 @@ fn capture_foreground_window(
 
             // 3. Create frame pool and session
             let frame_pool = match Direct3D11CaptureFramePool::CreateFreeThreaded(
-                &device,
+                &winrt_device,
                 DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 1,
-                item_size
+                item_size,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -741,17 +801,14 @@ fn capture_foreground_window(
                 }
             };
 
-            // Hide the yellow border (requires Windows 10 version 2004+)
             if let Err(e) = session.SetIsBorderRequired(false) {
                 tracing::debug!("Failed to hide capture border (maybe older OS): {:?}", e);
             }
-            // Hide the mouse cursor in the capture
             if let Err(e) = session.SetIsCursorCaptureEnabled(false) {
                 tracing::debug!("Failed to hide capture cursor: {:?}", e);
             }
 
             let (tx, rx) = sync_channel(1);
-
             let handler = TypedEventHandler::new(
                 move |pool: &Option<Direct3D11CaptureFramePool>, _: &Option<IInspectable>| {
                     if let Some(pool) = pool {
@@ -760,28 +817,34 @@ fn capture_foreground_window(
                         }
                     }
                     Ok(())
-                }
+                },
             );
 
-            if let Err(e) = frame_pool.FrameArrived(&handler) {
-                tracing::warn!("Failed to register FrameArrived event: {:?}", e);
-                *session_guard = None;
-                return None;
-            }
+            let frame_arrived_token = match frame_pool.FrameArrived(&handler) {
+                Ok(token) => token,
+                Err(e) => {
+                    tracing::warn!("Failed to register FrameArrived event: {:?}", e);
+                    *session_guard = None;
+                    return None;
+                }
+            };
 
             if let Err(e) = session.StartCapture() {
                 tracing::warn!("StartCapture failed: {:?}", e);
+                let _ = frame_pool.RemoveFrameArrived(frame_arrived_token);
                 *session_guard = None;
                 return None;
             }
 
             *session_guard = Some(WgcCaptureSession {
                 hwnd: hwnd_raw,
-                _session: session,
-                _frame_pool: frame_pool,
+                session,
+                frame_pool,
+                frame_arrived_token: Some(frame_arrived_token),
                 rx,
                 d3d_device,
                 d3d_context,
+                winrt_device,
                 item,
                 current_size: item_size,
                 last_image: None,
@@ -855,7 +918,13 @@ fn capture_foreground_window(
         // Verification that ContentSize matches our locally allocated texture bounds.
         // If the window grew or shrunk, ContentSize differs from the Surface (desc) dimension.
         if width != desc.Width || height != desc.Height {
-            tracing::info!("WGC: Window content size changed ({}x{} -> {}x{}), invalidating session to force recreation.", desc.Width, desc.Height, width, height);
+            tracing::info!(
+                "WGC: Window content size changed ({}x{} -> {}x{}), invalidating session to force recreation.",
+                desc.Width,
+                desc.Height,
+                width,
+                height
+            );
             *session_guard = None;
             return None;
         }
@@ -866,7 +935,10 @@ fn capture_foreground_window(
         desc.MiscFlags = 0;
 
         let mut staging_texture: Option<ID3D11Texture2D> = None;
-        if let Err(e) = session.d3d_device.CreateTexture2D(&desc, None, Some(&mut staging_texture)) {
+        if let Err(e) = session
+            .d3d_device
+            .CreateTexture2D(&desc, None, Some(&mut staging_texture))
+        {
             tracing::warn!("Failed to create staging texture: {:?}", e);
             *session_guard = None;
             return None;
@@ -878,7 +950,10 @@ fn capture_foreground_window(
 
         // 6. Map and extract pixels
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        if let Err(e) = session.d3d_context.Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) {
+        if let Err(e) = session
+            .d3d_context
+            .Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        {
             tracing::warn!("Failed to map staging texture: {:?}", e);
             *session_guard = None;
             return None;
@@ -896,7 +971,6 @@ fn capture_foreground_window(
                 let b = raw[offset];
                 let g = raw[offset + 1];
                 let r = raw[offset + 2];
-                // Ignore alpha
                 rgb_pixels.push(r);
                 rgb_pixels.push(g);
                 rgb_pixels.push(b);
@@ -916,7 +990,6 @@ fn capture_foreground_window(
         };
 
         let mut dynamic = DynamicImage::ImageRgb8(rgb_image);
-
         let max_dim = width.max(height);
         if max_dim > max_side {
             let ratio = max_side as f64 / max_dim as f64;
@@ -937,6 +1010,7 @@ fn capture_foreground_window(
                 return None;
             }
         }
+
         let captured = CapturedImage {
             jpeg_bytes: jpeg_buf,
             width: final_w,
@@ -945,7 +1019,6 @@ fn capture_foreground_window(
         };
 
         session.last_image = Some(captured.clone());
-
         Some(captured)
     }
 }
@@ -1437,6 +1510,7 @@ pub async fn run_capture_loop(
         last_hwnd_raw = current_hwnd_raw;
     }
 
+    capture_state.clear_wgc_session("capture_loop_ended");
     tracing::info!("Rust capture loop ended");
 }
 
