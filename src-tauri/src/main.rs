@@ -13,7 +13,6 @@ fn main() {
         return;
     }
 
-    // 新增：隐藏启动（用于自动启动和轻量模式）
     if args.contains(&"--hidden".to_string()) {
         std::env::set_var("CARBONPAPER_START_HIDDEN", "1");
     }
