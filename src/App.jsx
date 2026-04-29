@@ -59,7 +59,7 @@ function App() {
   });
   const [autoStartSuppressed, setAutoStartSuppressed] = useState(false);
 
-  // Power Saving Mode State
+  // Power Saving Mode State (managed by Rust backend)
   const [powerSavingMode, setPowerSavingMode] = useState(() => {
     if (typeof window === 'undefined') return true;
     const saved = localStorage.getItem('powerSavingMode');
@@ -72,28 +72,30 @@ function App() {
     localStorage.setItem('powerSavingMode', powerSavingMode ? 'true' : 'false');
   }, [powerSavingMode]);
 
+  // Listen for power-saving-changed events from Rust backend
   useEffect(() => {
-    if (!('getBattery' in navigator)) return;
+    let unlisten;
+    const setup = async () => {
+      unlisten = await listen('power-saving-changed', (event) => {
+        const payload = event.payload || {};
+        // active = true means power saving is active (AC disconnected)
+        setPowerSavingSuppressed(payload.active === true);
+      });
 
-    let battery = null;
-    const handleBatteryChange = () => {
-      if (battery) {
-        setPowerSavingSuppressed(powerSavingMode && !battery.charging);
+      // Fetch initial status from Rust
+      try {
+        const status = await invoke('get_power_saving_status');
+        setPowerSavingMode(status.enabled !== false);
+        setPowerSavingSuppressed(status.active === true);
+      } catch (err) {
+        console.warn('Failed to get initial power saving status:', err);
       }
     };
-
-    navigator.getBattery().then(b => {
-      battery = b;
-      handleBatteryChange();
-      b.addEventListener('chargingchange', handleBatteryChange);
-    });
-
+    setup();
     return () => {
-      if (battery) {
-        battery.removeEventListener('chargingchange', handleBatteryChange);
-      }
+      if (unlisten) unlisten();
     };
-  }, [powerSavingMode])
+  }, []);
 
   // Window focus tracking for power saving SQL pause
   useEffect(() => {
@@ -751,29 +753,7 @@ function App() {
     }
   }, [autoStartMonitor, autoStartSuppressed, powerSavingSuppressed, backendStatus, pythonVersion, handleStartBackend, depsNeedUpdate, depsSyncing, depsCheckDone, modelsNeedDownload]);
 
-  useEffect(() => {
-    if (powerSavingSuppressed && backendStatus === 'online') {
-      invoke('stop_monitor').catch(console.warn);
-      invoke('frontend_log', { level: 'info', message: 'Power Saving Mode activated: AC disconnected. Stopped sub-service.' }).catch(console.warn);
-      pushNotification({
-        id: `power-saving-${Date.now()}`,
-        type: 'info',
-        title: '节电模式已激活',
-        message: '检测到交流电源断开，已暂停子服务运行。',
-        timestamp: Date.now(),
-      });
-    }
-  }, [powerSavingSuppressed, backendStatus, pushNotification]);
-
-  const prevPowerSavingSuppressedRef = useRef(powerSavingSuppressed);
-  useEffect(() => {
-    if (prevPowerSavingSuppressedRef.current !== powerSavingSuppressed) {
-      if (!powerSavingSuppressed && autoStartMonitor) {
-        invoke('frontend_log', { level: 'info', message: 'Power Saving Mode deactivated: AC connected. Autostarting sub-service if applicable.' }).catch(console.warn);
-      }
-      prevPowerSavingSuppressedRef.current = powerSavingSuppressed;
-    }
-  }, [powerSavingSuppressed, autoStartMonitor]);
+  // Auto-start condition checks powerSavingSuppressed (updated by Rust events)
 
   // debug: print out python version
   const refreshPythonVersion = useCallback(async () => {

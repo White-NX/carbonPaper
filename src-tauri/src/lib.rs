@@ -10,6 +10,7 @@ mod mcp_server;
 mod model_management;
 mod monitor;
 mod native_messaging;
+mod power;
 mod python;
 mod registry_config;
 mod resource_utils;
@@ -23,6 +24,7 @@ use autostart::{get_autostart_status, set_autostart};
 use capture::CaptureState;
 use credential_manager::CredentialManagerState;
 use monitor::MonitorState;
+use power::PowerState;
 use sensitive_filter::SensitiveFilterState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -494,6 +496,7 @@ pub fn run() {
         .manage(credential_state)
         .manage(storage_state)
         .manage(lightweight_state.clone())
+        .manage(Arc::new(PowerState::new()))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
@@ -615,6 +618,9 @@ pub fn run() {
                     tracing::info!("Restoring game mode monitor on startup");
                     monitor::start_game_mode_monitor(app.handle().clone());
                 }
+
+                // 启动电源监控（节能模式）
+                power::start_power_monitor(app.handle().clone());
 
                 match native_messaging::sync_installed_extension() {
                     Ok(true) => tracing::info!("Browser extension synced to latest version"),
@@ -824,6 +830,9 @@ pub fn run() {
             commands::utility::get_lightweight_status,
             commands::utility::get_lightweight_config,
             commands::utility::set_lightweight_config,
+            // 节能模式命令
+            power::get_power_saving_status,
+            power::set_power_saving_enabled,
         ]);
 
     #[cfg(desktop)]

@@ -10,10 +10,11 @@ export default function GeneralOptionsSection({
   onToggleLowRes,
   sendTelemetryDiagnostics,
   onToggleTelemetry,
-  powerSavingMode,
+  powerSavingMode: externalPowerSavingMode,
   onTogglePowerSaving,
 }) {
   const { t } = useTranslation();
+  const [powerSavingMode, setPowerSavingMode] = useState(externalPowerSavingMode !== false);
   const [gameModeEnabled, setGameModeEnabled] = useState(false);
   const [gameModeActive, setGameModeActive] = useState(false);
   const [gameModePermanent, setGameModePermanent] = useState(false);
@@ -31,6 +32,37 @@ export default function GeneralOptionsSection({
   useEffect(() => {
     getLightweightConfig().then(setLightweightConfigState).catch(console.error);
   }, []);
+
+  // Sync with external power saving mode
+  useEffect(() => {
+    setPowerSavingMode(externalPowerSavingMode !== false);
+  }, [externalPowerSavingMode]);
+
+  // Listen for power-saving-changed events from Rust
+  useEffect(() => {
+    const unlisten = listen('power-saving-changed', (event) => {
+      const payload = event.payload || {};
+      setPowerSavingMode(payload.enabled !== false);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const handleTogglePowerSaving = async () => {
+    const next = !powerSavingMode;
+    // Optimistic update
+    setPowerSavingMode(next);
+    onTogglePowerSaving();
+    try {
+      await invoke('set_power_saving_enabled', { enabled: next });
+    } catch (err) {
+      console.error('Failed to toggle power saving mode:', err);
+      // Revert on error
+      setPowerSavingMode(!next);
+      onTogglePowerSaving();
+    }
+  };
 
   useEffect(() => {
     (async () => {
