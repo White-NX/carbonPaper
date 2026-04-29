@@ -36,6 +36,7 @@ fn is_ac_power_connected() -> bool {
             status.ACLineStatus == 1
         } else {
             // If we can't determine, assume AC is connected (fail-safe)
+            tracing::warn!("Failed to get system power status, assuming AC connected");
             true
         }
     }
@@ -66,8 +67,11 @@ pub fn start_power_monitor(app: AppHandle) {
             let app_for_spawn = app_clone.clone();
             let power_state = app_clone.state::<Arc<PowerState>>();
             let enabled = power_state.enabled.load(Ordering::SeqCst);
+            let current_ac_connected = is_ac_power_connected();
+
             if !enabled {
-                // Power saving mode disabled, reset and continue
+                // Power saving mode disabled, update last_ac_connected and reset active state
+                last_ac_connected = current_ac_connected;
                 if power_state.active.load(Ordering::SeqCst) {
                     power_state.active.store(false, Ordering::SeqCst);
                     let _ = app_clone.emit("power-saving-changed", serde_json::json!({
@@ -77,8 +81,6 @@ pub fn start_power_monitor(app: AppHandle) {
                 }
                 continue;
             }
-
-            let current_ac_connected = is_ac_power_connected();
 
             // AC power disconnected -> activate power saving mode
             if !current_ac_connected && last_ac_connected {
@@ -160,13 +162,17 @@ pub fn get_power_saving_status(power_state: tauri::State<'_, Arc<PowerState>>) -
 }
 
 #[tauri::command]
-pub fn set_power_saving_enabled(power_state: tauri::State<'_, Arc<PowerState>>, enabled: bool) -> Result<(), String> {
+pub fn set_power_saving_enabled(power_state: tauri::State<'_, Arc<PowerState>>, app: AppHandle, enabled: bool) -> Result<(), String> {
     registry_config::set_bool("power_saving_mode_enabled", enabled)?;
     power_state.enabled.store(enabled, Ordering::SeqCst);
 
-    // If disabling while active, reset active state
+    // If disabling while active, reset active state and emit event
     if !enabled {
         power_state.active.store(false, Ordering::SeqCst);
+        let _ = app.emit("power-saving-changed", serde_json::json!({
+            "enabled": false,
+            "active": false,
+        }));
     }
 
     tracing::info!("Power saving mode enabled: {}", enabled);

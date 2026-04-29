@@ -53,14 +53,14 @@ export default function GeneralOptionsSection({
     const next = !powerSavingMode;
     // Optimistic update
     setPowerSavingMode(next);
-    onTogglePowerSaving();
+    onTogglePowerSaving(next);
     try {
       await invoke('set_power_saving_enabled', { enabled: next });
     } catch (err) {
       console.error('Failed to toggle power saving mode:', err);
       // Revert on error
       setPowerSavingMode(!next);
-      onTogglePowerSaving();
+      onTogglePowerSaving(!next);
     }
   };
 
