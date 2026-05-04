@@ -18,6 +18,10 @@ pub struct UpdateManifest {
     pub sha256: String,
     pub notes: Option<String>,
     pub pub_date: Option<String>,
+    #[serde(default)]
+    pub critical: bool,
+    #[serde(default)]
+    pub min_version: Option<String>,
 }
 
 /// Shared state for the update checker, caching the latest update manifest.
@@ -61,6 +65,7 @@ pub struct CheckResult {
     version: Option<String>,
     notes: Option<String>,
     current_version: String,
+    critical: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -86,6 +91,13 @@ pub async fn updater_check(
         .map_err(|e| format!("Failed to parse update manifest: {}", e))?;
 
     let available = is_newer(&manifest.version, &current_version);
+    
+    let mut is_critical = manifest.critical;
+    if let Some(min_ver) = &manifest.min_version {
+        if is_newer(min_ver, &current_version) {
+            is_critical = true;
+        }
+    }
 
     let result = CheckResult {
         available,
@@ -100,6 +112,7 @@ pub async fn updater_check(
             None
         },
         current_version,
+        critical: is_critical,
     };
 
     if available {

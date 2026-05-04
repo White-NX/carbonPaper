@@ -26,7 +26,8 @@ import HmacMigrationDialog from './components/HmacMigrationDialog';
 import StartupVacuumDialog from './components/StartupVacuumDialog';
 import { getScreenshotDetails, fetchImage, deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 import { runClustering, saveClusteringResults } from './lib/task_api';
-import { checkForUpdate } from './lib/update_api';
+import { checkForUpdate, downloadAndInstallUpdate } from './lib/update_api';
+import { UpdateModal } from './components/UpdateModal';
 
 function App() {
   // Disable context menu for Tauri production feel
@@ -804,26 +805,58 @@ function App() {
     refreshPythonVersion();
   }, [refreshPythonVersion]);
 
+  // Update state
+  const [updateModalVisible, setUpdateModalVisible] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState(null);
+  const [updateDownloading, setUpdateDownloading] = useState(false);
+  const [updateDownloadProgress, setUpdateDownloadProgress] = useState(null);
+  const [updateDownloadError, setUpdateDownloadError] = useState(null);
+
   // Startup update check — delayed 5s, silent on failure
   useEffect(() => {
     const timer = setTimeout(async () => {
       try {
         const result = await checkForUpdate();
         if (result.available) {
-          pushNotification({
-            id: `update-${Date.now()}`,
-            type: 'info',
-            title: '发现新版本',
-            message: `新版本 v${result.version} 已发布，前往 设置 > 关于 下载更新`,
-            timestamp: Date.now(),
-          });
+          const dismissedVersion = localStorage.getItem('updateDismissed');
+          if (result.critical || dismissedVersion !== result.version) {
+            setUpdateInfo(result);
+            setUpdateModalVisible(true);
+          }
         }
       } catch {
         // Network failure — silently ignore
       }
     }, 5000);
     return () => clearTimeout(timer);
-  }, [pushNotification]);
+  }, []);
+
+  // Debug Update Modal
+  useEffect(() => {
+    const handler = (e) => {
+      setUpdateInfo({
+        version: '9.9.9-debug',
+        body: 'This is a debug update payload.\n- It supports multiline text.\n- And lists.\n\nEnjoy testing the update modal!',
+        critical: e.detail?.critical || false
+      });
+      setUpdateModalVisible(true);
+    };
+    window.addEventListener('debug-update-modal', handler);
+    return () => window.removeEventListener('debug-update-modal', handler);
+  }, []);
+
+  const handleDownloadUpdate = async () => {
+    setUpdateDownloading(true);
+    setUpdateDownloadError(null);
+    try {
+      await downloadAndInstallUpdate((progress) => {
+        setUpdateDownloadProgress(progress);
+      });
+    } catch (err) {
+      setUpdateDownloadError(err.message || String(err));
+      setUpdateDownloading(false);
+    }
+  };
 
   // Header handlers
   const handleSearchSelect = (res) => {
@@ -1045,6 +1078,22 @@ function App() {
         onDismiss={dismissNotification}
         isOpen={showNotifications}
         onClosePanel={() => setShowNotifications(false)}
+      />
+
+      <UpdateModal
+        isVisible={updateModalVisible}
+        updateInfo={updateInfo}
+        downloading={updateDownloading}
+        downloadProgress={updateDownloadProgress}
+        downloadError={updateDownloadError}
+        onDownload={handleDownloadUpdate}
+        onLater={() => {
+          setUpdateModalVisible(false);
+          if (updateInfo) {
+            localStorage.setItem('updateDismissed', updateInfo.version);
+          }
+        }}
+        onClose={() => setUpdateModalVisible(false)}
       />
 
       <SettingsDialog
