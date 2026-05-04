@@ -479,6 +479,20 @@
     "failure": "Delete failed: {{error}}",
     "success": "Successfully deleted {{count}} records"
   },
+  "updateModal": {
+    "title": "New Version Released",
+    "titleCritical": "Critical Update Required",
+    "version": "Version {{version}}",
+    "releaseNotes": "Release Notes",
+    "downloadInstall": "Download & Install",
+    "later": "Later",
+    "background": "Download in Background",
+    "hide": "Hide to Background",
+    "retry": "Retry",
+    "downloading": "Downloading...",
+    "downloadFailed": "Download failed: {{error}}",
+    "criticalNotice": "This update includes important security fixes or feature improvements. To ensure your data safety and the best experience, needs update as soon as possible."
+  },
   "save_filters": {
     "synced": "Saved and synced to monitor service",
     "saved_local_not_running": "Saved locally; monitor service not running, will sync when started",

@@ -12,6 +12,7 @@ export async function checkForUpdate() {
       available: true,
       version: result.version,
       body: result.notes,
+      critical: result.critical,
     };
   }
   return { available: false };

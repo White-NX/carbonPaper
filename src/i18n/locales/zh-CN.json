@@ -459,6 +459,20 @@
     "failure": "删除失败: {{error}}",
     "success": "成功删除 {{count}} 条记录"
   },
+  "updateModal": {
+    "title": "新版本已发布",
+    "titleCritical": "需要关键更新",
+    "version": "版本 {{version}}",
+    "releaseNotes": "更新日志",
+    "downloadInstall": "下载并安装",
+    "later": "稍后",
+    "background": "后台下载",
+    "hide": "隐藏到后台",
+    "retry": "重试",
+    "downloading": "正在下载...",
+    "downloadFailed": "下载失败: {{error}}",
+    "criticalNotice": "该更新包含重要的安全修复或功能改进，为了您的数据安全和最佳体验，需要尽快更新。"
+  },
   "save_filters": {
     "synced": "已保存并同步到监控服务",
     "saved_local_not_running": "已保存到本地，监控服务未启动，启动后会自动同步",

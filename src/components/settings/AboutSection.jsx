@@ -16,8 +16,8 @@ export default function AboutSection({
   onDownloadUpdate,
 }) {
   const { t } = useTranslation();
-  const progressPercent =
-    downloading && downloadProgress.contentLength > 0
+  const hasValidTotal = downloading && downloadProgress.contentLength > 0;
+  const progressPercent = hasValidTotal
       ? Math.round((downloadProgress.downloaded / downloadProgress.contentLength) * 100)
       : 0;
 
@@ -32,7 +32,7 @@ export default function AboutSection({
             />
           </div>
           <div className="text-[10px] text-ide-muted text-center">
-            {progressPercent}%
+            {hasValidTotal ? `${progressPercent}%` : `${(downloadProgress.downloaded / 1024 / 1024).toFixed(1)} MB`}
           </div>
         </div>
       );
@@ -164,13 +164,27 @@ export default function AboutSection({
           {/* Debug: Test Error Window (dev only) */}
           {import.meta.env.DEV && (
             <section className="space-y-2">
-              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl">
+              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl flex flex-col gap-2">
                 <button
                   onClick={() => invoke('trigger_test_error').catch(console.error)}
                   className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
                 >
                   <Bug className="w-3.5 h-3.5" />
                   {t('errorWindow.triggerTest')}
+                </button>
+                <button
+                  onClick={() => window.dispatchEvent(new CustomEvent('debug-update-modal', { detail: { critical: false } }))}
+                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
+                >
+                  <Bug className="w-3.5 h-3.5" />
+                  Preview Update Modal (Normal)
+                </button>
+                <button
+                  onClick={() => window.dispatchEvent(new CustomEvent('debug-update-modal', { detail: { critical: true } }))}
+                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
+                >
+                  <Bug className="w-3.5 h-3.5" />
+                  Preview Update Modal (Critical)
                 </button>
               </div>
             </section>

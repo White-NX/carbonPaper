@@ -40,16 +40,25 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'CarbonPaper ${{ github.ref_name }}'
-          releaseBody: 'See the assets to download and install this version.'
-          releaseDraft: true
-          prerelease: false
 
       - name: Build portable zip
         run: npm run pack:portable
 
+      - name: Fetch Release Notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Try to fetch the release body created by the user or tauri-action
+          $body = gh release view ${{ github.ref_name }} --json body -q .body
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($body)) { 
+            $body = "Release ${{ github.ref_name }}" 
+          }
+          $body | Out-File -FilePath release_body.txt -Encoding utf8
+
       - name: Generate latest.json
-        run: node scripts/generate-latest-json.mjs ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/generate-latest-json.mjs ${{ github.ref_name }} release_body.txt
 
       - name: Upload portable zip and latest.json
         env:
