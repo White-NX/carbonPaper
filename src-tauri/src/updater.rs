@@ -81,7 +81,7 @@ pub async fn updater_check(
     state: tauri::State<'_, UpdaterState>,
 ) -> Result<CheckResult, String> {
     if !registry_config::get_bool("network_enabled").unwrap_or(true) {
-        return Err("网络功能已禁用".to_string());
+        return Err("Network features are disabled".to_string());
     }
     let current_version = app.config().version.clone().unwrap_or_default();
 
@@ -132,7 +132,7 @@ pub async fn updater_download(
     state: tauri::State<'_, UpdaterState>,
 ) -> Result<(), String> {
     if !registry_config::get_bool("network_enabled").unwrap_or(true) {
-        return Err("网络功能已禁用".to_string());
+        return Err("Network features are disabled".to_string());
     }
     let manifest = state
         .manifest

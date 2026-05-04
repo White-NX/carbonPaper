@@ -166,7 +166,7 @@
       "network": {
         "title": "Network Control",
         "label": "Enable Network Features",
-        "description": "Disable all external network requests, including update checks and model downloads."
+        "description": "When disabled, all external network requests will be blocked, including update checks and model downloads."
       }
     },
     "storageManagement": {

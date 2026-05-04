@@ -306,7 +306,7 @@ pub async fn download_model(
     concurrency: Option<usize>,
 ) -> Result<String, String> {
     if !registry_config::get_bool("network_enabled").unwrap_or(true) {
-        return Err("网络功能已禁用".to_string());
+        return Err("Network features are disabled".to_string());
     }
     // prepare aria2 path
     /*let aria2 = aria2_path
