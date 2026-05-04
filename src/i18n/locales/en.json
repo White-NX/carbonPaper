@@ -162,6 +162,11 @@
           "1m": "Monthly",
           "6m": "Every 6 months"
         }
+      },
+      "network": {
+        "title": "Network Control",
+        "label": "Enable Network Features",
+        "description": "Disable all external network requests, including update checks and model downloads."
       }
     },
     "storageManagement": {

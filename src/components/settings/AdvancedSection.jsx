@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap, Monitor, Layers, Database, Loader2 } from 'lucide-react';
+import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap, Monitor, Layers, Database, Loader2, Globe } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
 const CPU_PERCENT_OPTIONS = [5, 10, 15, 20, 30, 50];
@@ -516,6 +516,33 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
           <div className="flex items-start gap-2 p-2.5 bg-ide-panel/50 border border-ide-border/30 rounded-lg">
             <Info className="w-4 h-4 text-ide-muted shrink-0 mt-0.5" />
             <p className="text-xs text-ide-muted leading-relaxed">{t('settings.advanced.clustering.info')}</p>
+          </div>
+        </div>
+      </div>
+
+      {/* 网络控制 */}
+      <div className="space-y-3">
+        <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
+          <Globe className="w-4 h-4" />
+          {t('settings.advanced.network.title')}
+        </label>
+
+        <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1 min-w-0">
+              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.network.label')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.network.description')}</p>
+            </div>
+            <button
+              onClick={() => handleToggle('network_enabled')}
+              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${config.network_enabled ? 'bg-ide-accent' : 'bg-ide-border'
+                }`}
+            >
+              <div
+                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.network_enabled ? 'translate-x-5' : 'translate-x-0.5'
+                  }`}
+              />
+            </button>
           </div>
         </div>
       </div>
