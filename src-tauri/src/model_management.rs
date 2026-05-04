@@ -1,4 +1,5 @@
 use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources, get_log_path};
+use crate::registry_config;
 use anyhow::{anyhow, Context, Result};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::json;
@@ -304,6 +305,9 @@ pub async fn download_model(
     subdir: Option<&str>,
     concurrency: Option<usize>,
 ) -> Result<String, String> {
+    if !registry_config::get_bool("network_enabled").unwrap_or(true) {
+        return Err("Network features are disabled".to_string());
+    }
     // prepare aria2 path
     /*let aria2 = aria2_path
         .map(PathBuf::from)

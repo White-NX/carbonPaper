@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
 
 use crate::resource_utils::{file_in_local_appdata, normalize_path_for_command};
+use crate::registry_config;
 
 const UPDATE_CHECK_URL: &str =
     "https://github.com/White-NX/carbonPaper/releases/latest/download/latest.json";
@@ -79,6 +80,9 @@ pub async fn updater_check(
     app: AppHandle,
     state: tauri::State<'_, UpdaterState>,
 ) -> Result<CheckResult, String> {
+    if !registry_config::get_bool("network_enabled").unwrap_or(true) {
+        return Err("Network features are disabled".to_string());
+    }
     let current_version = app.config().version.clone().unwrap_or_default();
 
     let response = reqwest::get(UPDATE_CHECK_URL)
@@ -127,6 +131,9 @@ pub async fn updater_download(
     app: AppHandle,
     state: tauri::State<'_, UpdaterState>,
 ) -> Result<(), String> {
+    if !registry_config::get_bool("network_enabled").unwrap_or(true) {
+        return Err("Network features are disabled".to_string());
+    }
     let manifest = state
         .manifest
         .lock()

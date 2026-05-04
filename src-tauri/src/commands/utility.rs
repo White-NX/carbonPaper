@@ -66,6 +66,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let dml_device_id = registry_config::get_u32("dml_device_id").unwrap_or(0);
     let game_mode_enabled = registry_config::get_bool("game_mode_enabled").unwrap_or(true);
     let clustering_interval = registry_config::get_string("clustering_interval").unwrap_or_else(|| "1w".to_string());
+    let network_enabled = registry_config::get_bool("network_enabled").unwrap_or(true);
 
     Ok(serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
@@ -77,6 +78,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "dml_device_id": dml_device_id,
         "game_mode_enabled": game_mode_enabled,
         "clustering_interval": clustering_interval,
+        "network_enabled": network_enabled,
     }))
 }
 
@@ -111,6 +113,9 @@ pub fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     }
     if let Some(v) = config.get("clustering_interval").and_then(|v| v.as_str()) {
         registry_config::set_string("clustering_interval", v)?;
+    }
+    if let Some(v) = config.get("network_enabled").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("network_enabled", v)?;
     }
     Ok(())
 }
