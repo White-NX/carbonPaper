@@ -19,7 +19,8 @@ export function UpdateModal({
   if (!isVisible || !updateInfo) return null;
 
   const { version, body, critical } = updateInfo;
-  const progressPercent = downloadProgress
+  const hasValidTotal = downloadProgress && downloadProgress.contentLength > 0;
+  const progressPercent = hasValidTotal
     ? Math.round((downloadProgress.downloaded / downloadProgress.contentLength) * 100)
     : 0;
 
@@ -69,7 +70,12 @@ export function UpdateModal({
             <div className="w-full space-y-1.5 shrink-0 pt-2">
               <div className="flex justify-between text-xs">
                 <span className="text-ide-text font-medium">{t('updateModal.downloading')}</span>
-                <span className="text-ide-muted">{progressPercent}%</span>
+                <span className="text-ide-muted">
+                  {hasValidTotal 
+                    ? `${progressPercent}%` 
+                    : downloadProgress ? `${(downloadProgress.downloaded / 1024 / 1024).toFixed(1)} MB` : '0%'
+                  }
+                </span>
               </div>
               <div className="w-full h-2 bg-ide-bg rounded-full overflow-hidden border border-ide-border">
                 <div 
@@ -83,38 +89,46 @@ export function UpdateModal({
 
         {/* Actions */}
         <div className="mt-5 flex items-center justify-end gap-2 shrink-0">
-          {!critical && !downloading && (
-            <button
-              onClick={onLater}
-              disabled={downloading}
-              className="px-4 py-1.5 bg-ide-bg hover:bg-ide-bg/80 text-ide-muted border border-ide-border rounded text-sm transition-colors disabled:opacity-50"
-            >
-              {t('updateModal.later')}
-            </button>
-          )}
-
           {downloadError ? (
+            <>
+              <button
+                onClick={onClose}
+                className="px-4 py-1.5 bg-ide-bg hover:bg-ide-bg/80 text-ide-muted border border-ide-border rounded text-sm transition-colors"
+              >
+                {t('updateModal.later')}
+              </button>
+              <button
+                onClick={onDownload}
+                disabled={downloading}
+                className="px-4 py-1.5 bg-ide-accent hover:bg-ide-accent/90 text-white rounded text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                {t('updateModal.retry')}
+              </button>
+            </>
+          ) : downloading ? (
             <button
-              onClick={onDownload}
-              disabled={downloading}
-              className="px-4 py-1.5 bg-ide-accent hover:bg-ide-accent/90 text-white rounded text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
+              onClick={onClose}
+              className="px-4 py-1.5 bg-ide-accent hover:bg-ide-accent/90 text-white rounded text-sm font-medium transition-colors flex items-center gap-1.5"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
-              {t('updateModal.retry')}
+              {t('updateModal.hide')}
             </button>
           ) : (
-            <button
-              onClick={onDownload}
-              disabled={downloading}
-              className="px-4 py-1.5 bg-ide-accent hover:bg-ide-accent/90 text-white rounded text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
-            >
-              {downloading ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
+            <>
+              <button
+                onClick={critical ? () => { onDownload(); onClose(); } : onLater}
+                className="px-4 py-1.5 bg-ide-bg hover:bg-ide-bg/80 text-ide-muted border border-ide-border rounded text-sm transition-colors"
+              >
+                {critical ? t('updateModal.background') : t('updateModal.later')}
+              </button>
+              <button
+                onClick={onDownload}
+                className="px-4 py-1.5 bg-ide-accent hover:bg-ide-accent/90 text-white rounded text-sm font-medium transition-colors flex items-center gap-1.5"
+              >
                 <Download className="w-3.5 h-3.5" />
-              )}
-              {downloading ? t('updateModal.downloading') : t('updateModal.downloadInstall')}
-            </button>
+                {t('updateModal.downloadInstall')}
+              </button>
+            </>
           )}
         </div>
       </div>

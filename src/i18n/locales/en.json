@@ -486,6 +486,8 @@
     "releaseNotes": "Release Notes",
     "downloadInstall": "Download & Install",
     "later": "Later",
+    "background": "Download in Background",
+    "hide": "Hide to Background",
     "retry": "Retry",
     "downloading": "Downloading...",
     "downloadFailed": "Download failed: {{error}}",

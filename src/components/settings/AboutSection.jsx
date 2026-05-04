@@ -16,8 +16,8 @@ export default function AboutSection({
   onDownloadUpdate,
 }) {
   const { t } = useTranslation();
-  const progressPercent =
-    downloading && downloadProgress.contentLength > 0
+  const hasValidTotal = downloading && downloadProgress.contentLength > 0;
+  const progressPercent = hasValidTotal
       ? Math.round((downloadProgress.downloaded / downloadProgress.contentLength) * 100)
       : 0;
 
@@ -32,7 +32,7 @@ export default function AboutSection({
             />
           </div>
           <div className="text-[10px] text-ide-muted text-center">
-            {progressPercent}%
+            {hasValidTotal ? `${progressPercent}%` : `${(downloadProgress.downloaded / 1024 / 1024).toFixed(1)} MB`}
           </div>
         </div>
       );

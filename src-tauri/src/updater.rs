@@ -151,21 +151,16 @@ pub async fn updater_download(
     let mut file = std::fs::File::create(&zip_path)
         .map_err(|e| format!("Failed to create zip file: {}", e))?;
 
-    let stream = response;
     let mut hasher = Sha256::new();
 
-    // Read the response body in chunks
-    let bytes = stream
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
-
-    // Process in chunks for progress reporting
-    let chunk_size = 256 * 1024; // 256 KB chunks
-    for chunk in bytes.chunks(chunk_size) {
-        file.write_all(chunk)
+    // Read the response body as a stream for real progress and memory efficiency
+    use futures::StreamExt;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| format!("Failed to read chunk: {}", e))?;
+        file.write_all(&chunk)
             .map_err(|e| format!("Failed to write chunk: {}", e))?;
-        hasher.update(chunk);
+        hasher.update(&chunk);
         downloaded += chunk.len() as u64;
         let _ = app.emit(
             "updater-download-progress",
