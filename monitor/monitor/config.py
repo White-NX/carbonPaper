@@ -49,8 +49,14 @@ INTERVAL = 10  # seconds
 # ---------------------------------------------------------------------------
 # Feature toggles
 # ---------------------------------------------------------------------------
-CLUSTERING_ENABLED = True
-CLASSIFICATION_ENABLED = True
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+CLUSTERING_ENABLED = _env_bool("CARBONPAPER_CLUSTERING_ENABLED", True)
+CLASSIFICATION_ENABLED = _env_bool("CARBONPAPER_CLASSIFICATION_ENABLED", True)
 
 def update_feature_config(clustering_enabled: bool, classification_enabled: bool):
     global CLUSTERING_ENABLED, CLASSIFICATION_ENABLED

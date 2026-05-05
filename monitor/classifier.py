@@ -630,6 +630,7 @@ class ClassificationService:
         Returns:
             (category_name, confidence) — ``"未分类"`` when below threshold.
         """
+        self._ensure_index()
         if self.anchor_matrix is None or len(self.anchor_matrix) == 0:
             return ("未分类", 0.0)
 
@@ -677,6 +678,7 @@ class ClassificationService:
         title_weight: float = 0.8,
     ) -> Dict[str, Any]:
         """Return detailed channel scores for diagnostics."""
+        self._ensure_index()
         if self.anchor_matrix is None or len(self.anchor_matrix) == 0:
             return {
                 "category": "未分类",
