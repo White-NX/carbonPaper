@@ -38,6 +38,7 @@ impl StorageState {
             let mut ss_guard = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner());
             *ss_guard = src.join("screenshots");
         }
+        self.credential_state.set_data_dir(src.to_path_buf());
 
         if let Err(e) = self.initialize() {
             let msg = format!(
@@ -322,6 +323,7 @@ impl StorageState {
             let mut ss_guard = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner());
             *ss_guard = dst.join("screenshots");
         }
+        self.credential_state.set_data_dir(dst.clone());
 
         if let Err(e) = self.initialize() {
             let msg = format!("Failed to reinitialize storage after migration: {}", e);

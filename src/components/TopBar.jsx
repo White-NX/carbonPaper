@@ -65,6 +65,7 @@ export default function TopBar({
   handlePauseMonitor,
   handleResumeMonitor,
   backendOnline,
+  isAuthenticated,
 }) {
   const { t } = useTranslation();
   return (
@@ -97,7 +98,12 @@ export default function TopBar({
         />
         <button
           onClick={() => setShowSettings(true)}
-          className="p-2 hover:bg-ide-hover rounded-md text-ide-muted hover:text-ide-text"
+          disabled={!isAuthenticated}
+          className={`p-2 rounded-md ${
+            !isAuthenticated
+              ? 'opacity-50 cursor-not-allowed text-ide-muted'
+              : 'hover:bg-ide-hover text-ide-muted hover:text-ide-text'
+          }`}
           title={t('topbar.settings')}
         >
           <Settings className="w-4 h-4" />

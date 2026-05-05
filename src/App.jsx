@@ -932,6 +932,7 @@ function App() {
         handlePauseMonitor={handlePauseMonitor}
         handleResumeMonitor={handleResumeMonitor}
         backendOnline={backendStatus === 'online'}
+        isAuthenticated={isAuthenticated}
       />
 
       <div className={`flex-1 min-h-0 flex flex-col overflow-hidden relative ${isMaximized ? '' : 'mx-[3px] mb-[3px] rounded-md'}`}>
@@ -1097,7 +1098,7 @@ function App() {
       />
 
       <SettingsDialog
-        isOpen={showSettings}
+        isOpen={showSettings && isAuthenticated}
         onClose={() => setShowSettings(false)}
         autoStartMonitor={autoStartMonitor}
         onRecordsDeleted={bumpTimelineRefresh}
