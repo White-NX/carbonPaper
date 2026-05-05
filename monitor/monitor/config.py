@@ -46,6 +46,17 @@ INTERVAL = 10  # seconds
 # Exclusion configuration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Feature toggles
+# ---------------------------------------------------------------------------
+CLUSTERING_ENABLED = True
+CLASSIFICATION_ENABLED = True
+
+def update_feature_config(clustering_enabled: bool, classification_enabled: bool):
+    global CLUSTERING_ENABLED, CLASSIFICATION_ENABLED
+    CLUSTERING_ENABLED = clustering_enabled
+    CLASSIFICATION_ENABLED = classification_enabled
+
 # Built-in exclusion keywords (privacy / incognito indicators)
 EXCLUSION_KEYWORDS = ["InPrivate", "Incognito"]
 

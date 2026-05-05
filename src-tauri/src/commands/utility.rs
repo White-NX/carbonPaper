@@ -114,6 +114,12 @@ pub fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     if let Some(v) = config.get("clustering_interval").and_then(|v| v.as_str()) {
         registry_config::set_string("clustering_interval", v)?;
     }
+    if let Some(v) = config.get("clustering_enabled").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("clustering_enabled", v)?;
+    }
+    if let Some(v) = config.get("classification_enabled").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("classification_enabled", v)?;
+    }
     if let Some(v) = config.get("network_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("network_enabled", v)?;
     }
@@ -301,6 +307,45 @@ pub fn set_lightweight_config(config: serde_json::Value) -> Result<(), String> {
 
     if let Some(delay) = config.get("auto_lightweight_delay_minutes").and_then(|v| v.as_u64()) {
         registry_config::set_u32("auto_lightweight_delay_minutes", delay as u32)?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn open_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err("Path does not exist".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        let p_os = std::path::Path::new(&path);
+        if p_os.is_file() {
+            Command::new("explorer")
+                .arg("/select,")
+                .arg(p_os)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        } else {
+            Command::new("explorer")
+                .arg(p_os)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Fallback for macOS/Linux using open or xdg-open
+        use std::process::Command;
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        Command::new(opener)
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
 
     Ok(())

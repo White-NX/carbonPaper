@@ -877,6 +877,10 @@ class ClusteringScheduler:
 
     def _do_run(self) -> bool:
         """Execute one clustering run. Returns True only on successful completion."""
+        from monitor.config import CLUSTERING_ENABLED
+        if not CLUSTERING_ENABLED:
+            logger.debug("Skipping scheduled clustering: feature disabled")
+            return False
         if self._running:
             return False
         if not TaskEmbedder.is_model_available():
@@ -902,6 +906,9 @@ class ClusteringScheduler:
 
     def run_now(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> Dict[str, Any]:
         """Manually trigger a clustering run (blocking)."""
+        from monitor.config import CLUSTERING_ENABLED
+        if not CLUSTERING_ENABLED:
+            return {"status": "disabled", "error": "Clustering is disabled"}
         if self._running:
             return {"status": "already_running"}
         self._running = True

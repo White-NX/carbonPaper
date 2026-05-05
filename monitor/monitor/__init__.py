@@ -4,6 +4,7 @@ Provides ``start()`` / ``stop()`` and the IPC command dispatcher that
 bridges Rust - Python communication.
 """
 
+from . import config
 from .config import (
     paused_event,
     stop_event,
@@ -12,6 +13,7 @@ from .config import (
     get_exclusion_settings,
     _get_process_icon_base64,
     update_advanced_capture_config,
+    update_feature_config,
 )
 from .ipc_pipe import start_pipe_server
 import os
@@ -276,6 +278,99 @@ def _handle_command_impl(req: dict):
             'ocr_queue_max_size': ocr_queue_max_size,
         }
 
+    if cmd == 'update_feature_config':
+        clustering_enabled = req.get('clustering_enabled', True)
+        classification_enabled = req.get('classification_enabled', True)
+        update_feature_config(clustering_enabled, classification_enabled)
+        return {
+            'status': 'success',
+            'clustering_enabled': clustering_enabled,
+            'classification_enabled': classification_enabled,
+        }
+
+    if cmd == 'get_all_models':
+        logger.info('[DIAG:CMD-PY] Received get_all_models command')
+        local_appdata = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
+        
+        search_dirs = [
+            os.path.join(local_appdata, "carbonPaper", "models"),
+            os.path.join(local_appdata, "carbonPaper", "ppOCRmodel"),
+            os.path.join(os.path.expanduser('~'), ".rapidocr", "models"),
+            os.path.join(os.path.expanduser('~'), ".paddleocr"),
+        ]
+        
+        models_info = []
+        seen_paths = set()
+
+        for models_dir in search_dirs:
+            models_dir = os.path.normpath(models_dir)
+            if not os.path.exists(models_dir):
+                logger.info('[DIAG:CMD-PY] Models dir does not exist: %s', models_dir)
+                continue
+            
+            logger.info('[DIAG:CMD-PY] Scanning models dir: %s', models_dir)
+            
+            # For some dirs, we look at files directly (like .rapidocr/models contains .onnx files)
+            # For others, we look at subdirectories (like carbonPaper/models contains model folders)
+            items = os.listdir(models_dir)
+            for m in items:
+                m_path = os.path.join(models_dir, m)
+                if m_path in seen_paths:
+                    continue
+                
+                is_dir = os.path.isdir(m_path)
+                is_model_file = m.endswith('.onnx') or m.endswith('.pdmodel') or m.endswith('.bin')
+                
+                if is_dir or is_model_file:
+                    total_size = 0
+                    if is_dir:
+                        for dirpath, _, filenames in os.walk(m_path):
+                            for f in filenames:
+                                fp = os.path.join(dirpath, f)
+                                if not os.path.islink(fp):
+                                    try:
+                                        total_size += os.path.getsize(fp)
+                                    except Exception:
+                                        pass
+                    else:
+                        try:
+                            total_size = os.path.getsize(m_path)
+                        except Exception:
+                            pass
+                    
+                    if total_size == 0: continue
+
+                    # Determine purpose
+                    purpose = "未知"
+                    m_lower = m.lower()
+                    if "minilm" in m_lower:
+                        purpose = "任务聚类"
+                    elif "bge-small" in m_lower:
+                        purpose = "内容分类"
+                    elif "clip" in m_lower:
+                        purpose = "图像特征提取"
+                    elif "ocr" in m_lower or "det_infer" in m_lower or "rec_infer" in m_lower or "cls_infer" in m_lower or m_lower.startswith("ch_pp"):
+                        purpose = "文字识别 (OCR)"
+                    elif "zh_core_web" in m_lower or "en_core_web" in m_lower:
+                        purpose = "敏感信息识别"
+                        
+                    # Format size
+                    size_mb = total_size / (1024 * 1024)
+                    size_str = f"{size_mb:.1f} MB"
+                    if size_mb > 1024:
+                        size_str = f"{size_mb / 1024:.1f} GB"
+
+                    models_info.append({
+                        "name": m,
+                        "path": m_path,
+                        "size": size_str,
+                        "purpose": purpose
+                    })
+                    seen_paths.add(m_path)
+
+        logger.info('[DIAG:CMD-PY] Returning %d models', len(models_info))
+        return {'status': 'success', 'models': models_info}
+
     # ----- Vector search -----
     if cmd == 'search_nl':
         query = req.get('query', '')
@@ -490,7 +585,7 @@ def _handle_command_impl(req: dict):
             # Classify screenshot
             category = None
             category_confidence = None
-            if _classifier:
+            if _classifier and config.CLASSIFICATION_ENABLED:
                 try:
                     t_classify = time.perf_counter()
                     window_title = req.get('window_title', '')
@@ -521,7 +616,7 @@ def _handle_command_impl(req: dict):
                 logger.debug('[DIAG:process_ocr] screenshot_id=%s classify skipped (no classifier)', screenshot_id)
 
             # Add to task clustering hot layer (non-blocking, best-effort)
-            clustering_allowed = _clustering_scheduler_active and _last_clustering_session_valid
+            clustering_allowed = _clustering_scheduler_active and _last_clustering_session_valid and config.CLUSTERING_ENABLED
             if _clustering_manager and clustering_allowed:
                 try:
                     t_cluster = time.perf_counter()
@@ -770,11 +865,11 @@ def _handle_command_impl(req: dict):
     if cmd == 'get_clustering_status':
         if not _clustering_scheduler:
             return {'error': 'Clustering service not initialised'}
-        config = _clustering_scheduler.get_config()
+        sched_config = _clustering_scheduler.get_config()
         last = _clustering_scheduler.get_last_result()
         return {
             'status': 'success',
-            'config': config,
+            'config': sched_config,
             'last_result': {
                 k: v for k, v in (last or {}).items()
                 if k != 'clusters'
