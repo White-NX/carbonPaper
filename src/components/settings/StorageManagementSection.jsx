@@ -6,9 +6,10 @@ import { listen } from '@tauri-apps/api/event';
 import { Dialog } from '../Dialog';
 import { ConfirmDialog } from '../ConfirmDialog';
 import MigrationProgressDialog from './MigrationProgressDialog';
-import { HardDrive, RefreshCw, Clock, Database, Activity, FolderOpen, AlertTriangle, PieChart, ArrowLeft, Trash2, ChevronLeft, ChevronRight } from 'lucide-react';
+import { HardDrive, RefreshCw, Clock, Database, Activity, FolderOpen, AlertTriangle, PieChart, ArrowLeft, Trash2, ChevronLeft, ChevronRight, FileUp, FileDown } from 'lucide-react';
 import { formatBytes, formatTimestamp } from './analysisUtils';
 import { ThumbnailCard } from '../ThumbnailCard';
+import BackupMigrationDialog from '../BackupMigrationDialog';
 import {
   fetchThumbnailBatch,
   getProcessStorageStats,
@@ -288,6 +289,8 @@ export default function StorageManagementSection({
   const [selectedScreenshotIds, setSelectedScreenshotIds] = useState(() => new Set());
   const [deletingTarget, setDeletingTarget] = useState('');
   const [pendingDeleteIntent, setPendingDeleteIntent] = useState(null);
+  const [isBackupDialogOpen, setIsBackupDialogOpen] = useState(false);
+  const [backupMode, setBackupMode] = useState('export'); // 'export' or 'import'
   const [deleteQueueStatus, setDeleteQueueStatus] = useState({
     pending_screenshots: 0,
     pending_ocr: 0,
@@ -732,6 +735,25 @@ export default function StorageManagementSection({
                 <div className="text-[11px] text-ide-muted pt-2">
                   {t('settings.storageManagement.last_updated', { time: storage?.cached_at_ms ? formatTimestamp(storage.cached_at_ms) : '--' })}
                 </div>
+
+                <div className="flex gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => { setBackupMode('export'); setIsBackupDialogOpen(true); }}
+                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs border border-ide-border rounded-lg bg-ide-bg hover:border-ide-accent hover:text-ide-accent transition-colors"
+                  >
+                    <FileDown className="w-3.5 h-3.5" />
+                    {t('settings.storageManagement.backup.export', 'Export Backup')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setBackupMode('import'); setIsBackupDialogOpen(true); }}
+                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs border border-ide-border rounded-lg bg-ide-bg hover:border-ide-accent hover:text-ide-accent transition-colors"
+                  >
+                    <FileUp className="w-3.5 h-3.5" />
+                    {t('settings.storageManagement.backup.import', 'Import Backup')}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -1036,6 +1058,11 @@ export default function StorageManagementSection({
         </div>
       </Dialog>
 
+      <BackupMigrationDialog
+        isOpen={isBackupDialogOpen}
+        onClose={() => setIsBackupDialogOpen(false)}
+        mode={backupMode}
+      />
     </div>
   );
 }

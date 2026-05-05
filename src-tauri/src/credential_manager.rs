@@ -198,7 +198,32 @@ impl CredentialManagerState {
             self.invalidate_session();
         }
     }
-    
+
+    pub fn import_master_key(&self, master_key: &[u8]) -> Result<(), CredentialError> {
+        if master_key.len() != MASTER_KEY_LEN {
+            return Err(CredentialError::CryptoError(format!(
+                "Invalid master key length: {} (expected {})",
+                master_key.len(),
+                MASTER_KEY_LEN
+            )));
+        }
+
+        let ciphertext = encrypt_master_key_with_cng(master_key)?;
+        let file_data = encode_master_key_file(&ciphertext);
+        let key_file = self.data_dir.join(MASTER_KEY_FILE_NAME);
+        
+        std::fs::write(key_file, file_data)
+            .map_err(|e| CredentialError::SystemError(format!("Failed to write master key file: {}", e)))?;
+
+        // Update caches
+        let mut cached_master = self.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
+        *cached_master = Some(master_key.to_vec());
+        
+        let mut cached_db = self.cached_db_key.lock().unwrap_or_else(|e| e.into_inner());
+        *cached_db = None; // Force re-derivation
+
+        Ok(())
+    }
 }
 
 /// 使用主密钥加密数据（AES-GCM）

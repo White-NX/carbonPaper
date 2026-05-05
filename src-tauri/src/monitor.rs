@@ -45,6 +45,8 @@ pub struct MonitorState {
     pub game_mode_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     /// Set to true during intentional stop_monitor to suppress the watcher's monitor-exited event
     pub stopping: AtomicBool,
+    /// Prevents the monitor from restarting during migration tasks
+    pub migration_lock: AtomicBool,
 }
 
 impl MonitorState {
@@ -61,6 +63,7 @@ impl MonitorState {
             game_mode_permanently_suppressed: AtomicBool::new(false),
             game_mode_task: Mutex::new(None),
             stopping: AtomicBool::new(false),
+            migration_lock: AtomicBool::new(false),
         }
     }
 }
@@ -505,6 +508,10 @@ pub async fn start_monitor(
     state: State<'_, MonitorState>,
     app: AppHandle,
 ) -> Result<String, String> {
+    if state.migration_lock.load(Ordering::SeqCst) {
+        return Err("Cannot start monitor: Migration is currently in progress".to_string());
+    }
+
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|e| format!("<failed to get cwd: {}>", e));

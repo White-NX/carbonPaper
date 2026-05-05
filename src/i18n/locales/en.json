@@ -178,8 +178,10 @@
         "program_used": "App usage",
         "disk_used": "Disk usage",
         "path": "{{path}}"
-      },
-      "last_updated": "Updated: {{time}}",
+      },      "backup": {
+        "export": "Export Backup",
+        "import": "Import Backup"
+      },      "last_updated": "Updated: {{time}}",
       "storagePath": {
         "label": "Storage Location",
         "description": "Select and migrate the directory used for snapshots and database",
@@ -456,7 +458,30 @@
           }
         }
       }
+    },
+    "backup": {
+      "error_password_mismatch": "Passwords do not match",
+      "error_password_empty": "Password cannot be empty",
+      "export_title": "Export Data Backup",
+      "import_title": "Import Data Backup",
+      "export_hint": "This will pack your database and snapshots into an encrypted ZIP. The password is required to decrypt the backup on another computer. PLEASE KEEP IT SAFE.",
+      "import_hint": "Importing will replace your current data with the contents of the backup. This action cannot be undone.",
+      "password_label": "Backup Password",
+      "confirm_password_label": "Confirm Password",
+      "export_btn": "Start Export",
+      "import_btn": "Start Import",
+      "processing": "Processing...",
+      "processing_hint": "Please do not close the application.",
+      "success_title": "Operation Successful",
+      "export_success_hint": "Backup file has been saved.",
+      "import_success_hint": "Data has been imported. Please restart the application to apply changes.",
+      "error_title": "Operation Failed"
     }
+  },
+  "common": {
+    "cancel": "Cancel",
+    "close": "Close",
+    "retry": "Retry"
   },
   "topbar": {
     "settings": "Settings",
