@@ -263,9 +263,9 @@ class ClassificationService:
         self.anchor_scopes: List[str] = []  # scope per row (global/local)
         self.anchor_process_names: List[str] = []  # process name per row (lower-cased)
         self.category_names: List[str] = []
+        self._index_built = False
 
         self._load_anchors()
-        self._build_index()
 
     # ---- persistence --------------------------------------------------
 
@@ -343,6 +343,11 @@ class ClassificationService:
             json.dump(self.anchors, f, ensure_ascii=False, indent=2)
 
     # ---- index building -----------------------------------------------
+
+    def _ensure_index(self):
+        if not self._index_built:
+            self._build_index()
+            self._index_built = True
 
     def _build_index(self):
         """Pre-compute embeddings and weights for all anchors."""
@@ -499,25 +504,8 @@ class ClassificationService:
         channel: str = "all",
         include_debug: bool = False,
     ) -> Dict[str, float]:
-        """Score a single query embedding against all anchors.
-
-        Uses **top-K weighted voting** instead of simple ``max(cosine * weight)``.
-
-        Only anchors whose raw cosine similarity exceeds ``RELEVANCE_FLOOR``
-        participate.  Among qualifying anchors the per-category score is
-        the best *raw cosine* value, **boosted** (not multiplied) by the
-        anchor weight::
-
-            effective = cosine + bonus_factor * (weight - 1.0)
-
-        This ensures:
-          - Weight > 1 gives a mild additive bonus rather than a multiplicative
-            distortion of similarity.
-          - A weight-2 anchor at cosine 0.35 will NOT beat a weight-1 anchor
-            at cosine 0.65.
-
-        Returns a ``{category: score}`` dict.
-        """
+        """Score a single query embedding against all anchors."""
+        self._ensure_index()
         BONUS_FACTOR = 0.05  # each +1.0 weight adds this much to the raw cosine
 
         raw_scores = self.anchor_matrix @ query_emb  # (N,)
@@ -642,6 +630,7 @@ class ClassificationService:
         Returns:
             (category_name, confidence) — ``"未分类"`` when below threshold.
         """
+        self._ensure_index()
         if self.anchor_matrix is None or len(self.anchor_matrix) == 0:
             return ("未分类", 0.0)
 
@@ -689,6 +678,7 @@ class ClassificationService:
         title_weight: float = 0.8,
     ) -> Dict[str, Any]:
         """Return detailed channel scores for diagnostics."""
+        self._ensure_index()
         if self.anchor_matrix is None or len(self.anchor_matrix) == 0:
             return {
                 "category": "未分类",
@@ -771,6 +761,7 @@ class ClassificationService:
 
         Returns True if cosine similarity > DEDUP_COSINE_THRESHOLD with any existing anchor.
         """
+        self._ensure_index()
         if self.anchor_matrix is None or len(self.anchor_matrix) == 0:
             return False
 

@@ -78,7 +78,8 @@
       "analysis": "存储管理",
       "about": "关于",
       "extension": "浏览器扩展",
-      "ai_embedding": "人工智能嵌入"
+      "ai_embedding": "人工智能嵌入",
+      "features": "功能"
     },
     "security": {
       "protection": {
@@ -480,6 +481,32 @@
       "export_success_hint": "备份文件已成功保存。",
       "import_success_hint": "数据导入完成。请重新启动应用程序以应用更改。",
       "error_title": "操作失败"
+    },
+    "features": {
+      "title": "功能",
+      "management": {
+        "title": "功能管理",
+        "clustering": {
+          "label": "任务聚类",
+          "description": "使用 MiniLM 模型将相似活动分组为长期任务",
+          "interval_label": "自动聚类间隔",
+          "interval_desc": "设置后台自动运行任务聚类的时间间隔"
+        },
+        "classification": {
+          "label": "内容分类",
+          "description": "使用 BGE 模型自动分类截图内容"
+        },
+        "disabled_notice": "此功能已禁用"
+      },
+      "models": {
+        "title": "模型管理",
+        "name": "模型",
+        "purpose": "用途",
+        "size": "大小",
+        "location": "位置",
+        "empty": "暂无模型数据",
+        "refresh": "刷新"
+      }
     }
   },
   "common": {

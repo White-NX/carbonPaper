@@ -832,6 +832,7 @@ pub fn run() {
             commands::utility::get_lightweight_status,
             commands::utility::get_lightweight_config,
             commands::utility::set_lightweight_config,
+            commands::utility::open_path,
             // Power saving mode commands
             power::get_power_saving_status,
             power::set_power_saving_enabled,

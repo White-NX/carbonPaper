@@ -680,6 +680,21 @@ pub async fn start_monitor(
             cmd_proc.env("CARBONPAPER_DATA_DIR", dd);
         }
 
+        // Sync persisted feature toggles into the Python monitor at startup.
+        cmd_proc
+            .env(
+                "CARBONPAPER_CLUSTERING_ENABLED",
+                crate::registry_config::get_bool("clustering_enabled")
+                    .unwrap_or(true)
+                    .to_string(),
+            )
+            .env(
+                "CARBONPAPER_CLASSIFICATION_ENABLED",
+                crate::registry_config::get_bool("classification_enabled")
+                    .unwrap_or(true)
+                    .to_string(),
+            );
+
         // Pass DirectML configuration
         if crate::registry_config::get_bool("use_dml").unwrap_or(false) {
             // 检查游戏模式是否抑制了 DML（临时或永久）

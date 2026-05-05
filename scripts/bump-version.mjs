@@ -30,7 +30,9 @@ const updates = [];
 
 const updateJsonFile = async (filePath, updater) => {
   const raw = await readFile(filePath, 'utf8');
-  const data = JSON.parse(raw);
+  // Strip UTF-8 BOM if it exists
+  const cleanRaw = raw.startsWith('\uFEFF') ? raw.slice(1) : raw;
+  const data = JSON.parse(cleanRaw);
   const updated = updater(data) ?? data;
   const content = JSON.stringify(updated, null, 2) + '\n';
   updates.push({ filePath, content });

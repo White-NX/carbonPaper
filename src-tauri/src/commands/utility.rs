@@ -66,6 +66,8 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let dml_device_id = registry_config::get_u32("dml_device_id").unwrap_or(0);
     let game_mode_enabled = registry_config::get_bool("game_mode_enabled").unwrap_or(true);
     let clustering_interval = registry_config::get_string("clustering_interval").unwrap_or_else(|| "1w".to_string());
+    let clustering_enabled = registry_config::get_bool("clustering_enabled").unwrap_or(true);
+    let classification_enabled = registry_config::get_bool("classification_enabled").unwrap_or(true);
     let network_enabled = registry_config::get_bool("network_enabled").unwrap_or(true);
 
     Ok(serde_json::json!({
@@ -78,6 +80,8 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "dml_device_id": dml_device_id,
         "game_mode_enabled": game_mode_enabled,
         "clustering_interval": clustering_interval,
+        "clustering_enabled": clustering_enabled,
+        "classification_enabled": classification_enabled,
         "network_enabled": network_enabled,
     }))
 }
@@ -113,6 +117,12 @@ pub fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     }
     if let Some(v) = config.get("clustering_interval").and_then(|v| v.as_str()) {
         registry_config::set_string("clustering_interval", v)?;
+    }
+    if let Some(v) = config.get("clustering_enabled").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("clustering_enabled", v)?;
+    }
+    if let Some(v) = config.get("classification_enabled").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("classification_enabled", v)?;
     }
     if let Some(v) = config.get("network_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("network_enabled", v)?;
@@ -301,6 +311,45 @@ pub fn set_lightweight_config(config: serde_json::Value) -> Result<(), String> {
 
     if let Some(delay) = config.get("auto_lightweight_delay_minutes").and_then(|v| v.as_u64()) {
         registry_config::set_u32("auto_lightweight_delay_minutes", delay as u32)?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn open_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err("Path does not exist".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        let p_os = std::path::Path::new(&path);
+        if p_os.is_file() {
+            Command::new("explorer")
+                .arg("/select,")
+                .arg(p_os)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        } else {
+            Command::new("explorer")
+                .arg(p_os)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Fallback for macOS/Linux using open or xdg-open
+        use std::process::Command;
+        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        Command::new(opener)
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
 
     Ok(())

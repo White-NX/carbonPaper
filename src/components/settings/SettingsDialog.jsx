@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
-import { Settings as SettingsIcon, Shield, Info, Activity, Image as ImageIcon, Database, HardDrive, Wrench, Languages, Globe, Plug } from 'lucide-react';
+import { Settings as SettingsIcon, Shield, Info, Activity, Image as ImageIcon, Database, HardDrive, Wrench, Languages, Globe, Plug, Sparkles } from 'lucide-react';
 import { Dialog } from '../Dialog';
 import { updateMonitorFilters, deleteRecordsByTimeRange } from '../../lib/monitor_api';
 import { getAnalysisOverview } from '../../lib/analysis_api';
@@ -12,6 +12,7 @@ import SecuritySection from './SecuritySection';
 import StorageManagementSection from './StorageManagementSection';
 import AboutSection from './AboutSection';
 import AdvancedSection from './AdvancedSection';
+import FeaturesSection from './FeaturesSection';
 import LanguageSection from './LanguageSection';
 import BrowserExtensionSection from './BrowserExtensionSection';
 import AiEmbeddingSection from './AiEmbeddingSection';
@@ -422,6 +423,7 @@ function SettingsDialog({
     { id: 'general', label: t('settings.tabs.general'), icon: SettingsIcon },
     { id: 'language', label: t('settings.tabs.language'), icon: Languages },
     { id: 'security', label: t('settings.tabs.security'), icon: Shield },
+    { id: 'features', label: t('settings.tabs.features'), icon: Sparkles },
     { id: 'advanced', label: t('settings.tabs.advanced'), icon: Wrench },
     { id: 'extension', label: t('settings.tabs.extension'), icon: Globe },
     { id: 'ai_embedding', label: t('settings.tabs.ai_embedding'), icon: Plug },
@@ -523,6 +525,10 @@ function SettingsDialog({
                 deleteMessage={deleteMessage}
               />
             </div>
+          )}
+
+          {activeTab === 'features' && (
+            <FeaturesSection monitorStatus={monitorStatus} />
           )}
 
           {activeTab === 'advanced' && (

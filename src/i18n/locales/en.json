@@ -78,7 +78,8 @@
       "analysis": "Storage",
       "about": "About",
       "extension": "Browser Extension",
-      "ai_embedding": "AI Embedding"
+      "ai_embedding": "AI Embedding",
+      "features": "Features"
     },
     "security": {
       "protection": {
@@ -178,10 +179,12 @@
         "program_used": "App usage",
         "disk_used": "Disk usage",
         "path": "{{path}}"
-      },      "backup": {
+      },
+      "backup": {
         "export": "Export Backup",
         "import": "Import Backup"
-      },      "last_updated": "Updated: {{time}}",
+      },
+      "last_updated": "Updated: {{time}}",
       "storagePath": {
         "label": "Storage Location",
         "description": "Select and migrate the directory used for snapshots and database",
@@ -476,6 +479,32 @@
       "export_success_hint": "Backup file has been saved.",
       "import_success_hint": "Data has been imported. Please restart the application to apply changes.",
       "error_title": "Operation Failed"
+    },
+    "features": {
+      "title": "Features",
+      "management": {
+        "title": "Feature Management",
+        "clustering": {
+          "label": "Task Clustering",
+          "description": "Group similar activities into long-term tasks using MiniLM model",
+          "interval_label": "Auto Clustering Interval",
+          "interval_desc": "Set the interval for background auto clustering"
+        },
+        "classification": {
+          "label": "Content Classification",
+          "description": "Automatically classify screenshot content using BGE model"
+        },
+        "disabled_notice": "This feature is disabled"
+      },
+      "models": {
+        "title": "Model Management",
+        "name": "Model",
+        "purpose": "Purpose",
+        "size": "Size",
+        "location": "Location",
+        "empty": "No model data available",
+        "refresh": "Refresh"
+      }
     }
   },
   "common": {
