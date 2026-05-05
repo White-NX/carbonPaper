@@ -1,21 +1,18 @@
-use std::sync::Arc;
-use tauri::{Emitter, State, Manager};
-use crate::storage::StorageState;
-use crate::monitor::{MonitorState, stop_monitor, start_monitor};
 use crate::capture::CaptureState;
-use crate::credential_manager::{CredentialManagerState, get_cached_master_key};
-use argon2::{
-    password_hash::SaltString,
-    Argon2,
-};
+use crate::credential_manager::{get_cached_master_key, CredentialManagerState};
+use crate::monitor::{start_monitor, stop_monitor, MonitorState};
+use crate::storage::StorageState;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
+use argon2::{password_hash::SaltString, Argon2};
 use std::fs::File;
 use std::io::{Read, Write};
-use zip::write::FileOptions;
+use std::sync::Arc;
+use tauri::{Emitter, Manager, State};
 use walkdir::WalkDir;
+use zip::write::FileOptions;
 
 #[derive(serde::Serialize)]
 pub struct HmacMigrationStatus {
@@ -35,7 +32,7 @@ pub async fn storage_check_hmac_migration_status(
 ) -> Result<HmacMigrationStatus, String> {
     let needs_migration = state.check_hmac_migration_status()?;
     let is_running = state.is_hmac_migration_in_progress();
-    
+
     Ok(HmacMigrationStatus {
         needs_migration,
         is_running,
@@ -113,7 +110,7 @@ pub async fn storage_run_hmac_migration(
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<(), String> {
     let state = state.inner().clone();
-    
+
     if state.is_hmac_migration_in_progress() {
         return Err("ALREADY_RUNNING".to_string());
     }
@@ -228,14 +225,19 @@ pub async fn storage_export_backup(
     export_path: String,
 ) -> Result<(), String> {
     tracing::info!("Migration: Starting data export to {}", export_path);
-    
+
     let was_running = {
-        let guard = monitor_state.process.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = monitor_state
+            .process
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.is_some()
     };
 
-    monitor_state.migration_lock.store(true, std::sync::atomic::Ordering::SeqCst);
-    
+    monitor_state
+        .migration_lock
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
     let result = async {
         // 1. Release resources
         tracing::info!("Migration: Releasing resources (stopping monitor and storage)");
@@ -243,47 +245,61 @@ pub async fn storage_export_backup(
         state.shutdown()?;
 
         // 2. Get Master Key
-        let master_key = get_cached_master_key(&credential_state)
-            .ok_or_else(|| "Master key not unlocked. Please verify Windows Hello first.".to_string())?;
+        let master_key = get_cached_master_key(&credential_state).ok_or_else(|| {
+            "Master key not unlocked. Please verify Windows Hello first.".to_string()
+        })?;
 
         // 3. Encrypt Master Key with Argon2 + AES-GCM
         tracing::info!("Migration: Deriving backup key and encrypting master key");
         let salt = SaltString::generate(&mut rand::thread_rng());
         let argon2 = Argon2::default();
         let mut derived_key = [0u8; 32];
-        argon2.hash_password_into(password.as_bytes(), salt.as_str().as_bytes(), &mut derived_key)
+        argon2
+            .hash_password_into(
+                password.as_bytes(),
+                salt.as_str().as_bytes(),
+                &mut derived_key,
+            )
             .map_err(|e| format!("Argon2 error: {}", e))?;
 
-        let cipher = Aes256Gcm::new_from_slice(&derived_key).map_err(|e| format!("AES error: {}", e))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&derived_key).map_err(|e| format!("AES error: {}", e))?;
         let mut nonce_bytes = [0u8; 12];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        
-        let encrypted_master_key = cipher.encrypt(nonce, master_key.as_slice())
+
+        let encrypted_master_key = cipher
+            .encrypt(nonce, master_key.as_slice())
             .map_err(|e| format!("Encryption error: {}", e))?;
 
         // 4. Create ZIP
-        let file = File::create(&export_path).map_err(|e| format!("Failed to create export file: {}", e))?;
+        let file = File::create(&export_path)
+            .map_err(|e| format!("Failed to create export file: {}", e))?;
         let mut zip = zip::ZipWriter::new(file);
-        let options: FileOptions<'_, ()> = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
         // metadata.json
-        zip.start_file("metadata.json", options).map_err(|e| e.to_string())?;
+        zip.start_file("metadata.json", options)
+            .map_err(|e| e.to_string())?;
         let metadata = serde_json::json!({
             "salt": salt.as_str(),
             "nonce": hex::encode(nonce_bytes),
         });
-        zip.write_all(metadata.to_string().as_bytes()).map_err(|e| e.to_string())?;
+        zip.write_all(metadata.to_string().as_bytes())
+            .map_err(|e| e.to_string())?;
 
         // master_key.enc
-        zip.start_file("master_key.enc", options).map_err(|e| e.to_string())?;
-        zip.write_all(&encrypted_master_key).map_err(|e| e.to_string())?;
+        zip.start_file("master_key.enc", options)
+            .map_err(|e| e.to_string())?;
+        zip.write_all(&encrypted_master_key)
+            .map_err(|e| e.to_string())?;
 
         // --- Optimized: Single Pass File Collection ---
         tracing::info!("Migration: Scanning data directory for files");
         let data_dir = state.data_dir.lock().unwrap().clone();
         let mut files_to_process = Vec::new();
-        
+
         let db_path = data_dir.join("screenshots.db");
         if db_path.exists() {
             files_to_process.push((db_path, "screenshots.db".to_string()));
@@ -294,7 +310,10 @@ pub async fn storage_export_backup(
             for entry in WalkDir::new(&chroma_dir).into_iter().filter_map(|e| e.ok()) {
                 if entry.path().is_file() {
                     if let Ok(name) = entry.path().strip_prefix(&data_dir) {
-                        files_to_process.push((entry.path().to_owned(), name.to_string_lossy().replace('\\', "/")));
+                        files_to_process.push((
+                            entry.path().to_owned(),
+                            name.to_string_lossy().replace('\\', "/"),
+                        ));
                     }
                 }
             }
@@ -306,10 +325,14 @@ pub async fn storage_export_backup(
             for entry in WalkDir::new(&screenshot_dir)
                 .into_iter()
                 .filter_entry(|e| e.path() != thumbs_dir) // Skip thumbs directory
-                .filter_map(|e| e.ok()) {
+                .filter_map(|e| e.ok())
+            {
                 if entry.path().is_file() {
                     if let Ok(name) = entry.path().strip_prefix(&data_dir) {
-                        files_to_process.push((entry.path().to_owned(), name.to_string_lossy().replace('\\', "/")));
+                        files_to_process.push((
+                            entry.path().to_owned(),
+                            name.to_string_lossy().replace('\\', "/"),
+                        ));
                     }
                 }
             }
@@ -319,40 +342,58 @@ pub async fn storage_export_backup(
         tracing::info!("Migration: Found {} files to export", total_files);
         let mut copied_files = 0;
         let emit_progress = |copied: usize, name: &str| {
-            let _ = app_handle.emit("backup-migration-progress", serde_json::json!({
-                "total_files": total_files,
-                "copied_files": copied,
-                "current_file": name,
-            }));
+            let _ = app_handle.emit(
+                "backup-migration-progress",
+                serde_json::json!({
+                    "total_files": total_files,
+                    "copied_files": copied,
+                    "current_file": name,
+                }),
+            );
         };
 
         emit_progress(0, "Preparing files...");
 
         for (path, zip_name) in files_to_process {
-            zip.start_file(&zip_name, options).map_err(|e| e.to_string())?;
+            zip.start_file(&zip_name, options)
+                .map_err(|e| e.to_string())?;
             let mut f = File::open(&path).map_err(|e| e.to_string())?;
             std::io::copy(&mut f, &mut zip).map_err(|e| e.to_string())?;
-            
+
             copied_files += 1;
             if copied_files % 20 == 0 || copied_files == total_files {
-                tracing::info!("Migration: Exported {}/{} files (current: {})", copied_files, total_files, zip_name);
+                tracing::info!(
+                    "Migration: Exported {}/{} files (current: {})",
+                    copied_files,
+                    total_files,
+                    zip_name
+                );
                 emit_progress(copied_files, &zip_name);
             }
         }
 
         zip.finish().map_err(|e| e.to_string())?;
 
-        // 5. Restore
-        tracing::info!("Migration: Re-initializing storage");
-        state.initialize()?;
-        
         tracing::info!("Migration: Data export completed successfully");
         Ok::<(), String>(())
-    }.await;
+    }
+    .await;
 
-    monitor_state.migration_lock.store(false, std::sync::atomic::Ordering::SeqCst);
-    
-    if was_running {
+    // Always re-initialize storage after export attempt (success or failure)
+    tracing::info!("Migration: Re-initializing storage");
+    let init_result = state.initialize();
+    if let Err(ref e) = init_result {
+        tracing::error!(
+            "Migration: Failed to re-initialize storage after export: {}",
+            e
+        );
+    }
+
+    monitor_state
+        .migration_lock
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    if was_running && init_result.is_ok() {
         tracing::info!("Migration: Restarting monitor after export");
         let monitor_state_for_start = app_handle.state::<MonitorState>();
         if let Err(e) = start_monitor(monitor_state_for_start, app_handle.clone()).await {
@@ -360,7 +401,7 @@ pub async fn storage_export_backup(
         }
     }
 
-    result
+    result.and(init_result)
 }
 
 #[tauri::command]
@@ -374,13 +415,18 @@ pub async fn storage_import_backup(
     backup_zip_path: String,
 ) -> Result<(), String> {
     tracing::info!("Migration: Starting data import from {}", backup_zip_path);
-    
+
     let was_running = {
-        let guard = monitor_state.process.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = monitor_state
+            .process
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.is_some()
     };
 
-    monitor_state.migration_lock.store(true, std::sync::atomic::Ordering::SeqCst);
+    monitor_state
+        .migration_lock
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let result = async {
         // 1. Prepare
@@ -389,37 +435,57 @@ pub async fn storage_import_backup(
         state.shutdown()?;
 
         // 2. Open ZIP
-        let file = File::open(&backup_zip_path).map_err(|e| format!("Failed to open backup file: {}", e))?;
+        let file = File::open(&backup_zip_path)
+            .map_err(|e| format!("Failed to open backup file: {}", e))?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid ZIP: {}", e))?;
 
         // 3. Read metadata and encrypted master key
         let mut metadata_str = String::new();
         {
-            let mut metadata_file = archive.by_name("metadata.json").map_err(|_| "metadata.json missing in backup".to_string())?;
-            metadata_file.read_to_string(&mut metadata_str).map_err(|e| e.to_string())?;
+            let mut metadata_file = archive
+                .by_name("metadata.json")
+                .map_err(|_| "metadata.json missing in backup".to_string())?;
+            metadata_file
+                .read_to_string(&mut metadata_str)
+                .map_err(|e| e.to_string())?;
         }
-        let metadata: serde_json::Value = serde_json::from_str(&metadata_str).map_err(|e| e.to_string())?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_str).map_err(|e| e.to_string())?;
 
-        let salt_str = metadata["salt"].as_str().ok_or("salt missing in metadata")?;
-        let nonce_hex = metadata["nonce"].as_str().ok_or("nonce missing in metadata")?;
+        let salt_str = metadata["salt"]
+            .as_str()
+            .ok_or("salt missing in metadata")?;
+        let nonce_hex = metadata["nonce"]
+            .as_str()
+            .ok_or("nonce missing in metadata")?;
         let nonce_bytes = hex::decode(nonce_hex).map_err(|e| e.to_string())?;
+        if nonce_bytes.len() != 12 {
+            return Err("Invalid nonce length in backup metadata".to_string());
+        }
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let mut enc_master_key = Vec::new();
         {
-            let mut enc_key_file = archive.by_name("master_key.enc").map_err(|_| "master_key.enc missing in backup".to_string())?;
-            enc_key_file.read_to_end(&mut enc_master_key).map_err(|e| e.to_string())?;
+            let mut enc_key_file = archive
+                .by_name("master_key.enc")
+                .map_err(|_| "master_key.enc missing in backup".to_string())?;
+            enc_key_file
+                .read_to_end(&mut enc_master_key)
+                .map_err(|e| e.to_string())?;
         }
 
         // 4. Decrypt Master Key
         tracing::info!("Migration: Decrypting master key with provided password");
         let argon2 = Argon2::default();
         let mut derived_key = [0u8; 32];
-        argon2.hash_password_into(password.as_bytes(), salt_str.as_bytes(), &mut derived_key)
+        argon2
+            .hash_password_into(password.as_bytes(), salt_str.as_bytes(), &mut derived_key)
             .map_err(|e| format!("Argon2 error: {}", e))?;
 
-        let cipher = Aes256Gcm::new_from_slice(&derived_key).map_err(|e| format!("AES error: {}", e))?;
-        let master_key = cipher.decrypt(nonce, enc_master_key.as_slice())
+        let cipher =
+            Aes256Gcm::new_from_slice(&derived_key).map_err(|e| format!("AES error: {}", e))?;
+        let master_key = cipher
+            .decrypt(nonce, enc_master_key.as_slice())
             .map_err(|_| "Incorrect password or corrupted backup".to_string())?;
 
         if master_key.len() != 32 {
@@ -428,21 +494,26 @@ pub async fn storage_import_backup(
 
         // 5. Re-encrypt with local CNG
         tracing::info!("Migration: Re-encrypting master key with local Windows Hello");
-        credential_state.import_master_key(&master_key).map_err(|e| e.to_string())?;
+        credential_state
+            .import_master_key(&master_key)
+            .map_err(|e| e.to_string())?;
 
         // 6. Replace data files
         let data_dir = state.data_dir.lock().unwrap().clone();
-        
+
         let total_files = archive.len();
         tracing::info!("Migration: Starting extraction of {} entries", total_files);
         let mut copied_files = 0;
 
         let emit_progress = |copied: usize, name: &str| {
-            let _ = app_handle.emit("backup-migration-progress", serde_json::json!({
-                "total_files": total_files,
-                "copied_files": copied,
-                "current_file": name,
-            }));
+            let _ = app_handle.emit(
+                "backup-migration-progress",
+                serde_json::json!({
+                    "total_files": total_files,
+                    "copied_files": copied,
+                    "current_file": name,
+                }),
+            );
         };
 
         for i in 0..archive.len() {
@@ -474,27 +545,43 @@ pub async fn storage_import_backup(
 
             copied_files += 1;
             if copied_files % 50 == 0 || copied_files == total_files {
-                tracing::info!("Migration: Imported {}/{} entries (current: {})", copied_files, total_files, zip_name);
+                tracing::info!(
+                    "Migration: Imported {}/{} entries (current: {})",
+                    copied_files,
+                    total_files,
+                    zip_name
+                );
                 emit_progress(copied_files, &zip_name);
             }
         }
-        
-        tracing::info!("Migration: Data import completed successfully. Application restart recommended.");
-        Ok::<(), String>(())
-    }.await;
 
-    monitor_state.migration_lock.store(false, std::sync::atomic::Ordering::SeqCst);
-    
-    if result.is_err() {
-        tracing::info!("Migration: Import failed, attempting to restore storage and monitor state");
-        let _ = state.initialize();
-        if was_running {
-            let monitor_state_for_start = app_handle.state::<MonitorState>();
-            if let Err(e) = start_monitor(monitor_state_for_start, app_handle.clone()).await {
-                tracing::error!("Migration: Failed to restart monitor after failed import: {}", e);
-            }
+        tracing::info!(
+            "Migration: Data import completed successfully. Application restart recommended."
+        );
+        Ok::<(), String>(())
+    }
+    .await;
+
+    tracing::info!("Migration: Re-initializing storage after import");
+    let init_result = state.initialize();
+    if let Err(ref e) = init_result {
+        tracing::error!(
+            "Migration: Failed to re-initialize storage after import: {}",
+            e
+        );
+    }
+
+    monitor_state
+        .migration_lock
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    if was_running && init_result.is_ok() {
+        tracing::info!("Migration: Restarting monitor after import");
+        let monitor_state_for_start = app_handle.state::<MonitorState>();
+        if let Err(e) = start_monitor(monitor_state_for_start, app_handle.clone()).await {
+            tracing::error!("Migration: Failed to restart monitor after import: {}", e);
         }
     }
 
-    result
+    result.and(init_result)
 }

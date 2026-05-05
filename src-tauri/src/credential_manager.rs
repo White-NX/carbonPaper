@@ -66,7 +66,7 @@ pub struct CredentialManagerState {
     /// 缓存的主密钥（用于数据加密）
     cached_master_key: Mutex<Option<Vec<u8>>>,
     /// 数据目录路径
-    data_dir: PathBuf,
+    data_dir: Mutex<PathBuf>,
     /// 上次认证成功的时间戳（用于会话超时）
     last_auth_time: Mutex<Option<std::time::Instant>>,
     /// 应用是否在前台（用于会话管理）
@@ -103,7 +103,7 @@ impl CredentialManagerState {
             cached_db_key: Mutex::new(None),
             cached_public_key: Mutex::new(None),
             cached_master_key: Mutex::new(None),
-            data_dir,
+            data_dir: Mutex::new(data_dir),
             last_auth_time: Mutex::new(None),
             app_in_foreground: Mutex::new(true),
             session_timeout_secs: Mutex::new(initial_timeout),
@@ -199,6 +199,22 @@ impl CredentialManagerState {
         }
     }
 
+    pub fn set_data_dir(&self, data_dir: PathBuf) {
+        let mut guard = self.data_dir.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = data_dir;
+    }
+
+    fn file_path(&self, file_name: &str) -> PathBuf {
+        self.data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .join(file_name)
+    }
+
+    fn master_key_file_path(&self) -> PathBuf {
+        self.file_path(MASTER_KEY_FILE_NAME)
+    }
+
     pub fn import_master_key(&self, master_key: &[u8]) -> Result<(), CredentialError> {
         if master_key.len() != MASTER_KEY_LEN {
             return Err(CredentialError::CryptoError(format!(
@@ -210,7 +226,7 @@ impl CredentialManagerState {
 
         let ciphertext = encrypt_master_key_with_cng(master_key)?;
         let file_data = encode_master_key_file(&ciphertext);
-        let key_file = self.data_dir.join(MASTER_KEY_FILE_NAME);
+        let key_file = self.master_key_file_path();
         
         std::fs::write(key_file, file_data)
             .map_err(|e| CredentialError::SystemError(format!("Failed to write master key file: {}", e)))?;
@@ -406,7 +422,7 @@ mod windows_impl {
     /// - 锁定后解锁（master key 已缓存）：spawn 子进程执行 CNG 解密
     ///   → 子进程无 PIN 缓存，强制弹窗；主进程 CNG 缓存仍在，row key 解密无额外弹窗
     pub fn force_verify_and_unlock_master_key(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
-        let key_file = state.data_dir.join(MASTER_KEY_FILE_NAME);
+        let key_file = state.master_key_file_path();
         if !key_file.exists() {
             return Err(CredentialError::KeyNotFound);
         }
@@ -481,7 +497,7 @@ mod windows_impl {
             return Ok(key);
         }
 
-        let key_file = state.data_dir.join(MASTER_KEY_FILE_NAME);
+        let key_file = state.master_key_file_path();
         if !key_file.exists() {
             return Err(CredentialError::KeyNotFound);
         }
@@ -521,7 +537,7 @@ pub fn ensure_master_key_created(state: &CredentialManagerState) -> Result<(), C
         return Ok(());
     }
 
-    let key_file = state.data_dir.join(MASTER_KEY_FILE_NAME);
+    let key_file = state.master_key_file_path();
     if key_file.exists() {
         // 主密钥文件已存在，稍后由 credential_verify_user 解锁
         return Ok(());
@@ -557,7 +573,7 @@ pub async fn ensure_master_key_ready(state: &CredentialManagerState) -> Result<V
         return Ok(key);
     }
 
-    let key_file = state.data_dir.join(MASTER_KEY_FILE_NAME);
+    let key_file = state.master_key_file_path();
     if key_file.exists() {
         let master_key = unlock_master_key(state).await?;
         return Ok(master_key);
@@ -888,7 +904,7 @@ pub fn load_public_key_from_file(state: &CredentialManagerState) -> Result<Vec<u
         return Ok(key);
     }
 
-    let key_file = state.data_dir.join("credential_public_key.bin");
+    let key_file = state.file_path("credential_public_key.bin");
     if !key_file.exists() {
         return Err(CredentialError::KeyNotFound);
     }
@@ -906,7 +922,7 @@ pub fn load_public_key_from_file(state: &CredentialManagerState) -> Result<Vec<u
 
 /// 保存公钥到文件（用于后续无需交互的访问）
 pub fn save_public_key_to_file(state: &CredentialManagerState, public_key: &[u8]) -> Result<(), CredentialError> {
-    let key_file = state.data_dir.join("credential_public_key.bin");
+    let key_file = state.file_path("credential_public_key.bin");
     
     // 确保目录存在
     if let Some(parent) = key_file.parent() {

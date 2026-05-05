@@ -15,17 +15,16 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
   const [progress, setProgress] = useState(null);
 
   useEffect(() => {
-    let unlisten;
+    let unlistenPromise;
     if (status === 'processing') {
-      const setup = async () => {
-        unlisten = await listen('backup-migration-progress', (event) => {
-          setProgress(event.payload);
-        });
-      };
-      setup();
+      unlistenPromise = listen('backup-migration-progress', (event) => {
+        setProgress(event.payload);
+      });
     }
     return () => {
-      if (unlisten) unlisten();
+      if (unlistenPromise) {
+        unlistenPromise.then(unlisten => unlisten());
+      }
     };
   }, [status]);
 
