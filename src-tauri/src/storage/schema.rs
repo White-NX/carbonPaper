@@ -454,12 +454,30 @@ impl StorageState {
         Ok(())
     }
 
+    fn is_safe_identifier(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    fn is_safe_column_type(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ' ')
+    }
+
     fn add_column_if_missing(
         conn: &Connection,
         table: &str,
         column: &str,
         column_type: &str,
     ) -> Result<(), String> {
+        if !Self::is_safe_identifier(table) {
+            return Err(format!("Invalid table name: {}", table));
+        }
+        if !Self::is_safe_identifier(column) {
+            return Err(format!("Invalid column name: {}", column));
+        }
+        if !Self::is_safe_column_type(column_type) {
+            return Err(format!("Invalid column type: {}", column_type));
+        }
+
         let mut stmt = conn
             .prepare(&format!("PRAGMA table_info({})", table))
             .map_err(|e| format!("Failed to read table info: {}", e))?;
@@ -488,5 +506,58 @@ impl StorageState {
         conn.execute_batch(create_sql)
             .map_err(|e| format!("Failed to create table {}: {}", _table_name, e))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_identifier() {
+        assert!(StorageState::is_safe_identifier("screenshots"));
+        assert!(StorageState::is_safe_identifier("ocr_results"));
+        assert!(StorageState::is_safe_identifier("column_1"));
+        assert!(!StorageState::is_safe_identifier(""));
+        assert!(!StorageState::is_safe_identifier("table; DROP TABLE users;"));
+        assert!(!StorageState::is_safe_identifier("table--"));
+        assert!(!StorageState::is_safe_identifier("table "));
+        assert!(!StorageState::is_safe_identifier("table.name"));
+    }
+
+    #[test]
+    fn test_is_safe_column_type() {
+        assert!(StorageState::is_safe_column_type("TEXT"));
+        assert!(StorageState::is_safe_column_type("INTEGER NOT NULL DEFAULT 0"));
+        assert!(StorageState::is_safe_column_type("BLOB"));
+        assert!(StorageState::is_safe_column_type("TIMESTAMP"));
+        assert!(!StorageState::is_safe_column_type(""));
+        assert!(!StorageState::is_safe_column_type("TEXT; DROP TABLE users;"));
+        assert!(!StorageState::is_safe_column_type("INTEGER--"));
+    }
+
+    #[test]
+    fn test_add_column_if_missing_validation() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Safe calls (will fail because table doesn't exist, but should pass validation)
+        let res = StorageState::add_column_if_missing(&conn, "screenshots", "new_col", "TEXT");
+        assert!(res.is_err());
+        assert!(!res.unwrap_err().contains("Invalid"));
+
+        // Unsafe table
+        let res = StorageState::add_column_if_missing(&conn, "table; DROP TABLE users;", "new_col", "TEXT");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Invalid table name"));
+
+        // Unsafe column
+        let res = StorageState::add_column_if_missing(&conn, "screenshots", "col;--", "TEXT");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Invalid column name"));
+
+        // Unsafe type
+        let res = StorageState::add_column_if_missing(&conn, "screenshots", "new_col", "TEXT;--");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Invalid column type"));
     }
 }
