@@ -190,6 +190,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../compliance_process");
     println!("cargo:rerun-if-changed=../python-3.12.10-amd64.exe");
     println!("cargo:rerun-if-changed=../browser-extension");
+    println!("cargo:rerun-if-changed=build_pyz.py");
 
     // 最后，调用 tauri_build
     tauri_build::build();
@@ -223,7 +224,7 @@ fn locate_python() -> (String, Vec<String>) {
 
     panic!(
         "Build failed: no usable Python interpreter found. \
-         carbonPaper's build.rs needs Python 3.x on PATH to run `python -m zipapp` for \
+         carbonPaper's build.rs needs Python 3.x on PATH to run `build_pyz.py` for \
          the monitor integrity-check package. Install Python 3.12 or ensure `python` / `py -3` \
          resolves on your PATH."
     );
@@ -235,7 +236,12 @@ fn locate_python() -> (String, Vec<String>) {
 /// 这里**重新走一遍源目录**而不是用 pre-bundle/monitor/，
 /// 因为 pre-bundle 可能积累了源中已删除的陈旧文件（旧 build.rs 只复制不清理）。
 /// 我们把通过过滤的文件复制到 `target/pyz-staging-monitor/`（每次清空），
-/// 然后用 `python -m zipapp` 打包这个干净目录。
+/// 然后用 `build_pyz.py`（项目自带的确定性打包器）把 staging 目录打成 zipapp。
+///
+/// 为什么不直接 `python -m zipapp`：标准 zipapp 把每个 entry 的文件系统 mtime
+/// 写进 zip header，于是同一份源代码两次 build 产出字节不同的 .pyz，hash 漂移。
+/// `build_pyz.py` 固定 entry timestamp / external_attr / 排序 / compresslevel，
+/// 保证字节稳定，从而 `MONITOR_PYZ_SHA256` 可重现。
 ///
 /// 过滤规则与 main() 中的复制循环保持一致：
 ///   - 排除 `.venv` / `__pycache__` / `tests` 子目录
@@ -243,7 +249,8 @@ fn locate_python() -> (String, Vec<String>) {
 ///   - 仅收录扩展名为 `.py` / `.txt` / `.md` / `.json` 的文件
 ///   - `model/` 和 `models/` 全部收录（含权重等二进制）
 ///
-/// 入口点通过 `-m "main:main"` 生成（zipapp 自动写一个 __main__.py 调用 main.main()）。
+/// 入口点通过 `"main:main"` 生成（脚本自动写一个 __main__.py 调用 main.main()，
+/// 与 zipapp 的 MAIN_TEMPLATE 一致）。
 fn build_monitor_pyz(source_dir: &Path, out_pyz: &Path) -> String {
     // 先确认源目录确实存在主入口
     let main_py = source_dir.join("main.py");
@@ -325,29 +332,38 @@ fn build_monitor_pyz(source_dir: &Path, out_pyz: &Path) -> String {
         }
     }
 
-    // 3. 跑 python -m zipapp <staging> -o <out_pyz> -m "main:main" --compress
+    // 3. 跑 build_pyz.py <staging> <out_pyz> "main:main"
+    //    自定义打包脚本：固定 entry mtime / create_system / external_attr，
+    //    排序写入 + 显式 compresslevel，保证 .pyz 字节稳定（同源代码 → 同 hash），
+    //    这样 build.rs 嵌入到 Rust 二进制里的 SHA-256 可以重现。
+    //    `python -m zipapp` 会把每个成员的文件系统 mtime 写进 zip header，
+    //    导致两次 build 产出字节不同的 .pyz，hash 永远漂移——所以这里弃用。
+    let helper_script = Path::new("build_pyz.py");
+    if !helper_script.is_file() {
+        panic!(
+            "Build failed: missing helper script {}; expected at src-tauri/build_pyz.py",
+            helper_script.display()
+        );
+    }
+
     let (program, prefix_args) = locate_python();
     let mut zipapp_cmd = Command::new(&program);
     for a in &prefix_args {
         zipapp_cmd.arg(a);
     }
     zipapp_cmd
-        .arg("-m")
-        .arg("zipapp")
+        .arg(helper_script)
         .arg(staging)
-        .arg("-o")
         .arg(out_pyz)
-        .arg("-m")
-        .arg("main:main")
-        .arg("--compress");
+        .arg("main:main");
 
     let output = zipapp_cmd
         .output()
-        .unwrap_or_else(|e| panic!("Failed to spawn python -m zipapp: {}", e));
+        .unwrap_or_else(|e| panic!("Failed to spawn build_pyz.py: {}", e));
 
     if !output.status.success() {
         panic!(
-            "python -m zipapp failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+            "build_pyz.py failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
             output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
