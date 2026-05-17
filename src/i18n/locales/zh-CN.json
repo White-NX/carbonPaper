@@ -834,6 +834,21 @@
     "hideSocial": "隐藏社交任务",
     "socialTasks": "社交"
   },
+  "aboutSection": {
+    "debug": {
+      "trigger_security_alert": "预览安全告警蒙层"
+    }
+  },
+  "securityAlert": {
+    "title": "监控完整性已被破坏",
+    "debug_title": "安全告警 — 调试触发",
+    "default_message": "所需的监控组件未通过完整性检查。为保护你的数据，启动已被阻止。",
+    "code_label": "错误代码",
+    "detail_label": "详细信息",
+    "recovery_hint": "如果你没有亲自安装或更新 CarbonPaper，请从可信来源重新安装。已在 CarbonPaper AppData 目录下的 security.log 写入日志条目。",
+    "dismiss": "关闭",
+    "exit": "退出应用程序"
+  },
   "errorWindow": {
     "title": "程序出现关键错误",
     "unknownError": "未知错误",
