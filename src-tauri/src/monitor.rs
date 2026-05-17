@@ -539,9 +539,6 @@ pub async fn start_monitor(
         if let Some(p) = find_existing_file_in_resources(&app, "monitor.pyz") {
             pyz_candidates.push(p);
         }
-        if let Some(p) = find_existing_file_in_resources(&app, "monitor/monitor.pyz") {
-            pyz_candidates.push(p);
-        }
 
         // .py 候选（仅 dev 回退用）
         if let Ok(exe_path) = std::env::current_exe() {
