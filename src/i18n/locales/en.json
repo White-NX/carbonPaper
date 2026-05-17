@@ -832,6 +832,21 @@
     "hideSocial": "Hide social tasks",
     "socialTasks": "Social"
   },
+  "aboutSection": {
+    "debug": {
+      "trigger_security_alert": "Preview Security Alert Mask"
+    }
+  },
+  "securityAlert": {
+    "title": "Monitor integrity compromised",
+    "debug_title": "Security alert — debug trigger",
+    "default_message": "A required monitor component failed its integrity check. Startup has been blocked to protect your data.",
+    "code_label": "Code",
+    "detail_label": "Detail",
+    "recovery_hint": "If you did not install or update CarbonPaper yourself, please reinstall from a trusted source. A log entry has been written to security.log under your CarbonPaper AppData directory.",
+    "dismiss": "Dismiss",
+    "exit": "Exit application"
+  },
   "errorWindow": {
     "title": "Critical Error",
     "unknownError": "Unknown error",
