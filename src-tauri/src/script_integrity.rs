@@ -1,11 +1,32 @@
 //! Monitor script integrity verification.
 //!
-//! Design points:
-//! - `EXPECTED_PYZ_SHA256` is injected at compile time by `build.rs` via `cargo:rustc-env=MONITOR_PYZ_SHA256=...`,
-//!   so it is distributed with the Rust binary itself; attackers who modify `.pyz` cannot simultaneously modify this constant.
-//! - `verify_monitor_pyz()` reads the disk `.pyz`, computes SHA-256, and compares with the expected value; any mismatch/read failure returns Err.
-//! - `log_security_event()` appends the event to `<LocalAppData>/CarbonPaper/security.log` when verification fails,
-//!   independent of the tracing logging system for forensic purposes.
+//! ## Threat model — what this actually mitigates
+//!
+//! This is an *integrity* check, **not** anti-tamper protection against a
+//! privileged attacker. The expected SHA-256 of `monitor.pyz` is injected at
+//! compile time by `build.rs` via `cargo:rustc-env=MONITOR_PYZ_SHA256=...` and
+//! ends up as a `&'static str` constant in the Rust binary's `.rodata`. That
+//! raises the bar — an attacker now has to coherently patch **both** the
+//! `.exe` (rewriting the constant) and the `.pyz`, which breaks any
+//! Authenticode signature on the NSIS installer — but anyone with write
+//! access to the `.pyz` typically has comparable access to the `.exe`, so
+//! this is not proof against a determined adversary. For real anti-tamper,
+//! sign the installer and rely on Windows code-signing / SmartScreen.
+//!
+//! What the check *does* reliably catch:
+//!   - accidental corruption (disk error, half-written update)
+//!   - drive-by replacement of only the `.pyz` (e.g. malware that drops a
+//!     malicious monitor script next to an untouched executable)
+//!   - shipping a release binary against a stale or wrong-version `.pyz`
+//!
+//! ## Operational pieces
+//!
+//! - `verify_monitor_pyz()` reads the disk `.pyz`, computes SHA-256, and
+//!   compares with the expected value; any mismatch / read failure returns
+//!   `Err`.
+//! - `log_security_event()` appends the event to
+//!   `<LocalAppData>/CarbonPaper/security.log` when verification fails,
+//!   independent of the tracing logging system, for forensic purposes.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
