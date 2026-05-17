@@ -37,6 +37,180 @@ OCR_DIVERSITY_THRESHOLD = 0.7   # Add OCR as auxiliary anchor only if cosine < t
 OCR_MIN_LENGTH = 20             # Minimum OCR text length to consider as auxiliary anchor
 
 # ---------------------------------------------------------------------------
+# Process → category prior — for "single-purpose" apps where the process name
+# alone is a strong signal of the activity. Applied as a small additive bonus
+# on the final blended score. Do not add multi-purpose processes (browsers,
+# Steam, Office suite, etc.) here — their content drives the category.
+# ---------------------------------------------------------------------------
+PROCESS_CATEGORY_PRIOR: Dict[str, str] = {
+    # ---- 社交通讯 ----
+    "qq.exe": "社交通讯",
+    "tim.exe": "社交通讯",
+    "wechat.exe": "社交通讯",
+    "weixin.exe": "社交通讯",
+    "wxwork.exe": "社交通讯",
+    "dingtalk.exe": "社交通讯",
+    "feishu.exe": "社交通讯",
+    "lark.exe": "社交通讯",
+    "telegram.exe": "社交通讯",
+    "whatsapp.exe": "社交通讯",
+    "slack.exe": "社交通讯",
+    "outlook.exe": "社交通讯",
+    "thunderbird.exe": "社交通讯",
+    "foxmail.exe": "社交通讯",
+    "ms-teams.exe": "社交通讯",
+
+    # ---- 编程开发 ----
+    "code.exe": "编程开发",
+    "code - insiders.exe": "编程开发",
+    "cursor.exe": "编程开发",
+    "windsurf.exe": "编程开发",
+    "idea64.exe": "编程开发",
+    "idea.exe": "编程开发",
+    "pycharm64.exe": "编程开发",
+    "pycharm.exe": "编程开发",
+    "webstorm64.exe": "编程开发",
+    "goland64.exe": "编程开发",
+    "clion64.exe": "编程开发",
+    "phpstorm64.exe": "编程开发",
+    "rubymine64.exe": "编程开发",
+    "rider64.exe": "编程开发",
+    "studio64.exe": "编程开发",
+    "devenv.exe": "编程开发",
+    "sublime_text.exe": "编程开发",
+    "gvim.exe": "编程开发",
+    "nvim.exe": "编程开发",
+    "postman.exe": "编程开发",
+    "insomnia.exe": "编程开发",
+    "dbeaver.exe": "编程开发",
+    "navicat.exe": "编程开发",
+    "ssms.exe": "编程开发",
+    "github desktop.exe": "编程开发",
+    "sourcetree.exe": "编程开发",
+    "gitkraken.exe": "编程开发",
+    "fork.exe": "编程开发",
+    "docker desktop.exe": "编程开发",
+    "windowsterminal.exe": "编程开发",
+    "wezterm-gui.exe": "编程开发",
+    "alacritty.exe": "编程开发",
+
+    # ---- 办公文档 ----
+    "winword.exe": "办公文档",
+    "excel.exe": "办公文档",
+    "powerpnt.exe": "办公文档",
+    "onenote.exe": "办公文档",
+    "visio.exe": "办公文档",
+    "mspub.exe": "办公文档",
+    "wps.exe": "办公文档",
+    "wpsoffice.exe": "办公文档",
+    "et.exe": "办公文档",
+    "wpp.exe": "办公文档",
+    "foxitreader.exe": "办公文档",
+    "foxitphantompdf.exe": "办公文档",
+    "acrord32.exe": "办公文档",
+    "acrobat.exe": "办公文档",
+    "sumatrapdf.exe": "办公文档",
+    "pdfxedit.exe": "办公文档",
+    "evernote.exe": "办公文档",
+    "typora.exe": "办公文档",
+    "obsidian.exe": "办公文档",
+    "notion.exe": "办公文档",
+    "logseq.exe": "办公文档",
+
+    # ---- 设计创作 ----
+    "photoshop.exe": "设计创作",
+    "illustrator.exe": "设计创作",
+    "indesign.exe": "设计创作",
+    "adobe premiere pro.exe": "设计创作",
+    "premierepro.exe": "设计创作",
+    "afterfx.exe": "设计创作",
+    "audition.exe": "设计创作",
+    "adobe media encoder.exe": "设计创作",
+    "lightroom.exe": "设计创作",
+    "xd.exe": "设计创作",
+    "blender.exe": "设计创作",
+    "3dsmax.exe": "设计创作",
+    "maya.exe": "设计创作",
+    "zbrush.exe": "设计创作",
+    "cinema 4d.exe": "设计创作",
+    "c4d.exe": "设计创作",
+    "figma.exe": "设计创作",
+    "sketch.exe": "设计创作",
+    "jianyingpro.exe": "设计创作",
+    "resolve.exe": "设计创作",
+    "krita.exe": "设计创作",
+    "inkscape.exe": "设计创作",
+    "gimp-2.10.exe": "设计创作",
+    "acad.exe": "设计创作",
+    "sketchup.exe": "设计创作",
+
+    # ---- 游戏 ----
+    "steam.exe": "游戏",
+    "epicgameslauncher.exe": "游戏",
+    "battle.net.exe": "游戏",
+    "wegame.exe": "游戏",
+    "ubisoftconnect.exe": "游戏",
+    "gog galaxy.exe": "游戏",
+    "league of legends.exe": "游戏",
+    "leagueclient.exe": "游戏",
+    "valorant.exe": "游戏",
+    "valorant-win64-shipping.exe": "游戏",
+    "dota2.exe": "游戏",
+    "cs2.exe": "游戏",
+    "csgo.exe": "游戏",
+    "minecraft.exe": "游戏",
+    "minecraftlauncher.exe": "游戏",
+    "minecraft launcher.exe": "游戏",
+    "yuanshen.exe": "游戏",
+    "genshinimpact.exe": "游戏",
+    "starrail.exe": "游戏",
+    "bh3.exe": "游戏",
+    "zenlesszonezero.exe": "游戏",
+    "wzryclient.exe": "游戏",
+    "r5apex.exe": "游戏",
+    "tslgame.exe": "游戏",
+    "gta5.exe": "游戏",
+    "rdr2.exe": "游戏",
+    "eldenring.exe": "游戏",
+    "bluestacks.exe": "游戏",
+    "ldplayer.exe": "游戏",
+    "ldplayer9.exe": "游戏",
+    "mumumultiplayer.exe": "游戏",
+    "xxmi launcher.exe": "游戏",
+
+    # ---- 影音娱乐 ----
+    "cloudmusic.exe": "影音娱乐",
+    "qqmusic.exe": "影音娱乐",
+    "kugou.exe": "影音娱乐",
+    "spotify.exe": "影音娱乐",
+    "foobar2000.exe": "影音娱乐",
+    "aimp.exe": "影音娱乐",
+    "potplayer.exe": "影音娱乐",
+    "potplayermini64.exe": "影音娱乐",
+    "vlc.exe": "影音娱乐",
+    "mpc-hc.exe": "影音娱乐",
+    "mpc-be.exe": "影音娱乐",
+    "bilibili.exe": "影音娱乐",
+    "iqiyi.exe": "影音娱乐",
+    "youku.exe": "影音娱乐",
+    "qqlive.exe": "影音娱乐",
+    "douyin.exe": "影音娱乐",
+    "twitch.exe": "影音娱乐",
+
+    # ---- 学习教育 ----
+    "anki.exe": "学习教育",
+    "youdaodict.exe": "学习教育",
+
+    # ---- 阅读资讯 ----
+    "weread.exe": "阅读资讯",
+    "kindle.exe": "阅读资讯",
+    "zotero.exe": "阅读资讯",
+    "mendeley.exe": "阅读资讯",
+    "endnote.exe": "阅读资讯",
+}
+PROCESS_PRIOR_BONUS = 0.12
+
+# ---------------------------------------------------------------------------
 # Anchor data type helper
 # ---------------------------------------------------------------------------
 
@@ -64,74 +238,232 @@ def _make_anchor(
 
 DEFAULT_ANCHORS: Dict[str, List[Dict[str, Any]]] = {
     "编程开发": [
-        _make_anchor("Python异步编程原理"),
-        _make_anchor("VS Code调试技巧"),
-        _make_anchor("Git分支管理教程"),
-        _make_anchor("React组件开发入门"),
-        _make_anchor("数据库SQL查询优化"),
+        # 真实窗口标题 / 应用名
+        _make_anchor("main.py - Visual Studio Code"),
+        _make_anchor("app.tsx - Cursor"),
+        _make_anchor("MainActivity.kt - Android Studio"),
+        _make_anchor("项目 [run] - IntelliJ IDEA"),
+        _make_anchor("Pull Request - GitHub"),
+        _make_anchor("Visual Studio Code 编辑器"),
+        _make_anchor("终端 - bash"),
+        _make_anchor("Windows PowerShell 终端"),
+        _make_anchor("Docker Desktop 容器管理"),
+        _make_anchor("Postman API 接口调试"),
+        _make_anchor("DBeaver 数据库连接"),
+        # 活动短语
+        _make_anchor("Python 异步编程原理"),
+        _make_anchor("Git 分支合并冲突解决"),
+        _make_anchor("React 组件状态管理"),
+        _make_anchor("Rust 内存所有权与借用"),
+        _make_anchor("SQL 查询性能优化"),
+        _make_anchor("调试断点单步执行"),
+        _make_anchor("代码评审 Code Review"),
+        _make_anchor("Stack Overflow 报错搜索"),
+        _make_anchor("正则表达式匹配测试"),
+        _make_anchor("Jupyter Notebook 数据分析"),
     ],
     "学习教育": [
-        _make_anchor("高数极限入门教程"),
-        _make_anchor("考研英语长难句分析"),
+        _make_anchor("高等数学课程视频"),
+        _make_anchor("考研英语单词背诵"),
         _make_anchor("线性代数矩阵运算"),
         _make_anchor("物理力学实验报告"),
         _make_anchor("雅思听力真题练习"),
+        _make_anchor("托福口语口试训练"),
+        _make_anchor("Anki 闪卡复习"),
+        _make_anchor("Coursera 在线课程"),
+        _make_anchor("中国大学 MOOC 学习"),
+        _make_anchor("网易云课堂视频回放"),
+        _make_anchor("学习通在线测验"),
+        _make_anchor("雨课堂课件 PPT"),
+        _make_anchor("LeetCode 算法刷题"),
+        _make_anchor("牛客网面试题库"),
+        _make_anchor("化学元素周期表"),
+        _make_anchor("中学物理公式整理"),
+        _make_anchor("驾考科目一题库"),
+        _make_anchor("有道词典英汉翻译"),
+        _make_anchor("作业批改与讲解"),
+        _make_anchor("期末考试复习笔记"),
     ],
     "影音娱乐": [
-        _make_anchor("主播整活合集"),
-        _make_anchor("搞笑动物视频"),
-        _make_anchor("电影剪辑混剪精彩片段"),
-        _make_anchor("音乐MV首播"),
+        _make_anchor("网易云音乐播放列表"),
+        _make_anchor("QQ 音乐我的歌单"),
+        _make_anchor("酷狗音乐曲库"),
+        _make_anchor("Spotify 流媒体音乐"),
+        _make_anchor("哔哩哔哩首页"),
+        _make_anchor("B 站视频弹幕"),
+        _make_anchor("B 站番剧追更"),
+        _make_anchor("腾讯视频电视剧"),
+        _make_anchor("爱奇艺综艺节目"),
+        _make_anchor("优酷电影点播"),
+        _make_anchor("抖音短视频"),
+        _make_anchor("快手直播间"),
+        _make_anchor("YouTube 视频推荐"),
+        _make_anchor("Twitch 直播频道"),
+        _make_anchor("PotPlayer 视频播放"),
+        _make_anchor("VLC 媒体播放器"),
+        _make_anchor("主播游戏直播"),
+        _make_anchor("电影剪辑混剪"),
         _make_anchor("综艺节目精彩回顾"),
+        _make_anchor("演唱会现场录像"),
     ],
     "社交通讯": [
+        _make_anchor("微信"),
         _make_anchor("微信聊天消息"),
-        _make_anchor("QQ群聊通知提醒"),
-        _make_anchor("Discord频道讨论"),
-        _make_anchor("邮箱收件箱新邮件"),
+        _make_anchor("QQ"),
+        _make_anchor("QQ 群聊通知"),
+        _make_anchor("Discord 频道讨论"),
         _make_anchor("钉钉工作群消息"),
+        _make_anchor("企业微信通讯"),
+        _make_anchor("飞书会议邀请"),
+        _make_anchor("Slack 团队频道"),
+        _make_anchor("Microsoft Teams 会议"),
+        _make_anchor("Telegram 私信"),
+        _make_anchor("Outlook 邮件收件箱"),
+        _make_anchor("Gmail 新邮件提醒"),
+        _make_anchor("QQ 邮箱办公邮件"),
+        _make_anchor("网易邮箱通知"),
+        _make_anchor("短信验证码"),
+        _make_anchor("微博私信会话"),
+        _make_anchor("小红书消息中心"),
+        _make_anchor("知乎站内私信"),
+        _make_anchor("邮件回复转发"),
     ],
     "办公文档": [
-        _make_anchor("Word文档排版编辑"),
-        _make_anchor("Excel数据统计分析"),
-        _make_anchor("PPT演示文稿模板"),
-        _make_anchor("PDF合同文件审阅"),
+        _make_anchor("文档1 - Microsoft Word"),
+        _make_anchor("工作簿1 - Microsoft Excel"),
+        _make_anchor("演示文稿1 - PowerPoint"),
+        _make_anchor("WPS 文字"),
+        _make_anchor("WPS 表格"),
+        _make_anchor("WPS 演示"),
+        _make_anchor("金山文档协作"),
+        _make_anchor("腾讯文档在线编辑"),
+        _make_anchor("石墨文档协作"),
+        _make_anchor("飞书云文档"),
+        _make_anchor("Notion 工作空间"),
+        _make_anchor("Obsidian 笔记仓库"),
+        _make_anchor("OneNote 笔记本"),
+        _make_anchor("印象笔记 Evernote"),
+        _make_anchor("Typora Markdown 编辑"),
+        _make_anchor("PDF 阅读与批注"),
+        _make_anchor("Adobe Acrobat PDF 编辑"),
         _make_anchor("会议纪要整理归档"),
+        _make_anchor("合同审批流程"),
+        _make_anchor("报销单填写提交"),
     ],
     "网页浏览": [
-        _make_anchor("百度搜索结果页面"),
-        _make_anchor("知乎热门问答推荐"),
-        _make_anchor("B站视频首页"),
-        _make_anchor("淘宝商品详情页"),
-        _make_anchor("头条新闻资讯"),
+        _make_anchor("百度搜索结果"),
+        _make_anchor("Google 搜索"),
+        _make_anchor("Bing 搜索引擎"),
+        _make_anchor("微博热搜话题"),
+        _make_anchor("豆瓣评分书影音"),
+        _make_anchor("淘宝商品详情"),
+        _make_anchor("京东电商购物"),
+        _make_anchor("拼多多优惠商品"),
+        _make_anchor("天猫旗舰店"),
+        _make_anchor("携程酒店预订"),
+        _make_anchor("12306 火车票预订"),
+        _make_anchor("美团外卖订餐"),
+        _make_anchor("饿了么外卖"),
+        _make_anchor("高德地图路线规划"),
+        _make_anchor("BOSS 直聘招聘"),
+        _make_anchor("拉勾招聘求职"),
+        _make_anchor("贴吧讨论帖"),
+        _make_anchor("天气预报查询"),
+        _make_anchor("快递物流查询"),
+        _make_anchor("银行网银转账"),
     ],
     "游戏": [
-        _make_anchor("英雄联盟排位赛对局"),
-        _make_anchor("原神探索地图任务"),
-        _make_anchor("Steam游戏库"),
-        _make_anchor("王者荣耀五排开黑"),
-        _make_anchor("Minecraft红石教程"),
+        # 应用名 / 游戏名
+        _make_anchor("原神"),
+        _make_anchor("崩坏：星穹铁道"),
+        _make_anchor("绝区零"),
+        _make_anchor("明日方舟"),
+        _make_anchor("王者荣耀"),
+        _make_anchor("和平精英"),
+        _make_anchor("英雄联盟"),
+        _make_anchor("League of Legends"),
+        _make_anchor("Dota 2"),
+        _make_anchor("CS2 竞技匹配"),
+        _make_anchor("Valorant 战术射击"),
+        _make_anchor("APEX 英雄战斗"),
+        _make_anchor("永劫无间天选之人"),
+        _make_anchor("Minecraft 生存模式"),
+        _make_anchor("黑神话悟空"),
+        # 平台 / 启动器
+        _make_anchor("Steam 游戏库"),
+        _make_anchor("Epic Games 启动器"),
+        _make_anchor("Battle.net 战网"),
+        _make_anchor("WeGame 平台"),
+        # 活动
+        _make_anchor("游戏排位赛对局"),
+        _make_anchor("Boss 战副本攻略"),
+        _make_anchor("游戏更新补丁下载"),
     ],
     "设计创作": [
-        _make_anchor("Photoshop图层编辑"),
-        _make_anchor("Figma界面原型设计"),
-        _make_anchor("Blender三维建模渲染"),
-        _make_anchor("Premiere视频剪辑"),
-        _make_anchor("Illustrator矢量绘图"),
+        _make_anchor("Photoshop 图层编辑"),
+        _make_anchor("Illustrator 矢量绘图"),
+        _make_anchor("InDesign 排版印刷"),
+        _make_anchor("Premiere Pro 视频剪辑"),
+        _make_anchor("After Effects 视觉特效"),
+        _make_anchor("DaVinci Resolve 调色"),
+        _make_anchor("剪映视频编辑"),
+        _make_anchor("Figma 界面原型设计"),
+        _make_anchor("Sketch UI 设计"),
+        _make_anchor("Adobe XD 交互原型"),
+        _make_anchor("Blender 三维建模"),
+        _make_anchor("Cinema 4D 渲染"),
+        _make_anchor("Maya 角色动画"),
+        _make_anchor("ZBrush 数字雕刻"),
+        _make_anchor("Procreate 数字绘画"),
+        _make_anchor("Krita 板绘"),
+        _make_anchor("AutoCAD 工程制图"),
+        _make_anchor("SketchUp 建筑建模"),
+        _make_anchor("海报设计排版"),
+        _make_anchor("LOGO 矢量设计"),
     ],
     "系统工具": [
-        _make_anchor("Windows设置控制面板"),
-        _make_anchor("任务管理器系统进程"),
+        _make_anchor("Windows 设置"),
+        _make_anchor("控制面板"),
+        _make_anchor("任务管理器"),
         _make_anchor("文件资源管理器"),
-        _make_anchor("PowerShell命令终端"),
-        _make_anchor("系统更新安装重启"),
+        _make_anchor("PowerShell 命令行"),
+        _make_anchor("命令提示符 cmd"),
+        _make_anchor("Windows 终端"),
+        _make_anchor("注册表编辑器"),
+        _make_anchor("服务管理器 services.msc"),
+        _make_anchor("事件查看器"),
+        _make_anchor("磁盘管理工具"),
+        _make_anchor("设备管理器"),
+        _make_anchor("系统更新 Windows Update"),
+        _make_anchor("驱动安装程序"),
+        _make_anchor("杀毒软件扫描"),
+        _make_anchor("7-Zip 压缩"),
+        _make_anchor("WinRAR 解压"),
+        _make_anchor("防火墙规则配置"),
+        _make_anchor("蓝牙设备配对"),
+        _make_anchor("剪贴板历史"),
     ],
     "阅读资讯": [
-        _make_anchor("小说阅读器翻页"),
-        _make_anchor("RSS订阅文章更新"),
-        _make_anchor("技术博客教程"),
+        _make_anchor("微信读书电子书"),
+        _make_anchor("Kindle 阅读器"),
+        _make_anchor("起点中文网小说"),
+        _make_anchor("番茄小说阅读"),
+        _make_anchor("得到 App 听书"),
+        _make_anchor("知网论文下载"),
+        _make_anchor("arXiv 预印本论文"),
+        _make_anchor("Google Scholar 学术搜索"),
         _make_anchor("学术论文文献综述"),
-        _make_anchor("电子书阅读目录"),
+        _make_anchor("Zotero 文献管理"),
+        _make_anchor("RSS 订阅文章更新"),
+        _make_anchor("今日头条新闻"),
+        _make_anchor("网易新闻订阅"),
+        _make_anchor("腾讯新闻热点"),
+        _make_anchor("澎湃新闻深度报道"),
+        _make_anchor("36氪科技资讯"),
+        _make_anchor("CSDN 技术博客"),
+        _make_anchor("掘金技术文章"),
+        _make_anchor("少数派文章"),
+        _make_anchor("Medium 英文博客"),
     ],
 }
 
@@ -224,6 +556,9 @@ class ClassificationService:
     LOCAL_BOOST_MONO = 0.15       # diversity = 1 (single category in local)
     LOCAL_BOOST_MODERATE = 0.30   # diversity = 2-3
     LOCAL_BOOST_DIVERSE = 0.50    # diversity >= 4
+    # If the local channel already strongly agrees with the title-blended winner,
+    # skip OCR fallback even when blended score is below TITLE_CONFIDENCE_THRESHOLD.
+    LOCAL_VETO_THRESHOLD = 0.5
 
     # Known browser process names → regex to strip application suffix from titles.
     # Only these processes get title cleaning for global anchors/queries.
@@ -477,6 +812,25 @@ class ClassificationService:
         return cleaned
 
     @staticmethod
+    def _apply_process_prior(
+        cat_scores: Dict[str, float],
+        process_name: str,
+    ) -> Dict[str, float]:
+        """Add a small fixed bonus to the category prior-mapped by ``process_name``.
+
+        Returns a *new* dict — does not mutate the input.  No-op if the process
+        is not in PROCESS_CATEGORY_PRIOR or the mapped category is missing from
+        the scores.
+        """
+        proc = (process_name or "").strip().lower()
+        prior_cat = PROCESS_CATEGORY_PRIOR.get(proc)
+        if not prior_cat or prior_cat not in cat_scores:
+            return cat_scores
+        out = dict(cat_scores)
+        out[prior_cat] = out[prior_cat] + PROCESS_PRIOR_BONUS
+        return out
+
+    @staticmethod
     def _match_scope(
         anchor_scope: str,
         anchor_process: str,
@@ -648,8 +1002,26 @@ class ClassificationService:
         best_cat = max(cat_scores, key=cat_scores.get)
         best_score = cat_scores[best_cat]
 
+        # OCR fallback gate: skip OCR blending when the local channel already
+        # strongly agrees with the title-blended winner — prevents an OCR-heavy
+        # signal from overturning a confident process-scoped judgment.
+        if title_local:
+            local_best_cat = max(title_local, key=title_local.get)
+            local_best_score = float(title_local.get(local_best_cat, 0.0))
+        else:
+            local_best_cat = best_cat
+            local_best_score = 0.0
+        local_agrees_strongly = (
+            local_best_score >= self.LOCAL_VETO_THRESHOLD
+            and local_best_cat == best_cat
+        )
+
         # If title confidence is low and OCR text is available, blend
-        if best_score < self.TITLE_CONFIDENCE_THRESHOLD and ocr_text and ocr_text.strip():
+        if (
+            best_score < self.TITLE_CONFIDENCE_THRESHOLD
+            and not local_agrees_strongly
+            and ocr_text and ocr_text.strip()
+        ):
             ocr_snippet = self._clean_ocr_text(ocr_text)[:200]
             if not ocr_snippet:
                 ocr_snippet = ocr_text[:200]
@@ -662,8 +1034,11 @@ class ClassificationService:
                 ocr_s = ocr_cat.get(cat, 0.0)
                 cat_scores[cat] = title_weight * cat_scores[cat] + (1 - title_weight) * ocr_s
 
-            best_cat = max(cat_scores, key=cat_scores.get)
-            best_score = cat_scores[best_cat]
+        # Apply process→category prior (additive bonus on the final blended score)
+        cat_scores = self._apply_process_prior(cat_scores, process_name)
+
+        best_cat = max(cat_scores, key=cat_scores.get)
+        best_score = cat_scores[best_cat]
 
         if best_score < self.CLASSIFY_MIN_THRESHOLD:
             return ("未分类", best_score)
@@ -712,18 +1087,38 @@ class ClassificationService:
         best_cat = max(blended_title, key=blended_title.get) if blended_title else "未分类"
         best_score = blended_title.get(best_cat, 0.0) if blended_title else 0.0
 
+        # OCR fallback gate — see classify() for rationale.
+        if title_local:
+            local_best_cat = max(title_local, key=title_local.get)
+            local_best_score = float(title_local.get(local_best_cat, 0.0))
+        else:
+            local_best_cat = best_cat
+            local_best_score = 0.0
+        local_agrees_strongly = (
+            local_best_score >= self.LOCAL_VETO_THRESHOLD
+            and local_best_cat == best_cat
+        )
+
         used_ocr = False
+        local_veto_active = False
         if best_score < self.TITLE_CONFIDENCE_THRESHOLD and q_ocr:
-            used_ocr = True
-            ocr_snippet = self._clean_ocr_text(q_ocr)[:200] or q_ocr[:200]
-            ocr_emb = self.embedder.encode_single(ocr_snippet)
-            ocr_local = self._score_embedding(ocr_emb, process_name=process_name, channel="local")
-            ocr_global = self._score_embedding(ocr_emb, process_name=process_name, channel="global")
-            blended_ocr = self._blend_channel_scores(ocr_local, ocr_global, self.category_names)
-            for cat in self.category_names:
-                blended_title[cat] = title_weight * blended_title.get(cat, 0.0) + (1 - title_weight) * blended_ocr.get(cat, 0.0)
-            best_cat = max(blended_title, key=blended_title.get)
-            best_score = blended_title[best_cat]
+            if local_agrees_strongly:
+                local_veto_active = True
+            else:
+                used_ocr = True
+                ocr_snippet = self._clean_ocr_text(q_ocr)[:200] or q_ocr[:200]
+                ocr_emb = self.embedder.encode_single(ocr_snippet)
+                ocr_local = self._score_embedding(ocr_emb, process_name=process_name, channel="local")
+                ocr_global = self._score_embedding(ocr_emb, process_name=process_name, channel="global")
+                blended_ocr = self._blend_channel_scores(ocr_local, ocr_global, self.category_names)
+                for cat in self.category_names:
+                    blended_title[cat] = title_weight * blended_title.get(cat, 0.0) + (1 - title_weight) * blended_ocr.get(cat, 0.0)
+
+        # Apply process→category prior (additive bonus on the final blended score)
+        blended_title = self._apply_process_prior(blended_title, process_name)
+
+        best_cat = max(blended_title, key=blended_title.get)
+        best_score = blended_title[best_cat]
 
         if best_score < self.CLASSIFY_MIN_THRESHOLD:
             best_cat = "未分类"
@@ -735,10 +1130,14 @@ class ClassificationService:
         local_top = sorted(title_local.items(), key=lambda kv: kv[1], reverse=True)[:3]
         global_top = sorted(title_global.items(), key=lambda kv: kv[1], reverse=True)[:3]
 
+        prior_cat = PROCESS_CATEGORY_PRIOR.get((process_name or "").strip().lower())
+
         return {
             "category": best_cat,
             "category_confidence": round(float(best_score), 4),
             "used_ocr": used_ocr,
+            "local_veto_active": local_veto_active,
+            "process_prior_applied": prior_cat,
             "process_name": process_name,
             "cleaned_title": clean_title,
             "top_scores": [{"category": k, "score": round(float(v), 4)} for k, v in sorted_scores],
@@ -881,6 +1280,10 @@ class ClassificationService:
                 result["title_global_added"] = True
 
         # --- 3. OCR auxiliary anchor ---
+        # NOTE: OCR feedback is recorded as a *local* (process-scoped) anchor only.
+        # Global OCR writes were intentionally removed — OCR content is highly
+        # process-specific (chat UI, app navigation, etc.) and writing it as a
+        # global anchor reliably caused cross-category embedding pollution.
         if ocr_text and len(ocr_text.strip()) >= OCR_MIN_LENGTH:
             ocr_snippet = self._clean_ocr_text(ocr_text)[:200]
             if not ocr_snippet:
@@ -890,8 +1293,6 @@ class ClassificationService:
             # Only add if OCR is sufficiently different from title
             title_ocr_cos = float(title_emb @ ocr_emb)
             if title_ocr_cos < OCR_DIVERSITY_THRESHOLD:
-                ocr_global_ok = self._is_informative_text(ocr_snippet, min_len=16)
-
                 if should_add_local:
                     if self._is_duplicate(category, ocr_emb, scope="local", process_name=process_name_norm):
                         result["ocr_local_dedup"] = True
@@ -908,22 +1309,6 @@ class ClassificationService:
                             )
                         )
                         result["ocr_local_added"] = True
-
-                if ocr_global_ok:
-                    if self._is_duplicate(category, ocr_emb, scope="global"):
-                        result["ocr_global_dedup"] = True
-                    else:
-                        if category not in self.anchors:
-                            self.anchors[category] = []
-                        self.anchors[category].append(
-                            _make_anchor(
-                                ocr_snippet,
-                                source="ocr_feedback",
-                                weight=WEIGHT_OCR_FEEDBACK,
-                                scope="global",
-                            )
-                        )
-                        result["ocr_global_added"] = True
 
         self._build_index()
         self._save_anchors()
