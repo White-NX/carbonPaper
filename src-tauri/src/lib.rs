@@ -15,6 +15,7 @@ mod python;
 mod registry_config;
 mod resource_utils;
 mod reverse_ipc;
+mod script_integrity;
 mod sensitive_filter;
 mod storage;
 mod updater;
@@ -717,6 +718,8 @@ pub fn run() {
             monitor::resume_monitor,
             monitor::get_monitor_status,
             monitor::execute_monitor_command,
+            // 安全告警调试触发（设置 → 高级 → 调试）
+            script_integrity::debug_trigger_security_alert,
             // 存储相关命令
             commands::storage::storage_get_timeline,
             commands::storage::storage_get_timeline_density,

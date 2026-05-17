@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 fn main() {
@@ -49,8 +51,9 @@ fn main() {
         // 检查是否是需要被完全排除的文件夹
         if path.is_dir() {
             let file_name = path.file_name().unwrap_or_default();
-            if file_name == ".venv" || file_name == "__pycache__" {
+            if file_name == ".venv" || file_name == "__pycache__" || file_name == "tests" {
                 // 如果是，返回 false，`walkdir` 将不会进入这个目录
+                // 排除 tests/ 是为了不把测试代码打进生产 monitor.pyz
                 return false;
             }
         }
@@ -108,6 +111,16 @@ fn main() {
     // --- 4. 特殊处理：创建空的 chroma_db 文件夹 ---
     fs::create_dir_all(prebundle_dir.join("chroma_db"))
         .expect("Failed to create empty chroma_db directory");
+
+    // --- 4.5 生成 monitor.pyz（zipapp 打包）并计算 SHA-256 嵌入二进制 ---
+    // 把源 monitor/ 下的运行时 Python 代码打成单个 zipapp 归档，
+    // 让 Rust 端启动时可以校验完整性，防止散落 .py 文件被篡改。
+    // 注意：我们从源目录重建一个干净的 staging 目录（不依赖 pre-bundle/monitor/，
+    //       后者可能含有源中已删除的陈旧文件）。
+    let pyz_path = Path::new("pre-bundle/monitor.pyz");
+    let pyz_hash = build_monitor_pyz(source_dir, pyz_path);
+    println!("cargo:rustc-env=MONITOR_PYZ_SHA256={}", pyz_hash);
+    eprintln!("monitor.pyz built; sha256={}", pyz_hash);
 
     // --- 5. 包含项目根目录下的 python 可执行文件（如果存在） ---
     // 目标：把 ../python-3.12.10-amd64.exe 复制为 pre-bundle/python-3.12.10-amd64.exe
@@ -180,4 +193,174 @@ fn main() {
 
     // 最后，调用 tauri_build
     tauri_build::build();
+}
+
+/// 在构建机上定位可用的 Python 解释器（3.x）。
+/// 依次尝试 `python`、`py -3`、本地 venv 路径。返回 (program, prefix_args)
+/// 第一个能执行 `--version` 的就用。
+fn locate_python() -> (String, Vec<String>) {
+    // 候选：(命令, 前置参数)
+    let candidates: Vec<(&str, Vec<&str>)> = vec![
+        ("python", vec![]),
+        ("py", vec!["-3"]),
+        ("../carbonPaper/.venv/Scripts/python.exe", vec![]),
+        ("../.venv/Scripts/python.exe", vec![]),
+    ];
+
+    for (cmd, args) in &candidates {
+        let mut probe = Command::new(cmd);
+        for a in args {
+            probe.arg(a);
+        }
+        probe.arg("--version");
+        if let Ok(output) = probe.output() {
+            if output.status.success() {
+                let owned_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+                return (cmd.to_string(), owned_args);
+            }
+        }
+    }
+
+    panic!(
+        "Build failed: no usable Python interpreter found. \
+         carbonPaper's build.rs needs Python 3.x on PATH to run `python -m zipapp` for \
+         the monitor integrity-check package. Install Python 3.12 or ensure `python` / `py -3` \
+         resolves on your PATH."
+    );
+}
+
+/// 把 `source_dir`（典型为 ../monitor，**源**目录）里的运行时 Python 代码
+/// 打成 zipapp 归档写入 `out_pyz`，并返回归档内容的 SHA-256（十六进制小写）。
+///
+/// 这里**重新走一遍源目录**而不是用 pre-bundle/monitor/，
+/// 因为 pre-bundle 可能积累了源中已删除的陈旧文件（旧 build.rs 只复制不清理）。
+/// 我们把通过过滤的文件复制到 `target/pyz-staging-monitor/`（每次清空），
+/// 然后用 `python -m zipapp` 打包这个干净目录。
+///
+/// 过滤规则与 main() 中的复制循环保持一致：
+///   - 排除 `.venv` / `__pycache__` / `tests` 子目录
+///   - 排除 `chroma_db/` 内容
+///   - 仅收录扩展名为 `.py` / `.txt` / `.md` / `.json` 的文件
+///   - `model/` 和 `models/` 全部收录（含权重等二进制）
+///
+/// 入口点通过 `-m "main:main"` 生成（zipapp 自动写一个 __main__.py 调用 main.main()）。
+fn build_monitor_pyz(source_dir: &Path, out_pyz: &Path) -> String {
+    // 先确认源目录确实存在主入口
+    let main_py = source_dir.join("main.py");
+    if !main_py.is_file() {
+        panic!(
+            "Build failed: expected {} to exist before building monitor.pyz",
+            main_py.display()
+        );
+    }
+
+    // 1. 准备干净的 staging 目录
+    let staging = Path::new("target/pyz-staging-monitor");
+    if staging.exists() {
+        fs::remove_dir_all(staging)
+            .unwrap_or_else(|e| panic!("Failed to clean pyz staging dir: {}", e));
+    }
+    fs::create_dir_all(staging)
+        .unwrap_or_else(|e| panic!("Failed to create pyz staging dir: {}", e));
+
+    // 2. 应用与 main() 同样的过滤规则，把源 monitor/ 文件复制到 staging
+    //    比 main() 更严：在 walker 阶段就排除 chroma_db/ 和 screenshots/，
+    //    避免它们以空目录 entry 形式进 zipapp（语义上它们是运行时数据，不该入包）。
+    let walker = WalkDir::new(source_dir).into_iter().filter_entry(|e| {
+        let path = e.path();
+        if path.is_dir() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if matches!(
+                &*name,
+                ".venv" | "__pycache__" | "tests" | "chroma_db" | "screenshots"
+            ) {
+                return false;
+            }
+        }
+        true
+    });
+
+    let model_dir_singular = source_dir.join("model");
+    let model_dir_plural = source_dir.join("models");
+    let chroma_dir = source_dir.join("chroma_db");
+
+    for entry in walker {
+        let entry = entry.unwrap_or_else(|e| panic!("Failed to walk source dir: {}", e));
+        let src_path = entry.path();
+        let relative = match src_path.strip_prefix(source_dir) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let dst_path = staging.join(relative);
+
+        if src_path.is_dir() {
+            fs::create_dir_all(&dst_path)
+                .unwrap_or_else(|e| panic!("Failed to mkdir in staging: {}", e));
+            continue;
+        }
+        if !src_path.is_file() {
+            continue;
+        }
+
+        // 排除 chroma_db 下文件
+        if src_path.starts_with(&chroma_dir) {
+            continue;
+        }
+
+        let in_models = src_path.starts_with(&model_dir_singular)
+            || src_path.starts_with(&model_dir_plural);
+        let ok_ext = src_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|e| ["py", "txt", "md", "json"].contains(&e))
+            .unwrap_or(false);
+
+        if in_models || ok_ext {
+            if let Some(parent) = dst_path.parent() {
+                fs::create_dir_all(parent)
+                    .unwrap_or_else(|e| panic!("Failed to mkdir for staging file: {}", e));
+            }
+            fs::copy(src_path, &dst_path)
+                .unwrap_or_else(|e| panic!("Failed to copy to staging: {}", e));
+        }
+    }
+
+    // 3. 跑 python -m zipapp <staging> -o <out_pyz> -m "main:main" --compress
+    let (program, prefix_args) = locate_python();
+    let mut zipapp_cmd = Command::new(&program);
+    for a in &prefix_args {
+        zipapp_cmd.arg(a);
+    }
+    zipapp_cmd
+        .arg("-m")
+        .arg("zipapp")
+        .arg(staging)
+        .arg("-o")
+        .arg(out_pyz)
+        .arg("-m")
+        .arg("main:main")
+        .arg("--compress");
+
+    let output = zipapp_cmd
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to spawn python -m zipapp: {}", e));
+
+    if !output.status.success() {
+        panic!(
+            "python -m zipapp failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    // 4. 计算 SHA-256
+    let pyz_bytes = fs::read(out_pyz).unwrap_or_else(|e| {
+        panic!("Failed to read freshly built {}: {}", out_pyz.display(), e)
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(&pyz_bytes);
+    let hash = hasher.finalize();
+    // 转为小写十六进制（与 Rust 端 verify 的 format!("{:x}") 一致）
+    hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()
 }

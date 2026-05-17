@@ -14,6 +14,7 @@ import { AdvancedSearch } from './components/AdvancedSearch';
 import SettingsDialog from './components/settings/SettingsDialog';
 import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
+import SecurityAlertMask from './components/SecurityAlertMask';
 
 import ExtensionSetupWizard from './components/ExtensionSetupWizard';
 import ClusteringSetupWizard from './components/ClusteringSetupWizard';
@@ -331,6 +332,27 @@ function App() {
 
   const pushNotification = useCallback((notification) => {
     setNotifications((prev) => [notification, ...prev].slice(0, 200));
+  }, []);
+
+  // Security Alert Mask
+  const [securityAlert, setSecurityAlert] = useState(null);
+
+  useEffect(() => {
+    let unlisten;
+    const setup = async () => {
+      unlisten = await listen('security-alert', (event) => {
+        const payload = event.payload || {};
+        setSecurityAlert({
+          code: payload.code,
+          message: payload.message,
+          detail: payload.detail,
+        });
+      });
+    };
+    setup();
+    return () => {
+      if (unlisten) unlisten();
+    };
   }, []);
 
   const dismissNotification = useCallback((id) => {
@@ -958,6 +980,11 @@ function App() {
           onAuthSuccess={handleAuthSuccess}
           authError={authError}
           setAuthError={setAuthError}
+        />
+
+        <SecurityAlertMask
+          alert={securityAlert}
+          onDismiss={() => setSecurityAlert(null)}
         />
 
         <ErrorWindow

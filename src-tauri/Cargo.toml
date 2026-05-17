@@ -22,6 +22,7 @@ path = "src/bin/nmh.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 walkdir = "2.5.0"
+sha2 = "0.10"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }

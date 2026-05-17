@@ -521,36 +521,77 @@ pub async fn start_monitor(
 
     let stdout_cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    // 寻找 python 脚本路径，按优先级尝试多种方式
-    let script_path = {
-        let mut candidates: Vec<PathBuf> = Vec::new();
+    // 寻找 python 脚本路径。
+    // 优先使用打包好的 monitor.pyz（生产环境唯一允许的入口）；
+    // 仅在 dev 构建（cfg!(debug_assertions)）下，找不到 .pyz 时才回退到散落的 main.py。
+    // .pyz 找到后会在下面经过 SHA-256 完整性校验（release 模式必校验）。
+    let (script_path, is_pyz) = {
+        let mut pyz_candidates: Vec<PathBuf> = Vec::new();
+        let mut py_candidates: Vec<PathBuf> = Vec::new();
 
-        // 1. 基于可执行文件所在目录查找（生产环境 + 开机自启动）
+        // .pyz 候选（按优先级）
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
-                candidates.push(exe_dir.join("monitor").join("main.py"));
+                pyz_candidates.push(exe_dir.join("monitor.pyz"));
+                pyz_candidates.push(exe_dir.join("monitor").join("monitor.pyz"));
             }
         }
-
-        // 2. 基于 Tauri 资源目录查找（生产环境）
-        if let Some(res_path) = find_existing_file_in_resources(&app, "monitor/main.py") {
-            candidates.push(res_path);
+        if let Some(p) = find_existing_file_in_resources(&app, "monitor.pyz") {
+            pyz_candidates.push(p);
+        }
+        if let Some(p) = find_existing_file_in_resources(&app, "monitor/monitor.pyz") {
+            pyz_candidates.push(p);
         }
 
-        // 3. 基于 CWD 的相对路径（开发模式）
-        candidates.push(PathBuf::from("monitor/main.py")); // CWD 是项目根目录
-        candidates.push(PathBuf::from("../monitor/main.py")); // CWD 是 src-tauri
-
-        match candidates.iter().find(|p| p.exists()) {
-            Some(p) => normalize_path_for_command(p),
-            None => {
-                let tried: Vec<String> =
-                    candidates.iter().map(|p| p.display().to_string()).collect();
-                return Err(format!(
-                    "Could not find monitor/main.py. CWD: {}. Tried: {:?}",
-                    cwd, tried
-                ));
+        // .py 候选（仅 dev 回退用）
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                py_candidates.push(exe_dir.join("monitor").join("main.py"));
             }
+        }
+        if let Some(p) = find_existing_file_in_resources(&app, "monitor/main.py") {
+            py_candidates.push(p);
+        }
+        py_candidates.push(PathBuf::from("monitor/main.py")); // CWD 是项目根
+        py_candidates.push(PathBuf::from("../monitor/main.py")); // CWD 是 src-tauri
+
+        if let Some(p) = pyz_candidates.iter().find(|p| p.exists()) {
+            (normalize_path_for_command(p), true)
+        } else if cfg!(debug_assertions) {
+            // Dev 模式：允许散落 main.py 回退（不做完整性校验）
+            match py_candidates.iter().find(|p| p.exists()) {
+                Some(p) => (normalize_path_for_command(p), false),
+                None => {
+                    let tried_pyz: Vec<String> =
+                        pyz_candidates.iter().map(|p| p.display().to_string()).collect();
+                    let tried_py: Vec<String> =
+                        py_candidates.iter().map(|p| p.display().to_string()).collect();
+                    return Err(format!(
+                        "Could not find monitor.pyz nor monitor/main.py. CWD: {}. Tried pyz: {:?}; py: {:?}",
+                        cwd, tried_pyz, tried_py
+                    ));
+                }
+            }
+        } else {
+            // Release 模式：必须有 .pyz，不允许回退
+            let tried: Vec<String> =
+                pyz_candidates.iter().map(|p| p.display().to_string()).collect();
+            crate::script_integrity::log_security_event(
+                &app,
+                "pyz_missing",
+                &format!("CWD={}, tried={:?}", cwd, tried),
+            );
+            let _ = app.emit(
+                "security-alert",
+                serde_json::json!({
+                    "code": "MONITOR_PYZ_MISSING",
+                    "message": "Required monitor.pyz is missing. Startup blocked."
+                }),
+            );
+            return Err(format!(
+                "Required monitor.pyz not found. CWD: {}. Tried: {:?}",
+                cwd, tried
+            ));
         }
     };
 
@@ -558,6 +599,30 @@ pub async fn start_monitor(
         .canonicalize()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|e| format!("<failed to canonicalize script: {}>", e));
+
+    // 完整性校验闸门：release 构建 + 使用 .pyz 时，必须通过 SHA-256 校验才能启动。
+    // 失败时：写安全日志 + 推送 security-alert 事件 + 返回 Err 拒绝启动。
+    if is_pyz && !cfg!(debug_assertions) {
+        let pyz_path_obj = std::path::Path::new(&script_path);
+        if let Err(reason) = crate::script_integrity::verify_monitor_pyz(pyz_path_obj) {
+            tracing::error!("monitor.pyz integrity check failed: {}", reason);
+            crate::script_integrity::log_security_event(
+                &app,
+                "pyz_integrity_fail",
+                &format!("path={} reason={}", script_abs, reason),
+            );
+            let _ = app.emit(
+                "security-alert",
+                serde_json::json!({
+                    "code": "MONITOR_PYZ_TAMPERED",
+                    "message": "Monitor script integrity check failed. Startup blocked.",
+                    "detail": reason,
+                }),
+            );
+            return Err(format!("Monitor integrity check failed: {}", reason));
+        }
+        tracing::info!("monitor.pyz integrity verified: {}", script_abs);
+    }
 
     // 生成随机的管道名和认证 token
     let pipe_name = generate_random_pipe_name();
@@ -655,8 +720,21 @@ pub async fn start_monitor(
         };
 
         let mut cmd_proc = Command::new(&python_executable);
-        // Pipe stdout/stderr so we can stream logs to the frontend
+        // Pipe stdout/stderr so we can stream logs to the frontend.
+        //
+        // 安全相关参数：
+        //   -I              isolated mode: 忽略 PYTHONPATH/HOME、用户 site-packages、sys.path 注入
+        //   -B              不写 .pyc（防止 __pycache__ 旁路）
+        //   -X utf8         强制 UTF-8 模式（替代 PYTHONIOENCODING，后者会被 -I 忽略）
+        //   -u              unbuffered stdio（原有）
+        //
+        // env_remove：再次确认 Python 不会读到污染过的 PYTHON* 环境变量
+        // （`-I` 蕴含 `-E` 已经隔离了，这里是 belt-and-suspenders）
         cmd_proc
+            .arg("-I")
+            .arg("-B")
+            .arg("-X")
+            .arg("utf8")
             .arg("-u")
             .arg(&script_path)
             .arg("--pipe-name")
@@ -665,8 +743,11 @@ pub async fn start_monitor(
             .arg(&auth_token)
             .arg("--storage-pipe")
             .arg(&reverse_pipe_name)
+            .env_remove("PYTHONPATH")
+            .env_remove("PYTHONHOME")
+            .env_remove("PYTHONSTARTUP")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("CARBON_PARENT_PID", std::process::id().to_string())
-            .env("PYTHONIOENCODING", "utf-8")
             .env("PROFILING_ENABLED", "1");
 
         // Pass the current storage.data_dir to the child process to ensure that Python uses the correct data directory at startup.
