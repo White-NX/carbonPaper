@@ -208,7 +208,6 @@ PROCESS_CATEGORY_PRIOR: Dict[str, str] = {
     "mendeley.exe": "阅读资讯",
     "endnote.exe": "阅读资讯",
 }
-PROCESS_PRIOR_BONUS = 0.12
 
 # ---------------------------------------------------------------------------
 # Anchor data type helper
@@ -556,9 +555,22 @@ class ClassificationService:
     LOCAL_BOOST_MONO = 0.15       # diversity = 1 (single category in local)
     LOCAL_BOOST_MODERATE = 0.30   # diversity = 2-3
     LOCAL_BOOST_DIVERSE = 0.50    # diversity >= 4
-    # If the local channel already strongly agrees with the title-blended winner,
-    # skip OCR fallback even when blended score is below TITLE_CONFIDENCE_THRESHOLD.
+    # OCR-fallback veto: if the local (process-scoped) channel already strongly
+    # agrees with the title-blended winner, skip the OCR blend even when the
+    # blended score is below TITLE_CONFIDENCE_THRESHOLD.
+    #
+    # Calibration: ``_score_embedding`` returns ``best_cosine + 0.05 * (weight - 1)``
+    # (see BONUS_FACTOR in that method). For user_feedback anchors (weight=2.0)
+    # the bonus is +0.05, so this 0.5 cutoff corresponds to raw cosine ≥ ~0.45;
+    # for ocr_feedback anchors (weight=1.5) it's ~0.475. Below this the local
+    # match is too noisy to overrule an OCR signal that might correct the call.
     LOCAL_VETO_THRESHOLD = 0.5
+    # Additive bonus applied to the PROCESS_CATEGORY_PRIOR-mapped category on
+    # the final blended score. Calibrated to nudge a borderline classification
+    # (e.g. blended 0.30) above CLASSIFY_MIN_THRESHOLD (0.38) when the process
+    # name is a strong signal, without overpowering a confident competing
+    # classification that already wins by more than 0.12.
+    PROCESS_PRIOR_BONUS = 0.12
 
     # Known browser process names → regex to strip application suffix from titles.
     # Only these processes get title cleaning for global anchors/queries.
@@ -811,8 +823,9 @@ class ClassificationService:
             return text
         return cleaned
 
-    @staticmethod
+    @classmethod
     def _apply_process_prior(
+        cls,
         cat_scores: Dict[str, float],
         process_name: str,
     ) -> Dict[str, float]:
@@ -827,7 +840,7 @@ class ClassificationService:
         if not prior_cat or prior_cat not in cat_scores:
             return cat_scores
         out = dict(cat_scores)
-        out[prior_cat] = out[prior_cat] + PROCESS_PRIOR_BONUS
+        out[prior_cat] = out[prior_cat] + cls.PROCESS_PRIOR_BONUS
         return out
 
     @staticmethod
