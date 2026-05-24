@@ -17,7 +17,9 @@ import NlClusterView from './NlClusterView';
 function formatTimestamp(ts) {
   if (!ts) return '—';
   try {
-    return new Date(ts).toLocaleString();
+    const d = new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z');
+    if (Number.isNaN(d.getTime())) return '—';
+    return d.toLocaleString();
   } catch {
     return '—';
   }

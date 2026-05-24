@@ -784,7 +784,7 @@ class HotColdManager:
         enable_rerank: bool = False,
         rerank_overfetch: int = 4,
         ocr_snippet_chars: int = 600,
-        rerank_variant: str = "q4f16",
+        rerank_variant: str = "uint8",
     ) -> List[Dict[str, Any]]:
         """Retrieve hot-layer snapshots most similar to a natural-language query.
 

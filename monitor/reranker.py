@@ -90,14 +90,15 @@ class Reranker:
     _lock = threading.RLock()
 
     def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._session = None
-            cls._instance._tokenizer = None
-            cls._instance._input_names = None
-            cls._instance._output_name = None
-            cls._instance._provider = None
-            cls._instance._loaded_variant = None
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._session = None
+                cls._instance._tokenizer = None
+                cls._instance._input_names = None
+                cls._instance._output_name = None
+                cls._instance._provider = None
+                cls._instance._loaded_variant = None
         return cls._instance
 
     # ---- availability ----------------------------------------------------

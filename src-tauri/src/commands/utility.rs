@@ -196,6 +196,9 @@ pub fn check_smart_cluster_setup_needed() -> Result<bool, String> {
     if registry_config::get_bool("smart_cluster_setup_done").unwrap_or(false) {
         return Ok(false);
     }
+    if registry_config::get_bool("smart_cluster_enabled").unwrap_or(false) {
+        return Ok(false);
+    }
     Ok(true)
 }
 

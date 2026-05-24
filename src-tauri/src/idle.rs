@@ -21,7 +21,7 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 
 /// Default idle threshold — user must be away from input for at least this
 /// many seconds before background ML work is allowed to start.
-pub const IDLE_THRESHOLD_SECS: u64 = 300;
+pub const IDLE_THRESHOLD_SECS: u64 = 1800;
 
 /// Polling cadence for the idle monitor loop.
 const POLL_INTERVAL_SECS: u64 = 10;

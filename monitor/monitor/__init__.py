@@ -911,7 +911,7 @@ def _handle_command_impl(req: dict):
         query = req.get('query', '')
         n_results = req.get('n_results', 30)
         enable_rerank = bool(req.get('enable_rerank', False))
-        rerank_variant = req.get('rerank_variant') or 'q4f16'
+        rerank_variant = req.get('rerank_variant') or 'uint8'
         try:
             from task_clustering import ModelNotAvailableError
             from reranker import RerankerNotAvailableError

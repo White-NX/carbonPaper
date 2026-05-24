@@ -353,7 +353,7 @@ export default function FeaturesSection({ monitorStatus }) {
             {!scModelAvailable && !scDownloading && !scDownloadError && (
               <div className="mt-4 pt-4 border-t border-ide-border/50 flex items-center justify-between gap-3">
                 <p className="text-xs text-ide-muted">
-                  {t('settings.features.management.smartCluster.modelNotDownloaded', 'bge-reranker-v2-m3 (q4f16, ~670MB) 尚未下载')}
+                  {t('settings.features.management.smartCluster.modelNotDownloaded', 'bge-reranker-v2-m3 (uint8, ~570MB) 尚未下载')}
                 </p>
                 <button
                   onClick={handleDownloadReranker}
