@@ -142,3 +142,152 @@ export async function getTaskClusters() {
     payload: { command: 'get_tasks' },
   });
 }
+
+/**
+ * Natural-language retrieval against the hot-layer MiniLM index (demo).
+ * Returns snapshots most similar to the query, ordered by descending similarity.
+ * @param {string} query
+ * @param {number} [nResults=30]
+ * @param {boolean} [enableRerank=false] - if true, over-fetches and re-scores with bge-reranker-v2-m3
+ * @param {string} [rerankVariant='fp16'] - ONNX variant: 'fp16' | 'q4f16' | 'int8' | 'fp32'
+ * @returns {Promise<{results: Array, reranked: boolean, rerank_variant: string|null}>}
+ */
+export async function nlClusterQuery(query, nResults = 30, enableRerank = false, rerankVariant = 'q4f16') {
+  const result = await invoke('execute_monitor_command', {
+    payload: {
+      command: 'nl_cluster_query',
+      query,
+      n_results: nResults,
+      enable_rerank: enableRerank,
+      rerank_variant: rerankVariant,
+    },
+  });
+  if (result && result.error) {
+    const err = new Error(result.error);
+    if (result.error.startsWith('RERANKER_UNAVAILABLE')) err.code = 'RERANKER_UNAVAILABLE';
+    throw err;
+  }
+  return {
+    results: result?.results || [],
+    reranked: !!result?.reranked,
+    rerank_variant: result?.rerank_variant || null,
+  };
+}
+
+/**
+ * Check whether the reranker model is on disk and loaded.
+ * @returns {Promise<{available: boolean, loaded: boolean, loaded_variant: string|null, provider: string|null, available_variants: string[], model_path: string}>}
+ */
+export async function getRerankerStatus() {
+  const result = await invoke('execute_monitor_command', {
+    payload: { command: 'nl_cluster_reranker_status' },
+  });
+  if (result && result.error) throw new Error(result.error);
+  return {
+    available: !!result?.available,
+    loaded: !!result?.loaded,
+    loaded_variant: result?.loaded_variant || null,
+    provider: result?.provider || null,
+    available_variants: result?.available_variants || [],
+    model_path: result?.model_path || '',
+  };
+}
+
+// ── Smart Cluster API ──────────────────────────────────────────────────
+
+/**
+ * List all smart clusters with their assignment counts.
+ */
+export async function listSmartClusters() {
+  return invoke('smart_cluster_list');
+}
+
+/**
+ * Get a single smart cluster by id.
+ */
+export async function getSmartCluster(id) {
+  return invoke('smart_cluster_get', { id });
+}
+
+/**
+ * Get the calibration examples (positive + negative) for a smart cluster.
+ */
+export async function getSmartClusterExamples(id) {
+  return invoke('smart_cluster_get_examples', { id });
+}
+
+/**
+ * Create a new smart cluster from calibration.
+ * @param {Object} req
+ * @param {string} req.anchor_text
+ * @param {number} req.threshold
+ * @param {string} [req.dominant_color]
+ * @param {Array} req.examples - [{ screenshot_id, is_positive, rerank_score }]
+ * @returns {Promise<{id: number, enqueued: number}>}
+ */
+export async function createSmartCluster(req) {
+  return invoke('smart_cluster_create', { req });
+}
+
+export async function deleteSmartCluster(id) {
+  return invoke('smart_cluster_delete', { id });
+}
+
+export async function updateSmartClusterAnchor(id, anchor) {
+  return invoke('smart_cluster_update_anchor', { id, anchor });
+}
+
+export async function updateSmartClusterThreshold(id, threshold) {
+  return invoke('smart_cluster_update_threshold', { id, threshold });
+}
+
+export async function toggleSmartClusterEnabled(id, enabled) {
+  return invoke('smart_cluster_toggle_enabled', { id, enabled });
+}
+
+export async function getSmartClusterAssignments(clusterId, page = 0, pageSize = 50) {
+  return invoke('smart_cluster_assignments', { clusterId, page, pageSize });
+}
+
+export async function rescanSmartCluster(clusterId) {
+  return invoke('smart_cluster_rescan', { clusterId });
+}
+
+export async function clearSmartClusterAssignments(clusterId) {
+  return invoke('smart_cluster_clear_assignments', { clusterId });
+}
+
+export async function getSmartClusterStatus() {
+  return invoke('smart_cluster_status');
+}
+
+/**
+ * Trigger the Python worker to drain the pending queue immediately,
+ * bypassing the idle gate for one pass.
+ */
+export async function smartClusterDrainNow() {
+  return invoke('execute_monitor_command', {
+    payload: { command: 'smart_cluster_drain_now' },
+  });
+}
+
+/**
+ * Run a calibration preview query — same as nlClusterQuery with rerank=true
+ * but routed through a dedicated command so future tuning (over-fetch, etc)
+ * doesn't affect the explore demo.
+ */
+export async function smartClusterCalibratePreview(query, nResults = 30) {
+  const result = await invoke('execute_monitor_command', {
+    payload: {
+      command: 'smart_cluster_calibrate_preview',
+      query,
+      n_results: nResults,
+    },
+  });
+  if (result && result.error) {
+    const err = new Error(result.error);
+    if (result.error.startsWith('RERANKER_UNAVAILABLE')) err.code = 'RERANKER_UNAVAILABLE';
+    throw err;
+  }
+  return result?.results || [];
+}

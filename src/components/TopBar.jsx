@@ -86,6 +86,9 @@ export default function TopBar({
         mode={searchMode}
         onModeChange={onSearchModeChange}
         backendOnline={backendOnline}
+        monitorPaused={monitorPaused}
+        handlePauseMonitor={handlePauseMonitor}
+        handleResumeMonitor={handleResumeMonitor}
       />
 
       <div className="flex items-center gap-1">

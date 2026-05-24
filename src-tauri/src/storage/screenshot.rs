@@ -981,6 +981,57 @@ impl StorageState {
     }
 
     /// Get screenshot details by ID.
+    /// Fetch multiple screenshots by their IDs in a single SQL round-trip.
+    /// Order in the returned vector is not guaranteed — callers should index by `record.id`.
+    /// IDs that don't exist or are soft-deleted are silently skipped.
+    pub fn get_screenshots_by_ids(&self, ids: &[i64]) -> Result<Vec<ScreenshotRecord>, String> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let raw_rows = {
+            let guard = self.get_connection_named("get_screenshots_by_ids")?;
+            let conn = guard.as_ref().unwrap();
+
+            // Build "?, ?, ?" placeholder list. IDs are i64 from trusted callers
+            // (validated upstream by serde), but we still bind via params for safety.
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT s.id, s.image_path, s.image_hash, s.width, s.height,
+                        s.window_title, s.process_name, s.metadata,
+                        s.window_title_enc, s.process_name_enc, s.metadata_enc,
+                        s.content_key_encrypted,
+                        strftime('%s', s.created_at) as timestamp, s.created_at,
+                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        pi.icon_enc, pi.icon_key_encrypted,
+                        ls.links_enc, ls.links_key_encrypted,
+                        s.category, s.category_confidence
+                 FROM screenshots s
+                 LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
+                 LEFT JOIN link_sets ls ON s.link_set_id = ls.id
+                 WHERE s.is_deleted = 0 AND s.id IN ({})",
+                placeholders
+            );
+
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+            let id_params: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+            let rows: Vec<RawScreenshotRow> = stmt
+                .query_map(id_params.as_slice(), RawScreenshotRow::from_row)
+                .map_err(|e| format!("Failed to execute query: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            rows
+        };
+
+        Ok(raw_rows.into_iter().map(|raw| raw.into_record()).collect())
+    }
+
     pub fn get_screenshot_by_id(&self, id: i64) -> Result<Option<ScreenshotRecord>, String> {
         tracing::debug!("get_screenshot_by_id called with id={}", id);
 
@@ -1150,6 +1201,80 @@ impl StorageState {
             .collect();
 
         Ok(results)
+    }
+
+    /// Get combined OCR texts for a batch of screenshot IDs in a single query.
+    /// Returns a map of screenshot_id -> joined OCR text.
+    pub fn get_ocr_results_by_screenshot_ids(
+        &self,
+        screenshot_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, String>, String> {
+        if screenshot_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let guard = self.get_connection_named("get_ocr_results_by_screenshot_ids")?;
+        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+
+        let mut result_map = std::collections::HashMap::new();
+
+        // Initialize empty lists for all requested IDs, so they are represented.
+        for &id in screenshot_ids {
+            result_map.insert(id, Vec::new());
+        }
+
+        // Process in chunks to avoid SQLite parameter limit (usually 999)
+        for chunk in screenshot_ids.chunks(500) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT screenshot_id, text_enc, text_key_encrypted
+                 FROM ocr_results
+                 WHERE is_deleted = 0 AND screenshot_id IN ({})
+                 ORDER BY screenshot_id, box_y1, box_x1",
+                placeholders.join(",")
+            );
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| format!("Failed to prepare batch OCR query: {}", e))?;
+
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    let screenshot_id: i64 = row.get(0)?;
+                    let text_enc: Option<Vec<u8>> = row.get(1)?;
+                    let text_key_enc: Option<Vec<u8>> = row.get(2)?;
+                    Ok((screenshot_id, text_enc, text_key_enc))
+                })
+                .map_err(|e| format!("Failed to execute batch OCR query: {}", e))?;
+
+            for row in rows.filter_map(|r| r.ok()) {
+                let (screenshot_id, text_enc, text_key_enc) = row;
+                let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
+                    (Some(data), Some(key)) => self
+                        .decrypt_payload_with_row_key(data, key)
+                        .ok()
+                        .and_then(|v| String::from_utf8(v).ok()),
+                    _ => None,
+                };
+                if let Some(text_str) = text {
+                    if !text_str.is_empty() {
+                        if let Some(vec) = result_map.get_mut(&screenshot_id) {
+                            vec.push(text_str);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Map the collected vectors of strings to joined strings
+        let final_map = result_map
+            .into_iter()
+            .map(|(id, vec)| (id, vec.join(" ")))
+            .collect();
+
+        Ok(final_map)
     }
 
     /// Delete a screenshot by ID.

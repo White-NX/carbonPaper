@@ -496,6 +496,21 @@
           "label": "内容分类",
           "description": "使用 BGE 模型自动分类截图内容"
         },
+        "smartCluster": {
+          "label": "智能聚类（按描述自动归档）",
+          "description": "使用自然语言描述自动将相关快照归入同一分类",
+          "modelMissing": "模型未下载",
+          "modelNotDownloaded": "需要下载 bge-reranker-v2-m3 模型（~570MB）",
+          "downloadModel": "下载模型",
+          "downloading": "正在下载 bge-reranker-v2-m3 模型…",
+          "status": "状态",
+          "pending": "待处理",
+          "activeClusters": "已启用",
+          "drainNow": "立即处理待处理队列",
+          "rescanAll": "全部重新匹配 hot 层",
+          "retry": "重试下载",
+          "openManagement": "打开智能聚类管理"
+        },
         "disabled_notice": "此功能已禁用"
       },
       "models": {
@@ -598,7 +613,10 @@
     "task": {
       "summaryPlaceholder": "清理任务进行中 ({{progress}}%)",
       "runningTitle": "后台清理任务正在运行",
-      "runningDesc": "当前进度 {{progress}}%，待处理 OCR {{ocr}} 条，截图 {{screenshots}} 条。"
+      "runningDesc": "当前进度 {{progress}}%，待处理 OCR {{ocr}} 条，截图 {{screenshots}} 条。",
+      "smartClusterSummaryPlaceholder": "智能聚类归档中 ({{progress}}%)",
+      "smartClusterRunningTitle": "智能聚类队列处理中",
+      "smartClusterRunningDesc": "当前进度 {{progress}}%，待处理快照 {{pending}} 条。"
     }
   },
   "sidebar": {
@@ -625,6 +643,7 @@
     "preview": "预览",
     "advancedSearch": "高级搜索",
     "tasks": "长期任务",
+    "smartCluster": "智能聚类",
     "expand": "展开侧栏",
     "collapse": "收起侧栏"
   },
@@ -650,6 +669,24 @@
     "info_note": "你也可以跳过此步骤，之后随时在「任务」面板中手动执行聚类。",
     "apply": "开始整理",
     "skip": "跳过"
+  },
+  "smartClusterSetup": {
+    "title": "智能聚类",
+    "subtitle": "按自然语言描述自动归档快照",
+    "description": "智能聚类可以根据你输入的自然语言描述，自动将相关的截图快照归入同一分类。基于 bge-reranker-v2-m3 模型，准确率远高于纯向量搜索。",
+    "modelInfo": "需要下载 bge-reranker-v2-m3 模型（~570MB，uint8 量化），该模型仅在系统空闲时使用。",
+    "modelSource": "模型来源：onnx-community/bge-reranker-v2-m3-ONNX",
+    "infoNote": "你也可以稍后在「设置 → 功能管理」中下载并启用此功能。",
+    "download": "下载并启用",
+    "downloading": "正在下载模型…",
+    "downloading_short": "下载中…",
+    "downloadComplete": "下载完成！",
+    "later": "稍后",
+    "dismiss": "不再提醒",
+    "dismissTooltip": "永久关闭此提示，可后续在设置中启用",
+    "retry": "重试下载",
+    "success": "智能聚类已就绪",
+    "openFeature": "打开智能聚类"
   },
   "authMask": {
     "title": "已锁定",

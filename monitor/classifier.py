@@ -500,6 +500,8 @@ class TextEmbedder:
                 "bge-small-zh-v1.5",
             )
 
+        from logging_config import log_model_loading
+        log_model_loading("BGE-small-zh-v1.5")
         logger.info("Loading BGE-small-zh-v1.5 from %s ...", model_path)
         self._tokenizer = AutoTokenizer.from_pretrained(model_path)
         self._model = AutoModel.from_pretrained(model_path)

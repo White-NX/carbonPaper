@@ -9,6 +9,7 @@ import { getTasks, getTaskScreenshots, deleteTask, updateTaskLabel, mergeTasks, 
 import { fetchThumbnailBatch } from '../lib/monitor_api';
 import { CATEGORY_COLORS, ENTERTAINMENT_CATEGORIES, SOCIAL_CATEGORIES } from '../lib/categories';
 import { ThumbnailCard } from './ThumbnailCard';
+import ClusterCard from './ClusterCard';
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -25,135 +26,6 @@ function formatDuration(startTs, endTs) {
   if (secs < 3600) return `${Math.round(secs / 60)}m`;
   if (secs < 86400) return `${(secs / 3600).toFixed(1)}h`;
   return `${(secs / 86400).toFixed(1)}d`;
-}
-
-// ── TaskCard ───────────────────────────────────────────────────────────
-
-function TaskCard({ task, selected, onSelect, onRename, onDelete, mergeable, onToggleMerge, mergeChecked }) {
-  const { t } = useTranslation();
-  const [editing, setEditing] = useState(false);
-  const [editLabel, setEditLabel] = useState('');
-  const inputRef = useRef(null);
-
-  const label = task.label || task.auto_label || t('tasks.unnamed');
-  const catColor = CATEGORY_COLORS[task.dominant_category] || '#6b7280';
-  const catLabel = task.dominant_category || null;
-
-  const handleStartEdit = (e) => {
-    e.stopPropagation();
-    setEditLabel(label);
-    setEditing(true);
-    setTimeout(() => inputRef.current?.focus(), 50);
-  };
-
-  const handleSave = async (e) => {
-    e.stopPropagation();
-    if (editLabel.trim()) {
-      await onRename(task.id, editLabel.trim());
-    }
-    setEditing(false);
-  };
-
-  const handleCancel = (e) => {
-    e.stopPropagation();
-    setEditing(false);
-  };
-
-  return (
-    <div
-      onClick={() => onSelect(task)}
-      className={`group relative p-3 rounded-xl border cursor-pointer transition-all duration-150 ${
-        selected
-          ? 'bg-ide-accent/10 border-ide-accent/40 shadow-sm'
-          : 'bg-ide-bg border-ide-border hover:bg-ide-hover hover:border-ide-border/60'
-      }`}
-    >
-      {/* Category color bar */}
-      <div
-        className="absolute left-0 top-2 bottom-2 w-1 rounded-r"
-        style={{ backgroundColor: catColor }}
-      />
-
-      <div className="pl-3 space-y-1.5">
-        {/* Header row */}
-        <div className="flex items-center gap-2">
-          {mergeable && (
-            <input
-              type="checkbox"
-              checked={mergeChecked}
-              onClick={(e) => e.stopPropagation()}
-              onChange={() => onToggleMerge(task.id)}
-              className="w-3.5 h-3.5 rounded accent-ide-accent shrink-0"
-            />
-          )}
-          {editing ? (
-            <div className="flex items-center gap-1 flex-1 min-w-0">
-              <input
-                ref={inputRef}
-                value={editLabel}
-                onChange={(e) => setEditLabel(e.target.value)}
-                onClick={(e) => e.stopPropagation()}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') handleSave(e);
-                  if (e.key === 'Escape') handleCancel(e);
-                }}
-                className="flex-1 px-1.5 py-0.5 text-sm bg-ide-bg border border-ide-accent rounded text-ide-text focus:outline-none min-w-0"
-              />
-              <button onClick={handleSave} className="p-0.5 hover:bg-ide-hover rounded"><Check className="w-3.5 h-3.5 text-green-400" /></button>
-              <button onClick={handleCancel} className="p-0.5 hover:bg-ide-hover rounded"><X className="w-3.5 h-3.5 text-red-400" /></button>
-            </div>
-          ) : (
-            <span className="text-sm font-medium text-ide-text truncate flex-1">
-              {label}
-              {catLabel && (
-                <span
-                  className="ml-1.5 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-normal align-middle"
-                  style={{ backgroundColor: catColor + '33', color: catColor }}
-                >
-                  {catLabel}
-                </span>
-              )}
-            </span>
-          )}
-          {!editing && (
-            <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-              <button onClick={handleStartEdit} className="p-1 hover:bg-ide-hover rounded" title={t('tasks.rename')}>
-                <Pencil className="w-3 h-3 text-ide-muted" />
-              </button>
-              <button
-                onClick={(e) => { e.stopPropagation(); onDelete(task.id); }}
-                className="p-1 hover:bg-ide-hover rounded"
-                title={t('tasks.delete')}
-              >
-                <Trash2 className="w-3 h-3 text-ide-muted" />
-              </button>
-            </div>
-          )}
-        </div>
-
-        {/* Meta row */}
-        <div className="flex items-center gap-3 text-xs text-ide-muted">
-          <span className="flex items-center gap-1">
-            {task.layer === 'cold' ? <Snowflake className="w-3 h-3" /> : <Flame className="w-3 h-3" />}
-            {task.layer}
-          </span>
-          <span className="flex items-center gap-1">
-            <ImageIcon className="w-3 h-3" />
-            {task.snapshot_count}
-          </span>
-          <span className="flex items-center gap-1">
-            <Clock className="w-3 h-3" />
-            {formatDuration(task.start_time, task.end_time)}
-          </span>
-        </div>
-
-        {/* Time range */}
-        <div className="text-[11px] text-ide-muted/60 truncate">
-          {formatTimestamp(task.start_time)} — {formatTimestamp(task.end_time)}
-        </div>
-      </div>
-    </div>
-  );
 }
 
 // ── Main TasksView ─────────────────────────────────────────────────────
@@ -309,6 +181,7 @@ export default function TasksView({ backendOnline, onSelectScreenshot }) {
       await loadTasks();
     } catch (err) {
       console.error('Failed to rename task:', err);
+      throw err;
     }
   };
 
@@ -466,7 +339,7 @@ export default function TasksView({ backendOnline, onSelectScreenshot }) {
       {/* ── Content ── */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* Task list panel */}
-        <div className="w-72 shrink-0 border-r border-ide-border overflow-y-auto p-2 space-y-1.5">
+        <div className="w-80 shrink-0 border-r border-ide-border overflow-y-auto p-2 space-y-2">
           {loading && !tasks.length ? (
             <div className="flex items-center justify-center h-32">
               <Loader2 className="w-5 h-5 animate-spin text-ide-muted" />
@@ -478,19 +351,33 @@ export default function TasksView({ backendOnline, onSelectScreenshot }) {
               <span className="text-[11px]">{t('tasks.emptyHint')}</span>
             </div>
           ) : (
-            tasks.map((task) => (
-              <TaskCard
-                key={task.id}
-                task={task}
-                selected={selectedTask?.id === task.id}
-                onSelect={setSelectedTask}
-                onRename={handleRename}
-                onDelete={handleDelete}
-                mergeable={mergeMode}
-                mergeChecked={mergeSelection.has(task.id)}
-                onToggleMerge={toggleMerge}
-              />
-            ))
+            tasks.map((task) => {
+              const label = task.label || task.auto_label || t('tasks.unnamed');
+              const catColor = CATEGORY_COLORS[task.dominant_category] || '#6b7280';
+              return (
+                <ClusterCard
+                  key={task.id}
+                  variant="task"
+                  id={task.id}
+                  title={label}
+                  subtitle={task.dominant_category || null}
+                  accentColor={catColor}
+                  metaChips={[
+                    { key: 'count', icon: ImageIcon, text: String(task.snapshot_count ?? 0) },
+                    { key: 'dur', icon: Clock, text: formatDuration(task.start_time, task.end_time) },
+                  ]}
+                  timeRange={`${formatTimestamp(task.start_time)} — ${formatTimestamp(task.end_time)}`}
+                  layerLabel={task.layer}
+                  selected={selectedTask?.id === task.id}
+                  mergeable={mergeMode}
+                  mergeChecked={mergeSelection.has(task.id)}
+                  onSelect={() => setSelectedTask(task)}
+                  onToggleMerge={toggleMerge}
+                  onRename={handleRename}
+                  onDelete={handleDelete}
+                />
+              );
+            })
           )}
         </div>
 

@@ -494,6 +494,21 @@
           "label": "Content Classification",
           "description": "Automatically classify screenshot content using BGE model"
         },
+        "smartCluster": {
+          "label": "Smart Clusters (auto-archive by description)",
+          "description": "Auto-group related screenshots by natural-language description",
+          "modelMissing": "Model not downloaded",
+          "modelNotDownloaded": "Requires bge-reranker-v2-m3 model (~570MB)",
+          "downloadModel": "Download Model",
+          "downloading": "Downloading bge-reranker-v2-m3 model…",
+          "status": "Status",
+          "pending": "Pending",
+          "activeClusters": "Active",
+          "drainNow": "Process pending queue now",
+          "rescanAll": "Re-match all hot layer",
+          "retry": "Retry Download",
+          "openManagement": "Open Smart Cluster Management"
+        },
         "disabled_notice": "This feature is disabled"
       },
       "models": {
@@ -596,7 +611,10 @@
     "task": {
       "summaryPlaceholder": "Cleanup in progress ({{progress}}%)",
       "runningTitle": "Background cleanup is running",
-      "runningDesc": "Progress {{progress}}%, pending OCR {{ocr}}, screenshots {{screenshots}}."
+      "runningDesc": "Progress {{progress}}%, pending OCR {{ocr}}, screenshots {{screenshots}}.",
+      "smartClusterSummaryPlaceholder": "Smart clustering in progress ({{progress}}%)",
+      "smartClusterRunningTitle": "Smart Clustering Queue processing",
+      "smartClusterRunningDesc": "Current progress {{progress}}%, pending screenshots {{pending}}."
     }
   },
   "sidebar": {
@@ -623,6 +641,7 @@
     "preview": "Preview",
     "advancedSearch": "Advanced Search",
     "tasks": "Long-term Tasks",
+    "smartCluster": "Smart Clusters",
     "expand": "Expand Sidebar",
     "collapse": "Collapse Sidebar"
   },
@@ -648,6 +667,24 @@
     "info_note": "You can also skip this step and manually run clustering later from the Tasks panel.",
     "apply": "Start Organizing",
     "skip": "Skip"
+  },
+  "smartClusterSetup": {
+    "title": "Smart Clusters",
+    "subtitle": "Auto-archive snapshots by natural language description",
+    "description": "Smart Clusters automatically group related screenshots into buckets based on your natural-language descriptions. Powered by bge-reranker-v2-m3, delivering far better accuracy than pure vector search.",
+    "modelInfo": "A bge-reranker-v2-m3 model (~570MB, uint8 quantized) must be downloaded. This model is only used when the system is idle.",
+    "modelSource": "Model source: onnx-community/bge-reranker-v2-m3-ONNX",
+    "infoNote": "You can also download and enable this feature later from Settings → Feature Management.",
+    "download": "Download & Enable",
+    "downloading": "Downloading model…",
+    "downloading_short": "Downloading…",
+    "downloadComplete": "Download complete!",
+    "later": "Later",
+    "dismiss": "Don't show again",
+    "dismissTooltip": "Permanently dismiss this prompt. Can be enabled later in settings.",
+    "retry": "Retry Download",
+    "success": "Smart Clusters are ready",
+    "openFeature": "Open Smart Clusters"
   },
   "authMask": {
     "title": "Program is Locked",

@@ -469,7 +469,7 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
     
     // 解析请求
     let response = match serde_json::from_slice::<serde_json::Value>(&buf) {
-        Ok(req) => process_request(&req, &storage, &ocr_cache),
+        Ok(req) => process_request(&req, &storage, &ocr_cache, &app_handle),
         Err(e) => StorageResponse::error(&format!(
             "Invalid JSON: {} (bytes={}, reason={})",
             e,
@@ -486,7 +486,7 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
 }
 
 /// 处理存储请求
-fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &OcrImageCache) -> StorageResponse {
+fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &OcrImageCache, app_handle: &tauri::AppHandle) -> StorageResponse {
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
     let diag_start = std::time::Instant::now();
 
@@ -792,6 +792,143 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                         "total": total,
                     }))
                 }
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
+
+        "get_screenshots_with_ocr_by_ids" => {
+            let ids: Vec<i64> = req
+                .get("ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+
+            if ids.is_empty() {
+                return StorageResponse::success(serde_json::json!({ "screenshots": [] }));
+            }
+
+            // Cap the batch size to bound work for a single IPC request.
+            const MAX_BATCH: usize = 500;
+            let ids: Vec<i64> = ids.into_iter().take(MAX_BATCH).collect();
+
+            // Fetch OCR results in batch first
+            let ocr_map = match storage.get_ocr_results_by_screenshot_ids(&ids) {
+                Ok(map) => map,
+                Err(e) => return StorageResponse::error(&e),
+            };
+
+            match storage.get_screenshots_by_ids(&ids) {
+                Ok(records) => {
+                    let out: Vec<serde_json::Value> = records
+                        .into_iter()
+                        .map(|rec| {
+                            let ocr_text = ocr_map.get(&rec.id).cloned().unwrap_or_default();
+                            serde_json::json!({
+                                "id": rec.id,
+                                "process_name": rec.process_name.unwrap_or_default(),
+                                "window_title": rec.window_title.unwrap_or_default(),
+                                "ocr_text": ocr_text,
+                                "timestamp": rec.timestamp.unwrap_or(0) as f64,
+                                "category": rec.category.unwrap_or_default(),
+                            })
+                        })
+                        .collect();
+                    StorageResponse::success(serde_json::json!({ "screenshots": out }))
+                }
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
+
+        // ============ Smart Cluster reverse IPC ============
+
+        "get_idle_state" => {
+            use std::sync::atomic::Ordering;
+            use tauri::Manager;
+            match app_handle.try_state::<std::sync::Arc<crate::idle::IdleState>>() {
+                Some(s) => StorageResponse::success(serde_json::json!({
+                    "is_idle": s.is_idle.load(Ordering::SeqCst),
+                    "idle_secs": s.idle_secs.load(Ordering::SeqCst),
+                    "fullscreen_exclusive": s.fullscreen_exclusive.load(Ordering::SeqCst),
+                })),
+                None => StorageResponse::error("IdleState not initialised"),
+            }
+        }
+
+        "smart_cluster_list_enabled" => {
+            match storage.list_smart_clusters() {
+                Ok(clusters) => {
+                    let enabled: Vec<serde_json::Value> = clusters
+                        .into_iter()
+                        .filter(|c| c.enabled)
+                        .map(|c| {
+                            serde_json::json!({
+                                "id": c.id,
+                                "anchor_text": c.anchor_text,
+                                "threshold": c.threshold,
+                            })
+                        })
+                        .collect();
+                    StorageResponse::success(serde_json::json!({ "clusters": enabled }))
+                }
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
+
+        "smart_cluster_enqueue_pending" => {
+            let id = req.get("screenshot_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            if id <= 0 {
+                return StorageResponse::error("missing screenshot_id");
+            }
+            match storage.enqueue_smart_cluster_pending(id) {
+                Ok(()) => StorageResponse::success(serde_json::json!({ "ok": true })),
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
+
+        "smart_cluster_peek_pending" => {
+            let limit = req.get("limit").and_then(|v| v.as_i64()).unwrap_or(32).clamp(1, 256);
+            match storage.peek_smart_cluster_pending_batch(limit) {
+                Ok(ids) => StorageResponse::success(serde_json::json!({ "ids": ids })),
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
+
+        "smart_cluster_delete_pending" => {
+            let ids: Vec<i64> = req
+                .get("ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return StorageResponse::success(serde_json::json!({ "ok": true, "deleted": 0 }));
+            }
+            // Cap to bound per-IPC work; the worker batch is ≤256 so this is
+            // a defence-in-depth check, not a normal-case limit.
+            const MAX_BATCH: usize = 1000;
+            let ids: Vec<i64> = ids.into_iter().take(MAX_BATCH).collect();
+            let count = ids.len() as i64;
+            match storage.delete_smart_cluster_pending_ids(&ids) {
+                Ok(()) => StorageResponse::success(serde_json::json!({ "ok": true, "deleted": count })),
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
+
+        "smart_cluster_count_pending" => {
+            match storage.count_smart_cluster_pending() {
+                Ok(n) => StorageResponse::success(serde_json::json!({ "count": n })),
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
+
+        "smart_cluster_record_assignment" => {
+            let cluster_id = req.get("smart_cluster_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let screenshot_id = req.get("screenshot_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let score = req.get("rerank_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if cluster_id <= 0 || screenshot_id <= 0 {
+                return StorageResponse::error("missing smart_cluster_id or screenshot_id");
+            }
+            match storage.record_smart_cluster_assignment(cluster_id, screenshot_id, score) {
+                Ok(()) => StorageResponse::success(serde_json::json!({ "ok": true })),
                 Err(e) => StorageResponse::error(&e),
             }
         }

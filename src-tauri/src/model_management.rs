@@ -358,28 +358,44 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
         .ok_or_else(|| "Could not determine local appdata directory.".to_string())?
         .join("models");
 
-    // Define all models and their required files
-    let models: Vec<(&str, Option<&str>, Vec<&str>)> = vec![
+    // Define all models and their required files.
+    // The `required` flag distinguishes core models (whose absence blocks
+    // backend startup via the auto-start gate in App.jsx) from optional
+    // feature-specific models (smart cluster reranker, future LLM judges)
+    // that the user explicitly opts in to via a setup wizard.
+    let models: Vec<(&str, Option<&str>, Vec<&str>, bool /* required */)> = vec![
         (
             "chinese-clip",
             None, // files are directly under models/
             vec!["vocab.txt", "pytorch_model.bin", "config.json", "preprocessor_config.json"],
+            true,
         ),
         (
             "bge-small-zh",
             Some("bge-small-zh-v1.5"),
             vec!["config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"],
+            true,
         ),
         (
             "minilm-l12",
             Some("paraphrase-multilingual-MiniLM-L12-v2"),
             vec!["config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "sentencepiece.bpe.model"],
+            true,
+        ),
+        // Smart Cluster reranker (OPTIONAL — user opts in via setup wizard).
+        // The onnx weight lives in `onnx/` (onnx-community layout); we treat
+        // q4f16 as canonical and let the runtime auto-detect other variants.
+        (
+            "bge-reranker-v2-m3",
+            Some("bge-reranker-v2-m3"),
+            vec!["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "onnx/model_uint8.onnx"],
+            false,
         ),
     ];
 
     let mut result = serde_json::Map::new();
 
-    for (key, subdir, files) in &models {
+    for (key, subdir, files, required) in &models {
         let base = match subdir {
             Some(s) => models_dir.join(s),
             None => models_dir.clone(),
@@ -393,10 +409,11 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             }
         }
         if missing.is_empty() {
-            result.insert(key.to_string(), json!({ "complete": true }));
+            result.insert(key.to_string(), json!({ "complete": true, "required": required }));
         } else {
             result.insert(key.to_string(), json!({
                 "complete": false,
+                "required": required,
                 "missing_files": missing
             }));
         }

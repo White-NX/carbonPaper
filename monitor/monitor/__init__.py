@@ -903,6 +903,105 @@ def _handle_command_impl(req: dict):
         except Exception as e:
             return {'error': str(e)}
 
+    if cmd == 'nl_cluster_query':
+        if not _clustering_manager:
+            return {'error': 'Clustering service not initialised'}
+        if not _sync_clustering_scheduler_auth_gate(force=True):
+            return {'error': 'AUTH_REQUIRED: clustering requires unlocked session'}
+        query = req.get('query', '')
+        n_results = req.get('n_results', 30)
+        enable_rerank = bool(req.get('enable_rerank', False))
+        rerank_variant = req.get('rerank_variant') or 'q4f16'
+        try:
+            from task_clustering import ModelNotAvailableError
+            from reranker import RerankerNotAvailableError
+            try:
+                results = _clustering_manager.query_by_text(
+                    query,
+                    n_results=int(n_results),
+                    enable_rerank=enable_rerank,
+                    rerank_variant=rerank_variant,
+                )
+            except ModelNotAvailableError:
+                return {'error': 'MiniLM model not downloaded — run clustering setup first'}
+            except RerankerNotAvailableError as e:
+                return {'error': f'RERANKER_UNAVAILABLE: {e}'}
+            return {
+                'status': 'success',
+                'results': results,
+                'reranked': enable_rerank,
+                'rerank_variant': rerank_variant if enable_rerank else None,
+            }
+        except Exception as e:
+            logger.exception('nl_cluster_query failed')
+            return {'error': str(e)}
+
+    if cmd == 'nl_cluster_reranker_status':
+        try:
+            from reranker import Reranker, _resolve_model_path, list_available_variants
+            r = Reranker()
+            return {
+                'status': 'success',
+                'available': Reranker.is_model_available(),
+                'loaded': r.is_loaded(),
+                'loaded_variant': r.loaded_variant,
+                'provider': r.provider,
+                'available_variants': list_available_variants(),
+                'model_path': _resolve_model_path(),
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    if cmd == 'smart_cluster_drain_now':
+        try:
+            from smart_cluster_worker import SmartClusterWorker
+            SmartClusterWorker().request_drain_now()
+            return {'status': 'success'}
+        except Exception as e:
+            return {'error': str(e)}
+
+    if cmd == 'smart_cluster_worker_status':
+        try:
+            from smart_cluster_worker import SmartClusterWorker
+            worker = SmartClusterWorker()
+            sc = worker.storage_client
+            pending_count = sc.smart_cluster_count_pending() if sc else 0
+            return {
+                'status': 'success',
+                'is_running': worker.is_running(),
+                'pending_count': pending_count,
+            }
+        except Exception as e:
+            return {'error': str(e)}
+
+    if cmd == 'smart_cluster_calibrate_preview':
+        """Run the NL retrieval pipeline with rerank=True and return scored
+        candidates so the frontend can show "if you save this, threshold
+        would be X" and let the user mark positive/negative examples."""
+        if not _clustering_manager:
+            return {'error': 'Clustering service not initialised'}
+        if not _sync_clustering_scheduler_auth_gate(force=True):
+            return {'error': 'AUTH_REQUIRED: clustering requires unlocked session'}
+        query = req.get('query', '')
+        n_results = int(req.get('n_results', 30))
+        try:
+            from task_clustering import ModelNotAvailableError
+            from reranker import RerankerNotAvailableError
+            try:
+                results = _clustering_manager.query_by_text(
+                    query,
+                    n_results=n_results,
+                    enable_rerank=True,
+                )
+            except ModelNotAvailableError:
+                return {'error': 'MiniLM model not downloaded — run clustering setup first'}
+            except RerankerNotAvailableError as e:
+                return {'error': f'RERANKER_UNAVAILABLE: {e}'}
+            return {'status': 'success', 'results': results}
+        except Exception as e:
+            logger.exception('smart_cluster_calibrate_preview failed')
+            return {'error': str(e)}
+
     return {'error': 'unknown command'}
 
 
@@ -1011,6 +1110,24 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         _clustering_scheduler_active = False
         _clustering_auth_monitor_thread = None
 
+    # Start smart cluster worker (idle-aware drain loop). Best-effort: any
+    # failure here must not block monitor startup since smart clusters are
+    # an optional feature.
+    try:
+        if _clustering_manager is not None and storage_pipe:
+            from smart_cluster_worker import SmartClusterWorker
+            from storage_client import get_storage_client
+            sc = get_storage_client()
+            if sc is not None:
+                SmartClusterWorker().start(
+                    sc,
+                    _clustering_manager.embedder,
+                    hot_collection_getter=lambda: _clustering_manager.hot_collection,
+                )
+                logger.info('Smart Cluster worker started')
+    except Exception as e:
+        logger.warning('Smart Cluster worker failed to start (non-fatal): %s', e)
+
     # NOTE: Screenshot capture loop is handled by Rust (capture.rs).
     # Python only provides OCR via the 'process_ocr' IPC command.
 
@@ -1029,6 +1146,11 @@ def stop():
     _clustering_scheduler_active = False
     if _clustering_auth_monitor_thread:
         _clustering_auth_monitor_thread = None
+    try:
+        from smart_cluster_worker import SmartClusterWorker
+        SmartClusterWorker().stop()
+    except Exception:
+        pass
     if _ocr_worker:
         try:
             _ocr_worker.stop()

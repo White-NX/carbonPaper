@@ -1,11 +1,12 @@
 import React from 'react';
-import { Layout, Search as SearchIcon, Layers, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
+import { Layout, Search as SearchIcon, Layers, Sparkles, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 const NAV_ITEMS = [
   { id: 'preview', icon: Layout, i18nKey: 'activityBar.preview' },
   { id: 'advanced-search', icon: SearchIcon, i18nKey: 'activityBar.advancedSearch' },
   { id: 'tasks', icon: Layers, i18nKey: 'activityBar.tasks' },
+  { id: 'smart-cluster', icon: Sparkles, i18nKey: 'activityBar.smartCluster', fallback: '智能聚类' },
 ];
 
 export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggleExpand }) {
@@ -19,15 +20,20 @@ export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggl
     >
       {/* Navigation icons */}
       <nav className="flex-1 flex flex-col pt-1">
-        {NAV_ITEMS.map(({ id, icon: Icon, i18nKey }) => {
+        {NAV_ITEMS.map(({ id, icon: Icon, i18nKey, fallback }) => {
           const isActive = activeTab === id;
+          const label = (() => {
+            const translated = t(i18nKey);
+            // i18next returns the key itself when missing — fall back to provided text
+            return translated === i18nKey && fallback ? fallback : translated;
+          })();
           return (
             <button
               key={id}
               type="button"
               data-tauri-drag-region="false"
               onClick={() => setActiveTab(id)}
-              title={!expanded ? t(i18nKey) : undefined}
+              title={!expanded ? label : undefined}
               className={`relative flex items-center gap-3 h-10 cursor-pointer transition-colors overflow-hidden ${
                 expanded ? 'px-3' : 'px-0 justify-center'
               } ${
@@ -42,7 +48,7 @@ export default function ActivityBar({ activeTab, setActiveTab, expanded, onToggl
               )}
               <Icon className="w-[18px] h-[18px] shrink-0" />
               {expanded && (
-                <span className="text-sm truncate whitespace-nowrap">{t(i18nKey)}</span>
+                <span className="text-sm truncate whitespace-nowrap">{label}</span>
               )}
             </button>
           );

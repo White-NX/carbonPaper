@@ -5,6 +5,7 @@ pub mod commands;
 mod credential_manager;
 pub mod error;
 mod error_window;
+mod idle;
 mod logging;
 mod mcp_server;
 mod model_management;
@@ -24,6 +25,7 @@ use analysis::AnalysisState;
 use autostart::{get_autostart_status, set_autostart};
 use capture::CaptureState;
 use credential_manager::CredentialManagerState;
+use idle::IdleState;
 use monitor::MonitorState;
 use power::PowerState;
 use sensitive_filter::SensitiveFilterState;
@@ -498,6 +500,7 @@ pub fn run() {
         .manage(storage_state)
         .manage(lightweight_state.clone())
         .manage(Arc::new(PowerState::new()))
+        .manage(Arc::new(IdleState::new()))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
@@ -622,6 +625,7 @@ pub fn run() {
 
                 // Start power monitor (power saving mode)
                 power::start_power_monitor(app.handle().clone());
+                idle::start_idle_monitor(app.handle().clone());
 
                 match native_messaging::sync_installed_extension() {
                     Ok(true) => tracing::info!("Browser extension synced to latest version"),
@@ -821,8 +825,26 @@ pub fn run() {
             commands::utility::mark_extension_setup_done,
             commands::utility::check_clustering_setup_needed,
             commands::utility::mark_clustering_setup_done,
+            commands::utility::check_smart_cluster_setup_needed,
+            commands::utility::mark_smart_cluster_setup_done,
             commands::utility::get_extension_enhancement_config,
             commands::utility::set_extension_enhancement,
+            // Smart Cluster commands
+            commands::smart_cluster::smart_cluster_list,
+            commands::smart_cluster::smart_cluster_get,
+            commands::smart_cluster::smart_cluster_get_examples,
+            commands::smart_cluster::smart_cluster_create,
+            commands::smart_cluster::smart_cluster_delete,
+            commands::smart_cluster::smart_cluster_update_anchor,
+            commands::smart_cluster::smart_cluster_update_threshold,
+            commands::smart_cluster::smart_cluster_toggle_enabled,
+            commands::smart_cluster::smart_cluster_assignments,
+            commands::smart_cluster::smart_cluster_rescan,
+            commands::smart_cluster::smart_cluster_rescan_all,
+            commands::smart_cluster::smart_cluster_clear_assignments,
+            commands::smart_cluster::smart_cluster_status,
+            // Idle / power
+            idle::get_idle_state,
             // Error window commands
             commands::utility::get_log_dir,
             commands::utility::restart_app,

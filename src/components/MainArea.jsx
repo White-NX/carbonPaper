@@ -3,6 +3,7 @@ import { AdvancedSearch } from './AdvancedSearch';
 import { InspectorImage } from './InspectorImage';
 import DetailCard from './DetailCard';
 import TasksView from './TasksView';
+import SmartClustersView from './SmartClustersView';
 import { Loader2, Copy, X } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import PreviewActionBar from './PreviewActionBar';
@@ -175,6 +176,15 @@ export default function MainArea({
 
         <div className={`${activeTab === 'tasks' ? 'flex flex-col' : 'hidden'} flex-1 w-full min-w-0 min-h-0 overflow-hidden`}>
           <TasksView
+            backendOnline={backendOnline}
+            onSelectScreenshot={(evt) => {
+              onAdvancedSelect?.(evt);
+            }}
+          />
+        </div>
+
+        <div className={`${activeTab === 'smart-cluster' ? 'flex flex-col' : 'hidden'} flex-1 w-full min-w-0 min-h-0 overflow-hidden`}>
+          <SmartClustersView
             backendOnline={backendOnline}
             onSelectScreenshot={(evt) => {
               onAdvancedSelect?.(evt);

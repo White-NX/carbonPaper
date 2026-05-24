@@ -68,6 +68,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let clustering_interval = registry_config::get_string("clustering_interval").unwrap_or_else(|| "1w".to_string());
     let clustering_enabled = registry_config::get_bool("clustering_enabled").unwrap_or(true);
     let classification_enabled = registry_config::get_bool("classification_enabled").unwrap_or(true);
+    let smart_cluster_enabled = registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
     let network_enabled = registry_config::get_bool("network_enabled").unwrap_or(true);
 
     Ok(serde_json::json!({
@@ -82,6 +83,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "clustering_interval": clustering_interval,
         "clustering_enabled": clustering_enabled,
         "classification_enabled": classification_enabled,
+        "smart_cluster_enabled": smart_cluster_enabled,
         "network_enabled": network_enabled,
     }))
 }
@@ -123,6 +125,9 @@ pub fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     }
     if let Some(v) = config.get("classification_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("classification_enabled", v)?;
+    }
+    if let Some(v) = config.get("smart_cluster_enabled").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("smart_cluster_enabled", v)?;
     }
     if let Some(v) = config.get("network_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("network_enabled", v)?;
@@ -177,6 +182,35 @@ pub async fn check_clustering_setup_needed(
 #[tauri::command]
 pub fn mark_clustering_setup_done() -> Result<(), String> {
     registry_config::set_bool("clustering_setup_done", true)
+}
+
+/// Smart cluster setup wizard — returns true if the wizard should be shown.
+/// Returns false when either:
+///   - The user previously permanently dismissed it, OR
+///   - The model is already downloaded and the feature is configured
+#[tauri::command]
+pub fn check_smart_cluster_setup_needed() -> Result<bool, String> {
+    if registry_config::get_bool("smart_cluster_setup_dismissed").unwrap_or(false) {
+        return Ok(false);
+    }
+    if registry_config::get_bool("smart_cluster_setup_done").unwrap_or(false) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Mark the smart cluster setup wizard as resolved.
+/// If `dismissed_permanently` is true, the wizard will never re-appear on
+/// future launches; the user can still trigger the download manually from
+/// the settings page.
+#[tauri::command]
+pub fn mark_smart_cluster_setup_done(dismissed_permanently: bool) -> Result<(), String> {
+    if dismissed_permanently {
+        registry_config::set_bool("smart_cluster_setup_dismissed", true)?;
+    } else {
+        registry_config::set_bool("smart_cluster_setup_done", true)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

@@ -321,6 +321,96 @@ class StorageClient:
             'limit': limit,
         })
 
+    def get_screenshots_with_ocr_by_ids(self, ids: List[int]) -> Dict[str, Any]:
+        """Fetch screenshots + OCR text for a specific set of IDs (single round-trip).
+
+        Used by the NL-cluster reranker path to enrich candidate text before
+        cross-encoder scoring. Returns {'screenshots': [...]} (no 'total').
+        """
+        if not ids:
+            return {'screenshots': []}
+        response = self._send_request({
+            'command': 'get_screenshots_with_ocr_by_ids',
+            'ids': [int(i) for i in ids],
+        })
+        if response.get('status') == 'success':
+            return response.get('data', {'screenshots': []})
+        raise RuntimeError(response.get('error', 'Unknown error during IPC get_screenshots_with_ocr_by_ids'))
+
+    # ---- Smart Cluster reverse IPC --------------------------------------
+
+    def get_idle_state(self) -> Dict[str, Any]:
+        """Read the current system idle state from Rust.
+
+        Returns {'is_idle': bool, 'idle_secs': int, 'fullscreen_exclusive': bool}.
+        Default to "not idle" on any error to fail safe.
+        """
+        response = self._send_request({'command': 'get_idle_state'})
+        if response.get('status') == 'success':
+            return response.get('data', {'is_idle': False, 'idle_secs': 0, 'fullscreen_exclusive': True})
+        return {'is_idle': False, 'idle_secs': 0, 'fullscreen_exclusive': True}
+
+    def smart_cluster_list_enabled(self) -> List[Dict[str, Any]]:
+        """Return enabled smart clusters with anchor text and threshold."""
+        response = self._send_request({'command': 'smart_cluster_list_enabled'})
+        if response.get('status') == 'success':
+            return response.get('data', {}).get('clusters', [])
+        return []
+
+    def smart_cluster_enqueue_pending(self, screenshot_id: int) -> bool:
+        response = self._send_request({
+            'command': 'smart_cluster_enqueue_pending',
+            'screenshot_id': int(screenshot_id),
+        })
+        return response.get('status') == 'success'
+
+    def smart_cluster_peek_pending(self, limit: int = 32) -> List[int]:
+        """Read up to ``limit`` pending screenshot ids WITHOUT removing them.
+
+        Rust applies a 30-day TTL filter and opportunistically prunes
+        expired rows in the same transaction. The caller must invoke
+        :meth:`smart_cluster_delete_pending` for ids it has fully processed;
+        on any failure path the ids stay in the queue and are retried on
+        the next idle window.
+        """
+        response = self._send_request({
+            'command': 'smart_cluster_peek_pending',
+            'limit': int(limit),
+        })
+        if response.get('status') == 'success':
+            return response.get('data', {}).get('ids', [])
+        return []
+
+    def smart_cluster_delete_pending(self, ids: List[int]) -> bool:
+        """Remove pending ids after they have been scored and assignments persisted."""
+        if not ids:
+            return True
+        response = self._send_request({
+            'command': 'smart_cluster_delete_pending',
+            'ids': [int(i) for i in ids],
+        })
+        return response.get('status') == 'success'
+
+    def smart_cluster_count_pending(self) -> int:
+        response = self._send_request({'command': 'smart_cluster_count_pending'})
+        if response.get('status') == 'success':
+            return int(response.get('data', {}).get('count', 0))
+        return 0
+
+    def smart_cluster_record_assignment(
+        self,
+        smart_cluster_id: int,
+        screenshot_id: int,
+        rerank_score: float,
+    ) -> bool:
+        response = self._send_request({
+            'command': 'smart_cluster_record_assignment',
+            'smart_cluster_id': int(smart_cluster_id),
+            'screenshot_id': int(screenshot_id),
+            'rerank_score': float(rerank_score),
+        })
+        return response.get('status') == 'success'
+
     def is_session_valid(self) -> bool:
         """Check whether the Rust credential session is currently unlocked."""
         response = self._send_request({'command': 'get_auth_status'})
