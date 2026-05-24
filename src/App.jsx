@@ -18,6 +18,7 @@ import SecurityAlertMask from './components/SecurityAlertMask';
 
 import ExtensionSetupWizard from './components/ExtensionSetupWizard';
 import ClusteringSetupWizard from './components/ClusteringSetupWizard';
+import SmartClusterSetupWizard from './components/SmartClusterSetupWizard';
 import ActivityBar from './components/ActivityBar';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
@@ -116,6 +117,7 @@ function App() {
 
   const [showExtensionSetup, setShowExtensionSetup] = useState(false);
   const [showClusteringSetup, setShowClusteringSetup] = useState(false);
+  const [showSmartClusterSetup, setShowSmartClusterSetup] = useState(false);
   const clusteringTimerRef = useRef(null);
   const [sessionTimeout, setSessionTimeout] = useState(() => {
     const saved = localStorage.getItem('sessionTimeout');
@@ -455,6 +457,30 @@ function App() {
     })();
     return () => { cancelled = true; };
   }, [backendStatus, isAuthenticated, showExtensionSetup]);
+
+  // Check if smart cluster setup wizard should be shown (after clustering wizard)
+  useEffect(() => {
+    if (backendStatus !== 'online' || !isAuthenticated || showExtensionSetup || showClusteringSetup) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const needed = await invoke('check_smart_cluster_setup_needed');
+        if (!cancelled && needed) {
+          setShowSmartClusterSetup(true);
+        }
+      } catch (err) {
+        console.warn('Failed to check smart cluster setup status:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [backendStatus, isAuthenticated, showExtensionSetup, showClusteringSetup]);
+
+  const handleSmartClusterSetupComplete = useCallback((enabled) => {
+    setShowSmartClusterSetup(false);
+    if (enabled) {
+      setActiveTab('smart-cluster');
+    }
+  }, []);
 
   // Background thumbnail warmup after auth
   useEffect(() => {
@@ -802,7 +828,10 @@ function App() {
         // Check if model files are complete
         try {
           const modelStatus = await invoke('check_model_files');
-          const hasIncomplete = Object.values(modelStatus).some((m) => !m.complete);
+          // Only block startup on REQUIRED models — optional feature models
+          // (e.g. smart cluster reranker) are downloaded later via their own
+          // setup wizard and must not gate the auto-start path.
+          const hasIncomplete = Object.values(modelStatus).some((m) => !m.complete && m.required !== false);
           if (hasIncomplete) {
             console.log('Model files incomplete:', modelStatus);
             setModelsNeedDownload(true);
@@ -865,6 +894,35 @@ function App() {
     };
     window.addEventListener('debug-update-modal', handler);
     return () => window.removeEventListener('debug-update-modal', handler);
+  }, []);
+
+  // Debug Wizards
+  useEffect(() => {
+    const showExtension = () => {
+      setShowClusteringSetup(false);
+      setShowSmartClusterSetup(false);
+      setShowExtensionSetup(true);
+    };
+    const showClustering = () => {
+      setShowExtensionSetup(false);
+      setShowSmartClusterSetup(false);
+      setShowClusteringSetup(true);
+    };
+    const showSmartCluster = () => {
+      setShowExtensionSetup(false);
+      setShowClusteringSetup(false);
+      setShowSmartClusterSetup(true);
+    };
+
+    window.addEventListener('debug-show-extension-wizard', showExtension);
+    window.addEventListener('debug-show-clustering-wizard', showClustering);
+    window.addEventListener('debug-show-smart-cluster-wizard', showSmartCluster);
+
+    return () => {
+      window.removeEventListener('debug-show-extension-wizard', showExtension);
+      window.removeEventListener('debug-show-clustering-wizard', showClustering);
+      window.removeEventListener('debug-show-smart-cluster-wizard', showSmartCluster);
+    };
   }, []);
 
   const handleDownloadUpdate = async () => {
@@ -1007,6 +1065,11 @@ function App() {
         <ClusteringSetupWizard
           isVisible={backendStatus === 'online' && isAuthenticated && !showExtensionSetup && showClusteringSetup}
           onComplete={handleClusteringSetupComplete}
+        />
+
+        <SmartClusterSetupWizard
+          isVisible={backendStatus === 'online' && isAuthenticated && !showExtensionSetup && !showClusteringSetup && showSmartClusterSetup}
+          onComplete={handleSmartClusterSetupComplete}
         />
 
         <Timeline

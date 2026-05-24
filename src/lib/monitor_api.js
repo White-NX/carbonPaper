@@ -587,3 +587,22 @@ export const removeLocalAnchorsByProcess = async (category, processName) => {
     }
     return response;
 };
+
+export const getSmartClusterWorkerStatus = async () => {
+    return withAuth(async () => {
+        try {
+            const response = await invoke('execute_monitor_command', {
+                payload: { command: 'smart_cluster_worker_status' }
+            });
+            if (response?.error) {
+                return { pending_count: 0, running: false };
+            }
+            return {
+                pending_count: response.pending_count || 0,
+                running: !!response.is_running,
+            };
+        } catch {
+            return { pending_count: 0, running: false };
+        }
+    });
+};

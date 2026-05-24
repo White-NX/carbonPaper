@@ -410,6 +410,69 @@ impl StorageState {
             "CREATE INDEX IF NOT EXISTS idx_task_assignments_task_id ON task_assignments(task_id)",
         ).map_err(|e| format!("Failed to create task_assignments index: {}", e))?;
 
+        // Smart cluster tables (NL-anchored user-defined clusters)
+        Self::create_table_if_missing(
+            conn,
+            "smart_clusters",
+            r#"
+            CREATE TABLE IF NOT EXISTS smart_clusters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                anchor_text TEXT NOT NULL,
+                threshold REAL NOT NULL DEFAULT 0.0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                dominant_color TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )?;
+        Self::create_table_if_missing(
+            conn,
+            "smart_cluster_examples",
+            r#"
+            CREATE TABLE IF NOT EXISTS smart_cluster_examples (
+                smart_cluster_id INTEGER NOT NULL,
+                screenshot_id INTEGER NOT NULL,
+                is_positive INTEGER NOT NULL,
+                rerank_score REAL,
+                PRIMARY KEY (smart_cluster_id, screenshot_id),
+                FOREIGN KEY (smart_cluster_id) REFERENCES smart_clusters(id) ON DELETE CASCADE,
+                FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
+            )
+            "#,
+        )?;
+        Self::create_table_if_missing(
+            conn,
+            "smart_cluster_assignments",
+            r#"
+            CREATE TABLE IF NOT EXISTS smart_cluster_assignments (
+                smart_cluster_id INTEGER NOT NULL,
+                screenshot_id INTEGER NOT NULL,
+                rerank_score REAL,
+                assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (smart_cluster_id, screenshot_id),
+                FOREIGN KEY (smart_cluster_id) REFERENCES smart_clusters(id) ON DELETE CASCADE,
+                FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
+            )
+            "#,
+        )?;
+        Self::create_table_if_missing(
+            conn,
+            "smart_cluster_pending",
+            r#"
+            CREATE TABLE IF NOT EXISTS smart_cluster_pending (
+                screenshot_id INTEGER PRIMARY KEY,
+                queued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
+            )
+            "#,
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_smart_cluster_assignments_cluster ON smart_cluster_assignments(smart_cluster_id);
+             CREATE INDEX IF NOT EXISTS idx_smart_cluster_assignments_screenshot ON smart_cluster_assignments(screenshot_id);
+             CREATE INDEX IF NOT EXISTS idx_smart_cluster_pending_queued_at ON smart_cluster_pending(queued_at);",
+        ).map_err(|e| format!("Failed to create smart_cluster indices: {}", e))?;
+
         // Staging table for bitmap index migration (same structure as blind_bitmap_index)
         Self::create_table_if_missing(
             conn,

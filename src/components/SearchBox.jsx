@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Image as ImageIcon, Type, Loader2, X, ChevronDown } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { searchScreenshots, fetchThumbnailBatch, fetchImage, getSoftDeleteQueueStatus } from '../lib/monitor_api';
+import { searchScreenshots, fetchThumbnailBatch, fetchImage, getSoftDeleteQueueStatus, getSmartClusterWorkerStatus } from '../lib/monitor_api';
 
 // Simple debounce hook
 function useDebounce(value, delay) {
@@ -19,7 +19,7 @@ function useDebounce(value, delay) {
     return debouncedValue;
 }
 
-export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, backendOnline }) {
+export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, backendOnline, monitorPaused, handlePauseMonitor, handleResumeMonitor }) {
     const { t } = useTranslation();
     const [query, setQuery] = useState('');
     const [localMode, setLocalMode] = useState('ocr'); // 'ocr' | 'nl'
@@ -126,6 +126,12 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     });
     const [deleteQueuePeak, setDeleteQueuePeak] = useState(0);
 
+    const [smartClusterQueueStatus, setSmartClusterQueueStatus] = useState({
+        pending_count: 0,
+        running: false,
+    });
+    const [smartClusterQueuePeak, setSmartClusterQueuePeak] = useState(0);
+
     const pendingDeleteTotal = Number(deleteQueueStatus?.pending_ocr || 0) + Number(deleteQueueStatus?.pending_screenshots || 0);
     const hasDeleteTask = Boolean(deleteQueueStatus?.running) || pendingDeleteTotal > 120;
     const deleteProgress = (() => {
@@ -135,11 +141,31 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         const ratio = ((deleteQueuePeak - pendingDeleteTotal) / deleteQueuePeak) * 100;
         return Math.max(0, Math.min(100, ratio));
     })();
-    const progressFillPercent = hasDeleteTask
-        ? (deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress))
-        : 0;
 
-    const taskSummaryPlaceholder = t('search.task.summaryPlaceholder', { progress: Math.round(deleteProgress) });
+    const hasClusterTask = Boolean(smartClusterQueueStatus?.running) && Number(smartClusterQueueStatus?.pending_count || 0) > 0;
+    const clusterProgress = (() => {
+        if (!hasClusterTask) return 0;
+        const pending = Number(smartClusterQueueStatus.pending_count || 0);
+        if (pending <= 0) return 100;
+        if (smartClusterQueuePeak <= 0) return 0;
+        const ratio = ((smartClusterQueuePeak - pending) / smartClusterQueuePeak) * 100;
+        return Math.max(0, Math.min(100, ratio));
+    })();
+
+    const showProgressBar = hasDeleteTask || hasClusterTask;
+    const progressFillPercent = (() => {
+        if (hasDeleteTask) {
+            return deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress);
+        }
+        if (hasClusterTask) {
+            return clusterProgress <= 0 ? 8 : Math.min(100, clusterProgress);
+        }
+        return 0;
+    })();
+
+    const taskSummaryPlaceholder = hasDeleteTask
+        ? t('search.task.summaryPlaceholder', { progress: Math.round(deleteProgress) })
+        : t('search.task.smartClusterSummaryPlaceholder', { progress: Math.round(clusterProgress) });
 
     // Active detection: check on mount and listen for progress events
     useEffect(() => {
@@ -195,6 +221,33 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     }, []);
 
     useEffect(() => {
+        let cancelled = false;
+        const loadClusterStatus = async () => {
+            try {
+                const config = await invoke('get_advanced_config');
+                if (cancelled) return;
+                if (config && config.smart_cluster_enabled) {
+                    const status = await getSmartClusterWorkerStatus();
+                    if (cancelled) return;
+                    setSmartClusterQueueStatus(status || { pending_count: 0, running: false });
+                } else {
+                    setSmartClusterQueueStatus({ pending_count: 0, running: false });
+                }
+            } catch {
+                if (cancelled) return;
+                setSmartClusterQueueStatus({ pending_count: 0, running: false });
+            }
+        };
+
+        loadClusterStatus();
+        const timer = setInterval(loadClusterStatus, 4000);
+        return () => {
+            cancelled = true;
+            clearInterval(timer);
+        };
+    }, []);
+
+    useEffect(() => {
         if (!hasDeleteTask) {
             setDeleteQueuePeak(0);
             return;
@@ -204,6 +257,68 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         }
     }, [hasDeleteTask, pendingDeleteTotal]);
 
+    useEffect(() => {
+        const running = Boolean(smartClusterQueueStatus?.running);
+        const pending = Number(smartClusterQueueStatus?.pending_count || 0);
+        if (!running || pending <= 0) {
+            setSmartClusterQueuePeak(0);
+            return;
+        }
+        if (pending > 0) {
+            setSmartClusterQueuePeak((prev) => Math.max(prev, pending));
+        }
+    }, [smartClusterQueueStatus?.running, smartClusterQueueStatus?.pending_count]);
+
+    const wasPausedRef = useRef(null);
+    // Hold the latest resume handler in a ref so the unmount-cleanup
+    // effect (empty deps) can call it without re-subscribing on every
+    // render. Without this, a SearchBox unmounted mid-task (route
+    // change, dialog close) would leave OCR capture indefinitely
+    // paused — a silent feature-killing bug.
+    const handleResumeMonitorRef = useRef(handleResumeMonitor);
+    useEffect(() => {
+        handleResumeMonitorRef.current = handleResumeMonitor;
+    }, [handleResumeMonitor]);
+
+    useEffect(() => {
+        if (hasClusterTask) {
+            if (wasPausedRef.current === null) {
+                wasPausedRef.current = !!monitorPaused;
+                if (!monitorPaused && handlePauseMonitor) {
+                    console.log("[SmartCluster] Auto-pausing OCR capture loop during task");
+                    handlePauseMonitor();
+                }
+            }
+        } else {
+            if (wasPausedRef.current !== null) {
+                const wasPaused = wasPausedRef.current;
+                wasPausedRef.current = null;
+                if (!wasPaused && handleResumeMonitor) {
+                    console.log("[SmartCluster] Auto-resuming OCR capture loop after task");
+                    handleResumeMonitor();
+                }
+            }
+        }
+    }, [hasClusterTask, monitorPaused, handlePauseMonitor, handleResumeMonitor]);
+
+    // Failsafe: if this component unmounts while we are still holding a
+    // pause we initiated, resume on the way out. wasPausedRef === false
+    // means "we paused capture on behalf of a cluster task that hasn't
+    // resolved" — exactly the case that would otherwise strand OCR.
+    useEffect(() => {
+        return () => {
+            if (wasPausedRef.current === false && handleResumeMonitorRef.current) {
+                console.log("[SmartCluster] Resuming OCR on SearchBox unmount (cleanup)");
+                try {
+                    handleResumeMonitorRef.current();
+                } catch (e) {
+                    console.warn("[SmartCluster] resume on unmount failed", e);
+                }
+            }
+            wasPausedRef.current = null;
+        };
+    }, []);
+
     return (
         <div
             className="relative w-[450px] z-50 pointer-events-auto"
@@ -212,7 +327,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
             data-keep-selection="true"
         >
             <div className="relative flex items-center bg-ide-panel rounded-md border border-ide-border focus-within:border-ide-accent focus-within:ring-1 focus-within:ring-ide-accent transition-all shadow-sm overflow-hidden">
-                {hasDeleteTask && (
+                {showProgressBar && (
                     <div
                         className="pointer-events-none absolute inset-y-0 left-0 bg-sky-500/35 dark:bg-sky-400/20 transition-all duration-500"
                         style={{ width: `${progressFillPercent}%` }}
@@ -248,7 +363,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 ref={inputRef}
                 type="text"
                 className="relative z-10 bg-transparent border-none outline-none text-ide-text text-sm w-full h-8 px-3 placeholder-ide-muted"
-                placeholder={hasDeleteTask ? taskSummaryPlaceholder : (mode === 'ocr' ? t('search.placeholder.ocr') : t('search.placeholder.nl'))}
+                placeholder={showProgressBar ? taskSummaryPlaceholder : (mode === 'ocr' ? t('search.placeholder.ocr') : t('search.placeholder.nl'))}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onFocus={() => setShowResults(true)}
@@ -315,6 +430,20 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                                     progress: Math.round(deleteProgress),
                                     ocr: deleteQueueStatus.pending_ocr || 0,
                                     screenshots: deleteQueueStatus.pending_screenshots || 0,
+                                })}
+                            </div>
+                        </div>
+                    )}
+                    {hasClusterTask && (
+                        <div className="p-3 bg-sky-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">
+                            <div className="flex items-center gap-2 text-sky-500 text-sm font-bold">
+                                <Loader2 size={14} className="animate-spin" />
+                                {t('search.task.smartClusterRunningTitle')}
+                            </div>
+                            <div className="text-xs text-ide-muted leading-relaxed">
+                                {t('search.task.smartClusterRunningDesc', {
+                                    progress: Math.round(clusterProgress),
+                                    pending: smartClusterQueueStatus.pending_count,
                                 })}
                             </div>
                         </div>

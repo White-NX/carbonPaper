@@ -14,6 +14,7 @@ mod process;
 mod schema;
 mod screenshot;
 mod search;
+pub mod smart_cluster;
 pub mod task;
 mod types;
 

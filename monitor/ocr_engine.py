@@ -79,6 +79,8 @@ class OCREngine:
         if getattr(self, '_initialized', False):
             return
 
+        from logging_config import log_model_loading
+        log_model_loading("PaddleOCR (RapidOCR)")
         logger.info("Initialising OCR (using %s, DirectML=%s)...", ocr_version, use_dml)
 
         # Record GPU usage flags

@@ -101,6 +101,8 @@ class TaskEmbedder:
                     "paraphrase-multilingual-MiniLM-L12-v2",
                 )
 
+            from logging_config import log_model_loading
+            log_model_loading("MiniLM-L12-v2")
             logger.info("Loading MiniLM-L12-v2 from %s …", model_path)
             self._tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
             self._model = AutoModel.from_pretrained(model_path, local_files_only=True)
@@ -318,6 +320,10 @@ class HotColdManager:
         logger.info("[task_clustering] HotColdManager ready (lazy loading collections)")
 
     @property
+    def embedder(self):
+        return self._embedder
+
+    @property
     def hot_collection(self):
         if self._client is None:
             return None
@@ -427,6 +433,15 @@ class HotColdManager:
             metadatas=[metadata],
             documents=[self._encrypt(combined)],
         )
+
+        # Enqueue for smart cluster evaluation. Best-effort and O(1) — the
+        # actual scoring happens in a separate idle-aware worker so this stays
+        # off the OCR critical path.
+        if self._storage_client:
+            try:
+                self._storage_client.smart_cluster_enqueue_pending(screenshot_id)
+            except Exception as e:
+                logger.debug("[task_clustering] smart cluster enqueue failed (non-fatal): %s", e)
 
     def get_hot_vectors(self, days: int = HOT_LAYER_DAYS) -> Tuple[np.ndarray, List[str], List[Dict]]:
         """Retrieve hot-layer vectors within the time window.
@@ -759,6 +774,138 @@ class HotColdManager:
             m["dominant_process"] = self._decrypt(m.get("dominant_process", ""))
             out.append(m)
         return out
+
+    # ---- Natural-language retrieval (demo) -------------------------------
+
+    def query_by_text(
+        self,
+        query: str,
+        n_results: int = 30,
+        enable_rerank: bool = False,
+        rerank_overfetch: int = 4,
+        ocr_snippet_chars: int = 600,
+        rerank_variant: str = "uint8",
+    ) -> List[Dict[str, Any]]:
+        """Retrieve hot-layer snapshots most similar to a natural-language query.
+
+        Reuses the MiniLM embedder + the existing ``task_vectors`` ChromaDB
+        collection (cosine space). Returns a list ordered by descending
+        similarity; each entry includes the decrypted process/title metadata
+        so the caller can render it directly.
+
+        When ``enable_rerank`` is True, fetches ``n_results * rerank_overfetch``
+        candidates from the embedding index, pulls OCR text for each via the
+        reverse storage IPC, and re-scores with the bge-reranker-v2-m3 cross
+        encoder. The reranker sees ``process | title | OCR`` jointly with the
+        query, which gives it the context to disambiguate cases the bi-encoder
+        collapses (e.g. "神经网络" ML vs neuroscience). Each returned entry
+        gains a ``rerank_score`` field; the list is sorted by it.
+        """
+        if not query or not query.strip():
+            return []
+
+        if not TaskEmbedder.is_model_available():
+            raise ModelNotAvailableError("MiniLM model not downloaded")
+
+        collection = self.hot_collection
+        if collection is None:
+            return []
+
+        # Empty collection guard — ChromaDB raises on query against an empty index.
+        try:
+            if collection.count() == 0:
+                return []
+        except Exception:
+            pass
+
+        # How many to pull from the bi-encoder. Reranker over-fetches.
+        fetch_n = max(1, int(n_results))
+        if enable_rerank:
+            fetch_n = max(fetch_n, fetch_n * max(1, int(rerank_overfetch)))
+
+        with self._lock:
+            self._embedder.load()
+        # MiniLM forward (~50-200 ms on CPU) deliberately runs OUTSIDE the
+        # manager lock: holding it across encode would stall the foreground
+        # OCR ingest path on every NL search. The embedder's own state is
+        # already protected by load() being a no-op after first call and
+        # encode_single being thread-safe at the model level.
+        vec = self._embedder.encode_single(query.strip())
+
+        try:
+            raw = collection.query(
+                query_embeddings=[vec.tolist()],
+                n_results=fetch_n,
+                include=["metadatas", "distances"],
+            )
+        except Exception as e:
+            logger.warning("[task_clustering] query_by_text failed: %s", e)
+            return []
+
+        ids_batch = (raw.get("ids") or [[]])[0]
+        metas_batch = (raw.get("metadatas") or [[]])[0]
+        dists_batch = (raw.get("distances") or [[]])[0]
+
+        candidates: List[Dict[str, Any]] = []
+        for doc_id, meta, dist in zip(ids_batch, metas_batch, dists_batch):
+            meta = meta or {}
+            similarity = 1.0 - float(dist) if dist is not None else None
+            candidates.append({
+                "screenshot_id": int(meta.get("screenshot_id", doc_id) or 0),
+                "similarity": similarity,
+                "distance": float(dist) if dist is not None else None,
+                "timestamp": float(meta.get("timestamp", 0.0) or 0.0),
+                "process_name": self._decrypt(meta.get("process_name", "")),
+                "window_title": self._decrypt(meta.get("window_title", "")),
+                "category": meta.get("category", ""),
+                "layer": meta.get("layer", "hot"),
+            })
+
+        if not enable_rerank or not candidates:
+            return candidates[:int(n_results)]
+
+        # ---- rerank path ---------------------------------------------------
+        from reranker import Reranker, RerankerNotAvailableError
+
+        try:
+            reranker = Reranker()
+            reranker.load(rerank_variant)  # raises RerankerNotAvailableError if missing
+        except RerankerNotAvailableError:
+            # Surface as a tagged exception so the caller can show a friendly hint.
+            raise
+
+        # Fetch OCR text for the candidate IDs in one IPC round-trip.
+        ocr_by_id: Dict[int, str] = {}
+        if self._storage_client:
+            try:
+                ids_to_fetch = [c["screenshot_id"] for c in candidates if c["screenshot_id"]]
+                resp = self._storage_client.get_screenshots_with_ocr_by_ids(ids_to_fetch)
+                for row in resp.get("screenshots", []) or []:
+                    rid = int(row.get("id", 0) or 0)
+                    if rid:
+                        ocr_by_id[rid] = row.get("ocr_text", "") or ""
+            except Exception as e:
+                logger.warning("[task_clustering] OCR fetch for rerank failed: %s", e)
+
+        docs: List[str] = []
+        for c in candidates:
+            ocr_text = ocr_by_id.get(c["screenshot_id"], "")
+            if ocr_text and ocr_snippet_chars > 0:
+                ocr_text = ocr_text[:ocr_snippet_chars]
+            parts = [p for p in (c["process_name"], c["window_title"], ocr_text) if p]
+            docs.append(" | ".join(parts) if parts else "(empty)")
+
+        try:
+            rerank_scores = reranker.rerank(query.strip(), docs, variant=rerank_variant)
+        except Exception as e:
+            logger.warning("[task_clustering] reranker failed, falling back to embedding order: %s", e)
+            return candidates[:int(n_results)]
+
+        for c, s in zip(candidates, rerank_scores):
+            c["rerank_score"] = float(s)
+
+        candidates.sort(key=lambda c: c.get("rerank_score", float("-inf")), reverse=True)
+        return candidates[:int(n_results)]
 
 
 # ---------------------------------------------------------------------------

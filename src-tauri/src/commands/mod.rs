@@ -11,5 +11,6 @@ pub fn check_auth_required(credential_state: &CredentialManagerState) -> Result<
 pub mod credential;
 pub mod mcp;
 pub mod migration;
+pub mod smart_cluster;
 pub mod storage;
 pub mod utility;

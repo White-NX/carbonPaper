@@ -34,6 +34,8 @@ class ChineseCLIPSingleton:
         if self._initialized:
             return
             
+        from logging_config import log_model_loading
+        log_model_loading("Chinese-CLIP")
         logger.info("Loading Chinese-CLIP model (resident in memory)...")
 
         model_name = os.environ.get('MODEL_PATH', None)

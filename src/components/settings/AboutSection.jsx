@@ -193,6 +193,27 @@ export default function AboutSection({
                   <Bug className="w-3.5 h-3.5" />
                   Preview Update Modal (Critical)
                 </button>
+                <button
+                  onClick={() => window.dispatchEvent(new CustomEvent('debug-show-extension-wizard'))}
+                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
+                >
+                  <Bug className="w-3.5 h-3.5" />
+                  Preview Extension Setup Wizard
+                </button>
+                <button
+                  onClick={() => window.dispatchEvent(new CustomEvent('debug-show-clustering-wizard'))}
+                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
+                >
+                  <Bug className="w-3.5 h-3.5" />
+                  Preview Clustering Setup Wizard
+                </button>
+                <button
+                  onClick={() => window.dispatchEvent(new CustomEvent('debug-show-smart-cluster-wizard'))}
+                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
+                >
+                  <Bug className="w-3.5 h-3.5" />
+                  Preview Smart Cluster Setup Wizard
+                </button>
               </div>
             </section>
           )}
