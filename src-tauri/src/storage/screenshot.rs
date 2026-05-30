@@ -1213,9 +1213,47 @@ impl StorageState {
             return Ok(std::collections::HashMap::new());
         }
 
-        let guard = self.get_connection_named("get_ocr_results_by_screenshot_ids")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        // Phase 1: Hold the DB connection lock only to retrieve the raw encrypted rows.
+        let raw_rows = {
+            let guard = self.get_connection_named("get_ocr_results_by_screenshot_ids")?;
+            let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
 
+            let mut raw_rows = Vec::new();
+
+            // Process in chunks to avoid SQLite parameter limit (usually 999)
+            for chunk in screenshot_ids.chunks(500) {
+                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+                let sql = format!(
+                    "SELECT screenshot_id, text_enc, text_key_encrypted
+                     FROM ocr_results
+                     WHERE is_deleted = 0 AND screenshot_id IN ({})
+                     ORDER BY screenshot_id, box_y1, box_x1",
+                    placeholders.join(",")
+                );
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("Failed to prepare batch OCR query: {}", e))?;
+
+                let rows = stmt
+                    .query_map(params.as_slice(), |row| {
+                        let screenshot_id: i64 = row.get(0)?;
+                        let text_enc: Option<Vec<u8>> = row.get(1)?;
+                        let text_key_enc: Option<Vec<u8>> = row.get(2)?;
+                        Ok((screenshot_id, text_enc, text_key_enc))
+                    })
+                    .map_err(|e| format!("Failed to execute batch OCR query: {}", e))?;
+
+                for row in rows.filter_map(|r| r.ok()) {
+                    raw_rows.push(row);
+                }
+            }
+            raw_rows
+        };
+
+        // Phase 2: Decrypt payloads and build the final map outside the DB lock.
         let mut result_map = std::collections::HashMap::new();
 
         // Initialize empty lists for all requested IDs, so they are represented.
@@ -1223,46 +1261,18 @@ impl StorageState {
             result_map.insert(id, Vec::new());
         }
 
-        // Process in chunks to avoid SQLite parameter limit (usually 999)
-        for chunk in screenshot_ids.chunks(500) {
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-            let sql = format!(
-                "SELECT screenshot_id, text_enc, text_key_encrypted
-                 FROM ocr_results
-                 WHERE is_deleted = 0 AND screenshot_id IN ({})
-                 ORDER BY screenshot_id, box_y1, box_x1",
-                placeholders.join(",")
-            );
-            let params: Vec<&dyn rusqlite::ToSql> =
-                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-
-            let mut stmt = conn
-                .prepare(&sql)
-                .map_err(|e| format!("Failed to prepare batch OCR query: {}", e))?;
-
-            let rows = stmt
-                .query_map(params.as_slice(), |row| {
-                    let screenshot_id: i64 = row.get(0)?;
-                    let text_enc: Option<Vec<u8>> = row.get(1)?;
-                    let text_key_enc: Option<Vec<u8>> = row.get(2)?;
-                    Ok((screenshot_id, text_enc, text_key_enc))
-                })
-                .map_err(|e| format!("Failed to execute batch OCR query: {}", e))?;
-
-            for row in rows.filter_map(|r| r.ok()) {
-                let (screenshot_id, text_enc, text_key_enc) = row;
-                let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
-                    (Some(data), Some(key)) => self
-                        .decrypt_payload_with_row_key(data, key)
-                        .ok()
-                        .and_then(|v| String::from_utf8(v).ok()),
-                    _ => None,
-                };
-                if let Some(text_str) = text {
-                    if !text_str.is_empty() {
-                        if let Some(vec) = result_map.get_mut(&screenshot_id) {
-                            vec.push(text_str);
-                        }
+        for (screenshot_id, text_enc, text_key_enc) in raw_rows {
+            let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
+                (Some(data), Some(key)) => self
+                    .decrypt_payload_with_row_key(data, key)
+                    .ok()
+                    .and_then(|v| String::from_utf8(v).ok()),
+                _ => None,
+            };
+            if let Some(text_str) = text {
+                if !text_str.is_empty() {
+                    if let Some(vec) = result_map.get_mut(&screenshot_id) {
+                        vec.push(text_str);
                     }
                 }
             }
