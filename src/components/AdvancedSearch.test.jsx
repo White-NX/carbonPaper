@@ -215,4 +215,21 @@ describe('AdvancedSearch', () => {
 
     expect(screen.getByText('text-41')).toBeInTheDocument();
   });
+
+  it('displays search error banner when search fails', async () => {
+    searchScreenshots.mockRejectedValueOnce(new Error('Chroma database is offline'));
+
+    render(
+      <AdvancedSearch
+        active
+        searchParams={{ query: 'hello', mode: 'ocr' }}
+        onSelectResult={vi.fn()}
+        backendOnline
+      />
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('advancedSearch.search.error')).toBeInTheDocument();
+    });
+  });
 });

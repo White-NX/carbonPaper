@@ -272,6 +272,15 @@ export async function smartClusterDrainNow() {
 }
 
 /**
+ * Trigger the Python worker to stop the currently running forced drain pass.
+ */
+export async function smartClusterStopDrain() {
+  return invoke('execute_monitor_command', {
+    payload: { command: 'smart_cluster_stop_drain' },
+  });
+}
+
+/**
  * Run a calibration preview query — same as nlClusterQuery with rerank=true
  * but routed through a dedicated command so future tuning (over-fetch, etc)
  * doesn't affect the explore demo.

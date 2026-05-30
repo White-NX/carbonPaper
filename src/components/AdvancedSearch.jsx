@@ -316,6 +316,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(false);
+  const [error, setError] = useState(null);
   const [selectedProcesses, setSelectedProcesses] = useState([]);
   const [processOptions, setProcessOptions] = useState([]);
   const [selectedCategories, setSelectedCategories] = useState([]);
@@ -375,6 +376,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     setHasMore(false);
     setLoading(false);
     setLoadingMore(false);
+    setError(null);
     offsetRef.current = 0;
     if (searchMode === undefined) {
       setMode(nextMode);
@@ -432,6 +434,7 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
       setHasMore(false);
       setLoading(false);
       setLoadingMore(false);
+      setError(null);
       offsetRef.current = 0;
       return;
     }
@@ -439,43 +442,56 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     const currentSearchId = ++searchIdRef.current;
     setLoading(true);
     setLoadingMore(false);
+    setError(null);
     setThumbnailCache({});
     offsetRef.current = 0;
     const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
-    const fetched = await searchScreenshots(normalizedQuery, mode, {
-      limit: pageSize,
-      offset: 0,
-      processNames: selectedProcesses,
-      categories: mode === 'ocr' ? selectedCategories : [],
-      startTime: computeTimestamp(startDate),
-      endTime: computeTimestamp(endDate),
-      fuzzy: mode !== 'nl'
-    });
-    if (searchIdRef.current !== currentSearchId) return;
+    try {
+      const fetched = await searchScreenshots(normalizedQuery, mode, {
+        limit: pageSize,
+        offset: 0,
+        processNames: selectedProcesses,
+        categories: mode === 'ocr' ? selectedCategories : [],
+        startTime: computeTimestamp(startDate),
+        endTime: computeTimestamp(endDate),
+        fuzzy: mode !== 'nl'
+      });
+      if (searchIdRef.current !== currentSearchId) return;
 
-    // NL 模式：批量enrichment分类信息
-    if (mode === 'nl' && fetched.length > 0) {
-      const hashes = fetched
-        .map((item) => (item.image_path || '').replace('memory://', ''))
-        .filter(Boolean);
-      if (hashes.length > 0) {
-        const categoryMap = await batchGetCategories(hashes);
-        if (searchIdRef.current === currentSearchId) {
-          for (const item of fetched) {
-            const hash = (item.image_path || '').replace('memory://', '');
-            if (hash && categoryMap[hash] !== undefined) {
-              item.category = categoryMap[hash];
+      // NL 模式：批量enrichment分类信息
+      if (mode === 'nl' && fetched.length > 0) {
+        const hashes = fetched
+          .map((item) => (item.image_path || '').replace('memory://', ''))
+          .filter(Boolean);
+        if (hashes.length > 0) {
+          const categoryMap = await batchGetCategories(hashes);
+          if (searchIdRef.current === currentSearchId) {
+            for (const item of fetched) {
+              const hash = (item.image_path || '').replace('memory://', '');
+              if (hash && categoryMap[hash] !== undefined) {
+                item.category = categoryMap[hash];
+              }
             }
           }
         }
       }
-    }
 
-    if (searchIdRef.current !== currentSearchId) return;
-    setResults(fetched);
-    setHasMore(fetched.length === pageSize);
-    offsetRef.current = fetched.length;
-    setLoading(false);
+      if (searchIdRef.current !== currentSearchId) return;
+      setResults(fetched);
+      setHasMore(fetched.length === pageSize);
+      offsetRef.current = fetched.length;
+    } catch (e) {
+      console.error("Advanced search resetAndFetch failed:", e);
+      if (searchIdRef.current === currentSearchId) {
+        setError(e.message || String(e));
+        setResults([]);
+        setHasMore(false);
+      }
+    } finally {
+      if (searchIdRef.current === currentSearchId) {
+        setLoading(false);
+      }
+    }
   }, [active, debouncedQuery, mode, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp]);
 
   useEffect(() => {
@@ -512,41 +528,53 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     if (!hasMore || loadingMore || loading) return;
     const currentSearchId = searchIdRef.current;
     setLoadingMore(true);
+    setError(null);
     const pageSize = mode === 'nl' ? NL_PAGE_SIZE : PAGE_SIZE;
-    const fetched = await searchScreenshots(debouncedQuery.trim(), mode, {
-      limit: pageSize,
-      offset: offsetRef.current,
-      processNames: selectedProcesses,
-      categories: mode === 'ocr' ? selectedCategories : [],
-      startTime: computeTimestamp(startDate),
-      endTime: computeTimestamp(endDate),
-      fuzzy: mode !== 'nl'
-    });
-    if (searchIdRef.current !== currentSearchId) return;
+    try {
+      const fetched = await searchScreenshots(debouncedQuery.trim(), mode, {
+        limit: pageSize,
+        offset: offsetRef.current,
+        processNames: selectedProcesses,
+        categories: mode === 'ocr' ? selectedCategories : [],
+        startTime: computeTimestamp(startDate),
+        endTime: computeTimestamp(endDate),
+        fuzzy: mode !== 'nl'
+      });
+      if (searchIdRef.current !== currentSearchId) return;
 
-    // NL 模式：批量enrichment
-    if (mode === 'nl' && fetched.length > 0) {
-      const hashes = fetched
-        .map((item) => (item.image_path || '').replace('memory://', ''))
-        .filter(Boolean);
-      if (hashes.length > 0) {
-        const categoryMap = await batchGetCategories(hashes);
-        if (searchIdRef.current === currentSearchId) {
-          for (const item of fetched) {
-            const hash = (item.image_path || '').replace('memory://', '');
-            if (hash && categoryMap[hash] !== undefined) {
-              item.category = categoryMap[hash];
+      // NL 模式：批量enrichment
+      if (mode === 'nl' && fetched.length > 0) {
+        const hashes = fetched
+          .map((item) => (item.image_path || '').replace('memory://', ''))
+          .filter(Boolean);
+        if (hashes.length > 0) {
+          const categoryMap = await batchGetCategories(hashes);
+          if (searchIdRef.current === currentSearchId) {
+            for (const item of fetched) {
+              const hash = (item.image_path || '').replace('memory://', '');
+              if (hash && categoryMap[hash] !== undefined) {
+                item.category = categoryMap[hash];
+              }
             }
           }
         }
       }
-    }
 
-    if (searchIdRef.current !== currentSearchId) return;
-    setResults((prev) => [...prev, ...fetched]);
-    setHasMore(fetched.length === pageSize);
-    offsetRef.current += fetched.length;
-    setLoadingMore(false);
+      if (searchIdRef.current !== currentSearchId) return;
+      setResults((prev) => [...prev, ...fetched]);
+      setHasMore(fetched.length === pageSize);
+      offsetRef.current += fetched.length;
+    } catch (e) {
+      console.error("Advanced search loadMore failed:", e);
+      if (searchIdRef.current === currentSearchId) {
+        setError(e.message || String(e));
+        setHasMore(false);
+      }
+    } finally {
+      if (searchIdRef.current === currentSearchId) {
+        setLoadingMore(false);
+      }
+    }
   }, [debouncedQuery, mode, selectedProcesses, selectedCategories, startDate, endDate, computeTimestamp, hasMore, loadingMore, loading]);
 
   useEffect(() => {
@@ -710,13 +738,18 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
         )}
       </form>
       <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar">
+        {error && (
+          <div className="p-4 mx-4 mt-3 bg-red-500/10 border border-red-500/20 rounded text-red-400 text-sm break-words shrink-0">
+            {t('advancedSearch.search.error', { message: error })}
+          </div>
+        )}
         {loading && (
           <div className="flex items-center justify-center py-8 text-ide-muted gap-2">
             <Loader2 className="w-4 h-4 animate-spin" />
             <span className="text-sm">{t('advancedSearch.search.searching')}</span>
           </div>
         )}
-        {!loading && results.length === 0 && (
+        {!loading && !error && results.length === 0 && (
           <div className="flex flex-col items-center justify-center py-16 text-ide-muted gap-2 text-sm">
             {(!query.trim() && selectedProcesses.length === 0 && selectedCategories.length === 0 && !startDate && !endDate) ? (
               <>

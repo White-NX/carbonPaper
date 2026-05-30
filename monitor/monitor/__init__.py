@@ -960,6 +960,14 @@ def _handle_command_impl(req: dict):
         except Exception as e:
             return {'error': str(e)}
 
+    if cmd == 'smart_cluster_stop_drain':
+        try:
+            from smart_cluster_worker import SmartClusterWorker
+            SmartClusterWorker().request_stop_drain()
+            return {'status': 'success'}
+        except Exception as e:
+            return {'error': str(e)}
+
     if cmd == 'smart_cluster_worker_status':
         try:
             from smart_cluster_worker import SmartClusterWorker
@@ -969,6 +977,7 @@ def _handle_command_impl(req: dict):
             return {
                 'status': 'success',
                 'is_running': worker.is_running(),
+                'is_force_running': worker.is_force_running(),
                 'pending_count': pending_count,
             }
         except Exception as e:

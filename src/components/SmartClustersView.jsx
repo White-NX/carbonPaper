@@ -8,8 +8,9 @@ import {
   listSmartClusters, deleteSmartCluster, updateSmartClusterAnchor,
   toggleSmartClusterEnabled, getSmartClusterAssignments,
   smartClusterDrainNow, getSmartClusterStatus, createSmartCluster,
+  smartClusterStopDrain,
 } from '../lib/task_api';
-import { fetchThumbnailBatch } from '../lib/monitor_api';
+import { fetchThumbnailBatch, getSmartClusterWorkerStatus } from '../lib/monitor_api';
 import { ThumbnailCard } from './ThumbnailCard';
 import ClusterCard from './ClusterCard';
 import NlClusterView from './NlClusterView';
@@ -62,7 +63,12 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot })
     if (!backendOnline) return;
     try {
       const s = await getSmartClusterStatus();
-      setStatusData(s);
+      const w = await getSmartClusterWorkerStatus();
+      setStatusData({
+        ...s,
+        is_running: w.running && w.pending_count > 0,
+        is_force_running: w.forceRunning && w.pending_count > 0,
+      });
     } catch { /* ignore */ }
   }, [backendOnline]);
 
@@ -158,6 +164,15 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot })
     }
   };
 
+  const handleStopDrain = async () => {
+    try {
+      await smartClusterStopDrain();
+      setTimeout(loadStatus, 500);
+    } catch (err) {
+      console.error('Stop drain failed:', err);
+    }
+  };
+
   const handleSaveCalibration = useCallback(async (req) => {
     try {
       await createSmartCluster(req);
@@ -204,13 +219,23 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot })
             </button>
             <button
               onClick={handleDrainNow}
-              disabled={!backendOnline || !statusData?.pending_count}
+              disabled={!backendOnline || !statusData?.pending_count || statusData?.is_running}
               className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-border text-ide-muted hover:text-ide-text hover:bg-ide-hover/30 disabled:opacity-40 transition-colors"
               title={t('smartClusters.processNowTooltip', '立即处理待处理队列')}
             >
               <Zap className="w-3 h-3" />
               {t('smartClusters.processNow', '立即处理')}
             </button>
+            {statusData?.is_force_running && (
+              <button
+                onClick={handleStopDrain}
+                className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-rose-500/30 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 transition-colors"
+                title={t('smartClusters.stopDrainTooltip', '停止处理')}
+              >
+                <X className="w-3 h-3 text-rose-400" />
+                {t('smartClusters.stopDrain', '停止')}
+              </button>
+            )}
             <button
               onClick={loadClusters}
               className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-border text-ide-muted hover:text-ide-text hover:bg-ide-hover/30 transition-colors"

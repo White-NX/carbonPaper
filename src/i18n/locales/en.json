@@ -168,6 +168,13 @@
         "title": "Network Control",
         "label": "Enable Network Features",
         "description": "When disabled, all external network requests will be blocked, including update checks and model downloads."
+      },
+      "onnx": {
+        "title": "ONNX Inference (Experimental)",
+        "label": "Use ONNX model inference",
+        "description": "When enabled, uses ONNX models instead of PyTorch models. This significantly reduces memory usage (~250-400MB) and speeds up startup and inference.",
+        "notice": "Note: Enabling this option will automatically download the required ONNX model files when the settings dialog is closed.",
+        "changed_notice": "ONNX settings will take effect when the monitor service restarts"
       }
     },
     "storageManagement": {
@@ -583,6 +590,7 @@
     "load_failed": "Failed to load analysis data: {{error}}"
   },
   "search": {
+    "searchError": "Search failed: {{message}}",
     "switchToNL": "Switch to Natural Language Search",
     "switchToOCR": "Switch to OCR Search",
     "selectMode": "Select Search Mode",
@@ -614,7 +622,10 @@
       "runningDesc": "Progress {{progress}}%, pending OCR {{ocr}}, screenshots {{screenshots}}.",
       "smartClusterSummaryPlaceholder": "Smart clustering in progress ({{progress}}%)",
       "smartClusterRunningTitle": "Smart Clustering Queue processing",
-      "smartClusterRunningDesc": "Current progress {{progress}}%, pending screenshots {{pending}}."
+      "smartClusterRunningDesc": "Current progress {{progress}}%, pending screenshots {{pending}}.",
+      "modelDownloadSummaryPlaceholder": "Downloading models ({{progress}}%)",
+      "modelDownloadRunningTitle": "Downloading Model Files",
+      "modelDownloadRunningDesc": "Downloading required model files in background, progress: {{progress}}%."
     }
   },
   "sidebar": {
@@ -704,6 +715,7 @@
   "advancedSearch": {
     "title": "Advanced",
     "search": {
+      "error": "Search failed: {{message}}",
       "placeholder_ocr": "Search OCR text...",
       "placeholder_nl": "Describe image content...",
       "go": "Go",
