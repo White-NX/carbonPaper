@@ -145,8 +145,8 @@ class OCREngine:
         with self._init_lock:
             if getattr(self, '_initialized', False):
                 return
+            from rapidocr_capability import PaddleOCR as RapidPaddleOCR
             try:
-                from rapidocr_capability import PaddleOCR as RapidPaddleOCR
                 init_params['ocr_version'] = ocr_version
                 init_params['cpu_threads'] = 1
                 init_params['use_dml'] = self._use_dml
@@ -158,7 +158,6 @@ class OCREngine:
                 if 'ocr_version' in init_params:
                      del init_params['ocr_version']
                 try:
-                    from rapidocr_capability import PaddleOCR as RapidPaddleOCR
                     init_params['cpu_threads'] = 1
                     self.ocr = RapidPaddleOCR(**init_params)
                 except Exception as e2:
@@ -326,7 +325,7 @@ class OCREngine:
         """
         results = []
         for image in images:
-            results.append(self.recognize(image, cls=cls))
+            results.append(self.recognize(image))
         return results
 
 

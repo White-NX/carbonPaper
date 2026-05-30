@@ -280,6 +280,7 @@ class PresidioService:
 
         if not self._initialized:
             # Lazy loading: just record the target language without eager loading the model
+            logger.info("Presidio: service not loaded, language switch deferred (%s → %s)", self._current_lang, lang_code)
             self._current_lang = lang_code
             return
 
