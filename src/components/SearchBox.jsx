@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Image as ImageIcon, Type, Loader2, X, ChevronDown } from 'lucide-react';
+import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { searchScreenshots, fetchThumbnailBatch, fetchImage, getSoftDeleteQueueStatus, getSmartClusterWorkerStatus } from '../lib/monitor_api';
@@ -25,6 +25,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     const [localMode, setLocalMode] = useState('ocr'); // 'ocr' | 'nl'
     const [showModeMenu, setShowModeMenu] = useState(false);
     const [results, setResults] = useState([]);
+    const [error, setError] = useState(null);
     const [loading, setLoading] = useState(false);
     const [showResults, setShowResults] = useState(false);
     const debouncedQuery = useDebounce(query, 500);
@@ -58,11 +59,13 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     useEffect(() => {
         if (debouncedQuery.trim().length === 0) {
             setResults([]);
+            setError(null);
             return;
         }
 
         const doSearch = async () => {
             setLoading(true);
+            setError(null);
             try {
                 const res = await searchScreenshots(debouncedQuery, mode);
                 setResults(res);
@@ -72,6 +75,11 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                     setShowResults(true);
                 }
                 userInteractionRef.current = false;
+            } catch (e) {
+                console.error("Search failed:", e);
+                setError(e.message || String(e));
+                setResults([]);
+                setShowResults(true);
             } finally {
                 setLoading(false);
             }
@@ -132,6 +140,22 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     });
     const [smartClusterQueuePeak, setSmartClusterQueuePeak] = useState(0);
 
+    const [downloadProgress, setDownloadProgress] = useState(0);
+    const [isDownloadingModels, setIsDownloadingModels] = useState(false);
+
+    useEffect(() => {
+        const handleProgress = (e) => {
+            if (e.detail) {
+                setDownloadProgress(e.detail.progress ?? 0);
+                setIsDownloadingModels(e.detail.active ?? false);
+            }
+        };
+        window.addEventListener('model-download-progress', handleProgress);
+        return () => {
+            window.removeEventListener('model-download-progress', handleProgress);
+        };
+    }, []);
+
     const pendingDeleteTotal = Number(deleteQueueStatus?.pending_ocr || 0) + Number(deleteQueueStatus?.pending_screenshots || 0);
     const hasDeleteTask = Boolean(deleteQueueStatus?.running) || pendingDeleteTotal > 120;
     const deleteProgress = (() => {
@@ -143,6 +167,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     })();
 
     const hasClusterTask = Boolean(smartClusterQueueStatus?.running) && Number(smartClusterQueueStatus?.pending_count || 0) > 0;
+    const canCancelClusterTask = hasClusterTask && Boolean(smartClusterQueueStatus?.forceRunning);
     const clusterProgress = (() => {
         if (!hasClusterTask) return 0;
         const pending = Number(smartClusterQueueStatus.pending_count || 0);
@@ -152,7 +177,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         return Math.max(0, Math.min(100, ratio));
     })();
 
-    const showProgressBar = hasDeleteTask || hasClusterTask;
+    const showProgressBar = hasDeleteTask || hasClusterTask || isDownloadingModels;
     const progressFillPercent = (() => {
         if (hasDeleteTask) {
             return deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress);
@@ -160,12 +185,24 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         if (hasClusterTask) {
             return clusterProgress <= 0 ? 8 : Math.min(100, clusterProgress);
         }
+        if (isDownloadingModels) {
+            return downloadProgress <= 0 ? 8 : Math.min(100, downloadProgress);
+        }
         return 0;
     })();
 
-    const taskSummaryPlaceholder = hasDeleteTask
-        ? t('search.task.summaryPlaceholder', { progress: Math.round(deleteProgress) })
-        : t('search.task.smartClusterSummaryPlaceholder', { progress: Math.round(clusterProgress) });
+    const taskSummaryPlaceholder = (() => {
+        if (hasDeleteTask) {
+            return t('search.task.summaryPlaceholder', { progress: Math.round(deleteProgress) });
+        }
+        if (hasClusterTask) {
+            return t('search.task.smartClusterSummaryPlaceholder', { progress: Math.round(clusterProgress) });
+        }
+        if (isDownloadingModels) {
+            return t('search.task.modelDownloadSummaryPlaceholder', { progress: Math.round(downloadProgress) });
+        }
+        return '';
+    })();
 
     // Active detection: check on mount and listen for progress events
     useEffect(() => {
@@ -319,6 +356,19 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         };
     }, []);
 
+    const handleCancelCluster = async (e) => {
+        if (e) e.stopPropagation();
+        try {
+            await invoke('execute_monitor_command', {
+                payload: { command: 'smart_cluster_stop_drain' }
+            });
+            const status = await getSmartClusterWorkerStatus();
+            setSmartClusterQueueStatus(status || { pending_count: 0, running: false });
+        } catch (err) {
+            console.error("Failed to cancel cluster process:", err);
+        }
+    };
+
     return (
         <div
             className="relative w-[450px] z-50 pointer-events-auto"
@@ -377,6 +427,15 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                     }
                 }}
             />
+            {canCancelClusterTask && (
+                <button
+                    onClick={handleCancelCluster}
+                    className="relative z-10 p-1 mr-2 text-rose-500 hover:text-rose-600 transition-colors shrink-0"
+                    title={t('search.task.stopTooltip', '停止处理智能聚类')}
+                >
+                    <Square size={14} fill="currentColor" />
+                </button>
+            )}
             {loading ? (
                 <Loader2 size={16} className="relative z-10 animate-spin text-ide-muted mr-2" />
             ) : (
@@ -434,18 +493,41 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                             </div>
                         </div>
                     )}
-                    {hasClusterTask && (
+                    {isDownloadingModels && (
                         <div className="p-3 bg-sky-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">
                             <div className="flex items-center gap-2 text-sky-500 text-sm font-bold">
                                 <Loader2 size={14} className="animate-spin" />
-                                {t('search.task.smartClusterRunningTitle')}
+                                {t('search.task.modelDownloadRunningTitle')}
                             </div>
                             <div className="text-xs text-ide-muted leading-relaxed">
-                                {t('search.task.smartClusterRunningDesc', {
-                                    progress: Math.round(clusterProgress),
-                                    pending: smartClusterQueueStatus.pending_count,
+                                {t('search.task.modelDownloadRunningDesc', {
+                                    progress: Math.round(downloadProgress),
                                 })}
                             </div>
+                        </div>
+                    )}
+                    {hasClusterTask && (
+                        <div className="p-3 bg-sky-500/10 border-b border-ide-border flex items-center justify-between gap-3 shrink-0">
+                            <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2 text-sky-500 text-sm font-bold">
+                                    <Loader2 size={14} className="animate-spin" />
+                                    {t('search.task.smartClusterRunningTitle')}
+                                </div>
+                                <div className="text-xs text-ide-muted leading-relaxed mt-1">
+                                    {t('search.task.smartClusterRunningDesc', {
+                                        progress: Math.round(clusterProgress),
+                                        pending: smartClusterQueueStatus.pending_count,
+                                    })}
+                                </div>
+                            </div>
+                            {canCancelClusterTask && (
+                                <button
+                                    onClick={handleCancelCluster}
+                                    className="px-2.5 py-1 bg-rose-500 hover:bg-rose-600 text-white rounded text-xs transition-colors font-medium shrink-0"
+                                >
+                                    {t('search.task.stop', '停止')}
+                                </button>
+                            )}
                         </div>
                     )}
                     {isMigrating && (
@@ -460,7 +542,9 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                         </div>
                     )}
                     <div className="overflow-y-auto custom-scrollbar">
-                        {results.length > 0 ? (
+                        {error ? (
+                            <div className="p-4 text-center text-red-400 text-sm break-words">{t('search.searchError', { message: error })}</div>
+                        ) : results.length > 0 ? (
                             results.map((item, index) => (
                                 <SearchResultItem
                                     key={item.id || index}

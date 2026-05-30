@@ -60,6 +60,7 @@ class TaskEmbedder:
             cls._instance = super().__new__(cls)
             cls._instance._model = None
             cls._instance._tokenizer = None
+            cls._instance._is_onnx = False
         return cls._instance
 
     # ---- lifecycle -------------------------------------------------------
@@ -75,8 +76,26 @@ class TaskEmbedder:
                 "models",
                 "paraphrase-multilingual-MiniLM-L12-v2",
             )
-        required_files = ["config.json", "pytorch_model.bin", "tokenizer.json"]
-        return all(os.path.isfile(os.path.join(model_path, f)) for f in required_files)
+        from onnx_utils import is_onnx_testing_enabled, get_onnx_model_path
+        if is_onnx_testing_enabled():
+            primary_onnx_path = os.path.join(
+                os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                "CarbonPaper",
+                "models-onnx",
+                "paraphrase-multilingual-MiniLM-L12-v2",
+            )
+            if not os.environ.get("MINILM_MODEL_PATH") and (
+                get_onnx_model_path(primary_onnx_path, "model_int8.onnx")
+                or get_onnx_model_path(primary_onnx_path, os.path.join("onnx", "model_quantized.onnx"))
+            ):
+                model_path = primary_onnx_path
+            has_onnx = bool(get_onnx_model_path(model_path, "model_int8.onnx") or
+                            get_onnx_model_path(model_path, os.path.join("onnx", "model_quantized.onnx")))
+            required_files = ["config.json", "tokenizer.json"]
+            return has_onnx and all(os.path.isfile(os.path.join(model_path, f)) for f in required_files)
+        else:
+            required_files = ["config.json", "pytorch_model.bin", "tokenizer.json"]
+            return all(os.path.isfile(os.path.join(model_path, f)) for f in required_files)
 
     def is_loaded(self) -> bool:
         return self._model is not None
@@ -90,8 +109,6 @@ class TaskEmbedder:
             if self._model is not None:
                 return
 
-            from transformers import AutoTokenizer, AutoModel
-
             model_path = os.environ.get("MINILM_MODEL_PATH")
             if not model_path:
                 model_path = os.path.join(
@@ -101,12 +118,40 @@ class TaskEmbedder:
                     "paraphrase-multilingual-MiniLM-L12-v2",
                 )
 
+            from onnx_utils import is_onnx_testing_enabled, get_onnx_model_path, create_onnx_session
+
+            if is_onnx_testing_enabled():
+                primary_onnx_path = os.path.join(
+                    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                    "CarbonPaper",
+                    "models-onnx",
+                    "paraphrase-multilingual-MiniLM-L12-v2",
+                )
+                if not os.environ.get("MINILM_MODEL_PATH") and (
+                    get_onnx_model_path(primary_onnx_path, "model_int8.onnx")
+                    or get_onnx_model_path(primary_onnx_path, os.path.join("onnx", "model_quantized.onnx"))
+                ):
+                    model_path = primary_onnx_path
+                onnx_file = get_onnx_model_path(model_path, "model_int8.onnx") or get_onnx_model_path(model_path, os.path.join("onnx", "model_quantized.onnx"))
+                if onnx_file:
+                    from logging_config import log_model_loading
+                    log_model_loading("MiniLM-L12-v2 (ONNX)")
+                    logger.info("Loading MiniLM-L12-v2 from ONNX: %s ...", onnx_file)
+                    from transformers import AutoTokenizer
+                    self._tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+                    self._model = create_onnx_session(onnx_file)
+                    self._is_onnx = True
+                    logger.info("MiniLM-L12-v2 loaded successfully via ONNX")
+                    return
+
+            from transformers import AutoTokenizer, AutoModel
             from logging_config import log_model_loading
             log_model_loading("MiniLM-L12-v2")
             logger.info("Loading MiniLM-L12-v2 from %s …", model_path)
             self._tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
             self._model = AutoModel.from_pretrained(model_path, local_files_only=True)
             self._model.eval()
+            self._is_onnx = False
             logger.info("MiniLM-L12-v2 loaded (device=%s)", self._model.device)
 
     def unload(self):
@@ -114,6 +159,7 @@ class TaskEmbedder:
         with self._lock:
             self._model = None
             self._tokenizer = None
+            self._is_onnx = False
         gc.collect()
         try:
             import torch
@@ -128,6 +174,30 @@ class TaskEmbedder:
     def encode(self, texts: List[str]) -> np.ndarray:
         """Batch-encode texts → (N, 384) L2-normalised numpy array."""
         self.load()
+
+        if self._is_onnx:
+            encoded = self._tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=256,
+                return_tensors="np",
+            )
+            from onnx_utils import build_transformer_inputs
+            inputs = build_transformer_inputs(self._model, encoded)
+            outputs = self._model.run(None, inputs)
+            token_embeddings = outputs[0]
+
+            attention_mask = encoded["attention_mask"]
+            input_mask_expanded = np.expand_dims(attention_mask, axis=-1).astype(np.float32)
+            sum_embeddings = np.sum(token_embeddings * input_mask_expanded, axis=1)
+            sum_mask = np.clip(np.sum(input_mask_expanded, axis=1), a_min=1e-9, a_max=None)
+            emb = sum_embeddings / sum_mask
+
+            norm = np.linalg.norm(emb, axis=1, keepdims=True)
+            emb = emb / np.clip(norm, a_min=1e-9, a_max=None)
+            return emb
+
         import torch
 
         encoded = self._tokenizer(

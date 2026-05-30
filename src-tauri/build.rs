@@ -51,7 +51,7 @@ fn main() {
         // 检查是否是需要被完全排除的文件夹
         if path.is_dir() {
             let file_name = path.file_name().unwrap_or_default();
-            if file_name == ".venv" || file_name == "__pycache__" || file_name == "tests" {
+            if file_name == ".venv" || file_name == ".pytest_cache" || file_name == "__pycache__" || file_name == "tests" {
                 // 如果是，返回 false，`walkdir` 将不会进入这个目录
                 // 排除 tests/ 是为了不把测试代码打进生产 monitor.pyz
                 return false;
@@ -279,7 +279,7 @@ fn build_monitor_pyz(source_dir: &Path, out_pyz: &Path) -> String {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             if matches!(
                 &*name,
-                ".venv" | "__pycache__" | "tests" | "chroma_db" | "screenshots"
+                ".venv" | ".pytest_cache" | "__pycache__" | "tests" | "chroma_db" | "screenshots"
             ) {
                 return false;
             }

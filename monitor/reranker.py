@@ -184,26 +184,14 @@ class Reranker:
                     model_dir, local_files_only=True, use_fast=True
                 )
 
-            # Prefer DirectML for GPU acceleration on Windows; fall back to CPU.
-            import onnxruntime as ort
-            available = ort.get_available_providers()
-            preferred = [p for p in ("DmlExecutionProvider", "CPUExecutionProvider") if p in available]
-            if not preferred:
-                preferred = available[:1] or ["CPUExecutionProvider"]
-
-            sess_options = ort.SessionOptions()
-            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess_options.inter_op_num_threads = 1
-
+            from onnx_utils import create_onnx_session
             from logging_config import log_model_loading
             log_model_loading(f"bge-reranker-v2-m3 ({variant})")
             logger.info(
-                "Loading reranker ONNX variant=%s from %s (providers=%s) ...",
-                variant, onnx_path, preferred,
+                "Loading reranker ONNX variant=%s from %s ...",
+                variant, onnx_path,
             )
-            self._session = ort.InferenceSession(
-                onnx_path, sess_options=sess_options, providers=preferred
-            )
+            self._session = create_onnx_session(onnx_path)
             self._provider = self._session.get_providers()[0] if self._session.get_providers() else None
             self._input_names = [i.name for i in self._session.get_inputs()]
             self._output_name = self._session.get_outputs()[0].name

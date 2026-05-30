@@ -1,13 +1,23 @@
 """Entry point: only serves as the programme entry; all logic lives in the `monitor` package."""
 
-# [CRITICAL] torch MUST be imported before any other DLL-dependent library (e.g. cv2)
-# otherwise WinError 127 (shm.dll dependency missing) will occur
-try:
-    import torch
-except ImportError:
-    pass
-
 import os
+
+
+def _onnx_testing_enabled() -> bool:
+    """Inline replica of onnx_utils.is_onnx_testing_enabled to avoid pulling
+    onnxruntime in before we decide whether to skip torch."""
+    return os.environ.get("CARBONPAPER_USE_ONNX", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# torch is only needed by the PyTorch fallback paths in classifier /
+# vector_store / task_clustering. When the ONNX sentinel is present, all
+# three take the ONNX branch and torch becomes dead weight (~250-400MB DLL
+# working set on Windows). Skip the import in that case.
+if not _onnx_testing_enabled():
+    try:
+        import torch  # noqa: F401 — warm up DLLs for PyTorch fallback path
+    except ImportError:
+        pass
 
 from logging_config import setup_logging
 setup_logging()

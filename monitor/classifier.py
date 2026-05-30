@@ -22,6 +22,7 @@ import json
 import logging
 import time
 import numpy as np
+import threading
 from typing import Tuple, List, Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -477,6 +478,8 @@ class TextEmbedder:
     _instance = None
     _model = None
     _tokenizer = None
+    _is_onnx = False
+    _lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
@@ -488,28 +491,76 @@ class TextEmbedder:
         if self._model is not None:
             return
 
-        from transformers import AutoTokenizer, AutoModel
+        with self._lock:
+            if self._model is not None:
+                return
 
-        model_path = os.environ.get("BGE_MODEL_PATH")
-        if not model_path:
-            model_path = os.path.join(
-                os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                "carbonPaper",
-                "models",
-                "bge-small-zh-v1.5",
-            )
+            model_path = os.environ.get("BGE_MODEL_PATH")
+            if not model_path:
+                model_path = os.path.join(
+                    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                    "carbonPaper",
+                    "models",
+                    "bge-small-zh-v1.5",
+                )
 
-        from logging_config import log_model_loading
-        log_model_loading("BGE-small-zh-v1.5")
-        logger.info("Loading BGE-small-zh-v1.5 from %s ...", model_path)
-        self._tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self._model = AutoModel.from_pretrained(model_path)
-        self._model.eval()
-        logger.info("BGE-small-zh-v1.5 loaded successfully (device=%s)", self._model.device)
+            from onnx_utils import is_onnx_testing_enabled, get_onnx_model_path, create_onnx_session
+
+            if is_onnx_testing_enabled():
+                primary_onnx_path = os.path.join(
+                    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                    "CarbonPaper",
+                    "models-onnx",
+                    "bge-small-zh-v1.5",
+                )
+                if not os.environ.get("BGE_MODEL_PATH") and (
+                    get_onnx_model_path(primary_onnx_path, "model_int8.onnx")
+                    or get_onnx_model_path(primary_onnx_path, os.path.join("onnx", "model_quantized.onnx"))
+                ):
+                    model_path = primary_onnx_path
+                onnx_file = get_onnx_model_path(model_path, "model_int8.onnx") or get_onnx_model_path(model_path, os.path.join("onnx", "model_quantized.onnx"))
+                if onnx_file:
+                    from logging_config import log_model_loading
+                    log_model_loading("BGE-small-zh-v1.5 (ONNX)")
+                    logger.info("Loading BGE-small-zh-v1.5 from ONNX: %s ...", onnx_file)
+                    from transformers import AutoTokenizer
+                    self._tokenizer = AutoTokenizer.from_pretrained(model_path)
+                    self._model = create_onnx_session(onnx_file)
+                    self._is_onnx = True
+                    logger.info("BGE-small-zh-v1.5 loaded successfully via ONNX")
+                    return
+
+            from transformers import AutoTokenizer, AutoModel
+            from logging_config import log_model_loading
+            log_model_loading("BGE-small-zh-v1.5")
+            logger.info("Loading BGE-small-zh-v1.5 from %s ...", model_path)
+            self._tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self._model = AutoModel.from_pretrained(model_path)
+            self._model.eval()
+            self._is_onnx = False
+            logger.info("BGE-small-zh-v1.5 loaded successfully (device=%s)", self._model.device)
 
     def encode(self, texts: List[str]) -> np.ndarray:
         """Batch-encode texts; returns (N, dim) L2-normalised numpy array."""
         self.initialize()
+
+        if self._is_onnx:
+            encoded = self._tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="np",
+            )
+            from onnx_utils import build_transformer_inputs
+            inputs = build_transformer_inputs(self._model, encoded)
+            outputs = self._model.run(None, inputs)
+            last_hidden_state = outputs[0]
+            # CLS pooling
+            emb = last_hidden_state[:, 0, :]
+            norm = np.linalg.norm(emb, axis=1, keepdims=True)
+            emb = emb / np.clip(norm, a_min=1e-9, a_max=None)
+            return emb
         import torch
 
         encoded = self._tokenizer(

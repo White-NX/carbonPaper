@@ -16,6 +16,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
   const [clusteringDropdownOpen, setClusteringDropdownOpen] = useState(false);
   const [cpuChanged, setCpuChanged] = useState(false);
   const [dmlChanged, setDmlChanged] = useState(false);
+  const [onnxChanged, setOnnxChanged] = useState(false);
   const [gpus, setGpus] = useState([]);
   const [gpuLoading, setGpuLoading] = useState(false);
   const [vacuumRunning, setVacuumRunning] = useState(false);
@@ -97,6 +98,9 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     }
     if (key === 'use_dml') {
       setDmlChanged(true);
+    }
+    if (key === 'use_onnx') {
+      setOnnxChanged(true);
     }
     if (key === 'capture_on_ocr_busy' || key === 'ocr_queue_limit_enabled') {
       await syncOcrConfigToMonitor(newConfig);
@@ -444,6 +448,49 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
               {monitorStatus === 'running' && onRestartMonitor && (
                 <button
                   onClick={() => { onRestartMonitor(); setDmlChanged(false); }}
+                  className="text-xs text-ide-warning hover:opacity-80 underline shrink-0 transition-colors"
+                >
+                  {t('settings.advanced.quick_restart')}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ONNX 推理 */}
+      <div className="space-y-3">
+        <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
+          <Zap className="w-4 h-4" />
+          {t('settings.advanced.onnx.title')}
+        </label>
+
+        <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1 min-w-0">
+              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.onnx.label')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.onnx.description')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.onnx.notice')}</p>
+            </div>
+            <button
+              onClick={() => handleToggle('use_onnx')}
+              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${config.use_onnx ? 'bg-ide-accent' : 'bg-ide-border'
+                }`}
+            >
+              <div
+                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.use_onnx ? 'translate-x-5' : 'translate-x-0.5'
+                  }`}
+              />
+            </button>
+          </div>
+
+          {onnxChanged && (
+            <div className="flex items-center gap-2 p-2.5 bg-ide-warning-bg border border-ide-warning-border rounded-lg">
+              <AlertTriangle className="w-4 h-4 text-ide-warning shrink-0" />
+              <p className="text-xs text-ide-warning-muted flex-1">{t('settings.advanced.onnx.changed_notice')}</p>
+              {monitorStatus === 'running' && onRestartMonitor && (
+                <button
+                  onClick={() => { onRestartMonitor(); setOnnxChanged(false); }}
                   className="text-xs text-ide-warning hover:opacity-80 underline shrink-0 transition-colors"
                 >
                   {t('settings.advanced.quick_restart')}
