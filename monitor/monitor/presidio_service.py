@@ -275,7 +275,15 @@ class PresidioService:
         lang_code = "zh" if language.startswith("zh") else "en"
         if self._current_lang == lang_code:
             return
-        logger.info("Presidio: switching language from %s to %s", self._current_lang, lang_code)
+
+        logger.info("Presidio: target language changing from %s to %s", self._current_lang, lang_code)
+
+        if not self._initialized:
+            # Lazy loading: just record the target language without eager loading the model
+            self._current_lang = lang_code
+            return
+
+        logger.info("Presidio: switching active model from %s to %s", self._current_lang, lang_code)
         # Re-initialize with new language (old model will be GC'd)
         self._analyzer = None
         self._current_model = None
