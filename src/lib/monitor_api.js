@@ -600,6 +600,7 @@ export const getSmartClusterWorkerStatus = async () => {
             return {
                 pending_count: response.pending_count || 0,
                 running: !!response.is_running,
+                forceRunning: !!response.is_force_running,
             };
         } catch {
             return { pending_count: 0, running: false };

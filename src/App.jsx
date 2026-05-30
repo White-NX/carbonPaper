@@ -1189,7 +1189,10 @@ function App() {
 
       <SettingsDialog
         isOpen={showSettings && isAuthenticated}
-        onClose={() => setShowSettings(false)}
+        onClose={() => {
+          setShowSettings(false);
+          refreshPythonVersion();
+        }}
         autoStartMonitor={autoStartMonitor}
         onRecordsDeleted={bumpTimelineRefresh}
         powerSavingSuppressed={powerSavingSuppressed}

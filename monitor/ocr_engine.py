@@ -14,7 +14,8 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-from rapidocr_capability import PaddleOCR as RapidPaddleOCR
+
+
 
 
 def _get_ppocr_base_dir() -> str:
@@ -144,6 +145,7 @@ class OCREngine:
         with self._init_lock:
             if getattr(self, '_initialized', False):
                 return
+            from rapidocr_capability import PaddleOCR as RapidPaddleOCR
             try:
                 init_params['ocr_version'] = ocr_version
                 init_params['cpu_threads'] = 1
@@ -323,7 +325,7 @@ class OCREngine:
         """
         results = []
         for image in images:
-            results.append(self.recognize(image, cls=cls))
+            results.append(self.recognize(image))
         return results
 
 
