@@ -26,6 +26,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     const [showModeMenu, setShowModeMenu] = useState(false);
     const [results, setResults] = useState([]);
     const [loading, setLoading] = useState(false);
+    const [error, setError] = useState(null);
     const [showResults, setShowResults] = useState(false);
     const debouncedQuery = useDebounce(query, 500);
     const wrapperRef = useRef(null);
@@ -58,11 +59,13 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     useEffect(() => {
         if (debouncedQuery.trim().length === 0) {
             setResults([]);
+            setError(null);
             return;
         }
 
         const doSearch = async () => {
             setLoading(true);
+            setError(null);
             try {
                 const res = await searchScreenshots(debouncedQuery, mode);
                 setResults(res);
@@ -72,6 +75,10 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                     setShowResults(true);
                 }
                 userInteractionRef.current = false;
+            } catch (err) {
+                console.error('Search failed:', err);
+                setError(err.message || 'Search failed');
+                setResults([]);
             } finally {
                 setLoading(false);
             }
@@ -460,7 +467,11 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                         </div>
                     )}
                     <div className="overflow-y-auto custom-scrollbar">
-                        {results.length > 0 ? (
+                        {error ? (
+                            <div className="p-4 text-center text-red-500 text-sm">
+                                {t('search.searchError', { message: error })}
+                            </div>
+                        ) : results.length > 0 ? (
                             results.map((item, index) => (
                                 <SearchResultItem
                                     key={item.id || index}
