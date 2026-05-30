@@ -168,6 +168,13 @@
         "title": "网络控制",
         "label": "启用网络功能",
         "description": "关闭后将禁用程序的所有外部网络请求，包括检查更新、下载模型等。"
+      },
+      "onnx": {
+        "title": "ONNX 推理 (测试性)",
+        "label": "使用 ONNX 模型推理",
+        "description": "启用后将使用 ONNX 模型代替 PyTorch 模型。大幅减少内存占用（~250-400MB）并加快启动与推理速度。",
+        "notice": "提示：开启此选项后，关闭设置页时将自动下载所需 ONNX 模型文件。",
+        "changed_notice": "ONNX 推理设置将在下次启动监控服务时生效"
       }
     },
     "storageManagement": {
@@ -585,6 +592,7 @@
     "alpha": "alpha"
   },
   "search": {
+    "searchError": "搜索出错：{{message}}",
     "switchToNL": "切换到自然语言搜索",
     "switchToOCR": "切换到 OCR 搜索",
     "selectMode": "选择搜索模式",
@@ -616,7 +624,10 @@
       "runningDesc": "当前进度 {{progress}}%，待处理 OCR {{ocr}} 条，截图 {{screenshots}} 条。",
       "smartClusterSummaryPlaceholder": "智能聚类归档中 ({{progress}}%)",
       "smartClusterRunningTitle": "智能聚类队列处理中",
-      "smartClusterRunningDesc": "当前进度 {{progress}}%，待处理快照 {{pending}} 条。"
+      "smartClusterRunningDesc": "当前进度 {{progress}}%，待处理快照 {{pending}} 条。",
+      "modelDownloadSummaryPlaceholder": "模型文件下载中 ({{progress}}%)",
+      "modelDownloadRunningTitle": "后台模型下载中",
+      "modelDownloadRunningDesc": "正在下载所需的模型文件，当前进度 {{progress}}%。"
     }
   },
   "sidebar": {
@@ -706,6 +717,7 @@
   "advancedSearch": {
     "title": "ADVANCED",
     "search": {
+      "error": "搜索出错：{{message}}",
       "placeholder_ocr": "在截图中搜索文本...",
       "placeholder_nl": "描述图片内容...",
       "go": "搜索",

@@ -58,14 +58,19 @@ class SmartClusterWorker:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._drain_now_event = threading.Event()
+        self._abort_drain_event = threading.Event()
         self._anchor_cache: Dict[int, np.ndarray] = {}      # cluster_id -> anchor MiniLM vec
         self._anchor_text_cache: Dict[int, str] = {}        # cluster_id -> anchor text (for cache validity)
         self._anchor_threshold_cache: Dict[int, float] = {} # cluster_id -> reranker threshold
         self._last_active_at = 0.0
         self._is_running = False
+        self._force_running = False
 
     def is_running(self) -> bool:
         return self._is_running
+
+    def is_force_running(self) -> bool:
+        return self._force_running
 
     @property
     def storage_client(self):
@@ -105,7 +110,12 @@ class SmartClusterWorker:
 
     def request_drain_now(self):
         """Wake the worker immediately, bypassing the idle gate for one pass."""
+        self._abort_drain_event.clear()
         self._drain_now_event.set()
+
+    def request_stop_drain(self):
+        """Abort the current forced drain run immediately."""
+        self._abort_drain_event.set()
 
     # ---- main loop ------------------------------------------------------
 
@@ -121,16 +131,24 @@ class SmartClusterWorker:
             try:
                 self._is_running = True
                 force = woke_via_drain
+                self._force_running = force
                 while not self._stop_event.is_set():
+                    if force and self._abort_drain_event.is_set():
+                        logger.info("[smart_cluster_worker] Forced drain aborted by user request.")
+                        break
+
                     has_more = self._tick(force=force)
                     if not has_more:
                         break
-                    # Yield slightly to avoid CPU starvation
-                    time.sleep(0.005 if force else 0.05)
+
+                    # Yield slightly to avoid CPU starvation / database contention.
+                    sleep_time = 0.3 if force else 0.05
+                    time.sleep(sleep_time)
             except Exception as e:
                 logger.exception("[smart_cluster_worker] tick failed: %s", e)
             finally:
                 self._is_running = False
+                self._force_running = False
 
             # If reranker has been idle long enough, unload to free RAM/VRAM.
             if (
@@ -354,10 +372,14 @@ class SmartClusterWorker:
 
         any_scored = False
         for cid, sids in by_cluster.items():
-            # Cheap idle re-check between clusters — if the user came back
-            # mid-batch, stop gracefully. Whatever clusters we already
-            # scored remain valid; the rest will be retried next tick
-            # because we return False below and the caller won't delete.
+            # Cheap idle or abort re-check between clusters — if the user came back
+            # mid-batch, or requested manual cancellation, stop gracefully. Whatever
+            # clusters we already scored remain valid; the rest will be retried next
+            # tick because we return False below and the caller won't delete.
+            if force and self._abort_drain_event.is_set():
+                logger.info("[smart_cluster_worker] Forced drain aborted mid-batch by user request.")
+                return False
+
             if not force and not self._still_idle():
                 logger.info("[smart_cluster_worker] left idle mid-batch; aborting after partial scoring")
                 return False
