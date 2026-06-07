@@ -27,7 +27,6 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     const [results, setResults] = useState([]);
     const [error, setError] = useState(null);
     const [loading, setLoading] = useState(false);
-    const [error, setError] = useState(null);
     const [showResults, setShowResults] = useState(false);
     const debouncedQuery = useDebounce(query, 500);
     const wrapperRef = useRef(null);
@@ -81,10 +80,6 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 setError(e.message || String(e));
                 setResults([]);
                 setShowResults(true);
-            } catch (err) {
-                console.error('Search failed:', err);
-                setError(err.message || 'Search failed');
-                setResults([]);
             } finally {
                 setLoading(false);
             }
