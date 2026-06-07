@@ -1,5 +1,5 @@
 use crate::capture::CaptureState;
-use crate::resource_utils::{find_existing_file_in_resources, normalize_path_for_command};
+use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources, normalize_path_for_command};
 use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
 use crate::storage::StorageState;
 use rand::Rng;
@@ -512,6 +512,19 @@ pub async fn start_monitor(
         return Err("Cannot start monitor: Migration is currently in progress".to_string());
     }
 
+    // Check if required model files are complete
+    if let Ok(model_status) = crate::model_management::check_model_files().await {
+        if let Some(obj) = model_status.as_object() {
+            let has_incomplete = obj.values().any(|m| {
+                m.get("complete").and_then(|c| c.as_bool()) == Some(false)
+                    && m.get("required").and_then(|r| r.as_bool()) != Some(false)
+            });
+            if has_incomplete {
+                return Err("Model files are incomplete. Please download required models first.".to_string());
+            }
+        }
+    }
+
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|e| format!("<failed to get cwd: {}>", e));
@@ -758,6 +771,8 @@ pub async fn start_monitor(
             cmd_proc.env("CARBONPAPER_DATA_DIR", dd);
         }
 
+        let use_onnx = crate::registry_config::get_bool("use_onnx").unwrap_or(true);
+
         // Sync persisted feature toggles into the Python monitor at startup.
         cmd_proc
             .env(
@@ -771,7 +786,50 @@ pub async fn start_monitor(
                 crate::registry_config::get_bool("classification_enabled")
                     .unwrap_or(true)
                     .to_string(),
+            )
+            .env(
+                "CARBONPAPER_USE_ONNX",
+                use_onnx.to_string(),
             );
+
+        if let Some(appdata_dir) = file_in_local_appdata() {
+            let models_dir = appdata_dir.join("models");
+            let onnx_models_dir = appdata_dir.join("models-onnx");
+            let nonempty = |path: &std::path::Path| {
+                path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+            };
+            let has_bge_onnx = |base: &std::path::Path| {
+                nonempty(&base.join("onnx").join("model_quantized.onnx"))
+                    || nonempty(&base.join("model_int8.onnx"))
+            };
+
+            let (clip_path, bge_path, minilm_path) = if use_onnx {
+                let primary_bge = onnx_models_dir.join("bge-small-zh-v1.5");
+                let legacy_bge = models_dir.join("bge-small-zh-v1.5");
+                let primary_minilm = onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
+                let legacy_minilm = models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
+                (
+                    if nonempty(&onnx_models_dir.join("onnx").join("model_q4.onnx")) {
+                        onnx_models_dir.clone()
+                    } else {
+                        models_dir.clone()
+                    },
+                    if has_bge_onnx(&primary_bge) { primary_bge } else { legacy_bge },
+                    if has_bge_onnx(&primary_minilm) { primary_minilm } else { legacy_minilm },
+                )
+            } else {
+                (
+                    models_dir.clone(),
+                    models_dir.join("bge-small-zh-v1.5"),
+                    models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
+                )
+            };
+
+            cmd_proc
+                .env("MODEL_PATH", clip_path.to_string_lossy().to_string())
+                .env("BGE_MODEL_PATH", bge_path.to_string_lossy().to_string())
+                .env("MINILM_MODEL_PATH", minilm_path.to_string_lossy().to_string());
+        }
 
         // Pass DirectML configuration
         if crate::registry_config::get_bool("use_dml").unwrap_or(false) {

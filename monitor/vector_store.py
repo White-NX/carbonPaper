@@ -6,6 +6,7 @@ import os
 import hashlib
 import logging
 import time as _time
+import threading
 from typing import List, Dict, Any, Optional, Union
 from PIL import Image
 import numpy as np
@@ -23,6 +24,16 @@ class ChineseCLIPSingleton:
     _model = None
     _processor = None
     _initialized = False
+    _is_onnx = False
+    _session = None
+    _lock = threading.Lock()
+    
+    # Cached inputs/outputs meta and fallback image size
+    _input_meta = {}
+    _output_meta = {}
+    _image_output_name = None
+    _text_output_name = None
+    _image_size = 224
     
     def __new__(cls):
         if cls._instance is None:
@@ -34,35 +45,198 @@ class ChineseCLIPSingleton:
         if self._initialized:
             return
             
-        from logging_config import log_model_loading
-        log_model_loading("Chinese-CLIP")
-        logger.info("Loading Chinese-CLIP model (resident in memory)...")
+        with self._lock:
+            if self._initialized:
+                return
+                
+            from logging_config import log_model_loading
+            log_model_loading("Chinese-CLIP")
+            logger.info("Loading Chinese-CLIP model (resident in memory)...")
 
-        model_name = os.environ.get('MODEL_PATH', None)
-        if not model_name:
-            model_name = os.path.abspath(os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), "carbonPaper", "models"))
+            from onnx_utils import is_onnx_testing_enabled, get_onnx_model_path, create_onnx_session
 
-        from transformers import ChineseCLIPModel, ChineseCLIPProcessor
-        
-        # model_name = "OFA-Sys/chinese-clip-vit-base-patch16"
-        try:
-            # [Fix] Use low_cpu_mem_usage=False to disable lazy loading (meta tensor)
-            # This avoids "Cannot copy out of meta tensor" error in newer transformers versions
-            self._processor = ChineseCLIPProcessor.from_pretrained(
-                model_name,
-                use_fast=False,  # Use slow processor to avoid torchvision dependency
-            )
-            self._model = ChineseCLIPModel.from_pretrained(
-                model_name,
-                low_cpu_mem_usage=False,  # Disable meta tensor lazy loading
-            )
-            self._model.eval()
-            self._initialized = True
-            logger.info("Chinese-CLIP model loaded successfully")
-        except Exception as e:
-            logger.error("Chinese-CLIP model loading failed: %s", e)
-            raise
+            model_name = os.environ.get('MODEL_PATH', None)
+            if not model_name:
+                model_name = os.path.abspath(os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), "carbonPaper", "models"))
+
+            if is_onnx_testing_enabled():
+                primary_onnx_path = os.path.abspath(os.path.join(
+                    os.environ.get('LOCALAPPDATA', os.path.expanduser('~')),
+                    "CarbonPaper",
+                    "models-onnx",
+                ))
+                if not os.environ.get('MODEL_PATH') and get_onnx_model_path(primary_onnx_path, os.path.join("onnx", "model_q4.onnx")):
+                    model_name = primary_onnx_path
+                onnx_file = get_onnx_model_path(model_name, os.path.join("onnx", "model_q4.onnx"))
+                if onnx_file:
+                    logger.info("Loading Chinese-CLIP from ONNX: %s...", onnx_file)
+                    from transformers import ChineseCLIPProcessor
+                    self._processor = ChineseCLIPProcessor.from_pretrained(
+                        model_name,
+                        use_fast=False,
+                    )
+                    self._session = create_onnx_session(onnx_file)
+                    self._is_onnx = True
+                    
+                    # 1. Parse and cache metadata for inputs and outputs
+                    self._input_meta = {i.name: {"shape": i.shape, "type": i.type} for i in self._session.get_inputs()}
+                    self._output_meta = {o.name: {"shape": o.shape, "type": o.type} for o in self._session.get_outputs()}
+                    
+                    image_embed_name = None
+                    text_embed_name = None
+                    for name in self._output_meta.keys():
+                        if "image_embeds" in name:
+                            image_embed_name = name
+                        elif "text_embeds" in name:
+                            text_embed_name = name
+                    
+                    if not image_embed_name:
+                        for name in self._output_meta.keys():
+                            if "image_features" in name:
+                                image_embed_name = name
+                                break
+                    if not text_embed_name:
+                        for name in self._output_meta.keys():
+                            if "text_features" in name:
+                                text_embed_name = name
+                                break
+                                
+                    if not image_embed_name:
+                        for name in self._output_meta.keys():
+                            if any(k in name.lower() for k in ("image", "vision", "visual")):
+                                image_embed_name = name
+                                logger.warning("No explicit image_embeds found, choosing heuristic output: %s", image_embed_name)
+                                break
+                    if not text_embed_name:
+                        for name in self._output_meta.keys():
+                            if "text" in name.lower():
+                                text_embed_name = name
+                                logger.warning("No explicit text_embeds found, choosing heuristic output: %s", text_embed_name)
+                                break
+                                
+                    if not image_embed_name or not text_embed_name:
+                        raise RuntimeError(
+                            f"Unsupported ONNX model layout: could not locate both image and text outputs in outputs {list(self._output_meta.keys())}"
+                        )
+                        
+                    self._image_output_name = image_embed_name
+                    self._text_output_name = text_embed_name
+                    
+                    # 2. Extract visual image size from processor configs dynamically
+                    self._image_size = 224
+                    try:
+                        if hasattr(self._processor, "image_processor") and self._processor.image_processor is not None:
+                            size_config = getattr(self._processor.image_processor, "size", None)
+                            if isinstance(size_config, dict):
+                                self._image_size = size_config.get("height", size_config.get("shortest_edge", 224))
+                            elif isinstance(size_config, int):
+                                self._image_size = size_config
+                        elif hasattr(self._processor, "feature_extractor") and self._processor.feature_extractor is not None:
+                            size_config = getattr(self._processor.feature_extractor, "size", None)
+                            if isinstance(size_config, dict):
+                                self._image_size = size_config.get("height", size_config.get("shortest_edge", 224))
+                            elif isinstance(size_config, int):
+                                self._image_size = size_config
+                    except Exception as e:
+                        logger.warning("Failed to extract image size from processor configuration: %s. Using default 224", e)
+                        
+                    # 3. Load-time smoke test
+                    try:
+                        logger.info("Running Chinese-CLIP ONNX smoke test...")
+                        dummy_image = Image.new("RGB", (10, 10), color="red")
+                        dummy_text = "测试"
+                        
+                        img_inputs = self._processor(images=dummy_image, return_tensors="np")
+                        img_feeds = self._build_clip_feeds(pixel_values=img_inputs["pixel_values"])
+                        img_outputs = self._session.run([self._image_output_name], img_feeds)
+                        img_emb = img_outputs[0]
+                        if img_emb.ndim != 2 or not np.isfinite(img_emb).all():
+                            raise ValueError(f"Invalid image embedding output shape or values: shape={img_emb.shape}")
+                            
+                        txt_inputs = self._processor(text=[dummy_text], return_tensors="np", padding=True)
+                        txt_feeds = self._build_clip_feeds(input_ids=txt_inputs["input_ids"], attention_mask=txt_inputs.get("attention_mask"))
+                        txt_outputs = self._session.run([self._text_output_name], txt_feeds)
+                        txt_emb = txt_outputs[0]
+                        if txt_emb.ndim != 2 or not np.isfinite(txt_emb).all():
+                            raise ValueError(f"Invalid text embedding output shape or values: shape={txt_emb.shape}")
+                        
+                        logger.info("Chinese-CLIP ONNX smoke test passed successfully.")
+                    except Exception as e:
+                        logger.error("Chinese-CLIP ONNX smoke test failed: %s", e)
+                        self._session = None
+                        self._processor = None
+                        self._is_onnx = False
+                        raise RuntimeError(f"Chinese-CLIP ONNX smoke test failed: {e}") from e
+
+                    self._initialized = True
+                    logger.info("Chinese-CLIP loaded successfully via ONNX")
+                    return
+
+            from transformers import ChineseCLIPModel, ChineseCLIPProcessor
             
+            try:
+                self._processor = ChineseCLIPProcessor.from_pretrained(
+                    model_name,
+                    use_fast=False,
+                )
+                self._model = ChineseCLIPModel.from_pretrained(
+                    model_name,
+                    low_cpu_mem_usage=False,
+                )
+                self._model.eval()
+                self._is_onnx = False
+                self._initialized = True
+                logger.info("Chinese-CLIP model loaded successfully")
+            except Exception as e:
+                logger.error("Chinese-CLIP model loading failed: %s", e)
+                raise
+                
+    def _build_clip_feeds(self, pixel_values=None, input_ids=None, attention_mask=None) -> dict:
+        feeds = {}
+        if pixel_values is not None:
+            batch_size = pixel_values.shape[0]
+        elif input_ids is not None:
+            batch_size = input_ids.shape[0]
+        else:
+            raise ValueError("Must provide either pixel_values or input_ids")
+
+        for name, meta in self._input_meta.items():
+            if name == "pixel_values":
+                if pixel_values is not None:
+                    arr = pixel_values
+                else:
+                    arr = np.zeros((batch_size, 3, self._image_size, self._image_size), dtype=np.float32)
+            elif name == "input_ids":
+                if input_ids is not None:
+                    arr = input_ids
+                else:
+                    arr = np.zeros((batch_size, 1), dtype=np.int64)
+            elif name == "attention_mask":
+                if attention_mask is not None:
+                    arr = attention_mask
+                else:
+                    if input_ids is not None:
+                        arr = np.ones_like(input_ids)
+                    else:
+                        arr = np.zeros((batch_size, 1), dtype=np.int64)
+            elif name == "token_type_ids":
+                if input_ids is not None:
+                    arr = np.zeros_like(input_ids)
+                else:
+                    arr = np.zeros((batch_size, 1), dtype=np.int64)
+            else:
+                logger.warning("Unknown session input: %s", name)
+                continue
+
+            if "int64" in meta["type"] and arr.dtype != np.int64:
+                arr = arr.astype(np.int64)
+            elif "float" in meta["type"] and arr.dtype != np.float32:
+                arr = arr.astype(np.float32)
+
+            feeds[name] = arr
+
+        return feeds
+
     def get_components(self):
         """Return model components (model, processor)."""
         if not self._initialized:
@@ -87,8 +261,14 @@ class ImageVectorizer:
     
     def _ensure_initialized(self):
         """Ensure the model is initialised."""
-        if self.model is None:
-            self.model, self.processor = self._singleton.get_components()
+        if not self._singleton._initialized:
+            self._singleton.initialize()
+        if self._singleton._is_onnx:
+            if self.processor is None:
+                _, self.processor = self._singleton.get_components()
+        else:
+            if self.model is None:
+                self.model, self.processor = self._singleton.get_components()
     
     def encode_image(self, image: Union[str, Image.Image, np.ndarray]) -> np.ndarray:
         """
@@ -101,6 +281,23 @@ class ImageVectorizer:
             Normalised image feature vector.
         """
         self._ensure_initialized()
+
+        if self._singleton._is_onnx:
+            if isinstance(image, str):
+                image = Image.open(image).convert('RGB')
+            elif isinstance(image, np.ndarray):
+                image = Image.fromarray(image).convert('RGB')
+            elif isinstance(image, Image.Image):
+                image = image.convert('RGB')
+
+            inputs = self.processor(images=image, return_tensors="np")
+            feeds = self._singleton._build_clip_feeds(pixel_values=inputs["pixel_values"])
+            outputs = self._singleton._session.run([self._singleton._image_output_name], feeds)
+            image_features = outputs[0]
+            norm = np.linalg.norm(image_features, axis=-1, keepdims=True)
+            image_features = image_features / np.clip(norm, a_min=1e-9, a_max=None)
+            return image_features.flatten()
+
         import torch
 
         # Handle different input types
@@ -232,6 +429,28 @@ class ImageVectorizer:
         """
         _t_total = _time.perf_counter()
         self._ensure_initialized()
+        if self._singleton._is_onnx:
+            _t0 = _time.perf_counter()
+            inputs = self.processor(text=[text], return_tensors="np", padding=True)
+            _t_tokenize = _time.perf_counter() - _t0
+
+            _t0 = _time.perf_counter()
+            feeds = self._singleton._build_clip_feeds(input_ids=inputs["input_ids"], attention_mask=inputs.get("attention_mask"))
+            outputs = self._singleton._session.run([self._singleton._text_output_name], feeds)
+            text_features = outputs[0]
+            norm = np.linalg.norm(text_features, axis=-1, keepdims=True)
+            text_features = text_features / np.clip(norm, a_min=1e-9, a_max=None)
+            _t_inference = _time.perf_counter() - _t0
+
+            arr = text_features.flatten()
+            _elapsed = _time.perf_counter() - _t_total
+            _log_fn = logger.warning if _elapsed > 10 else logger.info
+            _log_fn(
+                "[DIAG:encode_text:ONNX] tokenize=%.3fs inference=%.3fs total=%.3fs",
+                _t_tokenize, _t_inference, _elapsed
+            )
+            return arr
+
         import torch
 
         _t0 = _time.perf_counter()
@@ -269,6 +488,23 @@ class ImageVectorizer:
     def encode_images_batch(self, images: List[Union[str, Image.Image]]) -> np.ndarray:
         """Batch-encode images."""
         self._ensure_initialized()
+        if self._singleton._is_onnx:
+            pil_images = []
+            for img in images:
+                if isinstance(img, str):
+                    pil_images.append(Image.open(img).convert('RGB'))
+                elif isinstance(img, np.ndarray):
+                    pil_images.append(Image.fromarray(img).convert('RGB'))
+                else:
+                    pil_images.append(img.convert('RGB'))
+
+            inputs = self.processor(images=pil_images, return_tensors="np", padding=True)
+            feeds = self._singleton._build_clip_feeds(pixel_values=inputs["pixel_values"])
+            outputs = self._singleton._session.run([self._singleton._image_output_name], feeds)
+            image_features = outputs[0]
+            norm = np.linalg.norm(image_features, axis=-1, keepdims=True)
+            image_features = image_features / np.clip(norm, a_min=1e-9, a_max=None)
+            return image_features
         import torch
         
         pil_images = []

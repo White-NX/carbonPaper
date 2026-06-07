@@ -51,6 +51,56 @@ macro_rules! svec {
         vec![$($x.to_string()),*]
     };
 }
+
+fn file_exists_nonempty(path: &std::path::Path) -> bool {
+    path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+}
+
+fn missing_files(base: &std::path::Path, files: &[&str]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|file| !file_exists_nonempty(&base.join(file)))
+        .map(|file| file.to_string())
+        .collect()
+}
+
+fn missing_files_with_alternative(
+    base: &std::path::Path,
+    files: &[&str],
+    alternatives: &[&str],
+    display_missing: &str,
+) -> Vec<String> {
+    let mut missing = missing_files(base, files);
+    if !alternatives.iter().any(|file| file_exists_nonempty(&base.join(file))) {
+        missing.push(display_missing.to_string());
+    }
+    missing
+}
+
+fn insert_status_with_fallback(
+    result: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    primary_base: &std::path::Path,
+    legacy_base: Option<&std::path::Path>,
+    required: bool,
+    check_missing: impl Fn(&std::path::Path) -> Vec<String>,
+) {
+    let primary_missing = check_missing(primary_base);
+    let legacy_missing = legacy_base.map(|base| check_missing(base));
+    let complete = primary_missing.is_empty()
+        || legacy_missing.as_ref().map(|m| m.is_empty()).unwrap_or(false);
+
+    if complete {
+        result.insert(key.to_string(), json!({ "complete": true, "required": required }));
+    } else {
+        result.insert(key.to_string(), json!({
+            "complete": false,
+            "required": required,
+            "missing_files": primary_missing
+        }));
+    }
+}
+
 /// 在阻塞线程中启动 aria2c，并把 stdout/stderr 每行通过 app.emit 发送给前端，同时写入 log_file。
 ///
 /// - `aria2_path`：aria2c 可执行文件的路径
@@ -194,7 +244,7 @@ fn run_aria2_and_emit_blocking(
 async fn perform_download_hf_repo(
     app: AppHandle,
     aria2_path: PathBuf,
-    download_path: PathBuf, // 修改点1：参数名变更
+    download_path: PathBuf,
     repo: &str,
     files: Vec<String>,
     concurrency: usize,
@@ -205,23 +255,24 @@ async fn perform_download_hf_repo(
 
     println!("Starting download of {} files from repo {}...", files.len(), repo);
 
-    // 如果 repo 字符串需要在循环中使用且原函数没有对其所有权的处理，
-    // 在这里由于 build_file_url 是在 spawn 之前调用的，直接使用 &str 是安全的。
-
     for relpath in files {
         let aria2_path = aria2_path.clone();
-        // 修改点2：克隆 download_path 而不是 cache_base
         let download_path = download_path.clone(); 
         let app = app.clone();
         let log_file = Arc::clone(&log_file);
         let sem = Arc::clone(&sem);
 
-        // 修改点3：直接基于 download_path 拼接目标路径
-        // 如果 relpath 是 "bert/config.json"，target 就是 "download_path/bert/config.json"
         let target = download_path.join(&relpath);
         
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
+            let canonical_parent = parent.canonicalize()
+                .map_err(|e| anyhow!("Failed to canonicalize parent dir: {}", e))?;
+            let canonical_root = download_path.canonicalize()
+                .map_err(|e| anyhow!("Failed to canonicalize download path: {}", e))?;
+            if !canonical_parent.starts_with(&canonical_root) {
+                return Err(anyhow!("Directory traversal detected via symbolic link / boundary escape"));
+            }
         }
         
         let parent_dir = target
@@ -235,25 +286,17 @@ async fn perform_download_hf_repo(
             .ok_or_else(|| anyhow!("非法文件名"))?
             .to_string();
 
-        // 跳过已存在文件（简单判断）
-        // 这里保留了原来的逻辑：如果目标路径下已有文件且大小>0，则视为已下载/已缓存
         if let Ok(md) = tokio::fs::metadata(&target).await {
             if md.len() > 0 {
-                // 直接跳过
                 continue;
             }
         }
 
-        // 构建下载 URL
-        // 注意：repo 变量在这里使用，因为是在 tokio::spawn 外部，引用是有效的
         let url = build_file_url(repo, &relpath); 
 
-        // spawn 异步任务
         let handle = tokio::spawn(async move {
-            // acquire semaphore permit
             let _permit = sem.acquire_owned().await.unwrap();
 
-            // 在阻塞线程池里执行 aria2 子进程
             let res = task::spawn_blocking(move || {
                 run_aria2_and_emit_blocking(aria2_path, url, parent_dir, outfile, app, log_file)
             })
@@ -266,7 +309,6 @@ async fn perform_download_hf_repo(
         handles.push(handle);
     }
 
-    // 等待所有任务
     let mut any_err: Option<anyhow::Error> = None;
     for h in handles {
         match h.await {
@@ -287,9 +329,23 @@ async fn perform_download_hf_repo(
     if let Some(e) = any_err {
         Err(anyhow!("部分文件下载失败：{}", e))
     } else {
-        // 修改点4：返回 download_path
         Ok(download_path) 
     }
+}
+
+fn is_safe_relative_path(rel: &str) -> bool {
+    use std::path::{Component, Path};
+    !rel.trim().is_empty()
+        && Path::new(rel).components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+fn is_valid_repo(repo: &str) -> bool {
+    let trimmed = repo.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    !trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
 #[tauri::command]
@@ -304,22 +360,36 @@ pub async fn download_model(
     repo: Option<&str>,
     subdir: Option<&str>,
     concurrency: Option<usize>,
+    model_runtime: Option<&str>,
 ) -> Result<String, String> {
     if !registry_config::get_bool("network_enabled").unwrap_or(true) {
         return Err("Network features are disabled".to_string());
     }
-    // prepare aria2 path
-    /*let aria2 = aria2_path
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("aria2c"));
-    */
+
     let aria2 = find_existing_file_in_resources(&app, "aria2c.exe")
         .ok_or_else(|| "aria2c executable not found in resources; The program installation may be incomplete.".to_string())?;
 
-    // prepare cache dir
+    // Validate inputs
+    if let Some(sub) = subdir {
+        if !is_safe_relative_path(sub) {
+            return Err("Invalid subdir relative path".to_string());
+        }
+    }
+    if let Some(r) = repo {
+        if !is_valid_repo(r) {
+            return Err("Invalid model repository name".to_string());
+        }
+    }
+
+    // prepare cache dir. Core ONNX models are isolated from PyTorch weights to
+    // avoid mixing incompatible config/tokenizer files in the same directory.
+    let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
+    let runtime = model_runtime.unwrap_or("").trim().to_ascii_lowercase();
+    let use_onnx_root = runtime == "onnx"
+        || (runtime.is_empty() && use_onnx && subdir.is_none() && repo.is_none());
     let mut download_path = file_in_local_appdata()
         .ok_or_else(|| "Could not determine resource directory.".to_string())?
-        .join("models");
+        .join(if use_onnx_root { "models-onnx" } else { "models" });
     if let Some(sub) = subdir {
         download_path = download_path.join(sub);
     }
@@ -327,7 +397,6 @@ pub async fn download_model(
 
     // prepare log file under log path
     let log_dir = get_log_path();
-    // delete log file if exists
     let log_path = log_dir;
     if log_path.exists() {
         std::fs::remove_file(&log_path).map_err(|e| e.to_string())?;
@@ -336,13 +405,40 @@ pub async fn download_model(
     let log_file = Arc::new(Mutex::new(f));
 
     let conc = concurrency.unwrap_or(8);
-    let repo = repo.unwrap_or("OFA-Sys/chinese-clip-vit-base-patch16");
-    let files = files.unwrap_or_else(|| svec![
-        "vocab.txt",
-        "pytorch_model.bin",
-        "config.json",
-        "preprocessor_config.json",
-    ]);
+    let repo = repo.unwrap_or_else(|| {
+        if use_onnx_root {
+            "Xenova/chinese-clip-vit-base-patch16"
+        } else {
+            "OFA-Sys/chinese-clip-vit-base-patch16"
+        }
+    });
+    let files = files.unwrap_or_else(|| {
+        if use_onnx_root {
+            svec![
+                "vocab.txt",
+                "config.json",
+                "preprocessor_config.json",
+                "onnx/model_q4.onnx",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+            ]
+        } else {
+            svec![
+                "vocab.txt",
+                "pytorch_model.bin",
+                "config.json",
+                "preprocessor_config.json",
+            ]
+        }
+    });
+
+    // Validate each file relative path
+    for file in &files {
+        if !is_safe_relative_path(file) {
+            return Err(format!("Invalid file relative path: {}", file));
+        }
+    }
 
     match perform_download_hf_repo(app.clone(), aria2, download_path, repo, files, conc, log_file).await {
         Ok(path) => Ok(path.to_string_lossy().to_string()),
@@ -354,70 +450,120 @@ pub async fn download_model(
 /// Check whether all required model files exist on disk.
 /// Returns a JSON object mapping each model key to its status.
 pub async fn check_model_files() -> Result<serde_json::Value, String> {
-    let models_dir = file_in_local_appdata()
-        .ok_or_else(|| "Could not determine local appdata directory.".to_string())?
-        .join("models");
+    let appdata_dir = file_in_local_appdata()
+        .ok_or_else(|| "Could not determine local appdata directory.".to_string())?;
+    let models_dir = appdata_dir.join("models");
+    let onnx_models_dir = appdata_dir.join("models-onnx");
 
-    // Define all models and their required files.
-    // The `required` flag distinguishes core models (whose absence blocks
-    // backend startup via the auto-start gate in App.jsx) from optional
-    // feature-specific models (smart cluster reranker, future LLM judges)
-    // that the user explicitly opts in to via a setup wizard.
-    let models: Vec<(&str, Option<&str>, Vec<&str>, bool /* required */)> = vec![
-        (
-            "chinese-clip",
-            None, // files are directly under models/
-            vec!["vocab.txt", "pytorch_model.bin", "config.json", "preprocessor_config.json"],
-            true,
-        ),
-        (
-            "bge-small-zh",
-            Some("bge-small-zh-v1.5"),
-            vec!["config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"],
-            true,
-        ),
-        (
-            "minilm-l12",
-            Some("paraphrase-multilingual-MiniLM-L12-v2"),
-            vec!["config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "sentencepiece.bpe.model"],
-            true,
-        ),
-        // Smart Cluster reranker (OPTIONAL — user opts in via setup wizard).
-        // The onnx weight lives in `onnx/` (onnx-community layout); we treat
-        // q4f16 as canonical and let the runtime auto-detect other variants.
-        (
-            "bge-reranker-v2-m3",
-            Some("bge-reranker-v2-m3"),
-            vec!["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "onnx/model_uint8.onnx"],
-            false,
-        ),
-    ];
-
+    let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
     let mut result = serde_json::Map::new();
 
-    for (key, subdir, files, required) in &models {
-        let base = match subdir {
-            Some(s) => models_dir.join(s),
-            None => models_dir.clone(),
-        };
-        let mut missing: Vec<String> = Vec::new();
-        for file in files {
-            let path = base.join(file);
-            let exists = path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false);
-            if !exists {
-                missing.push(file.to_string());
-            }
-        }
-        if missing.is_empty() {
-            result.insert(key.to_string(), json!({ "complete": true, "required": required }));
-        } else {
-            result.insert(key.to_string(), json!({
-                "complete": false,
-                "required": required,
-                "missing_files": missing
-            }));
-        }
+    if use_onnx {
+        insert_status_with_fallback(
+            &mut result,
+            "chinese-clip",
+            &onnx_models_dir,
+            Some(&models_dir),
+            true,
+            |base| missing_files(base, &["vocab.txt", "config.json", "preprocessor_config.json", "onnx/model_q4.onnx"]),
+        );
+        insert_status_with_fallback(
+            &mut result,
+            "bge-small-zh",
+            &onnx_models_dir.join("bge-small-zh-v1.5"),
+            Some(&models_dir.join("bge-small-zh-v1.5")),
+            true,
+            |base| {
+                missing_files_with_alternative(
+                    base,
+                    &["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
+                    &["onnx/model_quantized.onnx", "model_int8.onnx"],
+                    "onnx/model_quantized.onnx",
+                )
+            },
+        );
+        insert_status_with_fallback(
+            &mut result,
+            "minilm-l12",
+            &onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
+            Some(&models_dir.join("paraphrase-multilingual-MiniLM-L12-v2")),
+            true,
+            |base| {
+                missing_files_with_alternative(
+                    base,
+                    &["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
+                    &["onnx/model_quantized.onnx", "model_int8.onnx"],
+                    "onnx/model_quantized.onnx",
+                )
+            },
+        );
+    } else {
+        insert_status_with_fallback(
+            &mut result,
+            "chinese-clip",
+            &models_dir,
+            None,
+            true,
+            |base| missing_files(base, &["vocab.txt", "pytorch_model.bin", "config.json", "preprocessor_config.json"]),
+        );
+        insert_status_with_fallback(
+            &mut result,
+            "bge-small-zh",
+            &models_dir.join("bge-small-zh-v1.5"),
+            None,
+            true,
+            |base| missing_files(base, &["config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"]),
+        );
+        insert_status_with_fallback(
+            &mut result,
+            "minilm-l12",
+            &models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
+            None,
+            true,
+            |base| missing_files(base, &["config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "sentencepiece.bpe.model"]),
+        );
     }
 
+    insert_status_with_fallback(
+        &mut result,
+        "bge-reranker-v2-m3",
+        &models_dir.join("bge-reranker-v2-m3"),
+        None,
+        false,
+        |base| missing_files(base, &["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "onnx/model_uint8.onnx"]),
+    );
+
     Ok(serde_json::Value::Object(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_relative_path() {
+        assert!(is_safe_relative_path("onnx/model.onnx"));
+        assert!(is_safe_relative_path("config.json"));
+        assert!(is_safe_relative_path("a/b/c"));
+        
+        assert!(!is_safe_relative_path(""));
+        assert!(!is_safe_relative_path(" "));
+        assert!(!is_safe_relative_path(".."));
+        assert!(!is_safe_relative_path("../a"));
+        assert!(!is_safe_relative_path("a/../b"));
+        assert!(!is_safe_relative_path("/etc/passwd"));
+        assert!(!is_safe_relative_path("C:\\Windows\\temp"));
+        assert!(!is_safe_relative_path("\\\\?\\C:\\Windows"));
+    }
+
+    #[test]
+    fn test_is_valid_repo() {
+        assert!(is_valid_repo("Xenova/chinese-clip-vit-base-patch16"));
+        assert!(is_valid_repo("OFA-Sys/chinese-clip-vit-base-patch16"));
+        
+        assert!(!is_valid_repo(""));
+        assert!(!is_valid_repo("  "));
+        assert!(!is_valid_repo("repo name"));
+        assert!(!is_valid_repo("repo\nname"));
+    }
 }

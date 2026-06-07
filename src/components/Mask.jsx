@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { WifiOff, Loader2, Play, Route, PackageOpen, Shield, ShieldEllipsis, RotateCcw, Download } from 'lucide-react';
+import { WifiOff, Loader2, Play, Route, PackageOpen, Shield, ShieldEllipsis, RotateCcw, Download, X } from 'lucide-react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -197,6 +197,43 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
   const [modelDownloading, setModelDownloading] = React.useState(false);
   const modelDownloadLogRef = React.useRef(null);
   const modelDownloadStartedRef = React.useRef(false);
+  const [isClosedByUser, setIsClosedByUser] = React.useState(false);
+  const [downloadProgressState, setDownloadProgressState] = React.useState({
+    keys: [],
+    currentIdx: 0,
+    currentFileProgress: {},
+  });
+
+  // Reset isClosedByUser when modelsNeedDownload becomes true
+  React.useEffect(() => {
+    if (modelsNeedDownload) {
+      setIsClosedByUser(false);
+    }
+  }, [modelsNeedDownload]);
+
+  // Memoize overall progress
+  const overallProgress = React.useMemo(() => {
+    const { keys, currentIdx, currentFileProgress } = downloadProgressState;
+    if (!keys || keys.length === 0) return 0;
+    const progressValues = Object.values(currentFileProgress);
+    const currentModelProgress = progressValues.length > 0
+      ? progressValues.reduce((sum, val) => sum + val, 0) / Math.max(progressValues.length, 5)
+      : 0;
+    const progress = (currentIdx * 100 + currentModelProgress) / keys.length;
+    return Math.max(0, Math.min(100, progress));
+  }, [downloadProgressState]);
+
+  // Dispatch custom event to let other components (like SearchBox) know about model download status
+  React.useEffect(() => {
+    window.dispatchEvent(
+      new CustomEvent('model-download-progress', {
+        detail: {
+          active: modelDownloading && isClosedByUser,
+          progress: Math.round(overallProgress),
+        },
+      })
+    );
+  }, [modelDownloading, isClosedByUser, overallProgress]);
 
   // Auto-scroll model download log
   React.useEffect(() => {
@@ -218,6 +255,21 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
           const line = payload.line || JSON.stringify(payload);
           const ts = new Date().toLocaleTimeString();
           setModelDownloadLog((prev) => [...prev, `[${ts}] ${line}`]);
+
+          // Parse progress percentage from aria2 log line
+          if (payload.source === 'aria2' && payload.file) {
+            const match = line.match(/\((\d+)%\)/);
+            if (match) {
+              const percent = parseInt(match[1], 10);
+              setDownloadProgressState((prev) => {
+                const newProgress = { ...prev.currentFileProgress, [payload.file]: percent };
+                return {
+                  ...prev,
+                  currentFileProgress: newProgress,
+                };
+              });
+            }
+          }
         });
       } catch (e) {
         console.warn('Failed to register model download log listener', e);
@@ -243,27 +295,73 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
 
     (async () => {
       try {
-        // Download each missing model
+        const config = await invoke('get_advanced_config');
+        const useOnnx = config?.use_onnx || false;
+
+        const keysToDownload = [];
         if (missingModels['chinese-clip'] && !missingModels['chinese-clip'].complete) {
-          setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_clip')}`]);
-          await invoke('download_model');
+          keysToDownload.push('chinese-clip');
         }
         if (missingModels['bge-small-zh'] && !missingModels['bge-small-zh'].complete) {
-          setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_bge')}`]);
-          await invoke('download_model', {
-            repo: 'BAAI/bge-small-zh-v1.5',
-            subdir: 'bge-small-zh-v1.5',
-            files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'vocab.txt', 'special_tokens_map.json'],
-          });
+          keysToDownload.push('bge-small-zh');
         }
         if (missingModels['minilm-l12'] && !missingModels['minilm-l12'].complete) {
-          setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_minilm')}`]);
-          await invoke('download_model', {
-            repo: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
-            subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
-            files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'sentencepiece.bpe.model'],
-          });
+          keysToDownload.push('minilm-l12');
         }
+
+        setDownloadProgressState({
+          keys: keysToDownload,
+          currentIdx: 0,
+          currentFileProgress: {},
+        });
+
+        for (let i = 0; i < keysToDownload.length; i++) {
+          const key = keysToDownload[i];
+          setDownloadProgressState((prev) => ({
+            ...prev,
+            currentIdx: i,
+            currentFileProgress: {},
+          }));
+
+          if (key === 'chinese-clip') {
+            setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_clip')}`]);
+            // This will fall back to default parameters inside Rust, which handles use_onnx
+            await invoke('download_model');
+          } else if (key === 'bge-small-zh') {
+            setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_bge')}`]);
+            if (useOnnx) {
+              await invoke('download_model', {
+                repo: 'Xenova/bge-small-zh-v1.5',
+                subdir: 'bge-small-zh-v1.5',
+                files: ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'onnx/model_quantized.onnx'],
+                modelRuntime: 'onnx',
+              });
+            } else {
+              await invoke('download_model', {
+                repo: 'BAAI/bge-small-zh-v1.5',
+                subdir: 'bge-small-zh-v1.5',
+                files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'vocab.txt', 'special_tokens_map.json'],
+              });
+            }
+          } else if (key === 'minilm-l12') {
+            setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_minilm')}`]);
+            if (useOnnx) {
+              await invoke('download_model', {
+                repo: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2',
+                subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
+                files: ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'onnx/model_quantized.onnx'],
+                modelRuntime: 'onnx',
+              });
+            } else {
+              await invoke('download_model', {
+                repo: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
+                subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
+                files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'sentencepiece.bpe.model'],
+              });
+            }
+          }
+        }
+
         setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.complete')}`]);
         if (onModelsDownloadComplete) onModelsDownloadComplete();
       } catch (err) {
@@ -383,25 +481,44 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
           // pass the python executable path chosen in the previous step (escaped)
           const res = await invoke('install_python_venv', { python_path: processedPythonPath });
           appendDepsLog(res);
+          const config = await invoke('get_advanced_config');
+          const useOnnx = config?.use_onnx || false;
+
           // download model files (Chinese-CLIP)
           appendDepsLog(t('mask.venv.step2.download_models'));
           const modelRes = await invoke('download_model');
           appendDepsLog(modelRes);
+
           // download BGE classification model
           appendDepsLog(t('mask.venv.step2.download_bge'));
-          const bgeRes = await invoke('download_model', {
-            repo: 'BAAI/bge-small-zh-v1.5',
-            subdir: 'bge-small-zh-v1.5',
-            files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'vocab.txt', 'special_tokens_map.json'],
-          });
+          const bgeRes = useOnnx
+            ? await invoke('download_model', {
+              repo: 'Xenova/bge-small-zh-v1.5',
+              subdir: 'bge-small-zh-v1.5',
+              files: ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'onnx/model_quantized.onnx'],
+              modelRuntime: 'onnx',
+            })
+            : await invoke('download_model', {
+              repo: 'BAAI/bge-small-zh-v1.5',
+              subdir: 'bge-small-zh-v1.5',
+              files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'vocab.txt', 'special_tokens_map.json'],
+            });
           appendDepsLog(bgeRes);
+
           // download MiniLM clustering model
           appendDepsLog(t('mask.venv.step2.download_minilm'));
-          const minilmRes = await invoke('download_model', {
-            repo: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
-            subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
-            files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'sentencepiece.bpe.model'],
-          });
+          const minilmRes = useOnnx
+            ? await invoke('download_model', {
+              repo: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2',
+              subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
+              files: ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'onnx/model_quantized.onnx'],
+              modelRuntime: 'onnx',
+            })
+            : await invoke('download_model', {
+              repo: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
+              subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
+              files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'sentencepiece.bpe.model'],
+            });
           appendDepsLog(minilmRes);
           appendDepsLog(t('mask.venv.step2.deps_complete'));
           setDepsInstallSuccess(true);
@@ -551,6 +668,7 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
 
   // ==================== Model download overlay ====================
   if (modelsNeedDownload && renderPythonVersion && renderVenvInstallStep == null && !depsNeedUpdate) {
+    if (isClosedByUser) return null;
     return (
       <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-ide-bg/80 backdrop-blur-sm text-ide-muted">
         {isDev && renderDebugSelector()}
@@ -558,7 +676,15 @@ export default function Mask({ backendStatus, pythonVersion, backendError, handl
         <p className="text-lg font-semibold">{t('mask.model_download.title')}</p>
         <p className="text-sm opacity-70 mt-1">{t('mask.model_download.subtitle')}</p>
 
-        <div className="mt-6 w-full max-w-2xl px-6">
+        <div className="mt-6 w-full max-w-2xl px-6 relative">
+          <button
+            onClick={() => setIsClosedByUser(true)}
+            className="absolute -top-10 right-6 text-ide-muted hover:text-ide-text transition-colors flex items-center gap-1 text-xs px-2.5 py-1 bg-ide-panel border border-ide-border rounded-md"
+            title={t('mask.model_download.run_in_background', '后台运行')}
+          >
+            <X size={14} />
+            {t('mask.model_download.run_in_background', '后台运行')}
+          </button>
           <textarea
             ref={modelDownloadLogRef}
             readOnly

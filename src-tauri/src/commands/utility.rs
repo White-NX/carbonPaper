@@ -70,6 +70,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let classification_enabled = registry_config::get_bool("classification_enabled").unwrap_or(true);
     let smart_cluster_enabled = registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
     let network_enabled = registry_config::get_bool("network_enabled").unwrap_or(true);
+    let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
 
     Ok(serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
@@ -85,6 +86,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "classification_enabled": classification_enabled,
         "smart_cluster_enabled": smart_cluster_enabled,
         "network_enabled": network_enabled,
+        "use_onnx": use_onnx,
     }))
 }
 
@@ -131,6 +133,9 @@ pub fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     }
     if let Some(v) = config.get("network_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("network_enabled", v)?;
+    }
+    if let Some(v) = config.get("use_onnx").and_then(|v| v.as_bool()) {
+        registry_config::set_bool("use_onnx", v)?;
     }
     Ok(())
 }
