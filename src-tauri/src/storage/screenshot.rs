@@ -1,13 +1,10 @@
 //! Screenshot CRUD operations (save, get, delete, commit, abort).
 
-use crate::credential_manager::{
-    encrypt_row_key_with_cng,
-    encrypt_with_master_key,
-};
+use crate::credential_manager::{encrypt_row_key_with_cng, encrypt_with_master_key};
 use chrono::{DateTime, Utc};
 use rand::RngCore;
-use rusqlite::{params, Connection, OptionalExtension};
 use roaring::RoaringBitmap;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::atomic::Ordering;
 
 use super::types::RawScreenshotRow;
@@ -23,7 +20,9 @@ impl StorageState {
         let guard = self.get_connection_named("get_all_image_paths")?;
         let conn = guard.as_ref().unwrap();
         let mut stmt = conn
-            .prepare("SELECT image_path FROM screenshots WHERE is_deleted = 0 ORDER BY created_at DESC")
+            .prepare(
+                "SELECT image_path FROM screenshots WHERE is_deleted = 0 ORDER BY created_at DESC",
+            )
             .map_err(|e| format!("Failed to prepare query: {}", e))?;
         let paths: Vec<String> = stmt
             .query_map([], |row| row.get(0))
@@ -189,7 +188,9 @@ impl StorageState {
 
         // Use dedup tables for page_icon and visible_links
         let page_icon_id: Option<i64> = match &request.page_icon {
-            Some(value) if !value.is_empty() => Some(Self::get_or_create_page_icon_id(conn, value)?),
+            Some(value) if !value.is_empty() => {
+                Some(Self::get_or_create_page_icon_id(conn, value)?)
+            }
             _ => None,
         };
         let link_set_id: Option<i64> = match &request.visible_links {
@@ -411,7 +412,9 @@ impl StorageState {
 
         // Use dedup tables for page_icon and visible_links
         let page_icon_id: Option<i64> = match &request.page_icon {
-            Some(value) if !value.is_empty() => Some(Self::get_or_create_page_icon_id(conn, value)?),
+            Some(value) if !value.is_empty() => {
+                Some(Self::get_or_create_page_icon_id(conn, value)?)
+            }
             _ => None,
         };
         let link_set_id: Option<i64> = match &request.visible_links {
@@ -1099,11 +1102,18 @@ impl StorageState {
             let guard = self.get_connection_named("get_screenshot_by_image_path")?;
             let conn = guard.as_ref().unwrap();
 
-            let (where_clause, param_value): (&str, String) = if let Some(hash) = path.strip_prefix("memory://") {
-                ("WHERE s.image_hash = ? AND s.is_deleted = 0", hash.to_string())
-            } else {
-                ("WHERE s.image_path = ? AND s.is_deleted = 0", path.to_string())
-            };
+            let (where_clause, param_value): (&str, String) =
+                if let Some(hash) = path.strip_prefix("memory://") {
+                    (
+                        "WHERE s.image_hash = ? AND s.is_deleted = 0",
+                        hash.to_string(),
+                    )
+                } else {
+                    (
+                        "WHERE s.image_path = ? AND s.is_deleted = 0",
+                        path.to_string(),
+                    )
+                };
 
             let sql = format!(
                 "SELECT s.id, s.image_path, s.image_hash, s.width, s.height,
@@ -1216,7 +1226,9 @@ impl StorageState {
         // Phase 1: Hold the DB connection lock only to retrieve the raw encrypted rows.
         let raw_rows = {
             let guard = self.get_connection_named("get_ocr_results_by_screenshot_ids")?;
-            let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+            let conn = guard
+                .as_ref()
+                .ok_or_else(|| "Database connection is None".to_string())?;
 
             let mut raw_rows = Vec::new();
 
@@ -1312,7 +1324,10 @@ impl StorageState {
 
         // Delete database record
         let deleted = conn
-            .execute("DELETE FROM screenshots WHERE id = ? AND is_deleted = 0", [id])
+            .execute(
+                "DELETE FROM screenshots WHERE id = ? AND is_deleted = 0",
+                [id],
+            )
             .map_err(|e| format!("Failed to delete screenshot: {}", e))?;
 
         // Try to delete image file
@@ -1441,7 +1456,8 @@ impl StorageState {
             param_values.push(Box::new(month_key.clone()));
         }
 
-        let params_ref: Vec<&dyn rusqlite::ToSql> = param_values.iter().map(|v| v.as_ref()).collect();
+        let params_ref: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|v| v.as_ref()).collect();
 
         let mut guard = self.get_connection_named("soft_delete_process_month")?;
         let conn = guard.as_mut().unwrap();
@@ -1453,9 +1469,9 @@ impl StorageState {
             "INSERT OR IGNORE INTO delete_queue_screenshots (id) SELECT id FROM screenshots WHERE {}",
             filter_plain
         );
-        let queued_screenshots = tx
-            .execute(&queue_screenshots_sql, params_ref.as_slice())
-            .map_err(|e| format!("Failed to queue screenshots: {}", e))? as i64;
+        let queued_screenshots =
+            tx.execute(&queue_screenshots_sql, params_ref.as_slice())
+                .map_err(|e| format!("Failed to queue screenshots: {}", e))? as i64;
 
         let queue_ocr_sql = format!(
             "INSERT OR IGNORE INTO delete_queue_ocr (id)
@@ -1465,9 +1481,9 @@ impl StorageState {
              WHERE o.is_deleted = 0 AND {}",
             filter_alias
         );
-        let queued_ocr = tx
-            .execute(&queue_ocr_sql, params_ref.as_slice())
-            .map_err(|e| format!("Failed to queue OCR rows: {}", e))? as i64;
+        let queued_ocr =
+            tx.execute(&queue_ocr_sql, params_ref.as_slice())
+                .map_err(|e| format!("Failed to queue OCR rows: {}", e))? as i64;
 
         let mark_ocr_sql = format!(
             "UPDATE ocr_results
@@ -1476,9 +1492,9 @@ impl StorageState {
                AND screenshot_id IN (SELECT id FROM screenshots WHERE {})",
             filter_plain
         );
-        let ocr_marked = tx
-            .execute(&mark_ocr_sql, params_ref.as_slice())
-            .map_err(|e| format!("Failed to mark OCR rows deleted: {}", e))? as i64;
+        let ocr_marked =
+            tx.execute(&mark_ocr_sql, params_ref.as_slice())
+                .map_err(|e| format!("Failed to mark OCR rows deleted: {}", e))? as i64;
 
         let mark_screenshots_sql = format!(
             "UPDATE screenshots SET is_deleted = 1 WHERE {}",
@@ -1486,7 +1502,8 @@ impl StorageState {
         );
         let screenshots_marked = tx
             .execute(&mark_screenshots_sql, params_ref.as_slice())
-            .map_err(|e| format!("Failed to mark screenshots deleted: {}", e))? as i64;
+            .map_err(|e| format!("Failed to mark screenshots deleted: {}", e))?
+            as i64;
 
         tx.commit()
             .map_err(|e| format!("Failed to commit soft-delete transaction: {}", e))?;
@@ -1514,7 +1531,11 @@ impl StorageState {
         &self,
         screenshot_ids: &[i64],
     ) -> Result<SoftDeleteScreenshotsResult, String> {
-        let mut normalized_ids: Vec<i64> = screenshot_ids.iter().copied().filter(|id| *id > 0).collect();
+        let mut normalized_ids: Vec<i64> = screenshot_ids
+            .iter()
+            .copied()
+            .filter(|id| *id > 0)
+            .collect();
         normalized_ids.sort_unstable();
         normalized_ids.dedup();
 
@@ -1697,10 +1718,14 @@ impl StorageState {
         let conn = guard.as_ref().unwrap();
 
         let pending_screenshots: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| format!("Failed to count screenshot queue: {}", e))?;
         let pending_ocr: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| format!("Failed to count OCR queue: {}", e))?;
 
         Ok(DeleteQueueStatus {
@@ -1730,7 +1755,9 @@ impl StorageState {
                 .map_err(|e| format!("Failed to prepare OCR queue read: {}", e))?;
 
             let mapped_rows = read_stmt
-                .query_map([safe_batch_size], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .query_map([safe_batch_size], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
                 .map_err(|e| format!("Failed to read OCR queue rows: {}", e))?;
 
             let collected: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> =
@@ -1773,7 +1800,9 @@ impl StorageState {
 
         if !removals.is_empty() {
             let mut get_stmt = tx
-                .prepare_cached("SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1")
+                .prepare_cached(
+                    "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
+                )
                 .map_err(|e| format!("Failed to prepare bitmap read: {}", e))?;
             let mut put_stmt = tx
                 .prepare_cached(
@@ -1826,8 +1855,10 @@ impl StorageState {
             tx.execute(&sql_delete_ocr, params_ocr.as_slice())
                 .map_err(|e| format!("Failed to hard-delete OCR rows: {}", e))?;
 
-            let sql_delete_queue =
-                format!("DELETE FROM delete_queue_ocr WHERE id IN ({})", placeholders);
+            let sql_delete_queue = format!(
+                "DELETE FROM delete_queue_ocr WHERE id IN ({})",
+                placeholders
+            );
             let params_queue: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
             tx.execute(&sql_delete_queue, params_queue.as_slice())
@@ -1862,7 +1893,9 @@ impl StorageState {
             .map_err(|e| format!("Failed to prepare screenshot queue read: {}", e))?;
 
         let rows: Vec<(i64, Option<String>, Option<String>)> = stmt
-            .query_map([safe_batch_size], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([safe_batch_size], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .map_err(|e| format!("Failed to read screenshot queue rows: {}", e))?
             .filter_map(|r| r.ok())
             .collect();
@@ -1922,8 +1955,10 @@ impl StorageState {
                 .map_err(|e| format!("Failed to hard-delete screenshots: {}", e))?;
             deleted_screenshots += deleted;
 
-            let sql_delete_queue =
-                format!("DELETE FROM delete_queue_screenshots WHERE id IN ({})", placeholders);
+            let sql_delete_queue = format!(
+                "DELETE FROM delete_queue_screenshots WHERE id IN ({})",
+                placeholders
+            );
             let params_queue: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
             tx.execute(&sql_delete_queue, params_queue.as_slice())
@@ -1948,10 +1983,14 @@ impl StorageState {
         let conn = guard.as_ref().unwrap();
 
         let pending_screenshots: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| format!("Failed to count screenshot queue: {}", e))?;
         let pending_ocr: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| format!("Failed to count OCR queue: {}", e))?;
 
         if pending_screenshots > 0 || pending_ocr > 0 {
@@ -1985,7 +2024,10 @@ impl StorageState {
 
     /// Get or create a page_icon dedup entry. Returns the row ID.
     /// Uses INSERT OR IGNORE + SELECT pattern for atomic upsert.
-    pub(crate) fn get_or_create_page_icon_id(conn: &Connection, plaintext: &str) -> Result<i64, String> {
+    pub(crate) fn get_or_create_page_icon_id(
+        conn: &Connection,
+        plaintext: &str,
+    ) -> Result<i64, String> {
         let content_hash = Self::compute_static_hash(plaintext);
 
         // Try to find existing entry first (fast path)

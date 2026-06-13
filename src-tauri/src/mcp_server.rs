@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
 
 use crate::credential_manager::{
-    self, encrypt_with_master_key, decrypt_with_master_key, CredentialManagerState,
+    self, decrypt_with_master_key, encrypt_with_master_key, CredentialManagerState,
 };
 use crate::monitor::{self, MonitorState};
 use crate::sensitive_filter::SensitiveFilterState;
@@ -127,10 +127,24 @@ struct JsonRpcError {
 
 impl JsonRpcResponse {
     fn success(id: Option<Value>, result: Value) -> Self {
-        Self { jsonrpc: "2.0".into(), id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
     fn error(id: Option<Value>, code: i64, message: String) -> Self {
-        Self { jsonrpc: "2.0".into(), id, result: None, error: Some(JsonRpcError { code, message, data: None }) }
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message,
+                data: None,
+            }),
+        }
     }
 }
 
@@ -143,13 +157,20 @@ async fn auth_middleware(
 ) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let auth_header = req.headers().get("authorization").and_then(|v| v.to_str().ok());
+    let auth_header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
 
     let token = match auth_header {
         Some(h) if h.starts_with("Bearer ") => &h[7..],
         _ => {
             tracing::warn!("MCP {} {} — 401 missing/invalid auth header", method, uri);
-            return (StatusCode::UNAUTHORIZED, "Missing or invalid Authorization header").into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Missing or invalid Authorization header",
+            )
+                .into_response();
         }
     };
 
@@ -185,9 +206,7 @@ async fn handle_mcp(
 
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(req.id, &state.skill_instructions),
-        "notifications/initialized" => {
-            JsonRpcResponse::success(req.id, serde_json::json!({}))
-        }
+        "notifications/initialized" => JsonRpcResponse::success(req.id, serde_json::json!({})),
         "ping" => JsonRpcResponse::success(req.id, serde_json::json!({})),
         "tools/list" => handle_tools_list(req.id),
         "tools/call" => handle_tools_call(&state, req.id, req.params).await,
@@ -201,17 +220,20 @@ async fn handle_mcp(
 }
 
 fn handle_initialize(id: Option<Value>, instructions: &str) -> JsonRpcResponse {
-    JsonRpcResponse::success(id, serde_json::json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": {
-            "tools": {}
-        },
-        "serverInfo": {
-            "name": "CarbonPaper",
-            "version": env!("CARGO_PKG_VERSION")
-        },
-        "instructions": instructions
-    }))
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {
+                "tools": {}
+            },
+            "serverInfo": {
+                "name": "CarbonPaper",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "instructions": instructions
+        }),
+    )
 }
 
 // ==================== Tool definitions ====================
@@ -334,7 +356,10 @@ async fn handle_tools_call(
     };
 
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
 
     tracing::info!("MCP tools/call: tool={}", tool_name);
 
@@ -352,19 +377,24 @@ async fn handle_tools_call(
     match result {
         Ok(content) => {
             tracing::info!("MCP tools/call: tool={} — ok", tool_name);
-            JsonRpcResponse::success(id, serde_json::json!({
-                "content": [{ "type": "text", "text": content.to_string() }]
-            }))
+            JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{ "type": "text", "text": content.to_string() }]
+                }),
+            )
         }
         Err(e) => {
             tracing::warn!("MCP tools/call: tool={} — error: {}", tool_name, e);
-            let code = if e.contains("AUTH_REQUIRED") || e.contains("CNG") || e.contains("authentication") {
-                -32001 // CNG auth required
-            } else if e.contains("Monitor not started") {
-                -32002 // Monitor not running
-            } else {
-                -32000 // Generic tool error
-            };
+            let code =
+                if e.contains("AUTH_REQUIRED") || e.contains("CNG") || e.contains("authentication")
+                {
+                    -32001 // CNG auth required
+                } else if e.contains("Monitor not started") {
+                    -32002 // Monitor not running
+                } else {
+                    -32000 // Generic tool error
+                };
             JsonRpcResponse::error(id, code, e)
         }
     }
@@ -404,10 +434,13 @@ async fn presidio_analyze_texts(
         "language": language,
     });
     if !entity_types.is_empty() {
-        payload.as_object_mut().expect("just constructed as object").insert(
-            "entity_types".to_string(),
-            serde_json::to_value(entity_types).unwrap(),
-        );
+        payload
+            .as_object_mut()
+            .expect("just constructed as object")
+            .insert(
+                "entity_types".to_string(),
+                serde_json::to_value(entity_types).unwrap(),
+            );
     }
 
     let result = match tokio::time::timeout(
@@ -525,15 +558,27 @@ fn decode_url_for_filter(url: &str) -> String {
 async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value, String> {
     require_authenticated_session(&state.app_handle)?;
 
-    let start_time = args.get("start_time").and_then(|v| v.as_f64())
+    let start_time = args
+        .get("start_time")
+        .and_then(|v| v.as_f64())
         .ok_or("Missing required parameter: start_time")?;
-    let end_time = args.get("end_time").and_then(|v| v.as_f64())
+    let end_time = args
+        .get("end_time")
+        .and_then(|v| v.as_f64())
         .ok_or("Missing required parameter: end_time")?;
     let max_records = args.get("max_records").and_then(|v| v.as_i64());
 
     // Convert ms to seconds if needed
-    let start_ts = if start_time > 10_000_000_000.0 { start_time / 1000.0 } else { start_time };
-    let end_ts = if end_time > 10_000_000_000.0 { end_time / 1000.0 } else { end_time };
+    let start_ts = if start_time > 10_000_000_000.0 {
+        start_time / 1000.0
+    } else {
+        start_time
+    };
+    let end_ts = if end_time > 10_000_000_000.0 {
+        end_time / 1000.0
+    } else {
+        end_time
+    };
 
     let storage = state.app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
@@ -544,8 +589,13 @@ async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value
 
     let mut records: Vec<_> = tokio::task::spawn_blocking(move || {
         let filter_mode = filter.get_mode();
-        let records = storage.get_screenshots_by_time_range_limited(start_ts, end_ts, max_records.or(Some(500)))?;
-        let records: Vec<_> = records.into_iter()
+        let records = storage.get_screenshots_by_time_range_limited(
+            start_ts,
+            end_ts,
+            max_records.or(Some(500)),
+        )?;
+        let records: Vec<_> = records
+            .into_iter()
             .filter(|r| {
                 match filter_mode.as_str() {
                     // In remove_paragraph/mask mode, don't reject based on window_title alone
@@ -575,10 +625,12 @@ async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value
 
     // Presidio second-pass: filter records whose window titles contain PII
     if presidio_enabled && !records.is_empty() {
-        let titles: Vec<String> = records.iter()
+        let titles: Vec<String> = records
+            .iter()
             .map(|r| r.window_title.clone().unwrap_or_default())
             .collect();
-        let pii_results = presidio_analyze_texts(&app_handle, &titles, &presidio_lang, &presidio_entities).await;
+        let pii_results =
+            presidio_analyze_texts(&app_handle, &titles, &presidio_lang, &presidio_entities).await;
         let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
         let mode = filter_reload.get_mode();
         match mode.as_str() {
@@ -614,29 +666,43 @@ async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value
     }
 
     // Build compact response (strip metadata, image_hash, image_path which are not useful to AI clients)
-    let output: Vec<Value> = records.iter().map(|r| {
-        let mut obj = serde_json::json!({
-            "id": r.id,
-            "window_title": r.window_title,
-            "process_name": r.process_name,
-            "created_at": r.created_at,
-            "timestamp": r.timestamp,
-        });
-        let m = obj.as_object_mut().expect("just constructed as object");
-        if let Some(ref v) = r.source { m.insert("source".into(), serde_json::json!(v)); }
-        if let Some(ref v) = r.page_url { m.insert("page_url".into(), serde_json::json!(v)); }
-        if let Some(ref v) = r.category { m.insert("category".into(), serde_json::json!(v)); }
-        obj
-    }).collect();
+    let output: Vec<Value> = records
+        .iter()
+        .map(|r| {
+            let mut obj = serde_json::json!({
+                "id": r.id,
+                "window_title": r.window_title,
+                "process_name": r.process_name,
+                "created_at": r.created_at,
+                "timestamp": r.timestamp,
+            });
+            let m = obj.as_object_mut().expect("just constructed as object");
+            if let Some(ref v) = r.source {
+                m.insert("source".into(), serde_json::json!(v));
+            }
+            if let Some(ref v) = r.page_url {
+                m.insert("page_url".into(), serde_json::json!(v));
+            }
+            if let Some(ref v) = r.category {
+                m.insert("category".into(), serde_json::json!(v));
+            }
+            obj
+        })
+        .collect();
     Ok(Value::Array(output))
 }
 
 async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Result<Value, String> {
     require_authenticated_session(&state.app_handle)?;
 
-    let id = args.get("id").and_then(|v| v.as_i64())
+    let id = args
+        .get("id")
+        .and_then(|v| v.as_i64())
         .ok_or("Missing required parameter: id")?;
-    let include_coords = args.get("include_coords").and_then(|v| v.as_bool()).unwrap_or(false);
+    let include_coords = args
+        .get("include_coords")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let storage = state.app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
@@ -660,9 +726,13 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
                     // reject → reject entire record
                     // remove_paragraph → replace with [censored]
                     // mask → character-level mask (█)
-                    let title_sensitive = r.window_title.as_ref()
+                    let title_sensitive = r
+                        .window_title
+                        .as_ref()
                         .is_some_and(|t| filter.contains_sensitive(t));
-                    let url_sensitive = r.page_url.as_ref()
+                    let url_sensitive = r
+                        .page_url
+                        .as_ref()
                         .is_some_and(|u| filter.contains_sensitive(&decode_url_for_filter(u)));
 
                     if title_sensitive || url_sensitive {
@@ -701,14 +771,20 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
                                 }
                             }
                             "remove_paragraph" => {
-                                let filtered: Vec<_> = links.iter()
+                                let filtered: Vec<_> = links
+                                    .iter()
                                     .filter(|l| !filter.contains_sensitive(&l.text))
                                     .cloned()
                                     .collect();
-                                r.visible_links = if filtered.is_empty() { None } else { Some(filtered) };
+                                r.visible_links = if filtered.is_empty() {
+                                    None
+                                } else {
+                                    Some(filtered)
+                                };
                             }
                             "mask" => {
-                                let masked: Vec<_> = links.iter()
+                                let masked: Vec<_> = links
+                                    .iter()
                                     .map(|l| crate::storage::VisibleLink {
                                         text: filter.mask_sensitive(&l.text),
                                         url: l.url.clone(),
@@ -723,22 +799,28 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
                     // --- OCR texts (paragraph-level content) ---
                     match filter_mode.as_str() {
                         "reject" => {
-                            let any_sensitive = ocr_results.iter()
+                            let any_sensitive = ocr_results
+                                .iter()
                                 .any(|o| filter.contains_sensitive(&o.text));
                             if any_sensitive {
                                 return Ok((r, ocr_results, None, true));
                             }
                         }
                         "remove_paragraph" => {
-                            let ocr_results: Vec<_> = ocr_results.into_iter()
+                            let ocr_results: Vec<_> = ocr_results
+                                .into_iter()
                                 .filter(|o| !filter.contains_sensitive(&o.text))
                                 .collect();
                             let related = storage.get_related_screenshots(r.id, 0)?;
                             return Ok((r, ocr_results, Some(related), false));
                         }
                         "mask" => {
-                            let ocr_results: Vec<_> = ocr_results.into_iter()
-                                .map(|mut o| { o.text = filter.mask_sensitive(&o.text); o })
+                            let ocr_results: Vec<_> = ocr_results
+                                .into_iter()
+                                .map(|mut o| {
+                                    o.text = filter.mask_sensitive(&o.text);
+                                    o
+                                })
                                 .collect();
                             let related = storage.get_related_screenshots(r.id, 0)?;
                             return Ok((r, ocr_results, Some(related), false));
@@ -806,7 +888,9 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
             all_texts.push(decode_url_for_filter(url));
         }
 
-        let pii_results = presidio_analyze_texts(&app_handle, &all_texts, &presidio_lang, &presidio_entities).await;
+        let pii_results =
+            presidio_analyze_texts(&app_handle, &all_texts, &presidio_lang, &presidio_entities)
+                .await;
 
         let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
         let mode = filter_reload.get_mode();
@@ -915,10 +999,16 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
     let ocr_value: Value = if include_coords {
         serde_json::to_value(&ocr_results).unwrap_or(Value::Null)
     } else {
-        ocr_results.iter().map(|o| serde_json::json!({
-            "text": o.text,
-            "confidence": o.confidence,
-        })).collect::<Vec<_>>().into()
+        ocr_results
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "text": o.text,
+                    "confidence": o.confidence,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into()
     };
     let task = if related.task_id >= 0 {
         serde_json::json!({
@@ -938,16 +1028,21 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
 async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, String> {
     require_authenticated_session(&state.app_handle)?;
 
-    let query = args.get("query").and_then(|v| v.as_str())
-        .ok_or("Missing required parameter: query")?.to_string();
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing required parameter: query")?
+        .to_string();
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20) as i32;
     let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     let fuzzy = args.get("fuzzy").and_then(|v| v.as_bool()).unwrap_or(true);
-    let process_names: Option<Vec<String>> = args.get("process_names")
+    let process_names: Option<Vec<String>> = args
+        .get("process_names")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
     let start_time = args.get("start_time").and_then(|v| v.as_f64());
     let end_time = args.get("end_time").and_then(|v| v.as_f64());
-    let categories: Option<Vec<String>> = args.get("categories")
+    let categories: Option<Vec<String>> = args
+        .get("categories")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     let storage = state.app_handle.state::<Arc<StorageState>>();
@@ -958,12 +1053,19 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
     let app_handle = state.app_handle.clone();
 
     let mut results = tokio::task::spawn_blocking(move || {
-        let results = storage.search_text(&query, limit, offset, fuzzy, process_names, start_time, end_time, categories)?;
-        let results: Vec<_> = results.into_iter()
-            .filter(|r| !filter.is_record_sensitive(
-                r.window_title.as_deref(),
-                &[r.text.as_str()],
-            ))
+        let results = storage.search_text(
+            &query,
+            limit,
+            offset,
+            fuzzy,
+            process_names,
+            start_time,
+            end_time,
+            categories,
+        )?;
+        let results: Vec<_> = results
+            .into_iter()
+            .filter(|r| !filter.is_record_sensitive(r.window_title.as_deref(), &[r.text.as_str()]))
             .collect();
         Ok::<_, String>(results)
     })
@@ -972,10 +1074,9 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
 
     // Presidio second-pass on search results
     if presidio_enabled && !results.is_empty() {
-        let texts: Vec<String> = results.iter()
-            .map(|r| r.text.clone())
-            .collect();
-        let pii_results = presidio_analyze_texts(&app_handle, &texts, &presidio_lang, &presidio_entities).await;
+        let texts: Vec<String> = results.iter().map(|r| r.text.clone()).collect();
+        let pii_results =
+            presidio_analyze_texts(&app_handle, &texts, &presidio_lang, &presidio_entities).await;
         let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
         let mode = filter_reload.get_mode();
         match mode.as_str() {
@@ -1000,20 +1101,23 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
     }
 
     // Strip box_coords to save tokens — not useful in MCP search results
-    let stripped: Vec<Value> = results.iter().map(|r| {
-        serde_json::json!({
-            "id": r.id,
-            "screenshot_id": r.screenshot_id,
-            "text": r.text,
-            "confidence": r.confidence,
-            "image_path": r.image_path,
-            "window_title": r.window_title,
-            "process_name": r.process_name,
-            "category": r.category,
-            "created_at": r.created_at,
-            "screenshot_created_at": r.screenshot_created_at,
+    let stripped: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "screenshot_id": r.screenshot_id,
+                "text": r.text,
+                "confidence": r.confidence,
+                "image_path": r.image_path,
+                "window_title": r.window_title,
+                "process_name": r.process_name,
+                "category": r.category,
+                "created_at": r.created_at,
+                "screenshot_created_at": r.screenshot_created_at,
+            })
         })
-    }).collect();
+        .collect();
 
     Ok(serde_json::to_value(&stripped).unwrap_or(Value::Null))
 }
@@ -1043,22 +1147,31 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
         if !filter.is_enabled() {
             return true;
         }
-        let title = item.get("metadata")
+        let title = item
+            .get("metadata")
             .and_then(|m| m.get("window_title"))
             .and_then(|v| v.as_str())
             .or_else(|| item.get("window_title").and_then(|v| v.as_str()));
         let ocr = item.get("ocr_text").and_then(|v| v.as_str());
         let mut texts: Vec<&str> = Vec::new();
-        if let Some(t) = ocr { texts.push(t); }
+        if let Some(t) = ocr {
+            texts.push(t);
+        }
         !filter.is_record_sensitive(title, &texts)
     };
 
     // Extract items array from the response
     let mut items: Vec<Value> = if let Some(arr) = result.as_array() {
-        arr.iter().filter(|item| dict_filter(item)).cloned().collect()
+        arr.iter()
+            .filter(|item| dict_filter(item))
+            .cloned()
+            .collect()
     } else if let Some(obj) = result.as_object() {
         if let Some(arr) = obj.get("results").and_then(|v| v.as_array()) {
-            arr.iter().filter(|item| dict_filter(item)).cloned().collect()
+            arr.iter()
+                .filter(|item| dict_filter(item))
+                .cloned()
+                .collect()
         } else {
             return Ok(result.clone());
         }
@@ -1068,7 +1181,8 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
 
     // Presidio second-pass (tier 2)
     if presidio_enabled && !items.is_empty() {
-        let texts: Vec<String> = items.iter()
+        let texts: Vec<String> = items
+            .iter()
             .map(|item| {
                 item.get("ocr_text")
                     .and_then(|v| v.as_str())
@@ -1076,29 +1190,41 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
                     .to_string()
             })
             .collect();
-        let pii_results = presidio_analyze_texts(&state.app_handle, &texts, &presidio_lang, &presidio_entities).await;
+        let pii_results = presidio_analyze_texts(
+            &state.app_handle,
+            &texts,
+            &presidio_lang,
+            &presidio_entities,
+        )
+        .await;
         let mode = filter.get_mode();
 
-        items = items.into_iter().enumerate().filter_map(|(i, mut item)| {
-            if !has_pii(&pii_results[i]) {
-                return Some(item);
-            }
-            match mode.as_str() {
-                "reject" | "remove_paragraph" => None,
-                "mask" => {
-                    if let Some(ocr) = item.get("ocr_text").and_then(|v| v.as_str()) {
-                        let masked = mask_pii_in_text(ocr, &pii_results[i]);
-                        item.as_object_mut().map(|o| o.insert("ocr_text".to_string(), Value::String(masked)));
-                    }
-                    Some(item)
+        items = items
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, mut item)| {
+                if !has_pii(&pii_results[i]) {
+                    return Some(item);
                 }
-                _ => Some(item),
-            }
-        }).collect();
+                match mode.as_str() {
+                    "reject" | "remove_paragraph" => None,
+                    "mask" => {
+                        if let Some(ocr) = item.get("ocr_text").and_then(|v| v.as_str()) {
+                            let masked = mask_pii_in_text(ocr, &pii_results[i]);
+                            item.as_object_mut()
+                                .map(|o| o.insert("ocr_text".to_string(), Value::String(masked)));
+                        }
+                        Some(item)
+                    }
+                    _ => Some(item),
+                }
+            })
+            .collect();
     }
 
     // Resolve screenshot_ids from image_hash and clean up output
-    let hashes: Vec<String> = items.iter()
+    let hashes: Vec<String> = items
+        .iter()
         .filter_map(|item| {
             item.get("image_path")
                 .and_then(|v| v.as_str())
@@ -1110,44 +1236,54 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
     let hash_to_id = if !hashes.is_empty() {
         let storage = state.app_handle.state::<Arc<StorageState>>();
         let storage = storage.inner().clone();
-        tokio::task::spawn_blocking(move || {
-            storage.batch_get_screenshot_ids_by_hash(&hashes)
-        })
-        .await
-        .map_err(|e| format!("Task join error: {:?}", e))?
-        .unwrap_or_default()
+        tokio::task::spawn_blocking(move || storage.batch_get_screenshot_ids_by_hash(&hashes))
+            .await
+            .map_err(|e| format!("Task join error: {:?}", e))?
+            .unwrap_or_default()
     } else {
         std::collections::HashMap::new()
     };
 
     // Build clean output: add screenshot_id, flatten metadata, remove internal fields
-    let cleaned: Vec<Value> = items.iter().map(|item| {
-        let image_path = item.get("image_path").and_then(|v| v.as_str()).unwrap_or("");
-        let screenshot_id = image_path
-            .strip_prefix("memory://")
-            .and_then(|hash| hash_to_id.get(hash));
+    let cleaned: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let image_path = item
+                .get("image_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let screenshot_id = image_path
+                .strip_prefix("memory://")
+                .and_then(|hash| hash_to_id.get(hash));
 
-        let window_title = item.get("metadata")
-            .and_then(|m| m.get("window_title"))
-            .and_then(|v| v.as_str())
-            .or_else(|| item.get("window_title").and_then(|v| v.as_str()));
-        let process_name = item.get("metadata")
-            .and_then(|m| m.get("process_name"))
-            .and_then(|v| v.as_str())
-            .or_else(|| item.get("process_name").and_then(|v| v.as_str()));
+            let window_title = item
+                .get("metadata")
+                .and_then(|m| m.get("window_title"))
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("window_title").and_then(|v| v.as_str()));
+            let process_name = item
+                .get("metadata")
+                .and_then(|m| m.get("process_name"))
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("process_name").and_then(|v| v.as_str()));
 
-        let mut obj = serde_json::json!({
-            "screenshot_id": screenshot_id,
-            "ocr_text": item.get("ocr_text"),
-            "distance": item.get("distance"),
-            "similarity": item.get("similarity"),
-            "screenshot_created_at": item.get("screenshot_created_at"),
-        });
-        let m = obj.as_object_mut().expect("just constructed as object");
-        if let Some(t) = window_title { m.insert("window_title".into(), Value::String(t.to_string())); }
-        if let Some(p) = process_name { m.insert("process_name".into(), Value::String(p.to_string())); }
-        obj
-    }).collect();
+            let mut obj = serde_json::json!({
+                "screenshot_id": screenshot_id,
+                "ocr_text": item.get("ocr_text"),
+                "distance": item.get("distance"),
+                "similarity": item.get("similarity"),
+                "screenshot_created_at": item.get("screenshot_created_at"),
+            });
+            let m = obj.as_object_mut().expect("just constructed as object");
+            if let Some(t) = window_title {
+                m.insert("window_title".into(), Value::String(t.to_string()));
+            }
+            if let Some(p) = process_name {
+                m.insert("process_name".into(), Value::String(p.to_string()));
+            }
+            obj
+        })
+        .collect();
 
     Ok(Value::Array(cleaned))
 }
@@ -1171,20 +1307,25 @@ async fn tool_get_task_clusters(state: &McpServerInner, args: Value) -> Result<V
     let mut tasks = tokio::task::spawn_blocking(move || {
         let filter_mode = filter.get_mode();
         let tasks = storage_clone.get_tasks(
-            layer_clone.as_deref(), start_time, end_time,
-            hide_inactive, None, None,
+            layer_clone.as_deref(),
+            start_time,
+            end_time,
+            hide_inactive,
+            None,
+            None,
         )?;
-        let tasks: Vec<_> = tasks.into_iter()
-            .filter(|t| {
-                match filter_mode.as_str() {
-                    "remove_paragraph" | "mask" => true,
-                    _ => {
-                        let label = t.label.as_deref();
-                        let auto_label = t.auto_label.as_deref();
-                        let mut texts: Vec<&str> = Vec::new();
-                        if let Some(l) = auto_label { texts.push(l); }
-                        !filter.is_record_sensitive(label, &texts)
+        let tasks: Vec<_> = tasks
+            .into_iter()
+            .filter(|t| match filter_mode.as_str() {
+                "remove_paragraph" | "mask" => true,
+                _ => {
+                    let label = t.label.as_deref();
+                    let auto_label = t.auto_label.as_deref();
+                    let mut texts: Vec<&str> = Vec::new();
+                    if let Some(l) = auto_label {
+                        texts.push(l);
                     }
+                    !filter.is_record_sensitive(label, &texts)
                 }
             })
             .map(|mut t| {
@@ -1236,7 +1377,9 @@ async fn tool_get_task_clusters(state: &McpServerInner, args: Value) -> Result<V
             });
             pii_indices.push((label_idx, auto_label_idx));
         }
-        let pii_results = presidio_analyze_texts(&app_handle, &all_texts, &presidio_lang, &presidio_entities).await;
+        let pii_results =
+            presidio_analyze_texts(&app_handle, &all_texts, &presidio_lang, &presidio_entities)
+                .await;
         let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
         let mode = filter_reload.get_mode();
         match mode.as_str() {
@@ -1288,7 +1431,9 @@ async fn tool_get_task_clusters(state: &McpServerInner, args: Value) -> Result<V
 async fn tool_get_task_screenshots(state: &McpServerInner, args: Value) -> Result<Value, String> {
     require_authenticated_session(&state.app_handle)?;
 
-    let task_id = args.get("task_id").and_then(|v| v.as_i64())
+    let task_id = args
+        .get("task_id")
+        .and_then(|v| v.as_i64())
         .ok_or("Missing required parameter: task_id")?;
     let page = args.get("page").and_then(|v| v.as_i64()).unwrap_or(0);
     let page_size = args.get("page_size").and_then(|v| v.as_i64()).unwrap_or(50);
@@ -1303,12 +1448,11 @@ async fn tool_get_task_screenshots(state: &McpServerInner, args: Value) -> Resul
     let mut screenshots = tokio::task::spawn_blocking(move || {
         let filter_mode = filter.get_mode();
         let screenshots = storage.get_task_screenshots(task_id, page, page_size)?;
-        let screenshots: Vec<_> = screenshots.into_iter()
-            .filter(|s| {
-                match filter_mode.as_str() {
-                    "remove_paragraph" | "mask" => true,
-                    _ => !filter.is_record_sensitive(s.window_title.as_deref(), &[]),
-                }
+        let screenshots: Vec<_> = screenshots
+            .into_iter()
+            .filter(|s| match filter_mode.as_str() {
+                "remove_paragraph" | "mask" => true,
+                _ => !filter.is_record_sensitive(s.window_title.as_deref(), &[]),
             })
             .map(|mut s| {
                 if filter.is_enabled() {
@@ -1331,10 +1475,12 @@ async fn tool_get_task_screenshots(state: &McpServerInner, args: Value) -> Resul
 
     // Presidio second-pass on window titles
     if presidio_enabled && !screenshots.is_empty() {
-        let titles: Vec<String> = screenshots.iter()
+        let titles: Vec<String> = screenshots
+            .iter()
             .map(|s| s.window_title.clone().unwrap_or_default())
             .collect();
-        let pii_results = presidio_analyze_texts(&app_handle, &titles, &presidio_lang, &presidio_entities).await;
+        let pii_results =
+            presidio_analyze_texts(&app_handle, &titles, &presidio_lang, &presidio_entities).await;
         let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
         let mode = filter_reload.get_mode();
         match mode.as_str() {
@@ -1374,19 +1520,22 @@ async fn tool_get_task_screenshots(state: &McpServerInner, args: Value) -> Resul
 async fn tool_rename_task(state: &McpServerInner, args: Value) -> Result<Value, String> {
     require_authenticated_session(&state.app_handle)?;
 
-    let task_id = args.get("task_id").and_then(|v| v.as_i64())
+    let task_id = args
+        .get("task_id")
+        .and_then(|v| v.as_i64())
         .ok_or("Missing required parameter: task_id")?;
-    let label = args.get("label").and_then(|v| v.as_str())
-        .ok_or("Missing required parameter: label")?.to_string();
+    let label = args
+        .get("label")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing required parameter: label")?
+        .to_string();
 
     let storage = state.app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
-    tokio::task::spawn_blocking(move || {
-        storage.update_task_label(task_id, &label)
-    })
-    .await
-    .map_err(|e| format!("Task join error: {:?}", e))?
-    .map(|_| serde_json::json!({"status": "ok"}))
+    tokio::task::spawn_blocking(move || storage.update_task_label(task_id, &label))
+        .await
+        .map_err(|e| format!("Task join error: {:?}", e))?
+        .map(|_| serde_json::json!({"status": "ok"}))
 }
 
 // ==================== Token helpers ====================
@@ -1411,18 +1560,28 @@ pub fn generate_token() -> String {
 }
 
 /// Encrypt a token with the MCP-derived key and return base64.
-pub fn encrypt_token(credential_state: &CredentialManagerState, token: &str) -> Result<String, String> {
+pub fn encrypt_token(
+    credential_state: &CredentialManagerState,
+    token: &str,
+) -> Result<String, String> {
     let key = derive_mcp_key(credential_state)?;
     let encrypted = encrypt_with_master_key(&key, token.as_bytes())
         .map_err(|e| format!("Token encryption failed: {}", e))?;
-    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encrypted))
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &encrypted,
+    ))
 }
 
 /// Decrypt a base64-encoded encrypted token.
-pub fn decrypt_token(credential_state: &CredentialManagerState, encrypted_b64: &str) -> Result<String, String> {
+pub fn decrypt_token(
+    credential_state: &CredentialManagerState,
+    encrypted_b64: &str,
+) -> Result<String, String> {
     let key = derive_mcp_key(credential_state)?;
-    let encrypted = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypted_b64)
-        .map_err(|e| format!("Base64 decode failed: {}", e))?;
+    let encrypted =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypted_b64)
+            .map_err(|e| format!("Base64 decode failed: {}", e))?;
     let decrypted = decrypt_with_master_key(&key, &encrypted)
         .map_err(|e| format!("Token decryption failed: {}", e))?;
     String::from_utf8(decrypted).map_err(|e| format!("Invalid UTF-8: {}", e))
@@ -1446,7 +1605,9 @@ async fn presidio_unload_model(app_handle: &tauri::AppHandle) {
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         monitor::forward_command_to_python(&monitor_state, payload),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(_)) => tracing::info!("Presidio model unloaded via IPC"),
         Ok(Err(e)) => tracing::debug!("Presidio unload IPC error (non-fatal): {}", e),
         Err(_) => tracing::debug!("Presidio unload IPC timeout"),
@@ -1463,9 +1624,14 @@ async fn presidio_check_idle(app_handle: &tauri::AppHandle) {
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         monitor::forward_command_to_python(&monitor_state, payload),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(val)) => {
-            let unloaded = val.get("unloaded").and_then(|v| v.as_bool()).unwrap_or(false);
+            let unloaded = val
+                .get("unloaded")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if unloaded {
                 tracing::info!("Presidio model idle-unloaded");
             }
@@ -1493,21 +1659,31 @@ pub async fn start_server(
     }
 
     // Load skill instructions from bundled resource, fall back to compile-time embedded version.
-    let skill_instructions = app_handle.path()
+    let skill_instructions = app_handle
+        .path()
         .resource_dir()
         .ok()
         .map(|dir| dir.join("ai_embedding").join("skill.md"))
         .and_then(|path| std::fs::read_to_string(&path).ok())
         .unwrap_or_else(|| {
-            tracing::warn!("Failed to load ai_embedding/skill.md from resource dir, using embedded fallback");
+            tracing::warn!(
+                "Failed to load ai_embedding/skill.md from resource dir, using embedded fallback"
+            );
             SKILL_INSTRUCTIONS_FALLBACK.to_string()
         });
 
-    let inner = Arc::new(McpServerInner { app_handle: app_handle.clone(), token_hash, skill_instructions });
+    let inner = Arc::new(McpServerInner {
+        app_handle: app_handle.clone(),
+        token_hash,
+        skill_instructions,
+    });
 
     let app = Router::new()
         .route("/mcp", post(handle_mcp))
-        .layer(middleware::from_fn_with_state(inner.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            inner.clone(),
+            auth_middleware,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(inner);
 
@@ -1515,13 +1691,16 @@ pub async fn start_server(
 
     // Use TcpSocket with SO_REUSEADDR so we can always rebind the port,
     // even if a previous listener wasn't fully released by the OS yet.
-    let socket = tokio::net::TcpSocket::new_v4()
-        .map_err(|e| format!("Failed to create socket: {}", e))?;
-    socket.set_reuseaddr(true)
+    let socket =
+        tokio::net::TcpSocket::new_v4().map_err(|e| format!("Failed to create socket: {}", e))?;
+    socket
+        .set_reuseaddr(true)
         .map_err(|e| format!("Failed to set SO_REUSEADDR: {}", e))?;
-    socket.bind(addr)
+    socket
+        .bind(addr)
         .map_err(|e| format!("Failed to bind port {}: {}", port, e))?;
-    let listener = socket.listen(1024)
+    let listener = socket
+        .listen(1024)
         .map_err(|e| format!("Failed to listen on port {}: {}", port, e))?;
 
     tracing::info!("MCP server listening on http://127.0.0.1:{}/mcp", port);
@@ -1546,11 +1725,17 @@ pub async fn start_server(
 
     let mcp_runtime = app_handle.state::<McpRuntimeState>();
     {
-        let mut guard = mcp_runtime.server_handle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = mcp_runtime
+            .server_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *guard = Some(handle);
     }
     {
-        let mut guard = mcp_runtime.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = mcp_runtime
+            .shutdown_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *guard = Some(shutdown_tx);
     }
 
@@ -1565,7 +1750,10 @@ pub async fn start_server(
                 presidio_check_idle(&app_for_idle).await;
             }
         });
-        let mut guard = mcp_runtime.idle_check_handle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = mcp_runtime
+            .idle_check_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *guard = Some(idle_handle);
     }
 
@@ -1576,7 +1764,10 @@ pub async fn start_server(
 pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
     // Abort the idle check timer
     let idle_handle = {
-        let mut guard = mcp_runtime.idle_check_handle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = mcp_runtime
+            .idle_check_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.take()
     };
     if let Some(h) = idle_handle {
@@ -1588,7 +1779,10 @@ pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
     // Send shutdown signal — select! in the server task will drop the
     // serve future (and TcpListener).
     let tx = {
-        let mut guard = mcp_runtime.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = mcp_runtime
+            .shutdown_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.take()
     };
     if let Some(tx) = tx {
@@ -1596,7 +1790,10 @@ pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
         tracing::info!("MCP shutdown signal sent");
     }
     let handle = {
-        let mut guard = mcp_runtime.server_handle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = mcp_runtime
+            .server_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.take()
     };
     if let Some(handle) = handle {
@@ -1615,12 +1812,14 @@ pub async fn auto_start(
 ) -> Result<(), String> {
     let policy = storage_state.load_policy()?;
 
-    let port = policy.get("mcp_port")
+    let port = policy
+        .get("mcp_port")
         .and_then(|v| v.as_u64())
         .map(|v| v as u16)
         .unwrap_or(DEFAULT_MCP_PORT);
 
-    let encrypted_b64 = policy.get("mcp_token_encrypted")
+    let encrypted_b64 = policy
+        .get("mcp_token_encrypted")
         .and_then(|v| v.as_str())
         .ok_or("No MCP token found in policy")?;
 
@@ -1634,7 +1833,9 @@ pub async fn auto_start(
 
 /// Get the configured port from policy.
 pub fn get_port(storage_state: &StorageState) -> u16 {
-    storage_state.load_policy().ok()
+    storage_state
+        .load_policy()
+        .ok()
         .and_then(|p| p.get("mcp_port").and_then(|v| v.as_u64()))
         .map(|v| v as u16)
         .unwrap_or(DEFAULT_MCP_PORT)

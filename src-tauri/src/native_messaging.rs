@@ -30,9 +30,10 @@ fn generate_nm_manifest(exe_path: &str, extension_ids: &[&str]) -> serde_json::V
 
 /// Get the path to the NMH executable
 fn get_nmh_exe_path() -> Result<PathBuf, String> {
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get current exe path: {}", e))?;
-    let exe_dir = current_exe.parent()
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Failed to get current exe path: {}", e))?;
+    let exe_dir = current_exe
+        .parent()
         .ok_or_else(|| "Failed to get exe directory".to_string())?;
     Ok(exe_dir.join("carbonpaper-nmh.exe"))
 }
@@ -73,7 +74,8 @@ fn register_nm_host(reg_key_path: &str, manifest_path: &std::path::Path) -> Resu
     use winreg::RegKey;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let (key, _) = hkcu.create_subkey(reg_key_path)
+    let (key, _) = hkcu
+        .create_subkey(reg_key_path)
         .map_err(|e| format!("Failed to create registry key {}: {}", reg_key_path, e))?;
 
     let manifest_path_str = manifest_path.to_string_lossy().to_string();
@@ -131,14 +133,15 @@ fn copy_extension_to_data_dir() -> Result<PathBuf, String> {
 }
 
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
-    std::fs::create_dir_all(dst)
-        .map_err(|e| format!("Failed to create dir {:?}: {}", dst, e))?;
+    std::fs::create_dir_all(dst).map_err(|e| format!("Failed to create dir {:?}: {}", dst, e))?;
 
-    for entry in std::fs::read_dir(src)
-        .map_err(|e| format!("Failed to read dir {:?}: {}", src, e))?
+    for entry in
+        std::fs::read_dir(src).map_err(|e| format!("Failed to read dir {:?}: {}", src, e))?
     {
         let entry = entry.map_err(|e| format!("Dir entry error: {}", e))?;
-        let file_type = entry.file_type().map_err(|e| format!("File type error: {}", e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("File type error: {}", e))?;
         let dest_path = dst.join(entry.file_name());
 
         if file_type.is_dir() {
@@ -154,19 +157,23 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 
 /// Find the browser-extension source directory (bundled with the app)
 fn find_extension_source_dir() -> Result<std::path::PathBuf, String> {
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get current exe path: {}", e))?;
-    let app_dir = current_exe.parent()
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Failed to get current exe path: {}", e))?;
+    let app_dir = current_exe
+        .parent()
         .and_then(|p| p.parent())
         .ok_or_else(|| "Failed to get app directory".to_string())?;
 
     let possible_sources = [
         app_dir.join("browser-extension"),
         current_exe.parent().unwrap().join("browser-extension"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("browser-extension"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("browser-extension"),
     ];
 
-    possible_sources.iter()
+    possible_sources
+        .iter()
         .find(|p| p.exists())
         .cloned()
         .ok_or_else(|| "Browser extension source directory not found".to_string())
@@ -177,7 +184,9 @@ fn read_manifest_version(dir: &std::path::Path) -> Option<String> {
     let manifest_path = dir.join("manifest.json");
     let content = std::fs::read_to_string(&manifest_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json.get("version").and_then(|v| v.as_str()).map(|s| s.to_string())
+    json.get("version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Sync the installed extension copy if the bundled source has a newer version.
@@ -328,7 +337,10 @@ fn open_browser_extensions_page(browser: &str, url: &str) {
         }
     }
 
-    tracing::warn!("Could not find {} browser executable, skipping extensions page open", browser);
+    tracing::warn!(
+        "Could not find {} browser executable, skipping extensions page open",
+        browser
+    );
 }
 
 #[tauri::command]

@@ -57,7 +57,9 @@ impl StorageState {
         dominant_color: Option<&str>,
     ) -> Result<i64, String> {
         let guard = self.get_connection_named("create_smart_cluster")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
             "INSERT INTO smart_clusters (anchor_text, threshold, dominant_color, enabled) \
              VALUES (?, ?, ?, 1)",
@@ -69,7 +71,9 @@ impl StorageState {
 
     pub fn list_smart_clusters(&self) -> Result<Vec<SmartClusterRecord>, String> {
         let guard = self.get_connection_named("list_smart_clusters")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         let mut stmt = conn
             .prepare(
                 "SELECT sc.id, sc.anchor_text, sc.threshold, sc.enabled, sc.dominant_color, \
@@ -105,7 +109,9 @@ impl StorageState {
 
     pub fn get_smart_cluster(&self, id: i64) -> Result<Option<SmartClusterRecord>, String> {
         let guard = self.get_connection_named("get_smart_cluster")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         match conn.query_row(
             "SELECT id, anchor_text, threshold, enabled, dominant_color, created_at, updated_at \
              FROM smart_clusters WHERE id = ?",
@@ -131,7 +137,9 @@ impl StorageState {
 
     pub fn delete_smart_cluster(&self, id: i64) -> Result<(), String> {
         let guard = self.get_connection_named("delete_smart_cluster")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute("DELETE FROM smart_clusters WHERE id = ?", params![id])
             .map_err(|e| format!("Failed to delete smart cluster: {}", e))?;
         Ok(())
@@ -139,7 +147,9 @@ impl StorageState {
 
     pub fn update_smart_cluster_anchor(&self, id: i64, anchor: &str) -> Result<(), String> {
         let guard = self.get_connection_named("update_smart_cluster_anchor")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
             "UPDATE smart_clusters SET anchor_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             params![anchor, id],
@@ -150,7 +160,9 @@ impl StorageState {
 
     pub fn update_smart_cluster_threshold(&self, id: i64, threshold: f64) -> Result<(), String> {
         let guard = self.get_connection_named("update_smart_cluster_threshold")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
             "UPDATE smart_clusters SET threshold = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             params![threshold, id],
@@ -161,7 +173,9 @@ impl StorageState {
 
     pub fn update_smart_cluster_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
         let guard = self.get_connection_named("update_smart_cluster_enabled")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
             "UPDATE smart_clusters SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             params![if enabled { 1 } else { 0 }, id],
@@ -180,7 +194,9 @@ impl StorageState {
         examples: &[SmartClusterExample],
     ) -> Result<(), String> {
         let mut guard = self.get_connection_named("save_smart_cluster_examples")?;
-        let conn = guard.as_mut().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to begin tx: {}", e))?;
@@ -213,7 +229,9 @@ impl StorageState {
         cluster_id: i64,
     ) -> Result<Vec<SmartClusterExample>, String> {
         let guard = self.get_connection_named("list_smart_cluster_examples")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         let mut stmt = conn
             .prepare(
                 "SELECT screenshot_id, is_positive, rerank_score \
@@ -247,7 +265,9 @@ impl StorageState {
         rerank_score: f64,
     ) -> Result<(), String> {
         let guard = self.get_connection_named("record_smart_cluster_assignment")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
             "INSERT OR REPLACE INTO smart_cluster_assignments \
              (smart_cluster_id, screenshot_id, rerank_score, assigned_at) \
@@ -265,7 +285,9 @@ impl StorageState {
         page_size: i64,
     ) -> Result<Vec<SmartClusterAssignmentStub>, String> {
         let guard = self.get_connection_named("list_smart_cluster_assignments")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         let offset = page * page_size;
         let mut stmt = conn
             .prepare(
@@ -301,7 +323,9 @@ impl StorageState {
 
     pub fn clear_smart_cluster_assignments(&self, cluster_id: i64) -> Result<(), String> {
         let guard = self.get_connection_named("clear_smart_cluster_assignments")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
             "DELETE FROM smart_cluster_assignments WHERE smart_cluster_id = ?",
             params![cluster_id],
@@ -323,7 +347,9 @@ impl StorageState {
 
     pub fn enqueue_smart_cluster_pending(&self, screenshot_id: i64) -> Result<(), String> {
         let guard = self.get_connection_named("enqueue_smart_cluster_pending")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
             "INSERT OR IGNORE INTO smart_cluster_pending (screenshot_id) VALUES (?)",
             params![screenshot_id],
@@ -336,7 +362,9 @@ impl StorageState {
     /// Used for backfill on cluster creation and manual rescan.
     pub fn enqueue_pending_from_recent(&self, days: i64) -> Result<i64, String> {
         let mut guard = self.get_connection_named("enqueue_pending_from_recent")?;
-        let conn = guard.as_mut().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to begin tx: {}", e))?;
@@ -365,7 +393,9 @@ impl StorageState {
     /// writes idempotent.
     pub fn peek_smart_cluster_pending_batch(&self, limit: i64) -> Result<Vec<i64>, String> {
         let mut guard = self.get_connection_named("peek_smart_cluster_pending_batch")?;
-        let conn = guard.as_mut().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to begin tx: {}", e))?;
@@ -409,7 +439,9 @@ impl StorageState {
         // in case a future caller hands us a larger slice.
         const CHUNK: usize = 500;
         let mut guard = self.get_connection_named("delete_smart_cluster_pending_ids")?;
-        let conn = guard.as_mut().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to begin tx: {}", e))?;
@@ -431,7 +463,9 @@ impl StorageState {
 
     pub fn count_smart_cluster_pending(&self) -> Result<i64, String> {
         let guard = self.get_connection_named("count_smart_cluster_pending")?;
-        let conn = guard.as_ref().ok_or_else(|| "Database connection is None".to_string())?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM smart_cluster_pending \

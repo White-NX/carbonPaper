@@ -1,6 +1,8 @@
 //! Image reading with decryption support.
 
-use crate::credential_manager::{decrypt_row_key_with_cng, decrypt_with_master_key, encrypt_with_master_key};
+use crate::credential_manager::{
+    decrypt_row_key_with_cng, decrypt_with_master_key, encrypt_with_master_key,
+};
 use std::path::{Path, PathBuf};
 
 use super::StorageState;
@@ -239,10 +241,8 @@ impl StorageState {
                     "SELECT id, image_path FROM screenshots WHERE is_deleted = 0 AND id IN ({})",
                     placeholders.join(",")
                 );
-                let params: Vec<&dyn rusqlite::ToSql> = chunk
-                    .iter()
-                    .map(|id| id as &dyn rusqlite::ToSql)
-                    .collect();
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
 
                 if let Ok(mut stmt) = conn.prepare(&sql) {
                     if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
@@ -268,10 +268,7 @@ impl StorageState {
 
         // Build path → result lookup
         let path_result_map: std::collections::HashMap<&str, &Result<(String, String), String>> =
-            thumb_results
-                .iter()
-                .map(|(p, r)| (p.as_str(), r))
-                .collect();
+            thumb_results.iter().map(|(p, r)| (p.as_str(), r)).collect();
 
         // Build result keyed by id string
         let mut results = std::collections::HashMap::new();
@@ -322,17 +319,12 @@ impl StorageState {
                     "SELECT image_path, content_key_encrypted FROM screenshots WHERE is_deleted = 0 AND image_path IN ({})",
                     placeholders.join(",")
                 );
-                let params: Vec<&dyn rusqlite::ToSql> = chunk
-                    .iter()
-                    .map(|p| p as &dyn rusqlite::ToSql)
-                    .collect();
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
 
                 if let Ok(mut stmt) = conn.prepare(&sql) {
                     if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<Vec<u8>>>(1)?,
-                        ))
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
                     }) {
                         for row in rows.filter_map(|r| r.ok()) {
                             map.insert(row.0, row.1);
@@ -477,10 +469,7 @@ impl StorageState {
         // Read and decrypt original image
         let raw_data =
             std::fs::read(original).map_err(|e| format!("Failed to read image: {}", e))?;
-        let fname = original
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let fname = original.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let is_encrypted = fname.contains(".enc");
         let image_data = if is_encrypted {
             decrypt_with_master_key(row_key, &raw_data)

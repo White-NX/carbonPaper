@@ -129,10 +129,8 @@ impl StorageState {
         // Hide entertainment-dominated tasks
         if hide_entertainment.unwrap_or(false) {
             // Build placeholders for IN clause
-            let placeholders: Vec<&str> = Self::ENTERTAINMENT_CATEGORIES
-                .iter()
-                .map(|_| "?")
-                .collect();
+            let placeholders: Vec<&str> =
+                Self::ENTERTAINMENT_CATEGORIES.iter().map(|_| "?").collect();
             sql.push_str(&format!(
                 " AND (dominant_category IS NULL OR dominant_category NOT IN ({}))",
                 placeholders.join(", ")
@@ -144,10 +142,7 @@ impl StorageState {
 
         // Hide social-dominated tasks
         if hide_social.unwrap_or(false) {
-            let placeholders: Vec<&str> = Self::SOCIAL_CATEGORIES
-                .iter()
-                .map(|_| "?")
-                .collect();
+            let placeholders: Vec<&str> = Self::SOCIAL_CATEGORIES.iter().map(|_| "?").collect();
             sql.push_str(&format!(
                 " AND (dominant_category IS NULL OR dominant_category NOT IN ({}))",
                 placeholders.join(", ")
@@ -176,7 +171,9 @@ impl StorageState {
                     start_time: row.get(5)?,
                     end_time: row.get(6)?,
                     snapshot_count: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
-                    layer: row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "hot".into()),
+                    layer: row
+                        .get::<_, Option<String>>(8)?
+                        .unwrap_or_else(|| "hot".into()),
                     created_at: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
                     updated_at: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
                     relevance_score: None, // computed below
@@ -255,16 +252,17 @@ impl StorageState {
                             created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                             category: row.get(6)?,
                         },
-                        row.get::<_, Option<Vec<u8>>>(7)?,  // window_title_enc
-                        row.get::<_, Option<Vec<u8>>>(8)?,  // process_name_enc
-                        row.get::<_, Option<Vec<u8>>>(9)?,  // content_key_enc
+                        row.get::<_, Option<Vec<u8>>>(7)?, // window_title_enc
+                        row.get::<_, Option<Vec<u8>>>(8)?, // process_name_enc
+                        row.get::<_, Option<Vec<u8>>>(9)?, // content_key_enc
                     ))
                 })
                 .map_err(|e| format!("Failed to query task screenshots: {}", e))?;
 
             let mut collected = Vec::new();
             for row in rows {
-                collected.push(row.map_err(|e| format!("Failed to read task screenshot row: {}", e))?);
+                collected
+                    .push(row.map_err(|e| format!("Failed to read task screenshot row: {}", e))?);
             }
             collected
         };
@@ -365,9 +363,9 @@ impl StorageState {
                             created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                             category: row.get(6)?,
                         },
-                        row.get::<_, Option<Vec<u8>>>(7)?,  // window_title_enc
-                        row.get::<_, Option<Vec<u8>>>(8)?,  // process_name_enc
-                        row.get::<_, Option<Vec<u8>>>(9)?,  // content_key_enc
+                        row.get::<_, Option<Vec<u8>>>(7)?, // window_title_enc
+                        row.get::<_, Option<Vec<u8>>>(8)?, // process_name_enc
+                        row.get::<_, Option<Vec<u8>>>(9)?, // content_key_enc
                     ))
                 })
                 .map_err(|e| format!("Failed to query related screenshots: {}", e))?;
@@ -549,10 +547,7 @@ impl StorageState {
     }
 
     /// Bulk-save tasks from a clustering run (replaces all existing hot-layer tasks).
-    pub fn save_clustering_results(
-        &self,
-        tasks: &[SaveTaskRequest],
-    ) -> Result<Vec<i64>, String> {
+    pub fn save_clustering_results(&self, tasks: &[SaveTaskRequest]) -> Result<Vec<i64>, String> {
         let mut guard = self.get_connection_named("save_clustering_results")?;
         let conn = guard.as_mut().unwrap();
 

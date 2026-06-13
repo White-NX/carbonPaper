@@ -83,11 +83,8 @@ pub async fn smart_cluster_create(
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let anchor = normalize_anchor_text(&req.anchor_text)?;
-        let id = state.create_smart_cluster(
-            &anchor,
-            req.threshold,
-            req.dominant_color.as_deref(),
-        )?;
+        let id =
+            state.create_smart_cluster(&anchor, req.threshold, req.dominant_color.as_deref())?;
         state.save_smart_cluster_examples(id, &req.examples)?;
 
         // Backfill — enqueue every non-deleted screenshot in the hot window for
@@ -153,11 +150,7 @@ pub fn smart_cluster_assignments(
     page_size: Option<i64>,
 ) -> Result<Vec<SmartClusterAssignmentStub>, String> {
     check_auth_required(&credential_state)?;
-    state.list_smart_cluster_assignments(
-        cluster_id,
-        page.unwrap_or(0),
-        page_size.unwrap_or(50),
-    )
+    state.list_smart_cluster_assignments(cluster_id, page.unwrap_or(0), page_size.unwrap_or(50))
 }
 
 /// Re-enqueue all recent hot-layer screenshots; the worker re-evaluates
@@ -173,11 +166,9 @@ pub async fn smart_cluster_rescan(
 ) -> Result<i64, String> {
     check_auth_required(&credential_state)?;
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || {
-        state.enqueue_pending_from_recent(HOT_LAYER_DAYS)
-    })
-    .await
-    .map_err(|e| format!("Task execution failed: {}", e))?
+    tokio::task::spawn_blocking(move || state.enqueue_pending_from_recent(HOT_LAYER_DAYS))
+        .await
+        .map_err(|e| format!("Task execution failed: {}", e))?
 }
 
 /// Re-enqueue all recent hot-layer screenshots against every enabled
@@ -190,11 +181,9 @@ pub async fn smart_cluster_rescan_all(
 ) -> Result<i64, String> {
     check_auth_required(&credential_state)?;
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || {
-        state.enqueue_pending_from_recent(HOT_LAYER_DAYS)
-    })
-    .await
-    .map_err(|e| format!("Task execution failed: {}", e))?
+    tokio::task::spawn_blocking(move || state.enqueue_pending_from_recent(HOT_LAYER_DAYS))
+        .await
+        .map_err(|e| format!("Task execution failed: {}", e))?
 }
 
 #[tauri::command]

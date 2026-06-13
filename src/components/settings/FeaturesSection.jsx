@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Layers, Database, ChevronDown, RefreshCw, ExternalLink, Sparkles, Download, Zap, RotateCcw, Loader2 } from 'lucide-react';
+import { Layers, Database, ChevronDown, RefreshCw, ExternalLink, Sparkles, Download, Zap, RotateCcw, Loader2, AlertTriangle } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
@@ -348,6 +348,15 @@ export default function FeaturesSection({ monitorStatus }) {
                 />
               </button>
             </div>
+
+            {!config.clustering_enabled && (
+              <div className="mt-4 flex items-start gap-2.5 p-2.5 bg-ide-warning-bg border border-ide-warning-border rounded-lg">
+                <AlertTriangle className="w-4 h-4 text-ide-warning shrink-0 mt-0.5" />
+                <p className="text-xs leading-relaxed text-ide-warning-muted">
+                  {t('settings.features.management.smartCluster.clusteringDisabledWarning', '任务聚类已关闭。智能聚类仍可在重扫时运行，但由于缺少截图采集阶段的自动文本向量化，候选召回需要临时编码，可能导致处理速度显著下降并增加资源占用。')}
+                </p>
+              </div>
+            )}
 
             {/* Model not downloaded — show download CTA */}
             {!scModelAvailable && !scDownloading && !scDownloadError && (

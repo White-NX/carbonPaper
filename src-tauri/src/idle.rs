@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 
 /// Default idle threshold — user must be away from input for at least this
 /// many seconds before background ML work is allowed to start.
@@ -185,7 +185,10 @@ pub fn start_idle_monitor(app: AppHandle) {
                 );
                 tracing::info!(
                     "Idle state changed: is_idle={} idle_secs={} fullscreen={} ac={}",
-                    is_idle, idle_secs, fullscreen, ac_connected
+                    is_idle,
+                    idle_secs,
+                    fullscreen,
+                    ac_connected
                 );
                 last_emitted_idle = Some(is_idle);
             }
@@ -211,9 +214,7 @@ pub fn stop_idle_monitor(idle_state: &Arc<IdleState>) {
 }
 
 #[tauri::command]
-pub fn get_idle_state(
-    idle_state: tauri::State<'_, Arc<IdleState>>,
-) -> serde_json::Value {
+pub fn get_idle_state(idle_state: tauri::State<'_, Arc<IdleState>>) -> serde_json::Value {
     serde_json::json!({
         "is_idle": idle_state.is_idle.load(Ordering::SeqCst),
         "idle_secs": idle_state.idle_secs.load(Ordering::SeqCst),

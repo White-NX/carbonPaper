@@ -38,12 +38,15 @@ fn main() {
     let cmd_pipe_name = compute_nmh_cmd_pipe_name(&browser_type).unwrap_or_default();
 
     // Send startup diagnostic so the browser console shows the detected values
-    send_nm_response(&stdout_mutex, &serde_json::json!({
-        "type": "nmh_ready",
-        "browser_type": browser_type,
-        "cmd_pipe": cmd_pipe_name,
-        "data_pipe": pipe_name,
-    }));
+    send_nm_response(
+        &stdout_mutex,
+        &serde_json::json!({
+            "type": "nmh_ready",
+            "browser_type": browser_type,
+            "cmd_pipe": cmd_pipe_name,
+            "data_pipe": pipe_name,
+        }),
+    );
 
     // Start command pipe thread immediately — it doesn't need the auth token
     // and allows the main app to send capture requests even during cold start
@@ -79,10 +82,13 @@ fn main() {
                 send_nm_response(&stdout_mutex, &response);
             }
             Err(e) => {
-                send_nm_response(&stdout_mutex, &serde_json::json!({
-                    "status": "error",
-                    "error": format!("Read error: {}", e)
-                }));
+                send_nm_response(
+                    &stdout_mutex,
+                    &serde_json::json!({
+                        "status": "error",
+                        "error": format!("Read error: {}", e)
+                    }),
+                );
                 break;
             }
         }
@@ -107,14 +113,17 @@ fn read_nm_message() -> io::Result<Option<serde_json::Value>> {
         return Ok(None);
     }
     if len > 10 * 1024 * 1024 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Message too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Message too large",
+        ));
     }
 
     let mut buf = vec![0u8; len];
     handle.read_exact(&mut buf)?;
 
-    let value: serde_json::Value = serde_json::from_slice(&buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     Ok(Some(value))
 }
@@ -152,11 +161,15 @@ fn handle_message(msg: serde_json::Value, pipe_name: &str, auth_token: &str) -> 
             // Complete message with all data
             let image_data = match msg.get("image_data").and_then(|v| v.as_str()) {
                 Some(d) => d,
-                None => return serde_json::json!({"status": "error", "error": "Missing image_data"}),
+                None => {
+                    return serde_json::json!({"status": "error", "error": "Missing image_data"})
+                }
             };
             let image_hash = match msg.get("image_hash").and_then(|v| v.as_str()) {
                 Some(h) => h,
-                None => return serde_json::json!({"status": "error", "error": "Missing image_hash"}),
+                None => {
+                    return serde_json::json!({"status": "error", "error": "Missing image_hash"})
+                }
             };
 
             let pipe_request = serde_json::json!({
@@ -190,16 +203,20 @@ fn send_to_pipe(pipe_name: &str, request: &serde_json::Value) -> serde_json::Val
 
     let data = match serde_json::to_vec(request) {
         Ok(d) => d,
-        Err(e) => return serde_json::json!({"status": "error", "error": format!("Serialization failed: {}", e)}),
+        Err(e) => {
+            return serde_json::json!({"status": "error", "error": format!("Serialization failed: {}", e)})
+        }
     };
 
     // Open the named pipe as a file (Windows named pipes can be opened as files)
     let mut pipe = match OpenOptions::new().read(true).write(true).open(pipe_name) {
         Ok(p) => p,
-        Err(e) => return serde_json::json!({
-            "status": "error",
-            "error": format!("Cannot connect to CarbonPaper (pipe {}): {}", pipe_name, e)
-        }),
+        Err(e) => {
+            return serde_json::json!({
+                "status": "error",
+                "error": format!("Cannot connect to CarbonPaper (pipe {}): {}", pipe_name, e)
+            })
+        }
     };
 
     // Write request
@@ -231,7 +248,9 @@ fn send_to_pipe(pipe_name: &str, request: &serde_json::Value) -> serde_json::Val
 
     match serde_json::from_slice(&response_buf) {
         Ok(v) => v,
-        Err(e) => serde_json::json!({"status": "error", "error": format!("Invalid response JSON: {}", e)}),
+        Err(e) => {
+            serde_json::json!({"status": "error", "error": format!("Invalid response JSON: {}", e)})
+        }
     }
 }
 
@@ -273,7 +292,8 @@ fn detect_browser_type() -> String {
 
         extern "system" {
             fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut std::ffi::c_void;
-            fn Process32FirstW(snapshot: *mut std::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
+            fn Process32FirstW(snapshot: *mut std::ffi::c_void, entry: *mut ProcessEntry32W)
+                -> i32;
             fn Process32NextW(snapshot: *mut std::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
             fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
         }
@@ -309,12 +329,13 @@ fn detect_browser_type() -> String {
 
             if Process32FirstW(snapshot, &mut entry) != 0 {
                 loop {
-                    let len = entry.sz_exe_file.iter().position(|&c| c == 0).unwrap_or(260);
+                    let len = entry
+                        .sz_exe_file
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(260);
                     let name = String::from_utf16_lossy(&entry.sz_exe_file[..len]).to_lowercase();
-                    process_map.insert(
-                        entry.th32_process_id,
-                        (entry.th32_parent_process_id, name),
-                    );
+                    process_map.insert(entry.th32_process_id, (entry.th32_parent_process_id, name));
 
                     entry = mem::zeroed();
                     entry.dw_size = mem::size_of::<ProcessEntry32W>() as u32;
@@ -427,10 +448,10 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
                 wide_name.as_ptr(),
                 PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                1,     // max instances
-                4096,  // out buffer
-                4096,  // in buffer
-                0,     // default timeout
+                1,    // max instances
+                4096, // out buffer
+                4096, // in buffer
+                0,    // default timeout
                 ptr::null(),
             )
         };
@@ -446,7 +467,9 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
         if connected == 0 {
             let err = unsafe { GetLastError() };
             if err != ERROR_PIPE_CONNECTED {
-                unsafe { CloseHandle(pipe); }
+                unsafe {
+                    CloseHandle(pipe);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
@@ -456,7 +479,13 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
         let mut buf = vec![0u8; 4096];
         let mut bytes_read: u32 = 0;
         let read_ok = unsafe {
-            ReadFile(pipe, buf.as_mut_ptr(), buf.len() as u32, &mut bytes_read, ptr::null())
+            ReadFile(
+                pipe,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut bytes_read,
+                ptr::null(),
+            )
         };
 
         if read_ok != 0 && bytes_read > 0 {
@@ -483,7 +512,13 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
                     let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
                     let mut written: u32 = 0;
                     unsafe {
-                        WriteFile(pipe, response_bytes.as_ptr(), response_bytes.len() as u32, &mut written, ptr::null());
+                        WriteFile(
+                            pipe,
+                            response_bytes.as_ptr(),
+                            response_bytes.len() as u32,
+                            &mut written,
+                            ptr::null(),
+                        );
                         FlushFileBuffers(pipe);
                     }
                 }
@@ -524,10 +559,7 @@ fn get_current_user_sid() -> Result<String, String> {
                 token_information_length: u32,
                 return_length: *mut u32,
             ) -> i32;
-            fn ConvertSidToStringSidW(
-                sid: *const u8,
-                string_sid: *mut *mut u16,
-            ) -> i32;
+            fn ConvertSidToStringSidW(sid: *const u8, string_sid: *mut *mut u16) -> i32;
             fn LocalFree(hmem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
             fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
         }
@@ -543,10 +575,23 @@ fn get_current_user_sid() -> Result<String, String> {
             }
 
             let mut return_length: u32 = 0;
-            GetTokenInformation(token, TOKEN_USER_INFO, ptr::null_mut(), 0, &mut return_length);
+            GetTokenInformation(
+                token,
+                TOKEN_USER_INFO,
+                ptr::null_mut(),
+                0,
+                &mut return_length,
+            );
 
             let mut buffer = vec![0u8; return_length as usize];
-            if GetTokenInformation(token, TOKEN_USER_INFO, buffer.as_mut_ptr(), return_length, &mut return_length) == 0 {
+            if GetTokenInformation(
+                token,
+                TOKEN_USER_INFO,
+                buffer.as_mut_ptr(),
+                return_length,
+                &mut return_length,
+            ) == 0
+            {
                 CloseHandle(token);
                 return Err("GetTokenInformation failed".into());
             }
@@ -568,7 +613,8 @@ fn get_current_user_sid() -> Result<String, String> {
                 p = p.add(1);
             }
             let slice = std::slice::from_raw_parts(string_sid, len);
-            let result = String::from_utf16(slice).map_err(|e| format!("UTF-16 conversion failed: {}", e))?;
+            let result = String::from_utf16(slice)
+                .map_err(|e| format!("UTF-16 conversion failed: {}", e))?;
 
             LocalFree(string_sid as *mut _);
             CloseHandle(token);
@@ -599,5 +645,7 @@ fn get_data_dir() -> PathBuf {
 
     // Fallback to default
     let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(local_appdata).join("CarbonPaper").join("data")
+    PathBuf::from(local_appdata)
+        .join("CarbonPaper")
+        .join("data")
 }

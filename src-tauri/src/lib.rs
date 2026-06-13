@@ -32,7 +32,7 @@ use sensitive_filter::SensitiveFilterState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use storage::StorageState;
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Emitter;
 use tauri::Manager;
@@ -40,12 +40,149 @@ use tauri_plugin_notification::NotificationExt;
 use window_vibrancy::apply_acrylic;
 
 const MENU_ID_OPEN: &str = "open";
-const MENU_ID_PAUSE: &str = "pause";
-const MENU_ID_RESUME: &str = "resume";
+const MENU_ID_TOGGLE_CAPTURE: &str = "toggle_capture";
 const MENU_ID_RESTART: &str = "restart";
+const MENU_ID_LIGHTWEIGHT: &str = "lightweight";
 const MENU_ID_QUIT: &str = "quit";
 
 pub static IS_UPDATING: AtomicBool = AtomicBool::new(false);
+pub static IS_QUITTING: AtomicBool = AtomicBool::new(false);
+
+type TrayMenuItem = MenuItem<tauri::Wry>;
+
+pub struct TrayMenuState {
+    pub open: TrayMenuItem,
+    pub toggle_capture: TrayMenuItem,
+    pub restart: TrayMenuItem,
+    pub lightweight: TrayMenuItem,
+    pub quit: TrayMenuItem,
+}
+
+#[derive(Clone, Copy)]
+struct TrayTexts {
+    open: &'static str,
+    screenshot_running: &'static str,
+    screenshot_paused: &'static str,
+    screenshot_stopped: &'static str,
+    restart: &'static str,
+    lightweight: &'static str,
+    lightweight_active: &'static str,
+    quit: &'static str,
+    open_error: &'static str,
+    switched_lightweight: &'static str,
+    auto_switched_lightweight: &'static str,
+}
+
+const TRAY_TEXTS_ZH: TrayTexts = TrayTexts {
+    open: "打开界面",
+    screenshot_running: "截图：运行中（点击暂停）",
+    screenshot_paused: "截图：已暂停（点击恢复）",
+    screenshot_stopped: "截图：未运行",
+    restart: "重启截图",
+    lightweight: "切换到轻量模式",
+    lightweight_active: "轻量模式已开启",
+    quit: "彻底退出",
+    open_error: "无法打开界面",
+    switched_lightweight: "已切换到轻量模式，通过托盘菜单可重新打开界面",
+    auto_switched_lightweight: "已自动切换到轻量模式以节省内存",
+};
+
+const TRAY_TEXTS_EN: TrayTexts = TrayTexts {
+    open: "Open Window",
+    screenshot_running: "Screenshots: On (click to pause)",
+    screenshot_paused: "Screenshots: Paused (click to resume)",
+    screenshot_stopped: "Screenshots: Not Running",
+    restart: "Restart Screenshots",
+    lightweight: "Switch to Lightweight Mode",
+    lightweight_active: "Lightweight Mode On",
+    quit: "Quit Completely",
+    open_error: "Failed to open window",
+    switched_lightweight: "Switched to lightweight mode. Reopen the window from the tray menu.",
+    auto_switched_lightweight: "Automatically switched to lightweight mode to save memory.",
+};
+
+fn normalize_app_language(language: &str) -> &'static str {
+    if language.to_ascii_lowercase().starts_with("en") {
+        "en"
+    } else {
+        "zh-CN"
+    }
+}
+
+fn tray_texts() -> &'static TrayTexts {
+    let language = registry_config::get_string("language").unwrap_or_else(|| "zh-CN".to_string());
+    match normalize_app_language(&language) {
+        "en" => &TRAY_TEXTS_EN,
+        _ => &TRAY_TEXTS_ZH,
+    }
+}
+
+pub(crate) fn tray_text_lightweight_switched() -> &'static str {
+    tray_texts().switched_lightweight
+}
+
+fn tray_text_auto_lightweight_switched() -> &'static str {
+    tray_texts().auto_switched_lightweight
+}
+
+pub(crate) fn set_app_language(app: &tauri::AppHandle, language: &str) -> Result<(), String> {
+    registry_config::set_string("language", normalize_app_language(language))?;
+    refresh_tray_menu(app);
+    Ok(())
+}
+
+pub(crate) fn refresh_tray_menu(app: &tauri::AppHandle) {
+    let Some(menu_state) = app.try_state::<TrayMenuState>() else {
+        return;
+    };
+
+    let texts = tray_texts();
+    let _ = menu_state.open.set_text(texts.open);
+    let _ = menu_state.restart.set_text(texts.restart);
+    let _ = menu_state.quit.set_text(texts.quit);
+
+    let monitor_running = app
+        .try_state::<MonitorState>()
+        .map(|state| {
+            let guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
+            guard.is_some()
+        })
+        .unwrap_or(false);
+
+    let capture_paused = app
+        .try_state::<Arc<CaptureState>>()
+        .map(|state| state.paused.load(Ordering::SeqCst))
+        .unwrap_or(false);
+
+    if monitor_running {
+        let _ = menu_state.toggle_capture.set_enabled(true);
+        let _ = menu_state.toggle_capture.set_text(if capture_paused {
+            texts.screenshot_paused
+        } else {
+            texts.screenshot_running
+        });
+    } else {
+        let _ = menu_state.toggle_capture.set_text(texts.screenshot_stopped);
+        let _ = menu_state.toggle_capture.set_enabled(false);
+    }
+
+    let is_lightweight = app
+        .try_state::<Arc<LightweightModeState>>()
+        .map(|state| {
+            *state
+                .is_lightweight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        })
+        .unwrap_or(false);
+
+    let _ = menu_state.lightweight.set_text(if is_lightweight {
+        texts.lightweight_active
+    } else {
+        texts.lightweight
+    });
+    let _ = menu_state.lightweight.set_enabled(!is_lightweight);
+}
 
 // 轻量模式状态管理
 pub struct LightweightModeState {
@@ -243,14 +380,26 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
 
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let app_handle = app.handle().clone();
+    let texts = tray_texts();
+
+    let open_item = MenuItemBuilder::with_id(MENU_ID_OPEN, texts.open).build(&app_handle)?;
+    let toggle_capture_item =
+        MenuItemBuilder::with_id(MENU_ID_TOGGLE_CAPTURE, texts.screenshot_stopped)
+            .enabled(false)
+            .build(&app_handle)?;
+    let restart_item =
+        MenuItemBuilder::with_id(MENU_ID_RESTART, texts.restart).build(&app_handle)?;
+    let lightweight_item =
+        MenuItemBuilder::with_id(MENU_ID_LIGHTWEIGHT, texts.lightweight).build(&app_handle)?;
+    let quit_item = MenuItemBuilder::with_id(MENU_ID_QUIT, texts.quit).build(&app_handle)?;
 
     let menu = MenuBuilder::new(&app_handle)
-        .item(&MenuItemBuilder::with_id(MENU_ID_OPEN, "打开界面").build(&app_handle)?)
-        .item(&MenuItemBuilder::with_id(MENU_ID_PAUSE, "暂停截图").build(&app_handle)?)
-        .item(&MenuItemBuilder::with_id(MENU_ID_RESUME, "恢复截图").build(&app_handle)?)
-        .item(&MenuItemBuilder::with_id(MENU_ID_RESTART, "重启截图").build(&app_handle)?)
+        .item(&open_item)
+        .item(&toggle_capture_item)
+        .item(&restart_item)
+        .item(&lightweight_item)
         .separator()
-        .item(&MenuItemBuilder::with_id(MENU_ID_QUIT, "彻底退出").build(&app_handle)?)
+        .item(&quit_item)
         .build()?;
 
     let mut tray_builder = TrayIconBuilder::new().menu(&menu);
@@ -268,6 +417,10 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     // 窗口存在，显示并聚焦
                     let _ = window.show();
                     let _ = window.set_focus();
+                    if let Some(lightweight_state) = app.try_state::<Arc<LightweightModeState>>() {
+                        *lightweight_state.is_lightweight.lock().unwrap() = false;
+                    }
+                    refresh_tray_menu(app);
                 } else {
                     // 窗口不存在（轻量模式），重建窗口
                     let app_handle = app.clone();
@@ -275,36 +428,44 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                         match create_main_window(&app_handle) {
                             Ok(()) => {
                                 // 更新轻量模式状态
-                                let lightweight_state = app_handle.state::<Arc<LightweightModeState>>();
+                                let lightweight_state =
+                                    app_handle.state::<Arc<LightweightModeState>>();
                                 *lightweight_state.is_lightweight.lock().unwrap() = false;
                                 tracing::info!("Window recreated from lightweight mode");
+                                refresh_tray_menu(&app_handle);
                             }
                             Err(e) => {
                                 tracing::error!("Failed to create main window: {}", e);
-                                let _ = app_handle.notification()
+                                let texts = tray_texts();
+                                let _ = app_handle
+                                    .notification()
                                     .builder()
                                     .title("CarbonPaper")
-                                    .body(&format!("无法打开界面: {}", e))
+                                    .body(&format!("{}: {}", texts.open_error, e))
                                     .show();
                             }
                         }
                     });
                 }
             }
-            MENU_ID_PAUSE => {
+            MENU_ID_TOGGLE_CAPTURE => {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<MonitorState>();
                     let cs = app_handle.state::<Arc<CaptureState>>();
-                    let _ = monitor::pause_monitor(state, cs).await;
-                });
-            }
-            MENU_ID_RESUME => {
-                let app_handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<MonitorState>();
-                    let cs = app_handle.state::<Arc<CaptureState>>();
-                    let _ = monitor::resume_monitor(state, cs).await;
+                    let monitor_running = {
+                        let guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.is_some()
+                    };
+                    if monitor_running {
+                        if cs.paused.load(Ordering::SeqCst) {
+                            let _ = monitor::resume_monitor(state, cs, app_handle.clone()).await;
+                        } else {
+                            let _ = monitor::pause_monitor(state, cs, app_handle.clone()).await;
+                        }
+                    } else {
+                        refresh_tray_menu(&app_handle);
+                    }
                 });
             }
             MENU_ID_RESTART => {
@@ -312,26 +473,64 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<MonitorState>();
                     let cs = app_handle.state::<Arc<CaptureState>>();
-                    let _ = monitor::stop_monitor(state, cs).await;
+                    let _ = monitor::stop_monitor(state, cs, app_handle.clone()).await;
                     let start_state = app_handle.state::<MonitorState>();
                     let _ = monitor::start_monitor(start_state, app_handle.clone()).await;
                 });
             }
-            MENU_ID_QUIT => {
+            MENU_ID_LIGHTWEIGHT => {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<MonitorState>();
-                    let cs = app_handle.state::<Arc<CaptureState>>();
-                    let _ = monitor::stop_monitor(state, cs).await;
-                    app_handle.exit(0);
+                    let lightweight_state = app_handle.state::<Arc<LightweightModeState>>();
+                    if let Err(e) = commands::utility::switch_to_lightweight_mode(
+                        app_handle.clone(),
+                        lightweight_state,
+                    )
+                    .await
+                    {
+                        tracing::error!("Failed to switch to lightweight mode from tray: {}", e);
+                    }
+                    refresh_tray_menu(&app_handle);
                 });
+            }
+            MENU_ID_QUIT => {
+                let app_handle = app.clone();
+                IS_QUITTING.store(true, Ordering::Relaxed);
+                cancel_auto_lightweight_timer(&app_handle);
+
+                let state = app_handle.state::<MonitorState>();
+                state.stopping.store(true, Ordering::SeqCst);
+
+                let capture_state = app_handle.state::<Arc<CaptureState>>();
+                capture_state.stopped.store(true, Ordering::SeqCst);
+                capture_state.paused.store(false, Ordering::SeqCst);
+                if let Some(handle) = capture_state
+                    .capture_task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    handle.abort();
+                }
+                capture_state.clear_wgc_session("app_quit");
+
+                app_handle.exit(0);
             }
             _ => {}
         })
         .build(&app_handle)?;
 
+    app.manage(TrayMenuState {
+        open: open_item,
+        toggle_capture: toggle_capture_item,
+        restart: restart_item,
+        lightweight: lightweight_item,
+        quit: quit_item,
+    });
+
     // 将托盘图标保存到应用状态中，防止被释放
     app.manage(tray);
+    refresh_tray_menu(&app_handle);
 
     Ok(())
 }
@@ -373,17 +572,14 @@ pub fn create_main_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::err
 
     tracing::info!("Creating main window");
 
-    let window = WebviewWindowBuilder::new(
-        app,
-        "main",
-        tauri::WebviewUrl::App("index.html".into())
-    )
-    .title("carbonpaper")
-    .inner_size(1300.0, 750.0)
-    .decorations(false)
-    .transparent(true)
-    .visible(true)
-    .build()?;
+    let window =
+        WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+            .title("carbonpaper")
+            .inner_size(1300.0, 750.0)
+            .decorations(false)
+            .transparent(true)
+            .visible(true)
+            .build()?;
 
     // 应用 Acrylic 效果
     let _ = apply_acrylic(&window, Some((0, 0, 0, 0)));
@@ -432,12 +628,14 @@ fn start_auto_lightweight_timer(app: tauri::AppHandle) {
                 // 更新状态
                 let lightweight_state = app_clone.state::<Arc<LightweightModeState>>();
                 *lightweight_state.is_lightweight.lock().unwrap() = true;
+                refresh_tray_menu(&app_clone);
 
                 // 发送通知
-                let _ = app_clone.notification()
+                let _ = app_clone
+                    .notification()
                     .builder()
                     .title("CarbonPaper")
-                    .body("已自动切换到轻量模式以节省内存")
+                    .body(tray_text_auto_lightweight_switched())
                     .show();
 
                 tracing::info!("Successfully switched to lightweight mode");
@@ -664,7 +862,10 @@ pub fn run() {
                     filter_state.load_dicts(app.handle());
                     if let Ok(policy) = storage.load_policy() {
                         if let Some(filter_config) = policy.get("sensitive_filter") {
-                            if let Ok(config) = serde_json::from_value::<sensitive_filter::SensitiveFilterConfig>(filter_config.clone()) {
+                            if let Ok(config) = serde_json::from_value::<
+                                sensitive_filter::SensitiveFilterConfig,
+                            >(filter_config.clone())
+                            {
                                 filter_state.update_config(config);
                             }
                         }
@@ -680,13 +881,19 @@ pub fn run() {
                         let mcp_runtime = app_handle_mcp.state::<mcp_server::McpRuntimeState>();
 
                         if let Ok(policy) = storage.load_policy() {
-                            if policy.get("mcp_enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            if policy
+                                .get("mcp_enabled")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
                                 match mcp_server::auto_start(
                                     app_handle_mcp.clone(),
                                     &credential,
                                     &storage,
                                     &mcp_runtime,
-                                ).await {
+                                )
+                                .await
+                                {
                                     Ok(()) => tracing::info!("MCP server auto-started"),
                                     Err(e) => tracing::error!("MCP auto-start failed: {}", e),
                                 }
@@ -698,7 +905,9 @@ pub fn run() {
                 python::auto_install_spacy_models(app.handle().clone());
 
                 // 轻量模式下自动启动监控
-                if start_hidden && registry_config::get_bool("lightweight_auto_start_monitor").unwrap_or(true) {
+                if start_hidden
+                    && registry_config::get_bool("lightweight_auto_start_monitor").unwrap_or(true)
+                {
                     let app_handle = app.handle().clone();
                     tauri::async_runtime::spawn(async move {
                         let state = app_handle.state::<MonitorState>();
@@ -716,6 +925,7 @@ pub fn run() {
             commands::utility::greet,
             commands::utility::close_process,
             commands::utility::set_updating_flag,
+            commands::utility::set_app_language,
             monitor::start_monitor,
             monitor::stop_monitor,
             monitor::pause_monitor,
@@ -891,7 +1101,9 @@ pub fn run() {
         .run(|_app_handle, event| {
             // 阻止应用在所有窗口关闭时退出
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                api.prevent_exit();
+                if !IS_UPDATING.load(Ordering::Relaxed) && !IS_QUITTING.load(Ordering::Relaxed) {
+                    api.prevent_exit();
+                }
             }
         });
 }

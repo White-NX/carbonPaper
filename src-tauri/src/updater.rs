@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
 
-use crate::resource_utils::{file_in_local_appdata, normalize_path_for_command};
 use crate::registry_config;
+use crate::resource_utils::{file_in_local_appdata, normalize_path_for_command};
 
 const UPDATE_CHECK_URL: &str =
     "https://github.com/White-NX/carbonPaper/releases/latest/download/latest.json";
@@ -95,7 +95,7 @@ pub async fn updater_check(
         .map_err(|e| format!("Failed to parse update manifest: {}", e))?;
 
     let available = is_newer(&manifest.version, &current_version);
-    
+
     let mut is_critical = manifest.critical;
     if let Some(min_ver) = &manifest.min_version {
         if is_newer(min_ver, &current_version) {
@@ -209,8 +209,7 @@ pub async fn updater_extract() -> Result<(), String> {
         .map_err(|e| format!("Failed to create extract dir: {}", e))?;
 
     // Extract zip
-    let file = std::fs::File::open(&zip_path)
-        .map_err(|e| format!("Failed to open zip: {}", e))?;
+    let file = std::fs::File::open(&zip_path).map_err(|e| format!("Failed to open zip: {}", e))?;
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip archive: {}", e))?;
 
@@ -254,7 +253,7 @@ pub async fn updater_apply(
     capture_state: tauri::State<'_, std::sync::Arc<crate::capture::CaptureState>>,
 ) -> Result<(), String> {
     // 1. Stop the Python monitor
-    let _ = crate::monitor::stop_monitor(monitor_state, capture_state).await;
+    let _ = crate::monitor::stop_monitor(monitor_state, capture_state, app.clone()).await;
 
     // 2. Set the updating flag so close is allowed
     crate::IS_UPDATING.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -267,11 +266,9 @@ pub async fn updater_apply(
         return Err("Extracted update directory not found. Run updater_extract first.".to_string());
     }
 
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get current exe path: {}", e))?;
-    let app_dir = current_exe
-        .parent()
-        .ok_or("Failed to get app directory")?;
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Failed to get current exe path: {}", e))?;
+    let app_dir = current_exe.parent().ok_or("Failed to get app directory")?;
 
     let app_dir_str = normalize_path_for_command(app_dir);
     let extract_dir_str = normalize_path_for_command(&extract_dir);

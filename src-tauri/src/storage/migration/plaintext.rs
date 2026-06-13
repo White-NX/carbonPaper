@@ -27,7 +27,11 @@ impl StorageState {
         };
 
         // Scan screenshots directory
-        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let screenshot_dir = self
+            .screenshot_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let entries = std::fs::read_dir(&screenshot_dir)
             .map_err(|e| format!("Failed to read screenshot directory: {}", e))?;
 
@@ -102,7 +106,11 @@ impl StorageState {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
         let new_file_name = format!("{}.enc", file_name);
-        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let screenshot_dir = self
+            .screenshot_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let new_path = screenshot_dir.join(&new_file_name);
 
         // Save encrypted file
@@ -133,7 +141,11 @@ impl StorageState {
 
     /// List all plaintext (non-encrypted) screenshot files.
     pub fn list_plaintext_screenshots(&self) -> Result<Vec<String>, String> {
-        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let screenshot_dir = self
+            .screenshot_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let entries = std::fs::read_dir(&screenshot_dir)
             .map_err(|e| format!("Failed to read screenshot directory: {}", e))?;
 
@@ -160,9 +172,7 @@ impl StorageState {
     /// Waits for user authentication before starting CNG decryption.
     pub fn backfill_plaintext_process_names(storage: Arc<Self>) {
         // Wait for user to authenticate before attempting CNG decryption
-        tracing::info!(
-            "[BACKFILL] waiting for user authentication before starting migration..."
-        );
+        tracing::info!("[BACKFILL] waiting for user authentication before starting migration...");
         loop {
             if storage.credential_state.is_session_valid() {
                 break;
@@ -216,43 +226,42 @@ impl StorageState {
             }
 
             // Phase 1: extract a batch of encrypted-only rows (hold mutex)
-            let batch: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> = match storage
-                .get_connection_named("backfill_process_names")
-            {
-                Ok(guard) => {
-                    let conn = guard.as_ref().unwrap();
-                    let mut stmt = match conn.prepare(
-                        "SELECT id, process_name_enc, content_key_encrypted FROM screenshots
+            let batch: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> =
+                match storage.get_connection_named("backfill_process_names") {
+                    Ok(guard) => {
+                        let conn = guard.as_ref().unwrap();
+                        let mut stmt = match conn.prepare(
+                            "SELECT id, process_name_enc, content_key_encrypted FROM screenshots
                          WHERE process_name IS NULL AND process_name_enc IS NOT NULL
                          LIMIT 100",
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("[BACKFILL] Failed to prepare query: {}", e);
-                            break;
-                        }
-                    };
-                    let rows = match stmt.query_map([], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, Option<Vec<u8>>>(1)?,
-                            row.get::<_, Option<Vec<u8>>>(2)?,
-                        ))
-                    }) {
-                        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                        Err(e) => {
-                            tracing::error!("[BACKFILL] Failed to execute query: {}", e);
-                            break;
-                        }
-                    };
-                    rows
-                    // guard dropped — mutex released
-                }
-                Err(e) => {
-                    tracing::error!("[BACKFILL] Failed to get connection: {}", e);
-                    break;
-                }
-            };
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("[BACKFILL] Failed to prepare query: {}", e);
+                                break;
+                            }
+                        };
+                        let rows = match stmt.query_map([], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, Option<Vec<u8>>>(1)?,
+                                row.get::<_, Option<Vec<u8>>>(2)?,
+                            ))
+                        }) {
+                            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                            Err(e) => {
+                                tracing::error!("[BACKFILL] Failed to execute query: {}", e);
+                                break;
+                            }
+                        };
+                        rows
+                        // guard dropped — mutex released
+                    }
+                    Err(e) => {
+                        tracing::error!("[BACKFILL] Failed to get connection: {}", e);
+                        break;
+                    }
+                };
 
             if batch.is_empty() {
                 break;
@@ -288,19 +297,12 @@ impl StorageState {
                                 "UPDATE screenshots SET process_name = ? WHERE id = ?",
                                 params![name, id],
                             ) {
-                                tracing::error!(
-                                    "[BACKFILL] Failed to update id={}: {}",
-                                    id,
-                                    e
-                                );
+                                tracing::error!("[BACKFILL] Failed to update id={}: {}", id, e);
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::error!(
-                            "[BACKFILL] Failed to get connection for update: {}",
-                            e
-                        );
+                        tracing::error!("[BACKFILL] Failed to get connection for update: {}", e);
                         break;
                     }
                 }

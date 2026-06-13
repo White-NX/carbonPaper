@@ -20,7 +20,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use thiserror::Error;
 
-
 /// 凭证管理器错误类型
 #[derive(Debug, Error)]
 #[allow(dead_code)]
@@ -109,26 +108,41 @@ impl CredentialManagerState {
             session_timeout_secs: Mutex::new(initial_timeout),
         }
     }
-    
+
     /// 设置会话超时时间（秒），-1 表示永不超时
     #[allow(dead_code)]
     pub fn set_session_timeout(&self, timeout_secs: i64) {
-        let mut timeout = self.session_timeout_secs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut timeout = self
+            .session_timeout_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *timeout = timeout_secs;
     }
-    
+
     /// 获取当前会话超时时间设置
     #[allow(dead_code)]
     pub fn get_session_timeout(&self) -> i64 {
-        *self.session_timeout_secs.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .session_timeout_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
-    
+
     /// 检查当前认证会话是否有效
     pub fn is_session_valid(&self) -> bool {
-        let last_auth = self.last_auth_time.lock().unwrap_or_else(|e| e.into_inner());
-        let in_foreground = *self.app_in_foreground.lock().unwrap_or_else(|e| e.into_inner());
-        let timeout_secs = *self.session_timeout_secs.lock().unwrap_or_else(|e| e.into_inner());
-        
+        let last_auth = self
+            .last_auth_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let in_foreground = *self
+            .app_in_foreground
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let timeout_secs = *self
+            .session_timeout_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         match *last_auth {
             Some(auth_time) => {
                 // 如果应用在后台，会话立即失效（除非设置为永不超时）
@@ -145,17 +159,23 @@ impl CredentialManagerState {
             None => false,
         }
     }
-    
+
     /// 更新认证时间戳
     pub fn update_auth_time(&self) {
-        let mut last_auth = self.last_auth_time.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last_auth = self
+            .last_auth_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *last_auth = Some(std::time::Instant::now());
     }
-    
+
     /// 清除认证会话（锁定 UI 访问权限）
     /// 注意：不清除 cached_master_key，以允许后台继续加密数据
     pub fn invalidate_session(&self) {
-        let mut last_auth = self.last_auth_time.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last_auth = self
+            .last_auth_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *last_auth = None;
 
         // 只清除 db_key 缓存（用于 UI 层的数据库访问）
@@ -170,7 +190,7 @@ impl CredentialManagerState {
         //     *cached_master = None;
         // }
     }
-    
+
     /// 完全清除所有缓存（应用退出或重置时调用）
     pub fn clear_all_cached_keys(&self) {
         {
@@ -178,22 +198,34 @@ impl CredentialManagerState {
             *cached_db = None;
         }
         {
-            let mut cached_master = self.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cached_master = self
+                .cached_master_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *cached_master = None;
         }
         {
-            let mut cached_pub = self.cached_public_key.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cached_pub = self
+                .cached_public_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *cached_pub = None;
         }
     }
-    
+
     /// 设置应用前台/后台状态
     pub fn set_foreground_state(&self, in_foreground: bool) {
-        let mut state = self.app_in_foreground.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self
+            .app_in_foreground
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *state = in_foreground;
-        
+
         // 如果进入后台，立即使会话失效（除非设置为永不超时）
-        let timeout = *self.session_timeout_secs.lock().unwrap_or_else(|e| e.into_inner());
+        let timeout = *self
+            .session_timeout_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !in_foreground && timeout != -1 {
             self.invalidate_session();
         }
@@ -227,14 +259,18 @@ impl CredentialManagerState {
         let ciphertext = encrypt_master_key_with_cng(master_key)?;
         let file_data = encode_master_key_file(&ciphertext);
         let key_file = self.master_key_file_path();
-        
-        std::fs::write(key_file, file_data)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to write master key file: {}", e)))?;
+
+        std::fs::write(key_file, file_data).map_err(|e| {
+            CredentialError::SystemError(format!("Failed to write master key file: {}", e))
+        })?;
 
         // Update caches
-        let mut cached_master = self.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cached_master = self
+            .cached_master_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *cached_master = Some(master_key.to_vec());
-        
+
         let mut cached_db = self.cached_db_key.lock().unwrap_or_else(|e| e.into_inner());
         *cached_db = None; // Force re-derivation
 
@@ -244,40 +280,48 @@ impl CredentialManagerState {
 
 /// 使用主密钥加密数据（AES-GCM）
 /// 返回格式: nonce(12字节) + 密文 + tag(16字节)
-pub fn encrypt_with_master_key(master_key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+pub fn encrypt_with_master_key(
+    master_key: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CredentialError> {
     let cipher = Aes256Gcm::new_from_slice(master_key)
         .map_err(|e| CredentialError::CryptoError(format!("Failed to create cipher: {}", e)))?;
-    
+
     // 生成随机 nonce
     let nonce_bytes: [u8; 12] = rand::random();
     let nonce = Nonce::from_slice(&nonce_bytes);
-    
+
     // 加密数据
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
         .map_err(|e| CredentialError::CryptoError(format!("Encryption failed: {}", e)))?;
-    
+
     // 组合结果: nonce + ciphertext
     let mut result = Vec::with_capacity(12 + ciphertext.len());
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&ciphertext);
-    
+
     Ok(result)
 }
 
 /// 使用主密钥解密数据
-pub fn decrypt_with_master_key(master_key: &[u8], encrypted: &[u8]) -> Result<Vec<u8>, CredentialError> {
+pub fn decrypt_with_master_key(
+    master_key: &[u8],
+    encrypted: &[u8],
+) -> Result<Vec<u8>, CredentialError> {
     if encrypted.len() < 12 + 16 {
-        return Err(CredentialError::CryptoError("Invalid encrypted data".to_string()));
+        return Err(CredentialError::CryptoError(
+            "Invalid encrypted data".to_string(),
+        ));
     }
 
     let cipher = Aes256Gcm::new_from_slice(master_key)
         .map_err(|e| CredentialError::CryptoError(format!("Failed to create cipher: {}", e)))?;
-    
+
     // 提取 nonce 和密文
     let nonce = Nonce::from_slice(&encrypted[..12]);
     let ciphertext = &encrypted[12..];
-    
+
     // 解密数据
     cipher
         .decrypt(nonce, ciphertext)
@@ -286,19 +330,29 @@ pub fn decrypt_with_master_key(master_key: &[u8], encrypted: &[u8]) -> Result<Ve
 
 /// 将加密数据编码为 Base64（用于存储在 ChromaDB 等文本字段）
 #[allow(dead_code)]
-pub fn encrypt_to_base64_with_master_key(master_key: &[u8], plaintext: &str) -> Result<String, CredentialError> {
+pub fn encrypt_to_base64_with_master_key(
+    master_key: &[u8],
+    plaintext: &str,
+) -> Result<String, CredentialError> {
     let encrypted = encrypt_with_master_key(master_key, plaintext.as_bytes())?;
-    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encrypted))
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &encrypted,
+    ))
 }
 
 /// 从 Base64 解密数据
 #[allow(dead_code)]
-pub fn decrypt_from_base64_with_master_key(master_key: &[u8], encrypted_base64: &str) -> Result<String, CredentialError> {
-    let encrypted = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypted_base64)
-        .map_err(|e| CredentialError::CryptoError(format!("Invalid base64: {}", e)))?;
+pub fn decrypt_from_base64_with_master_key(
+    master_key: &[u8],
+    encrypted_base64: &str,
+) -> Result<String, CredentialError> {
+    let encrypted =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypted_base64)
+            .map_err(|e| CredentialError::CryptoError(format!("Invalid base64: {}", e)))?;
 
     let decrypted = decrypt_with_master_key(master_key, &encrypted)?;
-    
+
     String::from_utf8(decrypted)
         .map_err(|e| CredentialError::CryptoError(format!("Invalid UTF-8: {}", e)))
 }
@@ -340,10 +394,10 @@ mod windows_impl {
 
     /// 从 CNG RSA 密钥导出公钥（不触发任何 UI 弹窗）
     pub fn export_cng_public_key() -> Result<Vec<u8>, CredentialError> {
+        use windows::core::HSTRING;
         use windows::Win32::Security::Cryptography::{
             NCryptExportKey, NCryptFreeObject, NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE,
         };
-        use windows::core::HSTRING;
 
         let key = open_or_create_cng_key()?;
 
@@ -396,7 +450,10 @@ mod windows_impl {
     ) -> Result<Vec<u8>, CredentialError> {
         // 首先检查是否有缓存的公钥
         {
-            let cached = state.cached_public_key.lock().unwrap_or_else(|e| e.into_inner());
+            let cached = state
+                .cached_public_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(ref key) = *cached {
                 return Ok(key.clone());
             }
@@ -407,7 +464,10 @@ mod windows_impl {
 
         // 缓存公钥
         {
-            let mut cached = state.cached_public_key.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cached = state
+                .cached_public_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *cached = Some(public_key.clone());
         }
 
@@ -421,7 +481,9 @@ mod windows_impl {
     ///   → 一次弹窗，且主进程 CNG PIN 缓存生效，后续 row key 解密无需再弹
     /// - 锁定后解锁（master key 已缓存）：spawn 子进程执行 CNG 解密
     ///   → 子进程无 PIN 缓存，强制弹窗；主进程 CNG 缓存仍在，row key 解密无额外弹窗
-    pub fn force_verify_and_unlock_master_key(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
+    pub fn force_verify_and_unlock_master_key(
+        state: &CredentialManagerState,
+    ) -> Result<Vec<u8>, CredentialError> {
         let key_file = state.master_key_file_path();
         if !key_file.exists() {
             return Err(CredentialError::KeyNotFound);
@@ -434,14 +496,18 @@ mod windows_impl {
             verify_via_subprocess(&key_file)?
         } else {
             // 冷启动：主进程内直接解密，让 CNG PIN 缓存留在主进程中
-            let file_data = std::fs::read(&key_file)
-                .map_err(|e| CredentialError::SystemError(format!("Failed to read master key file: {}", e)))?;
+            let file_data = std::fs::read(&key_file).map_err(|e| {
+                CredentialError::SystemError(format!("Failed to read master key file: {}", e))
+            })?;
             let ciphertext = decode_master_key_file(&file_data)?;
             decrypt_master_key_with_cng(&ciphertext)?
         };
 
         {
-            let mut cached = state.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cached = state
+                .cached_master_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *cached = Some(master_key.clone());
         }
 
@@ -450,8 +516,9 @@ mod windows_impl {
 
     /// 通过独立子进程执行 CNG 解密，绕过主进程的 PIN 缓存
     fn verify_via_subprocess(key_file: &std::path::Path) -> Result<Vec<u8>, CredentialError> {
-        let exe_path = std::env::current_exe()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to get current exe: {}", e)))?;
+        let exe_path = std::env::current_exe().map_err(|e| {
+            CredentialError::SystemError(format!("Failed to get current exe: {}", e))
+        })?;
 
         let output = std::process::Command::new(&exe_path)
             .arg("--cng-unlock")
@@ -459,15 +526,23 @@ mod windows_impl {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to spawn CNG unlock process: {}", e)))?
+            .map_err(|e| {
+                CredentialError::SystemError(format!("Failed to spawn CNG unlock process: {}", e))
+            })?
             .wait_with_output()
-            .map_err(|e| CredentialError::SystemError(format!("Failed to wait for CNG unlock process: {}", e)))?;
+            .map_err(|e| {
+                CredentialError::SystemError(format!(
+                    "Failed to wait for CNG unlock process: {}",
+                    e
+                ))
+            })?;
 
         match output.status.code() {
             Some(0) => {
                 let hex_str = String::from_utf8_lossy(&output.stdout);
-                let master_key = hex::decode(hex_str.trim())
-                    .map_err(|e| CredentialError::CryptoError(format!("Invalid hex from subprocess: {}", e)))?;
+                let master_key = hex::decode(hex_str.trim()).map_err(|e| {
+                    CredentialError::CryptoError(format!("Invalid hex from subprocess: {}", e))
+                })?;
 
                 if master_key.len() != MASTER_KEY_LEN {
                     return Err(CredentialError::CryptoError(format!(
@@ -492,7 +567,9 @@ mod windows_impl {
 
     /// 通过 Windows Hello 解锁并缓存主密钥
     #[allow(dead_code)]
-    pub async fn unlock_master_key(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
+    pub async fn unlock_master_key(
+        state: &CredentialManagerState,
+    ) -> Result<Vec<u8>, CredentialError> {
         if let Some(key) = get_cached_master_key(state) {
             return Ok(key);
         }
@@ -502,14 +579,18 @@ mod windows_impl {
             return Err(CredentialError::KeyNotFound);
         }
 
-        let file_data = std::fs::read(&key_file)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to read master key file: {}", e)))?;
+        let file_data = std::fs::read(&key_file).map_err(|e| {
+            CredentialError::SystemError(format!("Failed to read master key file: {}", e))
+        })?;
 
         let ciphertext = decode_master_key_file(&file_data)?;
         let master_key = decrypt_master_key_with_cng(&ciphertext)?;
 
         {
-            let mut cached = state.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cached = state
+                .cached_master_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *cached = Some(master_key.clone());
         }
 
@@ -524,7 +605,9 @@ pub use windows_impl::*;
 pub fn export_or_get_public_key(
     _state: &CredentialManagerState,
 ) -> Result<Vec<u8>, CredentialError> {
-    Err(CredentialError::SystemError("CNG is only available on Windows".to_string()))
+    Err(CredentialError::SystemError(
+        "CNG is only available on Windows".to_string(),
+    ))
 }
 
 /// 仅在首次使用时生成主密钥（不触发 Windows Hello）
@@ -551,15 +634,19 @@ pub fn ensure_master_key_created(state: &CredentialManagerState) -> Result<(), C
     let file_data = encode_master_key_file(&ciphertext);
 
     if let Some(parent) = key_file.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to create directory: {}", e)))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CredentialError::SystemError(format!("Failed to create directory: {}", e))
+        })?;
     }
 
     std::fs::write(&key_file, file_data)
         .map_err(|e| CredentialError::SystemError(format!("Failed to save master key: {}", e)))?;
 
     {
-        let mut cached = state.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cached = state
+            .cached_master_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *cached = Some(master_key.clone());
     }
 
@@ -568,7 +655,9 @@ pub fn ensure_master_key_created(state: &CredentialManagerState) -> Result<(), C
 
 #[cfg(windows)]
 #[allow(dead_code)]
-pub async fn ensure_master_key_ready(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
+pub async fn ensure_master_key_ready(
+    state: &CredentialManagerState,
+) -> Result<Vec<u8>, CredentialError> {
     if let Some(key) = get_cached_master_key(state) {
         return Ok(key);
     }
@@ -587,15 +676,19 @@ pub async fn ensure_master_key_ready(state: &CredentialManagerState) -> Result<V
     let file_data = encode_master_key_file(&ciphertext);
 
     if let Some(parent) = key_file.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to create directory: {}", e)))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CredentialError::SystemError(format!("Failed to create directory: {}", e))
+        })?;
     }
 
     std::fs::write(&key_file, file_data)
         .map_err(|e| CredentialError::SystemError(format!("Failed to save master key: {}", e)))?;
 
     {
-        let mut cached = state.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cached = state
+            .cached_master_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *cached = Some(master_key.clone());
     }
 
@@ -613,23 +706,37 @@ fn ensure_session_valid(state: &CredentialManagerState) -> Result<(), Credential
 
 /// 获取缓存的主密钥
 pub fn get_cached_master_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
-    state.cached_master_key.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    state
+        .cached_master_key
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// 获取缓存的数据库密钥
 #[allow(dead_code)]
 pub fn get_cached_db_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
-    state.cached_db_key.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    state
+        .cached_db_key
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// 获取缓存的公钥
 pub fn get_cached_public_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
-    state.cached_public_key.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    state
+        .cached_public_key
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// 获取或创建数据库密钥（同步版本，用于数据库初始化）
 #[allow(dead_code)]
-pub fn get_or_create_db_key_sync(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
+pub fn get_or_create_db_key_sync(
+    state: &CredentialManagerState,
+) -> Result<Vec<u8>, CredentialError> {
     // 先检查缓存
     if let Some(key) = get_cached_db_key(state) {
         return Ok(key);
@@ -644,7 +751,10 @@ pub fn get_or_create_db_key_sync(state: &CredentialManagerState) -> Result<Vec<u
 
     // 更新缓存
     {
-        let mut cached_db = state.cached_db_key.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cached_db = state
+            .cached_db_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *cached_db = Some(db_key.clone());
     }
 
@@ -653,7 +763,9 @@ pub fn get_or_create_db_key_sync(state: &CredentialManagerState) -> Result<Vec<u
 
 /// 获取或创建主密钥（同步版本）
 #[allow(dead_code)]
-pub fn get_or_create_master_key_sync(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
+pub fn get_or_create_master_key_sync(
+    state: &CredentialManagerState,
+) -> Result<Vec<u8>, CredentialError> {
     if let Some(key) = get_cached_master_key(state) {
         return Ok(key);
     }
@@ -663,13 +775,14 @@ pub fn get_or_create_master_key_sync(state: &CredentialManagerState) -> Result<V
 }
 
 #[cfg(windows)]
-fn open_or_create_cng_key() -> Result<windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE, CredentialError> {
+fn open_or_create_cng_key(
+) -> Result<windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE, CredentialError> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Security::Cryptography::{
-        NCryptCreatePersistedKey, NCryptFinalizeKey, NCryptOpenKey, NCryptOpenStorageProvider,
-        NCryptSetProperty, NCryptFreeObject, CERT_KEY_SPEC, NCRYPT_FLAGS, NCRYPT_KEY_HANDLE, 
-        NCRYPT_PROV_HANDLE, NCRYPT_RSA_ALGORITHM, NCRYPT_OVERWRITE_KEY_FLAG,
-        NCRYPT_UI_POLICY, NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG, NCRYPT_HANDLE,
+        NCryptCreatePersistedKey, NCryptFinalizeKey, NCryptFreeObject, NCryptOpenKey,
+        NCryptOpenStorageProvider, NCryptSetProperty, CERT_KEY_SPEC, NCRYPT_FLAGS, NCRYPT_HANDLE,
+        NCRYPT_KEY_HANDLE, NCRYPT_OVERWRITE_KEY_FLAG, NCRYPT_PROV_HANDLE, NCRYPT_RSA_ALGORITHM,
+        NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG, NCRYPT_UI_POLICY,
     };
 
     // 属性名称常量
@@ -688,7 +801,13 @@ fn open_or_create_cng_key() -> Result<windows::Win32::Security::Cryptography::NC
     let key_name = HSTRING::from(CNG_KEY_NAME);
     let key_pcwstr = PCWSTR::from_raw(key_name.as_ptr());
     let open_result = unsafe {
-        NCryptOpenKey(provider, &mut key, key_pcwstr, CERT_KEY_SPEC(0), NCRYPT_FLAGS(0))
+        NCryptOpenKey(
+            provider,
+            &mut key,
+            key_pcwstr,
+            CERT_KEY_SPEC(0),
+            NCRYPT_FLAGS(0),
+        )
     };
 
     if open_result.is_ok() {
@@ -750,27 +869,20 @@ fn open_or_create_cng_key() -> Result<windows::Win32::Security::Cryptography::NC
         )
     };
 
-    unsafe {
-        NCryptSetProperty(
-            new_key,
-            policy_pcwstr,
-            policy_bytes,
-            NCRYPT_FLAGS(0),
-        )
-    }
-    .map_err(|e| {
-        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(new_key.0)) };
-        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
-        CredentialError::SystemError(format!("Failed to set UI policy: {}", e))
-    })?;
-
-    // 最终确定密钥
-    unsafe { NCryptFinalizeKey(new_key, NCRYPT_FLAGS(0)) }
-        .map_err(|e| {
+    unsafe { NCryptSetProperty(new_key, policy_pcwstr, policy_bytes, NCRYPT_FLAGS(0)) }.map_err(
+        |e| {
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(new_key.0)) };
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
-            CredentialError::SystemError(format!("Failed to finalize CNG key: {}", e))
-        })?;
+            CredentialError::SystemError(format!("Failed to set UI policy: {}", e))
+        },
+    )?;
+
+    // 最终确定密钥
+    unsafe { NCryptFinalizeKey(new_key, NCRYPT_FLAGS(0)) }.map_err(|e| {
+        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(new_key.0)) };
+        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
+        CredentialError::SystemError(format!("Failed to finalize CNG key: {}", e))
+    })?;
 
     let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
     Ok(new_key)
@@ -779,11 +891,11 @@ fn open_or_create_cng_key() -> Result<windows::Win32::Security::Cryptography::NC
 #[cfg(windows)]
 fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialError> {
     use windows::Win32::Security::Cryptography::{
-        NCryptEncrypt, NCryptFreeObject, NCRYPT_PAD_PKCS1_FLAG, NCRYPT_HANDLE,
+        NCryptEncrypt, NCryptFreeObject, NCRYPT_HANDLE, NCRYPT_PAD_PKCS1_FLAG,
     };
 
     let key = open_or_create_cng_key()?;
-    
+
     // 使用 PKCS1 padding（更广泛支持）
     // 第一次调用获取输出大小
     let mut out_len: u32 = 0;
@@ -831,11 +943,11 @@ pub fn encrypt_row_key_with_cng(row_key: &[u8]) -> Result<Vec<u8>, CredentialErr
 #[cfg(windows)]
 pub fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
     use windows::Win32::Security::Cryptography::{
-        NCryptDecrypt, NCryptFreeObject, NCRYPT_PAD_PKCS1_FLAG, NCRYPT_HANDLE,
+        NCryptDecrypt, NCryptFreeObject, NCRYPT_HANDLE, NCRYPT_PAD_PKCS1_FLAG,
     };
 
     let key = open_or_create_cng_key()?;
-    
+
     // 第一次调用获取输出大小
     let mut out_len: u32 = 0;
     unsafe {
@@ -888,18 +1000,24 @@ fn encode_master_key_file(ciphertext: &[u8]) -> Vec<u8> {
 
 pub fn decode_master_key_file(data: &[u8]) -> Result<Vec<u8>, CredentialError> {
     if data.len() <= MASTER_KEY_FILE_MAGIC.len() {
-        return Err(CredentialError::CryptoError("Invalid master key file".to_string()));
+        return Err(CredentialError::CryptoError(
+            "Invalid master key file".to_string(),
+        ));
     }
 
     if &data[..MASTER_KEY_FILE_MAGIC.len()] != MASTER_KEY_FILE_MAGIC {
-        return Err(CredentialError::CryptoError("Invalid master key file magic".to_string()));
+        return Err(CredentialError::CryptoError(
+            "Invalid master key file magic".to_string(),
+        ));
     }
 
     Ok(data[MASTER_KEY_FILE_MAGIC.len()..].to_vec())
 }
 
 /// 从文件加载公钥并缓存（无需用户交互）
-pub fn load_public_key_from_file(state: &CredentialManagerState) -> Result<Vec<u8>, CredentialError> {
+pub fn load_public_key_from_file(
+    state: &CredentialManagerState,
+) -> Result<Vec<u8>, CredentialError> {
     if let Some(key) = get_cached_public_key(state) {
         return Ok(key);
     }
@@ -913,7 +1031,10 @@ pub fn load_public_key_from_file(state: &CredentialManagerState) -> Result<Vec<u
         .map_err(|e| CredentialError::SystemError(format!("Failed to read public key: {}", e)))?;
 
     {
-        let mut cached = state.cached_public_key.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cached = state
+            .cached_public_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *cached = Some(public_key.clone());
     }
 
@@ -921,29 +1042,37 @@ pub fn load_public_key_from_file(state: &CredentialManagerState) -> Result<Vec<u
 }
 
 /// 保存公钥到文件（用于后续无需交互的访问）
-pub fn save_public_key_to_file(state: &CredentialManagerState, public_key: &[u8]) -> Result<(), CredentialError> {
+pub fn save_public_key_to_file(
+    state: &CredentialManagerState,
+    public_key: &[u8],
+) -> Result<(), CredentialError> {
     let key_file = state.file_path("credential_public_key.bin");
-    
+
     // 确保目录存在
     if let Some(parent) = key_file.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| CredentialError::SystemError(format!("Failed to create directory: {}", e)))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CredentialError::SystemError(format!("Failed to create directory: {}", e))
+        })?;
     }
-    
+
     std::fs::write(&key_file, public_key)
         .map_err(|e| CredentialError::SystemError(format!("Failed to save public key: {}", e)))?;
-    
+
     Ok(())
 }
 
 #[cfg(not(windows))]
 pub fn encrypt_row_key_with_cng(_row_key: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    Err(CredentialError::SystemError("CNG is only available on Windows".to_string()))
+    Err(CredentialError::SystemError(
+        "CNG is only available on Windows".to_string(),
+    ))
 }
 
 #[cfg(not(windows))]
 pub fn decrypt_row_key_with_cng(_ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    Err(CredentialError::SystemError("CNG is only available on Windows".to_string()))
+    Err(CredentialError::SystemError(
+        "CNG is only available on Windows".to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -990,7 +1119,10 @@ mod tests {
         // 5 bytes is too short (need at least 12 nonce + 16 tag = 28 bytes)
         let corrupt_data: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42];
         let result = decrypt_with_master_key(key, &corrupt_data);
-        assert!(result.is_err(), "Decrypting corrupt/short ciphertext should return an error");
+        assert!(
+            result.is_err(),
+            "Decrypting corrupt/short ciphertext should return an error"
+        );
     }
 
     #[test]
@@ -999,7 +1131,11 @@ mod tests {
         let plaintext: &[u8] = b"";
         let encrypted = encrypt_with_master_key(key, plaintext).unwrap();
         let decrypted = decrypt_with_master_key(key, &encrypted).unwrap();
-        assert_eq!(decrypted, Vec::<u8>::new(), "Round-trip of empty plaintext should produce empty Vec");
+        assert_eq!(
+            decrypted,
+            Vec::<u8>::new(),
+            "Round-trip of empty plaintext should produce empty Vec"
+        );
     }
 
     #[test]
@@ -1007,7 +1143,10 @@ mod tests {
         let master_key = b"some-master-key-for-testing-1234";
         let key1 = derive_db_key_from_master(master_key);
         let key2 = derive_db_key_from_master(master_key);
-        assert_eq!(key1, key2, "derive_db_key_from_master should be deterministic");
+        assert_eq!(
+            key1, key2,
+            "derive_db_key_from_master should be deterministic"
+        );
     }
 
     #[test]
@@ -1018,6 +1157,10 @@ mod tests {
         assert!(hex_str.starts_with("x'"), "hex key should start with x'");
         assert!(hex_str.ends_with("'"), "hex key should end with '");
         // db_key is 32 bytes = 64 hex chars, plus "x'" prefix and "'" suffix = 67 chars total
-        assert_eq!(hex_str.len(), 67, "hex key should be x' + 64 hex chars + ' = 67 chars");
+        assert_eq!(
+            hex_str.len(),
+            67,
+            "hex key should be x' + 64 hex chars + ' = 67 chars"
+        );
     }
 }

@@ -1,8 +1,8 @@
 //! HMAC v2 migration for existing OCR results.
 
+use super::super::StorageState;
 use rusqlite::params;
 use std::sync::atomic::Ordering;
-use super::super::StorageState;
 
 impl StorageState {
     /// Marker key in app_metadata for bitmap HMAC v2 migration completion.
@@ -23,7 +23,9 @@ impl StorageState {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        if done { return Ok(false); }
+        if done {
+            return Ok(false);
+        }
 
         // 2. Check if there is anything to migrate (old hashes)
         // Rows with text_hash = '' are newly captured and will be indexed by lazy indexer.
@@ -53,11 +55,13 @@ impl StorageState {
         }
 
         // Reset cancellation flag
-        self.hmac_migration_cancel_requested.store(false, Ordering::SeqCst);
+        self.hmac_migration_cancel_requested
+            .store(false, Ordering::SeqCst);
 
         let result = self.run_hmac_migration_internal(&mut progress_callback);
 
-        self.hmac_migration_in_progress.store(false, Ordering::SeqCst);
+        self.hmac_migration_in_progress
+            .store(false, Ordering::SeqCst);
         result
     }
 
@@ -119,9 +123,15 @@ impl StorageState {
                         "SELECT id, text_enc, text_key_encrypted FROM ocr_results WHERE id > ?1 ORDER BY id ASC LIMIT ?2"
                     ).map_err(|e| e.to_string())?;
 
-                    let mapped = stmt.query_map(params![cursor, MIGRATE_BATCH_SIZE], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?))
-                    }).map_err(|e| e.to_string())?;
+                    let mapped = stmt
+                        .query_map(params![cursor, MIGRATE_BATCH_SIZE], |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, Vec<u8>>(1)?,
+                                r.get::<_, Vec<u8>>(2)?,
+                            ))
+                        })
+                        .map_err(|e| e.to_string())?;
 
                     mapped.filter_map(|r| r.ok()).collect()
                 };
@@ -138,8 +148,12 @@ impl StorageState {
                     // C. UPDATE CURSOR
                     conn.execute(
                         "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
-                        params![Self::BITMAP_MIGRATION_CURSOR_KEY, last_id_in_batch.to_string()],
-                    ).ok();
+                        params![
+                            Self::BITMAP_MIGRATION_CURSOR_KEY,
+                            last_id_in_batch.to_string()
+                        ],
+                    )
+                    .ok();
 
                     Ok::<Option<(i64, usize)>, String>(Some((last_id_in_batch, batch_len)))
                 }
@@ -156,7 +170,12 @@ impl StorageState {
                     std::thread::sleep(std::time::Duration::from_millis(200));
 
                     if processed % 10000 < MIGRATE_BATCH_SIZE as usize {
-                        tracing::info!("[HMAC_MIGRATE] Progress: {} / {} (ID: {})", processed, total_rows, cursor);
+                        tracing::info!(
+                            "[HMAC_MIGRATE] Progress: {} / {} (ID: {})",
+                            processed,
+                            total_rows,
+                            cursor
+                        );
                     }
                 }
                 None => break,

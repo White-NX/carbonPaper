@@ -516,7 +516,8 @@
           "drainNow": "立即处理待处理队列",
           "rescanAll": "全部重新匹配 hot 层",
           "retry": "重试下载",
-          "openManagement": "打开智能聚类管理"
+          "openManagement": "打开智能聚类管理",
+          "clusteringDisabledWarning": "任务聚类已关闭。智能聚类仍可在重扫时运行，但由于缺少截图采集阶段的自动文本向量化，候选召回需要临时编码，可能导致处理速度显著下降并增加资源占用。"
         },
         "disabled_notice": "此功能已禁用"
       },

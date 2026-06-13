@@ -194,7 +194,10 @@ impl RawScreenshotRow {
         }
         .or_else(|| {
             // Fall back to dedup table data
-            match (self.page_icon_ref_enc.as_ref(), self.page_icon_ref_key.as_ref()) {
+            match (
+                self.page_icon_ref_enc.as_ref(),
+                self.page_icon_ref_key.as_ref(),
+            ) {
                 (Some(data), Some(key)) => {
                     let dedup_row_key = decrypt_row_key_with_cng(key).ok()?;
                     let decrypted = decrypt_with_master_key(&dedup_row_key, data).ok()?;
@@ -212,7 +215,10 @@ impl RawScreenshotRow {
         }
         .or_else(|| {
             // Fall back to dedup table data
-            match (self.link_set_ref_enc.as_ref(), self.link_set_ref_key.as_ref()) {
+            match (
+                self.link_set_ref_enc.as_ref(),
+                self.link_set_ref_key.as_ref(),
+            ) {
                 (Some(data), Some(key)) => {
                     let dedup_row_key = decrypt_row_key_with_cng(key).ok()?;
                     let decrypted = decrypt_with_master_key(&dedup_row_key, data).ok()?;

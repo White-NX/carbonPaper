@@ -13,10 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::resource_utils::{
-    file_in_local_appdata, file_in_resources,
-    find_existing_file_in_resources,
+    file_in_local_appdata, file_in_resources, find_existing_file_in_resources, get_log_path,
     normalize_path_for_command,
-    get_log_path,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -88,7 +86,9 @@ fn probe_python_command(cmd: &str, args: &[&str]) -> Option<(String, String)> {
     for arg in args {
         cmd_proc.arg(arg);
     }
-    cmd_proc.arg("-c").arg("import sys; print(sys.version.split()[0]); print(sys.executable)");
+    cmd_proc
+        .arg("-c")
+        .arg("import sys; print(sys.version.split()[0]); print(sys.executable)");
     #[cfg(windows)]
     {
         cmd_proc.creation_flags(0x08000000);
@@ -106,7 +106,9 @@ fn probe_python_command(cmd: &str, args: &[&str]) -> Option<(String, String)> {
 
 fn probe_python_executable(python_exe_path: &Path) -> Option<String> {
     let mut cmd_proc = std::process::Command::new(normalize_path_for_command(python_exe_path));
-    cmd_proc.arg("-c").arg("import sys; print(sys.version.split()[0])");
+    cmd_proc
+        .arg("-c")
+        .arg("import sys; print(sys.version.split()[0])");
     #[cfg(windows)]
     {
         cmd_proc.creation_flags(0x08000000);
@@ -124,7 +126,10 @@ fn probe_python_executable(python_exe_path: &Path) -> Option<String> {
 }
 
 fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
-    tracing::info!("Searching for Python {} in Windows Registry...", REQUIRED_PYTHON_VERSION);
+    tracing::info!(
+        "Searching for Python {} in Windows Registry...",
+        REQUIRED_PYTHON_VERSION
+    );
 
     let hives_to_check = [
         RegKey::predef(HKEY_CURRENT_USER),
@@ -145,7 +150,9 @@ fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
                         if let Ok(install_path_key) = version_key.open_subkey("InstallPath") {
                             if let Ok(install_dir) = install_path_key.get_value::<String, _>("") {
                                 let python_exe_path = PathBuf::from(install_dir).join("python.exe");
-                                if python_exe_path.is_file() && probe_python_executable(&python_exe_path).is_some() {
+                                if python_exe_path.is_file()
+                                    && probe_python_executable(&python_exe_path).is_some()
+                                {
                                     tracing::info!(
                                         "Verified python.exe matches {} at: {:?}",
                                         REQUIRED_PYTHON_VERSION,
@@ -234,8 +241,6 @@ pub fn get_venv_dir(_app: &AppHandle) -> PathBuf {
 }
 
 const INSTALLER_NAME: &str = "python-3.12.10-amd64.exe";
-
-
 
 // Run an elevated command while hiding the created window on Windows.
 // Implementation uses PowerShell Start-Process -Verb RunAs -WindowStyle Hidden -Wait
@@ -428,7 +433,8 @@ fn perform_install_python_venv(
         let _ = app.emit("install-log", json!({"source":"installer","line": format!("Creating virtual environment at: {:?} by using {:?}", venv_dir, python_path)}));
         tracing::info!(
             "perform_install_python_venv: creating venv at {:?} with python {:?}",
-            venv_dir, python_path
+            venv_dir,
+            python_path
         );
 
         // 如果本地 .venv 已存在，先删除
@@ -488,9 +494,7 @@ fn perform_install_python_venv(
                 e
             )
             .ok();
-            io::Error::other(
-                format!("Failed to run '{} -m venv': {}", python_cmd, e),
-            )
+            io::Error::other(format!("Failed to run '{} -m venv': {}", python_cmd, e))
         })?;
 
         writeln!(
@@ -498,7 +502,10 @@ fn perform_install_python_venv(
             "Venv command exit status: {:?}",
             status
         )?;
-        let _ = app.emit("install-log", json!({"source":"installer","line": format!("Venv command exit status: {:?}", status)}));
+        let _ = app.emit(
+            "install-log",
+            json!({"source":"installer","line": format!("Venv command exit status: {:?}", status)}),
+        );
 
         if !status.success() {
             let exit_code = status
@@ -529,7 +536,8 @@ fn perform_install_python_venv(
         let _ = app.emit("install-log", json!({"source":"installer","line": format!("Virtual environment created at: {:?} using {}", venv_dir, python_cmd)}));
         tracing::info!(
             "perform_install_python_venv: virtualenv created at {:?}, python={}",
-            venv_dir, python_cmd
+            venv_dir,
+            python_cmd
         );
         freshly_created_venv = true;
         if let Ok(mut f) = log_file.lock() {
@@ -710,14 +718,22 @@ fn perform_install_python_venv(
         if freshly_created_venv && venv_dir.exists() {
             if let Ok(arc_file) = log_file.lock() {
                 if let Ok(mut f) = arc_file.as_ref().lock() {
-                    let _ = writeln!(&mut *f, "Rolling back: removing freshly created venv at {:?}", venv_dir);
+                    let _ = writeln!(
+                        &mut *f,
+                        "Rolling back: removing freshly created venv at {:?}",
+                        venv_dir
+                    );
                 }
             }
             let _ = app_for_threads.emit("install-log", json!({"source":"installer","line": format!("Rolling back: removing freshly created venv at {:?}", venv_dir)}));
             if let Err(e) = fs::remove_dir_all(&venv_dir) {
                 if let Ok(arc_file) = log_file.lock() {
                     if let Ok(mut f) = arc_file.as_ref().lock() {
-                        let _ = writeln!(&mut *f, "Warning: failed to remove venv during rollback: {}", e);
+                        let _ = writeln!(
+                            &mut *f,
+                            "Warning: failed to remove venv during rollback: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -739,12 +755,15 @@ fn perform_install_python_venv(
     }
 
     // onnxruntime and onnxruntime-directml cannot coexist; otherwise, DmlExecutionProvider will be lost.
-    // Other dependencies (such as chromadb) may have indirectly installed onnxruntime; 
+    // Other dependencies (such as chromadb) may have indirectly installed onnxruntime;
     // they need to be uninstalled and then onnxruntime-directml reinstalled.
     {
         if let Ok(arc_file) = log_file.lock() {
             if let Ok(mut f) = arc_file.as_ref().lock() {
-                let _ = writeln!(&mut *f, "Fixing onnxruntime/onnxruntime-directml conflict...");
+                let _ = writeln!(
+                    &mut *f,
+                    "Fixing onnxruntime/onnxruntime-directml conflict..."
+                );
                 let _ = f.flush();
             }
         }
@@ -753,7 +772,11 @@ fn perform_install_python_venv(
         // Step 1: uninstall onnxruntime (non-directml)
         let mut uninstall_cmd = Command::new(&python_exec_cmd);
         uninstall_cmd
-            .arg("-m").arg("pip").arg("uninstall").arg("onnxruntime").arg("-y");
+            .arg("-m")
+            .arg("pip")
+            .arg("uninstall")
+            .arg("onnxruntime")
+            .arg("-y");
         #[cfg(windows)]
         {
             uninstall_cmd.creation_flags(0x08000000);
@@ -763,10 +786,14 @@ fn perform_install_python_venv(
         // Step 2: force-reinstall onnxruntime-directml (no-deps to avoid pulling onnxruntime back)
         let mut reinstall_cmd = Command::new(&python_exec_cmd);
         reinstall_cmd
-            .arg("-m").arg("pip").arg("install")
+            .arg("-m")
+            .arg("pip")
+            .arg("install")
             .arg("onnxruntime-directml==1.24.2")
-            .arg("--force-reinstall").arg("--no-deps")
-            .arg("-i").arg("https://mirrors.aliyun.com/pypi/simple/");
+            .arg("--force-reinstall")
+            .arg("--no-deps")
+            .arg("-i")
+            .arg("https://mirrors.aliyun.com/pypi/simple/");
         #[cfg(windows)]
         {
             reinstall_cmd.creation_flags(0x08000000);
@@ -784,7 +811,11 @@ fn perform_install_python_venv(
             Err(e) => {
                 if let Ok(arc_file) = log_file.lock() {
                     if let Ok(mut f) = arc_file.as_ref().lock() {
-                        let _ = writeln!(&mut *f, "Warning: failed to reinstall onnxruntime-directml: {}", e);
+                        let _ = writeln!(
+                            &mut *f,
+                            "Warning: failed to reinstall onnxruntime-directml: {}",
+                            e
+                        );
                         let _ = f.flush();
                     }
                 }
@@ -901,7 +932,9 @@ fn compute_requirements_hash(path: &Path) -> io::Result<String> {
 
 fn read_stored_requirements_hash(venv_dir: &Path) -> Option<String> {
     let hash_path = venv_dir.join(REQUIREMENTS_HASH_FILE);
-    fs::read_to_string(&hash_path).ok().map(|s| s.trim().to_string())
+    fs::read_to_string(&hash_path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn write_requirements_hash(venv_dir: &Path, hash: &str) -> io::Result<()> {
@@ -934,7 +967,8 @@ pub fn check_deps_freshness(app: AppHandle) -> Result<serde_json::Value, String>
             } else {
                 tracing::info!(
                     "Requirements hash mismatch: stored={}, current={}",
-                    stored_hash, current_hash
+                    stored_hash,
+                    current_hash
                 );
                 Ok(json!({ "needs_update": true, "reason": "hash_mismatch" }))
             }
@@ -984,7 +1018,9 @@ pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
         cmd_proc.creation_flags(0x08000000);
     }
 
-    let mut child = cmd_proc.spawn().map_err(|e| format!("Failed to spawn pip: {}", e))?;
+    let mut child = cmd_proc
+        .spawn()
+        .map_err(|e| format!("Failed to spawn pip: {}", e))?;
 
     let stdout = child.stdout.take().expect("failed to capture stdout");
     let stderr = child.stderr.take().expect("failed to capture stderr");
@@ -1009,22 +1045,34 @@ pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
         }
     });
 
-    let status = child.wait().map_err(|e| format!("Failed waiting for pip: {}", e))?;
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed waiting for pip: {}", e))?;
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
 
     if !status.success() {
-        let exit_code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
+        let exit_code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".into());
         return Err(format!("pip install failed (exit code {})", exit_code));
     }
 
-    let _ = app_for_emit.emit("install-log", json!({"source":"installer","line": "Fixing onnxruntime/onnxruntime-directml conflict..."}));
+    let _ = app_for_emit.emit(
+        "install-log",
+        json!({"source":"installer","line": "Fixing onnxruntime/onnxruntime-directml conflict..."}),
+    );
 
     // ONNX runtime conflict resolution
     {
         let mut uninstall_cmd = Command::new(&python_exec_cmd);
         uninstall_cmd
-            .arg("-m").arg("pip").arg("uninstall").arg("onnxruntime").arg("-y");
+            .arg("-m")
+            .arg("pip")
+            .arg("uninstall")
+            .arg("onnxruntime")
+            .arg("-y");
         #[cfg(windows)]
         {
             uninstall_cmd.creation_flags(0x08000000);
@@ -1033,10 +1081,14 @@ pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
 
         let mut reinstall_cmd = Command::new(&python_exec_cmd);
         reinstall_cmd
-            .arg("-m").arg("pip").arg("install")
+            .arg("-m")
+            .arg("pip")
+            .arg("install")
             .arg("onnxruntime-directml==1.24.2")
-            .arg("--force-reinstall").arg("--no-deps")
-            .arg("-i").arg("https://mirrors.aliyun.com/pypi/simple/");
+            .arg("--force-reinstall")
+            .arg("--no-deps")
+            .arg("-i")
+            .arg("https://mirrors.aliyun.com/pypi/simple/");
         #[cfg(windows)]
         {
             reinstall_cmd.creation_flags(0x08000000);
@@ -1064,7 +1116,10 @@ pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
         }
     }
 
-    let _ = app_for_emit.emit("install-log", json!({"source":"installer","line": "Dependency sync completed successfully."}));
+    let _ = app_for_emit.emit(
+        "install-log",
+        json!({"source":"installer","line": "Dependency sync completed successfully."}),
+    );
     Ok("Dependencies synced successfully.".into())
 }
 
@@ -1073,10 +1128,7 @@ pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
 /// Install a spaCy model package (e.g. `zh_core_web_sm`, `en_core_web_sm`)
 /// using pip from the existing venv.  Streams progress via `install-log` events.
 #[tauri::command]
-pub async fn install_spacy_model(
-    app: AppHandle,
-    model_name: String,
-) -> Result<String, String> {
+pub async fn install_spacy_model(app: AppHandle, model_name: String) -> Result<String, String> {
     // Validate model name to prevent injection
     let allowed = ["zh_core_web_sm", "en_core_web_sm"];
     if !allowed.contains(&model_name.as_str()) {
@@ -1086,7 +1138,10 @@ pub async fn install_spacy_model(
     let venv_dir = get_venv_dir(&app);
     let python_exec = venv_dir.join("Scripts").join("python.exe");
     if !python_exec.is_file() {
-        let msg = format!("Virtual environment python.exe not found at {:?}", python_exec);
+        let msg = format!(
+            "Virtual environment python.exe not found at {:?}",
+            python_exec
+        );
         tracing::error!("install_spacy_model: {}", msg);
         return Err(msg);
     }
@@ -1095,10 +1150,13 @@ pub async fn install_spacy_model(
     // For transformer models, install spacy-transformers first
     if model_name.contains("trf") {
         tracing::info!("install_spacy_model: installing spacy-transformers prerequisite");
-        let _ = app.emit("install-log", json!({
-            "source": "spacy",
-            "line": "Installing spacy-transformers prerequisite..."
-        }));
+        let _ = app.emit(
+            "install-log",
+            json!({
+                "source": "spacy",
+                "line": "Installing spacy-transformers prerequisite..."
+            }),
+        );
 
         let mut trf_cmd = Command::new(&python_exec_cmd);
         trf_cmd
@@ -1118,14 +1176,22 @@ pub async fn install_spacy_model(
         match trf_cmd.output() {
             Ok(output) => {
                 if output.status.success() {
-                    tracing::info!("install_spacy_model: spacy-transformers installed successfully");
-                    let _ = app.emit("install-log", json!({
-                        "source": "spacy",
-                        "line": "spacy-transformers installed."
-                    }));
+                    tracing::info!(
+                        "install_spacy_model: spacy-transformers installed successfully"
+                    );
+                    let _ = app.emit(
+                        "install-log",
+                        json!({
+                            "source": "spacy",
+                            "line": "spacy-transformers installed."
+                        }),
+                    );
                 } else {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!("install_spacy_model: spacy-transformers install failed: {}", stderr.trim());
+                    tracing::warn!(
+                        "install_spacy_model: spacy-transformers install failed: {}",
+                        stderr.trim()
+                    );
                     let _ = app.emit("install-log", json!({
                         "source": "spacy",
                         "line": format!("Warning: spacy-transformers install failed, continuing anyway...")
@@ -1133,16 +1199,26 @@ pub async fn install_spacy_model(
                 }
             }
             Err(e) => {
-                tracing::warn!("install_spacy_model: failed to run pip install spacy-transformers: {}", e);
+                tracing::warn!(
+                    "install_spacy_model: failed to run pip install spacy-transformers: {}",
+                    e
+                );
             }
         }
     }
 
-    tracing::info!("install_spacy_model: installing {} via {}", model_name, python_exec_cmd);
-    let _ = app.emit("install-log", json!({
-        "source": "spacy",
-        "line": format!("Installing spaCy model: {}...", model_name)
-    }));
+    tracing::info!(
+        "install_spacy_model: installing {} via {}",
+        model_name,
+        python_exec_cmd
+    );
+    let _ = app.emit(
+        "install-log",
+        json!({
+            "source": "spacy",
+            "line": format!("Installing spaCy model: {}...", model_name)
+        }),
+    );
 
     // Primary method: `python -m spacy download <model>`
     // This is the official way — spaCy resolves the compatible model version
@@ -1162,11 +1238,17 @@ pub async fn install_spacy_model(
         cmd_proc.creation_flags(0x08000000);
     }
 
-    tracing::info!("install_spacy_model: spawning `python -m spacy download {}`", model_name);
-    let _ = app.emit("install-log", json!({
-        "source": "spacy",
-        "line": format!("Running: python -m spacy download {}...", model_name)
-    }));
+    tracing::info!(
+        "install_spacy_model: spawning `python -m spacy download {}`",
+        model_name
+    );
+    let _ = app.emit(
+        "install-log",
+        json!({
+            "source": "spacy",
+            "line": format!("Running: python -m spacy download {}...", model_name)
+        }),
+    );
 
     let mut child = cmd_proc.spawn().map_err(|e| {
         let msg = format!("Failed to spawn spacy download: {}", e);
@@ -1183,8 +1265,13 @@ pub async fn install_spacy_model(
         let reader = BufReader::new(stdout);
         for line_res in reader.lines() {
             if let Ok(line) = line_res {
-                tracing::info!("install_spacy_model[{}] stdout: {}", model_name_for_log, line);
-                let _ = app_clone_stdout.emit("install-log", json!({"source":"spacy","line": line}));
+                tracing::info!(
+                    "install_spacy_model[{}] stdout: {}",
+                    model_name_for_log,
+                    line
+                );
+                let _ =
+                    app_clone_stdout.emit("install-log", json!({"source":"spacy","line": line}));
             }
         }
     });
@@ -1197,8 +1284,13 @@ pub async fn install_spacy_model(
         let reader = BufReader::new(stderr);
         for line_res in reader.lines() {
             if let Ok(line) = line_res {
-                tracing::warn!("install_spacy_model[{}] stderr: {}", model_name_for_log2, line);
-                let _ = app_clone_stderr.emit("install-log", json!({"source":"spacy","line": line}));
+                tracing::warn!(
+                    "install_spacy_model[{}] stderr: {}",
+                    model_name_for_log2,
+                    line
+                );
+                let _ =
+                    app_clone_stderr.emit("install-log", json!({"source":"spacy","line": line}));
                 if let Ok(mut lines) = stderr_lines_clone.lock() {
                     lines.push(line);
                 }
@@ -1214,26 +1306,41 @@ pub async fn install_spacy_model(
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
 
-    let exit_code_1 = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
-    tracing::info!("install_spacy_model: `spacy download {}` exit code: {}", model_name, exit_code_1);
+    let exit_code_1 = status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    tracing::info!(
+        "install_spacy_model: `spacy download {}` exit code: {}",
+        model_name,
+        exit_code_1
+    );
 
     if status.success() {
-        tracing::info!("install_spacy_model: {} installed successfully via spacy download", model_name);
+        tracing::info!(
+            "install_spacy_model: {} installed successfully via spacy download",
+            model_name
+        );
         let _ = crate::registry_config::set_bool(&spacy_reg_key(&model_name), true);
-        let _ = app.emit("install-log", json!({
-            "source": "spacy",
-            "line": format!("spaCy model {} installed successfully.", model_name)
-        }));
+        let _ = app.emit(
+            "install-log",
+            json!({
+                "source": "spacy",
+                "line": format!("spaCy model {} installed successfully.", model_name)
+            }),
+        );
         return Ok(format!("{} installed successfully", model_name));
     }
 
     // Collect stderr from first attempt for diagnostics
-    let first_stderr = stderr_lines.lock()
+    let first_stderr = stderr_lines
+        .lock()
         .map(|lines| lines.join("\n"))
         .unwrap_or_default();
     tracing::warn!(
         "install_spacy_model: `spacy download` failed (exit code {}), stderr:\n{}",
-        exit_code_1, first_stderr
+        exit_code_1,
+        first_stderr
     );
 
     // Fallback: query installed spaCy version, then pip install the matching GitHub wheel
@@ -1258,10 +1365,15 @@ pub async fn install_spacy_model(
         msg
     })?;
 
-    let spacy_version = String::from_utf8_lossy(&ver_output.stdout).trim().to_string();
+    let spacy_version = String::from_utf8_lossy(&ver_output.stdout)
+        .trim()
+        .to_string();
     if spacy_version.is_empty() || !ver_output.status.success() {
         let ver_stderr = String::from_utf8_lossy(&ver_output.stderr);
-        tracing::error!("install_spacy_model: could not determine spaCy version. stderr: {}", ver_stderr);
+        tracing::error!(
+            "install_spacy_model: could not determine spaCy version. stderr: {}",
+            ver_stderr
+        );
         return Err(format!(
             "Failed to install {} (`spacy download` exit code {}). Could not determine spaCy version for fallback.\n\
              Last output:\n{}",
@@ -1269,7 +1381,10 @@ pub async fn install_spacy_model(
             first_stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
         ));
     }
-    tracing::info!("install_spacy_model: detected spaCy version: {}", spacy_version);
+    tracing::info!(
+        "install_spacy_model: detected spaCy version: {}",
+        spacy_version
+    );
 
     // Extract major.minor from spaCy version (e.g. "3.7.5" → "3.7")
     let spacy_major_minor: String = {
@@ -1327,7 +1442,11 @@ pub async fn install_spacy_model(
         let reader = BufReader::new(stdout2);
         for line_res in reader.lines() {
             if let Ok(line) = line_res {
-                tracing::info!("install_spacy_model[{}] fallback stdout: {}", model_name_for_log3, line);
+                tracing::info!(
+                    "install_spacy_model[{}] fallback stdout: {}",
+                    model_name_for_log3,
+                    line
+                );
                 let _ = app_clone2.emit("install-log", json!({"source":"spacy","line": line}));
             }
         }
@@ -1341,7 +1460,11 @@ pub async fn install_spacy_model(
         let reader = BufReader::new(stderr2);
         for line_res in reader.lines() {
             if let Ok(line) = line_res {
-                tracing::warn!("install_spacy_model[{}] fallback stderr: {}", model_name_for_log4, line);
+                tracing::warn!(
+                    "install_spacy_model[{}] fallback stderr: {}",
+                    model_name_for_log4,
+                    line
+                );
                 let _ = app_clone3.emit("install-log", json!({"source":"spacy","line": line}));
                 if let Ok(mut lines) = stderr_lines2_clone.lock() {
                     lines.push(line);
@@ -1358,19 +1481,32 @@ pub async fn install_spacy_model(
     let _ = stdout_handle2.join();
     let _ = stderr_handle2.join();
 
-    let exit_code_2 = status2.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".into());
-    tracing::info!("install_spacy_model: fallback pip exit code: {}", exit_code_2);
+    let exit_code_2 = status2
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    tracing::info!(
+        "install_spacy_model: fallback pip exit code: {}",
+        exit_code_2
+    );
 
     if status2.success() {
-        tracing::info!("install_spacy_model: {} installed successfully from GitHub wheel", model_name);
+        tracing::info!(
+            "install_spacy_model: {} installed successfully from GitHub wheel",
+            model_name
+        );
         let _ = crate::registry_config::set_bool(&spacy_reg_key(&model_name), true);
-        let _ = app.emit("install-log", json!({
-            "source": "spacy",
-            "line": format!("spaCy model {} installed successfully (from GitHub).", model_name)
-        }));
+        let _ = app.emit(
+            "install-log",
+            json!({
+                "source": "spacy",
+                "line": format!("spaCy model {} installed successfully (from GitHub).", model_name)
+            }),
+        );
         Ok(format!("{} installed successfully", model_name))
     } else {
-        let fallback_stderr = stderr_lines2.lock()
+        let fallback_stderr = stderr_lines2
+            .lock()
             .map(|lines| lines.join("\n"))
             .unwrap_or_default();
         tracing::error!(
@@ -1378,14 +1514,26 @@ pub async fn install_spacy_model(
              `spacy download` exit code: {}, GitHub wheel exit code: {}\n\
              `spacy download` stderr:\n{}\n\
              GitHub wheel stderr:\n{}",
-            model_name, exit_code_1, exit_code_2, first_stderr, fallback_stderr
+            model_name,
+            exit_code_1,
+            exit_code_2,
+            first_stderr,
+            fallback_stderr
         );
 
         // Build a user-facing error with the last few stderr lines
         let last_lines: String = {
-            let combined = if !fallback_stderr.is_empty() { &fallback_stderr } else { &first_stderr };
+            let combined = if !fallback_stderr.is_empty() {
+                &fallback_stderr
+            } else {
+                &first_stderr
+            };
             let lines: Vec<&str> = combined.lines().collect();
-            let start = if lines.len() > 10 { lines.len() - 10 } else { 0 };
+            let start = if lines.len() > 10 {
+                lines.len() - 10
+            } else {
+                0
+            };
             lines[start..].join("\n")
         };
         Err(format!(
@@ -1405,13 +1553,15 @@ fn check_single_spacy_model(python_exec_cmd: &str, model: &str) -> bool {
     }
     match cmd.output() {
         Ok(output) => {
-            let ok = output.status.success()
-                && String::from_utf8_lossy(&output.stdout).trim() == "ok";
+            let ok =
+                output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "ok";
             if !ok {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 tracing::debug!(
                     "check_single_spacy_model: {} not available (exit={:?}, stderr={})",
-                    model, output.status.code(), stderr.trim()
+                    model,
+                    output.status.code(),
+                    stderr.trim()
                 );
             }
             ok
@@ -1467,8 +1617,16 @@ pub fn check_spacy_models(app: AppHandle) -> Result<serde_json::Value, String> {
 
     tracing::info!(
         "check_spacy_models: zh_sm={}, en_sm={}",
-        result.get("zh_core_web_sm").and_then(|v| v.get("installed")).and_then(|v| v.as_bool()).unwrap_or(false),
-        result.get("en_core_web_sm").and_then(|v| v.get("installed")).and_then(|v| v.as_bool()).unwrap_or(false),
+        result
+            .get("zh_core_web_sm")
+            .and_then(|v| v.get("installed"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        result
+            .get("en_core_web_sm")
+            .and_then(|v| v.get("installed"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     );
 
     Ok(serde_json::Value::Object(result))
@@ -1541,11 +1699,17 @@ pub fn auto_install_spacy_models(app: AppHandle) {
                 continue;
             }
 
-            tracing::info!("auto_install_spacy_models: {} not installed, starting install", model);
-            let _ = app.emit("spacy-model-status", json!({
-                "model": model,
-                "status": "installing"
-            }));
+            tracing::info!(
+                "auto_install_spacy_models: {} not installed, starting install",
+                model
+            );
+            let _ = app.emit(
+                "spacy-model-status",
+                json!({
+                    "model": model,
+                    "status": "installing"
+                }),
+            );
 
             let app_clone = app.clone();
             let model_name = model.to_string();
@@ -1561,19 +1725,28 @@ pub fn auto_install_spacy_models(app: AppHandle) {
             match result {
                 Ok(_) => {
                     let _ = registry_config::set_bool(&reg_key, true);
-                    tracing::info!("auto_install_spacy_models: {} installed successfully", model);
-                    let _ = app.emit("spacy-model-status", json!({
-                        "model": model,
-                        "status": "installed"
-                    }));
+                    tracing::info!(
+                        "auto_install_spacy_models: {} installed successfully",
+                        model
+                    );
+                    let _ = app.emit(
+                        "spacy-model-status",
+                        json!({
+                            "model": model,
+                            "status": "installed"
+                        }),
+                    );
                 }
                 Err(e) => {
                     tracing::error!("auto_install_spacy_models: {} install failed: {}", model, e);
-                    let _ = app.emit("spacy-model-status", json!({
-                        "model": model,
-                        "status": "failed",
-                        "error": e
-                    }));
+                    let _ = app.emit(
+                        "spacy-model-status",
+                        json!({
+                            "model": model,
+                            "status": "failed",
+                            "error": e
+                        }),
+                    );
                 }
             }
         }

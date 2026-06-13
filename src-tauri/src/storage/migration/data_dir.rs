@@ -7,7 +7,7 @@ use tauri::AppHandle;
 use tauri::Emitter;
 use walkdir::WalkDir;
 
-use super::{MigrationRunGuard, super::StorageState};
+use super::{super::StorageState, MigrationRunGuard};
 
 impl StorageState {
     /// Rollback a partial migration by removing copied files and created directories.
@@ -35,16 +35,16 @@ impl StorageState {
         {
             let mut data_guard = self.data_dir.lock().unwrap_or_else(|e| e.into_inner());
             *data_guard = src.to_path_buf();
-            let mut ss_guard = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ss_guard = self
+                .screenshot_dir
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *ss_guard = src.join("screenshots");
         }
         self.credential_state.set_data_dir(src.to_path_buf());
 
         if let Err(e) = self.initialize() {
-            let msg = format!(
-                "{}; failed to reinitialize source storage: {}",
-                message, e
-            );
+            let msg = format!("{}; failed to reinitialize source storage: {}", message, e);
             let _ = app_handle.emit(
                 "storage-migration-error",
                 json!({ "message": msg.clone(), "recoverable": false, "cancelled": cancelled }),
@@ -75,18 +75,21 @@ impl StorageState {
         target: String,
         migrate_data_files: bool,
     ) -> Result<serde_json::Value, String> {
-        if self
-            .migration_in_progress
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.migration_in_progress.swap(true, Ordering::SeqCst) {
             return Err("A storage migration is already in progress".to_string());
         }
         self.migration_cancel_requested
             .store(false, Ordering::SeqCst);
-        let _migration_guard =
-            MigrationRunGuard::new(&self.migration_in_progress, &self.migration_cancel_requested);
+        let _migration_guard = MigrationRunGuard::new(
+            &self.migration_in_progress,
+            &self.migration_cancel_requested,
+        );
 
-        let src = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let src = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         // User selects a storage root; actual data_dir is always under its "data" subdirectory
         let dst = PathBuf::from(&target).join("data");
 
@@ -199,15 +202,13 @@ impl StorageState {
                 if entry.file_type().is_dir() {
                     let existed = target_path.exists();
                     if let Err(e) = std::fs::create_dir_all(&target_path) {
-                        let msg =
-                            format!("Failed to create dir {}: {}", target_path.display(), e);
+                        let msg = format!("Failed to create dir {}: {}", target_path.display(), e);
                         Self::rollback_partial_migration(&copied_files, &mut created_dirs);
                         let _ = app_handle.emit(
                             "storage-migration-error",
                             json!({ "message": msg.clone(), "recoverable": false }),
                         );
-                        return self
-                            .restore_source_and_reinitialize(&app_handle, &src, msg, false);
+                        return self.restore_source_and_reinitialize(&app_handle, &src, msg, false);
                     }
                     if !existed {
                         created_dirs.push(target_path.clone());
@@ -228,8 +229,7 @@ impl StorageState {
                             "storage-migration-error",
                             json!({ "message": msg.clone(), "recoverable": false }),
                         );
-                        return self
-                            .restore_source_and_reinitialize(&app_handle, &src, msg, false);
+                        return self.restore_source_and_reinitialize(&app_handle, &src, msg, false);
                     }
                     if !existed {
                         created_dirs.push(parent.to_path_buf());
@@ -256,8 +256,7 @@ impl StorageState {
                             "storage-migration-error",
                             json!({ "message": msg.clone(), "recoverable": false }),
                         );
-                        return self
-                            .restore_source_and_reinitialize(&app_handle, &src, msg, false);
+                        return self.restore_source_and_reinitialize(&app_handle, &src, msg, false);
                     }
                 }
             }
@@ -320,7 +319,10 @@ impl StorageState {
         {
             let mut data_guard = self.data_dir.lock().unwrap_or_else(|e| e.into_inner());
             *data_guard = dst.clone();
-            let mut ss_guard = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ss_guard = self
+                .screenshot_dir
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *ss_guard = dst.join("screenshots");
         }
         self.credential_state.set_data_dir(dst.clone());

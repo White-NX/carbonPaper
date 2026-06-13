@@ -100,13 +100,12 @@ pub fn log_security_event(_app: &AppHandle, event: &str, detail: &str) {
     // 过滤掉换行避免行格式被打乱
     let safe_event = event.replace(['\n', '\r'], " ");
     let safe_detail = detail.replace(['\n', '\r'], " ");
-    let line = format!("[{}] event={} detail={}\n", timestamp, safe_event, safe_detail);
+    let line = format!(
+        "[{}] event={} detail={}\n",
+        timestamp, safe_event, safe_detail
+    );
 
-    match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+    match OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(mut f) => {
             if let Err(e) = f.write_all(line.as_bytes()) {
                 tracing::warn!(
@@ -149,10 +148,8 @@ mod tests {
     use super::*;
 
     // Known SHA-256 test vectors
-    const EMPTY_SHA256: &str =
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    const HELLO_SHA256: &str =
-        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
     #[test]
     fn test_compute_sha256_empty() {

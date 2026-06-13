@@ -42,10 +42,17 @@ const ensureLoaded = async (lng) => {
   }
 };
 
+const syncBackendLanguage = (lng) => {
+  invoke('set_app_language', { language: lng || 'zh-CN' }).catch(() => {
+    // Backend may not be available in web-only mode; ignore failures.
+  });
+};
+
 // load initial language (useLang detector may set i18n.language)
 const initialLang = localStorage.getItem('language') || i18n.language || 'zh-CN';
 ensureLoaded(initialLang).then(() => {
   i18n.changeLanguage(initialLang).catch(() => {});
+  syncBackendLanguage(initialLang);
 });
 
 // when language changes, try to lazy-load resources for it
@@ -56,6 +63,7 @@ i18n.on('languageChanged', (lng) => {
   } catch (e) {
     // ignore
   }
+  syncBackendLanguage(lng);
   // Notify Presidio PII service of language change (best-effort, non-blocking)
   invoke('execute_monitor_command', {
     payload: { command: 'presidio_set_language', language: lng }

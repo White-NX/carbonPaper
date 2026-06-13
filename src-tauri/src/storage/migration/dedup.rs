@@ -1,8 +1,8 @@
 //! Dedup migration: move inline data to dedup tables.
 
+use crate::credential_manager::{decrypt_row_key_with_cng, decrypt_with_master_key};
 use rusqlite::params;
 use std::sync::atomic::Ordering;
-use crate::credential_manager::{decrypt_row_key_with_cng, decrypt_with_master_key};
 
 use super::super::StorageState;
 
@@ -74,16 +74,22 @@ impl StorageState {
                     }
                 };
                 let plaintext = match decrypt_with_master_key(&row_key, icon_enc) {
-                    Ok(d) => match String::from_utf8(d) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!("migrate_inline_to_dedup: invalid utf8 in page_icon for id={}: {}", id, e);
-                            has_errors = true;
-                            continue;
+                    Ok(d) => {
+                        match String::from_utf8(d) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("migrate_inline_to_dedup: invalid utf8 in page_icon for id={}: {}", id, e);
+                                has_errors = true;
+                                continue;
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
-                        tracing::warn!("migrate_inline_to_dedup: failed to decrypt page_icon for id={}: {}", id, e);
+                        tracing::warn!(
+                            "migrate_inline_to_dedup: failed to decrypt page_icon for id={}: {}",
+                            id,
+                            e
+                        );
                         has_errors = true;
                         continue;
                     }
@@ -152,16 +158,22 @@ impl StorageState {
                     }
                 };
                 let plaintext = match decrypt_with_master_key(&row_key, links_enc) {
-                    Ok(d) => match String::from_utf8(d) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!("migrate_inline_to_dedup: invalid utf8 in link_set for id={}: {}", id, e);
-                            has_errors = true;
-                            continue;
+                    Ok(d) => {
+                        match String::from_utf8(d) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("migrate_inline_to_dedup: invalid utf8 in link_set for id={}: {}", id, e);
+                                has_errors = true;
+                                continue;
+                            }
                         }
-                    },
+                    }
                     Err(e) => {
-                        tracing::warn!("migrate_inline_to_dedup: failed to decrypt link_set for id={}: {}", id, e);
+                        tracing::warn!(
+                            "migrate_inline_to_dedup: failed to decrypt link_set for id={}: {}",
+                            id,
+                            e
+                        );
                         has_errors = true;
                         continue;
                     }
@@ -170,7 +182,11 @@ impl StorageState {
                 let links: Vec<super::super::VisibleLink> = match serde_json::from_str(&plaintext) {
                     Ok(l) => l,
                     Err(e) => {
-                        tracing::warn!("migrate_inline_to_dedup: failed to parse links JSON for id={}: {}", id, e);
+                        tracing::warn!(
+                            "migrate_inline_to_dedup: failed to parse links JSON for id={}: {}",
+                            id,
+                            e
+                        );
                         has_errors = true;
                         continue;
                     }
@@ -182,7 +198,11 @@ impl StorageState {
                         "UPDATE screenshots SET visible_links_enc = NULL WHERE id = ?",
                         params![id],
                     ) {
-                        tracing::warn!("migrate_inline_to_dedup: failed to clear empty links for id={}: {}", id, e);
+                        tracing::warn!(
+                            "migrate_inline_to_dedup: failed to clear empty links for id={}: {}",
+                            id,
+                            e
+                        );
                         has_errors = true;
                     }
                     continue;
@@ -224,7 +244,9 @@ impl StorageState {
         // Migration complete, write success marker (even if some rows were skipped due to errors)
         {
             if has_errors {
-                tracing::warn!("[DEDUP:MIGRATE] Completed with some errors; skipped rows will not be retried.");
+                tracing::warn!(
+                    "[DEDUP:MIGRATE] Completed with some errors; skipped rows will not be retried."
+                );
             }
             let guard = self.get_connection_named("dedup_migrate_mark")?;
             let conn = guard.as_ref().unwrap();

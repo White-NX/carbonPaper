@@ -1,5 +1,7 @@
 use crate::capture::CaptureState;
-use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources, normalize_path_for_command};
+use crate::resource_utils::{
+    file_in_local_appdata, find_existing_file_in_resources, normalize_path_for_command,
+};
 use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
 use crate::storage::StorageState;
 use rand::Rng;
@@ -15,16 +17,15 @@ use tokio::net::windows::named_pipe::ClientOptions;
 
 use std::os::windows::io::AsRawHandle;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectCpuRateControlInformation,
+    JobObjectExtendedLimitInformation, SetInformationJobObject,
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JobObjectCpuRateControlInformation,
-    JobObjectExtendedLimitInformation,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Performance::*;
-
 
 pub struct MonitorState {
     pub process: Mutex<Option<Child>>,
@@ -367,41 +368,61 @@ pub async fn execute_monitor_command(
     match command {
         "update_filters" => {
             // Update Rust-side exclusion settings
-            let filters = payload.get("filters").cloned().unwrap_or(serde_json::Value::Null);
-            let processes = filters.get("processes")
+            let filters = payload
+                .get("filters")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let processes = filters
+                .get("processes")
                 .or_else(|| payload.get("processes"))
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
-            let titles = filters.get("titles")
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                });
+            let titles = filters
+                .get("titles")
                 .or_else(|| payload.get("titles"))
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
-            let ignore_protected = filters.get("ignore_protected")
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                });
+            let ignore_protected = filters
+                .get("ignore_protected")
                 .or_else(|| payload.get("ignore_protected"))
                 .and_then(|v| v.as_bool());
 
             {
-                let data_dir = storage.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                capture_state.update_exclusion_settings(
-                    processes,
-                    titles,
-                    ignore_protected,
-                );
+                let data_dir = storage
+                    .data_dir
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                capture_state.update_exclusion_settings(processes, titles, ignore_protected);
                 capture_state.save_exclusion_settings(&data_dir);
             }
             // Still forward to Python for its internal state
         }
         "update_advanced_config" => {
             // Update Rust-side backpressure config
-            let capture_on_ocr_busy = payload.get("capture_on_ocr_busy")
+            let capture_on_ocr_busy = payload
+                .get("capture_on_ocr_busy")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let ocr_queue_max_size = payload.get("ocr_queue_max_size")
+            let ocr_queue_max_size = payload
+                .get("ocr_queue_max_size")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as u32;
 
-            capture_state.capture_on_ocr_busy.store(capture_on_ocr_busy, Ordering::SeqCst);
-            capture_state.ocr_queue_max_size.store(ocr_queue_max_size, Ordering::SeqCst);
+            capture_state
+                .capture_on_ocr_busy
+                .store(capture_on_ocr_busy, Ordering::SeqCst);
+            capture_state
+                .ocr_queue_max_size
+                .store(ocr_queue_max_size, Ordering::SeqCst);
             // Still forward to Python
         }
         _ => {}
@@ -416,7 +437,9 @@ async fn send_ipc_command_internal(
     cmd: &str,
 ) -> Result<String, String> {
     let req = serde_json::json!({ "command": cmd });
-    forward_command_to_python(state, req).await.map(|v| v.to_string())
+    forward_command_to_python(state, req)
+        .await
+        .map(|v| v.to_string())
 }
 
 /// Forward an arbitrary JSON command to the Python process via IPC.
@@ -520,7 +543,10 @@ pub async fn start_monitor(
                     && m.get("required").and_then(|r| r.as_bool()) != Some(false)
             });
             if has_incomplete {
-                return Err("Model files are incomplete. Please download required models first.".to_string());
+                return Err(
+                    "Model files are incomplete. Please download required models first."
+                        .to_string(),
+                );
             }
         }
     }
@@ -572,10 +598,14 @@ pub async fn start_monitor(
             match py_candidates.iter().find(|p| p.exists()) {
                 Some(p) => (normalize_path_for_command(p), false),
                 None => {
-                    let tried_pyz: Vec<String> =
-                        pyz_candidates.iter().map(|p| p.display().to_string()).collect();
-                    let tried_py: Vec<String> =
-                        py_candidates.iter().map(|p| p.display().to_string()).collect();
+                    let tried_pyz: Vec<String> = pyz_candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect();
+                    let tried_py: Vec<String> = py_candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect();
                     return Err(format!(
                         "Could not find monitor.pyz nor monitor/main.py. CWD: {}. Tried pyz: {:?}; py: {:?}",
                         cwd, tried_pyz, tried_py
@@ -584,8 +614,10 @@ pub async fn start_monitor(
             }
         } else {
             // Release 模式：必须有 .pyz，不允许回退
-            let tried: Vec<String> =
-                pyz_candidates.iter().map(|p| p.display().to_string()).collect();
+            let tried: Vec<String> = pyz_candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
             crate::script_integrity::log_security_event(
                 &app,
                 "pyz_missing",
@@ -715,7 +747,7 @@ pub async fn start_monitor(
             python_executable, python_exists, script_path, script_abs, cwd, pipe_name[0..30].to_string(), reverse_pipe_name[0..30].to_string()
         );
 
-        // Start the Python process with stdout/stderr piped, 
+        // Start the Python process with stdout/stderr piped,
         // and pass the pipe name and auth token as command line arguments (instead of environment variables)
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
@@ -787,10 +819,7 @@ pub async fn start_monitor(
                     .unwrap_or(true)
                     .to_string(),
             )
-            .env(
-                "CARBONPAPER_USE_ONNX",
-                use_onnx.to_string(),
-            );
+            .env("CARBONPAPER_USE_ONNX", use_onnx.to_string());
 
         if let Some(appdata_dir) = file_in_local_appdata() {
             let models_dir = appdata_dir.join("models");
@@ -814,8 +843,16 @@ pub async fn start_monitor(
                     } else {
                         models_dir.clone()
                     },
-                    if has_bge_onnx(&primary_bge) { primary_bge } else { legacy_bge },
-                    if has_bge_onnx(&primary_minilm) { primary_minilm } else { legacy_minilm },
+                    if has_bge_onnx(&primary_bge) {
+                        primary_bge
+                    } else {
+                        legacy_bge
+                    },
+                    if has_bge_onnx(&primary_minilm) {
+                        primary_minilm
+                    } else {
+                        legacy_minilm
+                    },
                 )
             } else {
                 (
@@ -828,26 +865,42 @@ pub async fn start_monitor(
             cmd_proc
                 .env("MODEL_PATH", clip_path.to_string_lossy().to_string())
                 .env("BGE_MODEL_PATH", bge_path.to_string_lossy().to_string())
-                .env("MINILM_MODEL_PATH", minilm_path.to_string_lossy().to_string());
+                .env(
+                    "MINILM_MODEL_PATH",
+                    minilm_path.to_string_lossy().to_string(),
+                );
         }
 
         // Pass DirectML configuration
         if crate::registry_config::get_bool("use_dml").unwrap_or(false) {
             // 检查游戏模式是否抑制了 DML（临时或永久）
             let suppressed = state.game_mode_dml_suppressed.load(Ordering::SeqCst)
-                || state.game_mode_permanently_suppressed.load(Ordering::SeqCst);
+                || state
+                    .game_mode_permanently_suppressed
+                    .load(Ordering::SeqCst);
             if !suppressed {
                 // 先枚举可用 GPU，如果完全没有可用显卡则跳过 DML
                 let gpus = enumerate_gpus_internal().unwrap_or_default();
                 if gpus.is_empty() {
-                    tracing::warn!("No compatible GPU detected, skipping DirectML (falling back to CPU)");
+                    tracing::warn!(
+                        "No compatible GPU detected, skipping DirectML (falling back to CPU)"
+                    );
                 } else {
                     cmd_proc.env("CARBONPAPER_USE_DML", "1");
-                    let mut device_id = crate::registry_config::get_u32("dml_device_id").unwrap_or(0);
+                    let mut device_id =
+                        crate::registry_config::get_u32("dml_device_id").unwrap_or(0);
                     // 校验 device_id 是否仍然有效，无效则回退到第一张可用卡
-                    if !gpus.iter().any(|g| g.get("id").and_then(|v| v.as_u64()) == Some(device_id as u64)) {
-                        let fallback_id = gpus[0].get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                        tracing::warn!("DML device_id {} no longer exists, falling back to {}", device_id, fallback_id);
+                    if !gpus
+                        .iter()
+                        .any(|g| g.get("id").and_then(|v| v.as_u64()) == Some(device_id as u64))
+                    {
+                        let fallback_id =
+                            gpus[0].get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        tracing::warn!(
+                            "DML device_id {} no longer exists, falling back to {}",
+                            device_id,
+                            fallback_id
+                        );
                         device_id = fallback_id;
                         let _ = crate::registry_config::set_u32("dml_device_id", device_id);
                     }
@@ -986,7 +1039,8 @@ pub async fn start_monitor(
                                 .code()
                                 .map(|c| c.to_string())
                                 .unwrap_or_else(|| "unknown".to_string());
-                            let _ = app_clone.emit("monitor-exited", serde_json::json!({"code": code}));
+                            let _ =
+                                app_clone.emit("monitor-exited", serde_json::json!({"code": code}));
                         }
                         break;
                     }
@@ -1018,6 +1072,7 @@ pub async fn start_monitor(
             Ok(_) => {
                 // 管道可连接，说明服务已就绪 — 启动 Rust 截图循环
                 spawn_capture_loop(&app);
+                crate::refresh_tray_menu(&app);
                 return Ok("Monitor started".into());
             }
             Err(e) => {
@@ -1096,7 +1151,11 @@ fn spawn_capture_loop(app: &AppHandle) {
 
     // Load exclusion settings from disk
     {
-        let data_dir = storage.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let data_dir = storage
+            .data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         capture_state.load_exclusion_settings(&data_dir);
     }
 
@@ -1104,10 +1163,13 @@ fn spawn_capture_loop(app: &AppHandle) {
     {
         let capture_on_ocr_busy =
             crate::registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
-        let ocr_queue_max_size =
-            crate::registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
-        capture_state.capture_on_ocr_busy.store(capture_on_ocr_busy, Ordering::SeqCst);
-        capture_state.ocr_queue_max_size.store(ocr_queue_max_size, Ordering::SeqCst);
+        let ocr_queue_max_size = crate::registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
+        capture_state
+            .capture_on_ocr_busy
+            .store(capture_on_ocr_busy, Ordering::SeqCst);
+        capture_state
+            .ocr_queue_max_size
+            .store(ocr_queue_max_size, Ordering::SeqCst);
     }
 
     let cs = capture_state.inner().clone();
@@ -1119,9 +1181,11 @@ fn spawn_capture_loop(app: &AppHandle) {
     let handle = tauri::async_runtime::spawn(async move {
         let _ms = app_handle.state::<MonitorState>();
         // Use AssertUnwindSafe + catch_unwind to detect panics in the capture loop
-        let result = std::panic::AssertUnwindSafe(
-            crate::capture::run_capture_loop(cs, st, app_handle.clone())
-        );
+        let result = std::panic::AssertUnwindSafe(crate::capture::run_capture_loop(
+            cs,
+            st,
+            app_handle.clone(),
+        ));
         match futures::FutureExt::catch_unwind(result).await {
             Ok(()) => {
                 // Normal exit
@@ -1134,7 +1198,10 @@ fn spawn_capture_loop(app: &AppHandle) {
         }
     });
 
-    let mut guard = capture_state.capture_task.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = capture_state
+        .capture_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     *guard = Some(handle);
 
     tracing::info!("Rust capture loop spawned");
@@ -1145,6 +1212,7 @@ fn spawn_capture_loop(app: &AppHandle) {
 pub async fn stop_monitor(
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
+    app: AppHandle,
 ) -> Result<String, String> {
     // 1. Stop the Rust capture loop
     capture_state.stopped.store(true, Ordering::SeqCst);
@@ -1155,7 +1223,10 @@ pub async fn stop_monitor(
 
     // Abort the capture task
     {
-        let mut guard = capture_state.capture_task.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = capture_state
+            .capture_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(handle) = guard.take() {
             handle.abort();
         }
@@ -1226,8 +1297,12 @@ pub async fn stop_monitor(
             .unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
+    {
+        let mut guard = state.job_handle.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
 
-    state.stopping.store(false, Ordering::SeqCst);
+    crate::refresh_tray_menu(&app);
 
     Ok("Monitor stopped".into())
 }
@@ -1237,11 +1312,14 @@ pub async fn stop_monitor(
 pub async fn pause_monitor(
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
+    app: AppHandle,
 ) -> Result<String, String> {
     // Pause Rust capture loop
     capture_state.paused.store(true, Ordering::SeqCst);
     // Also forward to Python so OCR worker pauses
-    send_ipc_command_internal(&state, "pause").await
+    let result = send_ipc_command_internal(&state, "pause").await;
+    crate::refresh_tray_menu(&app);
+    result
 }
 
 /// Resumes screenshot capture after a pause.
@@ -1249,11 +1327,14 @@ pub async fn pause_monitor(
 pub async fn resume_monitor(
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
+    app: AppHandle,
 ) -> Result<String, String> {
     // Resume Rust capture loop
     capture_state.paused.store(false, Ordering::SeqCst);
     // Also forward to Python so OCR worker resumes
-    send_ipc_command_internal(&state, "resume").await
+    let result = send_ipc_command_internal(&state, "resume").await;
+    crate::refresh_tray_menu(&app);
+    result
 }
 
 #[tauri::command]
@@ -1299,8 +1380,8 @@ pub async fn get_monitor_status(state: State<'_, MonitorState>) -> Result<String
 /// 枚举系统中的 GPU 设备（排除软件渲染器）
 pub fn enumerate_gpus_internal() -> Result<Vec<serde_json::Value>, String> {
     unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1()
-            .map_err(|e| format!("Failed to create DXGI factory: {:?}", e))?;
+        let factory: IDXGIFactory1 =
+            CreateDXGIFactory1().map_err(|e| format!("Failed to create DXGI factory: {:?}", e))?;
 
         let mut gpus = Vec::new();
         let mut i: u32 = 0;
@@ -1311,7 +1392,11 @@ pub fn enumerate_gpus_internal() -> Result<Vec<serde_json::Value>, String> {
             // 排除软件渲染器
             if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
                 let name = String::from_utf16_lossy(
-                    &desc.Description[..desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len())],
+                    &desc.Description[..desc
+                        .Description
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.Description.len())],
                 );
                 gpus.push(serde_json::json!({
                     "id": i,
@@ -1332,8 +1417,8 @@ pub fn enumerate_gpus() -> Result<Vec<serde_json::Value>, String> {
 /// 查询指定 GPU 的系统级显存占用率（使用 Windows Performance Counter，与任务管理器一致）
 fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
     unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1()
-            .map_err(|e| format!("Failed to create DXGI factory: {:?}", e))?;
+        let factory: IDXGIFactory1 =
+            CreateDXGIFactory1().map_err(|e| format!("Failed to create DXGI factory: {:?}", e))?;
 
         let adapter: IDXGIAdapter1 = factory
             .EnumAdapters1(device_id)
@@ -1389,12 +1474,7 @@ fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
         }
 
         let mut value = PDH_FMT_COUNTERVALUE::default();
-        let status = PdhGetFormattedCounterValue(
-            counter,
-            PDH_FMT_LARGE,
-            None,
-            &mut value,
-        );
+        let status = PdhGetFormattedCounterValue(counter, PDH_FMT_LARGE, None, &mut value);
         PdhCloseQuery(query);
 
         if status != 0 {
@@ -1416,7 +1496,10 @@ pub fn start_game_mode_monitor(app: AppHandle) {
 
     // 停止已有的监控任务
     {
-        let mut guard = monitor_state.game_mode_task.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = monitor_state
+            .game_mode_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(handle) = guard.take() {
             handle.abort();
         }
@@ -1442,7 +1525,9 @@ pub fn start_game_mode_monitor(app: AppHandle) {
             // ── Fullscreen non-browser detection ──
             {
                 let capture_state = app_clone.state::<Arc<CaptureState>>();
-                let was_paused = capture_state.game_mode_capture_paused.load(Ordering::SeqCst);
+                let was_paused = capture_state
+                    .game_mode_capture_paused
+                    .load(Ordering::SeqCst);
 
                 let should_pause = match crate::capture::check_foreground_fullscreen() {
                     Some((process_name, _window_class, true)) if !process_name.is_empty() => {
@@ -1466,9 +1551,13 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                 };
 
                 if should_pause != was_paused {
-                    capture_state.game_mode_capture_paused.store(should_pause, Ordering::SeqCst);
+                    capture_state
+                        .game_mode_capture_paused
+                        .store(should_pause, Ordering::SeqCst);
                     if should_pause {
-                        tracing::info!("Game mode: non-browser fullscreen app detected, pausing capture");
+                        tracing::info!(
+                            "Game mode: non-browser fullscreen app detected, pausing capture"
+                        );
                     } else {
                         tracing::info!("Game mode: fullscreen app exited, resuming capture");
                     }
@@ -1495,7 +1584,10 @@ pub fn start_game_mode_monitor(app: AppHandle) {
             let state = app_clone.state::<MonitorState>();
 
             // 如果已经被永久关闭，不再轮询
-            if state.game_mode_permanently_suppressed.load(Ordering::SeqCst) {
+            if state
+                .game_mode_permanently_suppressed
+                .load(Ordering::SeqCst)
+            {
                 continue;
             }
 
@@ -1508,7 +1600,11 @@ pub fn start_game_mode_monitor(app: AppHandle) {
             };
 
             let currently_suppressed = state.game_mode_dml_suppressed.load(Ordering::SeqCst);
-            tracing::debug!("Game mode: GPU 0 memory usage {:.1}%, DML suppressed: {}", usage * 100.0, currently_suppressed);
+            tracing::debug!(
+                "Game mode: GPU 0 memory usage {:.1}%, DML suppressed: {}",
+                usage * 100.0,
+                currently_suppressed
+            );
 
             if !currently_suppressed && usage >= 0.50 {
                 // 记录触发时间，检查频率限制
@@ -1523,25 +1619,47 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                         trigger_timestamps.len()
                     );
                     state.game_mode_dml_suppressed.store(true, Ordering::SeqCst);
-                    state.game_mode_permanently_suppressed.store(true, Ordering::SeqCst);
-                    let _ = app_clone.emit("game-mode-status", serde_json::json!({
-                        "active": true,
-                        "usage": usage,
-                        "permanent": true,
-                    }));
+                    state
+                        .game_mode_permanently_suppressed
+                        .store(true, Ordering::SeqCst);
+                    let _ = app_clone.emit(
+                        "game-mode-status",
+                        serde_json::json!({
+                            "active": true,
+                            "usage": usage,
+                            "permanent": true,
+                        }),
+                    );
 
                     // 重启 Python（不带 DML）
-                    let _ = stop_monitor(app_clone.state::<MonitorState>(), app_clone.state::<Arc<CaptureState>>()).await;
-                    let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
+                    let _ = stop_monitor(
+                        app_clone.state::<MonitorState>(),
+                        app_clone.state::<Arc<CaptureState>>(),
+                        app_clone.clone(),
+                    )
+                    .await;
+                    let _ =
+                        start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
                     continue;
                 }
 
-                tracing::info!("Game mode: GPU 0 memory usage {:.1}% >= 50%, suppressing DML", usage * 100.0);
+                tracing::info!(
+                    "Game mode: GPU 0 memory usage {:.1}% >= 50%, suppressing DML",
+                    usage * 100.0
+                );
                 state.game_mode_dml_suppressed.store(true, Ordering::SeqCst);
-                let _ = app_clone.emit("game-mode-status", serde_json::json!({"active": true, "usage": usage}));
+                let _ = app_clone.emit(
+                    "game-mode-status",
+                    serde_json::json!({"active": true, "usage": usage}),
+                );
 
                 // 重启 Python（不带 DML）
-                let _ = stop_monitor(app_clone.state::<MonitorState>(), app_clone.state::<Arc<CaptureState>>()).await;
+                let _ = stop_monitor(
+                    app_clone.state::<MonitorState>(),
+                    app_clone.state::<Arc<CaptureState>>(),
+                    app_clone.clone(),
+                )
+                .await;
                 let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
             } else if currently_suppressed && usage <= 0.40 {
                 // 记录触发时间（恢复也计入）
@@ -1554,28 +1672,49 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                         "Game mode: triggered {} times in 60s, permanently disabling DML until app restart",
                         trigger_timestamps.len()
                     );
-                    state.game_mode_permanently_suppressed.store(true, Ordering::SeqCst);
-                    let _ = app_clone.emit("game-mode-status", serde_json::json!({
-                        "active": true,
-                        "usage": usage,
-                        "permanent": true,
-                    }));
+                    state
+                        .game_mode_permanently_suppressed
+                        .store(true, Ordering::SeqCst);
+                    let _ = app_clone.emit(
+                        "game-mode-status",
+                        serde_json::json!({
+                            "active": true,
+                            "usage": usage,
+                            "permanent": true,
+                        }),
+                    );
                     // DML 已经被抑制，不需要再重启
                     continue;
                 }
 
-                tracing::info!("Game mode: GPU 0 memory usage {:.1}% <= 40%, restoring DML", usage * 100.0);
-                state.game_mode_dml_suppressed.store(false, Ordering::SeqCst);
-                let _ = app_clone.emit("game-mode-status", serde_json::json!({"active": false, "usage": usage}));
+                tracing::info!(
+                    "Game mode: GPU 0 memory usage {:.1}% <= 40%, restoring DML",
+                    usage * 100.0
+                );
+                state
+                    .game_mode_dml_suppressed
+                    .store(false, Ordering::SeqCst);
+                let _ = app_clone.emit(
+                    "game-mode-status",
+                    serde_json::json!({"active": false, "usage": usage}),
+                );
 
                 // 重启 Python（恢复 DML）
-                let _ = stop_monitor(app_clone.state::<MonitorState>(), app_clone.state::<Arc<CaptureState>>()).await;
+                let _ = stop_monitor(
+                    app_clone.state::<MonitorState>(),
+                    app_clone.state::<Arc<CaptureState>>(),
+                    app_clone.clone(),
+                )
+                .await;
                 let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
             }
         }
     });
 
-    let mut guard = monitor_state.game_mode_task.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = monitor_state
+        .game_mode_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     *guard = Some(handle);
 }
 
@@ -1583,25 +1722,37 @@ pub fn start_game_mode_monitor(app: AppHandle) {
 pub fn stop_game_mode_monitor(app: &AppHandle) {
     let monitor_state = app.state::<MonitorState>();
 
-    let mut guard = monitor_state.game_mode_task.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = monitor_state
+        .game_mode_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.take() {
         handle.abort();
     }
 
     // 重置所有游戏模式状态
-    monitor_state.game_mode_permanently_suppressed.store(false, Ordering::SeqCst);
-    let was_suppressed = monitor_state.game_mode_dml_suppressed.swap(false, Ordering::SeqCst);
+    monitor_state
+        .game_mode_permanently_suppressed
+        .store(false, Ordering::SeqCst);
+    let was_suppressed = monitor_state
+        .game_mode_dml_suppressed
+        .swap(false, Ordering::SeqCst);
 
     // 重置全屏暂停状态
     let capture_state = app.state::<Arc<CaptureState>>();
-    let was_fullscreen_paused = capture_state.game_mode_capture_paused.swap(false, Ordering::SeqCst);
+    let was_fullscreen_paused = capture_state
+        .game_mode_capture_paused
+        .swap(false, Ordering::SeqCst);
 
     if was_suppressed || was_fullscreen_paused {
-        let _ = app.emit("game-mode-status", serde_json::json!({
-            "active": false,
-            "usage": 0.0,
-            "fullscreen_paused": false,
-        }));
+        let _ = app.emit(
+            "game-mode-status",
+            serde_json::json!({
+                "active": false,
+                "usage": 0.0,
+                "fullscreen_paused": false,
+            }),
+        );
     }
     tracing::info!("Game mode: monitor stopped");
 }
@@ -1642,4 +1793,3 @@ mod tests {
         assert!(err.contains("Invalid JSON response"));
     }
 }
-

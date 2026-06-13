@@ -1,9 +1,9 @@
 // src-tauri/build.rs
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 fn main() {
@@ -51,7 +51,11 @@ fn main() {
         // 检查是否是需要被完全排除的文件夹
         if path.is_dir() {
             let file_name = path.file_name().unwrap_or_default();
-            if file_name == ".venv" || file_name == ".pytest_cache" || file_name == "__pycache__" || file_name == "tests" {
+            if file_name == ".venv"
+                || file_name == ".pytest_cache"
+                || file_name == "__pycache__"
+                || file_name == "tests"
+            {
                 // 如果是，返回 false，`walkdir` 将不会进入这个目录
                 // 排除 tests/ 是为了不把测试代码打进生产 monitor.pyz
                 return false;
@@ -80,8 +84,7 @@ fn main() {
             // 规则 1: 打包特定的文件夹
             let model_dir_singular = source_dir.join("model");
             let model_dir_plural = source_dir.join("models");
-            if src_path.starts_with(&model_dir_singular)
-                || src_path.starts_with(&model_dir_plural)
+            if src_path.starts_with(&model_dir_singular) || src_path.starts_with(&model_dir_plural)
             {
                 should_copy = true;
             }
@@ -314,8 +317,8 @@ fn build_monitor_pyz(source_dir: &Path, out_pyz: &Path) -> String {
             continue;
         }
 
-        let in_models = src_path.starts_with(&model_dir_singular)
-            || src_path.starts_with(&model_dir_plural);
+        let in_models =
+            src_path.starts_with(&model_dir_singular) || src_path.starts_with(&model_dir_plural);
         let ok_ext = src_path
             .extension()
             .and_then(|s| s.to_str())
@@ -371,12 +374,13 @@ fn build_monitor_pyz(source_dir: &Path, out_pyz: &Path) -> String {
     }
 
     // 4. 计算 SHA-256
-    let pyz_bytes = fs::read(out_pyz).unwrap_or_else(|e| {
-        panic!("Failed to read freshly built {}: {}", out_pyz.display(), e)
-    });
+    let pyz_bytes = fs::read(out_pyz)
+        .unwrap_or_else(|e| panic!("Failed to read freshly built {}: {}", out_pyz.display(), e));
     let mut hasher = Sha256::new();
     hasher.update(&pyz_bytes);
     let hash = hasher.finalize();
     // 转为小写十六进制（与 Rust 端 verify 的 format!("{:x}") 一致）
-    hash.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    hash.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()
 }

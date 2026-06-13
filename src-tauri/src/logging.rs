@@ -1,7 +1,7 @@
 //! Logging Module - Daily and Size-Based Rotating Log Files with Gzip Compression and Retention
 //!
 //! Provides a logging system that writes to daily log files with automatic rotation based on file size.
-//! Rust itself uses the tracing macro to output logs, and the stderr of Python child processes is 
+//! Rust itself uses the tracing macro to output logs, and the stderr of Python child processes is
 //! captured by Rust and written to the same log file as the `monitor.stderr` target.
 
 use flate2::write::GzEncoder;
@@ -162,7 +162,7 @@ impl<'a> MakeWriter<'a> for DailyRotatingWriter {
     }
 }
 
-/// Initialize logging system with two layers: file output (without ANSI colors) 
+/// Initialize logging system with two layers: file output (without ANSI colors)
 /// and stderr output (with ANSI colors for development).
 ///
 /// - Layer 1: File output (no ANSI colors, for production)
@@ -182,11 +182,11 @@ pub fn init_logging(data_dir: &Path) -> DailyRotatingWriter {
     // Default to "info" level if RUST_LOG is not set or invalid
     let default_level = "info";
 
-    let env_filter_file = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let env_filter_file =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
-    let env_filter_stderr = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let env_filter_stderr =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
     // 文件层：无 ANSI 颜色
     let file_layer = fmt::layer()
@@ -260,8 +260,11 @@ fn run_maintenance(logs_root: &Path) {
 
         // 超过保留天数的目录直接删除
         if let Ok(date) = chrono::NaiveDate::parse_from_str(&name_str, "%Y-%m-%d") {
-            let dir_date = date.and_hms_opt(0, 0, 0).unwrap()
-                .and_local_timezone(chrono::Local).unwrap();
+            let dir_date = date
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .unwrap();
             if dir_date < cutoff {
                 tracing::info!("Removing old log directory: {}", name_str);
                 let _ = fs::remove_dir_all(&dir_path);

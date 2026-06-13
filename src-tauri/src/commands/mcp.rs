@@ -1,11 +1,15 @@
-use std::sync::Arc;
 use crate::credential_manager::CredentialManagerState;
-use crate::storage::StorageState;
 use crate::mcp_server;
 use crate::sensitive_filter::{self, SensitiveFilterState};
+use crate::storage::StorageState;
+use std::sync::Arc;
 
-fn policy_as_object_mut(policy: &mut serde_json::Value) -> Result<&mut serde_json::Map<String, serde_json::Value>, String> {
-    policy.as_object_mut().ok_or_else(|| "Policy is not a valid JSON object".to_string())
+fn policy_as_object_mut(
+    policy: &mut serde_json::Value,
+) -> Result<&mut serde_json::Map<String, serde_json::Value>, String> {
+    policy
+        .as_object_mut()
+        .ok_or_else(|| "Policy is not a valid JSON object".to_string())
 }
 
 #[tauri::command]
@@ -25,11 +29,15 @@ pub async fn mcp_set_enabled(
         } else {
             let token = mcp_server::generate_token();
             let encrypted_b64 = mcp_server::encrypt_token(&credential_state, &token)?;
-            policy_as_object_mut(&mut policy)?.insert("mcp_token_encrypted".into(), serde_json::json!(encrypted_b64));
+            policy_as_object_mut(&mut policy)?.insert(
+                "mcp_token_encrypted".into(),
+                serde_json::json!(encrypted_b64),
+            );
             (token, true)
         };
 
-        let port = policy.get("mcp_port")
+        let port = policy
+            .get("mcp_port")
             .and_then(|v| v.as_u64())
             .map(|v| v as u16)
             .unwrap_or(mcp_server::get_port(&storage_state));
@@ -65,7 +73,10 @@ pub async fn mcp_get_status(
     mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
 ) -> Result<serde_json::Value, String> {
     let policy = storage_state.load_policy()?;
-    let enabled = policy.get("mcp_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let enabled = policy
+        .get("mcp_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let port = mcp_server::get_port(&storage_state);
     let running = mcp_state.is_running();
 
@@ -87,7 +98,10 @@ pub async fn mcp_reset_token(
     let encrypted_b64 = mcp_server::encrypt_token(&credential_state, &token)?;
 
     let mut policy = storage_state.load_policy()?;
-    policy_as_object_mut(&mut policy)?.insert("mcp_token_encrypted".into(), serde_json::json!(encrypted_b64));
+    policy_as_object_mut(&mut policy)?.insert(
+        "mcp_token_encrypted".into(),
+        serde_json::json!(encrypted_b64),
+    );
     storage_state.save_policy(&policy)?;
 
     let token_hash = mcp_server::hash_token(&token);
@@ -136,8 +150,8 @@ pub async fn mcp_set_sensitive_filter_config(
     filter_state.update_config(config.clone());
 
     let mut policy = storage_state.load_policy()?;
-    let config_value = serde_json::to_value(&config)
-        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+    let config_value =
+        serde_json::to_value(&config).map_err(|e| format!("Failed to serialize config: {}", e))?;
     policy_as_object_mut(&mut policy)?.insert("sensitive_filter".into(), config_value);
     storage_state.save_policy(&policy)
 }

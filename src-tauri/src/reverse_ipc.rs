@@ -1,25 +1,25 @@
 //! Restful API Server for Storage - Windows Named Pipe Implementation
 //!
-//! This module implements a reverse IPC server using Windows Named Pipes 
-//! to allow external processes (like Python scripts) to send storage-related 
-//! commands to the Rust backend. This is used for scenarios like browser 
-//! extensions or other integrations that need to save screenshots and OCR 
+//! This module implements a reverse IPC server using Windows Named Pipes
+//! to allow external processes (like Python scripts) to send storage-related
+//! commands to the Rust backend. This is used for scenarios like browser
+//! extensions or other integrations that need to save screenshots and OCR
 //! results without going through the full capture pipeline.
-//! 
-use crate::capture::OcrImageCache;
+//!
 use crate::capture::CaptureState;
+use crate::capture::OcrImageCache;
 use crate::monitor::MonitorState;
-use crate::storage::{SaveScreenshotRequest, StorageState, OcrResultInput};
+use crate::storage::{OcrResultInput, SaveScreenshotRequest, StorageState};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc;
-use std::os::windows::io::AsRawHandle;
-use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 
 /// Commands that Python can send to Rust via the reverse IPC named pipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,19 +66,13 @@ pub enum StorageCommand {
     GetPublicKey,
     /// Encrypt plaintext data for storage in ChromaDB.
     #[serde(rename = "encrypt_for_chromadb")]
-    EncryptForChromaDb {
-        plaintext: String,
-    },
+    EncryptForChromaDb { plaintext: String },
     /// Decrypt data previously encrypted for ChromaDB.
     #[serde(rename = "decrypt_from_chromadb")]
-    DecryptFromChromaDb {
-        encrypted: String,
-    },
+    DecryptFromChromaDb { encrypted: String },
     /// Check whether a screenshot with the given hash already exists.
     #[serde(rename = "screenshot_exists")]
-    ScreenshotExists {
-        image_hash: String,
-    },
+    ScreenshotExists { image_hash: String },
 }
 
 // Use OcrResultInput from crate::storage to keep a single canonical type
@@ -101,7 +95,7 @@ impl StorageResponse {
             data: Some(data),
         }
     }
-    
+
     pub fn error(msg: &str) -> Self {
         Self {
             status: "error".to_string(),
@@ -111,15 +105,15 @@ impl StorageResponse {
     }
 }
 
+use windows::Win32::Security::GetTokenInformation;
 use windows::Win32::Security::{
-    InitializeSecurityDescriptor, SetSecurityDescriptorDacl, ACL, ACL_REVISION,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    TOKEN_QUERY, TokenUser,
+    InitializeSecurityDescriptor, SetSecurityDescriptorDacl, TokenUser, ACL, ACL_REVISION,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, TOKEN_QUERY,
+};
+use windows::Win32::Storage::FileSystem::{
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::Win32::Security::{GetTokenInformation};
-use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE, PIPE_ACCESS_DUPLEX};
-
 
 /// Holds pre-built security descriptor and ACL buffers whose addresses are referenced
 /// by the SECURITY_ATTRIBUTES pointer fields. Bundling them in a struct guarantees
@@ -163,12 +157,19 @@ fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContex
         let user_sid = token_user.User.Sid;
 
         let sid_len = windows::Win32::Security::GetLengthSid(user_sid);
-        let acl_size = std::mem::size_of::<ACL>() + std::mem::size_of::<windows::Win32::Security::ACCESS_ALLOWED_ACE>() + sid_len as usize - 4;
+        let acl_size = std::mem::size_of::<ACL>()
+            + std::mem::size_of::<windows::Win32::Security::ACCESS_ALLOWED_ACE>()
+            + sid_len as usize
+            - 4;
         let mut acl_buffer = vec![0u8; acl_size];
         let p_acl = acl_buffer.as_mut_ptr() as *mut ACL;
 
-        windows::Win32::Security::InitializeAcl(p_acl, acl_size as u32, windows::Win32::Security::ACE_REVISION(ACL_REVISION.0))
-            .map_err(|e| format!("InitializeAcl failed: {}", e))?;
+        windows::Win32::Security::InitializeAcl(
+            p_acl,
+            acl_size as u32,
+            windows::Win32::Security::ACE_REVISION(ACL_REVISION.0),
+        )
+        .map_err(|e| format!("InitializeAcl failed: {}", e))?;
 
         windows::Win32::Security::AddAccessAllowedAce(
             p_acl,
@@ -199,15 +200,18 @@ fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContex
             bInheritHandle: false.into(),
         };
 
-        Ok(PipeSecurityContext { sa, _sd: sd, _acl_buffer: acl_buffer })
+        Ok(PipeSecurityContext {
+            sa,
+            _sd: sd,
+            _acl_buffer: acl_buffer,
+        })
     }
 }
 
 /// Lightweight parent-PID lookup via CreateToolhelp32Snapshot (single process query).
 fn get_parent_pid(pid: u32) -> Option<u32> {
     use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32First, Process32Next,
-        PROCESSENTRY32, TH32CS_SNAPPROCESS,
+        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
     };
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
@@ -244,9 +248,14 @@ impl ReverseIpcServer {
             shutdown_tx: None,
         }
     }
-    
+
     /// Start the named pipe server that listens for Python storage requests.
-    pub fn start(&mut self, storage: Arc<StorageState>, ocr_cache: OcrImageCache, app_handle: tauri::AppHandle) -> Result<(), String> {
+    pub fn start(
+        &mut self,
+        storage: Arc<StorageState>,
+        ocr_cache: OcrImageCache,
+        app_handle: tauri::AppHandle,
+    ) -> Result<(), String> {
         let pipe_name = self.pipe_name.clone();
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
@@ -336,23 +345,27 @@ impl ReverseIpcServer {
 
         Ok(())
     }
-    
+
     /// 停止服务器
     pub fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.try_send(());
         }
     }
-    
+
     /// 获取管道名
     pub fn pipe_name(&self) -> &str {
         &self.pipe_name
     }
 }
 
-
 /// 处理单个客户端连接
-async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, ocr_cache: OcrImageCache, app_handle: tauri::AppHandle) {
+async fn handle_client(
+    mut server: NamedPipeServer,
+    storage: Arc<StorageState>,
+    ocr_cache: OcrImageCache,
+    app_handle: tauri::AppHandle,
+) {
     // 安全校验：验证客户端 PID
     let client_pid_raw = unsafe {
         let mut pid: u32 = 0;
@@ -368,7 +381,10 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
         Some(client_pid) => {
             let monitor_state = app_handle.state::<MonitorState>();
             let expected_pid_raw = {
-                let guard = monitor_state.process.lock().unwrap_or_else(|e| e.into_inner());
+                let guard = monitor_state
+                    .process
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 guard.as_ref().map(|child| child.id())
             };
 
@@ -387,13 +403,18 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
                 }
 
                 if !is_valid {
-                    tracing::warn!("Illegal access attempt to Reverse IPC from PID {} (not authorized)", client_pid);
+                    tracing::warn!(
+                        "Illegal access attempt to Reverse IPC from PID {} (not authorized)",
+                        client_pid
+                    );
                     let err_resp = serde_json::json!({"error": format!("Access denied: PID {} is not authorized", client_pid)});
                     let _ = server.write_all(err_resp.to_string().as_bytes()).await;
                     return;
                 }
             } else {
-                tracing::warn!("Reverse IPC connection received but monitor process is not registered");
+                tracing::warn!(
+                    "Reverse IPC connection received but monitor process is not registered"
+                );
                 return;
             }
         }
@@ -420,8 +441,10 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
 
             match tokio::time::timeout(
                 tokio::time::Duration::from_millis(500),
-                server.read(&mut temp_buf)
-            ).await {
+                server.read(&mut temp_buf),
+            )
+            .await
+            {
                 Ok(Ok(0)) => {
                     // 连接已关闭，数据读取完成
                     break String::from("peer_closed");
@@ -454,7 +477,8 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
                 }
                 Err(_) => {
                     // 单次 read 超时：若已有完整 JSON 则继续处理，否则继续等到全局超时
-                    if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                    if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok()
+                    {
                         break String::from("single_read_timeout_but_json_complete");
                     }
                     continue;
@@ -462,11 +486,11 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
             }
         }
     };
-    
+
     if buf.is_empty() {
         return;
     }
-    
+
     // 解析请求
     let response = match serde_json::from_slice::<serde_json::Value>(&buf) {
         Ok(req) => process_request(&req, &storage, &ocr_cache, &app_handle),
@@ -477,7 +501,7 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
             read_end_reason
         )),
     };
-    
+
     // 发送响应
     let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
     if let Err(e) = server.write_all(&response_bytes).await {
@@ -486,7 +510,12 @@ async fn handle_client(mut server: NamedPipeServer, storage: Arc<StorageState>, 
 }
 
 /// 处理存储请求
-fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &OcrImageCache, app_handle: &tauri::AppHandle) -> StorageResponse {
+fn process_request(
+    req: &serde_json::Value,
+    storage: &StorageState,
+    ocr_cache: &OcrImageCache,
+    app_handle: &tauri::AppHandle,
+) -> StorageResponse {
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
     let diag_start = std::time::Instant::now();
 
@@ -497,31 +526,27 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                 Ok(r) => r,
                 Err(e) => return StorageResponse::error(&format!("Invalid request: {}", e)),
             };
-            
+
             match storage.save_screenshot(&request) {
                 Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
                 Err(e) => StorageResponse::error(&e),
             }
         }
-        
-        "get_public_key" => {
-            match storage.get_public_key() {
-                Ok(key) => {
-                    let encoded = base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &key,
-                    );
-                    StorageResponse::success(serde_json::json!({
-                        "public_key": encoded
-                    }))
-                }
-                Err(e) => StorageResponse::error(&e),
+
+        "get_public_key" => match storage.get_public_key() {
+            Ok(key) => {
+                let encoded =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &key);
+                StorageResponse::success(serde_json::json!({
+                    "public_key": encoded
+                }))
             }
-        }
-        
+            Err(e) => StorageResponse::error(&e),
+        },
+
         "encrypt_for_chromadb" => {
             let plaintext = req.get("plaintext").and_then(|p| p.as_str()).unwrap_or("");
-            
+
             match storage.encrypt_for_chromadb(plaintext) {
                 Ok(encrypted) => StorageResponse::success(serde_json::json!({
                     "encrypted": encrypted
@@ -529,10 +554,10 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                 Err(e) => StorageResponse::error(&e),
             }
         }
-        
+
         "decrypt_from_chromadb" => {
             let encrypted = req.get("encrypted").and_then(|p| p.as_str()).unwrap_or("");
-            
+
             match storage.decrypt_from_chromadb(encrypted) {
                 Ok(decrypted) => StorageResponse::success(serde_json::json!({
                     "decrypted": decrypted
@@ -565,15 +590,13 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
             }))
         }
 
-        "get_auth_status" => {
-            StorageResponse::success(serde_json::json!({
-                "session_valid": storage.is_session_valid()
-            }))
-        }
-        
+        "get_auth_status" => StorageResponse::success(serde_json::json!({
+            "session_valid": storage.is_session_valid()
+        })),
+
         "screenshot_exists" => {
             let image_hash = req.get("image_hash").and_then(|h| h.as_str()).unwrap_or("");
-            
+
             match storage.screenshot_exists(image_hash) {
                 Ok(exists) => StorageResponse::success(serde_json::json!({
                     "exists": exists
@@ -623,7 +646,11 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                         None => {
                             let msg = "ocr_results must be an array when provided";
                             if let Err(e) = storage.abort_screenshot(screenshot_id, Some(msg)) {
-                                tracing::error!("Failed to abort screenshot {}: {}", screenshot_id, e);
+                                tracing::error!(
+                                    "Failed to abort screenshot {}: {}",
+                                    screenshot_id,
+                                    e
+                                );
                             }
                             return StorageResponse::error(msg);
                         }
@@ -635,8 +662,14 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                             Ok(parsed) => results.push(parsed),
                             Err(e) => {
                                 let msg = format!("Invalid ocr_results[{}]: {}", idx, e);
-                                if let Err(abort_err) = storage.abort_screenshot(screenshot_id, Some(&msg)) {
-                                    tracing::error!("Failed to abort screenshot {}: {}", screenshot_id, abort_err);
+                                if let Err(abort_err) =
+                                    storage.abort_screenshot(screenshot_id, Some(&msg))
+                                {
+                                    tracing::error!(
+                                        "Failed to abort screenshot {}: {}",
+                                        screenshot_id,
+                                        abort_err
+                                    );
                                 }
                                 return StorageResponse::error(&msg);
                             }
@@ -649,10 +682,18 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
             };
 
             // Extract category from request (may be provided by Python classification)
-            let category = req.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let category = req
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let category_confidence = req.get("category_confidence").and_then(|v| v.as_f64());
 
-            match storage.commit_screenshot(screenshot_id, ocr_results.as_ref(), category.as_deref(), category_confidence) {
+            match storage.commit_screenshot(
+                screenshot_id,
+                ocr_results.as_ref(),
+                category.as_deref(),
+                category_confidence,
+            ) {
                 Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
                 Err(e) => StorageResponse::error(&e),
             }
@@ -678,7 +719,10 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                 return StorageResponse::error("Invalid screenshot_id");
             }
 
-            let reason = req.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let reason = req
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             match storage.abort_screenshot(screenshot_id, reason.as_deref()) {
                 Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
@@ -727,17 +771,15 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                 None => {
                     // Fallback to storage (may trigger CNG) for non-capture callers
                     match storage.get_screenshot_by_id(screenshot_id) {
-                        Ok(Some(record)) => {
-                            match storage.read_image(&record.image_path) {
-                                Ok((b64_data, mime)) => {
-                                    StorageResponse::success(serde_json::json!({
-                                        "image_data": b64_data,
-                                        "mime_type": mime,
-                                    }))
-                                }
-                                Err(e) => StorageResponse::error(&format!("Failed to read image: {}", e)),
+                        Ok(Some(record)) => match storage.read_image(&record.image_path) {
+                            Ok((b64_data, mime)) => StorageResponse::success(serde_json::json!({
+                                "image_data": b64_data,
+                                "mime_type": mime,
+                            })),
+                            Err(e) => {
+                                StorageResponse::error(&format!("Failed to read image: {}", e))
                             }
-                        }
+                        },
                         Ok(None) => StorageResponse::error("Screenshot not found"),
                         Err(e) => StorageResponse::error(&e),
                     }
@@ -749,7 +791,11 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
             let start_ts = req.get("start_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let end_ts = req.get("end_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let offset = req.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
-            let limit = req.get("limit").and_then(|v| v.as_i64()).unwrap_or(500).min(1000);
+            let limit = req
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(500)
+                .min(1000);
 
             // If no time range given, use full range
             let (s, e) = if end_ts <= start_ts {
@@ -772,9 +818,11 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
                         .map(|rec| {
                             // Fetch OCR text for each screenshot
                             let ocr_text = match storage.get_screenshot_ocr_results(rec.id) {
-                                Ok(ocr_results) => {
-                                    ocr_results.iter().map(|r| r.text.clone()).collect::<Vec<_>>().join(" ")
-                                }
+                                Ok(ocr_results) => ocr_results
+                                    .iter()
+                                    .map(|r| r.text.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
                                 Err(_) => String::new(),
                             };
                             serde_json::json!({
@@ -840,7 +888,6 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
         }
 
         // ============ Smart Cluster reverse IPC ============
-
         "get_idle_state" => {
             use std::sync::atomic::Ordering;
             use tauri::Manager;
@@ -854,28 +901,29 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
             }
         }
 
-        "smart_cluster_list_enabled" => {
-            match storage.list_smart_clusters() {
-                Ok(clusters) => {
-                    let enabled: Vec<serde_json::Value> = clusters
-                        .into_iter()
-                        .filter(|c| c.enabled)
-                        .map(|c| {
-                            serde_json::json!({
-                                "id": c.id,
-                                "anchor_text": c.anchor_text,
-                                "threshold": c.threshold,
-                            })
+        "smart_cluster_list_enabled" => match storage.list_smart_clusters() {
+            Ok(clusters) => {
+                let enabled: Vec<serde_json::Value> = clusters
+                    .into_iter()
+                    .filter(|c| c.enabled)
+                    .map(|c| {
+                        serde_json::json!({
+                            "id": c.id,
+                            "anchor_text": c.anchor_text,
+                            "threshold": c.threshold,
                         })
-                        .collect();
-                    StorageResponse::success(serde_json::json!({ "clusters": enabled }))
-                }
-                Err(e) => StorageResponse::error(&e),
+                    })
+                    .collect();
+                StorageResponse::success(serde_json::json!({ "clusters": enabled }))
             }
-        }
+            Err(e) => StorageResponse::error(&e),
+        },
 
         "smart_cluster_enqueue_pending" => {
-            let id = req.get("screenshot_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let id = req
+                .get("screenshot_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             if id <= 0 {
                 return StorageResponse::error("missing screenshot_id");
             }
@@ -886,7 +934,11 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
         }
 
         "smart_cluster_peek_pending" => {
-            let limit = req.get("limit").and_then(|v| v.as_i64()).unwrap_or(32).clamp(1, 256);
+            let limit = req
+                .get("limit")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(32)
+                .clamp(1, 256);
             match storage.peek_smart_cluster_pending_batch(limit) {
                 Ok(ids) => StorageResponse::success(serde_json::json!({ "ids": ids })),
                 Err(e) => StorageResponse::error(&e),
@@ -908,22 +960,31 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
             let ids: Vec<i64> = ids.into_iter().take(MAX_BATCH).collect();
             let count = ids.len() as i64;
             match storage.delete_smart_cluster_pending_ids(&ids) {
-                Ok(()) => StorageResponse::success(serde_json::json!({ "ok": true, "deleted": count })),
+                Ok(()) => {
+                    StorageResponse::success(serde_json::json!({ "ok": true, "deleted": count }))
+                }
                 Err(e) => StorageResponse::error(&e),
             }
         }
 
-        "smart_cluster_count_pending" => {
-            match storage.count_smart_cluster_pending() {
-                Ok(n) => StorageResponse::success(serde_json::json!({ "count": n })),
-                Err(e) => StorageResponse::error(&e),
-            }
-        }
+        "smart_cluster_count_pending" => match storage.count_smart_cluster_pending() {
+            Ok(n) => StorageResponse::success(serde_json::json!({ "count": n })),
+            Err(e) => StorageResponse::error(&e),
+        },
 
         "smart_cluster_record_assignment" => {
-            let cluster_id = req.get("smart_cluster_id").and_then(|v| v.as_i64()).unwrap_or(0);
-            let screenshot_id = req.get("screenshot_id").and_then(|v| v.as_i64()).unwrap_or(0);
-            let score = req.get("rerank_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let cluster_id = req
+                .get("smart_cluster_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let screenshot_id = req
+                .get("screenshot_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let score = req
+                .get("rerank_score")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             if cluster_id <= 0 || screenshot_id <= 0 {
                 return StorageResponse::error("missing smart_cluster_id or screenshot_id");
             }
@@ -937,7 +998,11 @@ fn process_request(req: &serde_json::Value, storage: &StorageState, ocr_cache: &
     };
 
     if diag_start.elapsed().as_secs() >= 10 {
-        tracing::warn!("[DIAG:RIPC] command='{}' completed in {:?}", command, diag_start.elapsed());
+        tracing::warn!(
+            "[DIAG:RIPC] command='{}' completed in {:?}",
+            command,
+            diag_start.elapsed()
+        );
     }
     response
 }
@@ -953,7 +1018,7 @@ pub fn generate_reverse_pipe_name() -> String {
 
 // NMH Pipe Server
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 /// Compute deterministic NMH pipe name from current user's Windows SID.
@@ -969,11 +1034,11 @@ pub fn compute_nmh_pipe_name() -> Result<String, String> {
 
 /// Get the current user's SID string via Windows API
 fn get_current_user_sid() -> Result<String, String> {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
-    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows::core::PWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
         let mut token_handle = HANDLE::default();
@@ -999,11 +1064,14 @@ fn get_current_user_sid() -> Result<String, String> {
         ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string)
             .map_err(|e| format!("ConvertSidToStringSid failed: {}", e))?;
 
-        let result = sid_string.to_string()
+        let result = sid_string
+            .to_string()
             .map_err(|e| format!("SID string conversion failed: {}", e))?;
 
         // Free the allocated string
-        windows::Win32::Foundation::LocalFree(windows::Win32::Foundation::HLOCAL(sid_string.0 as *mut _));
+        windows::Win32::Foundation::LocalFree(windows::Win32::Foundation::HLOCAL(
+            sid_string.0 as *mut _,
+        ));
         let _ = windows::Win32::Foundation::CloseHandle(token_handle);
 
         Ok(result)
@@ -1040,9 +1108,7 @@ pub struct NmhPipeServer {
 
 impl NmhPipeServer {
     pub fn new() -> Self {
-        Self {
-            shutdown_tx: None,
-        }
+        Self { shutdown_tx: None }
     }
 
     /// Start the NMH pipe server with auth token validation
@@ -1139,8 +1205,10 @@ async fn handle_nmh_client(
 
             match tokio::time::timeout(
                 tokio::time::Duration::from_millis(500),
-                server.read(&mut temp_buf)
-            ).await {
+                server.read(&mut temp_buf),
+            )
+            .await
+            {
                 Ok(Ok(0)) => {
                     break String::from("peer_closed");
                 }
@@ -1166,7 +1234,8 @@ async fn handle_nmh_client(
                     }
                 }
                 Err(_) => {
-                    if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
+                    if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok()
+                    {
                         break String::from("single_read_timeout_but_json_complete");
                     }
                     continue;
@@ -1187,7 +1256,13 @@ async fn handle_nmh_client(
                 tracing::warn!("NMH auth token mismatch");
                 StorageResponse::error("Authentication failed")
             } else {
-                process_nmh_request(&req, storage.clone(), capture_state.clone(), app_handle.clone()).await
+                process_nmh_request(
+                    &req,
+                    storage.clone(),
+                    capture_state.clone(),
+                    app_handle.clone(),
+                )
+                .await
             }
         }
         Err(e) => StorageResponse::error(&format!(
@@ -1216,7 +1291,10 @@ async fn process_nmh_request(
     match command {
         "save_extension_screenshot" => {
             // Check if capture is paused
-            if capture_state.paused.load(std::sync::atomic::Ordering::SeqCst) {
+            if capture_state
+                .paused
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
                 return StorageResponse::error("Capture is paused");
             }
 
@@ -1230,23 +1308,44 @@ async fn process_nmh_request(
             };
             let width = req.get("width").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             let height = req.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let page_url = req.get("page_url").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let page_title = req.get("page_title").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let page_icon = req.get("page_icon").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let visible_links: Option<Vec<crate::storage::VisibleLink>> = req.get("visible_links")
+            let page_url = req
+                .get("page_url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let page_title = req
+                .get("page_title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let page_icon = req
+                .get("page_icon")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let visible_links: Option<Vec<crate::storage::VisibleLink>> = req
+                .get("visible_links")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
-            let browser_name = req.get("browser_name").and_then(|v| v.as_str())
-                .unwrap_or("browser-extension").to_string();
+            let browser_name = req
+                .get("browser_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("browser-extension")
+                .to_string();
 
             // Check if extension enhancement is enabled for this browser
             if !is_extension_enhanced_browser(&browser_name) {
-                return StorageResponse::error("Extension enhancement not enabled for this browser");
+                return StorageResponse::error(
+                    "Extension enhancement not enabled for this browser",
+                );
             }
 
             // OCR queue backpressure check (same logic as capture loop)
-            let in_flight = capture_state.in_flight_ocr_count.load(std::sync::atomic::Ordering::SeqCst);
-            let capture_on_busy = capture_state.capture_on_ocr_busy.load(std::sync::atomic::Ordering::SeqCst);
-            let max_queue = capture_state.ocr_queue_max_size.load(std::sync::atomic::Ordering::SeqCst);
+            let in_flight = capture_state
+                .in_flight_ocr_count
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let capture_on_busy = capture_state
+                .capture_on_ocr_busy
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let max_queue = capture_state
+                .ocr_queue_max_size
+                .load(std::sync::atomic::Ordering::SeqCst);
 
             if !capture_on_busy && in_flight > 0 {
                 return StorageResponse::error("OCR queue busy (conservative mode)");
@@ -1289,7 +1388,10 @@ async fn process_nmh_request(
                         ) {
                             // Store in OCR cache so Python can fetch via get_temp_image
                             {
-                                let mut cache = capture_state.ocr_image_cache.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut cache = capture_state
+                                    .ocr_image_cache
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
                                 cache.insert(screenshot_id, jpeg_bytes);
                             }
 
@@ -1301,7 +1403,9 @@ async fn process_nmh_request(
                             let timestamp_ms = chrono::Utc::now().timestamp_millis();
 
                             // Increment in-flight OCR counter
-                            capture_state.in_flight_ocr_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            capture_state
+                                .in_flight_ocr_count
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                             tokio::spawn(async move {
                                 let monitor_state = app_clone.state::<MonitorState>();
@@ -1313,21 +1417,36 @@ async fn process_nmh_request(
                                     &window_title,
                                     &browser_name,
                                     timestamp_ms,
-                                ).await;
+                                )
+                                .await;
 
                                 // Remove from OCR cache
                                 {
-                                    let mut cache = capture_arc.ocr_image_cache.lock().unwrap_or_else(|e| e.into_inner());
+                                    let mut cache = capture_arc
+                                        .ocr_image_cache
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
                                     cache.remove(&screenshot_id);
                                 }
 
                                 // Decrement in-flight OCR counter
-                                capture_arc.in_flight_ocr_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                capture_arc
+                                    .in_flight_ocr_count
+                                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
                                 if let Err(e) = result {
-                                    tracing::error!("Extension OCR failed for screenshot {}: {}", screenshot_id, e);
-                                    if let Err(abort_err) = storage_arc.abort_screenshot(screenshot_id, Some(&e)) {
-                                        tracing::error!("abort_screenshot also failed: {}", abort_err);
+                                    tracing::error!(
+                                        "Extension OCR failed for screenshot {}: {}",
+                                        screenshot_id,
+                                        e
+                                    );
+                                    if let Err(abort_err) =
+                                        storage_arc.abort_screenshot(screenshot_id, Some(&e))
+                                    {
+                                        tracing::error!(
+                                            "abort_screenshot also failed: {}",
+                                            abort_err
+                                        );
                                     }
                                 }
                             });
@@ -1374,7 +1493,12 @@ pub async fn request_extension_capture(process_name: &str) -> Result<(), String>
     let browser_type = process_name_to_browser_type(process_name);
     let pipe_name = compute_nmh_cmd_pipe_name(&browser_type)?;
 
-    tracing::info!("request_extension_capture: process={} browser_type={} pipe={}", process_name, browser_type, pipe_name);
+    tracing::info!(
+        "request_extension_capture: process={} browser_type={} pipe={}",
+        process_name,
+        browser_type,
+        pipe_name
+    );
 
     // Run blocking pipe I/O on a separate thread
     tokio::task::spawn_blocking(move || {
@@ -1388,8 +1512,8 @@ pub async fn request_extension_capture(process_name: &str) -> Result<(), String>
             .map_err(|e| format!("Cannot open NMH cmd pipe: {}", e))?;
 
         let request = serde_json::json!({"command": "request_capture"});
-        let data = serde_json::to_vec(&request)
-            .map_err(|e| format!("Serialization failed: {}", e))?;
+        let data =
+            serde_json::to_vec(&request).map_err(|e| format!("Serialization failed: {}", e))?;
 
         pipe.write_all(&data)
             .map_err(|e| format!("Pipe write failed: {}", e))?;
@@ -1440,8 +1564,13 @@ async fn process_extension_ocr(
     timestamp_ms: i64,
 ) -> Result<(), String> {
     let pipe_name = {
-        let guard = monitor_state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
-        guard.clone().ok_or_else(|| "Monitor pipe not available".to_string())?
+        let guard = monitor_state
+            .pipe_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .clone()
+            .ok_or_else(|| "Monitor pipe not available".to_string())?
     };
 
     let req = serde_json::json!({
@@ -1454,9 +1583,15 @@ async fn process_extension_ocr(
     });
 
     let (auth_token, seq_no) = {
-        let token = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let token = monitor_state
+            .auth_token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
             .ok_or_else(|| "Auth token not available".to_string())?;
-        let seq = monitor_state.request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = monitor_state
+            .request_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         (token, seq)
     };
 
@@ -1471,10 +1606,18 @@ async fn process_extension_ocr(
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     // Extract category from Python response
-    let category = response.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let category = response
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let category_confidence = response.get("category_confidence").and_then(|v| v.as_f64());
 
-    storage.commit_screenshot(screenshot_id, ocr_results.as_ref(), category.as_deref(), category_confidence)?;
+    storage.commit_screenshot(
+        screenshot_id,
+        ocr_results.as_ref(),
+        category.as_deref(),
+        category_confidence,
+    )?;
 
     tracing::debug!(
         "Extension screenshot {} committed with {} OCR results",
@@ -1545,7 +1688,11 @@ mod tests {
     #[test]
     fn test_generate_reverse_pipe_name_format() {
         let name = generate_reverse_pipe_name();
-        assert!(name.starts_with("carbon_storage_"), "pipe name should start with 'carbon_storage_': {}", name);
+        assert!(
+            name.starts_with("carbon_storage_"),
+            "pipe name should start with 'carbon_storage_': {}",
+            name
+        );
         // The random suffix is 32 bytes * 2 hex chars = 64 chars
         assert_eq!(name.len(), "carbon_storage_".len() + 64);
     }
@@ -1572,7 +1719,12 @@ mod tests {
 
         let cmd: StorageCommand = serde_json::from_value(payload).unwrap();
         match cmd {
-            StorageCommand::SaveScreenshotTemp { image_hash, width, height, .. } => {
+            StorageCommand::SaveScreenshotTemp {
+                image_hash,
+                width,
+                height,
+                ..
+            } => {
                 assert_eq!(image_hash, "h123");
                 assert_eq!(width, 1920);
                 assert_eq!(height, 1080);
@@ -1591,7 +1743,10 @@ mod tests {
 
         let cmd: StorageCommand = serde_json::from_value(payload).unwrap();
         match cmd {
-            StorageCommand::CommitScreenshot { screenshot_id, ocr_results } => {
+            StorageCommand::CommitScreenshot {
+                screenshot_id,
+                ocr_results,
+            } => {
                 assert_eq!(screenshot_id, "42");
                 assert!(ocr_results.is_some());
             }

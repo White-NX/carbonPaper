@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use crate::credential_manager::CredentialManagerState;
-use crate::storage::{self, StorageState};
-use crate::monitor::{self, MonitorState};
 use super::check_auth_required;
+use crate::credential_manager::CredentialManagerState;
+use crate::monitor::{self, MonitorState};
+use crate::storage::{self, StorageState};
+use std::sync::Arc;
 
 #[tauri::command]
 pub async fn storage_get_timeline(
@@ -118,19 +118,15 @@ pub async fn storage_get_image(
         };
 
         match image_path {
-            Some(path) => {
-                match state.read_image(&path) {
-                    Ok((data, mime_type)) => {
-                        Ok(serde_json::json!({
-                            "status": "success",
-                            "data": data,
-                            "mime_type": mime_type
-                        }))
-                    }
-                    Err(e) => Err(e)
-                }
-            }
-            None => Err("Image not found".to_string())
+            Some(path) => match state.read_image(&path) {
+                Ok((data, mime_type)) => Ok(serde_json::json!({
+                    "status": "success",
+                    "data": data,
+                    "mime_type": mime_type
+                })),
+                Err(e) => Err(e),
+            },
+            None => Err("Image not found".to_string()),
         }
     })
     .await
@@ -214,7 +210,10 @@ pub async fn storage_warmup_thumbnails(
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        if state.thumbnail_warmup_done.load(std::sync::atomic::Ordering::SeqCst) {
+        if state
+            .thumbnail_warmup_done
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return Ok(serde_json::json!({
                 "generated": 0,
                 "skipped": 0,
@@ -225,7 +224,9 @@ pub async fn storage_warmup_thumbnails(
 
         match state.is_thumbnail_warmup_done() {
             Ok(true) => {
-                state.thumbnail_warmup_done.store(true, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .thumbnail_warmup_done
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 return Ok(serde_json::json!({
                     "generated": 0,
                     "skipped": 0,
@@ -235,7 +236,10 @@ pub async fn storage_warmup_thumbnails(
             }
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!("[Warmup] Failed to check sentinel: {}, proceeding with warmup", e);
+                tracing::warn!(
+                    "[Warmup] Failed to check sentinel: {}, proceeding with warmup",
+                    e
+                );
             }
         }
 
@@ -258,7 +262,9 @@ pub async fn storage_warmup_thumbnails(
         if let Err(e) = state.mark_thumbnail_warmup_done() {
             tracing::warn!("[Warmup] Failed to write sentinel: {}", e);
         }
-        state.thumbnail_warmup_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .thumbnail_warmup_done
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         Ok(serde_json::json!({
             "generated": generated,
@@ -438,7 +444,11 @@ pub async fn storage_get_process_monthly_thumbnails(
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        state.get_process_monthly_thumbnails(&process_name, page.unwrap_or(0), page_size.unwrap_or(60))
+        state.get_process_monthly_thumbnails(
+            &process_name,
+            page.unwrap_or(0),
+            page_size.unwrap_or(60),
+        )
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))?
@@ -454,9 +464,11 @@ pub async fn storage_soft_delete(
     check_auth_required(&credential_state)?;
 
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || state.soft_delete_process_month(&process_name, month.as_deref()))
-        .await
-        .map_err(|e| format!("Task join error: {:?}", e))?
+    tokio::task::spawn_blocking(move || {
+        state.soft_delete_process_month(&process_name, month.as_deref())
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
 #[tauri::command]
@@ -638,7 +650,14 @@ pub async fn storage_get_tasks(
     hide_entertainment: Option<bool>,
     hide_social: Option<bool>,
 ) -> Result<Vec<storage::task::TaskRecord>, String> {
-    state.get_tasks(layer.as_deref(), start_time, end_time, hide_inactive, hide_entertainment, hide_social)
+    state.get_tasks(
+        layer.as_deref(),
+        start_time,
+        end_time,
+        hide_inactive,
+        hide_entertainment,
+        hide_social,
+    )
 }
 
 #[tauri::command]

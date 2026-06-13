@@ -1,8 +1,8 @@
 //! Bitmap index lazy indexing and maintenance.
 
+use super::super::StorageState;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::atomic::Ordering;
-use super::super::StorageState;
 
 impl StorageState {
     /// Number of OCR rows to process per batch for lazy indexing.
@@ -91,7 +91,11 @@ impl StorageState {
     }
 
     /// Internal helper to re-index a batch of rows.
-    pub(crate) fn index_batch_internal(&self, rows: Vec<(i64, Vec<u8>, Vec<u8>)>, hmac_key: &[u8]) -> Result<usize, String> {
+    pub(crate) fn index_batch_internal(
+        &self,
+        rows: Vec<(i64, Vec<u8>, Vec<u8>)>,
+        hmac_key: &[u8],
+    ) -> Result<usize, String> {
         let mut batch_tokens: std::collections::HashMap<String, roaring::RoaringBitmap> =
             std::collections::HashMap::new();
         let mut row_hashes: Vec<(i64, String)> = Vec::new();
@@ -122,15 +126,13 @@ impl StorageState {
         {
             let mut guard = self.get_connection_named("lazy_indexer_write")?;
             let conn = guard.as_mut().unwrap();
-            let tx = conn
-                .transaction()
-                .map_err(|e| format!("lazy tx: {}", e))?;
+            let tx = conn.transaction().map_err(|e| format!("lazy tx: {}", e))?;
 
             // Update text_hash
             {
-                let mut upd_stmt = tx.prepare_cached(
-                    "UPDATE ocr_results SET text_hash = ?1 WHERE id = ?2"
-                ).map_err(|e| format!("lazy upd prep: {}", e))?;
+                let mut upd_stmt = tx
+                    .prepare_cached("UPDATE ocr_results SET text_hash = ?1 WHERE id = ?2")
+                    .map_err(|e| format!("lazy upd prep: {}", e))?;
                 for (id, hash) in &row_hashes {
                     upd_stmt.execute(params![hash, id]).ok();
                 }
@@ -156,9 +158,8 @@ impl StorageState {
                         .map_err(|e| format!("lazy get: {}", e))?;
 
                     let merged = if let Some(blob) = existing_blob {
-                        let mut existing =
-                            roaring::RoaringBitmap::deserialize_from(&blob[..])
-                                .map_err(|e| format!("lazy deser: {}", e))?;
+                        let mut existing = roaring::RoaringBitmap::deserialize_from(&blob[..])
+                            .map_err(|e| format!("lazy deser: {}", e))?;
                         existing |= new_bitmap;
                         existing
                     } else {
@@ -175,8 +176,7 @@ impl StorageState {
                 }
             }
 
-            tx.commit()
-                .map_err(|e| format!("lazy commit: {}", e))?;
+            tx.commit().map_err(|e| format!("lazy commit: {}", e))?;
         }
 
         Ok(rows.len())
@@ -226,7 +226,9 @@ impl StorageState {
             }
 
             let mut get_stmt = tx
-                .prepare_cached("SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1")
+                .prepare_cached(
+                    "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
+                )
                 .map_err(|e| e.to_string())?;
             let mut put_stmt = tx
                 .prepare_cached(

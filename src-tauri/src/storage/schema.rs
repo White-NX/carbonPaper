@@ -18,8 +18,16 @@ impl StorageState {
         }
 
         // Create directories
-        let data_dir = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let screenshot_dir = self.screenshot_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let data_dir = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let screenshot_dir = self
+            .screenshot_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data directory: {}", e))?;
@@ -66,11 +74,9 @@ impl StorageState {
             let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(conn) = guard.as_ref() {
                 let approx_count: i64 = conn
-                    .query_row(
-                        "SELECT COALESCE(MAX(id), 0) FROM ocr_results",
-                        [],
-                        |row| row.get(0),
-                    )
+                    .query_row("SELECT COALESCE(MAX(id), 0) FROM ocr_results", [], |row| {
+                        row.get(0)
+                    })
                     .unwrap_or(0);
                 self.ocr_row_count
                     .store(approx_count as u64, Ordering::Relaxed);
@@ -330,7 +336,12 @@ impl StorageState {
                 "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
                 params![sentinel_key, version],
             )
-            .map_err(|e| format!("Failed to update auto_vacuum sentinel after manual VACUUM: {}", e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to update auto_vacuum sentinel after manual VACUUM: {}",
+                    e
+                )
+            })?;
 
             Ok(())
         })();
@@ -347,14 +358,24 @@ impl StorageState {
         Self::add_column_if_missing(conn, "screenshots", "process_name_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "screenshots", "metadata_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "screenshots", "content_key_encrypted", "BLOB")?;
-        Self::add_column_if_missing(conn, "screenshots", "is_deleted", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(
+            conn,
+            "screenshots",
+            "is_deleted",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // Add status and committed_at for two-phase screenshot lifecycle
         Self::add_column_if_missing(conn, "screenshots", "status", "TEXT")?;
         Self::add_column_if_missing(conn, "screenshots", "committed_at", "TIMESTAMP")?;
 
         Self::add_column_if_missing(conn, "ocr_results", "text_enc", "BLOB")?;
         Self::add_column_if_missing(conn, "ocr_results", "text_key_encrypted", "BLOB")?;
-        Self::add_column_if_missing(conn, "ocr_results", "is_deleted", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(
+            conn,
+            "ocr_results",
+            "is_deleted",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         // Browser extension metadata columns
         Self::add_column_if_missing(conn, "screenshots", "source", "TEXT")?;
@@ -408,7 +429,8 @@ impl StorageState {
         // Index for reverse lookup: task_id → screenshot_ids
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_task_assignments_task_id ON task_assignments(task_id)",
-        ).map_err(|e| format!("Failed to create task_assignments index: {}", e))?;
+        )
+        .map_err(|e| format!("Failed to create task_assignments index: {}", e))?;
 
         // Smart cluster tables (NL-anchored user-defined clusters)
         Self::create_table_if_missing(

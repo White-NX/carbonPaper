@@ -124,8 +124,11 @@ impl StorageState {
                     "SELECT id FROM screenshots WHERE is_deleted = 0 AND category IN ({})",
                     placeholders
                 );
-                let cat_params: Vec<&dyn rusqlite::ToSql> = cats.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
-                let mut stmt = conn.prepare(&sql).map_err(|e| format!("Failed to query category filter: {}", e))?;
+                let cat_params: Vec<&dyn rusqlite::ToSql> =
+                    cats.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("Failed to query category filter: {}", e))?;
                 let ids: std::collections::HashSet<i64> = stmt
                     .query_map(cat_params.as_slice(), |row| row.get::<_, i64>(0))
                     .map_err(|e| format!("Failed to fetch category ids: {}", e))?
@@ -175,9 +178,7 @@ impl StorageState {
 
                             if let Some(b) = blob {
                                 let rb = roaring::RoaringBitmap::deserialize_from(&b[..])
-                                    .map_err(|e| {
-                                        format!("Failed to deserialize bitmap: {}", e)
-                                    })?;
+                                    .map_err(|e| format!("Failed to deserialize bitmap: {}", e))?;
                                 bitmaps.push(rb);
                             } else {
                                 bitmaps.clear();
@@ -204,8 +205,7 @@ impl StorageState {
                             Vec::new();
 
                         for kw_bitmap in &keyword_bitmaps {
-                            let ocr_ids: Vec<i64> =
-                                kw_bitmap.iter().map(|v| v as i64).collect();
+                            let ocr_ids: Vec<i64> = kw_bitmap.iter().map(|v| v as i64).collect();
                             if ocr_ids.is_empty() {
                                 return Ok(vec![]);
                             }
@@ -218,10 +218,8 @@ impl StorageState {
                                     "SELECT DISTINCT screenshot_id FROM ocr_results WHERE id IN ({}) AND is_deleted = 0",
                                     placeholders
                                 );
-                                let params: Vec<&dyn rusqlite::ToSql> = chunk
-                                    .iter()
-                                    .map(|id| id as &dyn rusqlite::ToSql)
-                                    .collect();
+                                let params: Vec<&dyn rusqlite::ToSql> =
+                                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
                                 let mut stmt = conn.prepare(&sql).map_err(|e| {
                                     format!("Failed to prepare screenshot resolve: {}", e)
                                 })?;
@@ -267,8 +265,7 @@ impl StorageState {
                         return Ok(vec![]);
                     }
 
-                    let mut ids: Vec<i64> =
-                        intersection.into_iter().map(|v| v as i64).collect();
+                    let mut ids: Vec<i64> = intersection.into_iter().map(|v| v as i64).collect();
                     ids.sort_unstable_by(|a, b| b.cmp(a));
 
                     // For single-keyword path (OCR-level IDs), pre-filter by category
@@ -277,18 +274,27 @@ impl StorageState {
                             let needed = (offset + limit) as usize;
                             let mut filtered_ids = Vec::with_capacity(needed);
                             for chunk in ids.chunks(500) {
-                                if filtered_ids.len() >= needed { break; }
-                                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
+                                if filtered_ids.len() >= needed {
+                                    break;
+                                }
+                                let placeholders =
+                                    chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
                                 let sql = format!(
                                     "SELECT id, screenshot_id FROM ocr_results WHERE id IN ({}) AND is_deleted = 0",
                                     placeholders
                                 );
-                                let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-                                let mut stmt = conn.prepare(&sql).map_err(|e| format!("Failed to filter by category: {}", e))?;
-                                let mut chunk_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-                                let rows = stmt.query_map(params.as_slice(), |row| {
-                                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                                }).map_err(|e| format!("Failed to filter by category: {}", e))?;
+                                let params: Vec<&dyn rusqlite::ToSql> =
+                                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                                let mut stmt = conn
+                                    .prepare(&sql)
+                                    .map_err(|e| format!("Failed to filter by category: {}", e))?;
+                                let mut chunk_map: std::collections::HashMap<i64, i64> =
+                                    std::collections::HashMap::new();
+                                let rows = stmt
+                                    .query_map(params.as_slice(), |row| {
+                                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                                    })
+                                    .map_err(|e| format!("Failed to filter by category: {}", e))?;
                                 for row in rows.filter_map(|r| r.ok()) {
                                     chunk_map.insert(row.0, row.1);
                                 }
@@ -356,8 +362,10 @@ impl StorageState {
                         )
                     };
 
-                    let param_refs: Vec<&dyn rusqlite::ToSql> =
-                        page_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                    let param_refs: Vec<&dyn rusqlite::ToSql> = page_ids
+                        .iter()
+                        .map(|id| id as &dyn rusqlite::ToSql)
+                        .collect();
                     let mut stmt = conn
                         .prepare(&sql)
                         .map_err(|e| format!("Failed to prepare query: {}", e))?;
@@ -421,44 +429,40 @@ impl StorageState {
                                     _ => None,
                                 };
 
-                                let screenshot_key =
-                                    match screenshot_key_cache.get(&screenshot_id) {
-                                        Some(key) => Some(key.clone()),
-                                        None => match screenshot_key_enc.as_ref() {
-                                            Some(enc) => {
-                                                let key = decrypt_row_key_with_cng(enc).ok();
-                                                if let Some(ref k) = key {
-                                                    screenshot_key_cache
-                                                        .insert(screenshot_id, k.clone());
-                                                }
-                                                key
+                                let screenshot_key = match screenshot_key_cache.get(&screenshot_id)
+                                {
+                                    Some(key) => Some(key.clone()),
+                                    None => match screenshot_key_enc.as_ref() {
+                                        Some(enc) => {
+                                            let key = decrypt_row_key_with_cng(enc).ok();
+                                            if let Some(ref k) = key {
+                                                screenshot_key_cache
+                                                    .insert(screenshot_id, k.clone());
                                             }
-                                            None => None,
-                                        },
-                                    };
+                                            key
+                                        }
+                                        None => None,
+                                    },
+                                };
 
-                                let window_title = match (
-                                    window_title_enc.as_ref(),
-                                    screenshot_key.as_ref(),
-                                ) {
-                                    (Some(data), Some(key)) => {
-                                        decrypt_with_master_key(key, data)
-                                            .ok()
-                                            .and_then(|v| String::from_utf8(v).ok())
-                                    }
-                                    _ => None,
-                                };
-                                let process_name = match (
-                                    process_name_enc.as_ref(),
-                                    screenshot_key.as_ref(),
-                                ) {
-                                    (Some(data), Some(key)) => {
-                                        decrypt_with_master_key(key, data)
-                                            .ok()
-                                            .and_then(|v| String::from_utf8(v).ok())
-                                    }
-                                    _ => None,
-                                };
+                                let window_title =
+                                    match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
+                                        (Some(data), Some(key)) => {
+                                            decrypt_with_master_key(key, data)
+                                                .ok()
+                                                .and_then(|v| String::from_utf8(v).ok())
+                                        }
+                                        _ => None,
+                                    };
+                                let process_name =
+                                    match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
+                                        (Some(data), Some(key)) => {
+                                            decrypt_with_master_key(key, data)
+                                                .ok()
+                                                .and_then(|v| String::from_utf8(v).ok())
+                                        }
+                                        _ => None,
+                                    };
 
                                 SearchResult {
                                     id,
@@ -562,7 +566,8 @@ impl StorageState {
 
             if let Some(ref cats) = categories {
                 if !cats.is_empty() {
-                    let cat_placeholders = cats.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
+                    let cat_placeholders =
+                        cats.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
                     where_clauses.push(format!("s.category IN ({})", cat_placeholders));
                     for cat in cats {
                         params.push(Box::new(cat.clone()));
@@ -582,8 +587,7 @@ impl StorageState {
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|e| format!("Failed to prepare search query: {}", e))?;
-            let param_refs: Vec<&dyn rusqlite::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
             let mut screenshot_key_cache: std::collections::HashMap<i64, Vec<u8>> =
                 std::collections::HashMap::new();
@@ -620,74 +624,74 @@ impl StorageState {
                 })
                 .map_err(|e| format!("Failed to execute search query: {}", e))?
                 .filter_map(|r| r.ok())
-                        .map(
-                            |(
-                                screenshot_id,
-                                id,
-                                text_enc,
-                                text_key_enc,
-                                confidence,
-                                box_coords,
-                                image_path,
-                                window_title_enc,
-                                process_name_enc,
-                                screenshot_key_enc,
-                                created_at,
-                                screenshot_created_at,
-                                category,
-                            )| {
-                                let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
-                                    (Some(data), Some(key)) => self
-                                        .decrypt_payload_with_row_key(data, key)
-                                        .ok()
-                                        .and_then(|v| String::from_utf8(v).ok()),
-                                    _ => None,
-                                };
+                .map(
+                    |(
+                        screenshot_id,
+                        id,
+                        text_enc,
+                        text_key_enc,
+                        confidence,
+                        box_coords,
+                        image_path,
+                        window_title_enc,
+                        process_name_enc,
+                        screenshot_key_enc,
+                        created_at,
+                        screenshot_created_at,
+                        category,
+                    )| {
+                        let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
+                            (Some(data), Some(key)) => self
+                                .decrypt_payload_with_row_key(data, key)
+                                .ok()
+                                .and_then(|v| String::from_utf8(v).ok()),
+                            _ => None,
+                        };
 
-                                let screenshot_key = match screenshot_key_cache.get(&screenshot_id) {
-                                    Some(key) => Some(key.clone()),
-                                    None => match screenshot_key_enc.as_ref() {
-                                        Some(enc) => {
-                                            let key = decrypt_row_key_with_cng(enc).ok();
-                                            if let Some(ref k) = key {
-                                                screenshot_key_cache.insert(screenshot_id, k.clone());
-                                            }
-                                            key
-                                        }
-                                        None => None,
-                                    },
-                                };
-
-                                let window_title =
-                                    match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
-                                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                            .ok()
-                                            .and_then(|v| String::from_utf8(v).ok()),
-                                        _ => None,
-                                    };
-                                let process_name =
-                                    match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
-                                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                            .ok()
-                                            .and_then(|v| String::from_utf8(v).ok()),
-                                        _ => None,
-                                    };
-
-                                SearchResult {
-                                    id,
-                                    screenshot_id,
-                                    text: text.unwrap_or_default(),
-                                    confidence,
-                                    box_coords,
-                                    image_path,
-                                    window_title,
-                                    process_name,
-                                    category,
-                                    created_at,
-                                    screenshot_created_at,
+                        let screenshot_key = match screenshot_key_cache.get(&screenshot_id) {
+                            Some(key) => Some(key.clone()),
+                            None => match screenshot_key_enc.as_ref() {
+                                Some(enc) => {
+                                    let key = decrypt_row_key_with_cng(enc).ok();
+                                    if let Some(ref k) = key {
+                                        screenshot_key_cache.insert(screenshot_id, k.clone());
+                                    }
+                                    key
                                 }
+                                None => None,
                             },
-                        )
+                        };
+
+                        let window_title =
+                            match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
+                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                                    .ok()
+                                    .and_then(|v| String::from_utf8(v).ok()),
+                                _ => None,
+                            };
+                        let process_name =
+                            match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
+                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                                    .ok()
+                                    .and_then(|v| String::from_utf8(v).ok()),
+                                _ => None,
+                            };
+
+                        SearchResult {
+                            id,
+                            screenshot_id,
+                            text: text.unwrap_or_default(),
+                            confidence,
+                            box_coords,
+                            image_path,
+                            window_title,
+                            process_name,
+                            category,
+                            created_at,
+                            screenshot_created_at,
+                        }
+                    },
+                )
                 .collect();
 
             for (_, mut key) in screenshot_key_cache.into_iter() {
@@ -790,8 +794,7 @@ impl StorageState {
 
                 let mut screenshot_ids = std::collections::HashSet::new();
                 for chunk in ocr_ids.chunks(500) {
-                    let placeholders =
-                        chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
+                    let placeholders = chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
                     let sql = format!(
                         "SELECT DISTINCT screenshot_id FROM ocr_results WHERE id IN ({}) AND is_deleted = 0",
                         placeholders
@@ -910,74 +913,74 @@ impl StorageState {
                 })
                 .map_err(|e| format!("Failed to execute search query: {}", e))?
                 .filter_map(|r| r.ok())
-                        .map(
-                            |(
-                                screenshot_id,
-                                id,
-                                text_enc,
-                                text_key_enc,
-                                confidence,
-                                box_coords,
-                                image_path,
-                                window_title_enc,
-                                process_name_enc,
-                                screenshot_key_enc,
-                                created_at,
-                                screenshot_created_at,
-                                category,
-                            )| {
-                                let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
-                                    (Some(data), Some(key)) => self
-                                        .decrypt_payload_with_row_key(data, key)
-                                        .ok()
-                                        .and_then(|v| String::from_utf8(v).ok()),
-                                    _ => None,
-                                };
+                .map(
+                    |(
+                        screenshot_id,
+                        id,
+                        text_enc,
+                        text_key_enc,
+                        confidence,
+                        box_coords,
+                        image_path,
+                        window_title_enc,
+                        process_name_enc,
+                        screenshot_key_enc,
+                        created_at,
+                        screenshot_created_at,
+                        category,
+                    )| {
+                        let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
+                            (Some(data), Some(key)) => self
+                                .decrypt_payload_with_row_key(data, key)
+                                .ok()
+                                .and_then(|v| String::from_utf8(v).ok()),
+                            _ => None,
+                        };
 
-                                let screenshot_key = match screenshot_key_cache.get(&screenshot_id) {
-                                    Some(key) => Some(key.clone()),
-                                    None => match screenshot_key_enc.as_ref() {
-                                        Some(enc) => {
-                                            let key = decrypt_row_key_with_cng(enc).ok();
-                                            if let Some(ref k) = key {
-                                                screenshot_key_cache.insert(screenshot_id, k.clone());
-                                            }
-                                            key
-                                        }
-                                        None => None,
-                                    },
-                                };
-
-                                let window_title =
-                                    match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
-                                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                            .ok()
-                                            .and_then(|v| String::from_utf8(v).ok()),
-                                        _ => None,
-                                    };
-                                let process_name =
-                                    match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
-                                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                            .ok()
-                                            .and_then(|v| String::from_utf8(v).ok()),
-                                        _ => None,
-                                    };
-
-                                SearchResult {
-                                    id,
-                                    screenshot_id,
-                                    text: text.unwrap_or_default(),
-                                    confidence,
-                                    box_coords,
-                                    image_path,
-                                    window_title,
-                                    process_name,
-                                    category,
-                                    created_at,
-                                    screenshot_created_at,
+                        let screenshot_key = match screenshot_key_cache.get(&screenshot_id) {
+                            Some(key) => Some(key.clone()),
+                            None => match screenshot_key_enc.as_ref() {
+                                Some(enc) => {
+                                    let key = decrypt_row_key_with_cng(enc).ok();
+                                    if let Some(ref k) = key {
+                                        screenshot_key_cache.insert(screenshot_id, k.clone());
+                                    }
+                                    key
                                 }
+                                None => None,
                             },
-                        )
+                        };
+
+                        let window_title =
+                            match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
+                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                                    .ok()
+                                    .and_then(|v| String::from_utf8(v).ok()),
+                                _ => None,
+                            };
+                        let process_name =
+                            match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
+                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                                    .ok()
+                                    .and_then(|v| String::from_utf8(v).ok()),
+                                _ => None,
+                            };
+
+                        SearchResult {
+                            id,
+                            screenshot_id,
+                            text: text.unwrap_or_default(),
+                            confidence,
+                            box_coords,
+                            image_path,
+                            window_title,
+                            process_name,
+                            category,
+                            created_at,
+                            screenshot_created_at,
+                        }
+                    },
+                )
                 .collect();
 
             for (_, mut key) in screenshot_key_cache.into_iter() {
@@ -1059,18 +1062,26 @@ impl StorageState {
             let needed = (offset + limit) as usize;
             let mut filtered_ids = Vec::with_capacity(needed);
             for chunk in ids.chunks(500) {
-                if filtered_ids.len() >= needed { break; }
+                if filtered_ids.len() >= needed {
+                    break;
+                }
                 let placeholders = chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
                 let sql = format!(
                     "SELECT id, screenshot_id FROM ocr_results WHERE id IN ({}) AND is_deleted = 0",
                     placeholders
                 );
-                let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-                let mut stmt = conn.prepare(&sql).map_err(|e| format!("Failed to filter by category: {}", e))?;
-                let mut chunk_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-                let rows = stmt.query_map(params.as_slice(), |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                }).map_err(|e| format!("Failed to filter by category: {}", e))?;
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("Failed to filter by category: {}", e))?;
+                let mut chunk_map: std::collections::HashMap<i64, i64> =
+                    std::collections::HashMap::new();
+                let rows = stmt
+                    .query_map(params.as_slice(), |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(|e| format!("Failed to filter by category: {}", e))?;
                 for row in rows.filter_map(|r| r.ok()) {
                     chunk_map.insert(row.0, row.1);
                 }
@@ -1116,8 +1127,10 @@ impl StorageState {
             placeholders.join(",")
         );
 
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            page_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = page_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
 
         let mut stmt = conn
             .prepare(&sql)
@@ -1196,20 +1209,18 @@ impl StorageState {
                         },
                     };
 
-                    let window_title =
-                        match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
-                            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                .ok()
-                                .and_then(|v| String::from_utf8(v).ok()),
-                            _ => None,
-                        };
-                    let process_name =
-                        match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
-                            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                .ok()
-                                .and_then(|v| String::from_utf8(v).ok()),
-                            _ => None,
-                        };
+                    let window_title = match (window_title_enc.as_ref(), screenshot_key.as_ref()) {
+                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                            .ok()
+                            .and_then(|v| String::from_utf8(v).ok()),
+                        _ => None,
+                    };
+                    let process_name = match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
+                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                            .ok()
+                            .and_then(|v| String::from_utf8(v).ok()),
+                        _ => None,
+                    };
 
                     Some(SearchResult {
                         id,
@@ -1232,7 +1243,11 @@ impl StorageState {
         // (SQL ORDER BY destroys our score-based ordering)
         let mut results = results;
         if fuzzy {
-            let id_order: HashMap<i64, usize> = page_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+            let id_order: HashMap<i64, usize> = page_ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| (id, i))
+                .collect();
             results.sort_by_key(|r| id_order.get(&r.id).copied().unwrap_or(usize::MAX));
         }
 

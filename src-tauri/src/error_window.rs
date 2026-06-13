@@ -48,7 +48,13 @@ pub fn install_panic_hook() {
 
         // Include location if available
         let full_message = if let Some(loc) = panic_info.location() {
-            format!("{}\n  at {}:{}:{}", message, loc.file(), loc.line(), loc.column())
+            format!(
+                "{}\n  at {}:{}:{}",
+                message,
+                loc.file(),
+                loc.line(),
+                loc.column()
+            )
         } else {
             message
         };
@@ -76,10 +82,7 @@ pub fn show_error_window(app: &tauri::AppHandle, message: &str) {
     HAS_CRITICAL_ERROR.store(true, Ordering::SeqCst);
 
     // Emit event to the main window (frontend will render overlay)
-    let _ = app.emit(
-        "critical-error",
-        serde_json::json!({ "message": message }),
-    );
+    let _ = app.emit("critical-error", serde_json::json!({ "message": message }));
 
     // Ensure main window is visible and focused
     if let Some(main_win) = app.get_webview_window("main") {

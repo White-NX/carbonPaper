@@ -20,13 +20,7 @@ const DICT_KEY_MATERIAL: &[u8] = b"CarbonPaper-SensitiveDict-v1";
 /// strikes a good balance.
 const MIN_WORD_CHARS: usize = 2;
 
-const CATEGORY_IDS: &[&str] = &[
-    "cat_01",
-    "cat_02",
-    "cat_03",
-    "cat_04",
-    "cat_05",
-];
+const CATEGORY_IDS: &[&str] = &["cat_01", "cat_02", "cat_03", "cat_04", "cat_05"];
 
 /// Maps category ID to its dictionary filename.
 const DICT_FILES: &[(&str, &str)] = &[
@@ -109,58 +103,36 @@ impl SensitiveFilterState {
         let mut wl = self.word_lists.write().unwrap();
 
         for &(cat_id, dict_file) in DICT_FILES {
-            let filename = format!(
-                "compliance_process/dicts/{}",
-                dict_file
-            );
+            let filename = format!("compliance_process/dicts/{}", dict_file);
 
             let resource_path = match app_handle.path().resource_dir() {
                 Ok(dir) => dir.join(&filename),
                 Err(e) => {
-                    tracing::warn!(
-                        "Cannot resolve resource dir for {}: {}",
-                        cat_id,
-                        e
-                    );
+                    tracing::warn!("Cannot resolve resource dir for {}: {}", cat_id, e);
                     continue;
                 }
             };
 
             if !resource_path.exists() {
-                tracing::warn!(
-                    "Dict file not found: {}",
-                    resource_path.display()
-                );
+                tracing::warn!("Dict file not found: {}", resource_path.display());
                 continue;
             }
 
             let encrypted = match std::fs::read(&resource_path) {
                 Ok(data) => data,
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to read {}: {}",
-                        resource_path.display(),
-                        e
-                    );
+                    tracing::error!("Failed to read {}: {}", resource_path.display(), e);
                     continue;
                 }
             };
 
             match decrypt_dict(&key, &encrypted) {
                 Ok(words) => {
-                    tracing::info!(
-                        "Loaded {} words for '{}'",
-                        words.len(),
-                        cat_id
-                    );
+                    tracing::info!("Loaded {} words for '{}'", words.len(), cat_id);
                     wl.insert(cat_id.to_string(), words);
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to decrypt dict for '{}': {}",
-                        cat_id,
-                        e
-                    );
+                    tracing::error!("Failed to decrypt dict for '{}': {}", cat_id, e);
                 }
             }
         }
@@ -191,11 +163,7 @@ impl SensitiveFilterState {
     }
 
     /// Check if a record (window title + OCR texts) is flagged.
-    pub fn is_record_sensitive(
-        &self,
-        window_title: Option<&str>,
-        ocr_texts: &[&str],
-    ) -> bool {
+    pub fn is_record_sensitive(&self, window_title: Option<&str>, ocr_texts: &[&str]) -> bool {
         if !self.is_enabled() {
             return false;
         }
@@ -304,12 +272,7 @@ impl SensitiveFilterState {
         let mut all_words: Vec<String> = Vec::new();
         let mut skipped: usize = 0;
         for (cat_id, words) in wl.iter() {
-            if config
-                .categories
-                .get(cat_id)
-                .copied()
-                .unwrap_or(true)
-            {
+            if config.categories.get(cat_id).copied().unwrap_or(true) {
                 for w in words {
                     if w.chars().count() >= MIN_WORD_CHARS {
                         all_words.push(w.clone());
@@ -341,10 +304,7 @@ impl SensitiveFilterState {
                 .build(&all_words)
             {
                 Ok(ac) => {
-                    tracing::info!(
-                        "Built automaton with {} patterns",
-                        all_words.len()
-                    );
+                    tracing::info!("Built automaton with {} patterns", all_words.len());
                     Some(ac)
                 }
                 Err(e) => {
@@ -367,8 +327,8 @@ fn decrypt_dict(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<String>, String>
         return Err("Encrypted data too short".to_string());
     }
 
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| format!("Failed to create cipher: {}", e))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Failed to create cipher: {}", e))?;
 
     let nonce = Nonce::from_slice(&encrypted[..12]);
     let ciphertext = &encrypted[12..];
@@ -377,8 +337,7 @@ fn decrypt_dict(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<String>, String>
         .decrypt(nonce, ciphertext)
         .map_err(|e| format!("Decryption failed: {}", e))?;
 
-    let text = String::from_utf8(plaintext)
-        .map_err(|e| format!("Invalid UTF-8 in dict: {}", e))?;
+    let text = String::from_utf8(plaintext).map_err(|e| format!("Invalid UTF-8 in dict: {}", e))?;
 
     let words: Vec<String> = text
         .lines()
@@ -443,7 +402,11 @@ mod tests {
     fn test_mask_sensitive_basic() {
         let state = make_state_with_words(vec!["secret"]);
         let result = state.mask_sensitive("my secret data");
-        assert!(!result.contains("secret"), "masked text should not contain 'secret': {}", result);
+        assert!(
+            !result.contains("secret"),
+            "masked text should not contain 'secret': {}",
+            result
+        );
         assert!(result.contains("my "), "non-sensitive part should remain");
         assert!(result.contains(" data"), "non-sensitive part should remain");
     }

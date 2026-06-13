@@ -514,7 +514,8 @@
           "drainNow": "Process pending queue now",
           "rescanAll": "Re-match all hot layer",
           "retry": "Retry Download",
-          "openManagement": "Open Smart Cluster Management"
+          "openManagement": "Open Smart Cluster Management",
+          "clusteringDisabledWarning": "Task Clustering is disabled. Smart Clusters can still run during rescans, but without automatic text vectorization at screenshot capture time, candidate retrieval must encode text on demand, which may significantly reduce processing performance and increase resource usage."
         },
         "disabled_notice": "This feature is disabled"
       },

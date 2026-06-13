@@ -241,7 +241,12 @@ pub async fn storage_export_backup(
     let result = async {
         // 1. Release resources
         tracing::info!("Migration: Releasing resources (stopping monitor and storage)");
-        let _ = stop_monitor(monitor_state.clone(), capture_state.clone()).await;
+        let _ = stop_monitor(
+            monitor_state.clone(),
+            capture_state.clone(),
+            app_handle.clone(),
+        )
+        .await;
         state.shutdown()?;
 
         // 2. Get Master Key
@@ -431,7 +436,12 @@ pub async fn storage_import_backup(
     let result = async {
         // 1. Prepare
         tracing::info!("Migration: Releasing resources for import");
-        let _ = stop_monitor(monitor_state.clone(), capture_state.clone()).await;
+        let _ = stop_monitor(
+            monitor_state.clone(),
+            capture_state.clone(),
+            app_handle.clone(),
+        )
+        .await;
         state.shutdown()?;
 
         // 2. Open ZIP

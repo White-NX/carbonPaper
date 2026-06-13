@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use crate::credential_manager::{self, CredentialManagerState};
 use crate::storage::StorageState;
+use std::sync::Arc;
 
 #[tauri::command]
 pub async fn credential_initialize(

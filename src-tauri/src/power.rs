@@ -74,10 +74,13 @@ pub fn start_power_monitor(app: AppHandle) {
                 last_ac_connected = current_ac_connected;
                 if power_state.active.load(Ordering::SeqCst) {
                     power_state.active.store(false, Ordering::SeqCst);
-                    let _ = app_clone.emit("power-saving-changed", serde_json::json!({
-                        "enabled": false,
-                        "active": false,
-                    }));
+                    let _ = app_clone.emit(
+                        "power-saving-changed",
+                        serde_json::json!({
+                            "enabled": false,
+                            "active": false,
+                        }),
+                    );
                 }
                 continue;
             }
@@ -89,15 +92,21 @@ pub fn start_power_monitor(app: AppHandle) {
                 // Stop monitor if running
                 let monitor_state = app_clone.state::<crate::monitor::MonitorState>();
                 let capture_state = app_clone.state::<Arc<crate::capture::CaptureState>>();
-                let _ = crate::monitor::stop_monitor(monitor_state, capture_state).await;
+                let _ =
+                    crate::monitor::stop_monitor(monitor_state, capture_state, app_clone.clone())
+                        .await;
 
                 power_state.active.store(true, Ordering::SeqCst);
-                let _ = app_clone.emit("power-saving-changed", serde_json::json!({
-                    "enabled": true,
-                    "active": true,
-                }));
+                let _ = app_clone.emit(
+                    "power-saving-changed",
+                    serde_json::json!({
+                        "enabled": true,
+                        "active": true,
+                    }),
+                );
 
-                let _ = app_clone.notification()
+                let _ = app_clone
+                    .notification()
                     .builder()
                     .title("CarbonPaper")
                     .body("已切换到节能模式，交流电源已断开")
@@ -112,19 +121,26 @@ pub fn start_power_monitor(app: AppHandle) {
                 if auto_start {
                     tauri::async_runtime::spawn(async move {
                         let monitor_state = app_for_spawn.state::<crate::monitor::MonitorState>();
-                        if let Err(e) = crate::monitor::start_monitor(monitor_state, app_for_spawn.clone()).await {
+                        if let Err(e) =
+                            crate::monitor::start_monitor(monitor_state, app_for_spawn.clone())
+                                .await
+                        {
                             tracing::error!("Failed to start monitor after power restored: {}", e);
                         }
                     });
                 }
 
                 power_state.active.store(false, Ordering::SeqCst);
-                let _ = app_clone.emit("power-saving-changed", serde_json::json!({
-                    "enabled": true,
-                    "active": false,
-                }));
+                let _ = app_clone.emit(
+                    "power-saving-changed",
+                    serde_json::json!({
+                        "enabled": true,
+                        "active": false,
+                    }),
+                );
 
-                let _ = app_clone.notification()
+                let _ = app_clone
+                    .notification()
                     .builder()
                     .title("CarbonPaper")
                     .body("已退出节能模式，交流电源已恢复")
@@ -153,7 +169,9 @@ pub fn stop_power_monitor(app: &AppHandle) {
 // ==================== Tauri Commands ====================
 
 #[tauri::command]
-pub fn get_power_saving_status(power_state: tauri::State<'_, Arc<PowerState>>) -> serde_json::Value {
+pub fn get_power_saving_status(
+    power_state: tauri::State<'_, Arc<PowerState>>,
+) -> serde_json::Value {
     serde_json::json!({
         "enabled": power_state.enabled.load(Ordering::SeqCst),
         "active": power_state.active.load(Ordering::SeqCst),
@@ -162,17 +180,24 @@ pub fn get_power_saving_status(power_state: tauri::State<'_, Arc<PowerState>>) -
 }
 
 #[tauri::command]
-pub fn set_power_saving_enabled(power_state: tauri::State<'_, Arc<PowerState>>, app: AppHandle, enabled: bool) -> Result<(), String> {
+pub fn set_power_saving_enabled(
+    power_state: tauri::State<'_, Arc<PowerState>>,
+    app: AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
     registry_config::set_bool("power_saving_mode_enabled", enabled)?;
     power_state.enabled.store(enabled, Ordering::SeqCst);
 
     // If disabling while active, reset active state and emit event
     if !enabled {
         power_state.active.store(false, Ordering::SeqCst);
-        let _ = app.emit("power-saving-changed", serde_json::json!({
-            "enabled": false,
-            "active": false,
-        }));
+        let _ = app.emit(
+            "power-saving-changed",
+            serde_json::json!({
+                "enabled": false,
+                "active": false,
+            }),
+        );
     }
 
     tracing::info!("Power saving mode enabled: {}", enabled);

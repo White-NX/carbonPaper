@@ -34,12 +34,9 @@ fn read_run_value() -> Result<Option<String>, String> {
 #[cfg(windows)]
 fn set_autostart_windows(enabled: bool) -> Result<bool, String> {
     // 直接获取可执行文件完整路径，若失败再回退到 current_exe
-    let exe_path_buf = std::env::current_exe()
-        .map_err(|e| format!("Cannot get executable path: {}", e))?;
-    let exe_path = exe_path_buf
-        .to_string_lossy()
-        .to_string()
-        .replace('"', "");
+    let exe_path_buf =
+        std::env::current_exe().map_err(|e| format!("Cannot get executable path: {}", e))?;
+    let exe_path = exe_path_buf.to_string_lossy().to_string().replace('"', "");
 
     if enabled {
         // 不在命令行中包含 --hidden 参数，因为 lib.rs 会在运行时检查注册表值 start_with_window_hidden

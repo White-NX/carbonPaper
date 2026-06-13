@@ -1,8 +1,11 @@
+use crate::{
+    capture::CaptureState, monitor, monitor::MonitorState, registry_config, storage::StorageState,
+    LightweightModeState, IS_QUITTING, IS_UPDATING,
+};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
-use crate::{IS_UPDATING, registry_config, monitor, capture::CaptureState, monitor::MonitorState, storage::StorageState, LightweightModeState};
 
 #[tauri::command]
 pub fn frontend_log(level: String, message: String) {
@@ -31,12 +34,36 @@ pub fn restart_app(app: tauri::AppHandle) {
 pub async fn trigger_test_error() {
     let _ = tokio::task::spawn_blocking(|| {
         panic!("This is a test panic triggered from Rust!");
-    }).await;
+    })
+    .await;
 }
 
 #[tauri::command]
-pub fn exit_app() {
-    std::process::exit(1);
+pub async fn exit_app(
+    app: tauri::AppHandle,
+    monitor_state: tauri::State<'_, MonitorState>,
+    capture_state: tauri::State<'_, Arc<CaptureState>>,
+) -> Result<(), String> {
+    IS_QUITTING.store(true, Ordering::Relaxed);
+    monitor_state.stopping.store(true, Ordering::SeqCst);
+    capture_state.stopped.store(true, Ordering::SeqCst);
+    capture_state.paused.store(false, Ordering::SeqCst);
+    if let Some(handle) = capture_state
+        .capture_task
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        handle.abort();
+    }
+    capture_state.clear_wgc_session("app_exit_command");
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_app_language(app: tauri::AppHandle, language: String) -> Result<(), String> {
+    crate::set_app_language(&app, &language)
 }
 
 #[tauri::command]
@@ -65,9 +92,11 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let use_dml = registry_config::get_bool("use_dml").unwrap_or(false);
     let dml_device_id = registry_config::get_u32("dml_device_id").unwrap_or(0);
     let game_mode_enabled = registry_config::get_bool("game_mode_enabled").unwrap_or(true);
-    let clustering_interval = registry_config::get_string("clustering_interval").unwrap_or_else(|| "1w".to_string());
+    let clustering_interval =
+        registry_config::get_string("clustering_interval").unwrap_or_else(|| "1w".to_string());
     let clustering_enabled = registry_config::get_bool("clustering_enabled").unwrap_or(true);
-    let classification_enabled = registry_config::get_bool("classification_enabled").unwrap_or(true);
+    let classification_enabled =
+        registry_config::get_bool("classification_enabled").unwrap_or(true);
     let smart_cluster_enabled = registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
     let network_enabled = registry_config::get_bool("network_enabled").unwrap_or(true);
     let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
@@ -125,10 +154,16 @@ pub fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     if let Some(v) = config.get("clustering_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("clustering_enabled", v)?;
     }
-    if let Some(v) = config.get("classification_enabled").and_then(|v| v.as_bool()) {
+    if let Some(v) = config
+        .get("classification_enabled")
+        .and_then(|v| v.as_bool())
+    {
         registry_config::set_bool("classification_enabled", v)?;
     }
-    if let Some(v) = config.get("smart_cluster_enabled").and_then(|v| v.as_bool()) {
+    if let Some(v) = config
+        .get("smart_cluster_enabled")
+        .and_then(|v| v.as_bool())
+    {
         registry_config::set_bool("smart_cluster_enabled", v)?;
     }
     if let Some(v) = config.get("network_enabled").and_then(|v| v.as_bool()) {
@@ -147,14 +182,13 @@ pub async fn toggle_game_mode(app: tauri::AppHandle, enabled: bool) -> Result<()
         monitor::start_game_mode_monitor(app);
     } else {
         let state = app.state::<MonitorState>();
-        let was_suppressed = state
-            .game_mode_dml_suppressed
-            .load(Ordering::SeqCst);
+        let was_suppressed = state.game_mode_dml_suppressed.load(Ordering::SeqCst);
         monitor::stop_game_mode_monitor(&app);
         if was_suppressed {
             let _ = monitor::stop_monitor(
                 app.state::<MonitorState>(),
                 app.state::<Arc<CaptureState>>(),
+                app.clone(),
             )
             .await;
             let _ = monitor::start_monitor(app.state::<MonitorState>(), app.clone()).await;
@@ -243,9 +277,7 @@ pub fn set_extension_enhancement(browser: String, enabled: bool) -> Result<(), S
 #[tauri::command]
 pub fn get_game_mode_status(app: tauri::AppHandle) -> serde_json::Value {
     let state = app.state::<MonitorState>();
-    let active = state
-        .game_mode_dml_suppressed
-        .load(Ordering::SeqCst);
+    let active = state.game_mode_dml_suppressed.load(Ordering::SeqCst);
     let permanent = state
         .game_mode_permanently_suppressed
         .load(Ordering::SeqCst);
@@ -288,9 +320,11 @@ pub async fn switch_to_lightweight_mode(
     app.notification()
         .builder()
         .title("CarbonPaper")
-        .body("已切换到轻量模式，通过托盘菜单可重新打开界面")
+        .body(crate::tray_text_lightweight_switched())
         .show()
         .ok();
+
+    crate::refresh_tray_menu(&app);
 
     Ok(())
 }
@@ -318,6 +352,7 @@ pub async fn switch_to_standard_mode(
 
     // 标记为标准模式
     *lightweight_state.is_lightweight.lock().unwrap() = false;
+    crate::refresh_tray_menu(&app);
 
     Ok(())
 }
@@ -343,15 +378,24 @@ pub fn get_lightweight_config() -> Result<serde_json::Value, String> {
 /// 设置轻量模式配置
 #[tauri::command]
 pub fn set_lightweight_config(config: serde_json::Value) -> Result<(), String> {
-    if let Some(start_hidden) = config.get("start_with_window_hidden").and_then(|v| v.as_bool()) {
+    if let Some(start_hidden) = config
+        .get("start_with_window_hidden")
+        .and_then(|v| v.as_bool())
+    {
         registry_config::set_bool("start_with_window_hidden", start_hidden)?;
     }
 
-    if let Some(auto_enabled) = config.get("auto_lightweight_enabled").and_then(|v| v.as_bool()) {
+    if let Some(auto_enabled) = config
+        .get("auto_lightweight_enabled")
+        .and_then(|v| v.as_bool())
+    {
         registry_config::set_bool("auto_lightweight_enabled", auto_enabled)?;
     }
 
-    if let Some(delay) = config.get("auto_lightweight_delay_minutes").and_then(|v| v.as_u64()) {
+    if let Some(delay) = config
+        .get("auto_lightweight_delay_minutes")
+        .and_then(|v| v.as_u64())
+    {
         registry_config::set_u32("auto_lightweight_delay_minutes", delay as u32)?;
     }
 
@@ -387,7 +431,11 @@ pub fn open_path(path: String) -> Result<(), String> {
     {
         // Fallback for macOS/Linux using open or xdg-open
         use std::process::Command;
-        let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
         Command::new(opener)
             .arg(&path)
             .spawn()

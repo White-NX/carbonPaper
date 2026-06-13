@@ -21,26 +21,25 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId,
 };
 
-use windows::core::{Interface, IInspectable};
+use std::sync::mpsc::{sync_channel, Receiver};
+use windows::core::{IInspectable, Interface};
 use windows::Foundation::{EventRegistrationToken, IClosable, TypedEventHandler};
 use windows::Graphics::Capture::{
-    Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession, Direct3D11CaptureFrame
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };
-use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Texture2D,
-};
+use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use std::sync::mpsc::{sync_channel, Receiver};
 
 // ==================== Configuration ====================
 
@@ -662,7 +661,7 @@ fn capture_foreground_window(
                 } else {
                     true
                 }
-            },
+            }
             None => true,
         };
 
@@ -733,7 +732,10 @@ fn capture_foreground_window(
                     let winrt_device: IDirect3DDevice = match inspectable.cast() {
                         Ok(d) => d,
                         Err(e) => {
-                            tracing::warn!("Failed to cast inspectable to IDirect3DDevice: {:?}", e);
+                            tracing::warn!(
+                                "Failed to cast inspectable to IDirect3DDevice: {:?}",
+                                e
+                            );
                             *session_guard = None;
                             return None;
                         }
@@ -743,7 +745,10 @@ fn capture_foreground_window(
                 };
 
             // 2. Create GraphicsCaptureItem
-            let interop = match windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>() {
+            let interop = match windows::core::factory::<
+                GraphicsCaptureItem,
+                IGraphicsCaptureItemInterop,
+            >() {
                 Ok(i) => i,
                 Err(e) => {
                     tracing::warn!("Failed to get IGraphicsCaptureItemInterop: {:?}", e);
@@ -854,7 +859,10 @@ fn capture_foreground_window(
         let session = session_guard.as_mut().unwrap();
 
         // 4. Wait for a frame (up to 500ms)
-        let frame = match session.rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        let frame = match session
+            .rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+        {
             Ok(f) => f,
             Err(_) => {
                 // Timeout means the window hasn't updated its content. Very common.
@@ -895,7 +903,10 @@ fn capture_foreground_window(
         let dxgi_interface: IDirect3DDxgiInterfaceAccess = match surface.cast() {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!("Failed to cast surface to IDirect3DDxgiInterfaceAccess: {:?}", e);
+                tracing::warn!(
+                    "Failed to cast surface to IDirect3DDxgiInterfaceAccess: {:?}",
+                    e
+                );
                 *session_guard = None;
                 return None;
             }
@@ -946,13 +957,16 @@ fn capture_foreground_window(
         let staging_texture = staging_texture.unwrap();
 
         // Copy resource from GPU to staging
-        session.d3d_context.CopyResource(&staging_texture, &source_texture);
+        session
+            .d3d_context
+            .CopyResource(&staging_texture, &source_texture);
 
         // 6. Map and extract pixels
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        if let Err(e) = session
-            .d3d_context
-            .Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        if let Err(e) =
+            session
+                .d3d_context
+                .Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
         {
             tracing::warn!("Failed to map staging texture: {:?}", e);
             *session_guard = None;
@@ -962,7 +976,8 @@ fn capture_foreground_window(
         // WGC uses B8G8R8A8 normalized
         let row_pitch = mapped.RowPitch as usize;
         let mut rgb_pixels = Vec::with_capacity((width * height * 3) as usize);
-        let raw = std::slice::from_raw_parts(mapped.pData as *const u8, row_pitch * height as usize);
+        let raw =
+            std::slice::from_raw_parts(mapped.pData as *const u8, row_pitch * height as usize);
 
         for row in 0..height {
             let row_start = (row as usize) * row_pitch;
@@ -1022,7 +1037,6 @@ fn capture_foreground_window(
         Some(captured)
     }
 }
-
 
 // ==================== Process Icon Extraction ====================
 
@@ -1643,9 +1657,15 @@ async fn process_ocr_inner(
     });
 
     let (auth_token, seq_no) = {
-        let token = monitor_state.auth_token.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let token = monitor_state
+            .auth_token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
             .ok_or_else(|| "Auth token not available".to_string())?;
-        let seq = monitor_state.request_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = monitor_state
+            .request_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         (token, seq)
     };
 

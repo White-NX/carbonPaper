@@ -1,5 +1,5 @@
-use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources, get_log_path};
 use crate::registry_config;
+use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources, get_log_path};
 use anyhow::{anyhow, Context, Result};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::json;
@@ -71,7 +71,10 @@ fn missing_files_with_alternative(
     display_missing: &str,
 ) -> Vec<String> {
     let mut missing = missing_files(base, files);
-    if !alternatives.iter().any(|file| file_exists_nonempty(&base.join(file))) {
+    if !alternatives
+        .iter()
+        .any(|file| file_exists_nonempty(&base.join(file)))
+    {
         missing.push(display_missing.to_string());
     }
     missing
@@ -88,16 +91,25 @@ fn insert_status_with_fallback(
     let primary_missing = check_missing(primary_base);
     let legacy_missing = legacy_base.map(|base| check_missing(base));
     let complete = primary_missing.is_empty()
-        || legacy_missing.as_ref().map(|m| m.is_empty()).unwrap_or(false);
+        || legacy_missing
+            .as_ref()
+            .map(|m| m.is_empty())
+            .unwrap_or(false);
 
     if complete {
-        result.insert(key.to_string(), json!({ "complete": true, "required": required }));
+        result.insert(
+            key.to_string(),
+            json!({ "complete": true, "required": required }),
+        );
     } else {
-        result.insert(key.to_string(), json!({
-            "complete": false,
-            "required": required,
-            "missing_files": primary_missing
-        }));
+        result.insert(
+            key.to_string(),
+            json!({
+                "complete": false,
+                "required": required,
+                "missing_files": primary_missing
+            }),
+        );
     }
 }
 
@@ -253,33 +265,41 @@ async fn perform_download_hf_repo(
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut handles = Vec::with_capacity(files.len());
 
-    println!("Starting download of {} files from repo {}...", files.len(), repo);
+    println!(
+        "Starting download of {} files from repo {}...",
+        files.len(),
+        repo
+    );
 
     for relpath in files {
         let aria2_path = aria2_path.clone();
-        let download_path = download_path.clone(); 
+        let download_path = download_path.clone();
         let app = app.clone();
         let log_file = Arc::clone(&log_file);
         let sem = Arc::clone(&sem);
 
         let target = download_path.join(&relpath);
-        
+
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
-            let canonical_parent = parent.canonicalize()
+            let canonical_parent = parent
+                .canonicalize()
                 .map_err(|e| anyhow!("Failed to canonicalize parent dir: {}", e))?;
-            let canonical_root = download_path.canonicalize()
+            let canonical_root = download_path
+                .canonicalize()
                 .map_err(|e| anyhow!("Failed to canonicalize download path: {}", e))?;
             if !canonical_parent.starts_with(&canonical_root) {
-                return Err(anyhow!("Directory traversal detected via symbolic link / boundary escape"));
+                return Err(anyhow!(
+                    "Directory traversal detected via symbolic link / boundary escape"
+                ));
             }
         }
-        
+
         let parent_dir = target
             .parent()
             .ok_or_else(|| anyhow!("无法确定文件父目录"))?
             .to_path_buf();
-            
+
         let outfile = target
             .file_name()
             .and_then(|s| s.to_str())
@@ -292,7 +312,7 @@ async fn perform_download_hf_repo(
             }
         }
 
-        let url = build_file_url(repo, &relpath); 
+        let url = build_file_url(repo, &relpath);
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
@@ -329,14 +349,15 @@ async fn perform_download_hf_repo(
     if let Some(e) = any_err {
         Err(anyhow!("部分文件下载失败：{}", e))
     } else {
-        Ok(download_path) 
+        Ok(download_path)
     }
 }
 
 fn is_safe_relative_path(rel: &str) -> bool {
     use std::path::{Component, Path};
     !rel.trim().is_empty()
-        && Path::new(rel).components()
+        && Path::new(rel)
+            .components()
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
@@ -366,8 +387,10 @@ pub async fn download_model(
         return Err("Network features are disabled".to_string());
     }
 
-    let aria2 = find_existing_file_in_resources(&app, "aria2c.exe")
-        .ok_or_else(|| "aria2c executable not found in resources; The program installation may be incomplete.".to_string())?;
+    let aria2 = find_existing_file_in_resources(&app, "aria2c.exe").ok_or_else(|| {
+        "aria2c executable not found in resources; The program installation may be incomplete."
+            .to_string()
+    })?;
 
     // Validate inputs
     if let Some(sub) = subdir {
@@ -385,11 +408,15 @@ pub async fn download_model(
     // avoid mixing incompatible config/tokenizer files in the same directory.
     let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
     let runtime = model_runtime.unwrap_or("").trim().to_ascii_lowercase();
-    let use_onnx_root = runtime == "onnx"
-        || (runtime.is_empty() && use_onnx && subdir.is_none() && repo.is_none());
+    let use_onnx_root =
+        runtime == "onnx" || (runtime.is_empty() && use_onnx && subdir.is_none() && repo.is_none());
     let mut download_path = file_in_local_appdata()
         .ok_or_else(|| "Could not determine resource directory.".to_string())?
-        .join(if use_onnx_root { "models-onnx" } else { "models" });
+        .join(if use_onnx_root {
+            "models-onnx"
+        } else {
+            "models"
+        });
     if let Some(sub) = subdir {
         download_path = download_path.join(sub);
     }
@@ -440,7 +467,17 @@ pub async fn download_model(
         }
     }
 
-    match perform_download_hf_repo(app.clone(), aria2, download_path, repo, files, conc, log_file).await {
+    match perform_download_hf_repo(
+        app.clone(),
+        aria2,
+        download_path,
+        repo,
+        files,
+        conc,
+        log_file,
+    )
+    .await
+    {
         Ok(path) => Ok(path.to_string_lossy().to_string()),
         Err(e) => Err(format!("download_model error: {}", e)),
     }
@@ -465,7 +502,17 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             &onnx_models_dir,
             Some(&models_dir),
             true,
-            |base| missing_files(base, &["vocab.txt", "config.json", "preprocessor_config.json", "onnx/model_q4.onnx"]),
+            |base| {
+                missing_files(
+                    base,
+                    &[
+                        "vocab.txt",
+                        "config.json",
+                        "preprocessor_config.json",
+                        "onnx/model_q4.onnx",
+                    ],
+                )
+            },
         );
         insert_status_with_fallback(
             &mut result,
@@ -476,7 +523,12 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             |base| {
                 missing_files_with_alternative(
                     base,
-                    &["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
+                    &[
+                        "config.json",
+                        "tokenizer.json",
+                        "tokenizer_config.json",
+                        "special_tokens_map.json",
+                    ],
                     &["onnx/model_quantized.onnx", "model_int8.onnx"],
                     "onnx/model_quantized.onnx",
                 )
@@ -491,7 +543,12 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             |base| {
                 missing_files_with_alternative(
                     base,
-                    &["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
+                    &[
+                        "config.json",
+                        "tokenizer.json",
+                        "tokenizer_config.json",
+                        "special_tokens_map.json",
+                    ],
                     &["onnx/model_quantized.onnx", "model_int8.onnx"],
                     "onnx/model_quantized.onnx",
                 )
@@ -504,7 +561,17 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             &models_dir,
             None,
             true,
-            |base| missing_files(base, &["vocab.txt", "pytorch_model.bin", "config.json", "preprocessor_config.json"]),
+            |base| {
+                missing_files(
+                    base,
+                    &[
+                        "vocab.txt",
+                        "pytorch_model.bin",
+                        "config.json",
+                        "preprocessor_config.json",
+                    ],
+                )
+            },
         );
         insert_status_with_fallback(
             &mut result,
@@ -512,7 +579,19 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             &models_dir.join("bge-small-zh-v1.5"),
             None,
             true,
-            |base| missing_files(base, &["config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"]),
+            |base| {
+                missing_files(
+                    base,
+                    &[
+                        "config.json",
+                        "pytorch_model.bin",
+                        "tokenizer.json",
+                        "tokenizer_config.json",
+                        "vocab.txt",
+                        "special_tokens_map.json",
+                    ],
+                )
+            },
         );
         insert_status_with_fallback(
             &mut result,
@@ -520,7 +599,19 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             &models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
             None,
             true,
-            |base| missing_files(base, &["config.json", "pytorch_model.bin", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "sentencepiece.bpe.model"]),
+            |base| {
+                missing_files(
+                    base,
+                    &[
+                        "config.json",
+                        "pytorch_model.bin",
+                        "tokenizer.json",
+                        "tokenizer_config.json",
+                        "special_tokens_map.json",
+                        "sentencepiece.bpe.model",
+                    ],
+                )
+            },
         );
     }
 
@@ -530,7 +621,18 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
         &models_dir.join("bge-reranker-v2-m3"),
         None,
         false,
-        |base| missing_files(base, &["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "onnx/model_uint8.onnx"]),
+        |base| {
+            missing_files(
+                base,
+                &[
+                    "config.json",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "special_tokens_map.json",
+                    "onnx/model_uint8.onnx",
+                ],
+            )
+        },
     );
 
     Ok(serde_json::Value::Object(result))
@@ -545,7 +647,7 @@ mod tests {
         assert!(is_safe_relative_path("onnx/model.onnx"));
         assert!(is_safe_relative_path("config.json"));
         assert!(is_safe_relative_path("a/b/c"));
-        
+
         assert!(!is_safe_relative_path(""));
         assert!(!is_safe_relative_path(" "));
         assert!(!is_safe_relative_path(".."));
@@ -560,7 +662,7 @@ mod tests {
     fn test_is_valid_repo() {
         assert!(is_valid_repo("Xenova/chinese-clip-vit-base-patch16"));
         assert!(is_valid_repo("OFA-Sys/chinese-clip-vit-base-patch16"));
-        
+
         assert!(!is_valid_repo(""));
         assert!(!is_valid_repo("  "));
         assert!(!is_valid_repo("repo name"));

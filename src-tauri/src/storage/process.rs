@@ -172,17 +172,26 @@ impl StorageState {
             .map_err(|e| format!("Failed to prepare monthly thumbnails query: {}", e))?;
 
         let items: Vec<ProcessMonthlyThumbnailItem> = stmt
-            .query_map([&process_name as &dyn rusqlite::ToSql, &safe_page_size, &offset], |row| {
-                let ts_raw: Option<String> = row.get(3)?;
-                let timestamp = ts_raw.and_then(|v| v.parse::<i64>().ok());
-                Ok(ProcessMonthlyThumbnailItem {
-                    screenshot_id: row.get(0)?,
-                    image_path: row.get(1)?,
-                    created_at: row.get(2)?,
-                    timestamp,
-                    month: row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "unknown".to_string()),
-                })
-            })
+            .query_map(
+                [
+                    &process_name as &dyn rusqlite::ToSql,
+                    &safe_page_size,
+                    &offset,
+                ],
+                |row| {
+                    let ts_raw: Option<String> = row.get(3)?;
+                    let timestamp = ts_raw.and_then(|v| v.parse::<i64>().ok());
+                    Ok(ProcessMonthlyThumbnailItem {
+                        screenshot_id: row.get(0)?,
+                        image_path: row.get(1)?,
+                        created_at: row.get(2)?,
+                        timestamp,
+                        month: row
+                            .get::<_, Option<String>>(4)?
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    })
+                },
+            )
             .map_err(|e| format!("Failed to execute monthly thumbnails query: {}", e))?
             .filter_map(|r| r.ok())
             .collect();

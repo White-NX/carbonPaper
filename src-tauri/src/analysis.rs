@@ -6,9 +6,9 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sysinfo::{Pid, System};
 use tauri::{AppHandle, Manager, State};
 use walkdir::WalkDir;
-use sysinfo::{Pid, System};
 
 const MEMORY_WINDOW: Duration = Duration::from_secs(30 * 60);
 const STORAGE_CACHE_TTL: Duration = Duration::from_secs(5 * 60 * 60);
@@ -102,17 +102,39 @@ fn compute_storage_stats(data_dir: PathBuf) -> Result<StorageStats, String> {
     let chroma_dir = data_dir.join("chroma_db");
     let ocr_db = data_dir.join("screenshots.db");
 
-    let models_bytes = if models_dir.exists() { directory_size(&models_dir) } else { 0 };
-    let images_bytes = if screenshots_dir.exists() { directory_size(&screenshots_dir) } else { 0 };
+    let models_bytes = if models_dir.exists() {
+        directory_size(&models_dir)
+    } else {
+        0
+    };
+    let images_bytes = if screenshots_dir.exists() {
+        directory_size(&screenshots_dir)
+    } else {
+        0
+    };
     let database_bytes = {
-        let chroma_size = if chroma_dir.exists() { directory_size(&chroma_dir) } else { 0 };
-        let ocr_size = if ocr_db.exists() { file_size(&ocr_db) } else { 0 };
+        let chroma_size = if chroma_dir.exists() {
+            directory_size(&chroma_dir)
+        } else {
+            0
+        };
+        let ocr_size = if ocr_db.exists() {
+            file_size(&ocr_db)
+        } else {
+            0
+        };
         chroma_size + ocr_size
     };
-    let data_dir_bytes = if data_dir.exists() { directory_size(&data_dir) } else { 0 };
+    let data_dir_bytes = if data_dir.exists() {
+        directory_size(&data_dir)
+    } else {
+        0
+    };
 
     let total_bytes = data_dir_bytes.saturating_add(models_bytes);
-    let accounted = models_bytes.saturating_add(images_bytes).saturating_add(database_bytes);
+    let accounted = models_bytes
+        .saturating_add(images_bytes)
+        .saturating_add(database_bytes);
     let other_bytes = total_bytes.saturating_sub(accounted);
 
     Ok(StorageStats {
@@ -161,7 +183,10 @@ pub fn start_memory_sampler(app: AppHandle) {
 
             let pid_opt = {
                 let monitor_state = app.state::<MonitorState>();
-                let mut guard = monitor_state.process.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = monitor_state
+                    .process
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(child) = guard.as_mut() {
                     if let Ok(Some(_)) = child.try_wait() {
                         *guard = None;
@@ -212,12 +237,19 @@ pub async fn get_analysis_overview(
     // If not forcing, try to return cached stats quickly.
     if !force_storage {
         if let Some(stats) = get_cached_storage_stats(&state) {
-            return Ok(AnalysisOverview { memory, storage: stats });
+            return Ok(AnalysisOverview {
+                memory,
+                storage: stats,
+            });
         }
     }
 
     // 从 StorageState 获取实际的 data_dir
-    let data_dir = storage_state.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let data_dir = storage_state
+        .data_dir
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
 
     // Perform expensive storage computation on a blocking thread.
     let stats = tokio::task::spawn_blocking(move || compute_storage_stats(data_dir))
@@ -236,5 +268,8 @@ pub async fn get_analysis_overview(
         });
     }
 
-    Ok(AnalysisOverview { memory, storage: stats })
+    Ok(AnalysisOverview {
+        memory,
+        storage: stats,
+    })
 }

@@ -75,21 +75,28 @@ fn disk_totals_for_path(path: &Path) -> Option<(u64, u64)> {
 impl StorageState {
     /// Save storage policy to storage_policy.json in the app config directory.
     pub fn save_policy(&self, policy: &JsonValue) -> Result<(), String> {
-        let mut cfg_dir = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut cfg_dir = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(parent) = cfg_dir.parent() {
             cfg_dir = parent.to_path_buf();
         }
         let policy_path = cfg_dir.join("storage_policy.json");
 
-        let s = serde_json::to_string_pretty(policy)
-            .map_err(|e| format!("serde json error: {}", e))?;
-        std::fs::write(&policy_path, s)
-            .map_err(|e| format!("failed to write policy file: {}", e))
+        let s =
+            serde_json::to_string_pretty(policy).map_err(|e| format!("serde json error: {}", e))?;
+        std::fs::write(&policy_path, s).map_err(|e| format!("failed to write policy file: {}", e))
     }
 
     /// Load storage policy from storage_policy.json. Returns empty object if file doesn't exist.
     pub fn load_policy(&self) -> Result<JsonValue, String> {
-        let mut cfg_dir = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut cfg_dir = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(parent) = cfg_dir.parent() {
             cfg_dir = parent.to_path_buf();
         }
@@ -121,7 +128,11 @@ impl StorageState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let data_dir = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let data_dir = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         let current_images_bytes = if screenshot_dir.exists() {
             directory_size(&screenshot_dir)

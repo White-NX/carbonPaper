@@ -86,7 +86,11 @@ impl StorageState {
     /// Convert an absolute image path to a relative path (relative to data_dir).
     /// Uses forward slashes for consistency across platforms.
     fn to_relative_image_path(&self, abs_path: &Path) -> String {
-        let data_dir = self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let data_dir = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         match abs_path.strip_prefix(&data_dir) {
             Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
             Err(_) => abs_path.to_string_lossy().replace('\\', "/"),
@@ -100,19 +104,24 @@ impl StorageState {
         if p.is_absolute() {
             p.to_path_buf()
         } else {
-            self.data_dir.lock().unwrap_or_else(|e| e.into_inner()).join(rel_path)
+            self.data_dir
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .join(rel_path)
         }
     }
 
     /// Request cancellation of an ongoing migration.
     pub fn request_migration_cancel(&self) -> bool {
-        self.migration_cancel_requested.store(true, Ordering::SeqCst);
+        self.migration_cancel_requested
+            .store(true, Ordering::SeqCst);
         self.migration_in_progress.load(Ordering::SeqCst)
     }
 
     /// Request cancellation of an ongoing HMAC migration.
     pub fn request_hmac_migration_cancel(&self) -> bool {
-        self.hmac_migration_cancel_requested.store(true, Ordering::SeqCst);
+        self.hmac_migration_cancel_requested
+            .store(true, Ordering::SeqCst);
         self.hmac_migration_in_progress.load(Ordering::SeqCst)
     }
 
