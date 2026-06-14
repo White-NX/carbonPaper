@@ -1,7 +1,5 @@
 use crate::capture::CaptureState;
-use crate::resource_utils::{
-    file_in_local_appdata, find_existing_file_in_resources, normalize_path_for_command,
-};
+use crate::resource_utils::{find_existing_file_in_resources, normalize_path_for_command};
 use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
 use crate::storage::StorageState;
 use rand::Rng;
@@ -840,53 +838,17 @@ pub async fn start_monitor(
             )
             .env("CARBONPAPER_USE_ONNX", use_onnx.to_string());
 
-        if let Some(appdata_dir) = file_in_local_appdata() {
-            let models_dir = appdata_dir.join("models");
-            let onnx_models_dir = appdata_dir.join("models-onnx");
-            let nonempty = |path: &std::path::Path| {
-                path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
-            };
-            let has_bge_onnx = |base: &std::path::Path| {
-                nonempty(&base.join("onnx").join("model_quantized.onnx"))
-                    || nonempty(&base.join("model_int8.onnx"))
-            };
-
-            let (clip_path, bge_path, minilm_path) = if use_onnx {
-                let primary_bge = onnx_models_dir.join("bge-small-zh-v1.5");
-                let legacy_bge = models_dir.join("bge-small-zh-v1.5");
-                let primary_minilm = onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
-                let legacy_minilm = models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
-                (
-                    if nonempty(&onnx_models_dir.join("onnx").join("model_q4.onnx")) {
-                        onnx_models_dir.clone()
-                    } else {
-                        models_dir.clone()
-                    },
-                    if has_bge_onnx(&primary_bge) {
-                        primary_bge
-                    } else {
-                        legacy_bge
-                    },
-                    if has_bge_onnx(&primary_minilm) {
-                        primary_minilm
-                    } else {
-                        legacy_minilm
-                    },
-                )
-            } else {
-                (
-                    models_dir.clone(),
-                    models_dir.join("bge-small-zh-v1.5"),
-                    models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
-                )
-            };
-
+        if let Some(resolved) = &resolved_model_runtime {
+            let paths = &resolved.paths;
             cmd_proc
-                .env("MODEL_PATH", clip_path.to_string_lossy().to_string())
-                .env("BGE_MODEL_PATH", bge_path.to_string_lossy().to_string())
+                .env("MODEL_PATH", paths.clip_path.to_string_lossy().to_string())
+                .env(
+                    "BGE_MODEL_PATH",
+                    paths.bge_path.to_string_lossy().to_string(),
+                )
                 .env(
                     "MINILM_MODEL_PATH",
-                    minilm_path.to_string_lossy().to_string(),
+                    paths.minilm_path.to_string_lossy().to_string(),
                 );
         }
 

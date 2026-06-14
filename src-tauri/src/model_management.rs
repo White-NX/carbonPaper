@@ -181,6 +181,13 @@ fn required_pytorch_complete(models_dir: &Path) -> bool {
             .is_empty()
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedRequiredModelPaths {
+    pub clip_path: PathBuf,
+    pub bge_path: PathBuf,
+    pub minilm_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequiredModelRuntime {
     Onnx,
@@ -204,6 +211,45 @@ impl RequiredModelRuntime {
 pub struct ResolvedRequiredModels {
     pub runtime: RequiredModelRuntime,
     pub used_pytorch_fallback: bool,
+    pub paths: ResolvedRequiredModelPaths,
+}
+
+fn resolve_required_model_paths(
+    runtime: RequiredModelRuntime,
+    models_dir: &Path,
+    onnx_models_dir: &Path,
+) -> ResolvedRequiredModelPaths {
+    match runtime {
+        RequiredModelRuntime::Onnx => {
+            let primary_bge = onnx_models_dir.join("bge-small-zh-v1.5");
+            let legacy_bge = models_dir.join("bge-small-zh-v1.5");
+            let primary_minilm = onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
+            let legacy_minilm = models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
+
+            ResolvedRequiredModelPaths {
+                clip_path: if chinese_clip_onnx_missing(onnx_models_dir).is_empty() {
+                    onnx_models_dir.to_path_buf()
+                } else {
+                    models_dir.to_path_buf()
+                },
+                bge_path: if bge_onnx_missing(&primary_bge).is_empty() {
+                    primary_bge
+                } else {
+                    legacy_bge
+                },
+                minilm_path: if minilm_onnx_missing(&primary_minilm).is_empty() {
+                    primary_minilm
+                } else {
+                    legacy_minilm
+                },
+            }
+        }
+        RequiredModelRuntime::Pytorch => ResolvedRequiredModelPaths {
+            clip_path: models_dir.to_path_buf(),
+            bge_path: models_dir.join("bge-small-zh-v1.5"),
+            minilm_path: models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
+        },
+    }
 }
 
 pub fn resolve_required_model_runtime() -> Result<ResolvedRequiredModels, String> {
@@ -215,21 +261,27 @@ pub fn resolve_required_model_runtime() -> Result<ResolvedRequiredModels, String
 
     if prefer_onnx {
         if required_onnx_complete_with_fallback(&onnx_models_dir, &models_dir) {
+            let runtime = RequiredModelRuntime::Onnx;
             return Ok(ResolvedRequiredModels {
-                runtime: RequiredModelRuntime::Onnx,
+                runtime,
                 used_pytorch_fallback: false,
+                paths: resolve_required_model_paths(runtime, &models_dir, &onnx_models_dir),
             });
         }
         if required_pytorch_complete(&models_dir) {
+            let runtime = RequiredModelRuntime::Pytorch;
             return Ok(ResolvedRequiredModels {
-                runtime: RequiredModelRuntime::Pytorch,
+                runtime,
                 used_pytorch_fallback: true,
+                paths: resolve_required_model_paths(runtime, &models_dir, &onnx_models_dir),
             });
         }
     } else if required_pytorch_complete(&models_dir) {
+        let runtime = RequiredModelRuntime::Pytorch;
         return Ok(ResolvedRequiredModels {
-            runtime: RequiredModelRuntime::Pytorch,
+            runtime,
             used_pytorch_fallback: false,
+            paths: resolve_required_model_paths(runtime, &models_dir, &onnx_models_dir),
         });
     }
 
@@ -778,6 +830,29 @@ mod tests {
         }
     }
 
+    fn write_complete_clip_onnx(base: &Path) {
+        for rel in [
+            "vocab.txt",
+            "config.json",
+            "preprocessor_config.json",
+            "onnx/model_q4.onnx",
+        ] {
+            touch(base, rel);
+        }
+    }
+
+    fn write_complete_text_onnx(base: &Path) {
+        for rel in [
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "onnx/model_quantized.onnx",
+        ] {
+            touch(base, rel);
+        }
+    }
+
     #[test]
     fn test_required_models_detect_complete_pytorch_without_onnx() {
         let tmp = tempfile::tempdir().expect("create temp dir");
@@ -790,6 +865,34 @@ mod tests {
             &models_dir
         ));
         assert!(required_pytorch_complete(&models_dir));
+    }
+
+    #[test]
+    fn test_onnx_runtime_paths_skip_incomplete_primary_model_dir() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let models_dir = tmp.path().join("models");
+        let onnx_models_dir = tmp.path().join("models-onnx");
+
+        write_complete_clip_onnx(&onnx_models_dir);
+
+        let primary_bge = onnx_models_dir.join("bge-small-zh-v1.5");
+        let legacy_bge = models_dir.join("bge-small-zh-v1.5");
+        touch(&primary_bge, "onnx/model_quantized.onnx");
+        write_complete_text_onnx(&legacy_bge);
+
+        let primary_minilm = onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
+        write_complete_text_onnx(&primary_minilm);
+
+        assert!(required_onnx_complete_with_fallback(
+            &onnx_models_dir,
+            &models_dir
+        ));
+
+        let paths =
+            resolve_required_model_paths(RequiredModelRuntime::Onnx, &models_dir, &onnx_models_dir);
+        assert_eq!(paths.clip_path, onnx_models_dir);
+        assert_eq!(paths.bge_path, legacy_bge);
+        assert_eq!(paths.minilm_path, primary_minilm);
     }
 
     #[test]
