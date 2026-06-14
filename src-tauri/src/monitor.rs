@@ -1,7 +1,5 @@
 use crate::capture::CaptureState;
-use crate::resource_utils::{
-    file_in_local_appdata, find_existing_file_in_resources, normalize_path_for_command,
-};
+use crate::resource_utils::{find_existing_file_in_resources, normalize_path_for_command};
 use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
 use crate::storage::StorageState;
 use rand::Rng;
@@ -550,6 +548,22 @@ pub async fn start_monitor(
             }
         }
     }
+    let resolved_model_runtime = crate::model_management::resolve_required_model_runtime().ok();
+    if let Some(resolved) = &resolved_model_runtime {
+        if resolved.used_pytorch_fallback {
+            tracing::warn!(
+                "ONNX models are incomplete; falling back to existing PyTorch models for monitor startup"
+            );
+            let _ = app.emit(
+                "app-toast",
+                serde_json::json!({
+                    "type": "info",
+                    "title": "模型运行时已回退",
+                    "message": "未检测到完整 ONNX 模型，已使用本机已有的 PyTorch 模型启动监控。联网后可在设置中下载 ONNX 模型以降低内存占用。",
+                }),
+            );
+        }
+    }
 
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -803,7 +817,10 @@ pub async fn start_monitor(
             cmd_proc.env("CARBONPAPER_DATA_DIR", dd);
         }
 
-        let use_onnx = crate::registry_config::get_bool("use_onnx").unwrap_or(true);
+        let use_onnx = resolved_model_runtime
+            .as_ref()
+            .map(|resolved| resolved.runtime.use_onnx())
+            .unwrap_or_else(|| crate::registry_config::get_bool("use_onnx").unwrap_or(true));
 
         // Sync persisted feature toggles into the Python monitor at startup.
         cmd_proc
@@ -821,53 +838,17 @@ pub async fn start_monitor(
             )
             .env("CARBONPAPER_USE_ONNX", use_onnx.to_string());
 
-        if let Some(appdata_dir) = file_in_local_appdata() {
-            let models_dir = appdata_dir.join("models");
-            let onnx_models_dir = appdata_dir.join("models-onnx");
-            let nonempty = |path: &std::path::Path| {
-                path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
-            };
-            let has_bge_onnx = |base: &std::path::Path| {
-                nonempty(&base.join("onnx").join("model_quantized.onnx"))
-                    || nonempty(&base.join("model_int8.onnx"))
-            };
-
-            let (clip_path, bge_path, minilm_path) = if use_onnx {
-                let primary_bge = onnx_models_dir.join("bge-small-zh-v1.5");
-                let legacy_bge = models_dir.join("bge-small-zh-v1.5");
-                let primary_minilm = onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
-                let legacy_minilm = models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
-                (
-                    if nonempty(&onnx_models_dir.join("onnx").join("model_q4.onnx")) {
-                        onnx_models_dir.clone()
-                    } else {
-                        models_dir.clone()
-                    },
-                    if has_bge_onnx(&primary_bge) {
-                        primary_bge
-                    } else {
-                        legacy_bge
-                    },
-                    if has_bge_onnx(&primary_minilm) {
-                        primary_minilm
-                    } else {
-                        legacy_minilm
-                    },
-                )
-            } else {
-                (
-                    models_dir.clone(),
-                    models_dir.join("bge-small-zh-v1.5"),
-                    models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
-                )
-            };
-
+        if let Some(resolved) = &resolved_model_runtime {
+            let paths = &resolved.paths;
             cmd_proc
-                .env("MODEL_PATH", clip_path.to_string_lossy().to_string())
-                .env("BGE_MODEL_PATH", bge_path.to_string_lossy().to_string())
+                .env("MODEL_PATH", paths.clip_path.to_string_lossy().to_string())
+                .env(
+                    "BGE_MODEL_PATH",
+                    paths.bge_path.to_string_lossy().to_string(),
+                )
                 .env(
                     "MINILM_MODEL_PATH",
-                    minilm_path.to_string_lossy().to_string(),
+                    paths.minilm_path.to_string_lossy().to_string(),
                 );
         }
 
