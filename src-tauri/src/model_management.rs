@@ -6,7 +6,7 @@ use serde_json::json;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -78,6 +78,162 @@ fn missing_files_with_alternative(
         missing.push(display_missing.to_string());
     }
     missing
+}
+
+fn chinese_clip_onnx_missing(base: &Path) -> Vec<String> {
+    missing_files(
+        base,
+        &[
+            "vocab.txt",
+            "config.json",
+            "preprocessor_config.json",
+            "onnx/model_q4.onnx",
+        ],
+    )
+}
+
+fn bge_onnx_missing(base: &Path) -> Vec<String> {
+    missing_files_with_alternative(
+        base,
+        &[
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ],
+        &["onnx/model_quantized.onnx", "model_int8.onnx"],
+        "onnx/model_quantized.onnx",
+    )
+}
+
+fn minilm_onnx_missing(base: &Path) -> Vec<String> {
+    missing_files_with_alternative(
+        base,
+        &[
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ],
+        &["onnx/model_quantized.onnx", "model_int8.onnx"],
+        "onnx/model_quantized.onnx",
+    )
+}
+
+fn chinese_clip_pytorch_missing(base: &Path) -> Vec<String> {
+    missing_files(
+        base,
+        &[
+            "vocab.txt",
+            "pytorch_model.bin",
+            "config.json",
+            "preprocessor_config.json",
+        ],
+    )
+}
+
+fn bge_pytorch_missing(base: &Path) -> Vec<String> {
+    missing_files(
+        base,
+        &[
+            "config.json",
+            "pytorch_model.bin",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.txt",
+            "special_tokens_map.json",
+        ],
+    )
+}
+
+fn minilm_pytorch_missing(base: &Path) -> Vec<String> {
+    missing_files(
+        base,
+        &[
+            "config.json",
+            "pytorch_model.bin",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "sentencepiece.bpe.model",
+        ],
+    )
+}
+
+fn required_onnx_complete_with_fallback(onnx_models_dir: &Path, models_dir: &Path) -> bool {
+    let clip_complete = chinese_clip_onnx_missing(onnx_models_dir).is_empty()
+        || chinese_clip_onnx_missing(models_dir).is_empty();
+    let bge_complete = bge_onnx_missing(&onnx_models_dir.join("bge-small-zh-v1.5")).is_empty()
+        || bge_onnx_missing(&models_dir.join("bge-small-zh-v1.5")).is_empty();
+    let minilm_complete =
+        minilm_onnx_missing(&onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"))
+            .is_empty()
+            || minilm_onnx_missing(&models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"))
+                .is_empty();
+
+    clip_complete && bge_complete && minilm_complete
+}
+
+fn required_pytorch_complete(models_dir: &Path) -> bool {
+    chinese_clip_pytorch_missing(models_dir).is_empty()
+        && bge_pytorch_missing(&models_dir.join("bge-small-zh-v1.5")).is_empty()
+        && minilm_pytorch_missing(&models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"))
+            .is_empty()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequiredModelRuntime {
+    Onnx,
+    Pytorch,
+}
+
+impl RequiredModelRuntime {
+    pub fn use_onnx(self) -> bool {
+        matches!(self, Self::Onnx)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Onnx => "onnx",
+            Self::Pytorch => "pytorch",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedRequiredModels {
+    pub runtime: RequiredModelRuntime,
+    pub used_pytorch_fallback: bool,
+}
+
+pub fn resolve_required_model_runtime() -> Result<ResolvedRequiredModels, String> {
+    let appdata_dir = file_in_local_appdata()
+        .ok_or_else(|| "Could not determine local appdata directory.".to_string())?;
+    let models_dir = appdata_dir.join("models");
+    let onnx_models_dir = appdata_dir.join("models-onnx");
+    let prefer_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
+
+    if prefer_onnx {
+        if required_onnx_complete_with_fallback(&onnx_models_dir, &models_dir) {
+            return Ok(ResolvedRequiredModels {
+                runtime: RequiredModelRuntime::Onnx,
+                used_pytorch_fallback: false,
+            });
+        }
+        if required_pytorch_complete(&models_dir) {
+            return Ok(ResolvedRequiredModels {
+                runtime: RequiredModelRuntime::Pytorch,
+                used_pytorch_fallback: true,
+            });
+        }
+    } else if required_pytorch_complete(&models_dir) {
+        return Ok(ResolvedRequiredModels {
+            runtime: RequiredModelRuntime::Pytorch,
+            used_pytorch_fallback: false,
+        });
+    }
+
+    Err("Required model files are incomplete".to_string())
 }
 
 fn insert_status_with_fallback(
@@ -493,26 +649,24 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
     let onnx_models_dir = appdata_dir.join("models-onnx");
 
     let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
+    let use_pytorch_fallback = use_onnx
+        && !required_onnx_complete_with_fallback(&onnx_models_dir, &models_dir)
+        && required_pytorch_complete(&models_dir);
+    let active_runtime = if use_onnx && !use_pytorch_fallback {
+        RequiredModelRuntime::Onnx
+    } else {
+        RequiredModelRuntime::Pytorch
+    };
     let mut result = serde_json::Map::new();
 
-    if use_onnx {
+    if active_runtime.use_onnx() {
         insert_status_with_fallback(
             &mut result,
             "chinese-clip",
             &onnx_models_dir,
             Some(&models_dir),
             true,
-            |base| {
-                missing_files(
-                    base,
-                    &[
-                        "vocab.txt",
-                        "config.json",
-                        "preprocessor_config.json",
-                        "onnx/model_q4.onnx",
-                    ],
-                )
-            },
+            chinese_clip_onnx_missing,
         );
         insert_status_with_fallback(
             &mut result,
@@ -520,19 +674,7 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             &onnx_models_dir.join("bge-small-zh-v1.5"),
             Some(&models_dir.join("bge-small-zh-v1.5")),
             true,
-            |base| {
-                missing_files_with_alternative(
-                    base,
-                    &[
-                        "config.json",
-                        "tokenizer.json",
-                        "tokenizer_config.json",
-                        "special_tokens_map.json",
-                    ],
-                    &["onnx/model_quantized.onnx", "model_int8.onnx"],
-                    "onnx/model_quantized.onnx",
-                )
-            },
+            bge_onnx_missing,
         );
         insert_status_with_fallback(
             &mut result,
@@ -540,19 +682,7 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             &onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
             Some(&models_dir.join("paraphrase-multilingual-MiniLM-L12-v2")),
             true,
-            |base| {
-                missing_files_with_alternative(
-                    base,
-                    &[
-                        "config.json",
-                        "tokenizer.json",
-                        "tokenizer_config.json",
-                        "special_tokens_map.json",
-                    ],
-                    &["onnx/model_quantized.onnx", "model_int8.onnx"],
-                    "onnx/model_quantized.onnx",
-                )
-            },
+            minilm_onnx_missing,
         );
     } else {
         insert_status_with_fallback(
@@ -561,17 +691,7 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             &models_dir,
             None,
             true,
-            |base| {
-                missing_files(
-                    base,
-                    &[
-                        "vocab.txt",
-                        "pytorch_model.bin",
-                        "config.json",
-                        "preprocessor_config.json",
-                    ],
-                )
-            },
+            chinese_clip_pytorch_missing,
         );
         insert_status_with_fallback(
             &mut result,
@@ -579,19 +699,7 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             &models_dir.join("bge-small-zh-v1.5"),
             None,
             true,
-            |base| {
-                missing_files(
-                    base,
-                    &[
-                        "config.json",
-                        "pytorch_model.bin",
-                        "tokenizer.json",
-                        "tokenizer_config.json",
-                        "vocab.txt",
-                        "special_tokens_map.json",
-                    ],
-                )
-            },
+            bge_pytorch_missing,
         );
         insert_status_with_fallback(
             &mut result,
@@ -599,21 +707,19 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
             &models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
             None,
             true,
-            |base| {
-                missing_files(
-                    base,
-                    &[
-                        "config.json",
-                        "pytorch_model.bin",
-                        "tokenizer.json",
-                        "tokenizer_config.json",
-                        "special_tokens_map.json",
-                        "sentencepiece.bpe.model",
-                    ],
-                )
-            },
+            minilm_pytorch_missing,
         );
     }
+
+    result.insert(
+        "_runtime".to_string(),
+        json!({
+            "complete": true,
+            "required": false,
+            "runtime": active_runtime.as_str(),
+            "pytorch_fallback": use_pytorch_fallback,
+        }),
+    );
 
     insert_status_with_fallback(
         &mut result,
@@ -641,6 +747,50 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn touch(base: &Path, rel: &str) {
+        let path = base.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).expect("create parent dir");
+        fs::write(path, b"x").expect("write model marker");
+    }
+
+    fn write_complete_pytorch_models(models_dir: &Path) {
+        for rel in [
+            "vocab.txt",
+            "pytorch_model.bin",
+            "config.json",
+            "preprocessor_config.json",
+            "bge-small-zh-v1.5/config.json",
+            "bge-small-zh-v1.5/pytorch_model.bin",
+            "bge-small-zh-v1.5/tokenizer.json",
+            "bge-small-zh-v1.5/tokenizer_config.json",
+            "bge-small-zh-v1.5/vocab.txt",
+            "bge-small-zh-v1.5/special_tokens_map.json",
+            "paraphrase-multilingual-MiniLM-L12-v2/config.json",
+            "paraphrase-multilingual-MiniLM-L12-v2/pytorch_model.bin",
+            "paraphrase-multilingual-MiniLM-L12-v2/tokenizer.json",
+            "paraphrase-multilingual-MiniLM-L12-v2/tokenizer_config.json",
+            "paraphrase-multilingual-MiniLM-L12-v2/special_tokens_map.json",
+            "paraphrase-multilingual-MiniLM-L12-v2/sentencepiece.bpe.model",
+        ] {
+            touch(models_dir, rel);
+        }
+    }
+
+    #[test]
+    fn test_required_models_detect_complete_pytorch_without_onnx() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let models_dir = tmp.path().join("models");
+        let onnx_models_dir = tmp.path().join("models-onnx");
+        write_complete_pytorch_models(&models_dir);
+
+        assert!(!required_onnx_complete_with_fallback(
+            &onnx_models_dir,
+            &models_dir
+        ));
+        assert!(required_pytorch_complete(&models_dir));
+    }
 
     #[test]
     fn test_is_safe_relative_path() {

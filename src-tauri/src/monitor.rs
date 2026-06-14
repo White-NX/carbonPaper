@@ -550,6 +550,22 @@ pub async fn start_monitor(
             }
         }
     }
+    let resolved_model_runtime = crate::model_management::resolve_required_model_runtime().ok();
+    if let Some(resolved) = &resolved_model_runtime {
+        if resolved.used_pytorch_fallback {
+            tracing::warn!(
+                "ONNX models are incomplete; falling back to existing PyTorch models for monitor startup"
+            );
+            let _ = app.emit(
+                "app-toast",
+                serde_json::json!({
+                    "type": "info",
+                    "title": "模型运行时已回退",
+                    "message": "未检测到完整 ONNX 模型，已使用本机已有的 PyTorch 模型启动监控。联网后可在设置中下载 ONNX 模型以降低内存占用。",
+                }),
+            );
+        }
+    }
 
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -803,7 +819,10 @@ pub async fn start_monitor(
             cmd_proc.env("CARBONPAPER_DATA_DIR", dd);
         }
 
-        let use_onnx = crate::registry_config::get_bool("use_onnx").unwrap_or(true);
+        let use_onnx = resolved_model_runtime
+            .as_ref()
+            .map(|resolved| resolved.runtime.use_onnx())
+            .unwrap_or_else(|| crate::registry_config::get_bool("use_onnx").unwrap_or(true));
 
         // Sync persisted feature toggles into the Python monitor at startup.
         cmd_proc

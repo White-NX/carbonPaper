@@ -357,6 +357,27 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let unlisten;
+    const setup = async () => {
+      unlisten = await listen('app-toast', (event) => {
+        const payload = event.payload || {};
+        pushNotification({
+          id: payload.id || `toast-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          type: payload.type || 'info',
+          title: payload.title || 'CarbonPaper',
+          message: payload.message || '',
+          details: payload.details || '',
+          timestamp: payload.timestamp || Date.now(),
+        });
+      });
+    };
+    setup();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [pushNotification]);
+
   const dismissNotification = useCallback((id) => {
     setNotifications((prev) => prev.filter((n) => n.id !== id));
   }, []);
