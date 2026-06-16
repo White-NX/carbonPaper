@@ -1,6 +1,6 @@
 //! Screenshot CRUD operations (save, get, delete, commit, abort).
 
-use crate::credential_manager::{encrypt_row_key_with_cng, encrypt_with_master_key};
+use crate::credential_manager::encrypt_with_master_key;
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use roaring::RoaringBitmap;
@@ -124,7 +124,8 @@ impl StorageState {
         // Encrypt image data
         let encrypted_image = encrypt_with_master_key(&row_key, &image_data)
             .map_err(|e| format!("Failed to encrypt image: {}", e))?;
-        let encrypted_row_key = encrypt_row_key_with_cng(&row_key)
+        let encrypted_row_key = self
+            .wrap_row_key_for_storage(&row_key)
             .map_err(|e| format!("Failed to wrap image row key: {}", e))?;
 
         // Generate filename (use .enc extension to indicate encrypted file)
@@ -189,12 +190,12 @@ impl StorageState {
         // Use dedup tables for page_icon and visible_links
         let page_icon_id: Option<i64> = match &request.page_icon {
             Some(value) if !value.is_empty() => {
-                Some(Self::get_or_create_page_icon_id(conn, value)?)
+                Some(self.get_or_create_page_icon_id(conn, value)?)
             }
             _ => None,
         };
         let link_set_id: Option<i64> = match &request.visible_links {
-            Some(links) if !links.is_empty() => Some(Self::get_or_create_link_set_id(conn, links)?),
+            Some(links) if !links.is_empty() => Some(self.get_or_create_link_set_id(conn, links)?),
             _ => None,
         };
 
@@ -330,7 +331,8 @@ impl StorageState {
 
         let encrypted_image = encrypt_with_master_key(&row_key, &image_data)
             .map_err(|e| format!("Failed to encrypt image: {}", e))?;
-        let encrypted_row_key = encrypt_row_key_with_cng(&row_key)
+        let encrypted_row_key = self
+            .wrap_row_key_for_storage(&row_key)
             .map_err(|e| format!("Failed to wrap image row key: {}", e))?;
         let img_encrypt_dur = t1.elapsed();
 
@@ -413,12 +415,12 @@ impl StorageState {
         // Use dedup tables for page_icon and visible_links
         let page_icon_id: Option<i64> = match &request.page_icon {
             Some(value) if !value.is_empty() => {
-                Some(Self::get_or_create_page_icon_id(conn, value)?)
+                Some(self.get_or_create_page_icon_id(conn, value)?)
             }
             _ => None,
         };
         let link_set_id: Option<i64> = match &request.visible_links {
-            Some(links) if !links.is_empty() => Some(Self::get_or_create_link_set_id(conn, links)?),
+            Some(links) if !links.is_empty() => Some(self.get_or_create_link_set_id(conn, links)?),
             _ => None,
         };
 
@@ -750,6 +752,58 @@ impl StorageState {
             added: 0,
             skipped: 0,
         })
+    }
+
+    /// Abort stale pending screenshots during monitor startup.
+    ///
+    /// The caller supplies a cancellation check so startup recovery can stop as
+    /// soon as fresh capture work begins.
+    pub fn abort_startup_pending_screenshots<F>(
+        &self,
+        mut should_cancel: F,
+    ) -> Result<usize, String>
+    where
+        F: FnMut() -> bool,
+    {
+        let pending_ids: Vec<i64> = {
+            let guard = self.get_connection_named("list_startup_pending_screenshots")?;
+            let conn = guard.as_ref().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM screenshots WHERE status = 'pending' AND is_deleted = 0 ORDER BY id ASC",
+                )
+                .map_err(|e| format!("Failed to prepare pending screenshot query: {}", e))?;
+            let ids: Vec<i64> = stmt
+                .query_map([], |row| row.get(0))
+                .map_err(|e| format!("Failed to query pending screenshots: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+            ids
+        };
+
+        let mut aborted = 0usize;
+        for screenshot_id in pending_ids {
+            if should_cancel() {
+                tracing::info!(
+                    "[DIAG:STARTUP] pending screenshot cleanup cancelled after {} aborts",
+                    aborted
+                );
+                break;
+            }
+            match self.abort_screenshot(
+                screenshot_id,
+                Some("startup recovery: stale pending screenshot"),
+            ) {
+                Ok(_) => aborted += 1,
+                Err(e) => tracing::warn!(
+                    "[DIAG:STARTUP] failed to abort pending screenshot {}: {}",
+                    screenshot_id,
+                    e
+                ),
+            }
+        }
+
+        Ok(aborted)
     }
 
     /// Get screenshots within a time range.
@@ -2025,6 +2079,7 @@ impl StorageState {
     /// Get or create a page_icon dedup entry. Returns the row ID.
     /// Uses INSERT OR IGNORE + SELECT pattern for atomic upsert.
     pub(crate) fn get_or_create_page_icon_id(
+        &self,
         conn: &Connection,
         plaintext: &str,
     ) -> Result<i64, String> {
@@ -2050,7 +2105,8 @@ impl StorageState {
 
         let icon_enc = encrypt_with_master_key(&row_key, plaintext.as_bytes())
             .map_err(|e| format!("Failed to encrypt page_icon: {}", e))?;
-        let icon_key_encrypted = encrypt_row_key_with_cng(&row_key)
+        let icon_key_encrypted = self
+            .wrap_row_key_for_storage(&row_key)
             .map_err(|e| format!("Failed to wrap page_icon row key: {}", e))?;
 
         Self::zeroize_bytes(&mut row_key);
@@ -2076,6 +2132,7 @@ impl StorageState {
 
     /// Get or create a link_set dedup entry. Returns the row ID.
     pub(crate) fn get_or_create_link_set_id(
+        &self,
         conn: &Connection,
         links: &[super::VisibleLink],
     ) -> Result<i64, String> {
@@ -2105,7 +2162,8 @@ impl StorageState {
 
         let links_enc = encrypt_with_master_key(&row_key, json.as_bytes())
             .map_err(|e| format!("Failed to encrypt link_set: {}", e))?;
-        let links_key_encrypted = encrypt_row_key_with_cng(&row_key)
+        let links_key_encrypted = self
+            .wrap_row_key_for_storage(&row_key)
             .map_err(|e| format!("Failed to wrap link_set row key: {}", e))?;
 
         Self::zeroize_bytes(&mut row_key);

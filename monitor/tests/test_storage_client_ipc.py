@@ -1,4 +1,5 @@
 import json
+import struct
 
 import storage_client as sc
 
@@ -9,6 +10,10 @@ class FakePyWinError(Exception):
         self.winerror = winerror
 
 
+def frame(payload: bytes) -> bytes:
+    return struct.pack("<I", len(payload)) + payload
+
+
 def install_pipe_mocks(monkeypatch, read_chunks, flush_error=None):
     state = {
         "write_calls": 0,
@@ -17,7 +22,7 @@ def install_pipe_mocks(monkeypatch, read_chunks, flush_error=None):
         "read_calls": 0,
         "set_mode_calls": 0,
     }
-    chunk_iter = iter(read_chunks)
+    stream = bytearray(b"".join(read_chunks))
 
     def fake_create_file(*_args, **_kwargs):
         return object()
@@ -37,12 +42,11 @@ def install_pipe_mocks(monkeypatch, read_chunks, flush_error=None):
 
     def fake_read_file(_handle, _size):
         state["read_calls"] += 1
-        try:
-            chunk = next(chunk_iter)
-        except StopIteration:
+        if not stream:
             return 0, b""
-        if isinstance(chunk, Exception):
-            raise chunk
+        n = min(_size, len(stream))
+        chunk = bytes(stream[:n])
+        del stream[:n]
         return 0, chunk
 
     def fake_close_handle(_handle):
@@ -61,7 +65,7 @@ def install_pipe_mocks(monkeypatch, read_chunks, flush_error=None):
 
 def test_send_request_handles_utf8_split_and_partial_write(monkeypatch):
     response_obj = {"status": "success", "data": {"value": "中文"}}
-    response_bytes = json.dumps(response_obj, ensure_ascii=False).encode("utf-8")
+    response_bytes = frame(json.dumps(response_obj, ensure_ascii=False).encode("utf-8"))
     split_at = response_bytes.index("中文".encode("utf-8")) + 1
 
     benign_flush_error = FakePyWinError(109, "broken pipe after response")
@@ -73,7 +77,7 @@ def test_send_request_handles_utf8_split_and_partial_write(monkeypatch):
 
     client = sc.StorageClient("test-pipe")
     request = {"command": "probe", "payload": "x" * (70 * 1024)}
-    expected_request_len = len(json.dumps(request).encode("utf-8"))
+    expected_request_len = 4 + len(json.dumps(request).encode("utf-8"))
 
     result = client._send_request(request)
 
@@ -162,3 +166,49 @@ def test_list_screenshots_for_clustering_uses_expected_payload(monkeypatch):
         "limit": 9,
     }
     assert result["status"] == "success"
+
+
+def test_get_temp_image_bytes_reads_binary_frame(monkeypatch):
+    metadata = {
+        "status": "success",
+        "data": {
+            "mime_type": "image/jpeg",
+            "binary_frame": True,
+            "binary_body_len": 4,
+        },
+    }
+    metadata_bytes = json.dumps(metadata).encode("utf-8")
+    image_bytes = b"\xff\xd8\xff\xd9"
+    stream = bytearray(
+        struct.pack("<I", len(metadata_bytes))
+        + metadata_bytes
+        + struct.pack("<I", len(image_bytes))
+        + image_bytes
+    )
+
+    monkeypatch.setattr(sc.pywintypes, "error", FakePyWinError)
+    monkeypatch.setattr(sc.win32file, "CreateFile", lambda *_a, **_k: object())
+    monkeypatch.setattr(sc.win32pipe, "SetNamedPipeHandleState", lambda *_a, **_k: None)
+    monkeypatch.setattr(sc.win32file, "WriteFile", lambda _h, payload: (0, len(payload)))
+    monkeypatch.setattr(sc.win32file, "FlushFileBuffers", lambda _h: None)
+    monkeypatch.setattr(sc.win32file, "CloseHandle", lambda _h: None)
+
+    def fake_read_file(_handle, size):
+        if not stream:
+            return 0, b""
+        n = min(size, len(stream))
+        chunk = bytes(stream[:n])
+        del stream[:n]
+        return 0, chunk
+
+    monkeypatch.setattr(sc.win32file, "ReadFile", fake_read_file)
+
+    result = sc.StorageClient("test-pipe").get_temp_image_bytes(123)
+
+    assert result == {
+        "status": "success",
+        "data": {
+            "image_bytes": image_bytes,
+            "mime_type": "image/jpeg",
+        },
+    }

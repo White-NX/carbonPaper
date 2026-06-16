@@ -166,6 +166,9 @@ pub struct CaptureState {
     pub in_flight_ocr_count: AtomicU32,
     pub capture_on_ocr_busy: AtomicBool,
     pub ocr_queue_max_size: AtomicU32,
+    pub ocr_timeout_secs: AtomicU32,
+    pub ocr_cold_start_pending: AtomicBool,
+    pub startup_pending_cleanup_cancelled: AtomicBool,
     pub capture_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     pub ocr_image_cache: OcrImageCache,
     pub wgc_state: Mutex<Option<WgcCaptureSession>>,
@@ -190,6 +193,9 @@ impl CaptureState {
             in_flight_ocr_count: AtomicU32::new(0),
             capture_on_ocr_busy: AtomicBool::new(false),
             ocr_queue_max_size: AtomicU32::new(1),
+            ocr_timeout_secs: AtomicU32::new(120),
+            ocr_cold_start_pending: AtomicBool::new(true),
+            startup_pending_cleanup_cancelled: AtomicBool::new(false),
             capture_task: Mutex::new(None),
             ocr_image_cache: Arc::new(Mutex::new(HashMap::new())),
             wgc_state: Mutex::new(None),
@@ -1493,6 +1499,9 @@ pub async fn run_capture_loop(
                 continue;
             }
         };
+        capture_state
+            .startup_pending_cleanup_cancelled
+            .store(true, Ordering::SeqCst);
 
         // Spawn async OCR task
         let storage_clone = storage.clone();
@@ -1563,17 +1572,34 @@ async fn process_ocr_async(
         cache.insert(screenshot_id, jpeg_bytes.clone());
     }
 
-    let result = process_ocr_inner(
-        monitor_state,
-        &storage,
-        screenshot_id,
-        &jpeg_bytes,
-        &image_hash,
-        &window_title,
-        &process_name,
-        timestamp_ms,
+    let timeout_secs = if capture_state
+        .ocr_cold_start_pending
+        .swap(false, Ordering::SeqCst)
+    {
+        180
+    } else {
+        capture_state.ocr_timeout_secs.load(Ordering::SeqCst).max(1)
+    };
+
+    let result = match tokio::time::timeout(
+        tokio::time::Duration::from_secs(timeout_secs as u64),
+        process_ocr_inner(
+            monitor_state,
+            &storage,
+            screenshot_id,
+            &jpeg_bytes,
+            &image_hash,
+            &window_title,
+            &process_name,
+            timestamp_ms,
+            timeout_secs,
+        ),
     )
-    .await;
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!("OCR timed out after {}s", timeout_secs)),
+    };
 
     // Always remove from cache regardless of success/failure
     {
@@ -1628,6 +1654,7 @@ async fn process_ocr_inner(
     window_title: &str,
     process_name: &str,
     timestamp_ms: i64,
+    timeout_secs: u32,
 ) -> Result<(), String> {
     const OCR_IPC_ROUNDTRIP_WARN_MS: u128 = 60_000;
     const COMMIT_SLOW_WARN_MS: u128 = 2_000;
@@ -1654,6 +1681,7 @@ async fn process_ocr_inner(
         "window_title": window_title,
         "process_name": process_name,
         "timestamp": timestamp_ms,
+        "timeout_secs": timeout_secs,
     });
 
     let (auth_token, seq_no) = {

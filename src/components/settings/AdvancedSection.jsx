@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap, Monitor, Layers, Database, Loader2, Globe } from 'lucide-react';
+import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap, Monitor, Layers, Database, Loader2, Globe, Clock } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 
 const CPU_PERCENT_OPTIONS = [5, 10, 15, 20, 30, 50];
@@ -83,6 +83,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
           ocr_queue_max_size: newConfig.ocr_queue_limit_enabled
             ? newConfig.ocr_queue_max_size
             : 999999,
+          ocr_timeout_secs: newConfig.ocr_timeout_secs || 120,
         },
       });
     } catch (err) {
@@ -117,6 +118,14 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
   const handleQueueSizeChange = async (value) => {
     setQueueDropdownOpen(false);
     const newConfig = { ...config, ocr_queue_max_size: value };
+    await saveConfig(newConfig);
+    await syncOcrConfigToMonitor(newConfig);
+  };
+
+  const handleOcrTimeoutChange = async (value) => {
+    const parsed = Number.parseInt(value, 10);
+    const next = Number.isFinite(parsed) ? Math.min(600, Math.max(30, parsed)) : 120;
+    const newConfig = { ...config, ocr_timeout_secs: next };
     await saveConfig(newConfig);
     await syncOcrConfigToMonitor(newConfig);
   };
@@ -356,6 +365,34 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
               </div>
             </div>
           )}
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1 min-w-0">
+              <p className="text-sm text-ide-text font-medium flex items-center gap-2">
+                <Clock className="w-4 h-4 text-ide-muted" />
+                {t('settings.advanced.ocr.timeout_label', 'OCR 超时时间')}
+              </p>
+              <p className="text-xs text-ide-muted mt-1">
+                {t('settings.advanced.ocr.timeout_desc', '设定 OCR 任务的超时时间。冷启动固定允许 180 秒。')}
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <input
+                type="number"
+                min="30"
+                max="600"
+                step="10"
+                value={config.ocr_timeout_secs || 120}
+                onChange={(e) => {
+                  const newConfig = { ...config, ocr_timeout_secs: e.target.value };
+                  setConfig(newConfig);
+                }}
+                onBlur={(e) => handleOcrTimeoutChange(e.target.value)}
+                className="w-24 px-3 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm text-ide-text text-right"
+              />
+              <span className="text-xs text-ide-muted">{t('settings.advanced.ocr.seconds', '秒')}</span>
+            </div>
+          </div>
 
           {/* 信息提示 */}
           <div className="flex items-start gap-2 p-2.5 bg-ide-panel/50 border border-ide-border/30 rounded-lg">

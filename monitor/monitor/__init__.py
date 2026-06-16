@@ -132,7 +132,7 @@ def _delete_vectors_by_hashes(image_hashes):
     if not image_hashes:
         return {"deleted": 0, "requested": 0, "skipped": True}
 
-    if not _ocr_worker or not _ocr_worker.enable_vector_store or not _ocr_worker.vector_store:
+    if not _ocr_worker:
         return {"deleted": 0, "requested": len(image_hashes), "skipped": True}
 
     deleted = 0
@@ -140,7 +140,12 @@ def _delete_vectors_by_hashes(image_hashes):
         if not isinstance(image_hash, str) or not image_hash:
             continue
         try:
-            ok = _ocr_worker.vector_store.delete_image(f"memory://{image_hash}")
+            if hasattr(_ocr_worker, 'delete_vector_image'):
+                ok = _ocr_worker.delete_vector_image(image_hash)
+            elif getattr(_ocr_worker, 'vector_store', None):
+                ok = _ocr_worker.vector_store.delete_image(f"memory://{image_hash}")
+            else:
+                ok = False
             if ok:
                 deleted += 1
         except Exception:
@@ -271,11 +276,13 @@ def _handle_command_impl(req: dict):
     if cmd == 'update_advanced_config':
         capture_on_ocr_busy = bool(req.get('capture_on_ocr_busy', False))
         ocr_queue_max_size = int(req.get('ocr_queue_max_size', 1))
-        update_advanced_capture_config(capture_on_ocr_busy, ocr_queue_max_size)
+        ocr_timeout_secs = int(req.get('ocr_timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
+        update_advanced_capture_config(capture_on_ocr_busy, ocr_queue_max_size, ocr_timeout_secs)
         return {
             'status': 'success',
             'capture_on_ocr_busy': capture_on_ocr_busy,
             'ocr_queue_max_size': ocr_queue_max_size,
+            'ocr_timeout_secs': ocr_timeout_secs,
         }
 
     if cmd == 'update_feature_config':
@@ -453,6 +460,39 @@ def _handle_command_impl(req: dict):
             req.get('process_name', ''),
         )
 
+        if hasattr(_ocr_worker, 'request'):
+            timeout_secs = int(req.get('timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
+            try:
+                result = _ocr_worker.request(
+                    'process_ocr',
+                    {'request': req},
+                    timeout=max(30, min(600, timeout_secs)),
+                )
+                if result.get('status') == 'success':
+                    ocr_text = result.get('ocr_text', '')
+                    category = result.get('category')
+                    clustering_allowed = _clustering_scheduler_active and _last_clustering_session_valid and config.CLUSTERING_ENABLED
+                    if _clustering_manager and clustering_allowed:
+                        try:
+                            _clustering_manager.add_snapshot(
+                                screenshot_id=screenshot_id,
+                                process_name=req.get('process_name', ''),
+                                window_title=req.get('window_title', ''),
+                                ocr_text=ocr_text,
+                                timestamp=req.get('timestamp', 0),
+                                category=category or '',
+                            )
+                        except Exception as te:
+                            logger.warning('Task vector add failed: %s', te)
+                    result.pop('ocr_text', None)
+                return result
+            except TimeoutError as e:
+                logger.error('[DIAG:process_ocr] worker timeout screenshot_id=%s error=%s', screenshot_id, e)
+                return {'error': str(e)}
+            except Exception as e:
+                logger.error('[DIAG:process_ocr] worker failed screenshot_id=%s error=%s', screenshot_id, e, exc_info=True)
+                return {'error': str(e)}
+
         try:
             from PIL import Image
             import io as _io
@@ -465,10 +505,7 @@ def _handle_command_impl(req: dict):
                 logger.error('[DIAG:process_ocr] screenshot_id=%s storage client unavailable', screenshot_id)
                 return {'error': 'Storage client not available'}
 
-            resp = sc._send_request({
-                'command': 'get_temp_image',
-                'screenshot_id': screenshot_id,
-            })
+            resp = sc.get_temp_image_bytes(screenshot_id)
 
             if resp.get('status') != 'success':
                 logger.error(
@@ -479,8 +516,8 @@ def _handle_command_impl(req: dict):
                 )
                 return {'error': f"Failed to fetch image: {resp.get('error', 'unknown')}"}
 
-            image_data_b64 = resp.get('data', {}).get('image_data')
-            if not image_data_b64:
+            image_bytes = resp.get('data', {}).get('image_bytes')
+            if not image_bytes:
                 logger.error(
                     '[DIAG:process_ocr] screenshot_id=%s get_temp_image returned empty payload in %.3fs',
                     screenshot_id,
@@ -490,10 +527,10 @@ def _handle_command_impl(req: dict):
 
             fetch_elapsed = time.perf_counter() - t_fetch
             logger.debug(
-                '[DIAG:process_ocr] screenshot_id=%s temp image fetched in %.3fs payload_b64_len=%s',
+                '[DIAG:process_ocr] screenshot_id=%s temp image fetched in %.3fs payload_bytes=%s',
                 screenshot_id,
                 fetch_elapsed,
-                len(image_data_b64),
+                len(image_bytes),
             )
             if fetch_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
                 logger.warning(
@@ -503,7 +540,6 @@ def _handle_command_impl(req: dict):
                 )
 
             t_decode = time.perf_counter()
-            image_bytes = base64.b64decode(image_data_b64)
             image_pil = Image.open(_io.BytesIO(image_bytes))
             decode_elapsed = time.perf_counter() - t_decode
             logger.debug(
@@ -684,14 +720,17 @@ def _handle_command_impl(req: dict):
         title = req.get('title', '')
         ocr_text = req.get('ocr_text', '')
         process_name = req.get('process_name', '')
-        if not _classifier:
+        if not _classifier and not hasattr(_ocr_worker, 'classify'):
             return {'error': 'Classification service not initialised'}
         try:
-            category, confidence = _classifier.classify(
-                title=title,
-                ocr_text=ocr_text,
-                process_name=process_name,
-            )
+            if hasattr(_ocr_worker, 'classify'):
+                category, confidence = _ocr_worker.classify(title, ocr_text, process_name)
+            else:
+                category, confidence = _classifier.classify(
+                    title=title,
+                    ocr_text=ocr_text,
+                    process_name=process_name,
+                )
             return {
                 'status': 'success',
                 'category': category,
@@ -1069,27 +1108,21 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         logger.error("Failed to initialize shared ChromaDB client: %s", e)
         shared_chroma_client = None
 
-    # Lazy import to avoid triggering heavy model loading before IPC is ready
-    from ocr_service import OCRService
+    from .worker_process import RestartableModelWorker
 
-    logger.info("Initialising OCR service...")
-    _ocr_worker = OCRService(
-        vector_db_path=os.path.join(get_data_dir(), 'chroma_db'),
+    worker_env = {
+        'CARBONPAPER_CLUSTERING_ENABLED': str(config.CLUSTERING_ENABLED),
+        'CARBONPAPER_CLASSIFICATION_ENABLED': str(config.CLASSIFICATION_ENABLED),
+        'CARBONPAPER_USE_ONNX': os.environ.get('CARBONPAPER_USE_ONNX', 'true'),
+        'CARBONPAPER_OCR_TIMEOUT_SECS': str(getattr(config, '_ocr_timeout_secs', 120)),
+    }
+    _ocr_worker = RestartableModelWorker(
         storage_pipe=storage_pipe,
-        chroma_client=shared_chroma_client,
+        data_dir=get_data_dir(),
+        env=worker_env,
     )
-    _ocr_worker.start()
-
-    # Initialise classification service (BGE-small-zh-v1.5)
-    try:
-        from classifier import ClassificationService
-        _classifier = ClassificationService(
-            anchors_path=os.path.join(get_data_dir(), 'anchors.json'),
-        )
-        logger.info('Classification service initialised')
-    except Exception as e:
-        logger.warning('Classification service failed to initialise (non-fatal): %s', e)
-        _classifier = None
+    _classifier = _ocr_worker
+    logger.info('Restartable model worker proxy initialised')
 
     # Initialise task clustering service (MiniLM + HDBSCAN)
     try:

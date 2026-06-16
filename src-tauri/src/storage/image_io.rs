@@ -68,6 +68,60 @@ impl StorageState {
         result
     }
 
+    /// Read an encrypted image file and return raw image bytes.
+    pub fn read_image_bytes(&self, path: &str) -> Result<(Vec<u8>, String), String> {
+        let diag_start = std::time::Instant::now();
+
+        let (key_enc, abs_path) = {
+            let guard = self.get_connection_named("read_image_bytes")?;
+            let conn = guard.as_ref().unwrap();
+
+            if let Some(hash) = path.strip_prefix("memory://") {
+                let result: Option<(Option<Vec<u8>>, String)> = conn
+                    .query_row(
+                        "SELECT content_key_encrypted, image_path FROM screenshots WHERE image_hash = ? AND is_deleted = 0",
+                        [hash],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .ok();
+                match result {
+                    Some((key, real_path)) => (key, self.resolve_image_path(&real_path)),
+                    None => return Err(format!("No screenshot found for hash: {}", hash)),
+                }
+            } else {
+                let key: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT content_key_encrypted FROM screenshots WHERE image_path = ? AND is_deleted = 0",
+                        [path],
+                        |row| row.get(0),
+                    )
+                    .ok();
+
+                let resolved = self.resolve_image_path(path);
+                (key, resolved)
+            }
+        };
+
+        let query_elapsed = diag_start.elapsed();
+        let mut row_key = key_enc
+            .as_ref()
+            .and_then(|enc| decrypt_row_key_with_cng(enc).ok())
+            .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
+
+        let abs_path_str = abs_path.to_string_lossy().to_string();
+        let result = read_encrypted_image_bytes(&abs_path_str, &row_key);
+        Self::zeroize_bytes(&mut row_key);
+        if diag_start.elapsed().as_secs() >= 5 {
+            tracing::warn!(
+                "[DIAG:DB] read_image_bytes({}) query {:?}, total {:?}",
+                path,
+                query_elapsed,
+                diag_start.elapsed()
+            );
+        }
+        result
+    }
+
     /// Derive the cached thumbnail path from an original image path.
     /// E.g. `screenshots/foo.png.enc` → `screenshots/thumbs/foo.thumb.jpg.enc`
     pub fn thumbnail_path_for(original: &Path) -> PathBuf {
@@ -560,6 +614,15 @@ pub fn read_encrypted_image_as_base64(
     path: &str,
     row_key: &[u8],
 ) -> Result<(String, String), String> {
+    let (image_data, mime_type) = read_encrypted_image_bytes(path, row_key)?;
+    let base64_data =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &image_data);
+
+    Ok((base64_data, mime_type))
+}
+
+/// Read an encrypted image file and return raw image bytes (with decryption).
+pub fn read_encrypted_image_bytes(path: &str, row_key: &[u8]) -> Result<(Vec<u8>, String), String> {
     let path = Path::new(path);
 
     if !path.exists() {
@@ -602,8 +665,5 @@ pub fn read_encrypted_image_as_base64(
         data
     };
 
-    let base64_data =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &image_data);
-
-    Ok((base64_data, mime_type.to_string()))
+    Ok((image_data, mime_type.to_string()))
 }

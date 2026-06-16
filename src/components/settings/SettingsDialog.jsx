@@ -229,11 +229,12 @@ function SettingsDialog({
     monitorStatusRef.current = 'loading';
     try {
       await invoke('stop_monitor');
-      setMonitorStatus('stopped');
-      monitorStatusRef.current = 'stopped';
-      onManualStopMonitor?.();
     } catch (e) {
       console.error('Failed to stop monitor', e);
+    } finally {
+      onManualStopMonitor?.();
+      setMonitorStatus('stopped');
+      monitorStatusRef.current = 'stopped';
     }
   };
 
@@ -248,6 +249,8 @@ function SettingsDialog({
       await checkMonitorStatus();
     } catch (e) {
       console.error('Failed to restart monitor', e);
+      setMonitorStatus('stopped');
+      monitorStatusRef.current = 'stopped';
       await checkMonitorStatus();
     }
   };

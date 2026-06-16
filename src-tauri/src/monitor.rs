@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;
 
 use std::os::windows::io::AsRawHandle;
@@ -129,6 +129,10 @@ fn inject_ipc_auth(mut req: Value, auth_token: &str, seq_no: u64) -> Value {
             Value::String(auth_token.to_string()),
         );
         obj.insert("_seq_no".to_string(), Value::Number(seq_no.into()));
+        obj.insert(
+            "ipc_protocol_version".to_string(),
+            Value::Number(IPC_PROTOCOL_VERSION.into()),
+        );
     }
     req
 }
@@ -137,6 +141,56 @@ fn parse_ipc_response(bytes: &[u8]) -> Result<Value, String> {
     let resp_str = String::from_utf8_lossy(bytes);
     serde_json::from_str::<Value>(&resp_str)
         .map_err(|e| format!("Invalid JSON response: {}. Data: {}", e, resp_str))
+}
+
+const IPC_PROTOCOL_VERSION: u32 = 2;
+const IPC_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+async fn write_ipc_frame<W>(writer: &mut W, body: &[u8]) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    if body.len() > IPC_MAX_MESSAGE_BYTES {
+        return Err(format!(
+            "IPC request too large: {} bytes (max {})",
+            body.len(),
+            IPC_MAX_MESSAGE_BYTES
+        ));
+    }
+    let len = body.len() as u32;
+    writer
+        .write_all(&len.to_le_bytes())
+        .await
+        .map_err(|e| format!("Write frame length error: {}", e))?;
+    writer
+        .write_all(body)
+        .await
+        .map_err(|e| format!("Write frame body error: {}", e))
+}
+
+async fn read_ipc_frame<R>(reader: &mut R) -> Result<Vec<u8>, String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut first = [0u8; 4];
+    reader
+        .read_exact(&mut first)
+        .await
+        .map_err(|e| format!("Read frame length error: {}", e))?;
+
+    let len = u32::from_le_bytes(first) as usize;
+    if len > 0 && len <= IPC_MAX_MESSAGE_BYTES {
+        let mut body = vec![0u8; len];
+        reader
+            .read_exact(&mut body)
+            .await
+            .map_err(|e| format!("Read frame body error: {}", e))?;
+        return Ok(body);
+    }
+    Err(format!(
+        "Invalid IPC v{} frame length: {} (max {})",
+        IPC_PROTOCOL_VERSION, len, IPC_MAX_MESSAGE_BYTES
+    ))
 }
 
 // 内部函数：尝试连接到管道，支持重试
@@ -207,6 +261,19 @@ pub async fn send_ipc_request(
         .unwrap_or("<unknown>")
         .to_string();
     let is_process_ocr = command_name == "process_ocr";
+    let requested_timeout_secs = req
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.saturating_add(1));
+    let default_timeout_secs = match command_name.as_str() {
+        "stop" => 2,
+        "status" | "pause" | "resume" | "continue" => 5,
+        _ => 30,
+    };
+    let min_timeout_secs = if is_process_ocr { 30 } else { 1 };
+    let ipc_timeout_secs = requested_timeout_secs
+        .unwrap_or(default_timeout_secs)
+        .clamp(min_timeout_secs, 605);
     let ipc_started = std::time::Instant::now();
 
     if is_process_ocr {
@@ -244,8 +311,8 @@ pub async fn send_ipc_request(
         }
     };
 
-    let req_bytes = req.to_string().into_bytes();
-    if let Err(e) = client.write_all(&req_bytes).await {
+    let req_bytes = serde_json::to_vec(&req).map_err(|e| format!("Serialize error: {}", e))?;
+    if let Err(e) = write_ipc_frame(&mut client, &req_bytes).await {
         if is_process_ocr {
             tracing::error!(
                 "[DIAG:IPC] write failed command={} seq_no={} elapsed={}ms error={}",
@@ -255,7 +322,7 @@ pub async fn send_ipc_request(
                 e
             );
         }
-        return Err(format!("Write error: {}", e));
+        return Err(e);
     }
 
     if is_process_ocr {
@@ -268,9 +335,13 @@ pub async fn send_ipc_request(
         );
     }
 
-    let mut buf = Vec::new();
-    match client.read_to_end(&mut buf).await {
-        Ok(_) => {
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(ipc_timeout_secs),
+        read_ipc_frame(&mut client),
+    )
+    .await
+    {
+        Ok(Ok(buf)) => {
             if is_process_ocr {
                 let elapsed_ms = ipc_started.elapsed().as_millis();
                 tracing::debug!(
@@ -297,7 +368,7 @@ pub async fn send_ipc_request(
                 }
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             if is_process_ocr {
                 tracing::error!(
                     "[DIAG:IPC] read failed command={} seq_no={} elapsed={}ms error={}",
@@ -307,7 +378,20 @@ pub async fn send_ipc_request(
                     e
                 );
             }
-            Err(format!("Read error: {}", e))
+            Err(e)
+        }
+        Err(_) => {
+            let e = format!("IPC response timed out after {}s", ipc_timeout_secs);
+            if is_process_ocr {
+                tracing::error!(
+                    "[DIAG:IPC] read timeout command={} seq_no={} elapsed={}ms error={}",
+                    command_name,
+                    seq_no,
+                    ipc_started.elapsed().as_millis(),
+                    e
+                );
+            }
+            Err(e)
         }
     }
 }
@@ -414,6 +498,13 @@ pub async fn execute_monitor_command(
                 .get("ocr_queue_max_size")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as u32;
+            let ocr_timeout_secs = payload
+                .get("ocr_timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| {
+                    crate::registry_config::get_u32("ocr_timeout_secs").unwrap_or(120) as u64
+                })
+                .clamp(30, 600) as u32;
 
             capture_state
                 .capture_on_ocr_busy
@@ -421,6 +512,9 @@ pub async fn execute_monitor_command(
             capture_state
                 .ocr_queue_max_size
                 .store(ocr_queue_max_size, Ordering::SeqCst);
+            capture_state
+                .ocr_timeout_secs
+                .store(ocr_timeout_secs, Ordering::SeqCst);
             // Still forward to Python
         }
         _ => {}
@@ -836,7 +930,14 @@ pub async fn start_monitor(
                     .unwrap_or(true)
                     .to_string(),
             )
-            .env("CARBONPAPER_USE_ONNX", use_onnx.to_string());
+            .env("CARBONPAPER_USE_ONNX", use_onnx.to_string())
+            .env(
+                "CARBONPAPER_OCR_TIMEOUT_SECS",
+                crate::registry_config::get_u32("ocr_timeout_secs")
+                    .unwrap_or(120)
+                    .clamp(30, 600)
+                    .to_string(),
+            );
 
         if let Some(resolved) = &resolved_model_runtime {
             let paths = &resolved.paths;
@@ -1129,6 +1230,9 @@ fn spawn_capture_loop(app: &AppHandle) {
     capture_state.paused.store(false, Ordering::SeqCst);
     capture_state.in_flight_ocr_count.store(0, Ordering::SeqCst);
     capture_state.clear_wgc_session("spawn_capture_loop_reset");
+    capture_state
+        .startup_pending_cleanup_cancelled
+        .store(false, Ordering::SeqCst);
 
     // Load exclusion settings from disk
     {
@@ -1145,16 +1249,50 @@ fn spawn_capture_loop(app: &AppHandle) {
         let capture_on_ocr_busy =
             crate::registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
         let ocr_queue_max_size = crate::registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
+        let ocr_timeout_secs = crate::registry_config::get_u32("ocr_timeout_secs")
+            .unwrap_or(120)
+            .clamp(30, 600);
         capture_state
             .capture_on_ocr_busy
             .store(capture_on_ocr_busy, Ordering::SeqCst);
         capture_state
             .ocr_queue_max_size
             .store(ocr_queue_max_size, Ordering::SeqCst);
+        capture_state
+            .ocr_timeout_secs
+            .store(ocr_timeout_secs, Ordering::SeqCst);
+        capture_state
+            .ocr_cold_start_pending
+            .store(true, Ordering::SeqCst);
     }
 
     let cs = capture_state.inner().clone();
     let st = storage.inner().clone();
+    {
+        let cleanup_storage = st.clone();
+        let cleanup_capture_state = cs.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                cleanup_storage.abort_startup_pending_screenshots(|| {
+                    cleanup_capture_state
+                        .startup_pending_cleanup_cancelled
+                        .load(Ordering::SeqCst)
+                })
+            })
+            .await;
+            match result {
+                Ok(Ok(aborted)) if aborted > 0 => {
+                    tracing::info!(
+                        "[DIAG:STARTUP] aborted {} stale pending screenshots",
+                        aborted
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("[DIAG:STARTUP] pending cleanup failed: {}", e),
+                Err(e) => tracing::warn!("[DIAG:STARTUP] pending cleanup task failed: {}", e),
+            }
+        });
+    }
     // MonitorState is not Arc-wrapped in Tauri managed state, but we access it via AppHandle
     // We need to pass the AppHandle so the capture loop can access MonitorState
     let app_handle = app.clone();
@@ -1229,17 +1367,39 @@ pub async fn stop_monitor(
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
-    // 2. 尝试通过 IPC 发送结束信号 to Python
-    let _ = send_ipc_command_internal(&state, "stop").await;
+    // 2. Best-effort stop signal to Python. Do not let a broken worker or pipe
+    // handler hold the UI in LOADING during an intentional terminate/restart.
+    let _ = tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        send_ipc_command_internal(&state, "stop"),
+    )
+    .await;
 
-    // 等待进程退出
-    let mut process_guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(mut child) = process_guard.take() {
-        // 给一点时间让它自己退出
-        // 这里是同步阻塞，稍微不太好，但在 destroy 阶段通常可以接受
-        // 或者直接 kill
+    // Terminate the monitor process without blocking indefinitely. Child
+    // processes are also covered by the Job Object when its handle is dropped.
+    let child_to_stop = {
+        let mut process_guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
+        process_guard.take()
+    };
+    if let Some(mut child) = child_to_stop {
         let _ = child.kill();
-        let _ = child.wait();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_status)) => break,
+                Ok(None) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+                Ok(None) => {
+                    tracing::warn!("Timed out waiting for monitor process to exit after kill");
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to wait for monitor process after kill: {}", e);
+                    break;
+                }
+            }
+        }
     }
 
     // 停止反向 IPC 服务器
@@ -1284,6 +1444,7 @@ pub async fn stop_monitor(
     }
 
     crate::refresh_tray_menu(&app);
+    let _ = app.emit("monitor-stopped", serde_json::json!({"intentional": true}));
 
     Ok("Monitor stopped".into())
 }
@@ -1320,6 +1481,15 @@ pub async fn resume_monitor(
 
 #[tauri::command]
 pub async fn get_monitor_status(state: State<'_, MonitorState>) -> Result<String, String> {
+    if state.stopping.load(Ordering::SeqCst) {
+        let stopped = serde_json::json!({
+            "paused": false,
+            "stopped": true,
+            "interval": 0
+        });
+        return Ok(stopped.to_string());
+    }
+
     match send_ipc_command_internal(&state, "status").await {
         Ok(status) => Ok(status),
         Err(e) => {

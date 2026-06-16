@@ -1,8 +1,7 @@
 //! Plaintext screenshot file encryption, backfill, and cleanup.
 
 use crate::credential_manager::{
-    decrypt_row_key_with_cng, decrypt_with_master_key, encrypt_row_key_with_cng,
-    encrypt_with_master_key,
+    decrypt_row_key_with_cng, decrypt_with_master_key, encrypt_with_master_key,
 };
 use rand::RngCore;
 use rusqlite::params;
@@ -96,8 +95,7 @@ impl StorageState {
         rand::thread_rng().fill_bytes(&mut row_key);
         let encrypted = encrypt_with_master_key(&row_key, &data)
             .map_err(|e| format!("Failed to encrypt: {}", e))?;
-        let encrypted_key = encrypt_row_key_with_cng(&row_key)
-            .map_err(|e| format!("Failed to wrap row key: {}", e))?;
+        let encrypted_key = self.wrap_row_key_for_storage(&row_key)?;
         Self::zeroize_bytes(&mut row_key);
 
         // Generate new filename

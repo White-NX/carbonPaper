@@ -444,6 +444,87 @@ mod windows_impl {
         Ok(output)
     }
 
+    /// Encrypt with an exported RSAPUBLICBLOB only.
+    ///
+    /// This keeps background writes off the protected persisted key handle. The
+    /// persisted key has a high-protection UI policy, so even public operations
+    /// through that handle can surface Windows security UI on some systems.
+    pub fn encrypt_with_exported_public_key(
+        public_key: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CredentialError> {
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::Security::Cryptography::{
+            NCryptEncrypt, NCryptFreeObject, NCryptImportKey, NCryptOpenStorageProvider,
+            NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE, NCRYPT_PAD_PKCS1_FLAG,
+            NCRYPT_PROV_HANDLE,
+        };
+
+        let mut provider = NCRYPT_PROV_HANDLE::default();
+        let provider_name = HSTRING::from(CNG_PROVIDER_NAME);
+        unsafe {
+            NCryptOpenStorageProvider(&mut provider, PCWSTR::from_raw(provider_name.as_ptr()), 0)
+        }
+        .map_err(|e| CredentialError::SystemError(format!("Failed to open CNG provider: {}", e)))?;
+
+        let blob_type = HSTRING::from("RSAPUBLICBLOB");
+        let mut key = NCRYPT_KEY_HANDLE::default();
+        unsafe {
+            NCryptImportKey(
+                provider,
+                NCRYPT_KEY_HANDLE::default(),
+                PCWSTR::from_raw(blob_type.as_ptr()),
+                None,
+                &mut key,
+                public_key,
+                NCRYPT_FLAGS(0),
+            )
+        }
+        .map_err(|e| {
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
+            CredentialError::SystemError(format!("NCryptImportKey public key failed: {}", e))
+        })?;
+
+        let mut out_len: u32 = 0;
+        unsafe {
+            NCryptEncrypt(
+                key,
+                Some(plaintext),
+                None,
+                None,
+                &mut out_len,
+                NCRYPT_PAD_PKCS1_FLAG,
+            )
+        }
+        .map_err(|e| {
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
+            CredentialError::SystemError(format!("NCryptEncrypt public size failed: {}", e))
+        })?;
+
+        let mut output = vec![0u8; out_len as usize];
+        unsafe {
+            NCryptEncrypt(
+                key,
+                Some(plaintext),
+                None,
+                Some(output.as_mut_slice()),
+                &mut out_len,
+                NCRYPT_PAD_PKCS1_FLAG,
+            )
+        }
+        .map_err(|e| {
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
+            CredentialError::SystemError(format!("NCryptEncrypt public failed: {}", e))
+        })?;
+
+        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
+        output.truncate(out_len as usize);
+        Ok(output)
+    }
+
     /// 导出或获取缓存的公钥（同步，不触发任何 UI 弹窗）
     pub fn export_or_get_public_key(
         state: &CredentialManagerState,
@@ -604,6 +685,16 @@ pub use windows_impl::*;
 #[cfg(not(windows))]
 pub fn export_or_get_public_key(
     _state: &CredentialManagerState,
+) -> Result<Vec<u8>, CredentialError> {
+    Err(CredentialError::SystemError(
+        "CNG is only available on Windows".to_string(),
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn encrypt_with_exported_public_key(
+    _public_key: &[u8],
+    _plaintext: &[u8],
 ) -> Result<Vec<u8>, CredentialError> {
     Err(CredentialError::SystemError(
         "CNG is only available on Windows".to_string(),
@@ -935,11 +1026,6 @@ fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialE
     Ok(output)
 }
 
-/// 使用 CNG 公钥封装任意行密钥（无 UI）
-pub fn encrypt_row_key_with_cng(row_key: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    encrypt_master_key_with_cng(row_key)
-}
-
 #[cfg(windows)]
 pub fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
     use windows::Win32::Security::Cryptography::{
@@ -1059,13 +1145,6 @@ pub fn save_public_key_to_file(
         .map_err(|e| CredentialError::SystemError(format!("Failed to save public key: {}", e)))?;
 
     Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn encrypt_row_key_with_cng(_row_key: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    Err(CredentialError::SystemError(
-        "CNG is only available on Windows".to_string(),
-    ))
 }
 
 #[cfg(not(windows))]

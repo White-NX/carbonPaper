@@ -89,6 +89,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let ocr_queue_limit_enabled =
         registry_config::get_bool("ocr_queue_limit_enabled").unwrap_or(true);
     let ocr_queue_max_size = registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
+    let ocr_timeout_secs = registry_config::get_u32("ocr_timeout_secs").unwrap_or(120);
     let use_dml = registry_config::get_bool("use_dml").unwrap_or(false);
     let dml_device_id = registry_config::get_u32("dml_device_id").unwrap_or(0);
     let game_mode_enabled = registry_config::get_bool("game_mode_enabled").unwrap_or(true);
@@ -107,6 +108,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "capture_on_ocr_busy": capture_on_ocr_busy,
         "ocr_queue_limit_enabled": ocr_queue_limit_enabled,
         "ocr_queue_max_size": ocr_queue_max_size,
+        "ocr_timeout_secs": ocr_timeout_secs,
         "use_dml": use_dml,
         "dml_device_id": dml_device_id,
         "game_mode_enabled": game_mode_enabled,
@@ -138,6 +140,10 @@ pub fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
     }
     if let Some(v) = config.get("ocr_queue_max_size").and_then(|v| v.as_u64()) {
         registry_config::set_u32("ocr_queue_max_size", v as u32)?;
+    }
+    if let Some(v) = config.get("ocr_timeout_secs").and_then(|v| v.as_u64()) {
+        let clamped = (v as u32).clamp(30, 600);
+        registry_config::set_u32("ocr_timeout_secs", clamped)?;
     }
     if let Some(v) = config.get("use_dml").and_then(|v| v.as_bool()) {
         registry_config::set_bool("use_dml", v)?;
