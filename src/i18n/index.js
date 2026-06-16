@@ -48,6 +48,14 @@ const syncBackendLanguage = (lng) => {
   });
 };
 
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (event) => {
+    if (event.key !== 'language' || !event.newValue) return;
+    if (event.newValue === i18n.language) return;
+    i18n.changeLanguage(event.newValue).catch(() => {});
+  });
+}
+
 // load initial language (useLang detector may set i18n.language)
 const initialLang = localStorage.getItem('language') || i18n.language || 'zh-CN';
 ensureLoaded(initialLang).then(() => {
