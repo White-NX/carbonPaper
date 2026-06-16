@@ -5,6 +5,7 @@ import json
 import time
 import logging
 import threading
+import struct
 from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
@@ -12,6 +13,84 @@ import win32file
 import win32pipe
 import pywintypes
 from typing import Optional, Dict, Any, List
+
+
+IPC_PROTOCOL_VERSION = 2
+MAX_PIPE_MESSAGE_BYTES = 16 * 1024 * 1024
+MAX_PIPE_BINARY_BYTES = 64 * 1024 * 1024
+
+
+def _write_framed_json(handle, payload: bytes) -> None:
+    if len(payload) > MAX_PIPE_MESSAGE_BYTES:
+        raise ValueError(f"Request too large (max {MAX_PIPE_MESSAGE_BYTES} bytes)")
+    win32file.WriteFile(handle, struct.pack('<I', len(payload)))
+    offset = 0
+    chunk_size = 64 * 1024
+    while offset < len(payload):
+        chunk = payload[offset:offset + chunk_size]
+        _, written = win32file.WriteFile(handle, chunk)
+        if not isinstance(written, int) or written <= 0:
+            raise RuntimeError("Named pipe write returned no progress")
+        offset += written
+
+
+def _read_exact_frame(handle, max_bytes: int) -> bytes:
+    _, prefix = win32file.ReadFile(handle, 4)
+    if len(prefix) != 4:
+        raise RuntimeError(f"Incomplete frame prefix: {len(prefix)} bytes")
+    frame_len = struct.unpack('<I', prefix)[0]
+    if frame_len > max_bytes:
+        raise RuntimeError(f"Frame too large: {frame_len} bytes (max {max_bytes})")
+    chunks = []
+    remaining = frame_len
+    while remaining:
+        _, chunk = win32file.ReadFile(handle, min(64 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    body = b''.join(chunks)
+    if len(body) != frame_len:
+        raise RuntimeError(f"Incomplete frame: expected {frame_len}, got {len(body)}")
+    return body
+
+
+def _read_framed_json(handle) -> Dict[str, Any]:
+    try:
+        _, first = win32file.ReadFile(handle, 4)
+    except pywintypes.error as e:
+        if e.winerror == 109:
+            return {'status': 'error', 'error': 'Empty response'}
+        raise
+    if not first:
+        return {'status': 'error', 'error': 'Empty response'}
+
+    if len(first) == 4:
+        frame_len = struct.unpack('<I', first)[0]
+        if 0 < frame_len <= MAX_PIPE_MESSAGE_BYTES:
+            chunks = []
+            remaining = frame_len
+            while remaining:
+                _, chunk = win32file.ReadFile(handle, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            response_bytes = b''.join(chunks)
+            if len(response_bytes) != frame_len:
+                return {'status': 'error', 'error': f'Incomplete response frame: expected {frame_len}, got {len(response_bytes)}'}
+            response = json.loads(response_bytes.decode('utf-8'))
+            if response.get('status') == 'success' and response.get('data', {}).get('binary_frame'):
+                try:
+                    response['_binary_body'] = _read_exact_frame(handle, MAX_PIPE_BINARY_BYTES)
+                except Exception as e:
+                    return {'status': 'error', 'error': f'Binary response read failed: {e}'}
+            return response
+
+    return {
+        'status': 'error',
+        'error': f'Invalid IPC v{IPC_PROTOCOL_VERSION} frame length: {struct.unpack("<I", first)[0]}',
+    }
 
 
 class StorageClient:
@@ -94,23 +173,9 @@ class StorageClient:
                     None
                 )
                 
-                # Send request (write large data in chunks).
-                # Named pipes can report partial writes; always advance by actual bytes written.
+                # Send request using v2 length-prefixed framing.
                 request_bytes = json.dumps(request).encode('utf-8')
-                chunk_size = 64 * 1024  # 64KB chunks
-                offset = 0
-
-                while offset < len(request_bytes):
-                    chunk = request_bytes[offset:offset + chunk_size]
-                    chunk_offset = 0
-
-                    while chunk_offset < len(chunk):
-                        _, written = win32file.WriteFile(handle, chunk[chunk_offset:])
-                        if not isinstance(written, int) or written <= 0:
-                            raise RuntimeError("Named pipe write returned no progress")
-                        chunk_offset += written
-
-                    offset += chunk_offset
+                _write_framed_json(handle, request_bytes)
                 
                 # Flush pipe to ensure all data has been sent.
                 # In request/response mode the server may close quickly after handling
@@ -125,32 +190,7 @@ class StorageClient:
                         e.winerror,
                     )
                 
-                # Read response (supports chunked reads for large responses)
-                response_bytes = b''
-                while True:
-                    try:
-                        _, chunk = win32file.ReadFile(handle, 64 * 1024)
-                        if not chunk:
-                            break
-                        response_bytes += chunk
-                        # Try to parse; if successful, the response is complete
-                        try:
-                            response = json.loads(response_bytes.decode('utf-8'))
-                            return response
-                        except (json.JSONDecodeError, UnicodeDecodeError):
-                            # Incomplete response or mid-character split — continue reading
-                            continue
-                    except pywintypes.error as e:
-                        # Pipe ended (109) or other error
-                        if e.winerror == 109:
-                            break
-                        raise
-                
-                if response_bytes:
-                    response = json.loads(response_bytes.decode('utf-8'))
-                    return response
-                else:
-                    return {'status': 'error', 'error': 'Empty response'}
+                return _read_framed_json(handle)
                     
             finally:
                 win32file.CloseHandle(handle)
@@ -418,6 +458,28 @@ class StorageClient:
             data = response.get('data', {})
             return bool(data.get('session_valid', False))
         return False
+
+    def get_temp_image_bytes(self, screenshot_id: int) -> Dict[str, Any]:
+        """Fetch temporary OCR image bytes using v2 binary response framing."""
+        response = self._send_request({
+            'command': 'get_temp_image',
+            'screenshot_id': int(screenshot_id),
+        })
+        if response.get('status') != 'success':
+            return response
+
+        data = response.get('data', {})
+        image_bytes = response.get('_binary_body')
+        if image_bytes is None:
+            return {'status': 'error', 'error': 'Binary image response missing body frame'}
+
+        return {
+            'status': 'success',
+            'data': {
+                'image_bytes': image_bytes,
+                'mime_type': data.get('mime_type', 'image/jpeg'),
+            },
+        }
 
     def screenshot_exists(self, image_hash: str) -> bool:
         """

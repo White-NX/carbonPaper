@@ -21,6 +21,81 @@ use tokio::sync::mpsc;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 
+const IPC_PROTOCOL_VERSION: u32 = 2;
+const IPC_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const IPC_MAX_BINARY_BYTES: usize = 64 * 1024 * 1024;
+
+async fn read_ipc_frame(server: &mut NamedPipeServer) -> Result<Vec<u8>, String> {
+    let mut first = [0u8; 4];
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(30),
+        server.read_exact(&mut first),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) if e.raw_os_error() == Some(109) => return Ok(Vec::new()),
+        Ok(Err(e)) => return Err(format!("read_prefix_error:{}", e)),
+        Err(_) => return Err("overall_timeout".to_string()),
+    }
+
+    let len = u32::from_le_bytes(first) as usize;
+    if len > 0 && len <= IPC_MAX_MESSAGE_BYTES {
+        let mut body = vec![0u8; len];
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            server.read_exact(&mut body),
+        )
+        .await
+        .map_err(|_| "overall_timeout".to_string())?
+        .map_err(|e| format!("read_body_error:{}", e))?;
+        return Ok(body);
+    }
+
+    Err(format!(
+        "Invalid IPC v{} frame length: {} (max {})",
+        IPC_PROTOCOL_VERSION, len, IPC_MAX_MESSAGE_BYTES
+    ))
+}
+
+async fn write_ipc_frame(server: &mut NamedPipeServer, body: &[u8]) -> Result<(), String> {
+    if body.len() > IPC_MAX_MESSAGE_BYTES {
+        return Err(format!(
+            "Response too large: {} bytes (max {})",
+            body.len(),
+            IPC_MAX_MESSAGE_BYTES
+        ));
+    }
+    let len = body.len() as u32;
+    server
+        .write_all(&len.to_le_bytes())
+        .await
+        .map_err(|e| format!("write_prefix_error:{}", e))?;
+    server
+        .write_all(body)
+        .await
+        .map_err(|e| format!("write_body_error:{}", e))
+}
+
+async fn write_ipc_binary_frame(server: &mut NamedPipeServer, body: &[u8]) -> Result<(), String> {
+    if body.len() > IPC_MAX_BINARY_BYTES {
+        return Err(format!(
+            "Binary response too large: {} bytes (max {})",
+            body.len(),
+            IPC_MAX_BINARY_BYTES
+        ));
+    }
+    let len = body.len() as u32;
+    server
+        .write_all(&len.to_le_bytes())
+        .await
+        .map_err(|e| format!("write_binary_prefix_error:{}", e))?;
+    server
+        .write_all(body)
+        .await
+        .map_err(|e| format!("write_binary_body_error:{}", e))
+}
+
 /// Commands that Python can send to Rust via the reverse IPC named pipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command")]
@@ -208,31 +283,50 @@ fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContex
     }
 }
 
-/// Lightweight parent-PID lookup via CreateToolhelp32Snapshot (single process query).
-fn get_parent_pid(pid: u32) -> Option<u32> {
+/// Return whether `pid` is `expected_ancestor_pid` or a bounded-depth descendant.
+fn is_pid_descendant_of(pid: u32, expected_ancestor_pid: u32) -> bool {
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
     };
+    if pid == expected_ancestor_pid {
+        return true;
+    }
+
+    let mut parent_by_pid = std::collections::HashMap::<u32, u32>::new();
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return false,
+        };
         let mut entry = PROCESSENTRY32 {
             dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32,
             ..std::mem::zeroed()
         };
         if Process32First(snapshot, &mut entry).is_ok() {
             loop {
-                if entry.th32ProcessID == pid {
-                    let _ = windows::Win32::Foundation::CloseHandle(snapshot);
-                    return Some(entry.th32ParentProcessID);
-                }
+                parent_by_pid.insert(entry.th32ProcessID, entry.th32ParentProcessID);
                 if Process32Next(snapshot, &mut entry).is_err() {
                     break;
                 }
             }
         }
         let _ = windows::Win32::Foundation::CloseHandle(snapshot);
-        None
     }
+
+    let mut current = pid;
+    for _ in 0..8 {
+        let Some(parent) = parent_by_pid.get(&current).copied() else {
+            return false;
+        };
+        if parent == expected_ancestor_pid {
+            return true;
+        }
+        if parent == 0 || parent == current {
+            return false;
+        }
+        current = parent;
+    }
+    false
 }
 
 /// Named pipe server for Python-to-Rust reverse IPC (storage requests).
@@ -389,26 +483,16 @@ async fn handle_client(
             };
 
             if let Some(expected_pid) = expected_pid_raw {
-                let mut is_valid = false;
-                // 1. 直接匹配 (Monitor 进程)
-                if client_pid == expected_pid {
-                    is_valid = true;
-                } else {
-                    // 2. 检查是否为直接后代进程 (Python multiprocessing 第一层)
-                    if let Some(ppid) = get_parent_pid(client_pid) {
-                        if ppid == expected_pid {
-                            is_valid = true;
-                        }
-                    }
-                }
+                let is_valid = is_pid_descendant_of(client_pid, expected_pid);
 
                 if !is_valid {
                     tracing::warn!(
-                        "Illegal access attempt to Reverse IPC from PID {} (not authorized)",
-                        client_pid
+                        "Illegal access attempt to Reverse IPC from PID {} (monitor root PID {} not in parent chain)",
+                        client_pid,
+                        expected_pid
                     );
                     let err_resp = serde_json::json!({"error": format!("Access denied: PID {} is not authorized", client_pid)});
-                    let _ = server.write_all(err_resp.to_string().as_bytes()).await;
+                    let _ = write_ipc_frame(&mut server, err_resp.to_string().as_bytes()).await;
                     return;
                 }
             } else {
@@ -424,66 +508,14 @@ async fn handle_client(
         }
     }
 
-    // 读取请求 - 使用循环读取直到 JSON 完整或超时
-    // 因为图片 Base64 数据可能很大（数 MB），且数据可能分片到达
-    let mut buf = Vec::with_capacity(4 * 1024 * 1024); // 预分配 4MB
-    let mut temp_buf = vec![0u8; 64 * 1024]; // 64KB 临时缓冲区
-    let read_end_reason = {
-        // 设置读取超时
-        let read_timeout = tokio::time::Duration::from_secs(30);
-        let start_time = tokio::time::Instant::now();
-
-        loop {
-            if start_time.elapsed() > read_timeout {
-                tracing::warn!("Read timeout after {} bytes", buf.len());
-                break String::from("overall_timeout");
-            }
-
-            match tokio::time::timeout(
-                tokio::time::Duration::from_millis(500),
-                server.read(&mut temp_buf),
-            )
-            .await
-            {
-                Ok(Ok(0)) => {
-                    // 连接已关闭，数据读取完成
-                    break String::from("peer_closed");
-                }
-                Ok(Ok(n)) => {
-                    buf.extend_from_slice(&temp_buf[..n]);
-                    // 限制最大数据量为 16MB
-                    if buf.len() > 16 * 1024 * 1024 {
-                        tracing::error!("Request too large: {} bytes", buf.len());
-                        let response = StorageResponse::error("Request too large (max 16MB)");
-                        let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-                        let _ = server.write_all(&response_bytes).await;
-                        return;
-                    }
-
-                    // 仅在 JSON 已完整时结束读取，避免分片导致的截断解析
-                    if serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
-                        break String::from("json_complete");
-                    }
-                }
-                Ok(Err(e)) => {
-                    // 检查是否是 "管道已结束" 错误（正常情况，客户端已发送完数据）
-                    let is_pipe_ended = e.raw_os_error() == Some(109); // ERROR_BROKEN_PIPE
-                    if !is_pipe_ended {
-                        tracing::error!("Read error: {}", e);
-                        break format!("read_error:{}", e);
-                    } else {
-                        break String::from("broken_pipe_109");
-                    }
-                }
-                Err(_) => {
-                    // 单次 read 超时：若已有完整 JSON 则继续处理，否则继续等到全局超时
-                    if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok()
-                    {
-                        break String::from("single_read_timeout_but_json_complete");
-                    }
-                    continue;
-                }
-            }
+    let buf = match read_ipc_frame(&mut server).await {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("Reverse IPC read error: {}", e);
+            let response = StorageResponse::error(&e);
+            let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+            let _ = write_ipc_frame(&mut server, &response_bytes).await;
+            return;
         }
     };
 
@@ -492,19 +524,52 @@ async fn handle_client(
     }
 
     // 解析请求
-    let response = match serde_json::from_slice::<serde_json::Value>(&buf) {
-        Ok(req) => process_request(&req, &storage, &ocr_cache, &app_handle),
-        Err(e) => StorageResponse::error(&format!(
-            "Invalid JSON: {} (bytes={}, reason={})",
-            e,
-            buf.len(),
-            read_end_reason
-        )),
+    let req = match serde_json::from_slice::<serde_json::Value>(&buf) {
+        Ok(req) => req,
+        Err(e) => {
+            let response =
+                StorageResponse::error(&format!("Invalid JSON: {} (bytes={})", e, buf.len()));
+            let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+            if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
+                tracing::error!("Write error: {}", e);
+            }
+            return;
+        }
     };
+
+    if req.get("command").and_then(|c| c.as_str()) == Some("get_temp_image") {
+        match get_temp_image_bytes(&req, &storage, &ocr_cache) {
+            Ok((image_bytes, mime_type)) => {
+                let metadata = StorageResponse::success(serde_json::json!({
+                    "mime_type": mime_type,
+                    "binary_body_len": image_bytes.len(),
+                    "binary_frame": true,
+                }));
+                let metadata_bytes = serde_json::to_vec(&metadata).unwrap_or_default();
+                if let Err(e) = write_ipc_frame(&mut server, &metadata_bytes).await {
+                    tracing::error!("Write binary metadata error: {}", e);
+                    return;
+                }
+                if let Err(e) = write_ipc_binary_frame(&mut server, &image_bytes).await {
+                    tracing::error!("Write binary body error: {}", e);
+                }
+            }
+            Err(e) => {
+                let response = StorageResponse::error(&e);
+                let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+                if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
+                    tracing::error!("Write error: {}", e);
+                }
+            }
+        }
+        return;
+    }
+
+    let response = process_request(&req, &storage, &app_handle);
 
     // 发送响应
     let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-    if let Err(e) = server.write_all(&response_bytes).await {
+    if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
         tracing::error!("Write error: {}", e);
     }
 }
@@ -513,7 +578,6 @@ async fn handle_client(
 fn process_request(
     req: &serde_json::Value,
     storage: &StorageState,
-    ocr_cache: &OcrImageCache,
     app_handle: &tauri::AppHandle,
 ) -> StorageResponse {
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
@@ -729,64 +793,6 @@ fn process_request(
                 Err(e) => StorageResponse::error(&e),
             }
         }
-        "get_temp_image" => {
-            // Return image data from in-memory OCR cache (avoids CNG decryption / Windows Hello)
-            let screenshot_id_val = req.get("screenshot_id").cloned();
-            let screenshot_id = match screenshot_id_val {
-                Some(v) => {
-                    if v.is_i64() {
-                        v.as_i64().unwrap_or(-1)
-                    } else if v.is_u64() {
-                        v.as_u64().map(|x| x as i64).unwrap_or(-1)
-                    } else if v.is_string() {
-                        v.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1)
-                    } else {
-                        -1
-                    }
-                }
-                None => -1,
-            };
-
-            if screenshot_id < 0 {
-                return StorageResponse::error("Invalid screenshot_id");
-            }
-
-            // Look up the in-memory cache first (no CNG decryption needed)
-            let cached = {
-                let cache = ocr_cache.lock().unwrap_or_else(|e| e.into_inner());
-                cache.get(&screenshot_id).cloned()
-            };
-
-            match cached {
-                Some(jpeg_bytes) => {
-                    let b64_data = base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &jpeg_bytes,
-                    );
-                    StorageResponse::success(serde_json::json!({
-                        "image_data": b64_data,
-                        "mime_type": "image/jpeg",
-                    }))
-                }
-                None => {
-                    // Fallback to storage (may trigger CNG) for non-capture callers
-                    match storage.get_screenshot_by_id(screenshot_id) {
-                        Ok(Some(record)) => match storage.read_image(&record.image_path) {
-                            Ok((b64_data, mime)) => StorageResponse::success(serde_json::json!({
-                                "image_data": b64_data,
-                                "mime_type": mime,
-                            })),
-                            Err(e) => {
-                                StorageResponse::error(&format!("Failed to read image: {}", e))
-                            }
-                        },
-                        Ok(None) => StorageResponse::error("Screenshot not found"),
-                        Err(e) => StorageResponse::error(&e),
-                    }
-                }
-            }
-        }
-
         "list_screenshots_for_clustering" => {
             let start_ts = req.get("start_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let end_ts = req.get("end_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1007,6 +1013,54 @@ fn process_request(
     response
 }
 
+fn parse_screenshot_id(req: &serde_json::Value) -> Result<i64, String> {
+    let Some(v) = req.get("screenshot_id") else {
+        return Err("Invalid screenshot_id".to_string());
+    };
+    let screenshot_id = if v.is_i64() {
+        v.as_i64().unwrap_or(-1)
+    } else if v.is_u64() {
+        v.as_u64().map(|x| x as i64).unwrap_or(-1)
+    } else if v.is_string() {
+        v.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1)
+    } else {
+        -1
+    };
+    if screenshot_id < 0 {
+        Err("Invalid screenshot_id".to_string())
+    } else {
+        Ok(screenshot_id)
+    }
+}
+
+fn get_temp_image_bytes(
+    req: &serde_json::Value,
+    storage: &StorageState,
+    ocr_cache: &OcrImageCache,
+) -> Result<(Vec<u8>, String), String> {
+    let screenshot_id = parse_screenshot_id(req)?;
+
+    let cached = {
+        let cache = ocr_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(&screenshot_id).cloned()
+    };
+
+    if let Some(jpeg_bytes) = cached {
+        return Ok((jpeg_bytes, "image/jpeg".to_string()));
+    }
+
+    match storage.get_screenshot_by_id(screenshot_id) {
+        Ok(Some(record)) => {
+            let (bytes, mime) = storage
+                .read_image_bytes(&record.image_path)
+                .map_err(|e| format!("Failed to read image: {}", e))?;
+            Ok((bytes, mime))
+        }
+        Ok(None) => Err("Screenshot not found".to_string()),
+        Err(e) => Err(e),
+    }
+}
+
 /// 生成反向 IPC 管道名
 pub fn generate_reverse_pipe_name() -> String {
     let mut rng = rand::thread_rng();
@@ -1191,56 +1245,14 @@ async fn handle_nmh_client(
     app_handle: tauri::AppHandle,
     expected_token: String,
 ) {
-    // Read the full request (same pattern as handle_client)
-    let mut buf = Vec::with_capacity(4 * 1024 * 1024);
-    let mut temp_buf = vec![0u8; 64 * 1024];
-    let read_timeout = tokio::time::Duration::from_secs(30);
-    let start_time = tokio::time::Instant::now();
-    let read_end_reason = {
-        loop {
-            if start_time.elapsed() > read_timeout {
-                tracing::warn!("NMH read timeout after {} bytes", buf.len());
-                break String::from("overall_timeout");
-            }
-
-            match tokio::time::timeout(
-                tokio::time::Duration::from_millis(500),
-                server.read(&mut temp_buf),
-            )
-            .await
-            {
-                Ok(Ok(0)) => {
-                    break String::from("peer_closed");
-                }
-                Ok(Ok(n)) => {
-                    buf.extend_from_slice(&temp_buf[..n]);
-                    if buf.len() > 16 * 1024 * 1024 {
-                        let response = StorageResponse::error("Request too large (max 16MB)");
-                        let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-                        let _ = server.write_all(&response_bytes).await;
-                        return;
-                    }
-
-                    if serde_json::from_slice::<serde_json::Value>(&buf).is_ok() {
-                        break String::from("json_complete");
-                    }
-                }
-                Ok(Err(e)) => {
-                    if e.raw_os_error() != Some(109) {
-                        tracing::error!("NMH read error: {}", e);
-                        break format!("read_error:{}", e);
-                    } else {
-                        break String::from("broken_pipe_109");
-                    }
-                }
-                Err(_) => {
-                    if !buf.is_empty() && serde_json::from_slice::<serde_json::Value>(&buf).is_ok()
-                    {
-                        break String::from("single_read_timeout_but_json_complete");
-                    }
-                    continue;
-                }
-            }
+    let buf = match read_ipc_frame(&mut server).await {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("NMH read error: {}", e);
+            let response = StorageResponse::error(&e);
+            let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+            let _ = write_ipc_frame(&mut server, &response_bytes).await;
+            return;
         }
     };
 
@@ -1265,16 +1277,11 @@ async fn handle_nmh_client(
                 .await
             }
         }
-        Err(e) => StorageResponse::error(&format!(
-            "Invalid JSON: {} (bytes={}, reason={})",
-            e,
-            buf.len(),
-            read_end_reason
-        )),
+        Err(e) => StorageResponse::error(&format!("Invalid JSON: {} (bytes={})", e, buf.len())),
     };
 
     let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-    if let Err(e) = server.write_all(&response_bytes).await {
+    if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
         tracing::error!("NMH write error: {}", e);
     }
 }

@@ -744,6 +744,7 @@ function App() {
 
   useEffect(() => {
     let unlistenExit;
+    let unlistenStopped;
     const setup = async () => {
       unlistenExit = await listen('monitor-exited', (event) => {
         const payload = event?.payload || {};
@@ -756,11 +757,22 @@ function App() {
         setBackendError(message);
         reportBackendError('Python 子服务异常退出', message, details);
       });
+      unlistenStopped = await listen('monitor-stopped', () => {
+        setBackendStatus('offline');
+        backendStatusRef.current = 'offline';
+        setMonitorPaused(false);
+        setBackendError('');
+        lastBackendErrorRef.current = '';
+        backendStartAtRef.current = null;
+      });
     };
     setup();
     return () => {
       if (unlistenExit) {
         unlistenExit();
+      }
+      if (unlistenStopped) {
+        unlistenStopped();
       }
     };
   }, [reportBackendError, formatErrorDetails]);

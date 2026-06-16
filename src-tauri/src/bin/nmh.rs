@@ -9,13 +9,16 @@
 //!
 //! Protocol:
 //!   - stdin/stdout: Chrome NM protocol (4-byte LE length prefix + JSON)
-//!   - Named Pipe (data): connects to CarbonPaper's NMH pipe (deterministic name from user SID)
+//!   - Named Pipe (data): v2 frame (4-byte LE length prefix + JSON)
 //!   - Named Pipe (cmd):  CarbonPaper connects here to request captures
 
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+const IPC_PROTOCOL_VERSION: u32 = 2;
+const IPC_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() {
     // Compute deterministic pipe name
@@ -174,6 +177,7 @@ fn handle_message(msg: serde_json::Value, pipe_name: &str, auth_token: &str) -> 
 
             let pipe_request = serde_json::json!({
                 "command": "save_extension_screenshot",
+                "ipc_protocol_version": IPC_PROTOCOL_VERSION,
                 "auth_token": auth_token,
                 "image_data": image_data,
                 "image_hash": image_hash,
@@ -195,6 +199,42 @@ fn handle_message(msg: serde_json::Value, pipe_name: &str, auth_token: &str) -> 
             serde_json::json!({"status": "error", "error": format!("Unknown message type: {}", msg_type)})
         }
     }
+}
+
+fn write_pipe_frame<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
+    if body.len() > IPC_MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "IPC request too large: {} bytes (max {})",
+                body.len(),
+                IPC_MAX_MESSAGE_BYTES
+            ),
+        ));
+    }
+
+    writer.write_all(&(body.len() as u32).to_le_bytes())?;
+    writer.write_all(body)
+}
+
+fn read_pipe_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len == 0 || len > IPC_MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Invalid IPC v{} frame length: {} (max {})",
+                IPC_PROTOCOL_VERSION, len, IPC_MAX_MESSAGE_BYTES
+            ),
+        ));
+    }
+
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    Ok(body)
 }
 
 /// Send a JSON request to the Named Pipe and read the response
@@ -219,32 +259,21 @@ fn send_to_pipe(pipe_name: &str, request: &serde_json::Value) -> serde_json::Val
         }
     };
 
-    // Write request
-    if let Err(e) = pipe.write_all(&data) {
+    // Write v2 framed request.
+    if let Err(e) = write_pipe_frame(&mut pipe, &data) {
         return serde_json::json!({"status": "error", "error": format!("Pipe write failed: {}", e)});
     }
 
-    // Shutdown write side so server knows we're done sending
-    // On Windows named pipes, we need to flush and then read
     if let Err(e) = pipe.flush() {
         return serde_json::json!({"status": "error", "error": format!("Pipe flush failed: {}", e)});
     }
 
-    // Read response with timeout
-    let mut response_buf = Vec::new();
-    match pipe.read_to_end(&mut response_buf) {
-        Ok(_) => {}
+    let response_buf = match read_pipe_frame(&mut pipe) {
+        Ok(buf) => buf,
         Err(e) => {
-            // Broken pipe is OK if we already got data
-            if response_buf.is_empty() {
-                return serde_json::json!({"status": "error", "error": format!("Pipe read failed: {}", e)});
-            }
+            return serde_json::json!({"status": "error", "error": format!("Pipe read failed: {}", e)})
         }
-    }
-
-    if response_buf.is_empty() {
-        return serde_json::json!({"status": "error", "error": "Empty response from CarbonPaper"});
-    }
+    };
 
     match serde_json::from_slice(&response_buf) {
         Ok(v) => v,

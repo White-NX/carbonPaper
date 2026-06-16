@@ -248,7 +248,7 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
         {
             Ok(Ok(count)) => count,
             Ok(Err(e)) => {
-                tracing::warn!("[DELETE_QUEUE] OCR batch cleanup failed: {}", e);
+                tracing::debug!("[DELETE_QUEUE] OCR batch cleanup failed: {}", e);
                 0
             }
             Err(e) => {

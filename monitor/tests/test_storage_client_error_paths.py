@@ -1,4 +1,5 @@
 import storage_client as sc
+import struct
 
 
 class FakePyWinError(Exception):
@@ -17,6 +18,20 @@ def _install_win32(monkeypatch, *, create_file, write_file, read_file, flush_fil
     monkeypatch.setattr(sc.win32pipe, "SetNamedPipeHandleState", lambda *_a, **_k: None)
     if sleep_hook is not None:
         monkeypatch.setattr(sc.time, "sleep", sleep_hook)
+
+
+def _framed_reader(payload: bytes):
+    stream = bytearray(struct.pack("<I", len(payload)) + payload)
+
+    def read_file(_h, size):
+        if not stream:
+            return 0, b""
+        n = min(size, len(stream))
+        chunk = bytes(stream[:n])
+        del stream[:n]
+        return 0, chunk
+
+    return read_file
 
 
 def test_send_request_returns_ipc_error_when_connect_fails(monkeypatch):
@@ -54,7 +69,7 @@ def test_send_request_retries_on_pipe_busy(monkeypatch):
         monkeypatch,
         create_file=create_file,
         write_file=lambda _h, payload: (0, len(payload)),
-        read_file=lambda _h, _s: (0, response),
+        read_file=_framed_reader(response),
         flush_file=lambda _h: None,
         sleep_hook=lambda sec: sleeps.append(sec),
     )

@@ -96,7 +96,7 @@ impl StorageState {
                 };
 
                 // Create or reuse page_icon entry
-                match Self::get_or_create_page_icon_id(conn, &plaintext) {
+                match self.get_or_create_page_icon_id(conn, &plaintext) {
                     Ok(icon_id) => {
                         // Update screenshot and NULL out the inline column
                         if let Err(e) = conn.execute(
@@ -209,7 +209,7 @@ impl StorageState {
                 }
 
                 // Create or reuse link_set entry
-                match Self::get_or_create_link_set_id(conn, &links) {
+                match self.get_or_create_link_set_id(conn, &links) {
                     Ok(link_set_id) => {
                         if let Err(e) = conn.execute(
                             "UPDATE screenshots SET link_set_id = ?, visible_links_enc = NULL WHERE id = ?",

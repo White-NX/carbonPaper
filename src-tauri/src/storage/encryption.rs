@@ -1,7 +1,7 @@
 //! Row-level and ChromaDB encryption/decryption helpers.
 
 use crate::credential_manager::{
-    decrypt_row_key_with_cng, decrypt_with_master_key, encrypt_row_key_with_cng,
+    decrypt_row_key_with_cng, decrypt_with_master_key, encrypt_with_exported_public_key,
     encrypt_with_master_key, get_cached_public_key, load_public_key_from_file,
 };
 use rand::RngCore;
@@ -18,6 +18,12 @@ impl StorageState {
         compiler_fence(Ordering::SeqCst);
     }
 
+    pub(crate) fn wrap_row_key_for_storage(&self, row_key: &[u8]) -> Result<Vec<u8>, String> {
+        let public_key = self.get_public_key()?;
+        encrypt_with_exported_public_key(&public_key, row_key)
+            .map_err(|e| format!("Failed to wrap row key with public key: {}", e))
+    }
+
     pub(super) fn encrypt_payload_with_row_key(
         &self,
         plaintext: &[u8],
@@ -28,8 +34,7 @@ impl StorageState {
         let encrypted_data = encrypt_with_master_key(&row_key, plaintext)
             .map_err(|e| format!("Failed to encrypt payload: {}", e))?;
 
-        let encrypted_key = encrypt_row_key_with_cng(&row_key)
-            .map_err(|e| format!("Failed to wrap row key: {}", e))?;
+        let encrypted_key = self.wrap_row_key_for_storage(&row_key)?;
 
         Self::zeroize_bytes(&mut row_key);
         Ok((encrypted_data, encrypted_key))

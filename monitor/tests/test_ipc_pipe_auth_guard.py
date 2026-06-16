@@ -1,4 +1,5 @@
 import monitor.ipc_pipe as ipc_pipe
+import struct
 
 
 def test_authorized_when_matches_expected_pid():
@@ -33,12 +34,13 @@ def test_client_handler_allows_authorized_pid_and_executes_handler(monkeypatch):
     monkeypatch.setattr(ipc_pipe.os, "getppid", lambda: 1111)
     monkeypatch.setattr(
         ipc_pipe,
-        "_read_complete_json_message",
+        "_read_framed_json_message",
         lambda _h: '{"command":"status","_auth_token":"t","_seq_no":1}',
     )
 
     def fake_write(_h, data):
         state["writes"].append(data)
+        return 0, len(data)
 
     monkeypatch.setattr(ipc_pipe.win32file, "WriteFile", fake_write)
     monkeypatch.setattr(ipc_pipe.win32file, "FlushFileBuffers", lambda _h: None)
@@ -54,9 +56,8 @@ def test_client_handler_allows_authorized_pid_and_executes_handler(monkeypatch):
     assert state["request"] == {"command": "status", "_auth_token": "t", "_seq_no": 1}
     assert state["closed"] is True
 
-    decoded_writes = [
-        chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
-        for chunk in state["writes"]
-    ]
-    assert any('"ok": true' in item for item in decoded_writes)
-    assert all("Access denied" not in item for item in decoded_writes)
+    wire = b"".join(state["writes"])
+    frame_len = struct.unpack("<I", wire[:4])[0]
+    decoded = wire[4:4 + frame_len].decode("utf-8")
+    assert '"ok": true' in decoded
+    assert "Access denied" not in decoded

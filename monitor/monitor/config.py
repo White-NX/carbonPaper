@@ -81,6 +81,7 @@ IGNORE_PROTECTED_WINDOWS: bool = True
 # Advanced capture config (synced from Rust CaptureState)
 _capture_on_ocr_busy: bool = False
 _ocr_queue_max_size: int = 1
+_ocr_timeout_secs: int = int(os.environ.get("CARBONPAPER_OCR_TIMEOUT_SECS", "120") or "120")
 
 FILTER_SETTINGS_PATH = os.path.join(get_data_dir(), "monitor_filters.json")
 
@@ -190,11 +191,13 @@ def get_exclusion_settings():
     }
 
 
-def update_advanced_capture_config(capture_on_ocr_busy: bool, ocr_queue_max_size: int):
+def update_advanced_capture_config(capture_on_ocr_busy: bool, ocr_queue_max_size: int, ocr_timeout_secs: int = None):
     """Update advanced capture configuration (called via IPC, takes effect immediately)."""
-    global _capture_on_ocr_busy, _ocr_queue_max_size
+    global _capture_on_ocr_busy, _ocr_queue_max_size, _ocr_timeout_secs
     _capture_on_ocr_busy = capture_on_ocr_busy
     _ocr_queue_max_size = max(1, ocr_queue_max_size)
+    if ocr_timeout_secs is not None:
+        _ocr_timeout_secs = max(30, min(600, int(ocr_timeout_secs)))
 
 
 # Load persisted settings on module import

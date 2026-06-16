@@ -1,5 +1,7 @@
-import pytest
 import json
+import struct
+
+import pytest
 
 import monitor.ipc_pipe as ipc_pipe
 
@@ -10,12 +12,9 @@ class FakePyWinError(Exception):
         self.winerror = winerror
 
 
-def test_read_complete_json_message_handles_more_data(monkeypatch):
-    utf8_tail = bytes([0xE4, 0xB8, 0xAD, 0xE6, 0x96, 0x87, 0x22, 0x7D])
-    chunks = [
-        (234, b'{"command":"search_nl","query":"'),
-        (0, utf8_tail),
-    ]
+def test_read_framed_json_message_handles_chunked_body(monkeypatch):
+    body = json.dumps({"command": "search_nl", "query": "中文"}, ensure_ascii=False).encode("utf-8")
+    chunks = [(0, struct.pack("<I", len(body))), (234, body[:3]), (0, body[3:])]
 
     def fake_read(_handle, _size):
         if not chunks:
@@ -25,47 +24,47 @@ def test_read_complete_json_message_handles_more_data(monkeypatch):
     monkeypatch.setattr(ipc_pipe.pywintypes, "error", FakePyWinError)
     monkeypatch.setattr(ipc_pipe.win32file, "ReadFile", fake_read)
 
-    payload = ipc_pipe._read_complete_json_message(object(), chunk_size=16)
+    payload = ipc_pipe._read_framed_json_message(object(), chunk_size=3)
 
     parsed = json.loads(payload)
     assert parsed["command"] == "search_nl"
     assert parsed["query"] == "\u4e2d\u6587"
 
 
-def test_read_complete_json_message_rejects_oversize(monkeypatch):
+def test_read_framed_json_message_rejects_oversize(monkeypatch):
     def fake_read(_handle, _size):
-        return 0, b"123456"
+        return 0, struct.pack("<I", 6)
 
     monkeypatch.setattr(ipc_pipe.pywintypes, "error", FakePyWinError)
     monkeypatch.setattr(ipc_pipe.win32file, "ReadFile", fake_read)
 
-    with pytest.raises(ValueError, match="Request too large"):
-        ipc_pipe._read_complete_json_message(object(), max_bytes=5)
+    with pytest.raises(ValueError, match="Invalid IPC v2 frame length"):
+        ipc_pipe._read_framed_json_message(object(), max_bytes=5)
 
 
-def test_read_complete_json_message_handles_broken_pipe_after_data(monkeypatch):
-    state = {"called": 0}
+def test_read_framed_json_message_rejects_incomplete_body(monkeypatch):
+    chunks = [(0, struct.pack("<I", 10)), (0, b"abc")]
 
     def fake_read(_handle, _size):
-        state["called"] += 1
-        if state["called"] == 1:
-            return 234, b'{"command":"status"'
-        raise FakePyWinError(109, "broken pipe")
+        if not chunks:
+            return 0, b""
+        return chunks.pop(0)
 
     monkeypatch.setattr(ipc_pipe.pywintypes, "error", FakePyWinError)
     monkeypatch.setattr(ipc_pipe.win32file, "ReadFile", fake_read)
 
-    payload = ipc_pipe._read_complete_json_message(object())
+    with pytest.raises(RuntimeError, match="Incomplete IPC frame"):
+        ipc_pipe._read_framed_json_message(object())
 
-    assert payload == '{"command":"status"'
 
+def test_read_framed_json_message_unexpected_status_code(monkeypatch):
+    chunks = [(0, struct.pack("<I", 4)), (5, b"data")]
 
-def test_read_complete_json_message_unexpected_status_code(monkeypatch):
     def fake_read(_handle, _size):
-        return 5, b"data"
+        return chunks.pop(0)
 
     monkeypatch.setattr(ipc_pipe.pywintypes, "error", FakePyWinError)
     monkeypatch.setattr(ipc_pipe.win32file, "ReadFile", fake_read)
 
     with pytest.raises(RuntimeError, match="unexpected status code"):
-        ipc_pipe._read_complete_json_message(object())
+        ipc_pipe._read_framed_json_message(object())

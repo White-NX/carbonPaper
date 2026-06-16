@@ -5,6 +5,7 @@ import logging
 import pywintypes
 import os
 import time as _time
+import struct
 
 logger = logging.getLogger(__name__)
 import win32pipe
@@ -18,6 +19,7 @@ from typing import Callable
 
 
 MAX_PIPE_MESSAGE_BYTES = 16 * 1024 * 1024
+IPC_PROTOCOL_VERSION = 2
 
 
 def _is_authorized_client_pid(client_pid: int, expected_pid: int | None, curr_ppid: int) -> bool:
@@ -29,44 +31,50 @@ def _is_authorized_client_pid(client_pid: int, expected_pid: int | None, curr_pp
     return False
 
 
-def _read_complete_json_message(handle, chunk_size=1024 * 1024, max_bytes=MAX_PIPE_MESSAGE_BYTES):
-    """Read a complete JSON message from a named pipe handle.
+def _read_framed_json_message(handle, chunk_size=1024 * 1024, max_bytes=MAX_PIPE_MESSAGE_BYTES):
+    """Read a v2 length-prefixed JSON message."""
+    try:
+        resp_code, first = win32file.ReadFile(handle, 4)
+    except pywintypes.error as e:
+        if getattr(e, 'winerror', None) == 109:
+            return None
+        raise
 
-    Supports PIPE_TYPE_MESSAGE fragmentation via ERROR_MORE_DATA (234).
-    Returns decoded payload string, or None if no data was read.
-    """
-    chunks = []
-    total = 0
-
-    while True:
-        try:
-            resp_code, data = win32file.ReadFile(handle, chunk_size)
-        except pywintypes.error as e:
-            if getattr(e, 'winerror', None) == 109:  # ERROR_BROKEN_PIPE
-                break
-            raise
-
-        if data:
-            chunks.append(data)
-            total += len(data)
-            if total > max_bytes:
-                raise ValueError(f"Request too large (max {max_bytes} bytes)")
-
-        # 234 means there is still unread remainder for this message.
-        if resp_code == 234:
-            continue
-        if resp_code == 0:
-            break
-
-        raise RuntimeError(f"ReadFile returned unexpected status code: {resp_code}")
-
-    if not chunks:
+    if not first:
         return None
 
-    payload = b"".join(chunks).decode('utf-8').strip()
-    if not payload:
-        return None
-    return payload
+    if len(first) == 4:
+        frame_len = struct.unpack('<I', first)[0]
+        if 0 < frame_len <= max_bytes:
+            body = bytearray()
+            remaining = frame_len
+            while remaining:
+                resp_code, chunk = win32file.ReadFile(handle, min(chunk_size, remaining))
+                if chunk:
+                    body.extend(chunk)
+                    remaining -= len(chunk)
+                if resp_code not in (0, 234):
+                    raise RuntimeError(f"ReadFile returned unexpected status code: {resp_code}")
+                if not chunk:
+                    break
+            if len(body) != frame_len:
+                raise RuntimeError(f"Incomplete IPC frame: expected {frame_len}, got {len(body)}")
+            return bytes(body).decode('utf-8').strip()
+    padded = first.ljust(4, b'\0')
+    frame_len = struct.unpack('<I', padded)[0]
+    raise ValueError(f"Invalid IPC v{IPC_PROTOCOL_VERSION} frame length: {frame_len}")
+
+
+def _write_framed_json(handle, payload: bytes):
+    if len(payload) > MAX_PIPE_MESSAGE_BYTES:
+        raise ValueError(f"Response too large (max {MAX_PIPE_MESSAGE_BYTES} bytes)")
+    win32file.WriteFile(handle, struct.pack('<I', len(payload)))
+    offset = 0
+    while offset < len(payload):
+        _, written = win32file.WriteFile(handle, payload[offset:offset + 64 * 1024])
+        if not isinstance(written, int) or written <= 0:
+            raise RuntimeError("Named pipe write returned no progress")
+        offset += written
 
 
 def _make_security_attributes_for_current_user():
@@ -173,18 +181,18 @@ class _NamedPipeServer(threading.Thread):
             if not is_valid:
                 logger.warning(f"[SECURITY] Rejecting PID {client_pid}. (Expected: {expected_pid}, PPID: {curr_ppid})")
                 error_resp = json.dumps({"error": f"Access denied: PID {client_pid} is not authorized"}).encode('utf-8')
-                win32file.WriteFile(handle, error_resp)
+                _write_framed_json(handle, error_resp)
                 win32file.FlushFileBuffers(handle)
                 return
 
             logger.debug(f"IPC client verified: PID {client_pid}")
             # 2. Read Request
             try:
-                payload = _read_complete_json_message(handle)
+                payload = _read_framed_json_message(handle)
             except ValueError as e:
                 logger.error(str(e))
                 error_resp = json.dumps({"error": str(e)}).encode('utf-8')
-                win32file.WriteFile(handle, error_resp)
+                _write_framed_json(handle, error_resp)
                 win32file.FlushFileBuffers(handle)
                 return
             except pywintypes.error as e:
@@ -200,7 +208,7 @@ class _NamedPipeServer(threading.Thread):
             except json.JSONDecodeError:
                 logger.error(f"Invalid JSON: {payload[:100]}")
                 error_resp = json.dumps({"error": "Invalid JSON in request"}).encode('utf-8')
-                win32file.WriteFile(handle, error_resp)
+                _write_framed_json(handle, error_resp)
                 win32file.FlushFileBuffers(handle)
                 return
 
@@ -239,8 +247,18 @@ class _NamedPipeServer(threading.Thread):
 
             write_started = _time.perf_counter()
             resp_str = json.dumps(result, default=json_serial)
-            win32file.WriteFile(handle, resp_str.encode('utf-8'))
-            win32file.FlushFileBuffers(handle)
+            try:
+                _write_framed_json(handle, resp_str.encode('utf-8'))
+                win32file.FlushFileBuffers(handle)
+            except pywintypes.error as e:
+                if getattr(e, 'winerror', None) in (109, 232):
+                    logger.debug(
+                        "[DIAG:PIPE] client closed before response command=%s winerror=%s",
+                        command,
+                        e.winerror,
+                    )
+                    return
+                raise
             if is_process_ocr:
                 logger.debug(
                     '[DIAG:PIPE] response sent command=%s write=%.3fs total=%.3fs resp_bytes=%s',
@@ -280,8 +298,10 @@ def send_ipc_request(pipe_name, req):
             0, None
         )
         win32pipe.SetNamedPipeHandleState(handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
-        win32file.WriteFile(handle, json.dumps(req).encode('utf-8'))
-        payload = _read_complete_json_message(handle)
+        framed_req = dict(req)
+        framed_req['ipc_protocol_version'] = IPC_PROTOCOL_VERSION
+        _write_framed_json(handle, json.dumps(framed_req).encode('utf-8'))
+        payload = _read_framed_json_message(handle)
         return json.loads(payload) if payload else {}
     finally:
         try:
