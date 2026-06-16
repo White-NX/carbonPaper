@@ -33,7 +33,7 @@ function formatAssignedAt(ts) {
   return d.toLocaleString();
 }
 
-export default function SmartClustersView({ backendOnline, onSelectScreenshot }) {
+export default function SmartClustersView({ backendOnline, onSelectScreenshot, onOpenSnapshotPreview }) {
   const { t } = useTranslation();
   const [clusters, setClusters] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -318,71 +318,99 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot })
         </div>
 
         {/* Detail pane */}
-        <div className="flex-1 overflow-y-auto">
-          {selected ? (
-            <div className="p-4 space-y-3">
-              <div className="flex items-start justify-between gap-2">
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm text-ide-text font-medium flex items-center gap-2">
-                    <div
-                      className="w-2 h-2 rounded-full"
-                      style={{ backgroundColor: selected.dominant_color || '#6b7280' }}
-                    />
-                    {selected.anchor_text}
-                    <span className={`px-1.5 py-0.5 rounded text-[10px] ${
-                      selected.enabled
-                        ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                        : 'bg-ide-bg text-ide-muted border border-ide-border'
-                    }`}>
-                      {selected.enabled ? t('smartClusters.enabled', '已启用') : t('smartClusters.paused', '已暂停')}
+        <div className="relative flex-1 min-h-0 overflow-hidden">
+          <div className="h-full overflow-y-auto">
+            {selected ? (
+              <div className="p-4 space-y-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-ide-text font-medium flex items-center gap-2">
+                      <div
+                        className="w-2 h-2 rounded-full"
+                        style={{ backgroundColor: selected.dominant_color || '#6b7280' }}
+                      />
+                      {selected.anchor_text}
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] ${
+                        selected.enabled
+                          ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                          : 'bg-ide-bg text-ide-muted border border-ide-border'
+                      }`}>
+                        {selected.enabled ? t('smartClusters.enabled', '已启用') : t('smartClusters.paused', '已暂停')}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-ide-muted mt-1 flex items-center gap-3">
+                      <span>{t('smartClusters.threshold', '阈值:')} <span className="font-mono text-ide-text">{(selected.threshold ?? 0).toFixed(2)}</span></span>
+                      <span>·</span>
+                      <span>{t('smartClusters.archived', '已归档:')} <span className="font-mono text-ide-text">{selected.assignment_count ?? 0}</span> {t('smartClusters.snapshotsCount', '张快照')}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Assignments */}
+                {assignments.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center h-40 text-sm text-ide-muted gap-2">
+                    <Clock className="w-6 h-6 opacity-40" />
+                    <span>{t('smartClusters.noAssignments', '暂无已分配的快照')}</span>
+                    <span className="text-[11px] opacity-70">
+                      {t('smartClusters.idleProcessingHint', '后台工作线程会在系统空闲时陆续处理待评分队列')}
                     </span>
                   </div>
-                  <div className="text-[11px] text-ide-muted mt-1 flex items-center gap-3">
-                    <span>{t('smartClusters.threshold', '阈值:')} <span className="font-mono text-ide-text">{(selected.threshold ?? 0).toFixed(2)}</span></span>
-                    <span>·</span>
-                    <span>{t('smartClusters.archived', '已归档:')} <span className="font-mono text-ide-text">{selected.assignment_count ?? 0}</span> {t('smartClusters.snapshotsCount', '张快照')}</span>
+                ) : (
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+                    {assignments.map((s) => (
+                      <ThumbnailCard
+                        key={s.screenshot_id}
+                        sourceType="clusters"
+                        item={{
+                          screenshot_id: s.screenshot_id,
+                          image_path: s.image_path,
+                          process_name: s.process_name,
+                          window_title: s.window_title,
+                          category: s.category,
+                          created_at: s.created_at,
+                          assigned_at: s.assigned_at,
+                          rerank_score: s.rerank_score,
+                        }}
+                        preloadedSrc={thumbnailCache[s.screenshot_id] || null}
+                        onSelect={(payload) => {
+                          const enriched = {
+                            ...payload,
+                            assigned_at: s.assigned_at,
+                            rerank_score: s.rerank_score,
+                          };
+                          onSelectScreenshot?.(enriched);
+                        }}
+                        onOpenFloatingPreview={onOpenSnapshotPreview
+                          ? (payload) => {
+                            const enriched = {
+                              ...payload,
+                              assigned_at: s.assigned_at,
+                              rerank_score: s.rerank_score,
+                            };
+                            onOpenSnapshotPreview(enriched, {
+                              thumbnailSrc: thumbnailCache[s.screenshot_id] || null,
+                              sourceLabel: t('smartClusters.title', '智能聚类'),
+                              sourceDetail: selected.anchor_text,
+                              sourceType: 'smart-cluster',
+                            });
+                          }
+                          : undefined}
+                        footerText={s.rerank_score !== null && s.rerank_score !== undefined
+                          ? `score ${s.rerank_score.toFixed(2)}`
+                          : null}
+                        footerPersistent={false}
+                      />
+                    ))}
                   </div>
-                </div>
+                )}
               </div>
+            ) : (
+              <div className="flex items-center justify-center h-full text-sm text-ide-muted">
+                {t('smartClusters.selectClusterToView', '选择左侧聚类查看已归档的快照')}
+              </div>
+            )}
+          </div>
 
-              {/* Assignments */}
-              {assignments.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-40 text-sm text-ide-muted gap-2">
-                  <Clock className="w-6 h-6 opacity-40" />
-                  <span>{t('smartClusters.noAssignments', '暂无已分配的快照')}</span>
-                  <span className="text-[11px] opacity-70">
-                    {t('smartClusters.idleProcessingHint', '后台工作线程会在系统空闲时陆续处理待评分队列')}
-                  </span>
-                </div>
-              ) : (
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-                  {assignments.map((s) => (
-                    <ThumbnailCard
-                      key={s.screenshot_id}
-                      item={{
-                        screenshot_id: s.screenshot_id,
-                        image_path: s.image_path,
-                        process_name: s.process_name,
-                        window_title: s.window_title,
-                        category: s.category,
-                        created_at: s.created_at,
-                      }}
-                      preloadedSrc={thumbnailCache[s.screenshot_id] || null}
-                      onSelect={(payload) => onSelectScreenshot?.(payload)}
-                      footerText={s.rerank_score !== null && s.rerank_score !== undefined
-                        ? `score ${s.rerank_score.toFixed(2)}`
-                        : null}
-                      footerPersistent={false}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="flex items-center justify-center h-full text-sm text-ide-muted">
-              {t('smartClusters.selectClusterToView', '选择左侧聚类查看已归档的快照')}
-            </div>
-          )}
         </div>
       </div>
     </div>

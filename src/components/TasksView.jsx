@@ -30,7 +30,7 @@ function formatDuration(startTs, endTs) {
 
 // ── Main TasksView ─────────────────────────────────────────────────────
 
-export default function TasksView({ backendOnline, onSelectScreenshot }) {
+export default function TasksView({ backendOnline, onSelectScreenshot, onOpenSnapshotPreview }) {
   const { t } = useTranslation();
   const [tasks, setTasks] = useState([]);
   const [selectedTask, setSelectedTask] = useState(null);
@@ -404,6 +404,7 @@ export default function TasksView({ backendOnline, onSelectScreenshot }) {
                   {screenshots.map((s, index) => (
                     <ThumbnailCard
                       key={s.screenshot_id || index}
+                      sourceType="tasks"
                       item={{
                         screenshot_id: s.screenshot_id,
                         image_path: s.image_path,
@@ -414,6 +415,16 @@ export default function TasksView({ backendOnline, onSelectScreenshot }) {
                       }}
                       preloadedSrc={thumbnailCache[s.screenshot_id] || null}
                       onSelect={(payload) => onSelectScreenshot?.(payload)}
+                      onOpenFloatingPreview={onOpenSnapshotPreview
+                        ? (payload) => {
+                          onOpenSnapshotPreview(payload, {
+                            thumbnailSrc: thumbnailCache[s.screenshot_id] || null,
+                            sourceLabel: t('snapshotPreview.sources.tasks'),
+                            sourceDetail: selectedTask.label || selectedTask.auto_label || t('tasks.unnamed'),
+                            sourceType: 'task',
+                          });
+                        }
+                        : undefined}
                     />
                   ))}
                 </div>

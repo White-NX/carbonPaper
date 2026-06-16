@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Search, SlidersHorizontal, Filter, CalendarRange, X, Loader2, RefreshCw, Type, Image as ImageIcon, Tag } from 'lucide-react';
+import { Search, SlidersHorizontal, Filter, CalendarRange, X, Loader2, RefreshCw, Type, Image as ImageIcon, Tag, Maximize2, Eye } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -46,7 +46,7 @@ function highlightMatches(text, tokens) {
   );
 }
 
-function ResultPreview({ item, mode, onSelect, queryTokens, preloadedSrc = null }) {
+function ResultPreview({ item, mode, onSelect, onOpenFloatingPreview, queryTokens, preloadedSrc = null }) {
   const { t } = useTranslation();
   const [imageSrc, setImageSrc] = useState(preloadedSrc);
   const [loadingImage, setLoadingImage] = useState(!preloadedSrc);
@@ -108,21 +108,41 @@ function ResultPreview({ item, mode, onSelect, queryTokens, preloadedSrc = null 
     return String(candidate);
   }, [createdAt]);
 
+  const normalizedItem = {
+    ...item,
+    id: item.screenshot_id || item.id,
+    path: item.image_path || item.metadata?.image_path || item.path,
+  };
+
+  const cardClickBehavior = localStorage.getItem('cardClickBehavior_search') || 'preview';
+  const isStandaloneDefault = cardClickBehavior === 'standalone' && !!onOpenFloatingPreview;
+
+  const handleSelect = (event) => {
+    event.stopPropagation();
+    if (isStandaloneDefault) {
+      onOpenFloatingPreview(normalizedItem);
+    } else {
+      onSelect?.(normalizedItem);
+    }
+  };
+
+  const handleAlternateAction = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (isStandaloneDefault) {
+      onSelect?.(normalizedItem);
+    } else {
+      onOpenFloatingPreview?.(normalizedItem);
+    }
+  };
+
   return (
-    <button
-      className="w-full text-left border-b border-ide-border hover:bg-ide-hover/40 transition-colors"
-      onClick={(event) => { 
-        event.stopPropagation(); 
-        // Normalize the item to ensure 'path' field is set for App.jsx compatibility
-        const normalizedItem = {
-          ...item,
-          id: item.screenshot_id || item.id,
-          path: item.image_path || item.metadata?.image_path || item.path,
-        };
-        onSelect(normalizedItem); 
-      }}
-    >
-      <div className="flex gap-4 p-3">
+    <div className="group relative w-full border-b border-ide-border transition-colors hover:bg-ide-hover/40 focus-within:ring-2 focus-within:ring-inset focus-within:ring-ide-accent/60">
+      <button
+        type="button"
+        className="flex w-full gap-4 p-3 text-left focus-visible:outline-none"
+        onClick={handleSelect}
+      >
         <div className="w-36 h-24 rounded border border-ide-border overflow-hidden bg-black flex items-center justify-center text-ide-muted text-xs">
           {loadingImage && <Loader2 className="w-4 h-4 animate-spin" />}
           {!loadingImage && imageSrc && (
@@ -160,8 +180,19 @@ function ResultPreview({ item, mode, onSelect, queryTokens, preloadedSrc = null 
             </div>
           )}
         </div>
-      </div>
-    </button>
+      </button>
+      {onOpenFloatingPreview && (
+        <button
+          type="button"
+          className="absolute left-[122px] top-[18px] z-10 rounded border border-ide-border bg-ide-panel/95 p-1.5 text-ide-muted opacity-0 shadow-sm transition hover:bg-ide-hover hover:text-ide-text focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/70 group-hover:opacity-100"
+          onClick={handleAlternateAction}
+          title={isStandaloneDefault ? t('previewAction.openMainPreview') : t('previewAction.openFloatingPreview')}
+          aria-label={isStandaloneDefault ? t('previewAction.openMainPreview') : t('previewAction.openFloatingPreview')}
+        >
+          {isStandaloneDefault ? <Eye className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -308,7 +339,7 @@ function CategoryFilter({ categories, selected, onChange }) {
   );
 }
 
-export function AdvancedSearch({ active, searchParams, onSelectResult, searchMode, onSearchModeChange, backendOnline }) {
+export function AdvancedSearch({ active, searchParams, onSelectResult, onOpenSnapshotPreview, searchMode, onSearchModeChange, backendOnline }) {
   const [query, setQuery] = useState(searchParams?.query || '');
   const [mode, setMode] = useState(searchMode ?? (searchParams?.mode || 'ocr'));
   const [results, setResults] = useState([]);
@@ -611,6 +642,12 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
     setEndDate('');
   };
 
+  const searchSourceDetail = useMemo(() => {
+    const modeLabel = mode === 'nl' ? t('advancedSearch.modes.nl') : t('advancedSearch.modes.ocr');
+    const trimmed = query.trim();
+    return trimmed ? `${modeLabel} · ${trimmed}` : modeLabel;
+  }, [mode, query, t]);
+
   const [isMigrating, setIsMigrating] = useState(false);
   useEffect(() => {
     let mounted = true;
@@ -773,7 +810,19 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
               <ThumbnailCard
                 key={`${item.id || item.image_path || index}-${index}`}
                 item={item}
+                sourceType="search"
                 onSelect={(payload) => onSelectResult?.(payload)}
+                onOpenFloatingPreview={onOpenSnapshotPreview
+                  ? (payload) => {
+                    const id = payload.screenshot_id ?? payload.metadata?.screenshot_id;
+                    onOpenSnapshotPreview(payload, {
+                      thumbnailSrc: thumbnailCache[id] || null,
+                      sourceLabel: t('advancedSearch.title'),
+                      sourceDetail: searchSourceDetail,
+                      sourceType: 'advanced-search',
+                    });
+                  }
+                  : undefined}
                 preloadedSrc={thumbnailCache[item.screenshot_id ?? item.metadata?.screenshot_id] || null}
               />
             ))}
@@ -785,8 +834,20 @@ export function AdvancedSearch({ active, searchParams, onSelectResult, searchMod
                 <ResultPreview
                   item={item}
                   mode={mode}
+                  sourceType="search"
                   queryTokens={queryTokens}
                   onSelect={(payload) => onSelectResult?.(payload)}
+                  onOpenFloatingPreview={onOpenSnapshotPreview
+                    ? (payload) => {
+                      const id = payload.screenshot_id ?? payload.metadata?.screenshot_id;
+                      onOpenSnapshotPreview(payload, {
+                        thumbnailSrc: thumbnailCache[id] || null,
+                        sourceLabel: t('advancedSearch.title'),
+                        sourceDetail: searchSourceDetail,
+                        sourceType: 'advanced-search',
+                      });
+                    }
+                    : undefined}
                   preloadedSrc={thumbnailCache[item.screenshot_id ?? item.metadata?.screenshot_id] || null}
                 />
               </li>

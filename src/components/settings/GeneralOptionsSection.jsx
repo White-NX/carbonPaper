@@ -1,9 +1,61 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Circle } from 'lucide-react';
+import { Circle, ChevronDown } from 'lucide-react';
 import { getLightweightConfig, setLightweightConfig, switchToLightweightMode } from '../../lib/lightweight_api';
+
+function DropdownSelect({ value, onChange, options }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (ref.current && !ref.current.contains(event.target)) {
+        setOpen(false);
+      }
+    };
+    if (open) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [open]);
+
+  const selectedOption = options.find((opt) => opt.value === value) || options[0];
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-2 px-3 py-1.5 bg-ide-panel border border-ide-border rounded-lg text-xs text-ide-text hover:bg-ide-hover transition-colors min-w-[160px]"
+      >
+        <span className="flex-1 text-left">{selectedOption.label}</span>
+        <ChevronDown className={`w-3.5 h-3.5 text-ide-muted transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1.5 w-44 bg-ide-panel border border-ide-border rounded-xl shadow-xl z-50 overflow-hidden">
+          {options.map((opt) => (
+            <button
+              type="button"
+              key={opt.value}
+              onClick={() => {
+                setOpen(false);
+                onChange(opt.value);
+              }}
+              className={`w-full px-4 py-2.5 text-left hover:bg-ide-hover transition-colors flex items-center justify-between ${opt.value === value ? 'bg-ide-accent/10' : ''}`}
+            >
+              <span className="text-xs text-ide-text">{opt.label}</span>
+              {opt.value === value && (
+                <div className="w-1.5 h-1.5 rounded-full bg-ide-accent shrink-0" />
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function GeneralOptionsSection({
   lowResolutionAnalysis,
@@ -28,6 +80,10 @@ export default function GeneralOptionsSection({
     auto_lightweight_enabled: false,
     auto_lightweight_delay_minutes: 5,
   });
+
+  const [cardClickBehaviorSearch, setCardClickBehaviorSearch] = useState(() => localStorage.getItem('cardClickBehavior_search') || 'preview');
+  const [cardClickBehaviorTasks, setCardClickBehaviorTasks] = useState(() => localStorage.getItem('cardClickBehavior_tasks') || 'standalone');
+  const [cardClickBehaviorClusters, setCardClickBehaviorClusters] = useState(() => localStorage.getItem('cardClickBehavior_clusters') || 'standalone');
 
   useEffect(() => {
     getLightweightConfig().then(setLightweightConfigState).catch(console.error);
@@ -303,6 +359,68 @@ export default function GeneralOptionsSection({
           >
             {t('settings.general.lightweightMode.switchNow.button')}
           </button>
+        </div>
+
+        {/* Card Click Behavior */}
+        <div className="w-full h-px bg-ide-border/50" />
+
+        <div className="space-y-4">
+          <div>
+            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.cardClickBehavior.label')}</label>
+            <p className="text-xs text-ide-muted">
+              {t('settings.general.cardClickBehavior.description')}
+            </p>
+          </div>
+
+          <div className="space-y-3 pl-4 border-l-2 border-ide-border">
+            {/* Advanced Search */}
+            <div className="flex items-center justify-between gap-4">
+              <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.searchLabel')}</label>
+              <DropdownSelect
+                value={cardClickBehaviorSearch}
+                onChange={(val) => {
+                  setCardClickBehaviorSearch(val);
+                  localStorage.setItem('cardClickBehavior_search', val);
+                }}
+                options={[
+                  { value: 'preview', label: t('settings.general.cardClickBehavior.preview') },
+                  { value: 'standalone', label: t('settings.general.cardClickBehavior.standalone') },
+                ]}
+              />
+            </div>
+
+            {/* Tasks */}
+            <div className="flex items-center justify-between gap-4">
+              <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.tasksLabel')}</label>
+              <DropdownSelect
+                value={cardClickBehaviorTasks}
+                onChange={(val) => {
+                  setCardClickBehaviorTasks(val);
+                  localStorage.setItem('cardClickBehavior_tasks', val);
+                }}
+                options={[
+                  { value: 'preview', label: t('settings.general.cardClickBehavior.preview') },
+                  { value: 'standalone', label: t('settings.general.cardClickBehavior.standalone') },
+                ]}
+              />
+            </div>
+
+            {/* Smart Clusters */}
+            <div className="flex items-center justify-between gap-4">
+              <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.clustersLabel')}</label>
+              <DropdownSelect
+                value={cardClickBehaviorClusters}
+                onChange={(val) => {
+                  setCardClickBehaviorClusters(val);
+                  localStorage.setItem('cardClickBehavior_clusters', val);
+                }}
+                options={[
+                  { value: 'preview', label: t('settings.general.cardClickBehavior.preview') },
+                  { value: 'standalone', label: t('settings.general.cardClickBehavior.standalone') },
+                ]}
+              />
+            </div>
+          </div>
         </div>
 
       </div>
