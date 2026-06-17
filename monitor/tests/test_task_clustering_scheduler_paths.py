@@ -1,3 +1,5 @@
+import numpy as np
+
 import task_clustering as tc
 
 
@@ -111,4 +113,49 @@ def test_manual_auto_clustering_without_range_prompts_for_large_input(monkeypatc
 
     assert result["status"] == "needs_user_choice"
     assert result["n_total"] == threshold
+    assert result["reason"] == "large_range"
+
+
+def test_manual_auto_clustering_rechecks_prompt_after_backfill(monkeypatch):
+    manager = tc.HotColdManager(None)
+    threshold = 3
+    vectors = np.zeros((threshold + 1, tc.EMBEDDING_DIM), dtype=np.float32)
+    ids = [str(i) for i in range(threshold + 1)]
+    metas = [{"timestamp": float(i)} for i in range(threshold + 1)]
+
+    class Embedder:
+        def load(self):
+            return None
+
+        def unload(self):
+            return None
+
+    class Engine:
+        def run(self, *_args, **_kwargs):
+            raise AssertionError("full clustering should wait for user choice")
+
+        def run_sampled_assignment(self, *_args, **_kwargs):
+            raise AssertionError("batched clustering should wait for user choice")
+
+    monkeypatch.setattr(tc, "MANUAL_CLUSTERING_PROMPT_THRESHOLD", threshold)
+    monkeypatch.setattr(tc, "memory_status_for_clustering", lambda _count: {"low_memory": False})
+    monkeypatch.setattr(
+        manager,
+        "estimate_clustering_inputs",
+        lambda start_time=None, end_time=None: {
+            "count": threshold - 1,
+            "memory": {"low_memory": False},
+        },
+    )
+    monkeypatch.setattr(manager, "get_hot_vectors", lambda: (vectors[:0], [], []))
+    monkeypatch.setattr(manager, "_backfill_from_screenshots", lambda start_time=None, end_time=None: threshold + 1)
+    monkeypatch.setattr(manager, "get_all_hot_vectors", lambda: (vectors, ids, metas))
+    manager._embedder = Embedder()
+    manager._engine = Engine()
+
+    result = manager.run_clustering(clustering_mode="auto", manual=True)
+
+    assert result["status"] == "needs_user_choice"
+    assert result["n_total"] == threshold + 1
+    assert result["estimate"]["count"] == threshold + 1
     assert result["reason"] == "large_range"

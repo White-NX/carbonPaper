@@ -3,6 +3,22 @@ import { runClustering, saveClusteringResults } from '../lib/task_api';
 
 const DEFAULT_DELAY_MS = 60_000;
 
+function formatEstimatedGb(memory = {}) {
+  return memory.estimated_peak_bytes
+    ? (memory.estimated_peak_bytes / (1024 ** 3)).toFixed(1)
+    : '—';
+}
+
+function buildResourceChoicePrompt(result = {}) {
+  const count = result?.estimate?.count ?? result?.n_total ?? 0;
+  const memory = result?.estimate?.memory || {};
+  const reason = result.reason === 'low_memory'
+    ? '当前可用内存不足，完整聚类可能明显变慢或失败'
+    : '可聚类快照数量较多';
+
+  return `全部可聚类快照约 ${count} 张快照。${reason}。建议使用降级分批模式；这会先对样本聚类，再分批归属剩余快照。预计峰值内存约 ${formatEstimatedGb(memory)} GB。\n\n选择“确定”使用降级分批；选择“取消”继续全量聚类。`;
+}
+
 function buildTaskRequests(clusters) {
   return clusters.map((cluster) => ({
     label: cluster.label || null,
@@ -14,6 +30,13 @@ function buildTaskRequests(clusters) {
     dominant_process: cluster.dominant_process || null,
     dominant_category: cluster.dominant_category || null,
   }));
+}
+
+function buildCompletionMessage(result, taskCount) {
+  if (!result?.degraded) {
+    return `已将历史快照归纳为 ${taskCount} 个任务，可在"任务"面板中查看。`;
+  }
+  return `已将历史快照归纳为 ${taskCount} 个任务，可在"任务"面板中查看。本次使用降级分批模式：样本 ${result.sample_size ?? 0} 张，分批归属 ${result.assigned_count ?? 0} 张。`;
 }
 
 export function useDelayedClusteringSetupRunner({
@@ -49,7 +72,17 @@ export function useDelayedClusteringSetupRunner({
       });
 
       try {
-        const result = await runClustering();
+        let result = await runClustering({ manual: true });
+
+        if (result?.status === 'needs_user_choice') {
+          const useBatched = typeof window !== 'undefined' && typeof window.confirm === 'function'
+            ? window.confirm(buildResourceChoicePrompt(result))
+            : true;
+          result = await runClustering({
+            manual: true,
+            clusteringMode: useBatched ? 'batched' : 'full',
+          });
+        }
 
         if (result?.status === 'already_running') {
           pushNotification({
@@ -69,7 +102,7 @@ export function useDelayedClusteringSetupRunner({
             id: `clustering-done-${Date.now()}`,
             type: 'success',
             title: '任务聚类完成',
-            message: `已将历史快照归纳为 ${tasks.length} 个任务，可在"任务"面板中查看。`,
+            message: buildCompletionMessage(result, tasks.length),
             timestamp: Date.now(),
           });
           return;
@@ -79,7 +112,9 @@ export function useDelayedClusteringSetupRunner({
           id: `clustering-empty-${Date.now()}`,
           type: 'info',
           title: '任务聚类完成',
-          message: '未发现可归类的任务。快照数量可能不足，系统将在积累更多数据后自动尝试。',
+          message: result?.degraded
+            ? `未发现可归类的任务。本次使用降级分批模式：样本 ${result.sample_size ?? 0} 张，分批归属 ${result.assigned_count ?? 0} 张。`
+            : '未发现可归类的任务。快照数量可能不足，系统将在积累更多数据后自动尝试。',
           timestamp: Date.now(),
         });
       } catch (err) {

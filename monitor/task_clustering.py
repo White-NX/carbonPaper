@@ -942,23 +942,29 @@ class HotColdManager:
             estimated_count = int(estimate.get("count", 0) or 0)
             memory_status = estimate.get("memory") or {}
 
-            if (
-                manual
-                and clustering_mode == "auto"
-                and estimated_count >= MANUAL_CLUSTERING_PROMPT_THRESHOLD
-            ):
-                reason = "low_memory" if memory_status.get("low_memory") else "large_range"
+            def _needs_user_choice_response(count: int, memory: Dict[str, Any], source_estimate: Dict[str, Any]) -> Dict[str, Any]:
+                reason = "low_memory" if memory.get("low_memory") else "large_range"
+                choice_estimate = dict(source_estimate or {})
+                choice_estimate["count"] = count
+                choice_estimate["memory"] = memory
                 return {
                     "clusters": [],
                     "noise_ids": [],
                     "n_clusters": 0,
                     "n_noise": 0,
-                    "n_total": estimated_count,
+                    "n_total": count,
                     "status": "needs_user_choice",
                     "reason": reason,
                     "degrade_mode": "sample_assign",
-                    "estimate": estimate,
+                    "estimate": choice_estimate,
                 }
+
+            if (
+                manual
+                and clustering_mode == "auto"
+                and estimated_count >= MANUAL_CLUSTERING_PROMPT_THRESHOLD
+            ):
+                return _needs_user_choice_response(estimated_count, memory_status, estimate)
 
             try:
                 # Fetch vectors
@@ -988,6 +994,13 @@ class HotColdManager:
 
                 n_total = len(ids)
                 memory_status = memory_status_for_clustering(n_total)
+                if (
+                    manual
+                    and clustering_mode == "auto"
+                    and n_total >= MANUAL_CLUSTERING_PROMPT_THRESHOLD
+                ):
+                    return _needs_user_choice_response(n_total, memory_status, estimate)
+
                 use_approximate = clustering_mode == "batched"
                 if (
                     clustering_mode == "auto"
