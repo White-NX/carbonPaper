@@ -99,6 +99,8 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let classification_enabled =
         registry_config::get_bool("classification_enabled").unwrap_or(true);
     let smart_cluster_enabled = registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
+    let clustering_allow_full_low_memory =
+        registry_config::get_bool("clustering_allow_full_low_memory").unwrap_or(false);
     let network_enabled = registry_config::get_bool("network_enabled").unwrap_or(true);
     let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
 
@@ -116,6 +118,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "clustering_enabled": clustering_enabled,
         "classification_enabled": classification_enabled,
         "smart_cluster_enabled": smart_cluster_enabled,
+        "clustering_allow_full_low_memory": clustering_allow_full_low_memory,
         "network_enabled": network_enabled,
         "use_onnx": use_onnx,
     }))
@@ -171,6 +174,12 @@ pub fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
         .and_then(|v| v.as_bool())
     {
         registry_config::set_bool("smart_cluster_enabled", v)?;
+    }
+    if let Some(v) = config
+        .get("clustering_allow_full_low_memory")
+        .and_then(|v| v.as_bool())
+    {
+        registry_config::set_bool("clustering_allow_full_low_memory", v)?;
     }
     if let Some(v) = config.get("network_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("network_enabled", v)?;

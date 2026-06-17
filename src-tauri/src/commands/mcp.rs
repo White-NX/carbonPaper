@@ -1,5 +1,6 @@
 use crate::credential_manager::CredentialManagerState;
 use crate::mcp_server;
+use crate::mcp_token;
 use crate::sensitive_filter::{self, SensitiveFilterState};
 use crate::storage::StorageState;
 use std::sync::Arc;
@@ -24,11 +25,11 @@ pub async fn mcp_set_enabled(
         let mut policy = storage_state.load_policy()?;
         let existing_token = policy.get("mcp_token_encrypted").and_then(|v| v.as_str());
         let (token_plaintext, is_new_token) = if let Some(encrypted_b64) = existing_token {
-            let token = mcp_server::decrypt_token(&credential_state, encrypted_b64)?;
+            let token = mcp_token::decrypt_token(&credential_state, encrypted_b64)?;
             (token, false)
         } else {
-            let token = mcp_server::generate_token();
-            let encrypted_b64 = mcp_server::encrypt_token(&credential_state, &token)?;
+            let token = mcp_token::generate_token();
+            let encrypted_b64 = mcp_token::encrypt_token(&credential_state, &token)?;
             policy_as_object_mut(&mut policy)?.insert(
                 "mcp_token_encrypted".into(),
                 serde_json::json!(encrypted_b64),
@@ -48,7 +49,7 @@ pub async fn mcp_set_enabled(
         }
         storage_state.save_policy(&policy)?;
 
-        let token_hash = mcp_server::hash_token(&token_plaintext);
+        let token_hash = mcp_token::hash_token(&token_plaintext);
         mcp_state.set_token_hash(token_hash);
         mcp_server::start_server(app, port, token_hash).await?;
 
@@ -94,8 +95,8 @@ pub async fn mcp_reset_token(
     storage_state: tauri::State<'_, Arc<StorageState>>,
     mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
 ) -> Result<serde_json::Value, String> {
-    let token = mcp_server::generate_token();
-    let encrypted_b64 = mcp_server::encrypt_token(&credential_state, &token)?;
+    let token = mcp_token::generate_token();
+    let encrypted_b64 = mcp_token::encrypt_token(&credential_state, &token)?;
 
     let mut policy = storage_state.load_policy()?;
     policy_as_object_mut(&mut policy)?.insert(
@@ -104,7 +105,7 @@ pub async fn mcp_reset_token(
     );
     storage_state.save_policy(&policy)?;
 
-    let token_hash = mcp_server::hash_token(&token);
+    let token_hash = mcp_token::hash_token(&token);
     mcp_state.set_token_hash(token_hash);
 
     let was_running = mcp_state.is_running();
