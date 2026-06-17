@@ -19,6 +19,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
   const [isVisible, setIsVisible] = useState(false);
   const [isHoveringCard, setIsHoveringCard] = useState(false);
   const timerRef = useRef(null);
+  const cardRef = useRef(null);
 
   const iconSrc = useMemo(() => {
     const raw = selectedDetails?.record?.process_icon || selectedEvent?.processIcon || selectedDetails?.record?.page_icon;
@@ -170,26 +171,29 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
     openUrl(url).catch((err) => console.error('Failed to open URL:', err));
   };
 
-  // Dismiss card on click outside (image / blank area)
-  const handleBackdropClick = useCallback(() => {
-    if (isVisible) {
+  // Dismiss on outside press without intercepting the underlying image drag.
+  useEffect(() => {
+    if (!isVisible) return undefined;
+
+    const handleOutsidePointerDown = (event) => {
+      const cardEl = cardRef.current;
+      if (cardEl?.contains(event.target)) return;
+
       clearTimer();
+      setIsHoveringCard(false);
       setIsVisible(false);
-    }
+    };
+
+    document.addEventListener('pointerdown', handleOutsidePointerDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', handleOutsidePointerDown, true);
+    };
   }, [isVisible, clearTimer]);
 
   if (!selectedEvent) return null;
 
   return (
     <>
-      {/* Click-to-dismiss backdrop (covers the entire preview area behind the card) */}
-      {isVisible && (
-        <div
-          className="absolute inset-0 z-10"
-          onClick={handleBackdropClick}
-        />
-      )}
-
       {/* Collapsed indicator pill — hover to re-open */}
       <div
         className={`absolute top-4 left-4 z-20 flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-ide-panel shadow cursor-pointer select-none transition-all duration-300 ${
@@ -213,6 +217,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
 
       {/* Detail card */}
       <div
+        ref={cardRef}
         className={`absolute top-4 left-4 w-72 max-h-[calc(100%-2rem)] overflow-y-auto z-20 rounded-xl border border-ide-border bg-ide-panel shadow-lg transition-all duration-300 ${
           isVisible
             ? 'opacity-100 translate-x-0 pointer-events-auto'
