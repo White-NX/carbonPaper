@@ -6,6 +6,7 @@ import DetailCard from './DetailCard';
 import TasksView from './TasksView';
 import SmartClustersView from './SmartClustersView';
 import { Image as ImageIcon, Loader2, Copy, Maximize2, X } from 'lucide-react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { listen } from '@tauri-apps/api/event';
@@ -273,6 +274,27 @@ export default function MainArea({
       if (unlisten) unlisten();
     };
   }, []);
+
+  useEffect(() => {
+    let unlisten;
+    listen('snapshot-preview-open-main', (event) => {
+      const payload = event.payload || {};
+      const screenshotId = payload.screenshot_id ?? payload.id ?? payload.metadata?.screenshot_id;
+      const imagePath = payload.image_path || payload.path || payload.metadata?.image_path;
+      if (screenshotId === undefined && !imagePath) return;
+
+      onAdvancedSelect?.(payload);
+      setActiveTab('preview');
+      const currentWindow = getCurrentWindow();
+      currentWindow.show().catch(() => {});
+      currentWindow.setFocus().catch(() => {});
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [onAdvancedSelect, setActiveTab]);
 
   const openCurrentPreviewInDock = useCallback(() => {
     if (!selectedEvent) return;

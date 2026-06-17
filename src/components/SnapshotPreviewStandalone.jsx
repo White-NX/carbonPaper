@@ -187,6 +187,12 @@ export default function SnapshotPreviewStandalone() {
     setActiveKey(null);
   }, []);
 
+  const openInMainPreview = useCallback((tab) => {
+    const target = tab || activeTab;
+    if (!target) return;
+    emitTo('main', 'snapshot-preview-open-main', target).catch(() => {});
+  }, [activeTab]);
+
   return (
     <div className="h-screen w-screen overflow-hidden bg-transparent p-[3px] text-ide-text">
       <div className="flex h-full w-full flex-col overflow-hidden rounded-md border border-ide-border bg-ide-bg shadow-2xl">
@@ -199,6 +205,7 @@ export default function SnapshotPreviewStandalone() {
               onActiveChange={handleActiveChange}
               onCloseTab={closeTab}
               onClear={clearTabs}
+              onOpenInMainPreview={openInMainPreview}
               standalone
             />
           )}
