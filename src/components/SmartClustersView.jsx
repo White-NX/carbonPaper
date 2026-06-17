@@ -33,7 +33,23 @@ function formatAssignedAt(ts) {
   return d.toLocaleString();
 }
 
-export default function SmartClustersView({ backendOnline, onSelectScreenshot, onOpenSnapshotPreview }) {
+function isAuthRequiredError(err) {
+  return String(err?.message || err || '').includes('AUTH_REQUIRED');
+}
+
+function emitAuthRequired() {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('cp-auth-required'));
+  }
+}
+
+export default function SmartClustersView({
+  backendOnline,
+  isAuthenticated = true,
+  active = true,
+  onSelectScreenshot,
+  onOpenSnapshotPreview,
+}) {
   const { t } = useTranslation();
   const [clusters, setClusters] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -47,20 +63,30 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot, o
   const selected = clusters.find(c => c.id === selectedId) || null;
 
   const loadClusters = useCallback(async () => {
+    if (!active || !isAuthenticated) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const result = await listSmartClusters();
       setClusters(result || []);
+      setError(null);
     } catch (err) {
+      if (isAuthRequiredError(err)) {
+        setError(null);
+        emitAuthRequired();
+        return;
+      }
       console.error('Failed to load smart clusters:', err);
       setError(err?.message || String(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [active, isAuthenticated]);
 
   const loadStatus = useCallback(async () => {
-    if (!backendOnline) return;
+    if (!active || !backendOnline || !isAuthenticated) return;
     try {
       const s = await getSmartClusterStatus();
       const w = await getSmartClusterWorkerStatus();
@@ -69,37 +95,51 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot, o
         is_running: w.running && w.pending_count > 0,
         is_force_running: w.forceRunning && w.pending_count > 0,
       });
-    } catch { /* ignore */ }
-  }, [backendOnline]);
+    } catch (err) {
+      if (isAuthRequiredError(err)) emitAuthRequired();
+    }
+  }, [active, backendOnline, isAuthenticated]);
 
   const loadAssignments = useCallback(async (id) => {
-    if (!id) { setAssignments([]); return; }
+    if (!active || !isAuthenticated || !id) { setAssignments([]); return; }
     try {
       const result = await getSmartClusterAssignments(id, 0, 100);
       setAssignments(result || []);
     } catch (err) {
+      if (isAuthRequiredError(err)) {
+        emitAuthRequired();
+        return;
+      }
       console.error('Failed to load assignments:', err);
     }
-  }, []);
+  }, [active, isAuthenticated]);
 
   // Polling helper
   const handlePoll = useCallback(async () => {
+    if (!active || !isAuthenticated) return;
     await loadStatus();
     try {
       const result = await listSmartClusters();
       setClusters(result || []);
-    } catch { /* ignore */ }
+    } catch (err) {
+      if (isAuthRequiredError(err)) emitAuthRequired();
+    }
     if (selectedId) {
       await loadAssignments(selectedId);
     }
-  }, [loadStatus, selectedId, loadAssignments]);
+  }, [active, isAuthenticated, loadStatus, selectedId, loadAssignments]);
 
   useEffect(() => {
+    if (!active || !isAuthenticated) {
+      setLoading(false);
+      setError(null);
+      return undefined;
+    }
     loadClusters();
     loadStatus();
     const interval = setInterval(handlePoll, 10000);
     return () => clearInterval(interval);
-  }, [loadClusters, loadStatus, handlePoll]);
+  }, [active, isAuthenticated, loadClusters, loadStatus, handlePoll]);
 
   // Load assignments when a cluster is selected
   useEffect(() => {
@@ -125,6 +165,11 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot, o
       await updateSmartClusterAnchor(id, label);
       await loadClusters();
     } catch (err) {
+      if (isAuthRequiredError(err)) {
+        setError(null);
+        emitAuthRequired();
+        return;
+      }
       console.error('Rename failed:', err);
       setError(err?.message || String(err));
       throw err;
@@ -138,6 +183,11 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot, o
       if (selectedId === id) setSelectedId(null);
       await loadClusters();
     } catch (err) {
+      if (isAuthRequiredError(err)) {
+        setError(null);
+        emitAuthRequired();
+        return;
+      }
       console.error('Delete failed:', err);
       setError(err?.message || String(err));
     }
@@ -150,6 +200,11 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot, o
       await toggleSmartClusterEnabled(id, !cluster.enabled);
       await loadClusters();
     } catch (err) {
+      if (isAuthRequiredError(err)) {
+        setError(null);
+        emitAuthRequired();
+        return;
+      }
       console.error('Toggle failed:', err);
       setError(err?.message || String(err));
     }
@@ -180,6 +235,10 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot, o
       await loadClusters();
       await loadStatus();
     } catch (err) {
+      if (isAuthRequiredError(err)) {
+        emitAuthRequired();
+        return;
+      }
       console.error('Create smart cluster failed:', err);
       throw err;
     }
@@ -252,7 +311,7 @@ export default function SmartClustersView({ backendOnline, onSelectScreenshot, o
           <span>·</span>
           <span>{t('smartClusters.statusPending', '待处理:')} <span className="text-ide-text font-mono">{statusData?.pending_count ?? 0}</span></span>
           <span className="ml-auto opacity-70">
-            {t('smartClusters.idleWarning', '后台工作线程仅在系统空闲时运行（无键鼠输入 ≥5分钟、AC 通电、非全屏游戏）')}
+            {t('smartClusters.idleWarning', '后台工作线程仅在系统空闲时运行')}
           </span>
         </div>
 

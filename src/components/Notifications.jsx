@@ -2,35 +2,72 @@ import React, { useEffect } from 'react';
 import { X, CheckCircle2, XCircle, Info, Trash2 } from 'lucide-react';
 import { cn } from '../lib/utils';
 
+const DEFAULT_TOAST_DURATION_MS = {
+  success: 5000,
+  info: 5000,
+  error: 9000,
+};
+
+function getToastDuration(notification) {
+  if (notification.toastDuration === null || notification.toastDuration === false) {
+    return null;
+  }
+  const customDuration = Number(notification.toastDuration);
+  if (Number.isFinite(customDuration) && customDuration > 0) {
+    return customDuration;
+  }
+  return DEFAULT_TOAST_DURATION_MS[notification.type] ?? DEFAULT_TOAST_DURATION_MS.info;
+}
+
+function NotificationIcon({ type, className = 'w-5 h-5 shrink-0' }) {
+  if (type === 'success') return <CheckCircle2 className={cn(className, 'text-ide-success')} />;
+  if (type === 'error') return <XCircle className={cn(className, 'text-ide-error')} />;
+  return <Info className={cn(className, 'text-ide-accent')} />;
+}
+
+function NotificationToastItem({ notification, onClose }) {
+  useEffect(() => {
+    const duration = getToastDuration(notification);
+    if (duration === null) return undefined;
+
+    const timer = window.setTimeout(() => {
+      onClose(notification.id, 'timeout');
+    }, duration);
+
+    return () => window.clearTimeout(timer);
+  }, [notification.id, notification.toastDuration, notification.type, onClose]);
+
+  return (
+    <div
+      className={cn(
+        "pointer-events-auto min-w-[300px] max-w-[400px] p-4 rounded-lg shadow-lg border flex items-start gap-3 transition-all duration-300 animate-in slide-in-from-right-full",
+        "bg-ide-panel border-ide-border text-ide-text"
+      )}
+    >
+      <NotificationIcon type={notification.type} />
+
+      <div className="flex-1 overflow-hidden">
+        <h4 className="font-medium text-sm">{notification.title}</h4>
+        <p className="text-xs text-ide-muted mt-1 break-words max-h-24 overflow-y-auto pr-1 whitespace-pre-wrap">{notification.message}</p>
+        {notification.details && (
+          <pre className="text-[11px] text-ide-muted/80 mt-2 max-h-24 overflow-y-auto pr-1 whitespace-pre-wrap break-words">
+            {notification.details}
+          </pre>
+        )}
+      </div>
+
+      <button onClick={() => onClose(notification.id, 'manual')} className="text-ide-muted hover:text-ide-text">
+        <X className="w-4 h-4" />
+      </button>
+    </div>
+  );
+}
+
 export function NotificationToast({ notifications, onClose }) {
   return (
     <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 pointer-events-none">
       {notifications.map((n) => (
-        <div 
-          key={n.id} 
-          className={cn(
-            "pointer-events-auto min-w-[300px] max-w-[400px] p-4 rounded-lg shadow-lg border flex items-start gap-3 transition-all duration-300 animate-in slide-in-from-right-full",
-            "bg-ide-panel border-ide-border text-ide-text"
-          )}
-        >
-          {n.type === 'success' && <CheckCircle2 className="w-5 h-5 text-ide-success shrink-0" />}
-          {n.type === 'error' && <XCircle className="w-5 h-5 text-ide-error shrink-0" />}
-          {n.type === 'info' && <Info className="w-5 h-5 text-ide-accent shrink-0" />}
-          
-          <div className="flex-1 overflow-hidden">
-            <h4 className="font-medium text-sm">{n.title}</h4>
-            <p className="text-xs text-ide-muted mt-1 break-words max-h-24 overflow-y-auto pr-1 whitespace-pre-wrap">{n.message}</p>
-            {n.details && (
-              <pre className="text-[11px] text-ide-muted/80 mt-2 max-h-24 overflow-y-auto pr-1 whitespace-pre-wrap break-words">
-                {n.details}
-              </pre>
-            )}
-          </div>
-          
-          <button onClick={() => onClose(n.id)} className="text-ide-muted hover:text-ide-text">
-            <X className="w-4 h-4" />
-          </button>
-        </div>
+        <NotificationToastItem key={n.id} notification={n} onClose={onClose} />
       ))}
     </div>
   );
@@ -67,9 +104,7 @@ export function NotificationPanel({ notifications, onClear, onDismiss, isOpen, o
                     <div key={n.id} className="p-3 rounded bg-ide-bg border border-ide-border relative group">
                         <div className="flex gap-3">
                             <div className="mt-0.5">
-                                {n.type === 'success' && <CheckCircle2 className="w-4 h-4 text-ide-success" />}
-                                {n.type === 'error' && <XCircle className="w-4 h-4 text-ide-error" />}
-                                {n.type === 'info' && <Info className="w-4 h-4 text-ide-accent" />}
+                                <NotificationIcon type={n.type} className="w-4 h-4" />
                             </div>
                             <div className="flex-1">
                                 <h5 className="text-sm font-medium">{n.title}</h5>

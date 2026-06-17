@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next';
 import SnapshotPreviewDock from './SnapshotPreviewDock';
 import {
   getSnapshotPreviewKey,
+  sanitizeSnapshotPreviewState,
   SNAPSHOT_PREVIEW_WINDOW_STATE_KEY,
 } from '../lib/snapshot_preview';
 
@@ -14,10 +15,7 @@ function readPreviewState() {
     const raw = localStorage.getItem(SNAPSHOT_PREVIEW_WINDOW_STATE_KEY);
     if (!raw) return { tabs: [], activeKey: null };
     const parsed = JSON.parse(raw);
-    return {
-      tabs: Array.isArray(parsed?.tabs) ? parsed.tabs : [],
-      activeKey: parsed?.activeKey || null,
-    };
+    return sanitizeSnapshotPreviewState(parsed);
   } catch {
     return { tabs: [], activeKey: null };
   }
@@ -93,7 +91,7 @@ export default function SnapshotPreviewStandalone() {
       updatedAt: Date.now(),
     };
     try {
-      localStorage.setItem(SNAPSHOT_PREVIEW_WINDOW_STATE_KEY, JSON.stringify(state));
+      localStorage.setItem(SNAPSHOT_PREVIEW_WINDOW_STATE_KEY, JSON.stringify(sanitizeSnapshotPreviewState(state)));
       emitTo('main', 'snapshot-preview-state-changed', state).catch(() => {});
     } catch {
       // best-effort POC sync
@@ -189,6 +187,12 @@ export default function SnapshotPreviewStandalone() {
     setActiveKey(null);
   }, []);
 
+  const openInMainPreview = useCallback((tab) => {
+    const target = tab || activeTab;
+    if (!target) return;
+    emitTo('main', 'snapshot-preview-open-main', target).catch(() => {});
+  }, [activeTab]);
+
   return (
     <div className="h-screen w-screen overflow-hidden bg-transparent p-[3px] text-ide-text">
       <div className="flex h-full w-full flex-col overflow-hidden rounded-md border border-ide-border bg-ide-bg shadow-2xl">
@@ -201,6 +205,7 @@ export default function SnapshotPreviewStandalone() {
               onActiveChange={handleActiveChange}
               onCloseTab={closeTab}
               onClear={clearTabs}
+              onOpenInMainPreview={openInMainPreview}
               standalone
             />
           )}

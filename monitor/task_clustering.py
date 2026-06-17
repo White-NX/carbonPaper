@@ -22,6 +22,14 @@ import hashlib
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 
+from clustering_resources import (
+    CLUSTERING_ASSIGNMENT_BATCH_SIZE,
+    CLUSTERING_SAMPLE_SIZE,
+    LOW_MEMORY_CLUSTERING_THRESHOLD,
+    MANUAL_CLUSTERING_PROMPT_THRESHOLD,
+    memory_status_for_clustering,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -247,6 +255,59 @@ def build_task_text(process_name: str, window_title: str, ocr_text: str, max_ocr
 class ClusteringEngine:
     """Run PaCMAP + HDBSCAN on a set of embedding vectors."""
 
+    def _build_result(
+        self,
+        vectors: np.ndarray,
+        ids: List[str],
+        metadatas: List[Dict[str, Any]],
+        labels: np.ndarray,
+    ) -> Dict[str, Any]:
+        N = len(vectors)
+        unique_labels = set(labels)
+        clusters = []
+        noise_ids = []
+
+        for sid, lbl in zip(ids, labels):
+            if lbl == -1:
+                noise_ids.append(sid)
+
+        for cid in sorted(unique_labels - {-1}):
+            mask = labels == cid
+            cluster_vectors = vectors[mask]
+            cluster_ids = [ids[i] for i in range(N) if mask[i]]
+            cluster_metas = [metadatas[i] for i in range(N) if mask[i]]
+
+            centroid = cluster_vectors.mean(axis=0)
+            centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+
+            timestamps = [m.get("timestamp", 0) for m in cluster_metas]
+            processes = [m.get("process_name", "") for m in cluster_metas]
+            categories = [m.get("category", "") for m in cluster_metas]
+
+            def _dominant(items):
+                from collections import Counter
+                filtered = [x for x in items if x]
+                if not filtered:
+                    return ""
+                return Counter(filtered).most_common(1)[0][0]
+
+            clusters.append({
+                "cluster_id": int(cid),
+                "centroid": centroid,
+                "snapshot_ids": cluster_ids,
+                "start_time": float(min(timestamps)) if timestamps else 0.0,
+                "end_time": float(max(timestamps)) if timestamps else 0.0,
+                "snapshot_count": len(cluster_ids),
+                "dominant_process": _dominant(processes),
+                "dominant_category": _dominant(categories),
+            })
+
+        return {
+            "clusters": clusters,
+            "noise_ids": noise_ids,
+            "labels": labels,
+        }
+
     def run(
         self,
         vectors: np.ndarray,
@@ -320,51 +381,91 @@ class ClusteringEngine:
         n_noise = int((labels == -1).sum())
         logger.info("Clustering done in %.2fs: %d clusters, %d noise points", elapsed, n_clusters, n_noise)
 
-        # ---- Aggregate per-cluster statistics ----
-        clusters = []
-        noise_ids = []
+        return self._build_result(vectors, ids, metadatas, labels)
 
-        for i, (sid, lbl) in enumerate(zip(ids, labels)):
-            if lbl == -1:
-                noise_ids.append(sid)
+    def run_sampled_assignment(
+        self,
+        vectors: np.ndarray,
+        ids: List[str],
+        metadatas: List[Dict[str, Any]],
+        min_cluster_size: int = MIN_CLUSTER_SIZE,
+        min_samples: int = MIN_SAMPLES,
+        sample_size: int = CLUSTERING_SAMPLE_SIZE,
+        assignment_batch_size: int = CLUSTERING_ASSIGNMENT_BATCH_SIZE,
+        assignment_threshold: float = CENTROID_MATCH_THRESHOLD,
+    ) -> Dict[str, Any]:
+        """Approximate low-memory clustering.
 
-        for cid in sorted(unique_labels - {-1}):
-            mask = labels == cid
-            cluster_vectors = vectors[mask]
-            cluster_ids = [ids[i] for i in range(N) if mask[i]]
-            cluster_metas = [metadatas[i] for i in range(N) if mask[i]]
+        Runs the expensive global reducer/clusterer on a deterministic
+        time-stratified sample, then assigns the remaining vectors to the
+        nearest sampled centroid in bounded batches.
+        """
+        N = len(vectors)
+        if N <= sample_size:
+            result = self.run(vectors, ids, metadatas, min_cluster_size, min_samples)
+            result["degraded"] = False
+            return result
 
-            centroid = cluster_vectors.mean(axis=0)
-            centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+        sample_size = max(min_cluster_size, min(int(sample_size), N))
+        assignment_batch_size = max(1, int(assignment_batch_size))
+        order = sorted(range(N), key=lambda i: (float(metadatas[i].get("timestamp", 0) or 0), ids[i]))
+        positions = np.linspace(0, N - 1, sample_size, dtype=np.int64)
+        sample_indices = sorted({order[int(pos)] for pos in positions})
+        sample_set = set(sample_indices)
 
-            timestamps = [m.get("timestamp", 0) for m in cluster_metas]
-            processes = [m.get("process_name", "") for m in cluster_metas]
-            categories = [m.get("category", "") for m in cluster_metas]
+        logger.info(
+            "Approximate clustering: sample=%d of %d, assignment_batch=%d",
+            len(sample_indices),
+            N,
+            assignment_batch_size,
+        )
 
-            # dominant process / category by frequency
-            def _dominant(items):
-                from collections import Counter
-                filtered = [x for x in items if x]
-                if not filtered:
-                    return ""
-                return Counter(filtered).most_common(1)[0][0]
+        sample_vectors = vectors[sample_indices]
+        sample_ids = [ids[i] for i in sample_indices]
+        sample_metas = [metadatas[i] for i in sample_indices]
+        sample_result = self.run(sample_vectors, sample_ids, sample_metas, min_cluster_size, min_samples)
 
-            clusters.append({
-                "cluster_id": int(cid),
-                "centroid": centroid,
-                "snapshot_ids": cluster_ids,
-                "start_time": float(min(timestamps)) if timestamps else 0.0,
-                "end_time": float(max(timestamps)) if timestamps else 0.0,
-                "snapshot_count": len(cluster_ids),
-                "dominant_process": _dominant(processes),
-                "dominant_category": _dominant(categories),
+        labels = np.full(N, -1, dtype=np.int64)
+        for local_i, global_i in enumerate(sample_indices):
+            labels[global_i] = int(sample_result["labels"][local_i])
+
+        clusters = sample_result.get("clusters", [])
+        if not clusters:
+            result = self._build_result(vectors, ids, metadatas, labels)
+            result.update({
+                "degraded": True,
+                "degrade_mode": "sample_assign",
+                "sample_size": len(sample_indices),
+                "assigned_count": 0,
             })
+            return result
 
-        return {
-            "clusters": clusters,
-            "noise_ids": noise_ids,
-            "labels": labels,
-        }
+        cluster_ids = np.array([int(cl["cluster_id"]) for cl in clusters], dtype=np.int64)
+        centroids = np.vstack([cl["centroid"] for cl in clusters]).astype(np.float32)
+        centroids = centroids / (np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-9)
+        unsampled = [i for i in range(N) if i not in sample_set]
+        assigned = 0
+
+        for start in range(0, len(unsampled), assignment_batch_size):
+            batch_indices = unsampled[start:start + assignment_batch_size]
+            batch = vectors[batch_indices]
+            sims = batch @ centroids.T
+            best_pos = np.argmax(sims, axis=1)
+            best_scores = sims[np.arange(len(batch_indices)), best_pos]
+            for row_i, score in enumerate(best_scores):
+                if float(score) >= assignment_threshold:
+                    labels[batch_indices[row_i]] = int(cluster_ids[int(best_pos[row_i])])
+                    assigned += 1
+
+        result = self._build_result(vectors, ids, metadatas, labels)
+        result.update({
+            "degraded": True,
+            "degrade_mode": "sample_assign",
+            "sample_size": len(sample_indices),
+            "assigned_count": assigned,
+            "assignment_threshold": assignment_threshold,
+        })
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +659,62 @@ class HotColdManager:
             return np.empty((0, EMBEDDING_DIM)), [], []
         vectors = np.array(results["embeddings"], dtype=np.float32)
         return vectors, results["ids"], results["metadatas"]
+
+    def estimate_clustering_inputs(
+        self,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Estimate input count and memory pressure before expensive work."""
+        count: Optional[int] = None
+        source = "unknown"
+
+        if self._storage_client:
+            start_s = start_time if start_time is not None else time.time() - HOT_LAYER_DAYS * 86400
+            end_s = end_time if end_time is not None else time.time()
+            try:
+                first_page = self._storage_client.list_screenshots_for_clustering(
+                    start_ts=start_s,
+                    end_ts=end_s,
+                    offset=0,
+                    limit=1,
+                )
+                payload = first_page.get("data", first_page)
+                if not (first_page.get("status") == "error" or first_page.get("error")):
+                    count = int(payload.get("total", 0) or 0)
+                    source = "storage"
+            except Exception as e:
+                logger.debug("[task_clustering] input estimate via storage failed: %s", e)
+
+        if count is None:
+            try:
+                if start_time is not None and end_time is not None:
+                    raw = self.hot_collection.get(
+                        where={
+                            "$and": [
+                                {"timestamp": {"$gte": start_time}},
+                                {"timestamp": {"$lte": end_time}},
+                            ]
+                        },
+                        include=[],
+                    )
+                    count = len(raw.get("ids", []) or [])
+                    source = "hot_collection_range"
+                else:
+                    count = int(self.hot_collection.count())
+                    source = "hot_collection"
+            except Exception as e:
+                logger.debug("[task_clustering] input estimate via hot collection failed: %s", e)
+                count = 0
+
+        memory = memory_status_for_clustering(count)
+        return {
+            "count": count,
+            "source": source,
+            "memory": memory,
+            "manual_prompt_threshold": MANUAL_CLUSTERING_PROMPT_THRESHOLD,
+            "low_memory_threshold": LOW_MEMORY_CLUSTERING_THRESHOLD,
+        }
 
     # ---- Cold layer operations -------------------------------------------
 
@@ -755,6 +912,9 @@ class HotColdManager:
         min_cluster_size: int = MIN_CLUSTER_SIZE,
         min_samples: int = MIN_SAMPLES,
         auto_compress: bool = True,
+        clustering_mode: str = "auto",
+        manual: bool = False,
+        allow_full_low_memory: bool = False,
     ) -> Dict[str, Any]:
         """Execute HDBSCAN clustering on hot-layer vectors.
 
@@ -762,6 +922,11 @@ class HotColdManager:
             start_time / end_time: optional range override (for manual runs).
             min_cluster_size / min_samples: HDBSCAN params.
             auto_compress: if True, compress old clusters to cold layer.
+            clustering_mode: 'auto' | 'full' | 'batched'. 'batched' means
+                approximate sample+assign mode.
+            manual: True when triggered from a user action.
+            allow_full_low_memory: for automatic runs, bypass low-memory
+                downgrade when the advanced setting is enabled.
 
         Returns clustering results dict.
         """
@@ -769,8 +934,37 @@ class HotColdManager:
             logger.info("Starting clustering run (range=%s–%s) …",
                         start_time or "auto", end_time or "auto")
 
-            # Load embedder
-            self._embedder.load()
+            clustering_mode = (clustering_mode or "auto").strip().lower()
+            if clustering_mode not in {"auto", "full", "batched"}:
+                clustering_mode = "auto"
+
+            estimate = self.estimate_clustering_inputs(start_time, end_time)
+            estimated_count = int(estimate.get("count", 0) or 0)
+            memory_status = estimate.get("memory") or {}
+
+            def _needs_user_choice_response(count: int, memory: Dict[str, Any], source_estimate: Dict[str, Any]) -> Dict[str, Any]:
+                reason = "low_memory" if memory.get("low_memory") else "large_range"
+                choice_estimate = dict(source_estimate or {})
+                choice_estimate["count"] = count
+                choice_estimate["memory"] = memory
+                return {
+                    "clusters": [],
+                    "noise_ids": [],
+                    "n_clusters": 0,
+                    "n_noise": 0,
+                    "n_total": count,
+                    "status": "needs_user_choice",
+                    "reason": reason,
+                    "degrade_mode": "sample_assign",
+                    "estimate": choice_estimate,
+                }
+
+            if (
+                manual
+                and clustering_mode == "auto"
+                and estimated_count >= MANUAL_CLUSTERING_PROMPT_THRESHOLD
+            ):
+                return _needs_user_choice_response(estimated_count, memory_status, estimate)
 
             try:
                 # Fetch vectors
@@ -782,6 +976,7 @@ class HotColdManager:
                 # If hot layer is empty, try backfilling from screenshot_embeddings
                 if len(ids) == 0:
                     logger.warning("Hot layer empty — attempting backfill from SQLite")
+                    self._embedder.load()
                     backfilled = self._backfill_from_screenshots(start_time, end_time)
                     if backfilled > 0:
                         # Re-fetch after backfill — use get_all to avoid 30-day cutoff
@@ -797,14 +992,47 @@ class HotColdManager:
                     logger.warning("No vectors in hot layer for clustering (even after backfill)")
                     return {"clusters": [], "noise_ids": [], "status": "empty"}
 
+                n_total = len(ids)
+                memory_status = memory_status_for_clustering(n_total)
+                if (
+                    manual
+                    and clustering_mode == "auto"
+                    and n_total >= MANUAL_CLUSTERING_PROMPT_THRESHOLD
+                ):
+                    return _needs_user_choice_response(n_total, memory_status, estimate)
+
+                use_approximate = clustering_mode == "batched"
+                if (
+                    clustering_mode == "auto"
+                    and not manual
+                    and n_total >= LOW_MEMORY_CLUSTERING_THRESHOLD
+                    and memory_status.get("low_memory")
+                    and not allow_full_low_memory
+                ):
+                    use_approximate = True
+                    logger.info(
+                        "Scheduled clustering using approximate mode due to low memory: n=%d memory=%s",
+                        n_total,
+                        memory_status,
+                    )
+
                 # Run engine
-                result = self._engine.run(
-                    vectors=vectors,
-                    ids=ids,
-                    metadatas=metas,
-                    min_cluster_size=min_cluster_size,
-                    min_samples=min_samples,
-                )
+                if use_approximate:
+                    result = self._engine.run_sampled_assignment(
+                        vectors=vectors,
+                        ids=ids,
+                        metadatas=metas,
+                        min_cluster_size=min_cluster_size,
+                        min_samples=min_samples,
+                    )
+                else:
+                    result = self._engine.run(
+                        vectors=vectors,
+                        ids=ids,
+                        metadatas=metas,
+                        min_cluster_size=min_cluster_size,
+                        min_samples=min_samples,
+                    )
 
                 # Optionally compress to cold
                 if auto_compress and result["clusters"]:
@@ -824,8 +1052,14 @@ class HotColdManager:
                     "noise_ids": result["noise_ids"],
                     "n_clusters": len(result["clusters"]),
                     "n_noise": len(result["noise_ids"]),
-                    "n_total": len(ids),
+                    "n_total": n_total,
                     "status": "success",
+                    "degraded": bool(result.get("degraded")),
+                    "degrade_mode": result.get("degrade_mode"),
+                    "sample_size": result.get("sample_size"),
+                    "assigned_count": result.get("assigned_count"),
+                    "memory_status": memory_status,
+                    "clustering_mode": "batched" if use_approximate else "full",
                 }
             finally:
                 # Always unload the model after clustering to free memory
@@ -1094,7 +1328,7 @@ class ClusteringScheduler:
 
     def _do_run(self) -> bool:
         """Execute one clustering run. Returns True only on successful completion."""
-        from monitor.config import CLUSTERING_ENABLED
+        from monitor.config import CLUSTERING_ALLOW_FULL_LOW_MEMORY, CLUSTERING_ENABLED
         if not CLUSTERING_ENABLED:
             logger.debug("Skipping scheduled clustering: feature disabled")
             return False
@@ -1107,7 +1341,12 @@ class ClusteringScheduler:
         success = False
         try:
             logger.info("Scheduled clustering run starting …")
-            result = self._manager.run_clustering(auto_compress=True)
+            result = self._manager.run_clustering(
+                auto_compress=True,
+                clustering_mode="auto",
+                manual=False,
+                allow_full_low_memory=CLUSTERING_ALLOW_FULL_LOW_MEMORY,
+            )
             self._last_result = result
             self._last_run = time.time()
             self._save_config()
@@ -1121,9 +1360,15 @@ class ClusteringScheduler:
             self._running = False
         return success
 
-    def run_now(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> Dict[str, Any]:
+    def run_now(
+        self,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+        clustering_mode: str = "auto",
+        manual: bool = False,
+    ) -> Dict[str, Any]:
         """Manually trigger a clustering run (blocking)."""
-        from monitor.config import CLUSTERING_ENABLED
+        from monitor.config import CLUSTERING_ALLOW_FULL_LOW_MEMORY, CLUSTERING_ENABLED
         if not CLUSTERING_ENABLED:
             return {"status": "disabled", "error": "Clustering is disabled"}
         if self._running:
@@ -1134,6 +1379,9 @@ class ClusteringScheduler:
                 start_time=start_time,
                 end_time=end_time,
                 auto_compress=(start_time is None),
+                clustering_mode=clustering_mode,
+                manual=bool(manual or (start_time is not None and end_time is not None)),
+                allow_full_low_memory=CLUSTERING_ALLOW_FULL_LOW_MEMORY,
             )
             self._last_result = result
             if start_time is None:

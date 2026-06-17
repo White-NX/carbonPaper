@@ -27,8 +27,13 @@ class DummyScheduler:
     def __init__(self):
         self.last_args = None
 
-    def run_now(self, start_time=None, end_time=None):
-        self.last_args = {"start_time": start_time, "end_time": end_time}
+    def run_now(self, start_time=None, end_time=None, clustering_mode="auto", manual=False):
+        self.last_args = {
+            "start_time": start_time,
+            "end_time": end_time,
+            "clustering_mode": clustering_mode,
+            "manual": manual,
+        }
         return {"n_clusters": 2, "n_noise": 1}
 
 
@@ -138,11 +143,18 @@ def test_run_clustering_parses_numeric_range(monkeypatch):
                 "command": "run_clustering",
                 "start_time": "1000",
                 "end_time": 2000,
+                "clustering_mode": "full",
+                "manual": True,
             }
         )
 
         assert result["status"] == "success"
-        assert scheduler.last_args == {"start_time": 1000.0, "end_time": 2000.0}
+        assert scheduler.last_args == {
+            "start_time": 1000.0,
+            "end_time": 2000.0,
+            "clustering_mode": "full",
+            "manual": True,
+        }
     finally:
         _restore_globals(snapshot)
 

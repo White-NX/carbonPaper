@@ -52,6 +52,8 @@ describe('task_api', () => {
         command: 'run_clustering',
         start_time: 10,
         end_time: 20,
+        clustering_mode: 'auto',
+        manual: false,
       },
     });
 

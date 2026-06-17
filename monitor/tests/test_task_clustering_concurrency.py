@@ -130,7 +130,7 @@ def test_scheduler_can_recover_after_failed_run(monkeypatch):
         def __init__(self):
             self.calls = 0
 
-        def run_clustering(self, auto_compress=True):
+        def run_clustering(self, auto_compress=True, **_kwargs):
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("boom")

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Moon, Sun, Settings, Bell, Terminal, Layout, Minus, Square, X, Copy, Loader2, Monitor, Clock,
   WifiOff, Play, Search as SearchIcon, Info as InfoIcon, Route, PackageOpen
@@ -27,9 +27,9 @@ import ErrorWindow from './components/ErrorWindow';
 import HmacMigrationDialog from './components/HmacMigrationDialog';
 import StartupVacuumDialog from './components/StartupVacuumDialog';
 import { getScreenshotDetails, fetchImage, deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
-import { runClustering, saveClusteringResults } from './lib/task_api';
 import { checkForUpdate, downloadAndInstallUpdate } from './lib/update_api';
 import { UpdateModal } from './components/UpdateModal';
+import { useDelayedClusteringSetupRunner } from './hooks/useDelayedClusteringSetupRunner';
 
 function App() {
   // Disable context menu for Tauri production feel
@@ -118,7 +118,6 @@ function App() {
   const [showExtensionSetup, setShowExtensionSetup] = useState(false);
   const [showClusteringSetup, setShowClusteringSetup] = useState(false);
   const [showSmartClusterSetup, setShowSmartClusterSetup] = useState(false);
-  const clusteringTimerRef = useRef(null);
   const [sessionTimeout, setSessionTimeout] = useState(() => {
     const saved = localStorage.getItem('sessionTimeout');
     return saved ? parseInt(saved, 10) : 900; // 默认 15 分钟
@@ -331,8 +330,17 @@ function App() {
   // Notification System
   const [showNotifications, setShowNotifications] = useState(false);
   const [notifications, setNotifications] = useState([]);
+  const [hiddenToastIds, setHiddenToastIds] = useState(() => new Set());
 
   const pushNotification = useCallback((notification) => {
+    if (notification?.id) {
+      setHiddenToastIds((prev) => {
+        if (!prev.has(notification.id)) return prev;
+        const next = new Set(prev);
+        next.delete(notification.id);
+        return next;
+      });
+    }
     setNotifications((prev) => [notification, ...prev].slice(0, 200));
   }, []);
 
@@ -380,11 +388,58 @@ function App() {
 
   const dismissNotification = useCallback((id) => {
     setNotifications((prev) => prev.filter((n) => n.id !== id));
+    setHiddenToastIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
   }, []);
+
+  const dismissToast = useCallback((id) => {
+    setHiddenToastIds((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  }, []);
+
+  const handleToastClose = useCallback((id, reason = 'manual') => {
+    if (reason === 'timeout') {
+      dismissToast(id);
+      return;
+    }
+    dismissNotification(id);
+  }, [dismissNotification, dismissToast]);
 
   const clearNotifications = useCallback(() => {
     setNotifications([]);
+    setHiddenToastIds(new Set());
   }, []);
+
+  const toastNotifications = useMemo(() => {
+    return notifications
+      .filter((notification) => notification.showToast !== false && !hiddenToastIds.has(notification.id))
+      .slice(0, 3);
+  }, [hiddenToastIds, notifications]);
+
+  useEffect(() => {
+    setHiddenToastIds((prev) => {
+      if (prev.size === 0) return prev;
+      const currentIds = new Set(notifications.map((notification) => notification.id));
+      let changed = false;
+      const next = new Set();
+      prev.forEach((id) => {
+        if (currentIds.has(id)) {
+          next.add(id);
+        } else {
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [notifications]);
 
   const formatErrorDetails = useCallback((err) => {
     if (!err) return '';
@@ -523,83 +578,14 @@ function App() {
     return () => { cancelled = true; };
   }, [backendStatus, isAuthenticated]);
 
-  // Clustering setup wizard callback — delayed background execution
-  const handleClusteringSetupComplete = useCallback((shouldRun) => {
+  const closeClusteringSetup = useCallback(() => {
     setShowClusteringSetup(false);
-    if (!shouldRun) return;
+  }, []);
 
-    // Clear any previous timer
-    if (clusteringTimerRef.current) {
-      clearTimeout(clusteringTimerRef.current);
-    }
-
-    // Wait 60 seconds for the embedding model to finish initialising, then run
-    clusteringTimerRef.current = setTimeout(async () => {
-      clusteringTimerRef.current = null;
-      pushNotification({
-        id: `clustering-start-${Date.now()}`,
-        type: 'info',
-        title: '任务聚类',
-        message: '正在对历史快照进行任务聚类，这可能需要几分钟时间…',
-        timestamp: Date.now(),
-      });
-
-      try {
-        const result = await runClustering();
-
-        if (result && result.status === 'already_running') {
-          pushNotification({
-            id: `clustering-running-${Date.now()}`,
-            type: 'info',
-            title: '任务聚类',
-            message: '聚类任务已在后台运行中，请稍后查看结果。',
-            timestamp: Date.now(),
-          });
-          return;
-        }
-
-        // Save results to SQLite
-        if (result && result.clusters && result.clusters.length > 0) {
-          const tasks = result.clusters.map((c) => ({
-            label: c.label || null,
-            layer: 'hot',
-            centroid: c.centroid || [],
-            screenshot_ids: c.screenshot_ids || [],
-            start_time: c.start_time || null,
-            end_time: c.end_time || null,
-            dominant_process: c.dominant_process || null,
-            dominant_category: c.dominant_category || null,
-          }));
-          await saveClusteringResults(tasks);
-          pushNotification({
-            id: `clustering-done-${Date.now()}`,
-            type: 'success',
-            title: '任务聚类完成',
-            message: `已将历史快照归纳为 ${tasks.length} 个任务，可在"任务"面板中查看。`,
-            timestamp: Date.now(),
-          });
-        } else {
-          pushNotification({
-            id: `clustering-empty-${Date.now()}`,
-            type: 'info',
-            title: '任务聚类完成',
-            message: '未发现可归类的任务。快照数量可能不足，系统将在积累更多数据后自动尝试。',
-            timestamp: Date.now(),
-          });
-        }
-      } catch (err) {
-        console.error('Background clustering failed:', err);
-        pushNotification({
-          id: `clustering-error-${Date.now()}`,
-          type: 'error',
-          title: '任务聚类失败',
-          message: typeof err === 'string' ? err : (err?.message || '聚类过程中发生错误，请稍后在"任务"面板手动重试。'),
-          details: typeof err === 'string' ? '' : (err?.stack || ''),
-          timestamp: Date.now(),
-        });
-      }
-    }, 60_000);
-  }, [pushNotification]);
+  const handleClusteringSetupComplete = useDelayedClusteringSetupRunner({
+    onClose: closeClusteringSetup,
+    pushNotification,
+  });
 
   useEffect(() => {
     checkAuthStatus();
@@ -1144,6 +1130,7 @@ function App() {
             searchMode={searchMode}
             onSearchModeChange={setSearchMode}
             backendOnline={backendStatus === 'online'}
+            isAuthenticated={isAuthenticated}
             onAdvancedSelect={(res) => {
               const screenshotId = res.screenshot_id !== undefined ? res.screenshot_id : (res.metadata?.screenshot_id);
               const imagePath = res.image_path || res.metadata?.image_path;
@@ -1198,8 +1185,8 @@ function App() {
       </div>
 
       <NotificationToast
-        notifications={notifications.slice(0, 3)}
-        onClose={dismissNotification}
+        notifications={toastNotifications}
+        onClose={handleToastClose}
       />
       <NotificationPanel
         notifications={notifications}

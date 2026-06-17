@@ -38,6 +38,7 @@ export default function TasksView({ backendOnline, onSelectScreenshot, onOpenSna
   const [loading, setLoading] = useState(false);
   const [clusteringRunning, setClusteringRunning] = useState(false);
   const [clusteringError, setClusteringError] = useState(null);
+  const [clusteringNotice, setClusteringNotice] = useState(null);
   const [mergeMode, setMergeMode] = useState(false);
   const [mergeSelection, setMergeSelection] = useState(new Set());
   const [clusteringStatus, setClusteringStatus] = useState(null);
@@ -121,13 +122,54 @@ export default function TasksView({ backendOnline, onSelectScreenshot, onOpenSna
   const handleRunClustering = async () => {
     setClusteringRunning(true);
     setClusteringError(null);
+    setClusteringNotice(null);
     try {
       const options = {};
       if (rangeStart) options.startTime = new Date(rangeStart).getTime() / 1000;
       if (rangeEnd) options.endTime = new Date(rangeEnd).getTime() / 1000;
-      const result = await runClustering(options);
+      options.manual = true;
+      let result = await runClustering(options);
+      if (result?.status === 'needs_user_choice') {
+        const hasCompleteRange = Boolean(rangeStart && rangeEnd);
+        const count = result?.estimate?.count ?? result?.n_total ?? 0;
+        const memory = result?.estimate?.memory || {};
+        const scope = hasCompleteRange
+          ? t('tasks.clusteringRangeScope', {
+              defaultValue: '所选范围',
+            })
+          : t('tasks.clusteringAllScope', {
+              defaultValue: '全部可聚类快照',
+            });
+        const reason = result.reason === 'low_memory'
+          ? t('tasks.clusteringLowMemoryReason', {
+              defaultValue: '当前可用内存不足，完整聚类可能明显变慢或失败',
+            })
+          : t('tasks.clusteringLargeRangeReason', {
+              defaultValue: '可聚类快照数量较多',
+            });
+        const useBatched = window.confirm(t('tasks.clusteringDegradePrompt', {
+          scope,
+          count,
+          reason,
+          estimatedGb: memory.estimated_peak_bytes
+            ? (memory.estimated_peak_bytes / (1024 ** 3)).toFixed(1)
+            : '—',
+          defaultValue: '{{scope}}约 {{count}} 张快照。{{reason}}。建议使用降级分批模式；这会先对样本聚类，再分批归属剩余快照。预计峰值内存约 {{estimatedGb}} GB。\n\n选择“确定”使用降级分批；选择“取消”继续全量聚类。',
+        }));
+        result = await runClustering({
+          ...options,
+          clusteringMode: useBatched ? 'batched' : 'full',
+        });
+      }
       if (result?.status === 'empty') {
         setClusteringError(t('tasks.noData'));
+      }
+      if (result?.degraded) {
+        setClusteringNotice(t('tasks.clusteringDegradedNotice', {
+          sampleSize: result.sample_size ?? 0,
+          assignedCount: result.assigned_count ?? 0,
+          defaultValue: '本次使用降级分批模式：样本 {{sampleSize}} 张，分批归属 {{assignedCount}} 张。',
+        }));
       }
 
       // Persist clustering results to Rust SQLite so loadTasks() can find them
@@ -332,6 +374,12 @@ export default function TasksView({ backendOnline, onSelectScreenshot, onOpenSna
           <div className="flex items-center gap-2 px-2.5 py-1.5 bg-red-500/10 border border-red-500/30 rounded-lg">
             <X className="w-3.5 h-3.5 text-red-400 shrink-0 cursor-pointer" onClick={() => setClusteringError(null)} />
             <span className="text-xs text-red-400">{clusteringError}</span>
+          </div>
+        )}
+        {clusteringNotice && (
+          <div className="flex items-center gap-2 px-2.5 py-1.5 bg-ide-accent/10 border border-ide-accent/30 rounded-lg">
+            <X className="w-3.5 h-3.5 text-ide-accent shrink-0 cursor-pointer" onClick={() => setClusteringNotice(null)} />
+            <span className="text-xs text-ide-text">{clusteringNotice}</span>
           </div>
         )}
       </div>

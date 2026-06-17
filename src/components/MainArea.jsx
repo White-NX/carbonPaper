@@ -6,6 +6,7 @@ import DetailCard from './DetailCard';
 import TasksView from './TasksView';
 import SmartClustersView from './SmartClustersView';
 import { Image as ImageIcon, Loader2, Copy, Maximize2, X } from 'lucide-react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { listen } from '@tauri-apps/api/event';
@@ -13,6 +14,7 @@ import PreviewActionBar from './PreviewActionBar';
 import {
   getSnapshotPreviewKey,
   normalizeSnapshotPreviewItem,
+  sanitizeSnapshotPreviewState,
   SNAPSHOT_PREVIEW_TAB_LIMIT,
   SNAPSHOT_PREVIEW_WINDOW_LABEL,
   SNAPSHOT_PREVIEW_WINDOW_STATE_KEY,
@@ -130,6 +132,7 @@ export default function MainArea({
   onDeleteNearbyRecords,
   onCopyText,
   backendOnline,
+  isAuthenticated,
 }) {
   const { t } = useTranslation();
   const [showOcrPanel, setShowOcrPanel] = useState(false);
@@ -172,7 +175,7 @@ export default function MainArea({
 
   const syncSnapshotPreviewWindow = useCallback(async (state = buildSnapshotPreviewWindowState()) => {
     try {
-      localStorage.setItem(SNAPSHOT_PREVIEW_WINDOW_STATE_KEY, JSON.stringify(state));
+      localStorage.setItem(SNAPSHOT_PREVIEW_WINDOW_STATE_KEY, JSON.stringify(sanitizeSnapshotPreviewState(state)));
       const existing = await WebviewWindow.getByLabel(SNAPSHOT_PREVIEW_WINDOW_LABEL);
       if (existing) {
         await existing.emit('snapshot-preview-state', state);
@@ -256,11 +259,11 @@ export default function MainArea({
       setSnapshotPreviewTabs(nextTabs);
       setActiveSnapshotPreviewKey(nextActiveKey);
       try {
-        localStorage.setItem(SNAPSHOT_PREVIEW_WINDOW_STATE_KEY, JSON.stringify({
+        localStorage.setItem(SNAPSHOT_PREVIEW_WINDOW_STATE_KEY, JSON.stringify(sanitizeSnapshotPreviewState({
           tabs: nextTabs,
           activeKey: nextActiveKey,
           updatedAt: payload.updatedAt || Date.now(),
-        }));
+        })));
       } catch {
         // best effort
       }
@@ -271,6 +274,27 @@ export default function MainArea({
       if (unlisten) unlisten();
     };
   }, []);
+
+  useEffect(() => {
+    let unlisten;
+    listen('snapshot-preview-open-main', (event) => {
+      const payload = event.payload || {};
+      const screenshotId = payload.screenshot_id ?? payload.id ?? payload.metadata?.screenshot_id;
+      const imagePath = payload.image_path || payload.path || payload.metadata?.image_path;
+      if (screenshotId === undefined && !imagePath) return;
+
+      onAdvancedSelect?.(payload);
+      setActiveTab('preview');
+      const currentWindow = getCurrentWindow();
+      currentWindow.show().catch(() => {});
+      currentWindow.setFocus().catch(() => {});
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [onAdvancedSelect, setActiveTab]);
 
   const openCurrentPreviewInDock = useCallback(() => {
     if (!selectedEvent) return;
@@ -389,6 +413,8 @@ export default function MainArea({
         <div className={`${activeTab === 'smart-cluster' ? 'flex flex-col' : 'hidden'} flex-1 w-full min-w-0 min-h-0 overflow-hidden`}>
           <SmartClustersView
             backendOnline={backendOnline}
+            isAuthenticated={isAuthenticated}
+            active={activeTab === 'smart-cluster'}
             onOpenSnapshotPreview={openSnapshotPreview}
             onSelectScreenshot={(evt) => {
               onAdvancedSelect?.(evt);

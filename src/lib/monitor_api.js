@@ -137,6 +137,12 @@ const thumbnailQueue = new RequestQueue(6, 100);
 // Timeline thumbnails should load in parallel to avoid long UI delays after pan/zoom
 const timelineImageQueue = new RequestQueue(20, 800);
 
+const imageRequestKey = (prefix, id, path) => {
+    if (id !== null && id !== undefined && id !== '') return `${prefix}:id:${id}`;
+    if (path) return `${prefix}:path:${path}`;
+    return null;
+};
+
 /**
  * 初始化凭据管理器 - 应在应用启动时调用
  */
@@ -198,6 +204,7 @@ export const getTimelineDensity = async (startTime, endTime, bucketMs) => {
  * 需要认证才能访问
  */
 export const fetchImage = async (id, path = null) => {
+    const key = imageRequestKey('image', id, path);
     // Use queue to limit concurrent image requests
     return imageQueue.enqueue(async () => {
         return withAuth(async () => {
@@ -208,7 +215,7 @@ export const fetchImage = async (id, path = null) => {
             }
             return null;
         });
-    }, { priority: 'high' });
+    }, { priority: 'high', key });
 };
 
 /**
@@ -245,6 +252,7 @@ export const clearTimelineImageQueue = () => {
  * 通用缩略图获取（用于搜索结果等卡片展示）
  */
 export const fetchThumbnail = async (id, path = null) => {
+    const key = imageRequestKey('thumb', id, path);
     return thumbnailQueue.enqueue(async () => {
         return withAuth(async () => {
             const response = await invoke('storage_get_thumbnail', { id, path });
@@ -253,7 +261,7 @@ export const fetchThumbnail = async (id, path = null) => {
             }
             return null;
         });
-    }, { priority: 'normal' });
+    }, { priority: 'normal', key });
 };
 
 /**

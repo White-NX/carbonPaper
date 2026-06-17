@@ -57,11 +57,16 @@ def _env_bool(name: str, default: bool) -> bool:
 
 CLUSTERING_ENABLED = _env_bool("CARBONPAPER_CLUSTERING_ENABLED", True)
 CLASSIFICATION_ENABLED = _env_bool("CARBONPAPER_CLASSIFICATION_ENABLED", True)
+CLUSTERING_ALLOW_FULL_LOW_MEMORY = _env_bool("CARBONPAPER_CLUSTERING_ALLOW_FULL_LOW_MEMORY", False)
 
 def update_feature_config(clustering_enabled: bool, classification_enabled: bool):
     global CLUSTERING_ENABLED, CLASSIFICATION_ENABLED
     CLUSTERING_ENABLED = clustering_enabled
     CLASSIFICATION_ENABLED = classification_enabled
+
+def update_clustering_resource_config(allow_full_low_memory: bool):
+    global CLUSTERING_ALLOW_FULL_LOW_MEMORY
+    CLUSTERING_ALLOW_FULL_LOW_MEMORY = bool(allow_full_low_memory)
 
 # Built-in exclusion keywords (privacy / incognito indicators)
 EXCLUSION_KEYWORDS = ["InPrivate", "Incognito"]

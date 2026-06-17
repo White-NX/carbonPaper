@@ -84,6 +84,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
             ? newConfig.ocr_queue_max_size
             : 999999,
           ocr_timeout_secs: newConfig.ocr_timeout_secs || 120,
+          clustering_allow_full_low_memory: Boolean(newConfig.clustering_allow_full_low_memory),
         },
       });
     } catch (err) {
@@ -103,7 +104,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     if (key === 'use_onnx') {
       setOnnxChanged(true);
     }
-    if (key === 'capture_on_ocr_busy' || key === 'ocr_queue_limit_enabled') {
+    if (key === 'capture_on_ocr_busy' || key === 'ocr_queue_limit_enabled' || key === 'clustering_allow_full_low_memory') {
       await syncOcrConfigToMonitor(newConfig);
     }
   };
@@ -595,6 +596,23 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
                 </div>
               )}
             </div>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 border-t border-ide-border/50 pt-4">
+            <div className="flex-1 min-w-0">
+              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.clustering.allow_full_low_memory_label')}</p>
+              <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.clustering.allow_full_low_memory_desc')}</p>
+            </div>
+            <button
+              onClick={() => handleToggle('clustering_allow_full_low_memory')}
+              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${config.clustering_allow_full_low_memory ? 'bg-ide-accent' : 'bg-ide-border'
+                }`}
+            >
+              <div
+                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.clustering_allow_full_low_memory ? 'translate-x-5' : 'translate-x-0.5'
+                  }`}
+              />
+            </button>
           </div>
 
           <div className="flex items-start gap-2 p-2.5 bg-ide-panel/50 border border-ide-border/30 rounded-lg">
