@@ -13,8 +13,10 @@ from .config import (
     get_exclusion_settings,
     _get_process_icon_base64,
     update_advanced_capture_config,
+    update_clustering_resource_config,
     update_feature_config,
 )
+from .clustering_commands import handle_clustering_command
 from .ipc_pipe import start_pipe_server
 import os
 import uuid
@@ -351,12 +353,18 @@ def _handle_command_impl(req: dict):
         capture_on_ocr_busy = bool(req.get('capture_on_ocr_busy', False))
         ocr_queue_max_size = int(req.get('ocr_queue_max_size', 1))
         ocr_timeout_secs = int(req.get('ocr_timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
+        allow_full_low_memory = bool(req.get(
+            'clustering_allow_full_low_memory',
+            getattr(config, 'CLUSTERING_ALLOW_FULL_LOW_MEMORY', False),
+        ))
         update_advanced_capture_config(capture_on_ocr_busy, ocr_queue_max_size, ocr_timeout_secs)
+        update_clustering_resource_config(allow_full_low_memory)
         return {
             'status': 'success',
             'capture_on_ocr_busy': capture_on_ocr_busy,
             'ocr_queue_max_size': ocr_queue_max_size,
             'ocr_timeout_secs': ocr_timeout_secs,
+            'clustering_allow_full_low_memory': allow_full_low_memory,
         }
 
     if cmd == 'update_feature_config':
@@ -757,172 +765,14 @@ def _handle_command_impl(req: dict):
             logger.error('presidio_check_idle failed: %s', e)
             return {'error': str(e)}
 
-    # ----- Task clustering commands -----
-    if cmd == 'run_clustering':
-        if not _clustering_scheduler:
-            return {'error': 'Clustering service not initialised'}
-        if not _sync_clustering_scheduler_auth_gate(force=True):
-            return {'error': 'AUTH_REQUIRED: clustering requires unlocked session'}
-        start_time = req.get('start_time')
-        end_time = req.get('end_time')
-        try:
-            if start_time is not None:
-                start_time = float(start_time)
-            if end_time is not None:
-                end_time = float(end_time)
-            result = _clustering_scheduler.run_now(start_time=start_time, end_time=end_time)
-            return {'status': 'success', **result}
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'get_clustering_status':
-        if not _clustering_scheduler:
-            return {'error': 'Clustering service not initialised'}
-        sched_config = _clustering_scheduler.get_config()
-        last = _clustering_scheduler.get_last_result()
-        return {
-            'status': 'success',
-            'config': sched_config,
-            'last_result': {
-                k: v for k, v in (last or {}).items()
-                if k != 'clusters'
-            } if last else None,
-        }
-
-    if cmd == 'set_clustering_interval':
-        if not _clustering_scheduler:
-            return {'error': 'Clustering service not initialised'}
-        interval = req.get('interval', '1w')
-        try:
-            _clustering_scheduler.set_interval(interval)
-            return {'status': 'success', 'interval': interval}
-        except ValueError as e:
-            return {'error': str(e)}
-
-    if cmd == 'get_tasks':
-        if not _clustering_manager:
-            return {'error': 'Clustering service not initialised'}
-        if not _sync_clustering_scheduler_auth_gate(force=True):
-            return {'error': 'AUTH_REQUIRED: clustering requires unlocked session'}
-        try:
-            last = _clustering_scheduler.get_last_result() if _clustering_scheduler else None
-            hot_clusters = last.get('clusters', []) if last else []
-            cold_clusters = _clustering_manager.get_cold_clusters()
-            return {
-                'status': 'success',
-                'hot_clusters': hot_clusters,
-                'cold_clusters': cold_clusters,
-            }
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'nl_cluster_query':
-        if not _clustering_manager:
-            return {'error': 'Clustering service not initialised'}
-        if not _sync_clustering_scheduler_auth_gate(force=True):
-            return {'error': 'AUTH_REQUIRED: clustering requires unlocked session'}
-        query = req.get('query', '')
-        n_results = req.get('n_results', 30)
-        enable_rerank = bool(req.get('enable_rerank', False))
-        rerank_variant = req.get('rerank_variant') or 'uint8'
-        try:
-            from task_clustering import ModelNotAvailableError
-            from reranker import RerankerNotAvailableError
-            try:
-                results = _clustering_manager.query_by_text(
-                    query,
-                    n_results=int(n_results),
-                    enable_rerank=enable_rerank,
-                    rerank_variant=rerank_variant,
-                )
-            except ModelNotAvailableError:
-                return {'error': 'MiniLM model not downloaded — run clustering setup first'}
-            except RerankerNotAvailableError as e:
-                return {'error': f'RERANKER_UNAVAILABLE: {e}'}
-            return {
-                'status': 'success',
-                'results': results,
-                'reranked': enable_rerank,
-                'rerank_variant': rerank_variant if enable_rerank else None,
-            }
-        except Exception as e:
-            logger.exception('nl_cluster_query failed')
-            return {'error': str(e)}
-
-    if cmd == 'nl_cluster_reranker_status':
-        try:
-            from reranker import Reranker, _resolve_model_path, list_available_variants
-            r = Reranker()
-            return {
-                'status': 'success',
-                'available': Reranker.is_model_available(),
-                'loaded': r.is_loaded(),
-                'loaded_variant': r.loaded_variant,
-                'provider': r.provider,
-                'available_variants': list_available_variants(),
-                'model_path': _resolve_model_path(),
-            }
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'smart_cluster_drain_now':
-        try:
-            from smart_cluster_worker import SmartClusterWorker
-            SmartClusterWorker().request_drain_now()
-            return {'status': 'success'}
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'smart_cluster_stop_drain':
-        try:
-            from smart_cluster_worker import SmartClusterWorker
-            SmartClusterWorker().request_stop_drain()
-            return {'status': 'success'}
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'smart_cluster_worker_status':
-        try:
-            from smart_cluster_worker import SmartClusterWorker
-            worker = SmartClusterWorker()
-            sc = worker.storage_client
-            pending_count = sc.smart_cluster_count_pending() if sc else 0
-            return {
-                'status': 'success',
-                'is_running': worker.is_running(),
-                'is_force_running': worker.is_force_running(),
-                'pending_count': pending_count,
-            }
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'smart_cluster_calibrate_preview':
-        """Run the NL retrieval pipeline with rerank=True and return scored
-        candidates so the frontend can show "if you save this, threshold
-        would be X" and let the user mark positive/negative examples."""
-        if not _clustering_manager:
-            return {'error': 'Clustering service not initialised'}
-        if not _sync_clustering_scheduler_auth_gate(force=True):
-            return {'error': 'AUTH_REQUIRED: clustering requires unlocked session'}
-        query = req.get('query', '')
-        n_results = int(req.get('n_results', 30))
-        try:
-            from task_clustering import ModelNotAvailableError
-            from reranker import RerankerNotAvailableError
-            try:
-                results = _clustering_manager.query_by_text(
-                    query,
-                    n_results=n_results,
-                    enable_rerank=True,
-                )
-            except ModelNotAvailableError:
-                return {'error': 'MiniLM model not downloaded — run clustering setup first'}
-            except RerankerNotAvailableError as e:
-                return {'error': f'RERANKER_UNAVAILABLE: {e}'}
-            return {'status': 'success', 'results': results}
-        except Exception as e:
-            logger.exception('smart_cluster_calibrate_preview failed')
-            return {'error': str(e)}
+    clustering_response = handle_clustering_command(
+        req,
+        scheduler=_clustering_scheduler,
+        manager=_clustering_manager,
+        auth_gate=_sync_clustering_scheduler_auth_gate,
+    )
+    if clustering_response is not None:
+        return clustering_response
 
     return {'error': 'unknown command'}
 
@@ -988,6 +838,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     worker_env = {
         'CARBONPAPER_CLUSTERING_ENABLED': str(config.CLUSTERING_ENABLED),
         'CARBONPAPER_CLASSIFICATION_ENABLED': str(config.CLASSIFICATION_ENABLED),
+        'CARBONPAPER_CLUSTERING_ALLOW_FULL_LOW_MEMORY': str(config.CLUSTERING_ALLOW_FULL_LOW_MEMORY),
         'CARBONPAPER_USE_ONNX': os.environ.get('CARBONPAPER_USE_ONNX', 'true'),
         'CARBONPAPER_OCR_TIMEOUT_SECS': str(getattr(config, '_ocr_timeout_secs', 120)),
     }

@@ -6,7 +6,13 @@ def test_scheduler_skips_when_model_not_available(monkeypatch):
         def __init__(self):
             self.calls = 0
 
-        def run_clustering(self, auto_compress=True):
+        def run_clustering(
+            self,
+            auto_compress=True,
+            clustering_mode="auto",
+            manual=False,
+            allow_full_low_memory=False,
+        ):
             self.calls += 1
             return {"status": "success"}
 
@@ -23,7 +29,15 @@ def test_scheduler_skips_when_model_not_available(monkeypatch):
 
 def test_run_now_returns_already_running():
     class Manager:
-        def run_clustering(self, auto_compress=True, start_time=None, end_time=None):
+        def run_clustering(
+            self,
+            auto_compress=True,
+            start_time=None,
+            end_time=None,
+            clustering_mode="auto",
+            manual=False,
+            allow_full_low_memory=False,
+        ):
             return {"status": "success"}
 
     scheduler = tc.ClusteringScheduler(Manager())
@@ -38,8 +52,23 @@ def test_run_now_updates_last_run_only_for_default_mode(monkeypatch):
         def __init__(self):
             self.calls = []
 
-        def run_clustering(self, start_time=None, end_time=None, auto_compress=True):
-            self.calls.append((start_time, end_time, auto_compress))
+        def run_clustering(
+            self,
+            start_time=None,
+            end_time=None,
+            auto_compress=True,
+            clustering_mode="auto",
+            manual=False,
+            allow_full_low_memory=False,
+        ):
+            self.calls.append((
+                start_time,
+                end_time,
+                auto_compress,
+                clustering_mode,
+                manual,
+                allow_full_low_memory,
+            ))
             return {"status": "success"}
 
     manager = Manager()
@@ -57,9 +86,29 @@ def test_run_now_updates_last_run_only_for_default_mode(monkeypatch):
     assert res_default["status"] == "success"
     assert res_range["status"] == "success"
     assert manager.calls == [
-        (None, None, True),
-        (100.0, 200.0, False),
+        (None, None, True, "auto", False, False),
+        (100.0, 200.0, False, "auto", True, False),
     ]
     assert first_last_run > 0
     assert second_last_run == first_last_run
     assert save_calls["count"] == 1
+
+
+def test_manual_auto_clustering_without_range_prompts_for_large_input(monkeypatch):
+    manager = tc.HotColdManager(None)
+    threshold = tc.MANUAL_CLUSTERING_PROMPT_THRESHOLD
+
+    monkeypatch.setattr(
+        manager,
+        "estimate_clustering_inputs",
+        lambda start_time=None, end_time=None: {
+            "count": threshold,
+            "memory": {"low_memory": False},
+        },
+    )
+
+    result = manager.run_clustering(clustering_mode="auto", manual=True)
+
+    assert result["status"] == "needs_user_choice"
+    assert result["n_total"] == threshold
+    assert result["reason"] == "large_range"

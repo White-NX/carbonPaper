@@ -20,6 +20,7 @@ after RERANKER_IDLE_UNLOAD_SECS without work.
 """
 
 import logging
+import os
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -37,6 +38,7 @@ PREFILTER_THRESHOLD = 0.40          # MiniLM cosine cutoff before reranker
 OCR_SNIPPET_CHARS = 600             # truncate OCR text before feeding reranker
 RERANKER_IDLE_UNLOAD_SECS = 60.0    # unload reranker after N seconds w/o work
 DRAIN_NOW_TIMEOUT_SECS = 5.0        # max time the drain_now flag remains set
+MAX_PREFILTER_PAIRS = int(os.environ.get("CARBONPAPER_SMART_CLUSTER_MAX_PREFILTER_PAIRS", "4096") or "4096")
 
 
 class SmartClusterWorker:
@@ -192,6 +194,16 @@ class SmartClusterWorker:
             if stale:
                 self._storage_client.smart_cluster_delete_pending(stale)
             return pending > batch_size
+
+        max_snapshots_for_pair_budget = max(1, MAX_PREFILTER_PAIRS // max(1, len(clusters)))
+        if batch_size > max_snapshots_for_pair_budget:
+            logger.info(
+                "[smart_cluster_worker] reducing batch size from %d to %d for %d enabled cluster(s)",
+                batch_size,
+                max_snapshots_for_pair_budget,
+                len(clusters),
+            )
+            batch_size = max_snapshots_for_pair_budget
 
         # If the reranker model files are missing or the module is broken,
         # exit early WITHOUT touching the pending queue — the snapshots
@@ -369,6 +381,7 @@ class SmartClusterWorker:
         by_cluster: Dict[int, List[int]] = {}
         for sid, cid in candidates:
             by_cluster.setdefault(cid, []).append(sid)
+        cluster_by_id = {int(c["id"]): c for c in clusters}
 
         any_scored = False
         for cid, sids in by_cluster.items():
@@ -384,7 +397,7 @@ class SmartClusterWorker:
                 logger.info("[smart_cluster_worker] left idle mid-batch; aborting after partial scoring")
                 return False
 
-            cluster_meta = next((c for c in clusters if int(c["id"]) == cid), None)
+            cluster_meta = cluster_by_id.get(cid)
             if cluster_meta is None:
                 continue
             anchor_text = cluster_meta["anchor_text"]
