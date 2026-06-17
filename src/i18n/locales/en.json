@@ -767,7 +767,7 @@
     "statusClusters": "Clusters:",
     "statusEnabled": "enabled",
     "statusPending": "Pending:",
-    "idleWarning": "The background worker runs only when the system is idle: no keyboard or mouse input for at least 5 minutes, AC power connected, and no fullscreen game.",
+    "idleWarning": "The background worker runs only when the system is idle.",
     "noClusters": "No smart clusters yet",
     "noClustersHint": "Create a smart cluster to auto-archive related snapshots",
     "createFirst": "Create first cluster",

@@ -767,7 +767,7 @@
     "statusClusters": "聚类:",
     "statusEnabled": "已启用",
     "statusPending": "待处理:",
-    "idleWarning": "后台工作线程仅在系统空闲时运行（无键鼠输入 ≥5分钟、AC 通电、非全屏游戏）",
+    "idleWarning": "后台工作线程仅在系统空闲时运行",
     "noClusters": "还没有智能聚类",
     "noClustersHint": "新建一个智能聚类，让相关快照自动归档",
     "createFirst": "创建第一个聚类",

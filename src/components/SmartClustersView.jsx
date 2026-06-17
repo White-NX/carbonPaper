@@ -311,7 +311,7 @@ export default function SmartClustersView({
           <span>·</span>
           <span>{t('smartClusters.statusPending', '待处理:')} <span className="text-ide-text font-mono">{statusData?.pending_count ?? 0}</span></span>
           <span className="ml-auto opacity-70">
-            {t('smartClusters.idleWarning', '后台工作线程仅在系统空闲时运行（无键鼠输入 ≥5分钟、AC 通电、非全屏游戏）')}
+            {t('smartClusters.idleWarning', '后台工作线程仅在系统空闲时运行')}
           </span>
         </div>
 
