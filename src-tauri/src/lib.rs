@@ -942,6 +942,8 @@ pub fn run() {
             commands::storage::storage_get_thumbnail,
             commands::storage::storage_batch_get_thumbnails,
             commands::storage::storage_warmup_thumbnails,
+            commands::storage::storage_get_thumbnail_warmup_status,
+            commands::storage::storage_cancel_thumbnail_warmup,
             commands::storage::storage_get_screenshot_details,
             commands::storage::storage_delete_screenshot,
             commands::storage::storage_delete_by_time_range,

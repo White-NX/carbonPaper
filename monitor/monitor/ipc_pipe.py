@@ -1,4 +1,5 @@
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import json
 import datetime
 import logging
@@ -114,6 +115,12 @@ class _NamedPipeServer(threading.Thread):
         self.full_pipe_name = f'\\\\.\\pipe\\{pipe_name}'
         self.stop_event = threading.Event()
         self.security_attrs = _make_security_attributes_for_current_user()
+        self.max_workers = int(os.environ.get('CARBONPAPER_IPC_MAX_WORKERS', '8'))
+        self._worker_slots = threading.BoundedSemaphore(self.max_workers)
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix='NamedPipeHandler',
+        )
 
     def run(self):
         logger.info(f"NamedPipeServer starting on {self.full_pipe_name}")
@@ -145,10 +152,20 @@ class _NamedPipeServer(threading.Thread):
                     if getattr(e, 'winerror', None) != 535:
                         raise
 
-                # Delegate handling to a new thread to keep server listening
-                t = threading.Thread(target=self._client_handler, args=(handle,), daemon=True)
-                t.start()
-                handle = None  # ownership transferred to _client_handler
+                # Delegate handling to a bounded worker pool to keep server
+                # listening without allowing unbounded thread growth.
+                if not self._worker_slots.acquire(blocking=False):
+                    logger.warning("[DIAG:PIPE] handler pool busy; rejecting connection")
+                    try:
+                        error_resp = json.dumps({"error": "IPC server busy"}).encode('utf-8')
+                        _write_framed_json(handle, error_resp)
+                        win32file.FlushFileBuffers(handle)
+                    except Exception:
+                        pass
+                    continue
+
+                self._executor.submit(self._client_handler_guarded, handle)
+                handle = None  # ownership transferred to _client_handler_guarded
 
             except Exception as e:
                 if not self.stop_event.is_set():
@@ -164,6 +181,13 @@ class _NamedPipeServer(threading.Thread):
 
     def shutdown(self):
         self.stop_event.set()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _client_handler_guarded(self, handle):
+        try:
+            self._client_handler(handle)
+        finally:
+            self._worker_slots.release()
 
     def _client_handler(self, handle):
         """Handle a single client connection"""
@@ -186,87 +210,97 @@ class _NamedPipeServer(threading.Thread):
                 return
 
             logger.debug(f"IPC client verified: PID {client_pid}")
-            # 2. Read Request
-            try:
-                payload = _read_framed_json_message(handle)
-            except ValueError as e:
-                logger.error(str(e))
-                error_resp = json.dumps({"error": str(e)}).encode('utf-8')
-                _write_framed_json(handle, error_resp)
-                win32file.FlushFileBuffers(handle)
-                return
-            except pywintypes.error as e:
-                if getattr(e, 'winerror', None) == 109: # ERROR_BROKEN_PIPE
+
+            keep_alive = True
+            requests_handled = 0
+            while keep_alive and not getattr(self, 'stop_event', threading.Event()).is_set():
+                request_started = _time.perf_counter()
+                # 2. Read Request
+                try:
+                    payload = _read_framed_json_message(handle)
+                except ValueError as e:
+                    logger.error(str(e))
+                    error_resp = json.dumps({"error": str(e)}).encode('utf-8')
+                    _write_framed_json(handle, error_resp)
+                    win32file.FlushFileBuffers(handle)
                     return
-                raise
+                except pywintypes.error as e:
+                    if getattr(e, 'winerror', None) == 109: # ERROR_BROKEN_PIPE
+                        return
+                    raise
 
-            if not payload:
-                return
+                if not payload:
+                    return
 
-            try:
-                req = json.loads(payload)
-            except json.JSONDecodeError:
-                logger.error(f"Invalid JSON: {payload[:100]}")
-                error_resp = json.dumps({"error": "Invalid JSON in request"}).encode('utf-8')
-                _write_framed_json(handle, error_resp)
-                win32file.FlushFileBuffers(handle)
-                return
+                try:
+                    req = json.loads(payload)
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid JSON: {payload[:100]}")
+                    error_resp = json.dumps({"error": "Invalid JSON in request"}).encode('utf-8')
+                    _write_framed_json(handle, error_resp)
+                    win32file.FlushFileBuffers(handle)
+                    return
 
-            command = req.get('command')
-            is_process_ocr = command == 'process_ocr'
-            if is_process_ocr:
-                logger.debug(
-                    '[DIAG:PIPE] request received command=%s bytes=%s from_pid=%s',
-                    command,
-                    len(payload),
-                    client_pid,
-                )
-
-            # 3. Execute Command
-            exec_started = _time.perf_counter()
-            result = self.handler(req)
-            handler_elapsed = _time.perf_counter() - exec_started
-            if handler_elapsed >= 3.0:
-                logger.warning(
-                    '[DIAG:PIPE] slow handler command=%s exec=%.3fs',
-                    command,
-                    handler_elapsed,
-                )
-            elif is_process_ocr:
-                logger.debug(
-                    '[DIAG:PIPE] handler finished command=%s in %.3fs',
-                    command,
-                    handler_elapsed,
-                )
-
-            # 4. Write Response
-            def json_serial(obj):
-                if isinstance(obj, (datetime.datetime, datetime.date)):
-                    return obj.isoformat()
-                raise TypeError(f"Type {type(obj)} not serializable")
-
-            write_started = _time.perf_counter()
-            resp_str = json.dumps(result, default=json_serial)
-            try:
-                _write_framed_json(handle, resp_str.encode('utf-8'))
-                win32file.FlushFileBuffers(handle)
-            except pywintypes.error as e:
-                if getattr(e, 'winerror', None) in (109, 232):
+                keep_alive = bool(req.get('_ipc_keepalive', False))
+                command = req.get('command')
+                is_process_ocr = command == 'process_ocr'
+                requests_handled += 1
+                if is_process_ocr:
                     logger.debug(
-                        "[DIAG:PIPE] client closed before response command=%s winerror=%s",
+                        '[DIAG:PIPE] request received command=%s bytes=%s from_pid=%s keepalive=%s',
                         command,
-                        e.winerror,
+                        len(payload),
+                        client_pid,
+                        keep_alive,
                     )
-                    return
-                raise
-            if is_process_ocr:
-                logger.debug(
-                    '[DIAG:PIPE] response sent command=%s write=%.3fs total=%.3fs resp_bytes=%s',
-                    command,
-                    _time.perf_counter() - write_started,
-                    _time.perf_counter() - handler_started,
-                    len(resp_str),
-                )
+
+                # 3. Execute Command
+                exec_started = _time.perf_counter()
+                result = self.handler(req)
+                handler_elapsed = _time.perf_counter() - exec_started
+                if handler_elapsed >= 3.0:
+                    logger.warning(
+                        '[DIAG:PIPE] slow handler command=%s exec=%.3fs',
+                        command,
+                        handler_elapsed,
+                    )
+                elif is_process_ocr:
+                    logger.debug(
+                        '[DIAG:PIPE] handler finished command=%s in %.3fs',
+                        command,
+                        handler_elapsed,
+                    )
+
+                # 4. Write Response
+                def json_serial(obj):
+                    if isinstance(obj, (datetime.datetime, datetime.date)):
+                        return obj.isoformat()
+                    raise TypeError(f"Type {type(obj)} not serializable")
+
+                write_started = _time.perf_counter()
+                resp_str = json.dumps(result, default=json_serial)
+                try:
+                    _write_framed_json(handle, resp_str.encode('utf-8'))
+                    win32file.FlushFileBuffers(handle)
+                except pywintypes.error as e:
+                    if getattr(e, 'winerror', None) in (109, 232):
+                        logger.debug(
+                            "[DIAG:PIPE] client closed before response command=%s winerror=%s",
+                            command,
+                            e.winerror,
+                        )
+                        return
+                    raise
+                if is_process_ocr:
+                    logger.debug(
+                        '[DIAG:PIPE] response sent command=%s write=%.3fs request_total=%.3fs connection_total=%.3fs requests=%s resp_bytes=%s',
+                        command,
+                        _time.perf_counter() - write_started,
+                        _time.perf_counter() - request_started,
+                        _time.perf_counter() - handler_started,
+                        requests_handled,
+                        len(resp_str),
+                    )
 
         except Exception as e:
             logger.error(f"Error handling IPC client: {e}", exc_info=True)
@@ -286,8 +320,8 @@ def start_pipe_server(handler, pipe_name):
     return server
 
 
-def send_ipc_request(pipe_name, req):
-    """Client utility"""
+def send_debug_ipc_request(pipe_name, req):
+    """Debug CLI client utility."""
     full_pipe_name = f'\\\\.\\pipe\\{pipe_name}'
     try:
         handle = win32file.CreateFile(

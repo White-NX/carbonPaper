@@ -9,7 +9,7 @@
 use crate::capture::CaptureState;
 use crate::capture::OcrImageCache;
 use crate::monitor::MonitorState;
-use crate::storage::{OcrResultInput, SaveScreenshotRequest, StorageState};
+use crate::storage::{OcrResultInput, SaveScreenshotRequest, ScreenshotRecord, StorageState};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::os::windows::io::AsRawHandle;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 
@@ -178,6 +178,21 @@ impl StorageResponse {
             data: None,
         }
     }
+}
+
+fn screenshot_record_with_ocr_json(
+    rec: ScreenshotRecord,
+    ocr_map: &std::collections::HashMap<i64, String>,
+) -> serde_json::Value {
+    let ocr_text = ocr_map.get(&rec.id).cloned().unwrap_or_default();
+    serde_json::json!({
+        "id": rec.id,
+        "process_name": rec.process_name.unwrap_or_default(),
+        "window_title": rec.window_title.unwrap_or_default(),
+        "ocr_text": ocr_text,
+        "timestamp": rec.timestamp.unwrap_or(0) as f64,
+        "category": rec.category.unwrap_or_default(),
+    })
 }
 
 use windows::Win32::Security::GetTokenInformation;
@@ -367,6 +382,7 @@ impl ReverseIpcServer {
             rt.block_on(async move {
                 let full_pipe_name = format!(r"\\.\pipe\{}", pipe_name);
                 let wide_pipe_name: Vec<u16> = full_pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+                let handler_semaphore = Arc::new(Semaphore::new(8));
 
                 loop {
                     // 创建安全描述符
@@ -424,11 +440,24 @@ impl ReverseIpcServer {
                                 continue;
                             }
 
+                            let permit = match handler_semaphore.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    tracing::warn!("[DIAG:REVERSE_IPC] handler pool busy; rejecting connection");
+                                    let mut server = server;
+                                    let err_resp = StorageResponse::error("Reverse IPC server busy");
+                                    let response_bytes = serde_json::to_vec(&err_resp).unwrap_or_default();
+                                    let _ = write_ipc_frame(&mut server, &response_bytes).await;
+                                    continue;
+                                }
+                            };
+
                             // 处理客户端请求
                             let storage_clone = storage.clone();
                             let ocr_cache_clone = ocr_cache.clone();
                             let app_clone = app_handle.clone();
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 handle_client(server, storage_clone, ocr_cache_clone, app_clone).await;
                             });
                         }
@@ -508,69 +537,95 @@ async fn handle_client(
         }
     }
 
-    let buf = match read_ipc_frame(&mut server).await {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::error!("Reverse IPC read error: {}", e);
-            let response = StorageResponse::error(&e);
-            let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-            let _ = write_ipc_frame(&mut server, &response_bytes).await;
-            return;
-        }
-    };
-
-    if buf.is_empty() {
-        return;
-    }
-
-    // 解析请求
-    let req = match serde_json::from_slice::<serde_json::Value>(&buf) {
-        Ok(req) => req,
-        Err(e) => {
-            let response =
-                StorageResponse::error(&format!("Invalid JSON: {} (bytes={})", e, buf.len()));
-            let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-            if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
-                tracing::error!("Write error: {}", e);
-            }
-            return;
-        }
-    };
-
-    if req.get("command").and_then(|c| c.as_str()) == Some("get_temp_image") {
-        match get_temp_image_bytes(&req, &storage, &ocr_cache) {
-            Ok((image_bytes, mime_type)) => {
-                let metadata = StorageResponse::success(serde_json::json!({
-                    "mime_type": mime_type,
-                    "binary_body_len": image_bytes.len(),
-                    "binary_frame": true,
-                }));
-                let metadata_bytes = serde_json::to_vec(&metadata).unwrap_or_default();
-                if let Err(e) = write_ipc_frame(&mut server, &metadata_bytes).await {
-                    tracing::error!("Write binary metadata error: {}", e);
+    let mut keepalive = true;
+    let mut requests_handled: u64 = 0;
+    while keepalive {
+        let buf = match read_ipc_frame(&mut server).await {
+            Ok(result) => result,
+            Err(e) => {
+                if keepalive && requests_handled > 0 && e == "overall_timeout" {
+                    tracing::debug!(
+                        "[DIAG:REVERSE_IPC] persistent connection idle timeout after {} requests",
+                        requests_handled
+                    );
                     return;
                 }
-                if let Err(e) = write_ipc_binary_frame(&mut server, &image_bytes).await {
-                    tracing::error!("Write binary body error: {}", e);
-                }
-            }
-            Err(e) => {
+                tracing::error!("Reverse IPC read error: {}", e);
                 let response = StorageResponse::error(&e);
+                let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+                let _ = write_ipc_frame(&mut server, &response_bytes).await;
+                return;
+            }
+        };
+
+        if buf.is_empty() {
+            return;
+        }
+
+        // 解析请求
+        let req = match serde_json::from_slice::<serde_json::Value>(&buf) {
+            Ok(req) => req,
+            Err(e) => {
+                let response =
+                    StorageResponse::error(&format!("Invalid JSON: {} (bytes={})", e, buf.len()));
                 let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
                 if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
                     tracing::error!("Write error: {}", e);
                 }
+                return;
+            }
+        };
+
+        keepalive = req
+            .get("_ipc_keepalive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        requests_handled = requests_handled.saturating_add(1);
+
+        if req.get("command").and_then(|c| c.as_str()) == Some("get_temp_image") {
+            match get_temp_image_bytes(&req, &storage, &ocr_cache) {
+                Ok((image_bytes, mime_type)) => {
+                    let metadata = StorageResponse::success(serde_json::json!({
+                        "mime_type": mime_type,
+                        "binary_body_len": image_bytes.len(),
+                        "binary_frame": true,
+                    }));
+                    let metadata_bytes = serde_json::to_vec(&metadata).unwrap_or_default();
+                    if let Err(e) = write_ipc_frame(&mut server, &metadata_bytes).await {
+                        tracing::error!("Write binary metadata error: {}", e);
+                        return;
+                    }
+                    if let Err(e) = write_ipc_binary_frame(&mut server, &image_bytes).await {
+                        tracing::error!("Write binary body error: {}", e);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let response = StorageResponse::error(&e);
+                    let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+                    if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
+                        tracing::error!("Write error: {}", e);
+                        return;
+                    }
+                }
+            }
+        } else {
+            let response = process_request(&req, &storage, &app_handle);
+
+            // 发送响应
+            let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+            if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
+                tracing::error!("Write error: {}", e);
+                return;
             }
         }
-        return;
-    }
 
-    let response = process_request(&req, &storage, &app_handle);
-
-    // 发送响应
-    let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-    if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
-        tracing::error!("Write error: {}", e);
+        if keepalive && requests_handled % 100 == 0 {
+            tracing::debug!(
+                "[DIAG:REVERSE_IPC] persistent connection handled {} requests",
+                requests_handled
+            );
+        }
     }
 }
 
@@ -793,6 +848,26 @@ fn process_request(
                 Err(e) => StorageResponse::error(&e),
             }
         }
+        "update_screenshot_category" => {
+            let screenshot_id = req
+                .get("screenshot_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            let category = req.get("category").and_then(|v| v.as_str()).unwrap_or("");
+            let category_confidence = req.get("category_confidence").and_then(|v| v.as_f64());
+
+            if screenshot_id < 0 {
+                return StorageResponse::error("Invalid screenshot_id");
+            }
+            if category.trim().is_empty() {
+                return StorageResponse::error("category is required");
+            }
+
+            match storage.update_screenshot_category(screenshot_id, category, category_confidence) {
+                Ok(updated) => StorageResponse::success(serde_json::json!({"updated": updated})),
+                Err(e) => StorageResponse::error(&e),
+            }
+        }
         "list_screenshots_for_clustering" => {
             let start_ts = req.get("start_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let end_ts = req.get("end_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -819,27 +894,20 @@ fn process_request(
             // Paged query with SQL LIMIT/OFFSET (only decrypt this page)
             match storage.get_screenshots_by_time_range_paged(s, e, offset, limit) {
                 Ok(records) => {
+                    let ids: Vec<i64> = records.iter().map(|rec| rec.id).collect();
+                    let ocr_batch_started = std::time::Instant::now();
+                    let ocr_map = match storage.get_ocr_results_by_screenshot_ids(&ids) {
+                        Ok(map) => map,
+                        Err(e) => return StorageResponse::error(&e),
+                    };
+                    tracing::debug!(
+                        "[DIAG:CLUSTERING] batch OCR fetch ids={} elapsed={}ms",
+                        ids.len(),
+                        ocr_batch_started.elapsed().as_millis()
+                    );
                     let page: Vec<serde_json::Value> = records
                         .into_iter()
-                        .map(|rec| {
-                            // Fetch OCR text for each screenshot
-                            let ocr_text = match storage.get_screenshot_ocr_results(rec.id) {
-                                Ok(ocr_results) => ocr_results
-                                    .iter()
-                                    .map(|r| r.text.clone())
-                                    .collect::<Vec<_>>()
-                                    .join(" "),
-                                Err(_) => String::new(),
-                            };
-                            serde_json::json!({
-                                "id": rec.id,
-                                "process_name": rec.process_name.unwrap_or_default(),
-                                "window_title": rec.window_title.unwrap_or_default(),
-                                "ocr_text": ocr_text,
-                                "timestamp": rec.timestamp.unwrap_or(0) as f64,
-                                "category": rec.category.unwrap_or_default(),
-                            })
-                        })
+                        .map(|rec| screenshot_record_with_ocr_json(rec, &ocr_map))
                         .collect();
                     StorageResponse::success(serde_json::json!({
                         "screenshots": page,
@@ -875,17 +943,7 @@ fn process_request(
                 Ok(records) => {
                     let out: Vec<serde_json::Value> = records
                         .into_iter()
-                        .map(|rec| {
-                            let ocr_text = ocr_map.get(&rec.id).cloned().unwrap_or_default();
-                            serde_json::json!({
-                                "id": rec.id,
-                                "process_name": rec.process_name.unwrap_or_default(),
-                                "window_title": rec.window_title.unwrap_or_default(),
-                                "ocr_text": ocr_text,
-                                "timestamp": rec.timestamp.unwrap_or(0) as f64,
-                                "category": rec.category.unwrap_or_default(),
-                            })
-                        })
+                        .map(|rec| screenshot_record_with_ocr_json(rec, &ocr_map))
                         .collect();
                     StorageResponse::success(serde_json::json!({ "screenshots": out }))
                 }
@@ -1602,7 +1660,14 @@ async fn process_extension_ocr(
         (token, seq)
     };
 
-    let response = crate::monitor::send_ipc_request(&pipe_name, &auth_token, seq_no, req).await?;
+    let response = crate::monitor::send_ipc_request_reused(
+        monitor_state,
+        &pipe_name,
+        &auth_token,
+        seq_no,
+        req,
+    )
+    .await?;
 
     if let Some(error) = response.get("error").and_then(|v| v.as_str()) {
         return Err(format!("Python OCR error: {}", error));
@@ -1626,7 +1691,7 @@ async fn process_extension_ocr(
         category_confidence,
     )?;
 
-    tracing::debug!(
+    tracing::info!(
         "Extension screenshot {} committed with {} OCR results",
         screenshot_id,
         ocr_results.as_ref().map(|r| r.len()).unwrap_or(0)
@@ -1638,6 +1703,7 @@ async fn process_extension_ocr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_storage_response_success() {
@@ -1810,5 +1876,67 @@ mod tests {
         assert!(first.get("process_name").is_some());
         assert!(first.get("window_title").is_some());
         assert!(first.get("ocr_text").is_some());
+    }
+
+    #[test]
+    fn test_screenshot_record_with_ocr_json_uses_batch_map() {
+        let mut ocr_map = HashMap::new();
+        ocr_map.insert(42, "alpha beta".to_string());
+
+        let rec = ScreenshotRecord {
+            id: 42,
+            image_path: "screenshots/42.jpg.enc".to_string(),
+            image_hash: "h42".to_string(),
+            width: Some(100),
+            height: Some(80),
+            window_title: Some("Editor".to_string()),
+            process_name: Some("code.exe".to_string()),
+            created_at: "2026-06-16 12:00:00".to_string(),
+            metadata: None,
+            timestamp: Some(1_797_331_200_000),
+            source: None,
+            page_url: None,
+            page_icon: None,
+            visible_links: None,
+            category: Some("Development".to_string()),
+            category_confidence: Some(0.9),
+        };
+
+        let value = screenshot_record_with_ocr_json(rec, &ocr_map);
+
+        assert_eq!(value["id"], 42);
+        assert_eq!(value["ocr_text"], "alpha beta");
+        assert_eq!(value["process_name"], "code.exe");
+        assert_eq!(value["window_title"], "Editor");
+        assert_eq!(value["category"], "Development");
+    }
+
+    #[test]
+    fn test_screenshot_record_with_ocr_json_missing_ocr_is_empty() {
+        let rec = ScreenshotRecord {
+            id: 7,
+            image_path: "screenshots/7.jpg.enc".to_string(),
+            image_hash: "h7".to_string(),
+            width: None,
+            height: None,
+            window_title: None,
+            process_name: None,
+            created_at: "2026-06-16 12:00:00".to_string(),
+            metadata: None,
+            timestamp: None,
+            source: None,
+            page_url: None,
+            page_icon: None,
+            visible_links: None,
+            category: None,
+            category_confidence: None,
+        };
+
+        let value = screenshot_record_with_ocr_json(rec, &HashMap::new());
+
+        assert_eq!(value["ocr_text"], "");
+        assert_eq!(value["process_name"], "");
+        assert_eq!(value["window_title"], "");
+        assert_eq!(value["timestamp"], 0.0);
     }
 }

@@ -21,13 +21,12 @@ import uuid
 import base64
 import json
 import logging
+import queue
 import time
 import threading
 
 logger = logging.getLogger(__name__)
 
-PROCESS_OCR_SLOW_STAGE_SECS = 3.0
-PROCESS_OCR_SLOW_TOTAL_SECS = 20.0
 CLUSTERING_AUTH_POLL_INTERVAL_SECS = 2.0
 
 _server = None
@@ -40,6 +39,9 @@ _last_clustering_auth_check = 0.0
 _last_clustering_session_valid = False
 _clustering_auth_monitor_thread = None
 _clustering_auth_gate_lock = threading.Lock()
+_clustering_ingest_queue = None
+_clustering_ingest_thread = None
+_clustering_ingest_stop = threading.Event()
 _auth_token = None           # Auth token for IPC validation
 _last_seq_no = -1            # Last processed sequence number
 _storage_pipe = None         # Storage service pipe name
@@ -127,6 +129,81 @@ def _start_clustering_auth_monitor():
     _clustering_auth_monitor_thread.start()
 
 
+def _start_clustering_ingest_worker(maxsize: int = 128):
+    global _clustering_ingest_queue, _clustering_ingest_thread
+    if _clustering_ingest_thread and _clustering_ingest_thread.is_alive():
+        return
+    _clustering_ingest_queue = queue.Queue(maxsize=max(1, maxsize))
+    _clustering_ingest_stop.clear()
+
+    def _loop():
+        while not _clustering_ingest_stop.is_set():
+            try:
+                item = _clustering_ingest_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                if not (_clustering_manager and config.CLUSTERING_ENABLED):
+                    continue
+                if not (_clustering_scheduler_active and _last_clustering_session_valid):
+                    logger.debug(
+                        '[DIAG:clustering_ingest] skipped screenshot_id=%s (session locked/inactive)',
+                        item.get('screenshot_id'),
+                    )
+                    continue
+                started = time.perf_counter()
+                _clustering_manager.add_snapshot(**item)
+                logger.debug(
+                    '[DIAG:clustering_ingest] add_snapshot done screenshot_id=%s elapsed=%.3fs queue_size=%s',
+                    item.get('screenshot_id'),
+                    time.perf_counter() - started,
+                    _clustering_ingest_queue.qsize(),
+                )
+            except Exception as exc:
+                logger.warning(
+                    '[DIAG:clustering_ingest] add_snapshot failed screenshot_id=%s error=%s',
+                    item.get('screenshot_id'),
+                    exc,
+                )
+            finally:
+                _clustering_ingest_queue.task_done()
+
+    _clustering_ingest_thread = threading.Thread(
+        target=_loop,
+        name='clustering-ingest',
+        daemon=True,
+    )
+    _clustering_ingest_thread.start()
+
+
+def _stop_clustering_ingest_worker():
+    global _clustering_ingest_thread, _clustering_ingest_queue
+    _clustering_ingest_stop.set()
+    if _clustering_ingest_thread:
+        _clustering_ingest_thread.join(timeout=2.0)
+    _clustering_ingest_thread = None
+    _clustering_ingest_queue = None
+
+
+def _enqueue_clustering_snapshot(item: dict) -> bool:
+    if not (_clustering_manager and config.CLUSTERING_ENABLED):
+        return False
+    if not (_clustering_scheduler_active and _last_clustering_session_valid):
+        return False
+    if _clustering_ingest_queue is None:
+        _start_clustering_ingest_worker()
+    try:
+        _clustering_ingest_queue.put_nowait(item)
+        return True
+    except queue.Full:
+        logger.warning(
+            '[DIAG:clustering_ingest] queue full; dropped screenshot_id=%s maxsize=%s',
+            item.get('screenshot_id'),
+            _clustering_ingest_queue.maxsize,
+        )
+        return False
+
+
 def _delete_vectors_by_hashes(image_hashes):
     """Best-effort delete from vector store using image hashes."""
     if not image_hashes:
@@ -134,18 +211,15 @@ def _delete_vectors_by_hashes(image_hashes):
 
     if not _ocr_worker:
         return {"deleted": 0, "requested": len(image_hashes), "skipped": True}
+    if not hasattr(_ocr_worker, 'delete_vector_image'):
+        return {"deleted": 0, "requested": len(image_hashes), "skipped": True}
 
     deleted = 0
     for image_hash in image_hashes:
         if not isinstance(image_hash, str) or not image_hash:
             continue
         try:
-            if hasattr(_ocr_worker, 'delete_vector_image'):
-                ok = _ocr_worker.delete_vector_image(image_hash)
-            elif getattr(_ocr_worker, 'vector_store', None):
-                ok = _ocr_worker.vector_store.delete_image(f"memory://{image_hash}")
-            else:
-                ok = False
+            ok = _ocr_worker.delete_vector_image(image_hash)
             if ok:
                 deleted += 1
         except Exception:
@@ -452,7 +526,6 @@ def _handle_command_impl(req: dict):
         if not _ocr_worker:
             return {'error': 'OCR service not initialised'}
 
-        cmd_started = time.perf_counter()
         logger.debug(
             '[DIAG:process_ocr] start screenshot_id=%s image_hash=%s process=%s',
             screenshot_id,
@@ -460,259 +533,49 @@ def _handle_command_impl(req: dict):
             req.get('process_name', ''),
         )
 
-        if hasattr(_ocr_worker, 'request'):
-            timeout_secs = int(req.get('timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
-            try:
-                result = _ocr_worker.request(
-                    'process_ocr',
-                    {'request': req},
-                    timeout=max(30, min(600, timeout_secs)),
-                )
-                if result.get('status') == 'success':
-                    ocr_text = result.get('ocr_text', '')
-                    category = result.get('category')
-                    clustering_allowed = _clustering_scheduler_active and _last_clustering_session_valid and config.CLUSTERING_ENABLED
-                    if _clustering_manager and clustering_allowed:
-                        try:
-                            _clustering_manager.add_snapshot(
-                                screenshot_id=screenshot_id,
-                                process_name=req.get('process_name', ''),
-                                window_title=req.get('window_title', ''),
-                                ocr_text=ocr_text,
-                                timestamp=req.get('timestamp', 0),
-                                category=category or '',
-                            )
-                        except Exception as te:
-                            logger.warning('Task vector add failed: %s', te)
-                    result.pop('ocr_text', None)
-                return result
-            except TimeoutError as e:
-                logger.error('[DIAG:process_ocr] worker timeout screenshot_id=%s error=%s', screenshot_id, e)
-                return {'error': str(e)}
-            except Exception as e:
-                logger.error('[DIAG:process_ocr] worker failed screenshot_id=%s error=%s', screenshot_id, e, exc_info=True)
-                return {'error': str(e)}
+        if not hasattr(_ocr_worker, 'request'):
+            return {'error': 'OCR service requires RestartableModelWorker'}
 
+        timeout_secs = int(req.get('timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
         try:
-            from PIL import Image
-            import io as _io
-            from storage_client import get_storage_client
-
-            # Fetch decrypted image from Rust via reverse IPC
-            t_fetch = time.perf_counter()
-            sc = get_storage_client()
-            if not sc:
-                logger.error('[DIAG:process_ocr] screenshot_id=%s storage client unavailable', screenshot_id)
-                return {'error': 'Storage client not available'}
-
-            resp = sc.get_temp_image_bytes(screenshot_id)
-
-            if resp.get('status') != 'success':
-                logger.error(
-                    '[DIAG:process_ocr] screenshot_id=%s get_temp_image failed in %.3fs: %s',
-                    screenshot_id,
-                    time.perf_counter() - t_fetch,
-                    resp.get('error', 'unknown'),
-                )
-                return {'error': f"Failed to fetch image: {resp.get('error', 'unknown')}"}
-
-            image_bytes = resp.get('data', {}).get('image_bytes')
-            if not image_bytes:
-                logger.error(
-                    '[DIAG:process_ocr] screenshot_id=%s get_temp_image returned empty payload in %.3fs',
-                    screenshot_id,
-                    time.perf_counter() - t_fetch,
-                )
-                return {'error': 'No image data returned from storage'}
-
-            fetch_elapsed = time.perf_counter() - t_fetch
-            logger.debug(
-                '[DIAG:process_ocr] screenshot_id=%s temp image fetched in %.3fs payload_bytes=%s',
-                screenshot_id,
-                fetch_elapsed,
-                len(image_bytes),
+            result = _ocr_worker.request(
+                'process_ocr',
+                {'request': req},
+                timeout=max(30, min(600, timeout_secs)),
             )
-            if fetch_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
-                logger.warning(
-                    '[DIAG:process_ocr] screenshot_id=%s slow get_temp_image fetch=%.3fs',
+            if result.get('status') == 'success':
+                ocr_text = result.get('ocr_text', '')
+                ocr_results = result.get('ocr_results') or []
+                ocr_diag = result.get('ocr_diag') or {}
+                logger.info(
+                    '[DIAG:process_ocr] success screenshot_id=%s returned_blocks=%s text_len=%s postprocess_enqueued=%s elapsed=%.3fs worker_protocol=%s image_bytes=%s image_size=%s raw_blocks=%s filtered_blocks=%s ocr_elapsed=%.3fs',
                     screenshot_id,
-                    fetch_elapsed,
+                    len(ocr_results) if isinstance(ocr_results, list) else 0,
+                    len(ocr_text or ''),
+                    result.get('postprocess_enqueued'),
+                    float(result.get('elapsed') or 0.0),
+                    result.get('worker_protocol'),
+                    ocr_diag.get('image_bytes'),
+                    ocr_diag.get('image_size'),
+                    ocr_diag.get('raw_blocks'),
+                    ocr_diag.get('filtered_blocks'),
+                    float(ocr_diag.get('ocr_elapsed') or 0.0),
                 )
-
-            t_decode = time.perf_counter()
-            image_pil = Image.open(_io.BytesIO(image_bytes))
-            decode_elapsed = time.perf_counter() - t_decode
-            logger.debug(
-                '[DIAG:process_ocr] screenshot_id=%s image decoded in %.3fs bytes=%s mode=%s size=%s',
-                screenshot_id,
-                decode_elapsed,
-                len(image_bytes),
-                getattr(image_pil, 'mode', ''),
-                getattr(image_pil, 'size', ''),
-            )
-
-            # Run OCR
-            t_ocr = time.perf_counter()
-            ocr_results = _ocr_worker.ocr_engine.recognize(image_pil)
-            filtered = [r for r in ocr_results if r.get('confidence', 0) >= 0.5]
-            ocr_elapsed = time.perf_counter() - t_ocr
-            logger.debug(
-                '[DIAG:process_ocr] screenshot_id=%s ocr finished in %.3fs raw_blocks=%s filtered_blocks=%s',
-                screenshot_id,
-                ocr_elapsed,
-                len(ocr_results),
-                len(filtered),
-            )
-            if ocr_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
-                logger.warning(
-                    '[DIAG:process_ocr] screenshot_id=%s slow ocr=%.3fs raw_blocks=%s',
-                    screenshot_id,
-                    ocr_elapsed,
-                    len(ocr_results),
-                )
-
-            # Update stats
-            _ocr_worker.stats['processed_count'] += 1
-            _ocr_worker.stats['total_texts_found'] += len(filtered)
-
-            # Add to vector store (if enabled)
-            image_hash = req.get('image_hash', '')
-            ocr_text = ' '.join([r.get('text', '') for r in filtered])
-            if _ocr_worker.enable_vector_store and _ocr_worker.vector_store:
-                if ocr_text.strip():
-                    try:
-                        t_vector = time.perf_counter()
-                        _ocr_worker.vector_store.add_image(
-                            image_path=f"memory://{image_hash}",
-                            image=image_pil,
-                            metadata={
-                                'window_title': req.get('window_title', ''),
-                                'process_name': req.get('process_name', ''),
-                                'timestamp': req.get('timestamp', 0),
-                            },
-                            ocr_text=ocr_text,
-                        )
-                        vector_elapsed = time.perf_counter() - t_vector
-                        logger.debug(
-                            '[DIAG:process_ocr] screenshot_id=%s vector_store.add_image done in %.3fs text_len=%s',
-                            screenshot_id,
-                            vector_elapsed,
-                            len(ocr_text),
-                        )
-                        if vector_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
-                            logger.warning(
-                                '[DIAG:process_ocr] screenshot_id=%s slow vector_store.add_image=%.3fs text_len=%s',
-                                screenshot_id,
-                                vector_elapsed,
-                                len(ocr_text),
-                            )
-                    except Exception as ve:
-                        logger.warning('Vector store add failed: %s', ve)
-                else:
-                    logger.debug('[DIAG:process_ocr] screenshot_id=%s vector store skipped (empty text)', screenshot_id)
-            else:
-                logger.debug(
-                    '[DIAG:process_ocr] screenshot_id=%s vector store unavailable enabled=%s has_store=%s',
-                    screenshot_id,
-                    bool(getattr(_ocr_worker, 'enable_vector_store', False)),
-                    bool(getattr(_ocr_worker, 'vector_store', None)),
-                )
-
-            # Classify screenshot
-            category = None
-            category_confidence = None
-            if _classifier and config.CLASSIFICATION_ENABLED:
-                try:
-                    t_classify = time.perf_counter()
-                    window_title = req.get('window_title', '')
-                    process_name = req.get('process_name', '')
-                    category, category_confidence = _classifier.classify(
-                        title=window_title,
-                        ocr_text=ocr_text,
-                        process_name=process_name,
-                    )
-                    category_confidence = round(category_confidence, 4)
-                    classify_elapsed = time.perf_counter() - t_classify
-                    logger.debug(
-                        '[DIAG:process_ocr] screenshot_id=%s classify done in %.3fs category=%s confidence=%s',
-                        screenshot_id,
-                        classify_elapsed,
-                        category,
-                        category_confidence,
-                    )
-                    if classify_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
-                        logger.warning(
-                            '[DIAG:process_ocr] screenshot_id=%s slow classify=%.3fs',
-                            screenshot_id,
-                            classify_elapsed,
-                        )
-                except Exception as ce:
-                    logger.warning('Classification failed: %s', ce)
-            else:
-                logger.debug('[DIAG:process_ocr] screenshot_id=%s classify skipped (no classifier)', screenshot_id)
-
-            # Add to task clustering hot layer (non-blocking, best-effort)
-            clustering_allowed = _clustering_scheduler_active and _last_clustering_session_valid and config.CLUSTERING_ENABLED
-            if _clustering_manager and clustering_allowed:
-                try:
-                    t_cluster = time.perf_counter()
-                    _clustering_manager.add_snapshot(
-                        screenshot_id=screenshot_id,
-                        process_name=req.get('process_name', ''),
-                        window_title=req.get('window_title', ''),
-                        ocr_text=ocr_text,
-                        timestamp=req.get('timestamp', 0),
-                        category=category or '',
-                    )
-                    cluster_elapsed = time.perf_counter() - t_cluster
-                    logger.debug(
-                        '[DIAG:process_ocr] screenshot_id=%s clustering add done in %.3fs',
-                        screenshot_id,
-                        cluster_elapsed,
-                    )
-                    if cluster_elapsed >= PROCESS_OCR_SLOW_STAGE_SECS:
-                        logger.warning(
-                            '[DIAG:process_ocr] screenshot_id=%s slow clustering add=%.3fs',
-                            screenshot_id,
-                            cluster_elapsed,
-                        )
-                except Exception as te:
-                    logger.warning('Task vector add failed: %s', te)
-            elif _clustering_manager and not clustering_allowed:
-                logger.debug('[DIAG:process_ocr] screenshot_id=%s clustering skipped (session locked)', screenshot_id)
-            else:
-                logger.debug('[DIAG:process_ocr] screenshot_id=%s clustering skipped (no manager)', screenshot_id)
-
-            result = {
-                'status': 'success',
-                'ocr_results': filtered,
-            }
-            if category:
-                result['category'] = category
-                result['category_confidence'] = category_confidence
-            total_elapsed = time.perf_counter() - cmd_started
-            logger.info(
-                '[DIAG:process_ocr] success screenshot_id=%s total=%.3fs returned_blocks=%s',
-                screenshot_id,
-                total_elapsed,
-                len(filtered),
-            )
-            if total_elapsed >= PROCESS_OCR_SLOW_TOTAL_SECS:
-                logger.warning(
-                    '[DIAG:process_ocr] screenshot_id=%s very slow total=%.3fs',
-                    screenshot_id,
-                    total_elapsed,
-                )
+                _enqueue_clustering_snapshot({
+                    'screenshot_id': screenshot_id,
+                    'process_name': req.get('process_name', ''),
+                    'window_title': req.get('window_title', ''),
+                    'ocr_text': ocr_text,
+                    'timestamp': req.get('timestamp', 0),
+                    'category': '',
+                })
+                result.pop('ocr_text', None)
             return result
+        except TimeoutError as e:
+            logger.error('[DIAG:process_ocr] worker timeout screenshot_id=%s error=%s', screenshot_id, e)
+            return {'error': str(e)}
         except Exception as e:
-            logger.error(
-                '[DIAG:process_ocr] failed screenshot_id=%s total=%.3fs error=%s',
-                screenshot_id,
-                time.perf_counter() - cmd_started,
-                e,
-                exc_info=True,
-            )
-            _ocr_worker.stats['failed_count'] += 1
+            logger.error('[DIAG:process_ocr] worker failed screenshot_id=%s error=%s', screenshot_id, e, exc_info=True)
             return {'error': str(e)}
 
     # ----- Classification commands -----
@@ -720,17 +583,14 @@ def _handle_command_impl(req: dict):
         title = req.get('title', '')
         ocr_text = req.get('ocr_text', '')
         process_name = req.get('process_name', '')
-        if not _classifier and not hasattr(_ocr_worker, 'classify'):
+        if not _classifier or not hasattr(_classifier, 'classify'):
             return {'error': 'Classification service not initialised'}
         try:
-            if hasattr(_ocr_worker, 'classify'):
-                category, confidence = _ocr_worker.classify(title, ocr_text, process_name)
-            else:
-                category, confidence = _classifier.classify(
-                    title=title,
-                    ocr_text=ocr_text,
-                    process_name=process_name,
-                )
+            category, confidence = _classifier.classify(
+                title=title,
+                ocr_text=ocr_text,
+                process_name=process_name,
+            )
             return {
                 'status': 'success',
                 'category': category,
@@ -825,17 +685,20 @@ def _handle_command_impl(req: dict):
         if not isinstance(texts, list) or len(texts) == 0:
             return {'error': 'texts must be a non-empty list'}
         try:
-            from .presidio_service import PresidioService
-            svc = PresidioService.get_instance()
-            if not svc._initialized:
-                svc.initialize(language)
-            results = svc.analyze(texts, entity_types)
+            from .presidio_worker import get_presidio_worker
+            results = get_presidio_worker().analyze(
+                texts,
+                language,
+                entity_types,
+                timeout=float(req.get('timeout_secs', 14.0)),
+            )
             return {
                 'status': 'success',
-                'results': [
-                    {'entities': list(ents)} for ents in results
-                ],
+                'results': results,
             }
+        except TimeoutError as e:
+            logger.warning('presidio_analyze timeout: %s', e)
+            return {'error': str(e)}
         except Exception as e:
             logger.error('presidio_analyze failed: %s', e)
             return {'error': str(e)}
@@ -843,9 +706,13 @@ def _handle_command_impl(req: dict):
     if cmd == 'presidio_set_language':
         language = req.get('language', 'zh-CN')
         try:
-            from .presidio_service import PresidioService
-            svc = PresidioService.get_instance()
-            svc.switch_language(language)
+            from .presidio_worker import get_presidio_worker
+            result = get_presidio_worker().request(
+                {'command': 'set_language', 'language': language},
+                timeout=5.0,
+            )
+            if result.get('status') != 'success':
+                return {'error': result.get('error', 'presidio_set_language failed')}
             return {
                 'status': 'success',
                 'ok': True,
@@ -857,17 +724,26 @@ def _handle_command_impl(req: dict):
 
     if cmd == 'presidio_status':
         try:
-            from .presidio_service import PresidioService
-            svc = PresidioService.get_instance()
-            return {'status': 'success', **svc.get_status()}
+            from .presidio_worker import get_presidio_worker
+            result = get_presidio_worker().status()
+            if result.get('status') != 'success':
+                return {'status': 'success', 'loaded': False, 'language': None, 'model': 'none'}
+            return {
+                'status': 'success',
+                'loaded': bool(result.get('initialized')),
+                'language': result.get('language'),
+                'model': result.get('model') or 'none',
+                'watchdog': get_presidio_worker().status_snapshot(),
+            }
         except Exception as e:
             return {'status': 'success', 'loaded': False, 'language': None, 'model': 'none'}
 
     if cmd == 'presidio_unload':
         try:
-            from .presidio_service import PresidioService
-            svc = PresidioService.get_instance()
-            svc.unload()
+            from .presidio_worker import get_presidio_worker
+            result = get_presidio_worker().unload()
+            if result.get('status') != 'success':
+                return {'error': result.get('error', 'presidio_unload failed')}
             return {'status': 'success', 'unloaded': True}
         except Exception as e:
             logger.error('presidio_unload failed: %s', e)
@@ -875,10 +751,8 @@ def _handle_command_impl(req: dict):
 
     if cmd == 'presidio_check_idle':
         try:
-            from .presidio_service import PresidioService
-            svc = PresidioService.get_instance()
-            unloaded = svc.check_idle_and_unload()
-            return {'status': 'success', 'unloaded': unloaded}
+            from .presidio_worker import get_presidio_worker
+            return get_presidio_worker().check_idle()
         except Exception as e:
             logger.error('presidio_check_idle failed: %s', e)
             return {'error': str(e)}
@@ -1075,6 +949,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     _clustering_auth_monitor_thread = None
     _last_clustering_auth_check = 0.0
     _last_clustering_session_valid = False
+    _stop_clustering_ingest_worker()
 
     if not pipe_name:
         pipe_name = os.environ.get('CARBON_MONITOR_PIPE')
@@ -1138,6 +1013,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
             _clustering_scheduler = ClusteringScheduler(_clustering_manager, storage_client=sc)
             unlocked = _sync_clustering_scheduler_auth_gate(force=True)
             _start_clustering_auth_monitor()
+            _start_clustering_ingest_worker()
             logger.info('Task clustering service initialised (scheduler_active=%s unlocked=%s)', _clustering_scheduler_active, unlocked)
         else:
             logger.warning('Task clustering service skipped: shared ChromaDB client is None')
@@ -1180,6 +1056,7 @@ def stop():
     """Shut down the OCR service and IPC server."""
     global _clustering_scheduler_active, _clustering_auth_monitor_thread
     stop_event.set()
+    _stop_clustering_ingest_worker()
     if _clustering_scheduler:
         try:
             _clustering_scheduler.stop()
@@ -1191,6 +1068,11 @@ def stop():
     try:
         from smart_cluster_worker import SmartClusterWorker
         SmartClusterWorker().stop()
+    except Exception:
+        pass
+    try:
+        from .presidio_worker import get_presidio_worker
+        get_presidio_worker().stop()
     except Exception:
         pass
     if _ocr_worker:

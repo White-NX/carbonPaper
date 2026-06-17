@@ -511,7 +511,12 @@ function App() {
     invoke('storage_warmup_thumbnails')
       .then((result) => {
         if (!cancelled) {
-          console.log(`[Warmup] Done — generated: ${result?.generated ?? 0}, skipped: ${result?.skipped ?? 0}, errors: ${result?.errors ?? 0}`);
+          const progress = result?.progress || {};
+          if (result?.started || result?.running) {
+            console.log(`[Warmup] Background thumbnail warmup running — processed: ${progress.processed ?? 0}/${progress.total ?? 0}`);
+          } else {
+            console.log(`[Warmup] Thumbnail warmup skipped — cached: ${Boolean(result?.cached)}`);
+          }
         }
       })
       .catch((err) => console.warn('[Warmup] Thumbnail warmup failed:', err));

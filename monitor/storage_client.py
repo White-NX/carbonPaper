@@ -18,6 +18,7 @@ from typing import Optional, Dict, Any, List
 IPC_PROTOCOL_VERSION = 2
 MAX_PIPE_MESSAGE_BYTES = 16 * 1024 * 1024
 MAX_PIPE_BINARY_BYTES = 64 * 1024 * 1024
+PIPE_CLOSED_WINERRORS = (109, 232)
 
 
 def _write_framed_json(handle, payload: bytes) -> None:
@@ -107,9 +108,61 @@ class StorageClient:
         self.full_pipe_name = rf"\\.\pipe\{pipe_name}"
         self._public_key: Optional[bytes] = None
         self._semaphore = threading.Semaphore(2)
+        self._request_lock = threading.RLock()
+        self._persistent_handle = None
         self._decrypt_cache = OrderedDict()
         self._encrypt_cache = OrderedDict()
         self._cache_limit = 512
+
+    def _close_persistent_handle(self) -> None:
+        handle = self._persistent_handle
+        self._persistent_handle = None
+        if handle is not None:
+            try:
+                win32file.CloseHandle(handle)
+            except Exception:
+                pass
+
+    def _connect_persistent_handle(self):
+        if self._persistent_handle is not None:
+            return self._persistent_handle
+
+        handle = None
+        last_error = None
+        for attempt in range(6):
+            try:
+                handle = win32file.CreateFile(
+                    self.full_pipe_name,
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                    0,
+                    None,
+                    win32file.OPEN_EXISTING,
+                    0,
+                    None,
+                )
+                last_error = None
+                break
+            except pywintypes.error as e:
+                last_error = e
+                if e.winerror == 231 and attempt < 5:
+                    time.sleep(0.02 * (2 ** attempt))
+                    continue
+                raise
+
+        if handle is None:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Failed to connect to pipe")
+
+        win32pipe.SetNamedPipeHandleState(
+            handle,
+            win32pipe.PIPE_READMODE_BYTE,
+            None,
+            None,
+        )
+        self._persistent_handle = handle
+        logger.debug("[storage_client] persistent IPC connection established: %s", self.full_pipe_name)
+        return handle
 
     def _cache_get(self, cache: OrderedDict, key: str) -> Optional[str]:
         value = cache.get(key)
@@ -135,69 +188,55 @@ class StorageClient:
         """
         try:
             self._semaphore.acquire()
-            handle = None
-            last_error = None
+            with self._request_lock:
+                framed_request = dict(request)
+                framed_request['_ipc_keepalive'] = True
+                request_bytes = json.dumps(framed_request).encode('utf-8')
 
-            # Connect to the pipe (byte mode for large data transfer)
-            for attempt in range(6):
-                try:
-                    handle = win32file.CreateFile(
-                        self.full_pipe_name,
-                        win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                        0,
-                        None,
-                        win32file.OPEN_EXISTING,
-                        0,
-                        None
-                    )
-                    last_error = None
-                    break
-                except pywintypes.error as e:
-                    last_error = e
-                    if e.winerror == 231 and attempt < 5:
-                        time.sleep(0.02 * (2 ** attempt))
+                for attempt in range(2):
+                    handle = self._connect_persistent_handle()
+                    try:
+                        _write_framed_json(handle, request_bytes)
+
+                        # Flush pipe to ensure all data has been sent.
+                        try:
+                            win32file.FlushFileBuffers(handle)
+                        except pywintypes.error as e:
+                            if e.winerror not in PIPE_CLOSED_WINERRORS:
+                                raise
+                            logger.debug(
+                                "[storage_client] FlushFileBuffers returned %s; continue reading response",
+                                e.winerror,
+                            )
+                        response = _read_framed_json(handle)
+                    except pywintypes.error as e:
+                        if e.winerror not in PIPE_CLOSED_WINERRORS or attempt >= 1:
+                            raise
+                        logger.warning(
+                            "[storage_client] persistent pipe closed during request command=%s winerror=%s; reconnecting and retrying once",
+                            request.get('command'),
+                            e.winerror,
+                        )
+                        self._close_persistent_handle()
                         continue
-                    raise
 
-            if handle is None:
-                if last_error is not None:
-                    raise last_error
-                return {'status': 'error', 'error': 'Failed to connect to pipe'}
-            
-            try:
-                # Set pipe mode to byte-read mode
-                win32pipe.SetNamedPipeHandleState(
-                    handle,
-                    win32pipe.PIPE_READMODE_BYTE,
-                    None,
-                    None
-                )
-                
-                # Send request using v2 length-prefixed framing.
-                request_bytes = json.dumps(request).encode('utf-8')
-                _write_framed_json(handle, request_bytes)
-                
-                # Flush pipe to ensure all data has been sent.
-                # In request/response mode the server may close quickly after handling
-                # the request, so broken-pipe style flush errors can be benign.
-                try:
-                    win32file.FlushFileBuffers(handle)
-                except pywintypes.error as e:
-                    if e.winerror not in (109, 232):
-                        raise
-                    logger.debug(
-                        "[storage_client] FlushFileBuffers returned %s; continue reading response",
-                        e.winerror,
-                    )
-                
-                return _read_framed_json(handle)
-                    
-            finally:
-                win32file.CloseHandle(handle)
+                    if response == {'status': 'error', 'error': 'Empty response'}:
+                        self._close_persistent_handle()
+                        if attempt < 1:
+                            logger.warning(
+                                "[storage_client] persistent pipe returned empty response command=%s; reconnecting and retrying once",
+                                request.get('command'),
+                            )
+                            continue
+                    return response
+
+                raise RuntimeError("Failed to send request to pipe")
                 
         except pywintypes.error as e:
+            self._close_persistent_handle()
             return {'status': 'error', 'error': f'IPC error: {e}'}
         except Exception as e:
+            self._close_persistent_handle()
             return {'status': 'error', 'error': f'Error: {e}'}
         finally:
             self._semaphore.release()
@@ -376,6 +415,23 @@ class StorageClient:
         if response.get('status') == 'success':
             return response.get('data', {'screenshots': []})
         raise RuntimeError(response.get('error', 'Unknown error during IPC get_screenshots_with_ocr_by_ids'))
+
+    def update_screenshot_category(
+        self,
+        screenshot_id: int,
+        category: str,
+        category_confidence: Optional[float] = None,
+    ) -> bool:
+        """Update a screenshot category after asynchronous classification."""
+        request = {
+            'command': 'update_screenshot_category',
+            'screenshot_id': int(screenshot_id),
+            'category': category,
+        }
+        if category_confidence is not None:
+            request['category_confidence'] = float(category_confidence)
+        response = self._send_request(request)
+        return response.get('status') == 'success'
 
     # ---- Smart Cluster reverse IPC --------------------------------------
 
