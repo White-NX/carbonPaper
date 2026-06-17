@@ -10,14 +10,168 @@ from __future__ import annotations
 import datetime
 import io
 import logging
-import multiprocessing
 import os
+import queue
+import threading
 import time
 import traceback
 from typing import Any, Dict, Optional
 
+from .worker_supervisor import WorkerSupervisor, attach_response_metadata
+
 
 logger = logging.getLogger(__name__)
+WORKER_PROTOCOL_VERSION = 2
+
+
+class OcrPostprocessQueue:
+    """Bounded best-effort OCR post-processing queue.
+
+    The capture commit path must not wait for vector indexing or classification.
+    Jobs are dropped when the queue is full; OCR results have already been
+    returned to Rust by then.
+    """
+
+    def __init__(self, ocr_worker, classifier, maxsize: Optional[int] = None):
+        self.ocr_worker = ocr_worker
+        self.classifier = classifier
+        self.maxsize = maxsize or int(os.environ.get("CARBONPAPER_OCR_POSTPROCESS_QUEUE_MAX", "64"))
+        self._queue = queue.Queue(maxsize=max(1, self.maxsize))
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.dropped = 0
+        self.processed = 0
+        self.failed = 0
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="ocr-postprocess",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=timeout)
+
+    def enqueue(self, job: Dict[str, Any]) -> bool:
+        try:
+            self._queue.put_nowait(job)
+            logger.info(
+                "[DIAG:ocr_postprocess] enqueued screenshot_id=%s text_len=%s queue_size=%s",
+                job.get("screenshot_id"),
+                len(job.get("ocr_text", "") or ""),
+                self._queue.qsize(),
+            )
+            return True
+        except queue.Full:
+            self.dropped += 1
+            logger.warning(
+                "[DIAG:ocr_postprocess] queue full; dropped screenshot_id=%s dropped=%s maxsize=%s",
+                job.get("screenshot_id"),
+                self.dropped,
+                self.maxsize,
+            )
+            return False
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                job = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._handle_job(job)
+                self.processed += 1
+            except Exception as exc:
+                self.failed += 1
+                logger.warning(
+                    "[DIAG:ocr_postprocess] failed screenshot_id=%s error=%s",
+                    job.get("screenshot_id"),
+                    exc,
+                    exc_info=True,
+                )
+            finally:
+                self._queue.task_done()
+
+    def _handle_job(self, job: Dict[str, Any]):
+        from PIL import Image
+        from storage_client import get_storage_client
+        from . import config
+
+        screenshot_id = job.get("screenshot_id")
+        image_hash = job.get("image_hash", "")
+        ocr_text = job.get("ocr_text", "")
+        image_bytes = job.get("image_bytes") or b""
+        started = time.perf_counter()
+
+        image_pil = None
+        if self.ocr_worker.enable_vector_store and self.ocr_worker.vector_store and ocr_text.strip():
+            try:
+                image_pil = Image.open(io.BytesIO(image_bytes))
+                image_pil.load()
+                t_vector = time.perf_counter()
+                self.ocr_worker.vector_store.add_image(
+                    image_path=f"memory://{image_hash}",
+                    image=image_pil,
+                    metadata={
+                        "window_title": job.get("window_title", ""),
+                        "process_name": job.get("process_name", ""),
+                        "timestamp": job.get("timestamp", 0),
+                    },
+                    ocr_text=ocr_text,
+                )
+                logger.debug(
+                    "[DIAG:ocr_postprocess] vector add done screenshot_id=%s elapsed=%.3fs",
+                    screenshot_id,
+                    time.perf_counter() - t_vector,
+                )
+            except Exception as exc:
+                logger.warning("Vector store add failed: %s", exc)
+
+        if self.classifier and config.CLASSIFICATION_ENABLED:
+            try:
+                t_classify = time.perf_counter()
+                category, category_confidence = self.classifier.classify(
+                    title=job.get("window_title", ""),
+                    ocr_text=ocr_text,
+                    process_name=job.get("process_name", ""),
+                )
+                category_confidence = round(category_confidence, 4)
+                if category:
+                    sc = get_storage_client()
+                    if sc:
+                        ok = sc.update_screenshot_category(
+                            int(screenshot_id),
+                            category,
+                            category_confidence,
+                        )
+                        if not ok:
+                            logger.warning(
+                                "[DIAG:ocr_postprocess] category update skipped/failed screenshot_id=%s category=%s",
+                                screenshot_id,
+                                category,
+                            )
+                logger.info(
+                    "[DIAG:ocr_postprocess] classify done screenshot_id=%s elapsed=%.3fs category=%s confidence=%s",
+                    screenshot_id,
+                    time.perf_counter() - t_classify,
+                    category,
+                    category_confidence,
+                )
+            except Exception as exc:
+                logger.warning("Classification failed: %s", exc)
+
+        logger.info(
+            "[DIAG:ocr_postprocess] done screenshot_id=%s total=%.3fs queue_size=%s",
+            screenshot_id,
+            time.perf_counter() - started,
+            self._queue.qsize(),
+        )
 
 
 def _json_safe(obj):
@@ -26,10 +180,9 @@ def _json_safe(obj):
     return obj
 
 
-def _process_ocr(req: Dict[str, Any], ocr_worker, classifier) -> Dict[str, Any]:
+def _process_ocr(req: Dict[str, Any], ocr_worker, postprocess_queue: Optional[OcrPostprocessQueue]) -> Dict[str, Any]:
     from PIL import Image
     from storage_client import get_storage_client
-    from . import config
 
     screenshot_id = req.get("screenshot_id")
     if screenshot_id is None:
@@ -40,6 +193,7 @@ def _process_ocr(req: Dict[str, Any], ocr_worker, classifier) -> Dict[str, Any]:
     if not sc:
         return {"error": "Storage client not available"}
 
+    fetch_started = time.perf_counter()
     resp = sc.get_temp_image_bytes(screenshot_id)
     if resp.get("status") != "success":
         return {"error": f"Failed to fetch image: {resp.get('error', 'unknown')}"}
@@ -47,55 +201,67 @@ def _process_ocr(req: Dict[str, Any], ocr_worker, classifier) -> Dict[str, Any]:
     image_bytes = resp.get("data", {}).get("image_bytes")
     if not image_bytes:
         return {"error": "No image data returned from storage"}
+    fetch_elapsed = time.perf_counter() - fetch_started
 
     image_pil = Image.open(io.BytesIO(image_bytes))
     image_pil.load()
+    image_size = getattr(image_pil, "size", None)
+    image_mode = getattr(image_pil, "mode", "")
+    if image_pil.mode not in ("RGB", "L"):
+        image_pil = image_pil.convert("RGB")
 
+    ocr_started = time.perf_counter()
     ocr_results = ocr_worker.ocr_engine.recognize(image_pil)
+    ocr_elapsed = time.perf_counter() - ocr_started
     filtered = [r for r in ocr_results if r.get("confidence", 0) >= 0.5]
     ocr_worker.stats["processed_count"] += 1
     ocr_worker.stats["total_texts_found"] += len(filtered)
 
     image_hash = req.get("image_hash", "")
     ocr_text = " ".join([r.get("text", "") for r in filtered])
-    if ocr_worker.enable_vector_store and ocr_worker.vector_store and ocr_text.strip():
-        try:
-            ocr_worker.vector_store.add_image(
-                image_path=f"memory://{image_hash}",
-                image=image_pil,
-                metadata={
-                    "window_title": req.get("window_title", ""),
-                    "process_name": req.get("process_name", ""),
-                    "timestamp": req.get("timestamp", 0),
-                },
-                ocr_text=ocr_text,
-            )
-        except Exception as exc:
-            logger.warning("Vector store add failed: %s", exc)
+    postprocess_enqueued = False
+    if postprocess_queue:
+        postprocess_enqueued = postprocess_queue.enqueue({
+            "screenshot_id": screenshot_id,
+            "image_hash": image_hash,
+            "window_title": req.get("window_title", ""),
+            "process_name": req.get("process_name", ""),
+            "timestamp": req.get("timestamp", 0),
+            "ocr_text": ocr_text,
+            "image_bytes": image_bytes,
+        })
 
-    category = None
-    category_confidence = None
-    if classifier and config.CLASSIFICATION_ENABLED:
-        try:
-            category, category_confidence = classifier.classify(
-                title=req.get("window_title", ""),
-                ocr_text=ocr_text,
-                process_name=req.get("process_name", ""),
-            )
-            category_confidence = round(category_confidence, 4)
-        except Exception as exc:
-            logger.warning("Classification failed: %s", exc)
+    ocr_diag = {
+        "worker_protocol": WORKER_PROTOCOL_VERSION,
+        "image_bytes": len(image_bytes),
+        "image_size": list(image_size) if image_size else None,
+        "image_mode": image_mode,
+        "fetch_elapsed": fetch_elapsed,
+        "ocr_elapsed": ocr_elapsed,
+        "raw_blocks": len(ocr_results),
+        "filtered_blocks": len(filtered),
+    }
+    logger.info(
+        "[DIAG:process_ocr_worker] screenshot_id=%s image_bytes=%s image_size=%s image_mode=%s raw_blocks=%s filtered_blocks=%s fetch=%.3fs ocr=%.3fs",
+        screenshot_id,
+        ocr_diag["image_bytes"],
+        ocr_diag["image_size"],
+        ocr_diag["image_mode"],
+        ocr_diag["raw_blocks"],
+        ocr_diag["filtered_blocks"],
+        fetch_elapsed,
+        ocr_elapsed,
+    )
 
-    result = {
+    return {
         "status": "success",
         "ocr_results": filtered,
         "ocr_text": ocr_text,
+        "postprocess_enqueued": postprocess_enqueued,
         "elapsed": time.perf_counter() - cmd_started,
+        "worker_protocol": WORKER_PROTOCOL_VERSION,
+        "ocr_diag": ocr_diag,
     }
-    if category:
-        result["category"] = category
-        result["category_confidence"] = category_confidence
-    return result
 
 
 def _worker_main(conn, storage_pipe: Optional[str], data_dir: str, env: Dict[str, str]):
@@ -147,7 +313,10 @@ def _worker_main(conn, storage_pipe: Optional[str], data_dir: str, env: Dict[str
             logger.warning("Worker classifier init failed: %s", exc)
             classifier = None
 
-        conn.send({"status": "ready"})
+        postprocess_queue = OcrPostprocessQueue(ocr_worker, classifier)
+        postprocess_queue.start()
+
+        conn.send({"status": "ready", "worker_protocol": WORKER_PROTOCOL_VERSION})
     except Exception as exc:
         conn.send({"status": "error", "error": str(exc), "traceback": traceback.format_exc()})
         return
@@ -158,17 +327,24 @@ def _worker_main(conn, storage_pipe: Optional[str], data_dir: str, env: Dict[str
         except EOFError:
             return
         command = msg.get("command")
+
+        def send_response(response: Dict[str, Any]):
+            conn.send(attach_response_metadata(msg, response))
+
         try:
             if command == "stop":
-                conn.send({"status": "success"})
+                postprocess_queue.stop()
+                send_response({"status": "success"})
                 return
             if command == "process_ocr":
-                conn.send(_process_ocr(msg.get("request", {}), ocr_worker, classifier))
+                result = _process_ocr(msg.get("request", {}), ocr_worker, postprocess_queue)
+                result.setdefault("worker_protocol", WORKER_PROTOCOL_VERSION)
+                send_response(result)
             elif command == "get_stats":
-                conn.send({"status": "success", "stats": ocr_worker.get_stats()})
+                send_response({"status": "success", "stats": ocr_worker.get_stats()})
             elif command == "search_by_natural_language":
                 args = msg.get("args", {})
-                conn.send({
+                send_response({
                     "status": "success",
                     "results": ocr_worker.search_by_natural_language(**args),
                 })
@@ -177,147 +353,99 @@ def _worker_main(conn, storage_pipe: Optional[str], data_dir: str, env: Dict[str
                 ok = False
                 if ocr_worker.vector_store:
                     ok = bool(ocr_worker.vector_store.delete_image(f"memory://{image_hash}"))
-                conn.send({"status": "success", "ok": ok})
+                send_response({"status": "success", "ok": ok})
             elif command == "classify":
                 if not classifier:
-                    conn.send({"error": "Classification service not initialised"})
+                    send_response({"error": "Classification service not initialised"})
                 else:
                     args = msg.get("args", {})
                     category, confidence = classifier.classify(**args)
-                    conn.send({"status": "success", "category": category, "confidence": confidence})
+                    send_response({"status": "success", "category": category, "confidence": confidence})
             elif command == "classify_debug":
                 if not classifier:
-                    conn.send({"error": "Classification service not initialised"})
+                    send_response({"error": "Classification service not initialised"})
                 else:
-                    conn.send({"status": "success", "data": classifier.classify_debug(**msg.get("args", {}))})
+                    send_response({"status": "success", "data": classifier.classify_debug(**msg.get("args", {}))})
             elif command == "add_anchor":
                 if not classifier:
-                    conn.send({"error": "Classification service not initialised"})
+                    send_response({"error": "Classification service not initialised"})
                 else:
-                    conn.send({"status": "success", "data": classifier.add_anchor(**msg.get("args", {}))})
+                    send_response({"status": "success", "data": classifier.add_anchor(**msg.get("args", {}))})
             elif command == "remove_anchor":
                 if not classifier:
-                    conn.send({"error": "Classification service not initialised"})
+                    send_response({"error": "Classification service not initialised"})
                 else:
                     removed = classifier.remove_anchor(msg.get("category", ""), msg.get("title", ""))
-                    conn.send({"status": "success", "removed": removed})
+                    send_response({"status": "success", "removed": removed})
             elif command == "remove_local_anchors_by_process":
                 if not classifier:
-                    conn.send({"error": "Classification service not initialised"})
+                    send_response({"error": "Classification service not initialised"})
                 else:
                     removed_count = classifier.remove_local_anchors_by_process(
                         msg.get("category", ""),
                         msg.get("process_name", ""),
                     )
-                    conn.send({"status": "success", "removed_count": removed_count})
+                    send_response({"status": "success", "removed_count": removed_count})
             elif command == "get_categories":
                 if not classifier:
-                    conn.send({"error": "Classification service not initialised"})
+                    send_response({"error": "Classification service not initialised"})
                 else:
-                    conn.send({"status": "success", "categories": classifier.get_categories()})
+                    send_response({"status": "success", "categories": classifier.get_categories()})
             elif command == "get_anchors":
                 if not classifier:
-                    conn.send({"error": "Classification service not initialised"})
+                    send_response({"error": "Classification service not initialised"})
                 else:
-                    conn.send({"status": "success", "anchors": classifier.get_anchors()})
+                    send_response({"status": "success", "anchors": classifier.get_anchors()})
             else:
-                conn.send({"error": f"Unknown worker command: {command}"})
+                send_response({"error": f"Unknown worker command: {command}"})
         except Exception as exc:
-            conn.send({"error": str(exc), "traceback": traceback.format_exc()})
+            send_response({"error": str(exc), "traceback": traceback.format_exc()})
 
 
-class RestartableModelWorker:
+class RestartableModelWorker(WorkerSupervisor):
     def __init__(self, storage_pipe: Optional[str], data_dir: str, env: Optional[Dict[str, str]] = None):
         self.storage_pipe = storage_pipe
         self.data_dir = data_dir
         self.env = env or {}
-        self._ctx = multiprocessing.get_context("spawn")
-        self._conn = None
-        self._proc = None
-        self._lock = multiprocessing.RLock()
         self._stats = {"processed_count": 0, "failed_count": 0, "total_texts_found": 0, "start_time": None}
         self.stats = self._stats
         self.enable_vector_store = True
         self.vector_store = None
-
-    def start(self, timeout: float = 180.0):
-        with self._lock:
-            if self._proc is not None and self._proc.is_alive():
-                return
-            parent_conn, child_conn = self._ctx.Pipe()
-            proc = self._ctx.Process(
-                target=_worker_main,
-                args=(child_conn, self.storage_pipe, self.data_dir, self.env),
-                name="CarbonModelWorker",
-                daemon=True,
-            )
-            proc.start()
-            self._conn = parent_conn
-            self._proc = proc
-            if not parent_conn.poll(timeout):
-                self.restart()
-                raise TimeoutError(f"Model worker cold start timed out after {timeout}s")
-            ready = parent_conn.recv()
-            if ready.get("status") != "ready":
-                self.restart()
-                raise RuntimeError(ready.get("error", "Model worker failed to start"))
+        super().__init__(
+            name="CarbonModelWorker",
+            target=_worker_main,
+            args=(self.storage_pipe, self.data_dir, self.env),
+            ready_timeout=180.0,
+            stop_timeout=2.0,
+            kill_timeout=5.0,
+            log=logger,
+        )
 
     def request(self, command: str, payload: Optional[Dict[str, Any]] = None, timeout: float = 120.0):
-        with self._lock:
-            self.start(timeout=max(30.0, min(180.0, timeout)))
-            assert self._conn is not None
-            self._conn.send({"command": command, **(payload or {})})
-            if not self._conn.poll(timeout):
-                self.restart()
-                self._stats["failed_count"] += 1
-                raise TimeoutError(f"Model worker command {command} timed out after {timeout}s")
-            result = self._conn.recv()
-            if command == "process_ocr" and result.get("status") == "success":
-                self._stats["processed_count"] += 1
-                self._stats["total_texts_found"] += len(result.get("ocr_results") or [])
-            elif result.get("error"):
-                self._stats["failed_count"] += 1
-            return result
-
-    def restart(self):
-        with self._lock:
-            if self._proc is not None and self._proc.is_alive():
-                self._proc.terminate()
-                self._proc.join(timeout=5)
-                if self._proc.is_alive():
-                    self._proc.kill()
-            self._proc = None
-            self._conn = None
-
-    def stop(self):
-        with self._lock:
-            try:
-                if self._conn and self._proc and self._proc.is_alive():
-                    self._conn.send({"command": "stop"})
-                    self._conn.poll(2)
-            except Exception:
-                pass
-            self.restart()
+        try:
+            result = super().request(
+                command,
+                payload,
+                timeout=timeout,
+                start_timeout=max(30.0, min(180.0, timeout)),
+            )
+        except Exception:
+            self._stats["failed_count"] += 1
+            raise
+        if command == "process_ocr" and result.get("status") == "success":
+            self._stats["processed_count"] += 1
+            self._stats["total_texts_found"] += len(result.get("ocr_results") or [])
+        elif result.get("error"):
+            self._stats["failed_count"] += 1
+        return result
 
     def get_stats(self):
         # Status polling must never start the model worker. Cold-starting OCR,
         # vector, or classifier models from a cheap health check blocks the
         # monitor pipe long enough for Rust-side status callers to time out.
-        if self._proc is None or not self._proc.is_alive() or self._conn is None:
-            return dict(self._stats)
-        if not self._lock.acquire(block=False):
-            return dict(self._stats)
-        try:
-            self._conn.send({"command": "get_stats"})
-            if self._conn.poll(0.05):
-                result = self._conn.recv()
-                if result.get("status") == "success":
-                    return result.get("stats", self._stats)
-        except Exception:
-            return dict(self._stats)
-        finally:
-            self._lock.release()
-        return dict(self._stats)
+        stats = dict(self._stats)
+        stats["watchdog"] = self.status_snapshot()
+        return stats
 
     def pause(self):
         logger.info("Model worker proxy paused")

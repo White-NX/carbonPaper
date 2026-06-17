@@ -2,7 +2,42 @@ use super::check_auth_required;
 use crate::credential_manager::CredentialManagerState;
 use crate::monitor::{self, MonitorState};
 use crate::storage::{self, StorageState};
+use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[derive(Default, Clone)]
+struct ThumbnailWarmupProgress {
+    running: bool,
+    cancel_requested: bool,
+    total: u64,
+    processed: u64,
+    generated: u64,
+    skipped: u64,
+    errors: u64,
+}
+
+static THUMBNAIL_WARMUP_PROGRESS: Lazy<std::sync::Mutex<ThumbnailWarmupProgress>> =
+    Lazy::new(|| std::sync::Mutex::new(ThumbnailWarmupProgress::default()));
+static THUMBNAIL_WARMUP_RUNNING: AtomicBool = AtomicBool::new(false);
+static THUMBNAIL_WARMUP_CANCEL: AtomicBool = AtomicBool::new(false);
+
+fn thumbnail_warmup_progress_json() -> serde_json::Value {
+    let progress = THUMBNAIL_WARMUP_PROGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    serde_json::json!({
+        "running": progress.running,
+        "cancel_requested": progress.cancel_requested,
+        "total": progress.total,
+        "processed": progress.processed,
+        "generated": progress.generated,
+        "skipped": progress.skipped,
+        "errors": progress.errors,
+    })
+}
 
 #[tauri::command]
 pub async fn storage_get_timeline(
@@ -209,71 +244,165 @@ pub async fn storage_warmup_thumbnails(
     check_auth_required(&credential_state)?;
 
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || {
-        if state
-            .thumbnail_warmup_done
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+    if state.thumbnail_warmup_done.load(Ordering::SeqCst) {
+        return Ok(serde_json::json!({
+            "started": false,
+            "cached": true,
+            "progress": thumbnail_warmup_progress_json()
+        }));
+    }
+
+    match state.is_thumbnail_warmup_done() {
+        Ok(true) => {
+            state.thumbnail_warmup_done.store(true, Ordering::SeqCst);
             return Ok(serde_json::json!({
-                "generated": 0,
-                "skipped": 0,
-                "errors": 0,
-                "cached": true
+                "started": false,
+                "cached": true,
+                "progress": thumbnail_warmup_progress_json()
             }));
         }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(
+                "[Warmup] Failed to check sentinel: {}, proceeding with warmup",
+                e
+            );
+        }
+    }
 
-        match state.is_thumbnail_warmup_done() {
-            Ok(true) => {
-                state
-                    .thumbnail_warmup_done
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                return Ok(serde_json::json!({
-                    "generated": 0,
-                    "skipped": 0,
-                    "errors": 0,
-                    "cached": true
-                }));
-            }
-            Ok(false) => {}
+    if THUMBNAIL_WARMUP_RUNNING.swap(true, Ordering::SeqCst) {
+        return Ok(serde_json::json!({
+            "started": false,
+            "running": true,
+            "progress": thumbnail_warmup_progress_json()
+        }));
+    }
+
+    THUMBNAIL_WARMUP_CANCEL.store(false, Ordering::SeqCst);
+    {
+        let mut progress = THUMBNAIL_WARMUP_PROGRESS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *progress = ThumbnailWarmupProgress {
+            running: true,
+            ..ThumbnailWarmupProgress::default()
+        };
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let paths = match state.get_all_image_paths() {
+            Ok(paths) => paths,
             Err(e) => {
-                tracing::warn!(
-                    "[Warmup] Failed to check sentinel: {}, proceeding with warmup",
-                    e
-                );
+                tracing::warn!("[Warmup] Failed to list image paths: {}", e);
+                let mut progress = THUMBNAIL_WARMUP_PROGRESS
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                progress.running = false;
+                progress.errors += 1;
+                THUMBNAIL_WARMUP_RUNNING.store(false, Ordering::SeqCst);
+                return;
             }
+        };
+
+        {
+            let mut progress = THUMBNAIL_WARMUP_PROGRESS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            progress.total = paths.len() as u64;
         }
 
-        let paths = state.get_all_image_paths()?;
-        let mut generated: u64 = 0;
-        let mut skipped: u64 = 0;
-        let mut errors: u64 = 0;
+        const MAX_BATCH_ITEMS: usize = 32;
+        const MAX_BATCH_MS: u128 = 200;
+        const BATCH_PAUSE_MS: u64 = 250;
+
+        let mut batch_items = 0usize;
+        let mut batch_started = Instant::now();
 
         for path in &paths {
+            if THUMBNAIL_WARMUP_CANCEL.load(Ordering::SeqCst) {
+                tracing::info!("[Warmup] Thumbnail warmup cancelled");
+                break;
+            }
+
+            let mut generated_delta = 0;
+            let mut skipped_delta = 0;
+            let mut errors_delta = 0;
             match state.ensure_thumbnail_cached(path) {
-                Ok(true) => generated += 1,
-                Ok(false) => skipped += 1,
+                Ok(true) => generated_delta = 1,
+                Ok(false) => skipped_delta = 1,
                 Err(e) => {
                     tracing::warn!("[Warmup] Error for {}: {}", path, e);
-                    errors += 1;
+                    errors_delta = 1;
                 }
+            }
+
+            {
+                let mut progress = THUMBNAIL_WARMUP_PROGRESS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                progress.processed += 1;
+                progress.generated += generated_delta;
+                progress.skipped += skipped_delta;
+                progress.errors += errors_delta;
+            }
+
+            batch_items += 1;
+            if batch_items >= MAX_BATCH_ITEMS || batch_started.elapsed().as_millis() >= MAX_BATCH_MS
+            {
+                std::thread::sleep(Duration::from_millis(BATCH_PAUSE_MS));
+                batch_items = 0;
+                batch_started = Instant::now();
             }
         }
 
-        if let Err(e) = state.mark_thumbnail_warmup_done() {
-            tracing::warn!("[Warmup] Failed to write sentinel: {}", e);
+        let cancelled = THUMBNAIL_WARMUP_CANCEL.load(Ordering::SeqCst);
+        if !cancelled {
+            if let Err(e) = state.mark_thumbnail_warmup_done() {
+                tracing::warn!("[Warmup] Failed to write sentinel: {}", e);
+            }
+            state.thumbnail_warmup_done.store(true, Ordering::SeqCst);
         }
-        state
-            .thumbnail_warmup_done
-            .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        Ok(serde_json::json!({
-            "generated": generated,
-            "skipped": skipped,
-            "errors": errors
-        }))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {:?}", e))?
+        {
+            let mut progress = THUMBNAIL_WARMUP_PROGRESS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            progress.running = false;
+            progress.cancel_requested = cancelled;
+        }
+        THUMBNAIL_WARMUP_RUNNING.store(false, Ordering::SeqCst);
+        tracing::info!(
+            "[Warmup] Thumbnail warmup finished cancelled={} progress={}",
+            cancelled,
+            thumbnail_warmup_progress_json()
+        );
+    });
+
+    Ok(serde_json::json!({
+        "started": true,
+        "running": true,
+        "progress": thumbnail_warmup_progress_json()
+    }))
+}
+
+#[tauri::command]
+pub async fn storage_get_thumbnail_warmup_status(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+    Ok(thumbnail_warmup_progress_json())
+}
+
+#[tauri::command]
+pub fn storage_cancel_thumbnail_warmup() -> serde_json::Value {
+    THUMBNAIL_WARMUP_CANCEL.store(true, Ordering::SeqCst);
+    {
+        let mut progress = THUMBNAIL_WARMUP_PROGRESS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        progress.cancel_requested = true;
+    }
+    thumbnail_warmup_progress_json()
 }
 
 #[tauri::command]

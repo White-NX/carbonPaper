@@ -61,3 +61,48 @@ def test_client_handler_allows_authorized_pid_and_executes_handler(monkeypatch):
     decoded = wire[4:4 + frame_len].decode("utf-8")
     assert '"ok": true' in decoded
     assert "Access denied" not in decoded
+
+
+def test_client_handler_reuses_connection_when_keepalive(monkeypatch):
+    server = object.__new__(ipc_pipe._NamedPipeServer)
+    state = {"requests": [], "writes": [], "closed": False}
+
+    def fake_handler(req):
+        state["requests"].append(req["command"])
+        return {"ok": req["command"]}
+
+    payloads = iter([
+        '{"command":"status","_auth_token":"t","_seq_no":1,"_ipc_keepalive":true}',
+        '{"command":"pause","_auth_token":"t","_seq_no":2,"_ipc_keepalive":false}',
+    ])
+
+    server.handler = fake_handler
+    server.stop_event = type("StopEvent", (), {"is_set": lambda self: False})()
+
+    monkeypatch.setenv("CARBON_PARENT_PID", "4242")
+    monkeypatch.setattr(ipc_pipe.win32pipe, "GetNamedPipeClientProcessId", lambda _h: 4242)
+    monkeypatch.setattr(ipc_pipe.os, "getppid", lambda: 1111)
+    monkeypatch.setattr(ipc_pipe, "_read_framed_json_message", lambda _h: next(payloads))
+
+    def fake_write(_h, data):
+        state["writes"].append(data)
+        return 0, len(data)
+
+    monkeypatch.setattr(ipc_pipe.win32file, "WriteFile", fake_write)
+    monkeypatch.setattr(ipc_pipe.win32file, "FlushFileBuffers", lambda _h: None)
+    monkeypatch.setattr(
+        ipc_pipe.win32file,
+        "CloseHandle",
+        lambda _h: state.__setitem__("closed", True),
+    )
+
+    server._client_handler(object())
+
+    assert state["requests"] == ["status", "pause"]
+    assert state["closed"] is True
+    wire = b"".join(state["writes"])
+    first_len = struct.unpack("<I", wire[:4])[0]
+    second_start = 4 + first_len
+    second_len = struct.unpack("<I", wire[second_start:second_start + 4])[0]
+    assert b'"ok": "status"' in wire[4:4 + first_len]
+    assert b'"ok": "pause"' in wire[second_start + 4:second_start + 4 + second_len]

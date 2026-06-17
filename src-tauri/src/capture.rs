@@ -1705,7 +1705,14 @@ async fn process_ocr_inner(
     );
 
     let ipc_started = std::time::Instant::now();
-    let response = crate::monitor::send_ipc_request(&pipe_name, &auth_token, seq_no, req).await?;
+    let response = crate::monitor::send_ipc_request_reused(
+        monitor_state,
+        &pipe_name,
+        &auth_token,
+        seq_no,
+        req,
+    )
+    .await?;
 
     let ipc_ms = ipc_started.elapsed().as_millis();
     // NOTE: This is IPC roundtrip time and includes Python OCR inference + post-processing.
@@ -1777,7 +1784,7 @@ async fn process_ocr_inner(
         );
     }
 
-    tracing::debug!(
+    tracing::info!(
         "Screenshot {} committed with {} OCR results",
         screenshot_id,
         ocr_results.as_ref().map(|r| r.len()).unwrap_or(0)

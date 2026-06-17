@@ -111,8 +111,7 @@ impl StorageState {
         categories: Option<Vec<String>>,
     ) -> Result<Vec<SearchResult>, String> {
         let hmac_key = self.credential_state.get_hmac_key()?;
-        let mut guard = self.get_connection_named("search_text")?;
-        let conn = guard.as_mut().unwrap();
+        let conn = self.open_read_connection_named("search_text")?;
 
         // Pre-compute set of screenshot IDs matching the category filter.
         // This allows us to filter bitmap candidates BEFORE pagination,

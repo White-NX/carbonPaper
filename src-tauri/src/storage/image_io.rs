@@ -145,8 +145,7 @@ impl StorageState {
     pub fn read_thumbnail(&self, path: &str) -> Result<(String, String), String> {
         // Phase 1: DB query for the encrypted row key
         let (key_enc, abs_path) = {
-            let guard = self.get_connection_named("read_thumbnail")?;
-            let conn = guard.as_ref().unwrap();
+            let conn = self.open_read_connection_named("read_thumbnail")?;
 
             if let Some(hash) = path.strip_prefix("memory://") {
                 let result: Option<(Option<Vec<u8>>, String)> = conn
@@ -218,8 +217,7 @@ impl StorageState {
 
         // Phase 2: DB query for the encrypted row key (only reached when thumbnail is missing)
         let (key_enc, abs_path) = {
-            let guard = self.get_connection_named("ensure_thumbnail_cached")?;
-            let conn = guard.as_ref().unwrap();
+            let conn = self.open_read_connection_named("ensure_thumbnail_cached")?;
 
             if let Some(hash) = path.strip_prefix("memory://") {
                 let result: Option<(Option<Vec<u8>>, String)> = conn
@@ -355,16 +353,15 @@ impl StorageState {
 
         // Single DB query to get all content_key_encrypted values
         let key_map: std::collections::HashMap<String, Option<Vec<u8>>> = {
-            let guard = match self.get_connection_named("batch_read_thumbnails") {
-                Ok(g) => g,
+            let conn = match self.open_read_connection_named("batch_read_thumbnails") {
+                Ok(conn) => conn,
                 Err(e) => {
                     return paths
                         .iter()
-                        .map(|p| (p.clone(), Err(format!("DB connection error: {}", e))))
+                        .map(|p| (p.clone(), Err(format!("DB read connection error: {}", e))))
                         .collect();
                 }
             };
-            let conn = guard.as_ref().unwrap();
 
             let mut map = std::collections::HashMap::new();
             for chunk in paths.chunks(500) {
@@ -387,7 +384,6 @@ impl StorageState {
                 }
             }
             map
-            // guard dropped here, mutex released
         };
 
         // Process each path outside the lock

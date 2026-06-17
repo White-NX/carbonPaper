@@ -17,8 +17,7 @@ use super::{
 impl StorageState {
     /// Get all screenshot image paths (for thumbnail warmup).
     pub fn get_all_image_paths(&self) -> Result<Vec<String>, String> {
-        let guard = self.get_connection_named("get_all_image_paths")?;
-        let conn = guard.as_ref().unwrap();
+        let conn = self.open_read_connection_named("get_all_image_paths")?;
         let mut stmt = conn
             .prepare(
                 "SELECT image_path FROM screenshots WHERE is_deleted = 0 ORDER BY created_at DESC",
@@ -189,9 +188,7 @@ impl StorageState {
 
         // Use dedup tables for page_icon and visible_links
         let page_icon_id: Option<i64> = match &request.page_icon {
-            Some(value) if !value.is_empty() => {
-                Some(self.get_or_create_page_icon_id(conn, value)?)
-            }
+            Some(value) if !value.is_empty() => Some(self.get_or_create_page_icon_id(conn, value)?),
             _ => None,
         };
         let link_set_id: Option<i64> = match &request.visible_links {
@@ -414,9 +411,7 @@ impl StorageState {
 
         // Use dedup tables for page_icon and visible_links
         let page_icon_id: Option<i64> = match &request.page_icon {
-            Some(value) if !value.is_empty() => {
-                Some(self.get_or_create_page_icon_id(conn, value)?)
-            }
+            Some(value) if !value.is_empty() => Some(self.get_or_create_page_icon_id(conn, value)?),
             _ => None,
         };
         let link_set_id: Option<i64> = match &request.visible_links {
@@ -492,31 +487,29 @@ impl StorageState {
         let fn_start = std::time::Instant::now();
         let ocr_count = ocr_results.map(|v| v.len()).unwrap_or(0);
 
-        let mut guard = self.get_connection_named("commit_screenshot")?;
-        let conn = guard.as_mut().unwrap();
-        let mutex_wait_dur = fn_start.elapsed();
-
-        // Look up the screenshot record
-        let rec: Option<(String, Option<Vec<u8>>)> = conn
-            .query_row(
-                "SELECT image_path, content_key_encrypted FROM screenshots WHERE id = ? AND is_deleted = 0",
-                params![screenshot_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|e| format!("Failed to query screenshot: {}", e))?;
-
-        if rec.is_none() {
+        let db_wait_started = std::time::Instant::now();
+        let image_path_str = {
+            let guard = self.get_connection_named("commit_screenshot.lookup")?;
+            let conn = guard.as_ref().unwrap();
+            let image_path: Option<String> = conn
+                .query_row(
+                    "SELECT image_path FROM screenshots WHERE id = ? AND is_deleted = 0",
+                    params![screenshot_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("Failed to query screenshot: {}", e))?;
             if let Ok(mut h) = self.lock_holder.lock() {
                 *h = "";
             }
-            return Err("Screenshot not found".to_string());
-        }
+            drop(guard);
+            image_path.ok_or_else(|| "Screenshot not found".to_string())?
+        };
+        let mutex_wait_dur = db_wait_started.elapsed();
 
-        let (image_path_str, _content_key_enc) = rec.unwrap();
         let image_path = self.resolve_image_path(&image_path_str);
 
-        // If filename ends with .pending, rename to final name and update DB image_path
+        // If filename ends with .pending, rename to final name before taking the DB lock again.
         let mut final_image_path_str = image_path_str.clone();
         if let Some(fname) = image_path.file_name().and_then(|s| s.to_str()) {
             if fname.ends_with(".pending") {
@@ -536,20 +529,32 @@ impl StorageState {
 
         // Timing accumulators for OCR processing
         let mut total_encrypt_dur = std::time::Duration::ZERO;
-        let mut total_db_insert_dur = std::time::Duration::ZERO;
+        let total_db_insert_dur;
         let total_bitmap_dur = std::time::Duration::ZERO;
 
-        // Insert OCR results (if any)
+        // Encrypt OCR results outside the global DB mutex. This avoids holding the
+        // storage lock while generating row keys and wrapping them with CNG/public-key APIs.
+        let mut encrypted_results = Vec::new();
         if let Some(results) = ocr_results {
             for result in results {
                 let te0 = std::time::Instant::now();
                 let (text_enc, text_key_encrypted) =
                     self.encrypt_payload_with_row_key(result.text.as_bytes())?;
                 total_encrypt_dur += te0.elapsed();
+                encrypted_results.push((result, text_enc, text_key_encrypted));
+            }
+        }
 
-                // Insert OCR result (lazy indexing will process this later)
-                let td0 = std::time::Instant::now();
-                conn.execute(
+        let td0 = std::time::Instant::now();
+        {
+            let mut guard = self.get_connection_named("commit_screenshot.write")?;
+            let conn = guard.as_mut().unwrap();
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Failed to start commit transaction: {}", e))?;
+
+            for (result, text_enc, text_key_encrypted) in encrypted_results {
+                tx.execute(
                     "INSERT INTO ocr_results (
                         screenshot_id, text, text_hash, text_enc, text_key_encrypted, confidence,
                         box_x1, box_y1, box_x2, box_y2,
@@ -573,25 +578,45 @@ impl StorageState {
                     ],
                 )
                 .map_err(|e| format!("Failed to insert OCR result: {}", e))?;
-                total_db_insert_dur += td0.elapsed();
 
                 added += 1;
-                self.ocr_row_count.fetch_add(1, Ordering::Relaxed);
             }
-        }
 
-        // Mark committed and set committed_at, update image_path to renamed path
-        conn.execute(
-            "UPDATE screenshots SET image_path = ?, status = ?, committed_at = CURRENT_TIMESTAMP, category = ?, category_confidence = ? WHERE id = ? AND is_deleted = 0",
-            params![final_image_path_str, "committed", category, category_confidence, screenshot_id],
-        )
-        .map_err(|e| format!("Failed to mark screenshot committed: {}", e))?;
+            // Mark committed and set committed_at. If classification has already
+            // arrived asynchronously, do not overwrite it with NULL.
+            let updated = if category.is_some() {
+                tx.execute(
+                    "UPDATE screenshots SET image_path = ?, status = ?, committed_at = CURRENT_TIMESTAMP, category = ?, category_confidence = ? WHERE id = ? AND is_deleted = 0",
+                    params![final_image_path_str, "committed", category, category_confidence, screenshot_id],
+                )
+            } else {
+                tx.execute(
+                    "UPDATE screenshots SET image_path = ?, status = ?, committed_at = CURRENT_TIMESTAMP WHERE id = ? AND is_deleted = 0",
+                    params![final_image_path_str, "committed", screenshot_id],
+                )
+            }
+            .map_err(|e| format!("Failed to mark screenshot committed: {}", e))?;
 
-        // Clear lock holder on drop
-        if let Ok(mut h) = self.lock_holder.lock() {
-            *h = "";
+            if updated == 0 {
+                if let Ok(mut h) = self.lock_holder.lock() {
+                    *h = "";
+                }
+                return Err("Screenshot not found".to_string());
+            }
+
+            tx.commit()
+                .map_err(|e| format!("Failed to commit screenshot transaction: {}", e))?;
+
+            if let Ok(mut h) = self.lock_holder.lock() {
+                *h = "";
+            }
+            drop(guard);
         }
-        drop(guard);
+        total_db_insert_dur = td0.elapsed();
+        if added > 0 {
+            self.ocr_row_count
+                .fetch_add(added as u64, Ordering::Relaxed);
+        }
 
         let total_dur = fn_start.elapsed();
         if total_dur.as_secs() >= 5 {
@@ -897,8 +922,7 @@ impl StorageState {
         start_ts: f64,
         end_ts: f64,
     ) -> Result<i64, String> {
-        let guard = self.get_connection_named("count_screenshots_by_time_range")?;
-        let conn = guard.as_ref().unwrap();
+        let conn = self.open_read_connection_named("count_screenshots_by_time_range")?;
 
         let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -975,10 +999,9 @@ impl StorageState {
     ) -> Result<Vec<ScreenshotRecord>, String> {
         let diag_start = std::time::Instant::now();
 
-        // Phase 1: Hold mutex only for SQL query, extract raw data without decryption
+        // Phase 1: Use an independent read-only connection for SQL query, extract raw data without decryption
         let raw_rows = {
-            let mut guard = self.get_connection_named("get_screenshots_by_time_range_paged")?;
-            let conn = guard.as_mut().unwrap();
+            let conn = self.open_read_connection_named("get_screenshots_by_time_range_paged")?;
 
             let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -1277,12 +1300,9 @@ impl StorageState {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Phase 1: Hold the DB connection lock only to retrieve the raw encrypted rows.
+        // Phase 1: Use an independent read-only connection to retrieve the raw encrypted rows.
         let raw_rows = {
-            let guard = self.get_connection_named("get_ocr_results_by_screenshot_ids")?;
-            let conn = guard
-                .as_ref()
-                .ok_or_else(|| "Database connection is None".to_string())?;
+            let conn = self.open_read_connection_named("get_ocr_results_by_screenshot_ids")?;
 
             let mut raw_rows = Vec::new();
 
@@ -1355,34 +1375,46 @@ impl StorageState {
 
     /// Delete a screenshot by ID.
     pub fn delete_screenshot(&self, id: i64) -> Result<bool, String> {
-        let guard = self.get_connection_named("delete_screenshot")?;
-        let conn = guard.as_ref().unwrap();
+        let (deleted, image_path, ocr_count) = {
+            let guard = self.get_connection_named("delete_screenshot")?;
+            let conn = guard.as_ref().unwrap();
 
-        // Get image path first
-        let image_path: Option<String> = conn
-            .query_row(
-                "SELECT image_path FROM screenshots WHERE id = ? AND is_deleted = 0",
-                [id],
-                |row| row.get(0),
-            )
-            .ok();
+            // Get image path first
+            let image_path: Option<String> = conn
+                .query_row(
+                    "SELECT image_path FROM screenshots WHERE id = ? AND is_deleted = 0",
+                    [id],
+                    |row| row.get(0),
+                )
+                .ok();
 
-        // Count OCR rows that will be cascade-deleted
-        let ocr_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM ocr_results WHERE screenshot_id = ? AND is_deleted = 0",
-                [id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+            // Count OCR rows that will be cascade-deleted
+            let ocr_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ocr_results WHERE screenshot_id = ? AND is_deleted = 0",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
 
-        // Delete database record
-        let deleted = conn
-            .execute(
-                "DELETE FROM screenshots WHERE id = ? AND is_deleted = 0",
-                [id],
-            )
-            .map_err(|e| format!("Failed to delete screenshot: {}", e))?;
+            // Delete database record
+            let deleted = conn
+                .execute(
+                    "DELETE FROM screenshots WHERE id = ? AND is_deleted = 0",
+                    [id],
+                )
+                .map_err(|e| format!("Failed to delete screenshot: {}", e))?;
+
+            if deleted > 0 {
+                // Clean up orphaned dedup entries while the DB connection is held.
+                let _ = Self::cleanup_orphaned_dedup_entries(conn);
+            }
+            if let Ok(mut h) = self.lock_holder.lock() {
+                *h = "";
+            }
+            drop(guard);
+            (deleted, image_path, ocr_count)
+        };
 
         // Try to delete image file
         if deleted > 0 {
@@ -1397,8 +1429,6 @@ impl StorageState {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(ocr_count as u64))
                 });
-            // Clean up orphaned dedup entries
-            let _ = Self::cleanup_orphaned_dedup_entries(conn);
         }
 
         Ok(deleted > 0)
@@ -1410,9 +1440,6 @@ impl StorageState {
         start_ts: f64,
         end_ts: f64,
     ) -> Result<i32, String> {
-        let guard = self.get_connection_named("delete_screenshots_by_time_range")?;
-        let conn = guard.as_ref().unwrap();
-
         // Convert timestamps (milliseconds) to SQLite datetime
         let start_dt = DateTime::<Utc>::from_timestamp((start_ts / 1000.0) as i64, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -1421,33 +1448,49 @@ impl StorageState {
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
 
-        // Get all image paths to delete
-        let mut stmt = conn
-            .prepare("SELECT image_path FROM screenshots WHERE is_deleted = 0 AND created_at BETWEEN ? AND ?")
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+        let (paths, deleted, ocr_count) = {
+            let guard = self.get_connection_named("delete_screenshots_by_time_range")?;
+            let conn = guard.as_ref().unwrap();
 
-        let paths: Vec<String> = stmt
-            .query_map([&start_dt, &end_dt], |row| row.get(0))
-            .map_err(|e| format!("Failed to execute query: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
+            // Get all image paths to delete
+            let mut stmt = conn
+                .prepare("SELECT image_path FROM screenshots WHERE is_deleted = 0 AND created_at BETWEEN ? AND ?")
+                .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
-        // Count OCR rows that will be cascade-deleted
-        let ocr_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM ocr_results WHERE is_deleted = 0 AND screenshot_id IN (SELECT id FROM screenshots WHERE is_deleted = 0 AND created_at BETWEEN ? AND ?)",
-                [&start_dt, &end_dt],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+            let paths: Vec<String> = stmt
+                .query_map([&start_dt, &end_dt], |row| row.get(0))
+                .map_err(|e| format!("Failed to execute query: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
 
-        // Delete database records
-        let deleted = conn
-            .execute(
-                "DELETE FROM screenshots WHERE is_deleted = 0 AND created_at BETWEEN ? AND ?",
-                [&start_dt, &end_dt],
-            )
-            .map_err(|e| format!("Failed to delete screenshots: {}", e))?;
+            // Count OCR rows that will be cascade-deleted
+            let ocr_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM ocr_results WHERE is_deleted = 0 AND screenshot_id IN (SELECT id FROM screenshots WHERE is_deleted = 0 AND created_at BETWEEN ? AND ?)",
+                    [&start_dt, &end_dt],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            // Delete database records
+            let deleted = conn
+                .execute(
+                    "DELETE FROM screenshots WHERE is_deleted = 0 AND created_at BETWEEN ? AND ?",
+                    [&start_dt, &end_dt],
+                )
+                .map_err(|e| format!("Failed to delete screenshots: {}", e))?;
+
+            if deleted > 0 {
+                // Clean up orphaned dedup entries while the DB connection is held.
+                let _ = Self::cleanup_orphaned_dedup_entries(conn);
+            }
+            if let Ok(mut h) = self.lock_holder.lock() {
+                *h = "";
+            }
+            drop(stmt);
+            drop(guard);
+            (paths, deleted, ocr_count)
+        };
 
         if deleted > 0 {
             let _ = self
@@ -1455,8 +1498,6 @@ impl StorageState {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(ocr_count as u64))
                 });
-            // Clean up orphaned dedup entries
-            let _ = Self::cleanup_orphaned_dedup_entries(conn);
         }
 
         // Try to delete image files

@@ -22,8 +22,11 @@ mod types;
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
 pub use types::*;
 
-use crate::credential_manager::CredentialManagerState;
-use rusqlite::Connection;
+use crate::credential_manager::{
+    derive_db_key_from_public_key, get_cached_public_key, load_public_key_from_file,
+    CredentialManagerState,
+};
+use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -170,6 +173,47 @@ impl StorageState {
             return Err("Database not initialized".to_string());
         }
         Ok(guard)
+    }
+
+    /// Open an independent SQLCipher read-only connection for read-heavy paths.
+    ///
+    /// The database key is derived from the public key, matching initialize().
+    /// This does not require the private key or an unlocked credential session.
+    pub(crate) fn open_read_connection_named(
+        &self,
+        caller: &'static str,
+    ) -> Result<Connection, String> {
+        let started = std::time::Instant::now();
+        let data_dir = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let public_key = get_cached_public_key(&self.credential_state)
+            .or_else(|| load_public_key_from_file(&self.credential_state).ok())
+            .ok_or_else(|| "Public key not initialized".to_string())?;
+        let db_key = derive_db_key_from_public_key(&public_key);
+        let db_path = data_dir.join("screenshots.db");
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("Failed to open read database connection: {}", e))?;
+        let key_hex = hex::encode(&db_key);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key_hex))
+            .map_err(|e| format!("Failed to set read database key: {}", e))?;
+        conn.execute_batch("SELECT count(*) FROM sqlite_master;")
+            .map_err(|e| format!("Read database key verification failed: {}", e))?;
+
+        let elapsed = started.elapsed();
+        if elapsed.as_millis() >= 250 {
+            tracing::warn!(
+                "[DIAG:DB] read connection open slow caller={} elapsed={:?}",
+                caller,
+                elapsed
+            );
+        }
+        Ok(conn)
     }
 
     /// Returns whether the current credential session is unlocked/valid.

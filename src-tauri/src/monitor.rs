@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+use tokio::sync::Mutex as AsyncMutex;
 
 use std::os::windows::io::AsRawHandle;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -46,6 +47,13 @@ pub struct MonitorState {
     pub stopping: AtomicBool,
     /// Prevents the monitor from restarting during migration tasks
     pub migration_lock: AtomicBool,
+    python_ipc_client: AsyncMutex<Option<PersistentIpcClient>>,
+}
+
+struct PersistentIpcClient {
+    pipe_name: String,
+    client: NamedPipeClient,
+    requests: u64,
 }
 
 impl MonitorState {
@@ -63,6 +71,7 @@ impl MonitorState {
             game_mode_task: Mutex::new(None),
             stopping: AtomicBool::new(false),
             migration_lock: AtomicBool::new(false),
+            python_ipc_client: AsyncMutex::new(None),
         }
     }
 }
@@ -193,6 +202,102 @@ where
     ))
 }
 
+async fn send_ipc_request_on_client<C>(
+    client: &mut C,
+    req: &Value,
+    command_name: &str,
+    seq_no: u64,
+    ipc_timeout_secs: u64,
+    ipc_started: std::time::Instant,
+    is_process_ocr: bool,
+) -> Result<Value, String>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let req_bytes = serde_json::to_vec(req).map_err(|e| format!("Serialize error: {}", e))?;
+    if let Err(e) = write_ipc_frame(client, &req_bytes).await {
+        if is_process_ocr {
+            tracing::error!(
+                "[DIAG:IPC] write failed command={} seq_no={} elapsed={}ms error={}",
+                command_name,
+                seq_no,
+                ipc_started.elapsed().as_millis(),
+                e
+            );
+        }
+        return Err(e);
+    }
+
+    if is_process_ocr {
+        tracing::debug!(
+            "[DIAG:IPC] write done command={} seq_no={} request_bytes={} elapsed={}ms",
+            command_name,
+            seq_no,
+            req_bytes.len(),
+            ipc_started.elapsed().as_millis()
+        );
+    }
+
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(ipc_timeout_secs),
+        read_ipc_frame(client),
+    )
+    .await
+    {
+        Ok(Ok(buf)) => {
+            if is_process_ocr {
+                tracing::debug!(
+                    "[DIAG:IPC] read done command={} seq_no={} response_bytes={} elapsed={}ms",
+                    command_name,
+                    seq_no,
+                    buf.len(),
+                    ipc_started.elapsed().as_millis()
+                );
+            }
+            match parse_ipc_response(&buf) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    if is_process_ocr {
+                        tracing::error!(
+                            "[DIAG:IPC] invalid json command={} seq_no={} elapsed={}ms error={}",
+                            command_name,
+                            seq_no,
+                            ipc_started.elapsed().as_millis(),
+                            e
+                        );
+                    }
+                    Err(e)
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            if is_process_ocr {
+                tracing::error!(
+                    "[DIAG:IPC] read failed command={} seq_no={} elapsed={}ms error={}",
+                    command_name,
+                    seq_no,
+                    ipc_started.elapsed().as_millis(),
+                    e
+                );
+            }
+            Err(e)
+        }
+        Err(_) => {
+            let e = format!("IPC response timed out after {}s", ipc_timeout_secs);
+            if is_process_ocr {
+                tracing::error!(
+                    "[DIAG:IPC] read timeout command={} seq_no={} elapsed={}ms error={}",
+                    command_name,
+                    seq_no,
+                    ipc_started.elapsed().as_millis(),
+                    e
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
 // 内部函数：尝试连接到管道，支持重试
 async fn connect_to_pipe(
     pipe_name: &str,
@@ -246,14 +351,14 @@ async fn connect_to_pipe(
     Err(last_error)
 }
 
-/// Sends a JSON request to the Python process via named pipe IPC, adding auth token and sequence number.
-pub async fn send_ipc_request(
+pub async fn send_ipc_request_reused(
+    state: &MonitorState,
     pipe_name: &str,
     auth_token: &str,
     seq_no: u64,
     req: Value,
 ) -> Result<Value, String> {
-    let req = inject_ipc_auth(req, auth_token, seq_no);
+    let mut req = inject_ipc_auth(req, auth_token, seq_no);
 
     let command_name = req
         .get("command")
@@ -275,125 +380,84 @@ pub async fn send_ipc_request(
         .unwrap_or(default_timeout_secs)
         .clamp(min_timeout_secs, 605);
     let ipc_started = std::time::Instant::now();
+    let keepalive = command_name != "stop";
+    if let Some(obj) = req.as_object_mut() {
+        obj.insert("_ipc_keepalive".to_string(), Value::Bool(keepalive));
+    }
 
     if is_process_ocr {
         tracing::debug!(
-            "[DIAG:IPC] start command={} seq_no={} pipe={}",
+            "[DIAG:IPC] start reused command={} seq_no={} pipe={}",
             command_name,
             seq_no,
             pipe_name
         );
     }
 
-    let mut client = match connect_to_pipe(pipe_name).await {
-        Ok(client) => {
-            if is_process_ocr {
-                tracing::debug!(
-                    "[DIAG:IPC] connected command={} seq_no={} elapsed={}ms",
-                    command_name,
-                    seq_no,
-                    ipc_started.elapsed().as_millis()
-                );
-            }
-            client
-        }
-        Err(e) => {
-            if is_process_ocr {
-                tracing::error!(
-                    "[DIAG:IPC] connect failed command={} seq_no={} elapsed={}ms error={}",
-                    command_name,
-                    seq_no,
-                    ipc_started.elapsed().as_millis(),
-                    e
-                );
-            }
-            return Err(e);
-        }
-    };
-
-    let req_bytes = serde_json::to_vec(&req).map_err(|e| format!("Serialize error: {}", e))?;
-    if let Err(e) = write_ipc_frame(&mut client, &req_bytes).await {
-        if is_process_ocr {
-            tracing::error!(
-                "[DIAG:IPC] write failed command={} seq_no={} elapsed={}ms error={}",
-                command_name,
-                seq_no,
-                ipc_started.elapsed().as_millis(),
-                e
-            );
-        }
-        return Err(e);
-    }
-
-    if is_process_ocr {
+    let mut guard = state.python_ipc_client.lock().await;
+    let needs_connect = guard
+        .as_ref()
+        .map(|existing| existing.pipe_name != pipe_name)
+        .unwrap_or(true);
+    if needs_connect {
+        let client = connect_to_pipe(pipe_name).await?;
+        *guard = Some(PersistentIpcClient {
+            pipe_name: pipe_name.to_string(),
+            client,
+            requests: 0,
+        });
         tracing::debug!(
-            "[DIAG:IPC] write done command={} seq_no={} request_bytes={} elapsed={}ms",
-            command_name,
-            seq_no,
-            req_bytes.len(),
-            ipc_started.elapsed().as_millis()
+            "[DIAG:IPC] persistent connection established pipe={}",
+            pipe_name
         );
     }
 
-    match tokio::time::timeout(
-        tokio::time::Duration::from_secs(ipc_timeout_secs),
-        read_ipc_frame(&mut client),
+    let persistent = guard
+        .as_mut()
+        .ok_or_else(|| "Persistent IPC client unavailable".to_string())?;
+    let result = send_ipc_request_on_client(
+        &mut persistent.client,
+        &req,
+        &command_name,
+        seq_no,
+        ipc_timeout_secs,
+        ipc_started,
+        is_process_ocr,
     )
-    .await
-    {
-        Ok(Ok(buf)) => {
-            if is_process_ocr {
-                let elapsed_ms = ipc_started.elapsed().as_millis();
+    .await;
+
+    match &result {
+        Ok(_) if keepalive => {
+            persistent.requests = persistent.requests.saturating_add(1);
+            if is_process_ocr || persistent.requests % 100 == 0 {
                 tracing::debug!(
-                    "[DIAG:IPC] read done command={} seq_no={} response_bytes={} elapsed={}ms",
+                    "[DIAG:IPC] persistent request done command={} seq_no={} reused_count={} elapsed={}ms",
                     command_name,
                     seq_no,
-                    buf.len(),
-                    elapsed_ms
+                    persistent.requests,
+                    ipc_started.elapsed().as_millis()
                 );
-            }
-            match parse_ipc_response(&buf) {
-                Ok(v) => Ok(v),
-                Err(e) => {
-                    if is_process_ocr {
-                        tracing::error!(
-                            "[DIAG:IPC] invalid json command={} seq_no={} elapsed={}ms error={}",
-                            command_name,
-                            seq_no,
-                            ipc_started.elapsed().as_millis(),
-                            e
-                        );
-                    }
-                    Err(e)
-                }
             }
         }
-        Ok(Err(e)) => {
-            if is_process_ocr {
-                tracing::error!(
-                    "[DIAG:IPC] read failed command={} seq_no={} elapsed={}ms error={}",
-                    command_name,
-                    seq_no,
-                    ipc_started.elapsed().as_millis(),
-                    e
-                );
-            }
-            Err(e)
+        Ok(_) => {
+            tracing::debug!(
+                "[DIAG:IPC] closing persistent connection after command={}",
+                command_name
+            );
+            *guard = None;
         }
-        Err(_) => {
-            let e = format!("IPC response timed out after {}s", ipc_timeout_secs);
-            if is_process_ocr {
-                tracing::error!(
-                    "[DIAG:IPC] read timeout command={} seq_no={} elapsed={}ms error={}",
-                    command_name,
-                    seq_no,
-                    ipc_started.elapsed().as_millis(),
-                    e
-                );
-            }
-            Err(e)
+        Err(e) => {
+            tracing::warn!(
+                "[DIAG:IPC] persistent connection discarded command={} seq_no={} error={}",
+                command_name,
+                seq_no,
+                e
+            );
+            *guard = None;
         }
     }
+
+    result
 }
 
 /// 动态设置 Job Object 的 CPU 限制
@@ -572,7 +636,7 @@ pub async fn forward_command_to_python(
         None
     };
 
-    send_ipc_request(&pipe_name, &auth_token, seq_no, payload).await
+    send_ipc_request_reused(state, &pipe_name, &auth_token, seq_no, payload).await
 }
 
 fn create_job_object(cpu_limit_enabled: bool, cpu_limit_percent: u32) -> Result<JobHandle, String> {
@@ -1418,6 +1482,10 @@ pub async fn stop_monitor(
     }
     {
         let mut guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    {
+        let mut guard = state.python_ipc_client.lock().await;
         *guard = None;
     }
     {

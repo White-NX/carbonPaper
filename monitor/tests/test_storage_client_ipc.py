@@ -77,15 +77,122 @@ def test_send_request_handles_utf8_split_and_partial_write(monkeypatch):
 
     client = sc.StorageClient("test-pipe")
     request = {"command": "probe", "payload": "x" * (70 * 1024)}
-    expected_request_len = 4 + len(json.dumps(request).encode("utf-8"))
+    expected_wire_request = dict(request)
+    expected_wire_request["_ipc_keepalive"] = True
+    expected_request_len = 4 + len(json.dumps(expected_wire_request).encode("utf-8"))
 
     result = client._send_request(request)
 
     assert result == response_obj
     assert state["set_mode_calls"] == 1
-    assert state["close_calls"] == 1
+    assert state["close_calls"] == 0
     assert state["write_calls"] > 1
     assert state["written_bytes"] == expected_request_len
+
+
+def test_send_request_reuses_persistent_handle(monkeypatch):
+    responses = [
+        frame(json.dumps({"status": "success", "data": {"value": 1}}).encode("utf-8")),
+        frame(json.dumps({"status": "success", "data": {"value": 2}}).encode("utf-8")),
+    ]
+    state = install_pipe_mocks(monkeypatch, responses)
+    client = sc.StorageClient("test-pipe")
+
+    assert client._send_request({"command": "first"})["data"]["value"] == 1
+    assert client._send_request({"command": "second"})["data"]["value"] == 2
+
+    assert state["set_mode_calls"] == 1
+    assert state["close_calls"] == 0
+
+
+def test_send_request_reconnects_once_when_write_sees_closing_pipe(monkeypatch):
+    response_obj = {"status": "success", "data": {"value": 7}}
+    response_bytes = frame(json.dumps(response_obj).encode("utf-8"))
+    stream = bytearray(response_bytes)
+    state = {
+        "create_calls": 0,
+        "write_calls": 0,
+        "close_calls": 0,
+        "set_mode_calls": 0,
+    }
+
+    def fake_create_file(*_args, **_kwargs):
+        state["create_calls"] += 1
+        return object()
+
+    def fake_set_mode(*_args, **_kwargs):
+        state["set_mode_calls"] += 1
+
+    def fake_write_file(_handle, payload):
+        state["write_calls"] += 1
+        if state["write_calls"] == 1:
+            raise FakePyWinError(232, "pipe is being closed")
+        return 0, len(payload)
+
+    def fake_read_file(_handle, size):
+        if not stream:
+            return 0, b""
+        n = min(size, len(stream))
+        chunk = bytes(stream[:n])
+        del stream[:n]
+        return 0, chunk
+
+    monkeypatch.setattr(sc.pywintypes, "error", FakePyWinError)
+    monkeypatch.setattr(sc.win32file, "CreateFile", fake_create_file)
+    monkeypatch.setattr(sc.win32pipe, "SetNamedPipeHandleState", fake_set_mode)
+    monkeypatch.setattr(sc.win32file, "WriteFile", fake_write_file)
+    monkeypatch.setattr(sc.win32file, "FlushFileBuffers", lambda _h: None)
+    monkeypatch.setattr(sc.win32file, "ReadFile", fake_read_file)
+    monkeypatch.setattr(sc.win32file, "CloseHandle", lambda _h: state.__setitem__("close_calls", state["close_calls"] + 1))
+
+    result = sc.StorageClient("test-pipe")._send_request({"command": "get_temp_image"})
+
+    assert result == response_obj
+    assert state["create_calls"] == 2
+    assert state["set_mode_calls"] == 2
+    assert state["close_calls"] == 1
+    assert state["write_calls"] >= 2
+
+
+def test_send_request_reconnects_once_after_empty_response(monkeypatch):
+    response_obj = {"status": "success", "data": {"value": 9}}
+    stream = bytearray(frame(json.dumps(response_obj).encode("utf-8")))
+    state = {
+        "create_calls": 0,
+        "write_calls": 0,
+        "read_calls": 0,
+        "close_calls": 0,
+        "set_mode_calls": 0,
+    }
+
+    def fake_create_file(*_args, **_kwargs):
+        state["create_calls"] += 1
+        return object()
+
+    def fake_read_file(_handle, size):
+        state["read_calls"] += 1
+        if state["read_calls"] == 1:
+            return 0, b""
+        n = min(size, len(stream))
+        chunk = bytes(stream[:n])
+        del stream[:n]
+        return 0, chunk
+
+    monkeypatch.setattr(sc.pywintypes, "error", FakePyWinError)
+    monkeypatch.setattr(sc.win32file, "CreateFile", fake_create_file)
+    monkeypatch.setattr(sc.win32pipe, "SetNamedPipeHandleState", lambda *_a, **_k: state.__setitem__("set_mode_calls", state["set_mode_calls"] + 1))
+    monkeypatch.setattr(sc.win32file, "WriteFile", lambda _h, payload: (state.__setitem__("write_calls", state["write_calls"] + 1) or 0, len(payload)))
+    monkeypatch.setattr(sc.win32file, "FlushFileBuffers", lambda _h: None)
+    monkeypatch.setattr(sc.win32file, "ReadFile", fake_read_file)
+    monkeypatch.setattr(sc.win32file, "CloseHandle", lambda _h: state.__setitem__("close_calls", state["close_calls"] + 1))
+
+    result = sc.StorageClient("test-pipe")._send_request({"command": "after_idle"})
+
+    assert result == response_obj
+    assert state["create_calls"] == 2
+    assert state["set_mode_calls"] == 2
+    assert state["close_calls"] == 1
+    assert state["write_calls"] == 4
 
 
 def test_decrypt_many_retries_once_after_invalid_json(monkeypatch):
