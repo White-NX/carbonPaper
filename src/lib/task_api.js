@@ -97,14 +97,18 @@ export async function getRelatedScreenshots(screenshotId, limit = 8) {
  * @param {Object} [options]
  * @param {number} [options.startTime] - optional range start (seconds)
  * @param {number} [options.endTime] - optional range end (seconds)
+ * @param {'auto'|'full'|'batched'} [options.clusteringMode] - resource strategy
+ * @param {boolean} [options.manual] - true when invoked from a user action
  * @returns {Promise<Object>} Clustering result summary.
  */
-export async function runClustering({ startTime, endTime } = {}) {
+export async function runClustering({ startTime, endTime, clusteringMode, manual = false } = {}) {
   const result = await invoke('execute_monitor_command', {
     payload: {
       command: 'run_clustering',
       start_time: startTime ?? null,
       end_time: endTime ?? null,
+      clustering_mode: clusteringMode || 'auto',
+      manual,
     },
   });
   if (result && result.error) {
