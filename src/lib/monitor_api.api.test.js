@@ -10,11 +10,15 @@ vi.mock('./auth_api', () => ({
 }));
 
 import {
+  fetchImage,
+  fetchThumbnail,
   searchScreenshots,
   listProcesses,
   getScreenshotDetails,
   updateMonitorFilters,
 } from './monitor_api';
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe('monitor_api command wrappers', () => {
   let consoleErrorSpy;
@@ -98,5 +102,36 @@ describe('monitor_api command wrappers', () => {
     invoke.mockResolvedValue({ error: 'unknown command' });
 
     await expect(updateMonitorFilters({})).rejects.toMatchObject({ code: 'unsupported' });
+  });
+
+  it('dedupes concurrent full image requests by id', async () => {
+    invoke.mockImplementation(async () => {
+      await sleep(5);
+      return { status: 'success', data: 'abc', mime_type: 'image/png' };
+    });
+
+    const [first, second] = await Promise.all([fetchImage(42), fetchImage(42)]);
+
+    expect(first).toBe('data:image/png;base64,abc');
+    expect(second).toBe(first);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith('storage_get_image', { id: 42, path: null });
+  });
+
+  it('dedupes concurrent thumbnail requests by path', async () => {
+    invoke.mockImplementation(async () => {
+      await sleep(5);
+      return { status: 'success', data: 'thumb', mime_type: 'image/jpeg' };
+    });
+
+    const [first, second] = await Promise.all([
+      fetchThumbnail(null, 'D:/shots/a.jpg'),
+      fetchThumbnail(null, 'D:/shots/a.jpg'),
+    ]);
+
+    expect(first).toBe('data:image/jpeg;base64,thumb');
+    expect(second).toBe(first);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith('storage_get_thumbnail', { id: null, path: 'D:/shots/a.jpg' });
   });
 });

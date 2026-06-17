@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { searchScreenshots, fetchThumbnailBatch, fetchImage, getSoftDeleteQueueStatus, getSmartClusterWorkerStatus } from '../lib/monitor_api';
+import { searchScreenshots, fetchThumbnailBatch, fetchThumbnail, getSoftDeleteQueueStatus, getSmartClusterWorkerStatus } from '../lib/monitor_api';
 
 // Simple debounce hook
 function useDebounce(value, delay) {
@@ -594,7 +594,7 @@ function SearchResultItem({ item, mode, query, onClick, preloadedSrc }) {
             const path = item.image_path || item.metadata?.image_path || item.path;
             if (!id && !path) { if (active) setLoadFailed(true); return; }
             try {
-                const src = await fetchImage(id, id ? null : path);
+                const src = await fetchThumbnail(id, id ? null : path);
                 if (active) {
                     if (src) setImgSrc(src);
                     else setLoadFailed(true);
