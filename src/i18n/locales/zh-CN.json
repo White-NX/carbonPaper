@@ -563,6 +563,8 @@
     "hide": "隐藏到后台",
     "retry": "重试",
     "downloading": "正在下载...",
+    "extracting": "正在解压更新...",
+    "applying": "正在应用更新...",
     "downloadFailed": "下载失败: {{error}}",
     "criticalNotice": "该更新包含重要的安全修复或功能改进，为了您的数据安全和最佳体验，需要尽快更新。"
   },

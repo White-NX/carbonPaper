@@ -410,7 +410,7 @@ function SettingsDialog({
   const handleDownloadUpdate = async () => {
     if (!updateInfo) return;
     setDownloading(true);
-    setDownloadProgress({ downloaded: 0, contentLength: 0 });
+    setDownloadProgress({ phase: 'downloading', downloaded: 0, contentLength: 0 });
     try {
       await downloadAndInstallUpdate((progress) => {
         setDownloadProgress(progress);

@@ -952,6 +952,7 @@ function App() {
   const handleDownloadUpdate = async () => {
     setUpdateDownloading(true);
     setUpdateDownloadError(null);
+    setUpdateDownloadProgress({ phase: 'downloading', downloaded: 0, contentLength: 0 });
     try {
       await downloadAndInstallUpdate((progress) => {
         setUpdateDownloadProgress(progress);

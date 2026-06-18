@@ -19,10 +19,18 @@ export function UpdateModal({
   if (!isVisible || !updateInfo) return null;
 
   const { version, body, critical } = updateInfo;
+  const phase = downloadProgress?.phase || 'downloading';
   const hasValidTotal = downloadProgress && downloadProgress.contentLength > 0;
   const progressPercent = hasValidTotal
     ? Math.round((downloadProgress.downloaded / downloadProgress.contentLength) * 100)
     : 0;
+  const isApplying = phase === 'applying';
+  const isExtracting = phase === 'extracting';
+  const statusLabel = isApplying
+    ? t('updateModal.applying')
+    : isExtracting
+      ? t('updateModal.extracting')
+      : t('updateModal.downloading');
 
   const IconComponent = critical ? AlertCircle : ArrowUpCircle;
   const iconColorClass = critical ? 'text-red-500' : 'text-ide-accent';
@@ -69,9 +77,11 @@ export function UpdateModal({
           {downloading && (
             <div className="w-full space-y-1.5 shrink-0 pt-2">
               <div className="flex justify-between text-xs">
-                <span className="text-ide-text font-medium">{t('updateModal.downloading')}</span>
+                <span className="text-ide-text font-medium">{statusLabel}</span>
                 <span className="text-ide-muted">
-                  {hasValidTotal 
+                  {isApplying || isExtracting
+                    ? t(`updateModal.${phase}`)
+                    : hasValidTotal
                     ? `${progressPercent}%` 
                     : downloadProgress ? `${(downloadProgress.downloaded / 1024 / 1024).toFixed(1)} MB` : '0%'
                   }
@@ -80,7 +90,7 @@ export function UpdateModal({
               <div className="w-full h-2 bg-ide-bg rounded-full overflow-hidden border border-ide-border">
                 <div 
                   className="h-full bg-ide-accent rounded-full transition-all duration-300 ease-out" 
-                  style={{ width: `${progressPercent}%` }}
+                  style={{ width: `${isApplying || isExtracting ? 100 : progressPercent}%` }}
                 />
               </div>
             </div>
