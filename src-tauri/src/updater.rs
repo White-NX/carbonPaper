@@ -3,13 +3,21 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::registry_config;
 use crate::resource_utils::{file_in_local_appdata, normalize_path_for_command};
 
 const UPDATE_CHECK_URL: &str =
     "https://github.com/White-NX/carbonPaper/releases/latest/download/latest.json";
+const UPDATE_SMOKE_TEST_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_TEST";
+const UPDATE_SMOKE_MANIFEST_URL_ENV: &str = "CARBONPAPER_UPDATE_MANIFEST_URL";
+const UPDATE_SMOKE_RESULT_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_RESULT";
+const UPDATE_SMOKE_EXPECTED_VERSION_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_EXPECTED_VERSION";
+const UPDATE_SMOKE_EXPECTED_MANIFEST_VERSION_ENV: &str =
+    "CARBONPAPER_UPDATE_SMOKE_EXPECTED_MANIFEST_VERSION";
+const UPDATE_SMOKE_REQUIRE_APPLIED_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_REQUIRE_APPLIED";
+const UPDATE_SMOKE_APPLIED_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_APPLIED";
 
 /// Metadata about an available update (version, download URL, SHA256 hash, release notes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +43,217 @@ impl UpdaterState {
         Self {
             manifest: Mutex::new(None),
         }
+    }
+}
+
+pub(crate) fn is_update_smoke_test_enabled() -> bool {
+    std::env::var(UPDATE_SMOKE_TEST_ENV).ok().as_deref() == Some("1")
+}
+
+fn validate_loopback_update_url(raw: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|e| format!("Invalid update smoke test URL '{}': {}", raw, e))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "Update smoke test URL must use http or https, got '{}'",
+                scheme
+            ))
+        }
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Update smoke test URL must include a host".to_string())?;
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "[::1]";
+    if !is_loopback {
+        return Err(format!(
+            "Update smoke test URL must point at localhost, 127.0.0.1, or ::1, got '{}'",
+            host
+        ));
+    }
+
+    Ok(())
+}
+
+fn update_check_url() -> Result<String, String> {
+    if is_update_smoke_test_enabled() {
+        let url = std::env::var(UPDATE_SMOKE_MANIFEST_URL_ENV).map_err(|_| {
+            format!(
+                "{} must be set when {}=1",
+                UPDATE_SMOKE_MANIFEST_URL_ENV, UPDATE_SMOKE_TEST_ENV
+            )
+        })?;
+        validate_loopback_update_url(&url)?;
+        return Ok(url);
+    }
+
+    Ok(UPDATE_CHECK_URL.to_string())
+}
+
+fn write_update_smoke_status(
+    status: &str,
+    phase: &str,
+    current_version: &str,
+    target_version: Option<&str>,
+    error: Option<&str>,
+) {
+    let Ok(path) = std::env::var(UPDATE_SMOKE_RESULT_ENV) else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let payload = serde_json::json!({
+        "status": status,
+        "phase": phase,
+        "current_version": current_version,
+        "target_version": target_version,
+        "error": error,
+        "pid": std::process::id(),
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let serialized = serde_json::to_string_pretty(&payload)
+        .unwrap_or_else(|_| format!(r#"{{"status":"{}","phase":"{}"}}"#, status, phase));
+    let _ = std::fs::write(path, serialized);
+}
+
+pub(crate) fn maybe_run_update_smoke_test(app: AppHandle) {
+    if !is_update_smoke_test_enabled() {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let current_version = app.config().version.clone().unwrap_or_default();
+        let expected_version = std::env::var(UPDATE_SMOKE_EXPECTED_VERSION_ENV).ok();
+        let expected_manifest_version = std::env::var(UPDATE_SMOKE_EXPECTED_MANIFEST_VERSION_ENV)
+            .ok()
+            .or_else(|| expected_version.clone());
+        let require_applied = std::env::var(UPDATE_SMOKE_REQUIRE_APPLIED_ENV)
+            .ok()
+            .as_deref()
+            == Some("1");
+        let update_applied = std::env::var(UPDATE_SMOKE_APPLIED_ENV).ok().as_deref() == Some("1");
+
+        if expected_version.as_deref() == Some(current_version.as_str())
+            && (!require_applied || update_applied)
+        {
+            tracing::info!(
+                "[UPDATE_SMOKE] expected version {} is running",
+                current_version
+            );
+            write_update_smoke_status(
+                "success",
+                "updated_app_started",
+                &current_version,
+                expected_manifest_version.as_deref(),
+                None,
+            );
+            app.exit(0);
+            return;
+        }
+
+        tracing::info!(
+            "[UPDATE_SMOKE] starting update smoke test current_version={} target_version={:?} final_app_version={:?} require_applied={}",
+            current_version,
+            expected_manifest_version,
+            expected_version,
+            require_applied
+        );
+        write_update_smoke_status(
+            "running",
+            "check_started",
+            &current_version,
+            expected_manifest_version.as_deref(),
+            None,
+        );
+
+        let result = async {
+            let check = updater_check(app.clone(), app.state::<UpdaterState>()).await?;
+            if !check.available {
+                return Err(format!(
+                    "No update available for smoke test (current version {})",
+                    check.current_version
+                ));
+            }
+            if let Some(expected) = expected_manifest_version.as_deref() {
+                if check.version.as_deref() != Some(expected) {
+                    return Err(format!(
+                        "Smoke test manifest points to {:?}, expected {}",
+                        check.version, expected
+                    ));
+                }
+            }
+
+            write_update_smoke_status(
+                "running",
+                "download_started",
+                &current_version,
+                check.version.as_deref(),
+                None,
+            );
+            updater_download(app.clone(), app.state::<UpdaterState>()).await?;
+
+            write_update_smoke_status(
+                "running",
+                "extract_started",
+                &current_version,
+                check.version.as_deref(),
+                None,
+            );
+            updater_extract().await?;
+
+            write_update_smoke_status(
+                "running",
+                "apply_started",
+                &current_version,
+                check.version.as_deref(),
+                None,
+            );
+            updater_apply(
+                app.clone(),
+                app.state::<crate::monitor::MonitorState>(),
+                app.state::<std::sync::Arc<crate::capture::CaptureState>>(),
+            )
+            .await
+        }
+        .await;
+
+        if let Err(e) = result {
+            tracing::error!("[UPDATE_SMOKE] failed: {}", e);
+            write_update_smoke_status(
+                "failure",
+                "failed",
+                &current_version,
+                expected_manifest_version.as_deref(),
+                Some(&e),
+            );
+            app.exit(1);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_loopback_update_url;
+
+    #[test]
+    fn update_smoke_url_allows_loopback_hosts() {
+        assert!(validate_loopback_update_url("http://127.0.0.1:8787/latest.json").is_ok());
+        assert!(validate_loopback_update_url("http://localhost:8787/latest.json").is_ok());
+        assert!(validate_loopback_update_url("http://[::1]:8787/latest.json").is_ok());
+    }
+
+    #[test]
+    fn update_smoke_url_rejects_non_loopback_hosts() {
+        assert!(validate_loopback_update_url("https://example.com/latest.json").is_err());
+        assert!(validate_loopback_update_url("file:///tmp/latest.json").is_err());
     }
 }
 
@@ -80,13 +299,17 @@ pub async fn updater_check(
     app: AppHandle,
     state: tauri::State<'_, UpdaterState>,
 ) -> Result<CheckResult, String> {
-    if !registry_config::get_bool("network_enabled").unwrap_or(true) {
+    if !is_update_smoke_test_enabled()
+        && !registry_config::get_bool("network_enabled").unwrap_or(true)
+    {
         return Err("Network features are disabled".to_string());
     }
     let current_version = app.config().version.clone().unwrap_or_default();
 
-    let response = reqwest::get(UPDATE_CHECK_URL)
+    let response = reqwest::get(update_check_url()?)
         .await
+        .map_err(|e| format!("Failed to fetch update manifest: {}", e))?
+        .error_for_status()
         .map_err(|e| format!("Failed to fetch update manifest: {}", e))?;
 
     let manifest: UpdateManifest = response
@@ -131,7 +354,9 @@ pub async fn updater_download(
     app: AppHandle,
     state: tauri::State<'_, UpdaterState>,
 ) -> Result<(), String> {
-    if !registry_config::get_bool("network_enabled").unwrap_or(true) {
+    if !is_update_smoke_test_enabled()
+        && !registry_config::get_bool("network_enabled").unwrap_or(true)
+    {
         return Err("Network features are disabled".to_string());
     }
     let manifest = state
@@ -140,6 +365,9 @@ pub async fn updater_download(
         .unwrap()
         .clone()
         .ok_or("No update manifest cached. Call updater_check first.")?;
+    if is_update_smoke_test_enabled() {
+        validate_loopback_update_url(&manifest.url)?;
+    }
 
     let staging = staging_dir()?;
     let zip_path = staging.join("update.zip");
@@ -337,7 +565,13 @@ try {{
     Copy-Item -Path '{extract_dir}\*' -Destination '{app_dir}' -Recurse -Force
 
     # Start the updated app
-    Start-Process -FilePath (Join-Path '{app_dir}' '{exe_name}')
+    $updatedExe = Join-Path '{app_dir}' '{exe_name}'
+    if ($env:CARBONPAPER_UPDATE_SMOKE_TEST -eq '1') {{
+        $env:CARBONPAPER_UPDATE_SMOKE_APPLIED = '1'
+        Start-Process -FilePath $updatedExe -WindowStyle Hidden
+    }} else {{
+        Start-Process -FilePath $updatedExe
+    }}
 
     # Cleanup staging directory
     Start-Sleep -Seconds 2

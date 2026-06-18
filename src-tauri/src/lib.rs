@@ -728,6 +728,16 @@ pub fn run() {
 
                 build_tray(app)?;
 
+                if updater::is_update_smoke_test_enabled() {
+                    if let Some(window) = app.get_webview_window("main") {
+                        if let Err(e) = window.destroy() {
+                            tracing::warn!("Failed to destroy window for update smoke test: {}", e);
+                        }
+                    }
+                    updater::maybe_run_update_smoke_test(app.handle().clone());
+                    return Ok(());
+                }
+
                 // 只有非隐藏启动时才应用 acrylic 效果
                 if !start_hidden {
                     if let Some(window) = app.get_webview_window("main") {

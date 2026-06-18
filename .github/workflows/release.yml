@@ -60,6 +60,64 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/generate-latest-json.mjs ${{ github.ref_name }} release_body.txt
 
+      - name: Smoke test previous stable portable update
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION: ${{ vars.CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION }}
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $zipFile = "src-tauri/target/release/bundle/nsis/carbonpaper_${version}_x64_portable.zip"
+          $latestJson = "src-tauri/target/release/bundle/nsis/latest.json"
+          $args = @(
+            "-TargetTag", "${{ github.ref_name }}",
+            "-TargetVersion", $version,
+            "-CandidateZip", $zipFile,
+            "-LatestJson", $latestJson,
+            "-TimeoutSeconds", "180",
+            "-SkipIfPreviousReleaseLacksSmokeSupport"
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION)) {
+            $args += @("-MinPreviousVersionWithSmokeHook", $env:CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION)
+          }
+          ./scripts/update-smoke.ps1 @args
+
+      - name: Build forward update smoke target
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $core = ($version -split '[-+]')[0]
+          $parts = $core.Split('.')
+          if ($parts.Count -ne 3) {
+            throw "Cannot derive forward smoke version from tag version '$version'"
+          }
+          $patch = [int]$parts[2] + 1
+          $futureVersion = "$($parts[0]).$($parts[1]).$patch"
+          "CARBONPAPER_FORWARD_SMOKE_VERSION=$futureVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          node scripts/bump-version.mjs $futureVersion --label ""
+          npm run tauri -- build --no-bundle
+          npm run pack:portable
+
+      - name: Smoke test candidate forward portable update
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $futureVersion = $env:CARBONPAPER_FORWARD_SMOKE_VERSION
+          $candidateZip = "src-tauri/target/release/bundle/nsis/carbonpaper_${version}_x64_portable.zip"
+          $futureZip = "src-tauri/target/release/bundle/nsis/carbonpaper_${futureVersion}_x64_portable.zip"
+          $latestJson = "src-tauri/target/release/bundle/nsis/latest.json"
+          ./scripts/update-smoke.ps1 `
+            -TargetTag "${{ github.ref_name }}" `
+            -TargetVersion $futureVersion `
+            -ManifestVersion $futureVersion `
+            -ExpectedAppVersion $futureVersion `
+            -SourcePortableZip $candidateZip `
+            -CandidateZip $futureZip `
+            -LatestJson $latestJson `
+            -TimeoutSeconds 180 `
+            -RequireAppliedMarker
+
       - name: Upload portable zip and latest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
