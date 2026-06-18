@@ -70,18 +70,18 @@ jobs:
           $version = "${{ github.ref_name }}".TrimStart("v")
           $zipFile = "src-tauri/target/release/bundle/nsis/carbonpaper_${version}_x64_portable.zip"
           $latestJson = "src-tauri/target/release/bundle/nsis/latest.json"
-          $args = @(
-            "-TargetTag", "${{ github.ref_name }}",
-            "-TargetVersion", $version,
-            "-CandidateZip", $zipFile,
-            "-LatestJson", $latestJson,
-            "-TimeoutSeconds", "180",
-            "-SkipIfPreviousReleaseLacksSmokeSupport"
-          )
-          if (-not [string]::IsNullOrWhiteSpace($env:CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION)) {
-            $args += @("-MinPreviousVersionWithSmokeHook", $env:CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION)
+          $smokeArgs = @{
+            TargetTag                              = "${{ github.ref_name }}"
+            TargetVersion                          = $version
+            CandidateZip                           = $zipFile
+            LatestJson                             = $latestJson
+            TimeoutSeconds                         = 180
+            SkipIfPreviousReleaseLacksSmokeSupport = $true
           }
-          ./scripts/update-smoke.ps1 @args
+          if (-not [string]::IsNullOrWhiteSpace($env:CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION)) {
+            $smokeArgs["MinPreviousVersionWithSmokeHook"] = $env:CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION
+          }
+          ./scripts/update-smoke.ps1 @smokeArgs
 
       - name: Build forward update smoke target
         shell: pwsh
