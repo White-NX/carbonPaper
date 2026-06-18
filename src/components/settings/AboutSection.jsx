@@ -16,10 +16,18 @@ export default function AboutSection({
   onDownloadUpdate,
 }) {
   const { t } = useTranslation();
+  const phase = downloadProgress?.phase || 'downloading';
   const hasValidTotal = downloading && downloadProgress.contentLength > 0;
   const progressPercent = hasValidTotal
       ? Math.round((downloadProgress.downloaded / downloadProgress.contentLength) * 100)
       : 0;
+  const isApplying = phase === 'applying';
+  const isExtracting = phase === 'extracting';
+  const statusLabel = isApplying
+    ? t('updateModal.applying')
+    : isExtracting
+      ? t('updateModal.extracting')
+      : t('updateModal.downloading');
 
   const renderUpdateButton = () => {
     if (downloading) {
@@ -28,11 +36,13 @@ export default function AboutSection({
           <div className="w-full h-2 bg-ide-bg rounded-full overflow-hidden">
             <div
               className="h-full bg-ide-accent rounded-full transition-all duration-300"
-              style={{ width: `${progressPercent}%` }}
+              style={{ width: `${isApplying || isExtracting ? 100 : progressPercent}%` }}
             />
           </div>
           <div className="text-[10px] text-ide-muted text-center">
-            {hasValidTotal ? `${progressPercent}%` : `${(downloadProgress.downloaded / 1024 / 1024).toFixed(1)} MB`}
+            {isApplying || isExtracting
+              ? statusLabel
+              : hasValidTotal ? `${progressPercent}%` : `${(downloadProgress.downloaded / 1024 / 1024).toFixed(1)} MB`}
           </div>
         </div>
       );

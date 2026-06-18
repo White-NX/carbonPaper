@@ -628,6 +628,8 @@
     "hide": "Hide to Background",
     "retry": "Retry",
     "downloading": "Downloading...",
+    "extracting": "Extracting update...",
+    "applying": "Applying update...",
     "downloadFailed": "Download failed: {{error}}",
     "criticalNotice": "This update includes important security fixes or feature improvements. To ensure your data safety and the best experience, needs update as soon as possible."
   },

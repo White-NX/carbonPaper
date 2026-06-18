@@ -23,10 +23,15 @@ export async function checkForUpdate() {
  * @param {function} [onProgress] - Progress callback ({ downloaded, contentLength })
  */
 export async function downloadAndInstallUpdate(onProgress) {
+  const emitProgress = (progress) => {
+    if (onProgress) onProgress(progress);
+  };
+
   // Listen for download progress events
   const unlisten = onProgress
     ? await listen('updater-download-progress', (event) => {
-        onProgress({
+        emitProgress({
+          phase: 'downloading',
           downloaded: event.payload.downloaded,
           contentLength: event.payload.content_length,
         });
@@ -34,14 +39,12 @@ export async function downloadAndInstallUpdate(onProgress) {
     : null;
 
   try {
+    emitProgress({ phase: 'downloading', downloaded: 0, contentLength: 0 });
     await invoke('updater_download');
 
-    // Signal 100% before extract phase
-    if (onProgress) {
-      onProgress({ downloaded: 1, contentLength: 1 });
-    }
-
+    emitProgress({ phase: 'extracting', downloaded: 1, contentLength: 1 });
     await invoke('updater_extract');
+    emitProgress({ phase: 'applying', downloaded: 1, contentLength: 1 });
     await invoke('updater_apply');
   } finally {
     if (unlisten) unlisten();

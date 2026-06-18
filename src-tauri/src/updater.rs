@@ -252,13 +252,8 @@ pub async fn updater_apply(
     monitor_state: tauri::State<'_, crate::monitor::MonitorState>,
     capture_state: tauri::State<'_, std::sync::Arc<crate::capture::CaptureState>>,
 ) -> Result<(), String> {
-    // 1. Stop the Python monitor
-    let _ = crate::monitor::stop_monitor(monitor_state, capture_state, app.clone()).await;
+    tracing::info!("Update apply: preparing update");
 
-    // 2. Set the updating flag so close is allowed
-    crate::IS_UPDATING.store(true, std::sync::atomic::Ordering::Relaxed);
-
-    // 3. Resolve paths
     let staging = staging_dir()?;
     let extract_dir = staging.join("extracted");
 
@@ -278,6 +273,25 @@ pub async fn updater_apply(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+
+    crate::IS_UPDATING.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    tracing::info!("Update apply: stopping monitor before update");
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(15),
+        crate::monitor::stop_monitor(monitor_state, capture_state, app.clone()),
+    )
+    .await
+    {
+        Ok(Ok(message)) => tracing::info!("Update apply: monitor stopped: {}", message),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "Update apply: monitor stop failed, continuing update: {}",
+                e
+            )
+        }
+        Err(_) => tracing::warn!("Update apply: monitor stop timed out, continuing update"),
+    }
 
     // 4. Generate PowerShell update script
     let ps_script = format!(
@@ -343,6 +357,7 @@ try {{
 
     // Write the PowerShell script
     let ps_path = staging.join("update.ps1");
+    tracing::info!("Update apply: writing script to {}", ps_path.display());
     std::fs::write(&ps_path, &ps_script)
         .map_err(|e| format!("Failed to write update script: {}", e))?;
 
@@ -350,6 +365,7 @@ try {{
 
     // 5. Spawn detached PowerShell process
     use std::process::Command;
+    tracing::info!("Update apply: launching update script");
     Command::new("powershell.exe")
         .args([
             "-ExecutionPolicy",

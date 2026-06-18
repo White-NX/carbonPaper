@@ -1,12 +1,12 @@
 use crate::capture::CaptureState;
-use crate::resource_utils::{find_existing_file_in_resources, normalize_path_for_command};
-use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
-use crate::storage::StorageState;
+#[cfg(test)]
+use crate::monitor_ipc::parse_ipc_response;
 use crate::monitor_ipc::{
     generate_auth_token, generate_random_pipe_name, inject_ipc_auth, send_ipc_request_on_client,
 };
-#[cfg(test)]
-use crate::monitor_ipc::parse_ipc_response;
+use crate::resource_utils::{find_existing_file_in_resources, normalize_path_for_command};
+use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
+use crate::storage::StorageState;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -214,27 +214,26 @@ pub async fn send_ipc_request_reused(
         );
     }
 
-    let mut guard = state.python_ipc_client.lock().await;
-    let needs_connect = guard
-        .as_ref()
-        .map(|existing| existing.pipe_name != pipe_name)
-        .unwrap_or(true);
-    if needs_connect {
-        let client = connect_to_pipe(pipe_name).await?;
-        *guard = Some(PersistentIpcClient {
-            pipe_name: pipe_name.to_string(),
-            client,
-            requests: 0,
-        });
-        tracing::debug!(
-            "[DIAG:IPC] persistent connection established pipe={}",
-            pipe_name
-        );
-    }
+    let mut persistent = {
+        let mut guard = state.python_ipc_client.lock().await;
+        match guard.take() {
+            Some(existing) if existing.pipe_name == pipe_name => existing,
+            _ => {
+                drop(guard);
+                let client = connect_to_pipe(pipe_name).await?;
+                tracing::debug!(
+                    "[DIAG:IPC] persistent connection established pipe={}",
+                    pipe_name
+                );
+                PersistentIpcClient {
+                    pipe_name: pipe_name.to_string(),
+                    client,
+                    requests: 0,
+                }
+            }
+        }
+    };
 
-    let persistent = guard
-        .as_mut()
-        .ok_or_else(|| "Persistent IPC client unavailable".to_string())?;
     let result = send_ipc_request_on_client(
         &mut persistent.client,
         &req,
@@ -258,13 +257,27 @@ pub async fn send_ipc_request_reused(
                     ipc_started.elapsed().as_millis()
                 );
             }
+            let pipe_still_current = {
+                let guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+                guard.as_deref() == Some(pipe_name)
+            };
+            let mut guard = state.python_ipc_client.lock().await;
+            if pipe_still_current && guard.is_none() {
+                *guard = Some(persistent);
+            } else {
+                tracing::debug!(
+                    "[DIAG:IPC] dropping reusable connection command={} pipe_current={} newer_client={}",
+                    command_name,
+                    pipe_still_current,
+                    guard.is_some()
+                );
+            }
         }
         Ok(_) => {
             tracing::debug!(
                 "[DIAG:IPC] closing persistent connection after command={}",
                 command_name
             );
-            *guard = None;
         }
         Err(e) => {
             tracing::warn!(
@@ -273,7 +286,6 @@ pub async fn send_ipc_request_reused(
                 seq_no,
                 e
             );
-            *guard = None;
         }
     }
 
