@@ -34,12 +34,13 @@ jobs:
       - name: Build NMH binary
         run: npm run build:nmh:release
 
-      - name: Build and release with Tauri
+      - name: Build Tauri draft release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
+          releaseDraft: true
 
       - name: Build portable zip
         run: npm run pack:portable
@@ -126,3 +127,8 @@ jobs:
           $zipFile = "src-tauri/target/release/bundle/nsis/carbonpaper_${version}_x64_portable.zip"
           $latestJson = "src-tauri/target/release/bundle/nsis/latest.json"
           gh release upload ${{ github.ref_name }} $zipFile $latestJson --clobber
+
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit ${{ github.ref_name }} --draft=false
