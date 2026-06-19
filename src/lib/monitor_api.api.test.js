@@ -45,17 +45,14 @@ describe('monitor_api command wrappers', () => {
     });
 
     expect(results).toEqual([{ id: 1 }]);
-    expect(invoke).toHaveBeenCalledWith('execute_monitor_command', {
-      payload: {
-        command: 'search_nl',
-        query: 'invoice',
-        limit: 5,
-        offset: 2,
-        process_names: ['chrome.exe'],
-        start_time: 10,
-        end_time: 20,
-        fuzzy: false,
-      },
+    expect(invoke).toHaveBeenCalledWith('monitor_search_nl', {
+      query: 'invoice',
+      limit: 5,
+      offset: 2,
+      processNames: ['chrome.exe'],
+      startTime: 10,
+      endTime: 20,
+      fuzzy: false,
     });
   });
 

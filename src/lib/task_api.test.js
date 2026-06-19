@@ -47,21 +47,13 @@ describe('task_api', () => {
     await runClustering({ startTime: 10, endTime: 20 });
     await setClusteringInterval('1w');
 
-    expect(invoke).toHaveBeenNthCalledWith(1, 'execute_monitor_command', {
-      payload: {
-        command: 'run_clustering',
-        start_time: 10,
-        end_time: 20,
-        clustering_mode: 'auto',
-        manual: false,
-      },
+    expect(invoke).toHaveBeenNthCalledWith(1, 'monitor_run_clustering', {
+      startTime: 10,
+      endTime: 20,
+      clusteringMode: 'auto',
+      manual: false,
     });
 
-    expect(invoke).toHaveBeenNthCalledWith(2, 'execute_monitor_command', {
-      payload: {
-        command: 'set_clustering_interval',
-        interval: '1w',
-      },
-    });
+    expect(invoke).toHaveBeenNthCalledWith(2, 'monitor_set_clustering_interval', { interval: '1w' });
   });
 });

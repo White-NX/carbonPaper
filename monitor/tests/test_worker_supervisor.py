@@ -1,5 +1,7 @@
 import pytest
 import logging
+import threading
+import time
 
 from monitor.worker_process import RestartableModelWorker
 from monitor.worker_supervisor import (
@@ -182,3 +184,36 @@ def test_model_worker_status_does_not_send_pipe_request():
     assert conn.sent == []
     assert stats["watchdog"]["name"] == "CarbonModelWorker"
     assert stats["watchdog"]["alive"] is True
+
+
+def test_model_worker_status_snapshot_does_not_wait_for_busy_lock():
+    worker = RestartableModelWorker(storage_pipe=None, data_dir="unused", env={})
+    worker._proc = FakeProc()
+    worker._conn = EchoConn()
+    worker._state = "busy"
+    worker._current_command = "process_ocr"
+
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_worker_lock():
+        with worker._lock:
+            locked.set()
+            release.wait(timeout=2)
+
+    thread = threading.Thread(target=hold_worker_lock)
+    thread.start()
+    assert locked.wait(timeout=1)
+
+    started = time.perf_counter()
+    try:
+        stats = worker.get_stats()
+    finally:
+        release.set()
+        thread.join(timeout=1)
+
+    assert time.perf_counter() - started < 0.2
+    assert stats["watchdog"]["name"] == "CarbonModelWorker"
+    assert stats["watchdog"]["state"] == "busy"
+    assert stats["watchdog"]["current_command"] == "process_ocr"
+    assert stats["watchdog"]["lock_contended"] is True
