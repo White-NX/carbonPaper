@@ -92,9 +92,12 @@ pub fn start_power_monitor(app: AppHandle) {
                 // Stop monitor if running
                 let monitor_state = app_clone.state::<crate::monitor::MonitorState>();
                 let capture_state = app_clone.state::<Arc<crate::capture::CaptureState>>();
-                let _ =
-                    crate::monitor::stop_monitor(monitor_state, capture_state, app_clone.clone())
-                        .await;
+                let _ = crate::monitor::stop_monitor_impl(
+                    monitor_state,
+                    capture_state,
+                    app_clone.clone(),
+                )
+                .await;
 
                 power_state.active.store(true, Ordering::SeqCst);
                 let _ = app_clone.emit(
@@ -122,7 +125,7 @@ pub fn start_power_monitor(app: AppHandle) {
                     tauri::async_runtime::spawn(async move {
                         let monitor_state = app_for_spawn.state::<crate::monitor::MonitorState>();
                         if let Err(e) =
-                            crate::monitor::start_monitor(monitor_state, app_for_spawn.clone())
+                            crate::monitor::start_monitor_impl(monitor_state, app_for_spawn.clone())
                                 .await
                         {
                             tracing::error!("Failed to start monitor after power restored: {}", e);

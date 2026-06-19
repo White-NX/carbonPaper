@@ -222,10 +222,13 @@ pub fn start_memory_sampler(app: AppHandle) {
 
 #[tauri::command]
 pub async fn get_analysis_overview(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, AnalysisState>,
     storage_state: State<'_, Arc<StorageState>>,
     force_storage: bool,
 ) -> Result<AnalysisOverview, String> {
+    crate::commands::check_auth_required(&credential_state)?;
+
     let memory = {
         let history = state
             .memory_history

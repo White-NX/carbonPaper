@@ -246,13 +246,15 @@ fn is_pid_descendant_of(pid: u32, expected_ancestor_pid: u32) -> bool {
 /// Named pipe server for Python-to-Rust reverse IPC (storage requests).
 pub struct ReverseIpcServer {
     pipe_name: String,
+    auth_token: String,
     shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
 impl ReverseIpcServer {
-    pub fn new(pipe_name: &str) -> Self {
+    pub fn new(pipe_name: &str, auth_token: String) -> Self {
         Self {
             pipe_name: pipe_name.to_string(),
+            auth_token,
             shutdown_tx: None,
         }
     }
@@ -265,6 +267,7 @@ impl ReverseIpcServer {
         app_handle: tauri::AppHandle,
     ) -> Result<(), String> {
         let pipe_name = self.pipe_name.clone();
+        let auth_token = self.auth_token.clone();
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
 
@@ -355,9 +358,10 @@ impl ReverseIpcServer {
                             let storage_clone = storage.clone();
                             let ocr_cache_clone = ocr_cache.clone();
                             let app_clone = app_handle.clone();
+                            let auth_token_clone = auth_token.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                handle_client(server, storage_clone, ocr_cache_clone, app_clone).await;
+                                handle_client(server, storage_clone, ocr_cache_clone, app_clone, auth_token_clone).await;
                             });
                         }
                     }
@@ -387,6 +391,7 @@ async fn handle_client(
     storage: Arc<StorageState>,
     ocr_cache: OcrImageCache,
     app_handle: tauri::AppHandle,
+    expected_auth_token: String,
 ) {
     // 安全校验：验证客户端 PID
     let client_pid_raw = unsafe {
@@ -438,6 +443,7 @@ async fn handle_client(
 
     let mut keepalive = true;
     let mut requests_handled: u64 = 0;
+    let mut last_seq_no: Option<u64> = None;
     while keepalive {
         let buf = match read_ipc_frame(&mut server).await {
             Ok(result) => result,
@@ -474,6 +480,14 @@ async fn handle_client(
                 return;
             }
         };
+
+        if let Err(e) = validate_reverse_ipc_request(&req, &expected_auth_token, &mut last_seq_no) {
+            tracing::warn!("[SECURITY] Reverse IPC auth rejected: {}", e);
+            let response = StorageResponse::error(&e);
+            let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+            let _ = write_ipc_frame(&mut server, &response_bytes).await;
+            return;
+        }
 
         keepalive = req
             .get("_ipc_keepalive")
@@ -1018,6 +1032,44 @@ fn get_temp_image_bytes(
     }
 }
 
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (left, right) in a.iter().zip(b.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
+fn validate_reverse_ipc_request(
+    req: &serde_json::Value,
+    expected_auth_token: &str,
+    last_seq_no: &mut Option<u64>,
+) -> Result<(), String> {
+    let provided = req
+        .get("_auth_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Authentication failed".to_string())?;
+    if !constant_time_eq(provided, expected_auth_token) {
+        return Err("Authentication failed".to_string());
+    }
+
+    let seq_no = req
+        .get("_seq_no")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "Invalid sequence number".to_string())?;
+    if last_seq_no.map(|last| seq_no <= last).unwrap_or(false) {
+        return Err("Replay detected".to_string());
+    }
+    *last_seq_no = Some(seq_no);
+    Ok(())
+}
+
 /// 生成反向 IPC 管道名
 pub fn generate_reverse_pipe_name() -> String {
     let mut rng = rand::thread_rng();
@@ -1025,6 +1077,12 @@ pub fn generate_reverse_pipe_name() -> String {
         .map(|_| format!("{:02x}", rand::Rng::gen::<u8>(&mut rng)))
         .collect();
     format!("carbon_storage_{}", random_suffix)
+}
+
+pub fn generate_reverse_ipc_auth_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 // NMH Pipe Server
@@ -1674,6 +1732,62 @@ mod tests {
         let name1 = generate_reverse_pipe_name();
         let name2 = generate_reverse_pipe_name();
         assert_ne!(name1, name2, "Two generated pipe names should be different");
+    }
+
+    #[test]
+    fn test_reverse_ipc_auth_rejects_missing_token() {
+        let req = serde_json::json!({
+            "command": "get_auth_status",
+            "_seq_no": 1
+        });
+        let mut last = None;
+        let result = validate_reverse_ipc_request(&req, "secret", &mut last);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reverse_ipc_auth_rejects_wrong_token() {
+        let req = serde_json::json!({
+            "command": "get_auth_status",
+            "_auth_token": "wrong",
+            "_seq_no": 1
+        });
+        let mut last = None;
+        let result = validate_reverse_ipc_request(&req, "secret", &mut last);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reverse_ipc_auth_rejects_replayed_sequence() {
+        let mut last = None;
+        let first = serde_json::json!({
+            "command": "get_auth_status",
+            "_auth_token": "secret",
+            "_seq_no": 2
+        });
+        validate_reverse_ipc_request(&first, "secret", &mut last).unwrap();
+
+        let replay = serde_json::json!({
+            "command": "get_auth_status",
+            "_auth_token": "secret",
+            "_seq_no": 2
+        });
+        let result = validate_reverse_ipc_request(&replay, "secret", &mut last);
+        assert_eq!(result.unwrap_err(), "Replay detected");
+    }
+
+    #[test]
+    fn test_reverse_ipc_auth_accepts_monotonic_sequence() {
+        let mut last = None;
+        for seq_no in [1, 2] {
+            let req = serde_json::json!({
+                "command": "get_auth_status",
+                "_auth_token": "secret",
+                "_seq_no": seq_no
+            });
+            validate_reverse_ipc_request(&req, "secret", &mut last).unwrap();
+        }
+        assert_eq!(last, Some(2));
     }
 
     #[test]

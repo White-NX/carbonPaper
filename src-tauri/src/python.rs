@@ -841,7 +841,6 @@ fn perform_install_python_venv(
             tracing::warn!("Failed to write requirements hash: {}", e);
         }
     }
-
     Ok(())
 }
 
@@ -1115,7 +1114,6 @@ pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
             tracing::warn!("Failed to compute requirements hash after sync: {}", e);
         }
     }
-
     let _ = app_for_emit.emit(
         "install-log",
         json!({"source":"installer","line": "Dependency sync completed successfully."}),

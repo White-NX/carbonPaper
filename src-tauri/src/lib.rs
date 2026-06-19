@@ -15,6 +15,7 @@ mod monitor_ipc;
 mod native_messaging;
 mod power;
 mod python;
+mod python_launcher;
 mod registry_config;
 mod resource_utils;
 mod reverse_ipc;
@@ -462,9 +463,11 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     };
                     if monitor_running {
                         if cs.paused.load(Ordering::SeqCst) {
-                            let _ = monitor::resume_monitor(state, cs, app_handle.clone()).await;
+                            let _ =
+                                monitor::resume_monitor_impl(state, cs, app_handle.clone()).await;
                         } else {
-                            let _ = monitor::pause_monitor(state, cs, app_handle.clone()).await;
+                            let _ =
+                                monitor::pause_monitor_impl(state, cs, app_handle.clone()).await;
                         }
                     } else {
                         refresh_tray_menu(&app_handle);
@@ -476,9 +479,9 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 tauri::async_runtime::spawn(async move {
                     let state = app_handle.state::<MonitorState>();
                     let cs = app_handle.state::<Arc<CaptureState>>();
-                    let _ = monitor::stop_monitor(state, cs, app_handle.clone()).await;
+                    let _ = monitor::stop_monitor_impl(state, cs, app_handle.clone()).await;
                     let start_state = app_handle.state::<MonitorState>();
-                    let _ = monitor::start_monitor(start_state, app_handle.clone()).await;
+                    let _ = monitor::start_monitor_impl(start_state, app_handle.clone()).await;
                 });
             }
             MENU_ID_LIGHTWEIGHT => {
@@ -925,7 +928,7 @@ pub fn run() {
                     tauri::async_runtime::spawn(async move {
                         let state = app_handle.state::<MonitorState>();
                         let app_handle_clone = app_handle.clone();
-                        if let Err(e) = monitor::start_monitor(state, app_handle_clone).await {
+                        if let Err(e) = monitor::start_monitor_impl(state, app_handle_clone).await {
                             tracing::error!("Failed to auto-start monitor: {}", e);
                         }
                     });
@@ -944,7 +947,24 @@ pub fn run() {
             monitor::pause_monitor,
             monitor::resume_monitor,
             monitor::get_monitor_status,
-            monitor::execute_monitor_command,
+            monitor::monitor_search_nl,
+            monitor::monitor_update_filters,
+            monitor::monitor_update_advanced_config,
+            monitor::monitor_update_feature_config,
+            monitor::monitor_get_all_models,
+            monitor::monitor_run_clustering,
+            monitor::monitor_get_clustering_status,
+            monitor::monitor_set_clustering_interval,
+            monitor::monitor_get_task_clusters,
+            monitor::monitor_nl_cluster_query,
+            monitor::monitor_nl_cluster_reranker_status,
+            monitor::monitor_smart_cluster_worker_status,
+            monitor::monitor_smart_cluster_drain_now,
+            monitor::monitor_smart_cluster_stop_drain,
+            monitor::monitor_smart_cluster_calibrate_preview,
+            monitor::monitor_presidio_set_language,
+            monitor::monitor_classify_debug,
+            monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）
             script_integrity::debug_trigger_security_alert,
             // 存储相关命令
@@ -998,6 +1018,7 @@ pub fn run() {
             commands::mcp::mcp_set_enabled,
             commands::mcp::mcp_get_status,
             commands::mcp::mcp_reset_token,
+            commands::mcp::mcp_copy_token_to_clipboard,
             commands::mcp::mcp_get_port,
             commands::mcp::mcp_set_port,
             commands::mcp::mcp_get_sensitive_filter_config,
@@ -1125,6 +1146,10 @@ pub fn run() {
 
 pub fn run_silent_install() {
     python::run_silent_install();
+}
+
+pub fn run_python_launcher(args: &[String]) -> i32 {
+    python_launcher::run_python_launcher(args)
 }
 
 pub fn run_cng_unlock(key_file_path: &str) {

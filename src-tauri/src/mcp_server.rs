@@ -23,7 +23,7 @@ use crate::monitor::{self, MonitorState};
 use crate::sensitive_filter::SensitiveFilterState;
 use crate::storage::StorageState;
 use percent_encoding::percent_decode_str;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 // ==================== Default config ====================
 
@@ -40,6 +40,7 @@ pub struct McpRuntimeState {
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     token_hash: Mutex<Option<[u8; 32]>>,
     idle_check_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    last_error: Mutex<Option<String>>,
 }
 
 impl Default for McpRuntimeState {
@@ -55,6 +56,7 @@ impl McpRuntimeState {
             shutdown_tx: Mutex::new(None),
             token_hash: Mutex::new(None),
             idle_check_handle: Mutex::new(None),
+            last_error: Mutex::new(None),
         }
     }
 
@@ -73,6 +75,23 @@ impl McpRuntimeState {
 
     pub fn get_token_hash(&self) -> Option<[u8; 32]> {
         *self.token_hash.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn clear_last_error(&self) {
+        let mut guard = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+
+    pub fn set_last_error(&self, error: String) {
+        let mut guard = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(error);
+    }
+
+    pub fn get_last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -1668,6 +1687,7 @@ pub async fn start_server(
     });
 
     let mcp_runtime = app_handle.state::<McpRuntimeState>();
+    mcp_runtime.clear_last_error();
     {
         let mut guard = mcp_runtime
             .server_handle
@@ -1748,6 +1768,11 @@ pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
 }
 
 /// Auto-start the MCP server on app launch (called from setup if mcp_enabled).
+///
+/// v2 MCP tokens are encrypted with the Windows Hello master key, so auto-start
+/// intentionally fails with AUTH_REQUIRED while CarbonPaper is locked. The
+/// renderer-visible status remains enabled/not running until the user unlocks
+/// and explicitly starts MCP again.
 pub async fn auto_start(
     app_handle: tauri::AppHandle,
     credential_state: &CredentialManagerState,
@@ -1767,12 +1792,72 @@ pub async fn auto_start(
         .and_then(|v| v.as_str())
         .ok_or("No MCP token found in policy")?;
 
-    let token = mcp_token::decrypt_token(credential_state, encrypted_b64)?;
+    let token = match mcp_token::decrypt_token(credential_state, encrypted_b64) {
+        Ok(token) => token,
+        Err(e) => {
+            mcp_runtime.set_last_error(e.clone());
+            let state = if e.contains("AUTH_REQUIRED") {
+                "pending_auth"
+            } else {
+                "error"
+            };
+            let _ = app_handle.emit(
+                "mcp-status-changed",
+                serde_json::json!({ "state": state, "error": e.clone() }),
+            );
+            return Err(e);
+        }
+    };
     let token_hash = mcp_token::hash_token(&token);
 
     mcp_runtime.set_token_hash(token_hash);
 
-    start_server(app_handle, port, token_hash).await
+    match start_server(app_handle.clone(), port, token_hash).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            mcp_runtime.set_last_error(e.clone());
+            let _ = app_handle.emit(
+                "mcp-status-changed",
+                serde_json::json!({ "state": "error", "error": e.clone() }),
+            );
+            Err(e)
+        }
+    }
+}
+
+pub async fn restore_if_enabled(
+    app_handle: tauri::AppHandle,
+    credential_state: &CredentialManagerState,
+    storage_state: &StorageState,
+    mcp_runtime: &McpRuntimeState,
+) -> Result<bool, String> {
+    let policy = storage_state.load_policy()?;
+    let enabled = policy
+        .get("mcp_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !enabled || mcp_runtime.is_running() {
+        return Ok(false);
+    }
+
+    match auto_start(
+        app_handle.clone(),
+        credential_state,
+        storage_state,
+        mcp_runtime,
+    )
+    .await
+    {
+        Ok(()) => {
+            let _ = app_handle.emit(
+                "mcp-status-changed",
+                serde_json::json!({ "state": "running" }),
+            );
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Get the configured port from policy.

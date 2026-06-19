@@ -5,10 +5,13 @@ use crate::monitor_ipc::{
     generate_auth_token, generate_random_pipe_name, inject_ipc_auth, send_ipc_request_on_client,
 };
 use crate::resource_utils::{find_existing_file_in_resources, normalize_path_for_command};
-use crate::reverse_ipc::{generate_reverse_pipe_name, ReverseIpcServer};
+use crate::reverse_ipc::{
+    generate_reverse_ipc_auth_token, generate_reverse_pipe_name, ReverseIpcServer,
+};
 use crate::storage::StorageState;
+use std::collections::HashSet;
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -113,6 +116,8 @@ const STARTUP_MAX_WAIT_MS: u64 = 15_000;
 const STARTUP_LOG_TAIL_LINES: usize = 50;
 
 use serde_json::Value;
+
+const MAX_MONITOR_COMMAND_PAYLOAD_BYTES: usize = 256 * 1024;
 
 // Windows error code for ERROR_PIPE_BUSY
 #[cfg(windows)]
@@ -329,22 +334,30 @@ impl Drop for CpuLimitGuard {
     }
 }
 
-/// Sends an arbitrary command to the Python monitor via IPC.
-#[tauri::command]
-pub async fn execute_monitor_command(
-    state: State<'_, MonitorState>,
-    capture_state: State<'_, Arc<CaptureState>>,
-    storage: State<'_, Arc<StorageState>>,
-    payload: Value,
-) -> Result<Value, String> {
-    // Intercept commands that need Rust-side state updates
-    let command = payload
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+fn validate_monitor_command_payload(payload: &Value) -> Result<(), String> {
+    let payload_size = serde_json::to_vec(payload)
+        .map_err(|e| format!("Invalid monitor payload: {}", e))?
+        .len();
+    if payload_size > MAX_MONITOR_COMMAND_PAYLOAD_BYTES {
+        return Err("Monitor command payload too large".to_string());
+    }
+    Ok(())
+}
 
+fn apply_monitor_side_effects(
+    command: &str,
+    payload: &Value,
+    capture_state: Option<&CaptureState>,
+    storage: Option<&StorageState>,
+) {
     match command {
         "update_filters" => {
+            let Some(capture_state) = capture_state else {
+                return;
+            };
+            let Some(storage) = storage else {
+                return;
+            };
             // Update Rust-side exclusion settings
             let filters = payload
                 .get("filters")
@@ -382,9 +395,11 @@ pub async fn execute_monitor_command(
                 capture_state.update_exclusion_settings(processes, titles, ignore_protected);
                 capture_state.save_exclusion_settings(&data_dir);
             }
-            // Still forward to Python for its internal state
         }
         "update_advanced_config" => {
+            let Some(capture_state) = capture_state else {
+                return;
+            };
             // Update Rust-side backpressure config
             let capture_on_ocr_busy = payload
                 .get("capture_on_ocr_busy")
@@ -411,12 +426,342 @@ pub async fn execute_monitor_command(
             capture_state
                 .ocr_timeout_secs
                 .store(ocr_timeout_secs, Ordering::SeqCst);
-            // Still forward to Python
         }
         _ => {}
     }
+}
 
+async fn dispatch_typed_monitor_command(
+    state: &MonitorState,
+    capture_state: Option<&CaptureState>,
+    storage: Option<&StorageState>,
+    payload: Value,
+) -> Result<Value, String> {
+    validate_monitor_command_payload(&payload)?;
+    let command = payload
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    apply_monitor_side_effects(command, &payload, capture_state, storage);
     forward_command_to_python(&state, payload).await
+}
+
+async fn authenticated_monitor_command(
+    credential_state: &crate::credential_manager::CredentialManagerState,
+    state: &MonitorState,
+    payload: Value,
+) -> Result<Value, String> {
+    crate::commands::check_auth_required(credential_state)?;
+    dispatch_typed_monitor_command(state, None, None, payload).await
+}
+
+#[tauri::command]
+pub async fn monitor_search_nl(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    query: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+    process_names: Option<Vec<String>>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    fuzzy: Option<bool>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({
+            "command": "search_nl",
+            "query": query,
+            "limit": limit.unwrap_or(20).min(200),
+            "offset": offset.unwrap_or(0),
+            "process_names": process_names.unwrap_or_default(),
+            "start_time": start_time,
+            "end_time": end_time,
+            "fuzzy": fuzzy.unwrap_or(true),
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_update_filters(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    capture_state: State<'_, Arc<CaptureState>>,
+    storage: State<'_, Arc<StorageState>>,
+    filters: Value,
+) -> Result<Value, String> {
+    crate::commands::check_auth_required(&credential_state)?;
+    let payload = serde_json::json!({
+        "command": "update_filters",
+        "filters": filters,
+    });
+    dispatch_typed_monitor_command(&state, Some(&capture_state), Some(&storage), payload).await
+}
+
+#[tauri::command]
+pub async fn monitor_update_advanced_config(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    capture_state: State<'_, Arc<CaptureState>>,
+    capture_on_ocr_busy: bool,
+    ocr_queue_max_size: u32,
+    ocr_timeout_secs: u32,
+    clustering_allow_full_low_memory: bool,
+) -> Result<Value, String> {
+    crate::commands::check_auth_required(&credential_state)?;
+    let payload = serde_json::json!({
+        "command": "update_advanced_config",
+        "capture_on_ocr_busy": capture_on_ocr_busy,
+        "ocr_queue_max_size": ocr_queue_max_size,
+        "ocr_timeout_secs": ocr_timeout_secs,
+        "clustering_allow_full_low_memory": clustering_allow_full_low_memory,
+    });
+    dispatch_typed_monitor_command(&state, Some(&capture_state), None, payload).await
+}
+
+#[tauri::command]
+pub async fn monitor_update_feature_config(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    clustering_enabled: bool,
+    classification_enabled: bool,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({
+            "command": "update_feature_config",
+            "clustering_enabled": clustering_enabled,
+            "classification_enabled": classification_enabled,
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_get_all_models(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({ "command": "get_all_models" }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_run_clustering(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    clustering_mode: Option<String>,
+    manual: Option<bool>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({
+            "command": "run_clustering",
+            "start_time": start_time,
+            "end_time": end_time,
+            "clustering_mode": clustering_mode.unwrap_or_else(|| "auto".to_string()),
+            "manual": manual.unwrap_or(false),
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_get_clustering_status(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({ "command": "get_clustering_status" }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_set_clustering_interval(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    interval: String,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({ "command": "set_clustering_interval", "interval": interval }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_get_task_clusters(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({ "command": "get_tasks" }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_nl_cluster_query(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    query: String,
+    n_results: Option<u32>,
+    enable_rerank: Option<bool>,
+    rerank_variant: Option<String>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({
+            "command": "nl_cluster_query",
+            "query": query,
+            "n_results": n_results.unwrap_or(30).min(200),
+            "enable_rerank": enable_rerank.unwrap_or(false),
+            "rerank_variant": rerank_variant.unwrap_or_else(|| "q4f16".to_string()),
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_nl_cluster_reranker_status(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({ "command": "nl_cluster_reranker_status" }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_smart_cluster_worker_status(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({ "command": "smart_cluster_worker_status" }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_smart_cluster_drain_now(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({ "command": "smart_cluster_drain_now" }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_smart_cluster_stop_drain(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({ "command": "smart_cluster_stop_drain" }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_smart_cluster_calibrate_preview(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    query: String,
+    n_results: Option<u32>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({
+            "command": "smart_cluster_calibrate_preview",
+            "query": query,
+            "n_results": n_results.unwrap_or(30).min(200),
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_presidio_set_language(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    language: String,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({ "command": "presidio_set_language", "language": language }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_classify_debug(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    title: Option<String>,
+    ocr_text: Option<String>,
+    process_name: Option<String>,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({
+            "command": "classify_debug",
+            "title": title.unwrap_or_default(),
+            "ocr_text": ocr_text.unwrap_or_default(),
+            "process_name": process_name.unwrap_or_default(),
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn monitor_remove_local_anchors_by_process(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    category: String,
+    process_name: String,
+) -> Result<Value, String> {
+    authenticated_monitor_command(
+        &credential_state,
+        &state,
+        serde_json::json!({
+            "command": "remove_local_anchors_by_process",
+            "category": category,
+            "process_name": process_name,
+        }),
+    )
+    .await
 }
 
 // 内部函数：发送仅包含 command 的 IPC 命令 (兼容旧接口)
@@ -513,9 +858,97 @@ fn create_job_object(cpu_limit_enabled: bool, cpu_limit_percent: u32) -> Result<
     }
 }
 
+fn read_pyvenv_home(venv_dir: &Path) -> Option<PathBuf> {
+    let cfg = std::fs::read_to_string(venv_dir.join("pyvenv.cfg")).ok()?;
+    for line in cfg.lines() {
+        let (key, value) = line.split_once('=')?;
+        if key.trim().eq_ignore_ascii_case("home") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+    None
+}
+
+fn find_python_runtime_dll(venv_dir: &Path, python_executable: &Path) -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Some(parent) = python_executable.parent() {
+        candidates.push(parent.join("python312.dll"));
+        candidates.push(parent.join("python3.dll"));
+    }
+    candidates.push(venv_dir.join("Scripts").join("python312.dll"));
+    candidates.push(venv_dir.join("Scripts").join("python3.dll"));
+    candidates.push(venv_dir.join("python312.dll"));
+    candidates.push(venv_dir.join("python3.dll"));
+    if let Some(home) = read_pyvenv_home(venv_dir) {
+        candidates.push(home.join("python312.dll"));
+        candidates.push(home.join("python3.dll"));
+    }
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| "Python runtime DLL not found for launcher".to_string())
+}
+
+fn append_known_native_dll_dirs(dirs: &mut Vec<PathBuf>, site_packages: &Path) {
+    let mut push = |parts: &[&str]| {
+        let mut path = site_packages.to_path_buf();
+        for part in parts {
+            path.push(part);
+        }
+        dirs.push(path);
+    };
+
+    push(&["torch", "lib"]);
+    push(&["onnxruntime", "capi"]);
+    push(&["numpy.libs"]);
+    push(&["scipy.libs"]);
+    push(&["sklearn", ".libs"]);
+    push(&["scikit_learn.libs"]);
+    push(&["Pillow.libs"]);
+    push(&["cv2"]);
+    push(&["tokenizers"]);
+    push(&["safetensors"]);
+}
+
+fn python_launcher_dll_dirs(venv_dir: &Path, python_dll: &Path) -> String {
+    let site_packages = venv_dir.join("Lib").join("site-packages");
+    let mut dirs = vec![
+        venv_dir.to_path_buf(),
+        venv_dir.join("Scripts"),
+        venv_dir.join("DLLs"),
+        site_packages.clone(),
+    ];
+    append_known_native_dll_dirs(&mut dirs, &site_packages);
+    if let Some(home) = read_pyvenv_home(venv_dir) {
+        dirs.push(home);
+    }
+    if let Some(parent) = python_dll.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+
+    let mut seen = HashSet::new();
+    dirs.into_iter()
+        .filter_map(|path| {
+            if !path.exists() {
+                return None;
+            }
+            let resolved = path.canonicalize().unwrap_or(path);
+            let key = resolved.to_string_lossy().to_lowercase();
+            if !seen.insert(key) {
+                return None;
+            }
+            Some(resolved.to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// Starts the Python monitor subprocess for screenshot capture and OCR.
-#[tauri::command]
-pub async fn start_monitor(
+pub async fn start_monitor_impl(
     state: State<'_, MonitorState>,
     app: AppHandle,
 ) -> Result<String, String> {
@@ -716,9 +1149,34 @@ pub async fn start_monitor(
         };
 
         let python_exists = std::path::Path::new(&python_executable).exists();
+        let venv_dir = crate::python::get_venv_dir(&app);
+        let python_path = PathBuf::from(&python_executable);
+        let python_canonical = python_path
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve python executable: {}", e))?;
+        let venv_canonical = venv_dir
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve Python venv directory: {}", e))?;
+        if !python_canonical.starts_with(&venv_canonical) {
+            return Err(format!(
+                "Python executable is outside the expected venv: {}",
+                python_canonical.display()
+            ));
+        }
+        let python_dll = find_python_runtime_dll(&venv_canonical, &python_canonical)?;
+        let launcher_executable =
+            std::env::current_exe().map_err(|e| format!("Failed to resolve launcher: {}", e))?;
+        let launcher_dll_dirs = python_launcher_dll_dirs(&venv_canonical, &python_dll);
+        let scripts_dir = venv_canonical.join("Scripts");
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let system32_dir = std::path::Path::new(&system_root).join("System32");
+        let windows_dir = PathBuf::from(&system_root);
+        let child_path = std::env::join_paths([&scripts_dir, &system32_dir, &windows_dir])
+            .map_err(|e| format!("Failed to build monitor PATH: {}", e))?;
 
         // 生成反向 IPC 管道名并启动服务器
         let reverse_pipe_name = generate_reverse_pipe_name();
+        let reverse_ipc_auth_token = generate_reverse_ipc_auth_token();
 
         // 启动反向 IPC 服务器（用于接收 Python 的存储请求）
         {
@@ -727,7 +1185,8 @@ pub async fn start_monitor(
             let capture_state = app.state::<Arc<crate::capture::CaptureState>>();
             let ocr_cache = capture_state.ocr_image_cache.clone();
 
-            let mut reverse_server = ReverseIpcServer::new(&reverse_pipe_name);
+            let mut reverse_server =
+                ReverseIpcServer::new(&reverse_pipe_name, reverse_ipc_auth_token.clone());
             if let Err(e) = reverse_server.start(storage_arc, ocr_cache, app.clone()) {
                 tracing::error!("Failed to start reverse IPC server: {}", e);
             }
@@ -747,8 +1206,8 @@ pub async fn start_monitor(
         }
 
         tracing::info!(
-            "Starting monitor: python={} (exists={}) script={} script_abs={} cwd={} pipe={} storage_pipe={}",
-            python_executable, python_exists, script_path, script_abs, cwd, pipe_name[0..30].to_string(), reverse_pipe_name[0..30].to_string()
+            "Starting monitor: launcher={} python={} python_dll={} (exists={}) script={} script_abs={} cwd={} pipe={} storage_pipe={}",
+            launcher_executable.display(), python_executable, python_dll.display(), python_exists, script_path, script_abs, cwd, pipe_name[0..30].to_string(), reverse_pipe_name[0..30].to_string()
         );
 
         // Start the Python process with stdout/stderr piped,
@@ -765,7 +1224,7 @@ pub async fn start_monitor(
                 .map_err(|e| format!("Failed to create Job Object: {}", e))?
         };
 
-        let mut cmd_proc = Command::new(&python_executable);
+        let mut cmd_proc = Command::new(&launcher_executable);
         // Pipe stdout/stderr so we can stream logs to the frontend.
         //
         // 安全相关参数：
@@ -777,6 +1236,7 @@ pub async fn start_monitor(
         // env_remove：再次确认 Python 不会读到污染过的 PYTHON* 环境变量
         // （`-I` 蕴含 `-E` 已经隔离了，这里是 belt-and-suspenders）
         cmd_proc
+            .arg("--python-launcher")
             .arg("-I")
             .arg("-B")
             .arg("-X")
@@ -792,8 +1252,15 @@ pub async fn start_monitor(
             .env_remove("PYTHONPATH")
             .env_remove("PYTHONHOME")
             .env_remove("PYTHONSTARTUP")
+            .env_remove("PYTHONUSERBASE")
+            .env_remove("PYTHONINSPECT")
             .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PATH", child_path)
             .env("CARBON_PARENT_PID", std::process::id().to_string())
+            .env("CARBONPAPER_LAUNCHER_PYTHON_EXE", &python_executable)
+            .env("CARBONPAPER_LAUNCHER_PYTHON_DLL", &python_dll)
+            .env("CARBONPAPER_LAUNCHER_DLL_DIRS", &launcher_dll_dirs)
+            .env("CARBONPAPER_REVERSE_IPC_TOKEN", &reverse_ipc_auth_token)
             .env("PROFILING_ENABLED", "1");
 
         // Pass the current storage.data_dir to the child process to ensure that Python uses the correct data directory at startup.
@@ -1121,6 +1588,14 @@ pub async fn start_monitor(
     ))
 }
 
+#[tauri::command]
+pub async fn start_monitor(
+    state: State<'_, MonitorState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    start_monitor_impl(state, app).await
+}
+
 /// Spawn the Rust-side capture loop using CaptureState
 fn spawn_capture_loop(app: &AppHandle) {
     let capture_state = app.state::<Arc<CaptureState>>();
@@ -1229,8 +1704,7 @@ fn spawn_capture_loop(app: &AppHandle) {
 }
 
 /// Stops the Python monitor subprocess and the Rust capture loop.
-#[tauri::command]
-pub async fn stop_monitor(
+pub async fn stop_monitor_impl(
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
     app: AppHandle,
@@ -1355,9 +1829,19 @@ pub async fn stop_monitor(
     Ok("Monitor stopped".into())
 }
 
-/// Pauses screenshot capture without stopping the Python process.
 #[tauri::command]
-pub async fn pause_monitor(
+pub async fn stop_monitor(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    capture_state: State<'_, Arc<CaptureState>>,
+    app: AppHandle,
+) -> Result<String, String> {
+    crate::commands::check_auth_required(&credential_state)?;
+    stop_monitor_impl(state, capture_state, app).await
+}
+
+/// Pauses screenshot capture without stopping the Python process.
+pub async fn pause_monitor_impl(
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
     app: AppHandle,
@@ -1372,7 +1856,17 @@ pub async fn pause_monitor(
 
 /// Resumes screenshot capture after a pause.
 #[tauri::command]
-pub async fn resume_monitor(
+pub async fn pause_monitor(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    capture_state: State<'_, Arc<CaptureState>>,
+    app: AppHandle,
+) -> Result<String, String> {
+    crate::commands::check_auth_required(&credential_state)?;
+    pause_monitor_impl(state, capture_state, app).await
+}
+
+pub async fn resume_monitor_impl(
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
     app: AppHandle,
@@ -1383,6 +1877,17 @@ pub async fn resume_monitor(
     let result = send_ipc_command_internal(&state, "resume").await;
     crate::refresh_tray_menu(&app);
     result
+}
+
+#[tauri::command]
+pub async fn resume_monitor(
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: State<'_, MonitorState>,
+    capture_state: State<'_, Arc<CaptureState>>,
+    app: AppHandle,
+) -> Result<String, String> {
+    crate::commands::check_auth_required(&credential_state)?;
+    resume_monitor_impl(state, capture_state, app).await
 }
 
 #[tauri::command]
@@ -1689,14 +2194,15 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                     );
 
                     // 重启 Python（不带 DML）
-                    let _ = stop_monitor(
+                    let _ = stop_monitor_impl(
                         app_clone.state::<MonitorState>(),
                         app_clone.state::<Arc<CaptureState>>(),
                         app_clone.clone(),
                     )
                     .await;
                     let _ =
-                        start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
+                        start_monitor_impl(app_clone.state::<MonitorState>(), app_clone.clone())
+                            .await;
                     continue;
                 }
 
@@ -1711,13 +2217,14 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                 );
 
                 // 重启 Python（不带 DML）
-                let _ = stop_monitor(
+                let _ = stop_monitor_impl(
                     app_clone.state::<MonitorState>(),
                     app_clone.state::<Arc<CaptureState>>(),
                     app_clone.clone(),
                 )
                 .await;
-                let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
+                let _ =
+                    start_monitor_impl(app_clone.state::<MonitorState>(), app_clone.clone()).await;
             } else if currently_suppressed && usage <= 0.40 {
                 // 记录触发时间（恢复也计入）
                 let now = std::time::Instant::now();
@@ -1757,13 +2264,14 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                 );
 
                 // 重启 Python（恢复 DML）
-                let _ = stop_monitor(
+                let _ = stop_monitor_impl(
                     app_clone.state::<MonitorState>(),
                     app_clone.state::<Arc<CaptureState>>(),
                     app_clone.clone(),
                 )
                 .await;
-                let _ = start_monitor(app_clone.state::<MonitorState>(), app_clone.clone()).await;
+                let _ =
+                    start_monitor_impl(app_clone.state::<MonitorState>(), app_clone.clone()).await;
             }
         }
     });
@@ -1817,6 +2325,35 @@ pub fn stop_game_mode_monitor(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_python_launcher_dll_dirs_uses_known_native_whitelist() {
+        let temp = tempfile::tempdir().unwrap();
+        let venv_dir = temp.path();
+        let site_packages = venv_dir.join("Lib").join("site-packages");
+        let scripts_dir = venv_dir.join("Scripts");
+        let torch_lib = site_packages.join("torch").join("lib");
+        let numpy_libs = site_packages.join("numpy.libs");
+        let unlisted_native_dir = site_packages.join("unlisted_package").join("native");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::create_dir_all(&torch_lib).unwrap();
+        std::fs::create_dir_all(&numpy_libs).unwrap();
+        std::fs::create_dir_all(&unlisted_native_dir).unwrap();
+
+        let python_dll = scripts_dir.join("python312.dll");
+        std::fs::write(&python_dll, b"").unwrap();
+
+        let entries = python_launcher_dll_dirs(venv_dir, &python_dll)
+            .split(';')
+            .filter(|entry| !entry.is_empty())
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+
+        assert!(entries.contains(&site_packages.canonicalize().unwrap()));
+        assert!(entries.contains(&torch_lib.canonicalize().unwrap()));
+        assert!(entries.contains(&numpy_libs.canonicalize().unwrap()));
+        assert!(!entries.contains(&unlisted_native_dir.canonicalize().unwrap()));
+    }
 
     #[test]
     fn test_inject_ipc_auth_for_object_payload() {
