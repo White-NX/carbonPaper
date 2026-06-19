@@ -308,17 +308,14 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
     return withAuth(async () => {
         // 自然语言搜索使用 Python IPC
         if (mode === 'nl') {
-            const response = await invoke('execute_monitor_command', {
-                payload: {
-                    command: 'search_nl',
-                    query: query,
-                    limit: limit,
-                    offset: offset,
-                    process_names: processNames,
-                    start_time: startTime,
-                    end_time: endTime,
-                    fuzzy: fuzzy
-                }
+            const response = await invoke('monitor_search_nl', {
+                query,
+                limit,
+                offset,
+                processNames,
+                startTime,
+                endTime,
+                fuzzy,
             });
             if (response.error) {
                 throw new Error(response.error);
@@ -409,8 +406,7 @@ export const getSoftDeleteQueueStatus = async () => {
 
 export const getScreenshotDetails = async (id, path = null) => {
     try {
-        // 直接使用 Rust 存储层 API
-        const response = await invoke('storage_get_screenshot_details', { id, path });
+        const response = await withAuth(() => invoke('storage_get_screenshot_details', { id, path }));
         if (response.error) {
             console.error("Details error:", response.error);
             return { error: response.error };
@@ -423,24 +419,22 @@ export const getScreenshotDetails = async (id, path = null) => {
 };
 
 export const updateMonitorFilters = async (filters) => {
-    try {
-        const payload = {
-            command: 'update_filters',
-            filters
-        };
-        const response = await invoke('execute_monitor_command', { payload });
-        if (response?.error) {
-            const err = new Error(response.error);
-            if (response.error === 'unknown command') {
-                err.code = 'unsupported';
+    return withAuth(async () => {
+        try {
+            const response = await invoke('monitor_update_filters', { filters });
+            if (response?.error) {
+                const err = new Error(response.error);
+                if (response.error === 'unknown command') {
+                    err.code = 'unsupported';
+                }
+                throw err;
             }
-            throw err;
+            return response;
+        } catch (e) {
+            console.error("Failed to update monitor filters", e);
+            throw e;
         }
-        return response;
-    } catch (e) {
-        console.error("Failed to update monitor filters", e);
-        throw e;
-    }
+    }, { autoPrompt: true });
 };
 
 export const deleteScreenshot = async (screenshotId) => {
@@ -457,7 +451,7 @@ export const deleteScreenshot = async (screenshotId) => {
             console.error("Failed to delete screenshot", e);
             throw e;
         }
-    });
+    }, { autoPrompt: true });
 };
 
 export const deleteRecordsByTimeRange = async (minutes, centerTimestamp = null) => {
@@ -491,7 +485,7 @@ export const deleteRecordsByTimeRange = async (minutes, centerTimestamp = null) 
             console.error("Failed to delete records by time range", e);
             throw e;
         }
-    });
+    }, { autoPrompt: true });
 };
 
 // ==================== 数据迁移 API ====================
@@ -502,7 +496,7 @@ export const deleteRecordsByTimeRange = async (minutes, centerTimestamp = null) 
  */
 export const listPlaintextFiles = async () => {
     try {
-        const files = await invoke('storage_list_plaintext_files');
+        const files = await withAuth(() => invoke('storage_list_plaintext_files'));
         return files || [];
     } catch (e) {
         console.error("Failed to list plaintext files", e);
@@ -541,19 +535,19 @@ export const computeLinkScores = async (links) => {
 // ==================== 分类相关 ====================
 
 export const updateScreenshotCategory = async (screenshotId, category) => {
-    return await invoke('storage_update_category', {
+    return await withAuth(() => invoke('storage_update_category', {
         screenshotId,
         category,
-    });
+    }), { autoPrompt: true });
 };
 
 export const getCategories = async () => {
-    return await invoke('storage_get_categories');
+    return await withAuth(() => invoke('storage_get_categories'));
 };
 
 export const getCategoriesFromDb = async () => {
     try {
-        return await invoke('storage_get_categories_from_db');
+        return await withAuth(() => invoke('storage_get_categories_from_db'));
     } catch (e) {
         console.error('Failed to get categories from db', e);
         return [];
@@ -562,7 +556,7 @@ export const getCategoriesFromDb = async () => {
 
 export const batchGetCategories = async (imageHashes) => {
     try {
-        return await invoke('storage_batch_get_categories', { imageHashes });
+        return await withAuth(() => invoke('storage_batch_get_categories', { imageHashes }));
     } catch (e) {
         console.error('Failed to batch get categories', e);
         return {};
@@ -570,13 +564,11 @@ export const batchGetCategories = async (imageHashes) => {
 };
 
 export const classifyDebug = async ({ title = '', ocrText = '', processName = '' } = {}) => {
-    const payload = {
-        command: 'classify_debug',
+    const response = await withAuth(() => invoke('monitor_classify_debug', {
         title,
-        ocr_text: ocrText,
-        process_name: processName,
-    };
-    const response = await invoke('execute_monitor_command', { payload });
+        ocrText,
+        processName,
+    }), { autoPrompt: true });
     if (response?.error) {
         throw new Error(response.error);
     }
@@ -584,12 +576,10 @@ export const classifyDebug = async ({ title = '', ocrText = '', processName = ''
 };
 
 export const removeLocalAnchorsByProcess = async (category, processName) => {
-    const payload = {
-        command: 'remove_local_anchors_by_process',
+    const response = await withAuth(() => invoke('monitor_remove_local_anchors_by_process', {
         category,
-        process_name: processName,
-    };
-    const response = await invoke('execute_monitor_command', { payload });
+        processName,
+    }), { autoPrompt: true });
     if (response?.error) {
         throw new Error(response.error);
     }
@@ -599,9 +589,7 @@ export const removeLocalAnchorsByProcess = async (category, processName) => {
 export const getSmartClusterWorkerStatus = async () => {
     return withAuth(async () => {
         try {
-            const response = await invoke('execute_monitor_command', {
-                payload: { command: 'smart_cluster_worker_status' }
-            });
+            const response = await invoke('monitor_smart_cluster_worker_status');
             if (response?.error) {
                 return { pending_count: 0, running: false };
             }

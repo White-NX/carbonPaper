@@ -18,6 +18,7 @@ import {
   softDeleteScreenshots,
   softDeleteProcessMonth,
 } from '../../lib/monitor_api';
+import { withAuth } from '../../lib/auth_api';
 
 const PROCESS_PALETTE = ['#0ea5e9', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4', '#84cc16', '#8b5cf6', '#f97316'];
 
@@ -303,7 +304,7 @@ export default function StorageManagementSection({
     // try to persist to backend; if backend not available, fall back to localStorage
     (async () => {
       try {
-        await invoke('storage_set_policy', { policy: { storage_limit: storageLimit, retention_period: retentionPeriod } });
+        await withAuth(() => invoke('storage_set_policy', { policy: { storage_limit: storageLimit, retention_period: retentionPeriod } }));
       } catch (e) {
         // backend may be unavailable in dev; ignore and rely on localStorage
       }
@@ -315,7 +316,7 @@ export default function StorageManagementSection({
     // persist to backend as well
     (async () => {
       try {
-        await invoke('storage_set_policy', { policy: { storage_limit: storageLimit, retention_period: retentionPeriod } });
+        await withAuth(() => invoke('storage_set_policy', { policy: { storage_limit: storageLimit, retention_period: retentionPeriod } }));
       } catch (e) {
         // ignore
       }
@@ -326,7 +327,7 @@ export default function StorageManagementSection({
   useEffect(() => {
     (async () => {
       try {
-        const resp = await invoke('storage_get_policy');
+        const resp = await withAuth(() => invoke('storage_get_policy'));
         if (resp && typeof resp === 'object') {
           const backendPolicy = resp;
           if (backendPolicy.storage_limit) setStorageLimit(String(backendPolicy.storage_limit));
@@ -576,7 +577,7 @@ export default function StorageManagementSection({
       }
 
       if (shouldRestartMonitor) {
-        await invoke('stop_monitor');
+        await withAuth(() => invoke('stop_monitor'), { autoPrompt: true });
       }
 
       if (shouldMigrateData) {
@@ -593,10 +594,10 @@ export default function StorageManagementSection({
         });
       }
 
-      await invoke('storage_migrate_data_dir', {
+      await withAuth(() => invoke('storage_migrate_data_dir', {
         target: targetPath,
         migrateDataFiles: shouldMigrateData,
-      });
+      }), { autoPrompt: true });
 
       if (shouldMigrateData) {
         setMigrationProgress((s) => ({ ...s, current_file: t('settings.storageManagement.migration.completed') }));
@@ -618,7 +619,7 @@ export default function StorageManagementSection({
       setIsMigrating(false);
       setIsUpdatingStoragePath(false);
       if (shouldRestartMonitor) {
-        try { await invoke('start_monitor'); } catch (_) { }
+        try { await withAuth(() => invoke('start_monitor'), { autoPrompt: true }); } catch (_) { }
       }
     }
   };

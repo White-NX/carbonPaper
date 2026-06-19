@@ -5,6 +5,7 @@ import { listen } from '@tauri-apps/api/event';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { Dialog } from './Dialog';
 import { Lock, FileUp, FileDown, ShieldAlert, CheckCircle2, RefreshCw } from 'lucide-react';
+import { withAuth } from '../lib/auth_api';
 
 export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export' }) {
   const { t } = useTranslation();
@@ -53,7 +54,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
           return;
         }
 
-        await invoke('storage_export_backup', { password, exportPath: filePath });
+        await withAuth(() => invoke('storage_export_backup', { password, exportPath: filePath }), { autoPrompt: true });
       } else {
         const filePath = await open({
           filters: [{ name: 'CarbonPaper Backup', extensions: ['zip'] }],
@@ -65,7 +66,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
           return;
         }
 
-        await invoke('storage_import_backup', { password, backupZipPath: filePath });
+        await withAuth(() => invoke('storage_import_backup', { password, backupZipPath: filePath }), { autoPrompt: true });
       }
 
       setStatus('success');

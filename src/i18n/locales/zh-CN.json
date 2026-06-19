@@ -406,6 +406,8 @@
       "status": {
         "running": "服务运行中",
         "stopped": "服务已停止",
+        "pending_auth": "服务已启用，完成 Windows Hello 认证后会自动启动",
+        "error": "服务启动失败",
         "port_label": "端口",
         "auth_required": "需要先在应用中完成 Windows Hello 认证才能处理数据请求"
       },

@@ -2,6 +2,7 @@
  * Task clustering API — Tauri command wrappers for long-term task management.
  */
 import { invoke } from '@tauri-apps/api/core';
+import { withAuth } from './auth_api';
 
 // ── DB-backed task queries (Rust) ──────────────────────────────────────
 
@@ -17,14 +18,14 @@ import { invoke } from '@tauri-apps/api/core';
  * @returns {Promise<Array>} TaskRecord[]
  */
 export async function getTasks({ layer, startTime, endTime, hideInactive = true, hideEntertainment = true, hideSocial = true } = {}) {
-  return invoke('storage_get_tasks', {
+  return withAuth(() => invoke('storage_get_tasks', {
     layer: layer || null,
     startTime: startTime ?? null,
     endTime: endTime ?? null,
     hideInactive,
     hideEntertainment,
     hideSocial,
-  });
+  }));
 }
 
 /**
@@ -35,11 +36,11 @@ export async function getTasks({ layer, startTime, endTime, hideInactive = true,
  * @returns {Promise<Array>} TaskScreenshotStub[]
  */
 export async function getTaskScreenshots(taskId, page = 0, pageSize = 50) {
-  return invoke('storage_get_task_screenshots', {
+  return withAuth(() => invoke('storage_get_task_screenshots', {
     taskId,
     page,
     pageSize,
-  });
+  }));
 }
 
 /**
@@ -48,7 +49,7 @@ export async function getTaskScreenshots(taskId, page = 0, pageSize = 50) {
  * @param {string} label
  */
 export async function updateTaskLabel(taskId, label) {
-  return invoke('storage_update_task_label', { taskId, label });
+  return withAuth(() => invoke('storage_update_task_label', { taskId, label }), { autoPrompt: true });
 }
 
 /**
@@ -56,7 +57,7 @@ export async function updateTaskLabel(taskId, label) {
  * @param {number} taskId
  */
 export async function deleteTask(taskId) {
-  return invoke('storage_delete_task', { taskId });
+  return withAuth(() => invoke('storage_delete_task', { taskId }), { autoPrompt: true });
 }
 
 /**
@@ -65,7 +66,7 @@ export async function deleteTask(taskId) {
  * @returns {Promise<number>} The surviving task ID.
  */
 export async function mergeTasks(taskIds) {
-  return invoke('storage_merge_tasks', { taskIds });
+  return withAuth(() => invoke('storage_merge_tasks', { taskIds }), { autoPrompt: true });
 }
 
 /**
@@ -74,7 +75,7 @@ export async function mergeTasks(taskIds) {
  * @returns {Promise<number[]>} New task IDs.
  */
 export async function saveClusteringResults(tasks) {
-  return invoke('storage_save_clustering_results', { tasks });
+  return withAuth(() => invoke('storage_save_clustering_results', { tasks }), { autoPrompt: true });
 }
 
 /**
@@ -84,10 +85,10 @@ export async function saveClusteringResults(tasks) {
  * @returns {Promise<{task_id: number, task_label: string|null, screenshots: Array}>}
  */
 export async function getRelatedScreenshots(screenshotId, limit = 8) {
-  return invoke('storage_get_related_screenshots', {
+  return withAuth(() => invoke('storage_get_related_screenshots', {
     screenshotId,
     limit,
-  });
+  }));
 }
 
 // ── Python-backed clustering commands (via monitor IPC) ────────────────
@@ -102,15 +103,12 @@ export async function getRelatedScreenshots(screenshotId, limit = 8) {
  * @returns {Promise<Object>} Clustering result summary.
  */
 export async function runClustering({ startTime, endTime, clusteringMode, manual = false } = {}) {
-  const result = await invoke('execute_monitor_command', {
-    payload: {
-      command: 'run_clustering',
-      start_time: startTime ?? null,
-      end_time: endTime ?? null,
-      clustering_mode: clusteringMode || 'auto',
-      manual,
-    },
-  });
+  const result = await withAuth(() => invoke('monitor_run_clustering', {
+    startTime: startTime ?? null,
+    endTime: endTime ?? null,
+    clusteringMode: clusteringMode || 'auto',
+    manual,
+  }), { autoPrompt: manual });
   if (result && result.error) {
     throw new Error(result.error);
   }
@@ -122,9 +120,7 @@ export async function runClustering({ startTime, endTime, clusteringMode, manual
  * @returns {Promise<Object>} { config, last_result }
  */
 export async function getClusteringStatus() {
-  return invoke('execute_monitor_command', {
-    payload: { command: 'get_clustering_status' },
-  });
+  return withAuth(() => invoke('monitor_get_clustering_status'));
 }
 
 /**
@@ -132,9 +128,7 @@ export async function getClusteringStatus() {
  * @param {'1d'|'1w'|'1m'|'6m'} interval
  */
 export async function setClusteringInterval(interval) {
-  return invoke('execute_monitor_command', {
-    payload: { command: 'set_clustering_interval', interval },
-  });
+  return withAuth(() => invoke('monitor_set_clustering_interval', { interval }), { autoPrompt: true });
 }
 
 /**
@@ -142,9 +136,7 @@ export async function setClusteringInterval(interval) {
  * @returns {Promise<Object>} { hot_clusters, cold_clusters }
  */
 export async function getTaskClusters() {
-  return invoke('execute_monitor_command', {
-    payload: { command: 'get_tasks' },
-  });
+  return withAuth(() => invoke('monitor_get_task_clusters'));
 }
 
 /**
@@ -157,15 +149,12 @@ export async function getTaskClusters() {
  * @returns {Promise<{results: Array, reranked: boolean, rerank_variant: string|null}>}
  */
 export async function nlClusterQuery(query, nResults = 30, enableRerank = false, rerankVariant = 'q4f16') {
-  const result = await invoke('execute_monitor_command', {
-    payload: {
-      command: 'nl_cluster_query',
-      query,
-      n_results: nResults,
-      enable_rerank: enableRerank,
-      rerank_variant: rerankVariant,
-    },
-  });
+  const result = await withAuth(() => invoke('monitor_nl_cluster_query', {
+    query,
+    nResults,
+    enableRerank,
+    rerankVariant,
+  }));
   if (result && result.error) {
     const err = new Error(result.error);
     if (result.error.startsWith('RERANKER_UNAVAILABLE')) err.code = 'RERANKER_UNAVAILABLE';
@@ -183,9 +172,7 @@ export async function nlClusterQuery(query, nResults = 30, enableRerank = false,
  * @returns {Promise<{available: boolean, loaded: boolean, loaded_variant: string|null, provider: string|null, available_variants: string[], model_path: string}>}
  */
 export async function getRerankerStatus() {
-  const result = await invoke('execute_monitor_command', {
-    payload: { command: 'nl_cluster_reranker_status' },
-  });
+  const result = await withAuth(() => invoke('monitor_nl_cluster_reranker_status'));
   if (result && result.error) throw new Error(result.error);
   return {
     available: !!result?.available,
@@ -203,21 +190,21 @@ export async function getRerankerStatus() {
  * List all smart clusters with their assignment counts.
  */
 export async function listSmartClusters() {
-  return invoke('smart_cluster_list');
+  return withAuth(() => invoke('smart_cluster_list'));
 }
 
 /**
  * Get a single smart cluster by id.
  */
 export async function getSmartCluster(id) {
-  return invoke('smart_cluster_get', { id });
+  return withAuth(() => invoke('smart_cluster_get', { id }));
 }
 
 /**
  * Get the calibration examples (positive + negative) for a smart cluster.
  */
 export async function getSmartClusterExamples(id) {
-  return invoke('smart_cluster_get_examples', { id });
+  return withAuth(() => invoke('smart_cluster_get_examples', { id }));
 }
 
 /**
@@ -230,39 +217,39 @@ export async function getSmartClusterExamples(id) {
  * @returns {Promise<{id: number, enqueued: number}>}
  */
 export async function createSmartCluster(req) {
-  return invoke('smart_cluster_create', { req });
+  return withAuth(() => invoke('smart_cluster_create', { req }), { autoPrompt: true });
 }
 
 export async function deleteSmartCluster(id) {
-  return invoke('smart_cluster_delete', { id });
+  return withAuth(() => invoke('smart_cluster_delete', { id }), { autoPrompt: true });
 }
 
 export async function updateSmartClusterAnchor(id, anchor) {
-  return invoke('smart_cluster_update_anchor', { id, anchor });
+  return withAuth(() => invoke('smart_cluster_update_anchor', { id, anchor }), { autoPrompt: true });
 }
 
 export async function updateSmartClusterThreshold(id, threshold) {
-  return invoke('smart_cluster_update_threshold', { id, threshold });
+  return withAuth(() => invoke('smart_cluster_update_threshold', { id, threshold }), { autoPrompt: true });
 }
 
 export async function toggleSmartClusterEnabled(id, enabled) {
-  return invoke('smart_cluster_toggle_enabled', { id, enabled });
+  return withAuth(() => invoke('smart_cluster_toggle_enabled', { id, enabled }), { autoPrompt: true });
 }
 
 export async function getSmartClusterAssignments(clusterId, page = 0, pageSize = 50) {
-  return invoke('smart_cluster_assignments', { clusterId, page, pageSize });
+  return withAuth(() => invoke('smart_cluster_assignments', { clusterId, page, pageSize }));
 }
 
 export async function rescanSmartCluster(clusterId) {
-  return invoke('smart_cluster_rescan', { clusterId });
+  return withAuth(() => invoke('smart_cluster_rescan', { clusterId }), { autoPrompt: true });
 }
 
 export async function clearSmartClusterAssignments(clusterId) {
-  return invoke('smart_cluster_clear_assignments', { clusterId });
+  return withAuth(() => invoke('smart_cluster_clear_assignments', { clusterId }), { autoPrompt: true });
 }
 
 export async function getSmartClusterStatus() {
-  return invoke('smart_cluster_status');
+  return withAuth(() => invoke('smart_cluster_status'));
 }
 
 /**
@@ -270,18 +257,14 @@ export async function getSmartClusterStatus() {
  * bypassing the idle gate for one pass.
  */
 export async function smartClusterDrainNow() {
-  return invoke('execute_monitor_command', {
-    payload: { command: 'smart_cluster_drain_now' },
-  });
+  return withAuth(() => invoke('monitor_smart_cluster_drain_now'), { autoPrompt: true });
 }
 
 /**
  * Trigger the Python worker to stop the currently running forced drain pass.
  */
 export async function smartClusterStopDrain() {
-  return invoke('execute_monitor_command', {
-    payload: { command: 'smart_cluster_stop_drain' },
-  });
+  return withAuth(() => invoke('monitor_smart_cluster_stop_drain'), { autoPrompt: true });
 }
 
 /**
@@ -290,13 +273,10 @@ export async function smartClusterStopDrain() {
  * doesn't affect the explore demo.
  */
 export async function smartClusterCalibratePreview(query, nResults = 30) {
-  const result = await invoke('execute_monitor_command', {
-    payload: {
-      command: 'smart_cluster_calibrate_preview',
-      query,
-      n_results: nResults,
-    },
-  });
+  const result = await withAuth(() => invoke('monitor_smart_cluster_calibrate_preview', {
+    query,
+    nResults,
+  }), { autoPrompt: true });
   if (result && result.error) {
     const err = new Error(result.error);
     if (result.error.startsWith('RERANKER_UNAVAILABLE')) err.code = 'RERANKER_UNAVAILABLE';

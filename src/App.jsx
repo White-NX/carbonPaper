@@ -30,6 +30,7 @@ import { getScreenshotDetails, fetchImage, deleteScreenshot, deleteRecordsByTime
 import { checkForUpdate, downloadAndInstallUpdate } from './lib/update_api';
 import { UpdateModal } from './components/UpdateModal';
 import { useDelayedClusteringSetupRunner } from './hooks/useDelayedClusteringSetupRunner';
+import { withAuth } from './lib/auth_api';
 
 function App() {
   // Disable context menu for Tauri production feel
@@ -563,7 +564,7 @@ function App() {
     if (backendStatus !== 'online' || !isAuthenticated) return;
     let cancelled = false;
     console.log('[Warmup] Starting background thumbnail warmup...');
-    invoke('storage_warmup_thumbnails')
+    withAuth(() => invoke('storage_warmup_thumbnails'))
       .then((result) => {
         if (!cancelled) {
           const progress = result?.progress || {};
@@ -613,7 +614,7 @@ function App() {
           const v = parseInt(saved, 10);
           if (!Number.isNaN(v)) {
             try {
-              await invoke('credential_set_session_timeout', { timeout: v });
+              await withAuth(() => invoke('credential_set_session_timeout', { timeout: v }));
             } catch (e) {
               console.warn('Failed to migrate session timeout to backend', e);
             }
@@ -633,7 +634,7 @@ function App() {
     return () => window.removeEventListener('cp-auth-required', handleAuthRequired);
   }, []);
 
-  const handleStartBackend = async () => {
+  const handleStartBackend = useCallback(async () => {
     setAutoStartSuppressed(false);
     setBackendError('');
     setBackendStatus('waiting');
@@ -651,11 +652,11 @@ function App() {
       setAutoStartSuppressed(true);
       reportBackendError('Python 子服务启动失败', message, details);
     }
-  };
+  }, [formatErrorDetails, reportBackendError]);
 
   const handlePauseMonitor = useCallback(async () => {
     try {
-      await invoke('pause_monitor');
+      await withAuth(() => invoke('pause_monitor'), { autoPrompt: true });
       setMonitorPaused(true);
     } catch (err) {
       console.warn('Failed to pause monitor:', err);
@@ -664,7 +665,7 @@ function App() {
 
   const handleResumeMonitor = useCallback(async () => {
     try {
-      await invoke('resume_monitor');
+      await withAuth(() => invoke('resume_monitor'), { autoPrompt: true });
       setMonitorPaused(false);
     } catch (err) {
       console.warn('Failed to resume monitor:', err);

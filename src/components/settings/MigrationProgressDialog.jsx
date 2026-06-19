@@ -2,6 +2,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dialog } from '../Dialog';
 import { invoke } from '@tauri-apps/api/core';
+import { withAuth } from '../../lib/auth_api';
 
 export default function MigrationProgressDialog({ isOpen, onClose, progress, error }) {
   const { t } = useTranslation();
@@ -28,7 +29,7 @@ export default function MigrationProgressDialog({ isOpen, onClose, progress, err
               className="px-3 py-1 text-sm rounded border border-ide-border bg-ide-panel"
               onClick={async () => {
                 try {
-                  await invoke('storage_migration_cancel');
+                  await withAuth(() => invoke('storage_migration_cancel'), { autoPrompt: true });
                 } catch (e) {
                   // ignore if not implemented
                 }

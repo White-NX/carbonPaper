@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap, Monitor, Layers, Database, Loader2, Globe, Clock } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { withAuth } from '../../lib/auth_api';
 
 const CPU_PERCENT_OPTIONS = [5, 10, 15, 20, 30, 50];
 const OCR_QUEUE_SIZE_OPTIONS = [1, 2, 3, 5, 10];
@@ -67,7 +68,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
   const saveConfig = async (newConfig) => {
     setConfig(newConfig);
     try {
-      await invoke('set_advanced_config', { config: newConfig });
+      await withAuth(() => invoke('set_advanced_config', { config: newConfig }), { autoPrompt: true });
     } catch (err) {
       console.error('Failed to save advanced config:', err);
     }
@@ -76,17 +77,14 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
   const syncOcrConfigToMonitor = async (newConfig) => {
     if (monitorStatus !== 'running') return;
     try {
-      await invoke('execute_monitor_command', {
-        payload: {
-          command: 'update_advanced_config',
-          capture_on_ocr_busy: newConfig.capture_on_ocr_busy,
-          ocr_queue_max_size: newConfig.ocr_queue_limit_enabled
-            ? newConfig.ocr_queue_max_size
-            : 999999,
-          ocr_timeout_secs: newConfig.ocr_timeout_secs || 120,
-          clustering_allow_full_low_memory: Boolean(newConfig.clustering_allow_full_low_memory),
-        },
-      });
+      await withAuth(() => invoke('monitor_update_advanced_config', {
+        captureOnOcrBusy: newConfig.capture_on_ocr_busy,
+        ocrQueueMaxSize: newConfig.ocr_queue_limit_enabled
+          ? newConfig.ocr_queue_max_size
+          : 999999,
+        ocrTimeoutSecs: newConfig.ocr_timeout_secs || 120,
+        clusteringAllowFullLowMemory: Boolean(newConfig.clustering_allow_full_low_memory),
+      }), { autoPrompt: true });
     } catch (err) {
       console.error('Failed to sync OCR config to monitor:', err);
     }
@@ -151,7 +149,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     setVacuumMessage('');
     setVacuumRunning(true);
     try {
-      const result = await invoke('storage_run_manual_vacuum');
+      const result = await withAuth(() => invoke('storage_run_manual_vacuum'), { autoPrompt: true });
       if (result?.already_running) {
         setVacuumMessage(t('settings.advanced.vacuum.already_running', '已有数据库优化任务正在执行，请稍候。'));
       } else {
@@ -579,9 +577,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
                         await saveConfig(newConfig);
                         // Also sync to Python backend
                         try {
-                          await invoke('execute_monitor_command', {
-                            payload: { command: 'set_clustering_interval', interval },
-                          });
+                          await withAuth(() => invoke('monitor_set_clustering_interval', { interval }), { autoPrompt: true });
                         } catch { /* best-effort */ }
                       }}
                       className={`w-full px-4 py-2.5 text-left hover:bg-ide-hover transition-colors flex items-center justify-between ${interval === (config.clustering_interval || '1w') ? 'bg-ide-accent/10' : ''

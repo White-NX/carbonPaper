@@ -4,6 +4,7 @@ import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square } from 'lucid
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { searchScreenshots, fetchThumbnailBatch, fetchThumbnail, getSoftDeleteQueueStatus, getSmartClusterWorkerStatus } from '../lib/monitor_api';
+import { smartClusterStopDrain } from '../lib/task_api';
 
 // Simple debounce hook
 function useDebounce(value, delay) {
@@ -359,9 +360,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
     const handleCancelCluster = async (e) => {
         if (e) e.stopPropagation();
         try {
-            await invoke('execute_monitor_command', {
-                payload: { command: 'smart_cluster_stop_drain' }
-            });
+            await smartClusterStopDrain();
             const status = await getSmartClusterWorkerStatus();
             setSmartClusterQueueStatus(status || { pending_count: 0, running: false });
         } catch (err) {

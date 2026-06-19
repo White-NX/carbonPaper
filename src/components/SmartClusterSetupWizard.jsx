@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Sparkles, Download, Loader2, Info, AlertCircle, RotateCcw, CheckCircle2 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { withAuth } from '../lib/auth_api';
 
 /**
  * Smart Cluster Setup Wizard.
@@ -81,7 +82,7 @@ export default function SmartClusterSetupWizard({ isVisible, onComplete }) {
       setDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('smartClusterSetup.downloadComplete', 'Download complete')}`]);
       // Mark setup done (non-dismissed) and enable the feature.
       await invoke('mark_smart_cluster_setup_done', { dismissedPermanently: false });
-      await invoke('set_advanced_config', { config: { smart_cluster_enabled: true } });
+      await withAuth(() => invoke('set_advanced_config', { config: { smart_cluster_enabled: true } }), { autoPrompt: true });
       setDownloadSucceeded(true);
       success = true;
     } catch (err) {

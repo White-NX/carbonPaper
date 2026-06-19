@@ -406,6 +406,8 @@
       "status": {
         "running": "MCP server is running",
         "stopped": "MCP server is stopped",
+        "pending_auth": "Enabled. The MCP server will start automatically after Windows Hello authentication.",
+        "error": "MCP server failed to start",
         "port_label": "Port",
         "auth_required": "Authentication required"
       },

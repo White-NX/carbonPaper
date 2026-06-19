@@ -19,6 +19,7 @@ import AiEmbeddingSection from './AiEmbeddingSection';
 import { defaultFilterSettings, formatInvokeError, normalizeList } from './filterUtils';
 import { REFRESH_INTERVAL_MS } from './analysisUtils';
 import { checkForUpdate, downloadAndInstallUpdate } from '../../lib/update_api';
+import { withAuth } from '../../lib/auth_api';
 
 function SettingsDialog({
   isOpen,
@@ -216,7 +217,7 @@ function SettingsDialog({
     monitorStatusRef.current = 'waiting';
     onManualStartMonitor?.();
     try {
-      await invoke('start_monitor');
+      await withAuth(() => invoke('start_monitor'), { autoPrompt: true });
     } catch (e) {
       console.error('Failed to start monitor', e);
       setMonitorStatus('stopped');
@@ -228,7 +229,7 @@ function SettingsDialog({
     setMonitorStatus('loading');
     monitorStatusRef.current = 'loading';
     try {
-      await invoke('stop_monitor');
+      await withAuth(() => invoke('stop_monitor'), { autoPrompt: true });
     } catch (e) {
       console.error('Failed to stop monitor', e);
     } finally {
@@ -242,10 +243,10 @@ function SettingsDialog({
     setMonitorStatus('loading');
     monitorStatusRef.current = 'loading';
     try {
-      await invoke('stop_monitor');
+      await withAuth(() => invoke('stop_monitor'), { autoPrompt: true });
       setMonitorStatus('waiting');
       monitorStatusRef.current = 'waiting';
-      await invoke('start_monitor');
+      await withAuth(() => invoke('start_monitor'), { autoPrompt: true });
       await checkMonitorStatus();
     } catch (e) {
       console.error('Failed to restart monitor', e);
@@ -257,7 +258,7 @@ function SettingsDialog({
 
   const handlePauseMonitor = async () => {
     try {
-      await invoke('pause_monitor');
+      await withAuth(() => invoke('pause_monitor'), { autoPrompt: true });
       await checkMonitorStatus();
     } catch (e) {
       console.error(e);
@@ -266,7 +267,7 @@ function SettingsDialog({
 
   const handleResumeMonitor = async () => {
     try {
-      await invoke('resume_monitor');
+      await withAuth(() => invoke('resume_monitor'), { autoPrompt: true });
       await checkMonitorStatus();
     } catch (e) {
       console.error(e);
