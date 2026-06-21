@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Layers, Database, ChevronDown, RefreshCw, ExternalLink, Sparkles, Download, Zap, RotateCcw, Loader2, AlertTriangle } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { withAuth } from '../../lib/auth_api';
 
 export default function FeaturesSection({ monitorStatus }) {
   const { t } = useTranslation();
@@ -42,10 +43,8 @@ export default function FeaturesSection({ monitorStatus }) {
     }
     setModelsLoading(true);
     try {
-      console.log('[FeaturesSection] Invoking execute_monitor_command for get_all_models');
-      const res = await invoke('execute_monitor_command', {
-        payload: { command: 'get_all_models' },
-      });
+      console.log('[FeaturesSection] Invoking monitor_get_all_models');
+      const res = await withAuth(() => invoke('monitor_get_all_models'));
       console.log('[FeaturesSection] Received raw response from backend:', res);
       const parsedRes = typeof res === 'string' ? JSON.parse(res) : res;
       console.log('[FeaturesSection] Parsed response:', parsedRes);
@@ -86,7 +85,7 @@ export default function FeaturesSection({ monitorStatus }) {
 
   const refreshSmartClusterStatus = async () => {
     try {
-      const s = await invoke('smart_cluster_status');
+      const s = await withAuth(() => invoke('smart_cluster_status'));
       setScStatus(s);
     } catch { /* ignore */ }
   };
@@ -135,15 +134,12 @@ export default function FeaturesSection({ monitorStatus }) {
   const saveConfig = async (newConfig) => {
     setConfig(newConfig);
     try {
-      await invoke('set_advanced_config', { config: newConfig });
+      await withAuth(() => invoke('set_advanced_config', { config: newConfig }), { autoPrompt: true });
       // Notify python backend
-      await invoke('execute_monitor_command', {
-        payload: { 
-          command: 'update_feature_config', 
-          clustering_enabled: newConfig.clustering_enabled,
-          classification_enabled: newConfig.classification_enabled
-        },
-      });
+      await withAuth(() => invoke('monitor_update_feature_config', {
+        clusteringEnabled: newConfig.clustering_enabled,
+        classificationEnabled: newConfig.classification_enabled,
+      }), { autoPrompt: true });
     } catch (err) {
       console.error('Failed to save advanced config:', err);
     }
@@ -194,7 +190,7 @@ export default function FeaturesSection({ monitorStatus }) {
 
   const handleDrainNow = async () => {
     try {
-      await invoke('execute_monitor_command', { payload: { command: 'smart_cluster_drain_now' } });
+      await withAuth(() => invoke('monitor_smart_cluster_drain_now'), { autoPrompt: true });
       // Refresh status soon after triggering.
       setTimeout(refreshSmartClusterStatus, 500);
     } catch (err) {
@@ -204,7 +200,7 @@ export default function FeaturesSection({ monitorStatus }) {
 
   const handleRescanAll = async () => {
     try {
-      await invoke('smart_cluster_rescan_all');
+      await withAuth(() => invoke('smart_cluster_rescan_all'), { autoPrompt: true });
       setTimeout(refreshSmartClusterStatus, 500);
     } catch (err) {
       console.warn('Failed to trigger rescan:', err);
@@ -281,9 +277,7 @@ export default function FeaturesSection({ monitorStatus }) {
                             const newConfig = { ...config, clustering_interval: interval };
                             await saveConfig(newConfig);
                             try {
-                              await invoke('execute_monitor_command', {
-                                payload: { command: 'set_clustering_interval', interval },
-                              });
+                              await withAuth(() => invoke('monitor_set_clustering_interval', { interval }), { autoPrompt: true });
                             } catch { /* best-effort */ }
                           }}
                           className={`w-full px-4 py-2.5 text-left hover:bg-ide-hover transition-colors flex items-center justify-between ${interval === (config.clustering_interval || '1w') ? 'bg-ide-accent/10' : ''}`}

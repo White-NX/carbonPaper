@@ -282,22 +282,32 @@ class WorkerSupervisor:
             self.restart(reason="stop", count=False)
 
     def status_snapshot(self) -> Dict[str, Any]:
-        with self._lock:
-            alive = bool(self._proc is not None and self._proc.is_alive())
-            return {
-                "name": self.name,
-                "state": self._state,
-                "alive": alive,
-                "pid": self._proc.pid if self._proc is not None else None,
-                "current_command": self._current_command,
-                "restart_count": self._restart_count,
-                "failure_count": self._failure_count,
-                "last_error": self._last_error,
-                "last_restart_reason": self._last_restart_reason,
-                "last_restart_at": self._last_restart_at,
-                "degraded_until": self._degraded_until or None,
-                "started_at": self._started_at,
-            }
+        acquired = self._lock.acquire(blocking=False)
+        if acquired:
+            try:
+                return self._status_snapshot_unlocked(lock_contended=False)
+            finally:
+                self._lock.release()
+        return self._status_snapshot_unlocked(lock_contended=True)
+
+    def _status_snapshot_unlocked(self, *, lock_contended: bool) -> Dict[str, Any]:
+        proc = self._proc
+        alive = bool(proc is not None and proc.is_alive())
+        return {
+            "name": self.name,
+            "state": self._state,
+            "alive": alive,
+            "pid": proc.pid if proc is not None else None,
+            "current_command": self._current_command,
+            "restart_count": self._restart_count,
+            "failure_count": self._failure_count,
+            "last_error": self._last_error,
+            "last_restart_reason": self._last_restart_reason,
+            "last_restart_at": self._last_restart_at,
+            "degraded_until": self._degraded_until or None,
+            "started_at": self._started_at,
+            "lock_contended": lock_contended,
+        }
 
     def _next_request_id_locked(self) -> int:
         self._request_seq += 1

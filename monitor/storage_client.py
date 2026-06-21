@@ -6,6 +6,7 @@ import time
 import logging
 import threading
 import struct
+import os
 from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,8 @@ class StorageClient:
         self._decrypt_cache = OrderedDict()
         self._encrypt_cache = OrderedDict()
         self._cache_limit = 512
+        self._auth_token = os.environ.get("CARBONPAPER_REVERSE_IPC_TOKEN", "")
+        self._seq_no = 0
 
     def _close_persistent_handle(self) -> None:
         handle = self._persistent_handle
@@ -191,6 +194,9 @@ class StorageClient:
             with self._request_lock:
                 framed_request = dict(request)
                 framed_request['_ipc_keepalive'] = True
+                framed_request['_auth_token'] = self._auth_token
+                self._seq_no += 1
+                framed_request['_seq_no'] = self._seq_no
                 request_bytes = json.dumps(framed_request).encode('utf-8')
 
                 for attempt in range(2):

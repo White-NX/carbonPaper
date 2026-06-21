@@ -394,7 +394,11 @@ pub async fn storage_get_thumbnail_warmup_status(
 }
 
 #[tauri::command]
-pub fn storage_cancel_thumbnail_warmup() -> serde_json::Value {
+pub fn storage_cancel_thumbnail_warmup(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
     THUMBNAIL_WARMUP_CANCEL.store(true, Ordering::SeqCst);
     {
         let mut progress = THUMBNAIL_WARMUP_PROGRESS
@@ -402,7 +406,7 @@ pub fn storage_cancel_thumbnail_warmup() -> serde_json::Value {
             .unwrap_or_else(|e| e.into_inner());
         progress.cancel_requested = true;
     }
-    thumbnail_warmup_progress_json()
+    Ok(thumbnail_warmup_progress_json())
 }
 
 #[tauri::command]
@@ -446,10 +450,13 @@ pub async fn storage_get_screenshot_details(
 
 #[tauri::command]
 pub async fn storage_delete_screenshot(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     monitor_state: tauri::State<'_, MonitorState>,
     screenshot_id: i64,
 ) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
     let image_hash = match state.get_screenshot_by_id(screenshot_id)? {
         Some(record) => Some(record.image_hash),
         None => None,
@@ -484,11 +491,14 @@ pub async fn storage_delete_screenshot(
 
 #[tauri::command]
 pub async fn storage_delete_by_time_range(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     monitor_state: tauri::State<'_, MonitorState>,
     start_time: f64,
     end_time: f64,
 ) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
     let start_ts = start_time / 1000.0;
     let end_ts = end_time / 1000.0;
     let image_hashes = match state.get_screenshots_by_time_range(start_ts, end_ts) {
@@ -629,9 +639,12 @@ pub async fn storage_get_delete_queue_status(
 
 #[tauri::command]
 pub async fn storage_save_screenshot(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     request: storage::SaveScreenshotRequest,
 ) -> Result<storage::SaveScreenshotResponse, String> {
+    check_auth_required(&credential_state)?;
+
     state.save_screenshot(&request)
 }
 
@@ -656,9 +669,12 @@ pub async fn storage_get_public_key(
 
 #[tauri::command]
 pub async fn storage_set_policy(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     policy: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
     state
         .save_policy(&policy)
         .map_err(|e| format!("Failed to save policy: {}", e))?;
@@ -667,11 +683,18 @@ pub async fn storage_set_policy(
 
 #[tauri::command]
 pub async fn storage_get_policy(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<serde_json::Value, String> {
-    state
+    check_auth_required(&credential_state)?;
+
+    let mut policy = state
         .load_policy()
-        .map_err(|e| format!("Failed to load policy: {}", e))
+        .map_err(|e| format!("Failed to load policy: {}", e))?;
+    if let Some(obj) = policy.as_object_mut() {
+        obj.remove("mcp_token_encrypted");
+    }
+    Ok(policy)
 }
 
 #[tauri::command]
@@ -695,11 +718,14 @@ pub async fn storage_decrypt_from_chromadb(
 
 #[tauri::command]
 pub async fn storage_update_category(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     monitor_state: tauri::State<'_, MonitorState>,
     screenshot_id: i64,
     category: String,
 ) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
     let old_category = state
         .get_screenshot_by_id(screenshot_id)
         .ok()
@@ -746,8 +772,11 @@ pub async fn storage_update_category(
 
 #[tauri::command]
 pub async fn storage_get_categories(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     monitor_state: tauri::State<'_, MonitorState>,
 ) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
     let payload = serde_json::json!({
         "command": "get_categories"
     });
@@ -756,21 +785,28 @@ pub async fn storage_get_categories(
 
 #[tauri::command]
 pub async fn storage_get_categories_from_db(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<Vec<String>, String> {
+    check_auth_required(&credential_state)?;
+
     state.get_categories_from_db()
 }
 
 #[tauri::command]
 pub async fn storage_batch_get_categories(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     image_hashes: Vec<String>,
 ) -> Result<std::collections::HashMap<String, Option<String>>, String> {
+    check_auth_required(&credential_state)?;
+
     state.batch_get_categories_by_hash(&image_hashes)
 }
 
 #[tauri::command]
 pub async fn storage_get_tasks(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     layer: Option<String>,
     start_time: Option<f64>,
@@ -779,6 +815,8 @@ pub async fn storage_get_tasks(
     hide_entertainment: Option<bool>,
     hide_social: Option<bool>,
 ) -> Result<Vec<storage::task::TaskRecord>, String> {
+    check_auth_required(&credential_state)?;
+
     state.get_tasks(
         layer.as_deref(),
         start_time,
@@ -791,52 +829,70 @@ pub async fn storage_get_tasks(
 
 #[tauri::command]
 pub async fn storage_get_related_screenshots(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     screenshot_id: i64,
     limit: Option<i64>,
 ) -> Result<storage::task::RelatedScreenshotsResult, String> {
+    check_auth_required(&credential_state)?;
+
     state.get_related_screenshots(screenshot_id, limit.unwrap_or(8))
 }
 
 #[tauri::command]
 pub async fn storage_get_task_screenshots(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     task_id: i64,
     page: Option<i64>,
     page_size: Option<i64>,
 ) -> Result<Vec<storage::task::TaskScreenshotStub>, String> {
+    check_auth_required(&credential_state)?;
+
     state.get_task_screenshots(task_id, page.unwrap_or(0), page_size.unwrap_or(50))
 }
 
 #[tauri::command]
 pub async fn storage_update_task_label(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     task_id: i64,
     label: String,
 ) -> Result<(), String> {
+    check_auth_required(&credential_state)?;
+
     state.update_task_label(task_id, &label)
 }
 
 #[tauri::command]
 pub async fn storage_delete_task(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     task_id: i64,
 ) -> Result<(), String> {
+    check_auth_required(&credential_state)?;
+
     state.delete_task(task_id)
 }
 
 #[tauri::command]
 pub async fn storage_merge_tasks(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     task_ids: Vec<i64>,
 ) -> Result<i64, String> {
+    check_auth_required(&credential_state)?;
+
     state.merge_tasks(&task_ids)
 }
 
 #[tauri::command]
 pub async fn storage_save_clustering_results(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     tasks: Vec<storage::task::SaveTaskRequest>,
 ) -> Result<Vec<i64>, String> {
+    check_auth_required(&credential_state)?;
+
     state.save_clustering_results(&tasks)
 }

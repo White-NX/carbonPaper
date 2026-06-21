@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Dialog } from '../Dialog';
 import { ConfirmDialog } from '../ConfirmDialog';
+import { withAuth } from '../../lib/auth_api';
 
 export default function AiEmbeddingSection() {
   const { t } = useTranslation();
@@ -14,6 +15,10 @@ export default function AiEmbeddingSection() {
     return saved > 0 ? saved : 23816;
   });
   const [running, setRunning] = useState(false);
+  const [serviceState, setServiceState] = useState(() => (
+    localStorage.getItem('mcpEnabled') === 'true' ? 'pending_auth' : 'disabled'
+  ));
+  const [statusError, setStatusError] = useState('');
   // Skip loading spinner if we have cached state from localStorage
   const hasCachedState = localStorage.getItem('mcpEnabled') !== null;
   const [loading, setLoading] = useState(!hasCachedState);
@@ -24,8 +29,6 @@ export default function AiEmbeddingSection() {
   const [showPrivacyDialog, setShowPrivacyDialog] = useState(false);
   const [confirmText, setConfirmText] = useState('');
 
-  // Token display (one-time)
-  const [token, setToken] = useState(null);
   const [tokenCopied, setTokenCopied] = useState(false);
 
   // Token reset confirmation
@@ -61,6 +64,8 @@ export default function AiEmbeddingSection() {
       setEnabled(status.enabled);
       setPort(status.port);
       setRunning(status.running);
+      setServiceState(status.state || (status.enabled ? (status.running ? 'running' : 'pending_auth') : 'disabled'));
+      setStatusError(status.error || '');
 
       // Sync to localStorage for instant state on next mount
       localStorage.setItem('mcpEnabled', status.enabled ? 'true' : 'false');
@@ -68,7 +73,7 @@ export default function AiEmbeddingSection() {
 
       // Load filter config
       try {
-        const filterConfig = await invoke('mcp_get_sensitive_filter_config');
+        const filterConfig = await withAuth(() => invoke('mcp_get_sensitive_filter_config'));
         setFilterEnabled(filterConfig.enabled);
         setFilterCategories(filterConfig.categories);
         if (filterConfig.mode) setFilterMode(filterConfig.mode);
@@ -109,6 +114,13 @@ export default function AiEmbeddingSection() {
     loadStatus();
   }, [loadStatus]);
 
+  useEffect(() => {
+    const unlisten = listen('mcp-status-changed', () => {
+      loadStatus();
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, [loadStatus]);
+
   // Listen for background auto-install events
   useEffect(() => {
     const unlisten = listen('spacy-model-status', (event) => {
@@ -133,9 +145,11 @@ export default function AiEmbeddingSection() {
       setActionLoading(true);
       setError('');
       try {
-        await invoke('mcp_set_enabled', { enabled: false });
+        await withAuth(() => invoke('mcp_set_enabled', { enabled: false }), { autoPrompt: true });
         setEnabled(false);
         setRunning(false);
+        setServiceState('disabled');
+        setStatusError('');
         localStorage.setItem('mcpEnabled', 'false');
       } catch (e) {
         setError(String(e));
@@ -150,17 +164,17 @@ export default function AiEmbeddingSection() {
     setActionLoading(true);
     setError('');
     try {
-      const result = await invoke('mcp_set_enabled', { enabled: true });
+      const result = await withAuth(() => invoke('mcp_set_enabled', { enabled: true }), { autoPrompt: true });
       setEnabled(true);
       setRunning(true);
+      setServiceState('running');
+      setStatusError('');
       localStorage.setItem('mcpEnabled', 'true');
       if (result.port) {
         setPort(result.port);
         localStorage.setItem('mcpPort', String(result.port));
       }
-      if (result.token) {
-        setToken(result.token);
-      }
+      setTokenCopied(false);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -173,11 +187,8 @@ export default function AiEmbeddingSection() {
     setActionLoading(true);
     setError('');
     try {
-      const result = await invoke('mcp_reset_token');
-      if (result.token) {
-        setToken(result.token);
-        setTokenCopied(false);
-      }
+      const result = await withAuth(() => invoke('mcp_reset_token'), { autoPrompt: true });
+      setTokenCopied(Boolean(result?.copied_to_clipboard));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -209,10 +220,10 @@ export default function AiEmbeddingSection() {
     setFilterEnabled(newEnabled);
     setFilterCategories(newCategories);
     try {
-      await invoke('mcp_set_sensitive_filter_config', {
+      await withAuth(() => invoke('mcp_set_sensitive_filter_config', {
         config: { enabled: newEnabled, categories: newCategories, mode: filterMode,
           presidio_enabled: piiEnabled, presidio_entities: Object.keys(piiEntities).filter(k => piiEntities[k]) }
-      });
+      }), { autoPrompt: true });
     } catch (e) {
       setFilterEnabled(filterEnabled);
       setFilterCategories(filterCategories);
@@ -224,10 +235,10 @@ export default function AiEmbeddingSection() {
     const newCategories = { ...filterCategories, [category]: !filterCategories[category] };
     setFilterCategories(newCategories);
     try {
-      await invoke('mcp_set_sensitive_filter_config', {
+      await withAuth(() => invoke('mcp_set_sensitive_filter_config', {
         config: { enabled: filterEnabled, categories: newCategories, mode: filterMode,
           presidio_enabled: piiEnabled, presidio_entities: Object.keys(piiEntities).filter(k => piiEntities[k]) }
-      });
+      }), { autoPrompt: true });
     } catch (e) {
       setFilterCategories(filterCategories);
       console.error('Failed to save filter config:', e);
@@ -238,10 +249,10 @@ export default function AiEmbeddingSection() {
     const prevMode = filterMode;
     setFilterMode(newMode);
     try {
-      await invoke('mcp_set_sensitive_filter_config', {
+      await withAuth(() => invoke('mcp_set_sensitive_filter_config', {
         config: { enabled: filterEnabled, categories: filterCategories, mode: newMode,
           presidio_enabled: piiEnabled, presidio_entities: Object.keys(piiEntities).filter(k => piiEntities[k]) }
-      });
+      }), { autoPrompt: true });
     } catch (e) {
       setFilterMode(prevMode);
       console.error('Failed to save filter config:', e);
@@ -251,13 +262,13 @@ export default function AiEmbeddingSection() {
   const savePiiConfig = async (newEnabled, newEntities) => {
     try {
       const entityList = Object.keys(newEntities).filter(k => newEntities[k]);
-      await invoke('mcp_set_sensitive_filter_config', {
+      await withAuth(() => invoke('mcp_set_sensitive_filter_config', {
         config: {
           enabled: filterEnabled, categories: filterCategories, mode: filterMode,
           presidio_enabled: newEnabled,
           presidio_entities: entityList,
         }
-      });
+      }), { autoPrompt: true });
     } catch (e) {
       console.error('Failed to save PII config:', e);
     }
@@ -301,23 +312,37 @@ export default function AiEmbeddingSection() {
     }
   };
 
-  const handleCopyToken = async () => {
-    if (!token) return;
+  const handleCopyCurrentToken = async () => {
     try {
-      await navigator.clipboard.writeText(token);
+      await withAuth(() => invoke('mcp_copy_token_to_clipboard'), { autoPrompt: true });
       setTokenCopied(true);
-      setTimeout(() => setTokenCopied(false), 2000);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = token;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-      setTokenCopied(true);
-      setTimeout(() => setTokenCopied(false), 2000);
+    } catch (e) {
+      setError(String(e));
     }
   };
+
+  const normalizedServiceState = enabled
+    ? (running ? 'running' : serviceState || 'pending_auth')
+    : 'disabled';
+  const statusBadge = {
+    running: { label: 'RUNNING', className: 'text-green-500' },
+    pending_auth: { label: 'WAITING', className: 'text-amber-400' },
+    error: { label: 'ERROR', className: 'text-red-500' },
+    stopped: { label: 'STOPPED', className: 'text-red-500' },
+  }[normalizedServiceState] || { label: 'STOPPED', className: 'text-red-500' };
+  const statusMessage = (() => {
+    if (!enabled) return t('settings.ai_embedding.status.stopped');
+    if (normalizedServiceState === 'running') {
+      return `${t('settings.ai_embedding.status.port_label')}: ${port}`;
+    }
+    if (normalizedServiceState === 'pending_auth') {
+      return t('settings.ai_embedding.status.pending_auth');
+    }
+    if (normalizedServiceState === 'error') {
+      return statusError || t('settings.ai_embedding.status.error');
+    }
+    return t('settings.ai_embedding.status.stopped');
+  })();
 
   if (loading) {
     return (
@@ -354,15 +379,13 @@ export default function AiEmbeddingSection() {
             <label className="block mb-1 font-semibold text-ide-text">
               {t('settings.ai_embedding.enable_label')}{' '}
               {enabled && (
-                <span className={running ? 'text-green-500' : 'text-red-500'}>
-                  {running ? 'RUNNING' : 'STOPPED'}
+                <span className={statusBadge.className}>
+                  {statusBadge.label}
                 </span>
               )}
             </label>
             <p className="text-xs text-ide-muted">
-              {enabled
-                ? `${t('settings.ai_embedding.status.port_label')}: ${port}`
-                : t('settings.ai_embedding.status.stopped')}
+              {statusMessage}
             </p>
           </div>
           <button
@@ -384,15 +407,26 @@ export default function AiEmbeddingSection() {
           </div>
         )}
 
-        {/* Row 2: Token management (when enabled, token not being shown) */}
-        {enabled && !token && (
+        {/* Row 2: Token management */}
+        {enabled && (
           <>
             <div className="w-full h-px bg-ide-border/50" />
             <div className="flex items-center justify-between gap-4">
               <div className="flex-1">
                 <label className="block mb-1 font-semibold text-ide-text">{t('settings.ai_embedding.token.title')}</label>
                 <p className="text-xs text-ide-muted">{t('settings.ai_embedding.token.description')}</p>
+                {tokenCopied && (
+                  <p className="text-xs text-green-400 mt-1">{t('settings.ai_embedding.token.copied')}</p>
+                )}
               </div>
+              <button
+                onClick={handleCopyCurrentToken}
+                disabled={actionLoading}
+                className="shrink-0 px-3 py-1.5 text-xs text-ide-text hover:bg-ide-hover border border-ide-border rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-50"
+              >
+                {tokenCopied ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
+                {t('settings.ai_embedding.token.copy')}
+              </button>
               <button
                 onClick={() => setShowResetConfirm(true)}
                 disabled={actionLoading}
@@ -405,8 +439,8 @@ export default function AiEmbeddingSection() {
           </>
         )}
 
-        {/* Row 3: Connection info (when enabled, running, token not being shown) */}
-        {enabled && !token && running && (
+        {/* Row 3: Connection info */}
+        {enabled && running && (
           <>
             <div className="w-full h-px bg-ide-border/50" />
             <div>
@@ -425,8 +459,8 @@ export default function AiEmbeddingSection() {
           </>
         )}
 
-        {/* Row 4: Privacy protection level (when enabled, token not being shown) */}
-        {enabled && !token && (
+        {/* Row 4: Privacy protection level */}
+        {enabled && (
           <>
             <div className="w-full h-px bg-ide-border/50" />
             <div>
@@ -510,8 +544,8 @@ export default function AiEmbeddingSection() {
           </>
         )}
 
-        {/* Row 5: Filter mode (when enabled, not off, token not being shown) */}
-        {enabled && !token && filterEnabled && (
+        {/* Row 5: Filter mode */}
+        {enabled && filterEnabled && (
           <>
             <div className="w-full h-px bg-ide-border/50" />
             <div>
@@ -553,8 +587,8 @@ export default function AiEmbeddingSection() {
           </>
         )}
 
-        {/* Row 6: PII Detection (when enabled, token not being shown) */}
-        {enabled && !token && (
+        {/* Row 6: PII Detection */}
+        {enabled && (
           <>
             <div className="w-full h-px bg-ide-border/50" />
             <div>
@@ -670,39 +704,6 @@ export default function AiEmbeddingSection() {
           </>
         )}
       </div>
-
-      {/* Token one-time display — separate alert card (temporary state) */}
-      {token && (
-        <div className="p-4 bg-ide-bg border border-ide-warning-border rounded-xl space-y-3">
-          <div className="flex items-start gap-2">
-            <AlertTriangle className="w-4 h-4 text-ide-warning shrink-0 mt-0.5" />
-            <p className="text-xs text-ide-warning leading-relaxed">
-              {t('settings.ai_embedding.token.show_once_warning')}
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <code className="flex-1 px-3 py-2 bg-ide-panel border border-ide-border rounded-lg text-xs text-ide-text font-mono break-all select-all">
-              {token}
-            </code>
-            <button
-              onClick={handleCopyToken}
-              className="shrink-0 px-3 py-2 bg-ide-panel border border-ide-border rounded-lg text-xs text-ide-text hover:bg-ide-hover transition-colors flex items-center gap-1.5"
-            >
-              {tokenCopied ? (
-                <><Check className="w-3.5 h-3.5 text-green-400" />{t('settings.ai_embedding.token.copied')}</>
-              ) : (
-                <><Copy className="w-3.5 h-3.5" />{t('settings.ai_embedding.token.copy')}</>
-              )}
-            </button>
-          </div>
-          <button
-            onClick={() => { setToken(null); setTokenCopied(false); }}
-            className="w-full py-1.5 text-xs text-ide-muted hover:text-ide-text hover:bg-ide-hover rounded-lg transition-colors"
-          >
-            {t('settings.ai_embedding.privacy_warning.cancel_button')}
-          </button>
-        </div>
-      )}
 
       {/* Privacy warning dialog */}
       <Dialog

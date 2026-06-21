@@ -125,7 +125,11 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-pub fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
+pub fn set_advanced_config(
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    config: serde_json::Value,
+) -> Result<(), String> {
+    crate::commands::check_auth_required(&credential_state)?;
     if let Some(v) = config.get("cpu_limit_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("cpu_limit_enabled", v)?;
     }
@@ -191,7 +195,13 @@ pub fn set_advanced_config(config: serde_json::Value) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn toggle_game_mode(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+pub async fn toggle_game_mode(
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::commands::check_auth_required(&credential_state)?;
+
     registry_config::set_bool("game_mode_enabled", enabled)?;
     if enabled {
         monitor::start_game_mode_monitor(app);
@@ -200,13 +210,13 @@ pub async fn toggle_game_mode(app: tauri::AppHandle, enabled: bool) -> Result<()
         let was_suppressed = state.game_mode_dml_suppressed.load(Ordering::SeqCst);
         monitor::stop_game_mode_monitor(&app);
         if was_suppressed {
-            let _ = monitor::stop_monitor(
+            let _ = monitor::stop_monitor_impl(
                 app.state::<MonitorState>(),
                 app.state::<Arc<CaptureState>>(),
                 app.clone(),
             )
             .await;
-            let _ = monitor::start_monitor(app.state::<MonitorState>(), app.clone()).await;
+            let _ = monitor::start_monitor_impl(app.state::<MonitorState>(), app.clone()).await;
         }
     }
     Ok(())
@@ -281,7 +291,13 @@ pub fn get_extension_enhancement_config() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-pub fn set_extension_enhancement(browser: String, enabled: bool) -> Result<(), String> {
+pub fn set_extension_enhancement(
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    browser: String,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::commands::check_auth_required(&credential_state)?;
+
     match browser.as_str() {
         "chrome" => registry_config::set_bool("extension_enhanced_chrome", enabled),
         "edge" => registry_config::set_bool("extension_enhanced_edge", enabled),

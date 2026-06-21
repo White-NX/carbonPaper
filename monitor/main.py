@@ -70,7 +70,7 @@ def main():
 
   auth_token = args.auth_token
 
-  logger.info(f'Starting monitor service: pipe={args.pipe_name[:30]}, token={auth_token[:16]}..., storage_pipe={args.storage_pipe[:30] if args.storage_pipe else "None"}')
+  logger.info(f'Starting monitor service: pipe={args.pipe_name[:30]}, token_present={bool(auth_token)}, storage_pipe={args.storage_pipe[:30] if args.storage_pipe else "None"}')
 
   # Initialise storage client (if a storage pipe name was provided)
   if args.storage_pipe:

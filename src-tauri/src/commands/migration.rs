@@ -1,6 +1,6 @@
 use crate::capture::CaptureState;
 use crate::credential_manager::{get_cached_master_key, CredentialManagerState};
-use crate::monitor::{start_monitor, stop_monitor, MonitorState};
+use crate::monitor::{start_monitor_impl, stop_monitor_impl, MonitorState};
 use crate::storage::StorageState;
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -85,8 +85,11 @@ pub async fn storage_run_startup_vacuum_if_needed(
 
 #[tauri::command]
 pub async fn storage_run_manual_vacuum(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<serde_json::Value, String> {
+    super::check_auth_required(&credential_state)?;
+
     let state = state.inner().clone();
 
     tokio::task::spawn_blocking(move || match state.run_manual_vacuum() {
@@ -107,8 +110,11 @@ pub async fn storage_run_manual_vacuum(
 #[tauri::command]
 pub async fn storage_run_hmac_migration(
     app_handle: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<(), String> {
+    super::check_auth_required(&credential_state)?;
+
     let state = state.inner().clone();
 
     if state.is_hmac_migration_in_progress() {
@@ -139,8 +145,11 @@ pub async fn storage_run_hmac_migration(
 
 #[tauri::command]
 pub async fn storage_hmac_migration_cancel(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<serde_json::Value, String> {
+    super::check_auth_required(&credential_state)?;
+
     let in_progress = state.request_hmac_migration_cancel();
     Ok(serde_json::json!({
         "status": if in_progress { "cancel_requested" } else { "idle" },
@@ -150,8 +159,11 @@ pub async fn storage_hmac_migration_cancel(
 
 #[tauri::command]
 pub async fn storage_list_plaintext_files(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<Vec<String>, String> {
+    super::check_auth_required(&credential_state)?;
+
     state.list_plaintext_screenshots()
 }
 
@@ -178,10 +190,13 @@ pub async fn storage_migrate_plaintext(
 #[tauri::command]
 pub async fn storage_migrate_data_dir(
     app_handle: tauri::AppHandle,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     target: String,
     migrate_data_files: bool,
 ) -> Result<serde_json::Value, String> {
+    super::check_auth_required(&credential_state)?;
+
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         state.migrate_data_dir_blocking(app_handle, target, migrate_data_files)
@@ -191,12 +206,17 @@ pub async fn storage_migrate_data_dir(
 }
 
 #[tauri::command]
-pub fn storage_migration_cancel(state: tauri::State<'_, Arc<StorageState>>) -> serde_json::Value {
+pub fn storage_migration_cancel(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<serde_json::Value, String> {
+    super::check_auth_required(&credential_state)?;
+
     let in_progress = state.request_migration_cancel();
-    serde_json::json!({
+    Ok(serde_json::json!({
         "status": if in_progress { "cancel_requested" } else { "idle" },
         "in_progress": in_progress
-    })
+    }))
 }
 
 #[tauri::command]
@@ -224,6 +244,8 @@ pub async fn storage_export_backup(
     password: String,
     export_path: String,
 ) -> Result<(), String> {
+    super::check_auth_required(&credential_state)?;
+
     tracing::info!("Migration: Starting data export to {}", export_path);
 
     let was_running = {
@@ -241,7 +263,7 @@ pub async fn storage_export_backup(
     let result = async {
         // 1. Release resources
         tracing::info!("Migration: Releasing resources (stopping monitor and storage)");
-        let _ = stop_monitor(
+        let _ = stop_monitor_impl(
             monitor_state.clone(),
             capture_state.clone(),
             app_handle.clone(),
@@ -401,7 +423,7 @@ pub async fn storage_export_backup(
     if was_running && init_result.is_ok() {
         tracing::info!("Migration: Restarting monitor after export");
         let monitor_state_for_start = app_handle.state::<MonitorState>();
-        if let Err(e) = start_monitor(monitor_state_for_start, app_handle.clone()).await {
+        if let Err(e) = start_monitor_impl(monitor_state_for_start, app_handle.clone()).await {
             tracing::error!("Migration: Failed to restart monitor after export: {}", e);
         }
     }
@@ -419,6 +441,8 @@ pub async fn storage_import_backup(
     password: String,
     backup_zip_path: String,
 ) -> Result<(), String> {
+    super::check_auth_required(&credential_state)?;
+
     tracing::info!("Migration: Starting data import from {}", backup_zip_path);
 
     let was_running = {
@@ -436,7 +460,7 @@ pub async fn storage_import_backup(
     let result = async {
         // 1. Prepare
         tracing::info!("Migration: Releasing resources for import");
-        let _ = stop_monitor(
+        let _ = stop_monitor_impl(
             monitor_state.clone(),
             capture_state.clone(),
             app_handle.clone(),
@@ -588,7 +612,7 @@ pub async fn storage_import_backup(
     if was_running && init_result.is_ok() {
         tracing::info!("Migration: Restarting monitor after import");
         let monitor_state_for_start = app_handle.state::<MonitorState>();
-        if let Err(e) = start_monitor(monitor_state_for_start, app_handle.clone()).await {
+        if let Err(e) = start_monitor_impl(monitor_state_for_start, app_handle.clone()).await {
             tracing::error!("Migration: Failed to restart monitor after import: {}", e);
         }
     }

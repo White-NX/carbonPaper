@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Dialog } from './Dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { withAuth } from '../lib/auth_api';
 
 export default function HmacMigrationDialog() {
   const { t } = useTranslation();
@@ -45,7 +46,7 @@ export default function HmacMigrationDialog() {
 
         if (!status.is_running) {
           try {
-            await invoke('storage_run_hmac_migration');
+            await withAuth(() => invoke('storage_run_hmac_migration'), { autoPrompt: true });
             if (isMounted) setIsOpen(false);
           } catch (err) {
             // Tauri errors might be strings or objects. Check for both.

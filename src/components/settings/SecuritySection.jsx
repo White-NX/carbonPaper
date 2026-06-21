@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Shield, ShieldCheck, Clock, Info, ChevronDown, AlertTriangle } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { withAuth } from '../../lib/auth_api';
 
 // 会话超时选项的固定值; 标签/描述由 i18n 在组件内生成
 const SESSION_TIMEOUT_VALUES = [
@@ -45,7 +46,7 @@ export default function SecuritySection({
     try {
       localStorage.setItem('sessionTimeout', String(value));
       // 通知后端更新超时时间
-      await invoke('credential_set_session_timeout', { timeout: value });
+      await withAuth(() => invoke('credential_set_session_timeout', { timeout: value }), { autoPrompt: true });
     } catch (err) {
       console.warn('Failed to save session timeout:', err);
     }

@@ -1,4 +1,5 @@
 use crate::credential_manager::{self, CredentialManagerState};
+use crate::mcp_server;
 use crate::storage::StorageState;
 use std::sync::Arc;
 
@@ -38,8 +39,10 @@ pub async fn credential_initialize(
 
 #[tauri::command]
 pub async fn credential_verify_user(
+    app: tauri::AppHandle,
     state: tauri::State<'_, Arc<CredentialManagerState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
+    mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
 ) -> Result<bool, String> {
     #[cfg(windows)]
     {
@@ -49,14 +52,21 @@ pub async fn credential_verify_user(
         state.update_auth_time();
         storage_state.try_dedup_migration();
         storage_state.try_bitmap_index_migration();
+        if let Err(e) =
+            mcp_server::restore_if_enabled(app, &state, &storage_state, &mcp_state).await
+        {
+            tracing::warn!("Failed to restore MCP after authentication: {}", e);
+        }
 
         Ok(true)
     }
 
     #[cfg(not(windows))]
     {
+        let _ = &app;
         let _ = &state;
         let _ = &storage_state;
+        let _ = &mcp_state;
         Err("Windows Hello is only available on Windows".to_string())
     }
 }
@@ -90,6 +100,8 @@ pub async fn credential_set_session_timeout(
     state: tauri::State<'_, Arc<CredentialManagerState>>,
     timeout: i64,
 ) -> Result<(), String> {
+    crate::commands::check_auth_required(&state)?;
+
     state.set_session_timeout(timeout);
     if let Err(e) = crate::registry_config::set_string("session_timeout_secs", &timeout.to_string())
     {

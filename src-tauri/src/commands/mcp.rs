@@ -4,6 +4,94 @@ use crate::mcp_token;
 use crate::sensitive_filter::{self, SensitiveFilterState};
 use crate::storage::StorageState;
 use std::sync::Arc;
+use tauri::Emitter;
+
+#[cfg(windows)]
+struct GlobalMemGuard {
+    handle: windows::Win32::Foundation::HGLOBAL,
+    transferred: bool,
+}
+
+#[cfg(windows)]
+impl Drop for GlobalMemGuard {
+    fn drop(&mut self) {
+        if !self.transferred {
+            unsafe {
+                let _ = windows::Win32::Foundation::GlobalFree(self.handle);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn copy_mcp_token_to_clipboard(window: &tauri::Window, token: &str) -> Result<(), String> {
+    use std::mem::size_of;
+    use std::ptr;
+    use windows::Win32::Foundation::{HANDLE, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    let mut wide: Vec<u16> = token.encode_utf16().collect();
+    wide.push(0);
+    let byte_len = wide.len() * size_of::<u16>();
+
+    unsafe {
+        let owner_hwnd = window
+            .hwnd()
+            .map_err(|e| format!("Failed to get window handle: {}", e))?;
+        OpenClipboard(HWND(owner_hwnd.0 as _))
+            .map_err(|e| format!("Failed to open clipboard: {:?}", e))?;
+        let clipboard_open = ClipboardGuard;
+
+        EmptyClipboard().map_err(|e| format!("Failed to empty clipboard: {:?}", e))?;
+        let handle = GlobalAlloc(GMEM_MOVEABLE, byte_len)
+            .map_err(|e| format!("GlobalAlloc failed: {:?}", e))?;
+        let mut global_mem = GlobalMemGuard {
+            handle,
+            transferred: false,
+        };
+        let locked = GlobalLock(global_mem.handle);
+        if locked.is_null() {
+            return Err("GlobalLock failed".to_string());
+        }
+
+        ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, locked as *mut u8, byte_len);
+        match GlobalUnlock(global_mem.handle) {
+            Ok(()) => {}
+            // GlobalUnlock returns zero when the lock count reaches zero; in that
+            // success case GetLastError remains ERROR_SUCCESS, which windows-rs
+            // surfaces as an HRESULT(0) Error.
+            Err(e) if e.code().0 == 0 => {}
+            Err(e) => return Err(format!("GlobalUnlock failed: {:?}", e)),
+        }
+        SetClipboardData(13, HANDLE(global_mem.handle.0))
+            .map_err(|e| format!("Failed to set clipboard data: {:?}", e))?;
+        global_mem.transferred = true;
+
+        std::mem::forget(clipboard_open);
+        CloseClipboard().map_err(|e| format!("Failed to close clipboard: {:?}", e))?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+struct ClipboardGuard;
+
+#[cfg(windows)]
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::DataExchange::CloseClipboard();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn copy_mcp_token_to_clipboard(_window: &tauri::Window, _token: &str) -> Result<(), String> {
+    Err("MCP token clipboard delivery is only available on Windows".to_string())
+}
 
 fn policy_as_object_mut(
     policy: &mut serde_json::Value,
@@ -21,11 +109,20 @@ pub async fn mcp_set_enabled(
     mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
     enabled: bool,
 ) -> Result<serde_json::Value, String> {
+    super::check_auth_required(&credential_state)?;
+
     if enabled {
         let mut policy = storage_state.load_policy()?;
         let existing_token = policy.get("mcp_token_encrypted").and_then(|v| v.as_str());
         let (token_plaintext, is_new_token) = if let Some(encrypted_b64) = existing_token {
             let token = mcp_token::decrypt_token(&credential_state, encrypted_b64)?;
+            if !mcp_token::is_current_format(encrypted_b64) {
+                let encrypted_v2 = mcp_token::encrypt_token(&credential_state, &token)?;
+                policy_as_object_mut(&mut policy)?.insert(
+                    "mcp_token_encrypted".into(),
+                    serde_json::json!(encrypted_v2),
+                );
+            }
             (token, false)
         } else {
             let token = mcp_token::generate_token();
@@ -51,18 +148,39 @@ pub async fn mcp_set_enabled(
 
         let token_hash = mcp_token::hash_token(&token_plaintext);
         mcp_state.set_token_hash(token_hash);
-        mcp_server::start_server(app, port, token_hash).await?;
-
-        if is_new_token {
-            Ok(serde_json::json!({ "status": "ok", "token": token_plaintext, "port": port }))
-        } else {
-            Ok(serde_json::json!({ "status": "ok", "port": port }))
+        if let Err(e) = mcp_server::start_server(app.clone(), port, token_hash).await {
+            mcp_state.set_last_error(e.clone());
+            if let Ok(mut rollback_policy) = storage_state.load_policy() {
+                if let Ok(obj) = policy_as_object_mut(&mut rollback_policy) {
+                    obj.insert("mcp_enabled".into(), serde_json::json!(false));
+                    let _ = storage_state.save_policy(&rollback_policy);
+                }
+            }
+            let _ = app.emit(
+                "mcp-status-changed",
+                serde_json::json!({ "state": "error", "error": e.clone() }),
+            );
+            return Err(e);
         }
+
+        let _ = app.emit(
+            "mcp-status-changed",
+            serde_json::json!({ "state": "running" }),
+        );
+
+        let _ = is_new_token;
+        Ok(serde_json::json!({ "status": "ok", "port": port }))
     } else {
         mcp_server::stop_server(&mcp_state).await;
         let mut policy = storage_state.load_policy()?;
         policy_as_object_mut(&mut policy)?.insert("mcp_enabled".into(), serde_json::json!(false));
         storage_state.save_policy(&policy)?;
+        mcp_state.clear_last_error();
+
+        let _ = app.emit(
+            "mcp-status-changed",
+            serde_json::json!({ "state": "disabled" }),
+        );
 
         Ok(serde_json::json!({ "status": "ok" }))
     }
@@ -70,6 +188,7 @@ pub async fn mcp_set_enabled(
 
 #[tauri::command]
 pub async fn mcp_get_status(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
     mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
 ) -> Result<serde_json::Value, String> {
@@ -80,21 +199,43 @@ pub async fn mcp_get_status(
         .unwrap_or(false);
     let port = mcp_server::get_port(&storage_state);
     let running = mcp_state.is_running();
+    let last_error = mcp_state.get_last_error();
+    let state = if !enabled {
+        "disabled"
+    } else if running {
+        "running"
+    } else if !credential_state.is_session_valid()
+        || last_error
+            .as_deref()
+            .map(|e| e.contains("AUTH_REQUIRED"))
+            .unwrap_or(false)
+    {
+        "pending_auth"
+    } else if last_error.is_some() {
+        "error"
+    } else {
+        "stopped"
+    };
 
     Ok(serde_json::json!({
         "enabled": enabled,
         "port": port,
-        "running": running
+        "running": running,
+        "state": state,
+        "error": last_error
     }))
 }
 
 #[tauri::command]
 pub async fn mcp_reset_token(
     app: tauri::AppHandle,
+    window: tauri::Window,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
     mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
 ) -> Result<serde_json::Value, String> {
+    super::check_auth_required(&credential_state)?;
+
     let token = mcp_token::generate_token();
     let encrypted_b64 = mcp_token::encrypt_token(&credential_state, &token)?;
 
@@ -115,7 +256,34 @@ pub async fn mcp_reset_token(
         mcp_server::start_server(app, port, token_hash).await?;
     }
 
-    Ok(serde_json::json!({ "status": "ok", "token": token }))
+    let copied_to_clipboard = copy_mcp_token_to_clipboard(&window, &token).is_ok();
+    Ok(serde_json::json!({
+        "status": "ok",
+        "token_delivery": "clipboard",
+        "copied_to_clipboard": copied_to_clipboard
+    }))
+}
+
+#[tauri::command]
+pub async fn mcp_copy_token_to_clipboard(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<serde_json::Value, String> {
+    super::check_auth_required(&credential_state)?;
+
+    let policy = storage_state.load_policy()?;
+    let encrypted_token = policy
+        .get("mcp_token_encrypted")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "No MCP token found in policy".to_string())?;
+    let token = mcp_token::decrypt_token(&credential_state, encrypted_token)?;
+    copy_mcp_token_to_clipboard(&window, &token)?;
+    Ok(serde_json::json!({
+        "status": "ok",
+        "token_delivery": "clipboard",
+        "copied_to_clipboard": true
+    }))
 }
 
 #[tauri::command]
@@ -127,9 +295,12 @@ pub async fn mcp_get_port(
 
 #[tauri::command]
 pub async fn mcp_set_port(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
     port: u16,
 ) -> Result<(), String> {
+    super::check_auth_required(&credential_state)?;
+
     let mut policy = storage_state.load_policy()?;
     policy_as_object_mut(&mut policy)?.insert("mcp_port".into(), serde_json::json!(port));
     storage_state.save_policy(&policy)
@@ -137,17 +308,23 @@ pub async fn mcp_set_port(
 
 #[tauri::command]
 pub async fn mcp_get_sensitive_filter_config(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     filter_state: tauri::State<'_, Arc<SensitiveFilterState>>,
 ) -> Result<sensitive_filter::SensitiveFilterConfig, String> {
+    super::check_auth_required(&credential_state)?;
+
     Ok(filter_state.get_config())
 }
 
 #[tauri::command]
 pub async fn mcp_set_sensitive_filter_config(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     filter_state: tauri::State<'_, Arc<SensitiveFilterState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
     config: sensitive_filter::SensitiveFilterConfig,
 ) -> Result<(), String> {
+    super::check_auth_required(&credential_state)?;
+
     filter_state.update_config(config.clone());
 
     let mut policy = storage_state.load_policy()?;

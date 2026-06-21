@@ -108,6 +108,14 @@ def _sync_clustering_scheduler_auth_gate(force: bool = False) -> bool:
     return session_valid
 
 
+def _cached_clustering_session_valid() -> bool:
+    if not _clustering_scheduler:
+        return False
+    if _storage_pipe is None:
+        return True
+    return _last_clustering_session_valid
+
+
 def _start_clustering_auth_monitor():
     """Start background auth monitor so OCR hot path does not perform IPC checks."""
     global _clustering_auth_monitor_thread
@@ -290,9 +298,7 @@ def _handle_command_impl(req: dict):
     req_seq_no = req.get('_seq_no')
 
     if _auth_token and req_token != _auth_token:
-        logger.warning('Auth failed: expected=%s... got=%s...',
-                       _auth_token[:16] if _auth_token else 'None',
-                       req_token[:16] if req_token else 'None')
+        logger.warning('Auth failed: token_present=%s', bool(req_token))
         return {'error': 'Authentication failed: Invalid token'}
 
     # Replay-attack prevention
@@ -324,12 +330,11 @@ def _handle_command_impl(req: dict):
         return {'status': 'stopped'}
 
     if cmd == 'status':
-        clustering_unlocked = _sync_clustering_scheduler_auth_gate(force=False)
         status = {
             'paused': paused_event.is_set(),
             'stopped': stop_event.is_set(),
             'interval': INTERVAL,
-            'clustering_auth_unlocked': clustering_unlocked,
+            'clustering_auth_unlocked': _cached_clustering_session_valid(),
             'clustering_scheduler_active': _clustering_scheduler_active,
         }
         if _ocr_worker:

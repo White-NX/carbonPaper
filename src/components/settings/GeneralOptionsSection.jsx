@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Circle, ChevronDown } from 'lucide-react';
 import { getLightweightConfig, setLightweightConfig, switchToLightweightMode } from '../../lib/lightweight_api';
+import { withAuth } from '../../lib/auth_api';
 
 function DropdownSelect({ value, onChange, options }) {
   const [open, setOpen] = useState(false);
@@ -157,7 +158,7 @@ export default function GeneralOptionsSection({
     const next = !gameModeEnabled;
     setGameModeEnabled(next);
     try {
-      await invoke('toggle_game_mode', { enabled: next });
+      await withAuth(() => invoke('toggle_game_mode', { enabled: next }), { autoPrompt: true });
     } catch (err) {
       console.error('Failed to toggle game mode:', err);
       setGameModeEnabled(!next);

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { Globe } from 'lucide-react';
+import { withAuth } from '../../lib/auth_api';
 
 export default function BrowserExtensionSection() {
   const { t } = useTranslation();
@@ -52,7 +53,7 @@ export default function BrowserExtensionSection() {
 
   const handleEnhanceToggle = async (browser, enabled) => {
     try {
-      await invoke('set_extension_enhancement', { browser, enabled });
+      await withAuth(() => invoke('set_extension_enhancement', { browser, enabled }), { autoPrompt: true });
       setEnhance(prev => ({ ...prev, [browser]: enabled }));
     } catch (e) {
       console.error('Failed to set extension enhancement:', e);

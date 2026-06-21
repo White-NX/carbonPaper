@@ -507,7 +507,7 @@ pub async fn updater_apply(
     tracing::info!("Update apply: stopping monitor before update");
     match tokio::time::timeout(
         tokio::time::Duration::from_secs(15),
-        crate::monitor::stop_monitor(monitor_state, capture_state, app.clone()),
+        crate::monitor::stop_monitor_impl(monitor_state, capture_state, app.clone()),
     )
     .await
     {

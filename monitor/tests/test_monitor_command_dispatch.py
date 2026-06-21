@@ -45,6 +45,8 @@ def _snapshot_globals():
         "_clustering_scheduler": mm._clustering_scheduler,
         "_clustering_manager": mm._clustering_manager,
         "_clustering_scheduler_active": mm._clustering_scheduler_active,
+        "_last_clustering_session_valid": mm._last_clustering_session_valid,
+        "_storage_pipe": mm._storage_pipe,
     }
 
 
@@ -55,6 +57,8 @@ def _restore_globals(snapshot):
     mm._clustering_scheduler = snapshot["_clustering_scheduler"]
     mm._clustering_manager = snapshot["_clustering_manager"]
     mm._clustering_scheduler_active = snapshot["_clustering_scheduler_active"]
+    mm._last_clustering_session_valid = snapshot["_last_clustering_session_valid"]
+    mm._storage_pipe = snapshot["_storage_pipe"]
     mm.paused_event.clear()
     mm.stop_event.clear()
 
@@ -179,5 +183,29 @@ def test_auth_token_and_sequence_number_guard():
             {"command": "status", "_auth_token": "secret-token", "_seq_no": 10}
         )
         assert "error" not in ok
+    finally:
+        _restore_globals(snapshot)
+
+
+def test_status_uses_cached_clustering_auth_without_sync_gate(monkeypatch):
+    snapshot = _snapshot_globals()
+    try:
+        mm._auth_token = None
+        mm._last_seq_no = -1
+        mm._ocr_worker = None
+        mm._clustering_scheduler = DummyScheduler()
+        mm._clustering_scheduler_active = True
+        mm._last_clustering_session_valid = True
+        mm._storage_pipe = "storage-pipe"
+
+        def fail_if_called(force=False):
+            raise AssertionError("status must not call auth gate synchronously")
+
+        monkeypatch.setattr(mm, "_sync_clustering_scheduler_auth_gate", fail_if_called)
+
+        result = mm._handle_command_impl({"command": "status"})
+
+        assert result["clustering_auth_unlocked"] is True
+        assert result["clustering_scheduler_active"] is True
     finally:
         _restore_globals(snapshot)

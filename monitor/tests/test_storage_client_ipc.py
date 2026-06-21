@@ -79,6 +79,8 @@ def test_send_request_handles_utf8_split_and_partial_write(monkeypatch):
     request = {"command": "probe", "payload": "x" * (70 * 1024)}
     expected_wire_request = dict(request)
     expected_wire_request["_ipc_keepalive"] = True
+    expected_wire_request["_auth_token"] = ""
+    expected_wire_request["_seq_no"] = 1
     expected_request_len = 4 + len(json.dumps(expected_wire_request).encode("utf-8"))
 
     result = client._send_request(request)
