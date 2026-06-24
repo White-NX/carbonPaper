@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Sparkles, Plus, Loader2, RefreshCw, AlertCircle, X,
-  Zap, Image as ImageIcon, Clock, Hash, Trash2,
+  Zap, Image as ImageIcon, Clock, Hash, FileText,
 } from 'lucide-react';
 import {
   listSmartClusters, deleteSmartCluster, updateSmartClusterAnchor,
@@ -37,6 +37,305 @@ function isAuthRequiredError(err) {
   return String(err?.message || err || '').includes('AUTH_REQUIRED');
 }
 
+function normalizeSummaryList(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'object') return Object.values(value);
+  return [value];
+}
+
+function extractSnapshotId(item) {
+  if (item === null || item === undefined) return null;
+  if (typeof item === 'number' && item > 0) return item;
+  if (typeof item === 'string') {
+    const match = item.match(/#?(\d{2,})/);
+    return match ? Number(match[1]) : null;
+  }
+  if (typeof item === 'object') {
+    const id = item.screenshot_id ?? item.snapshot_id ?? item.id;
+    return typeof id === 'number' && id > 0 ? id : null;
+  }
+  return null;
+}
+
+function getEvidenceRef(item, index) {
+  if (item && typeof item === 'object') {
+    return item.ref ?? item.reference ?? item.index ?? index + 1;
+  }
+  return index + 1;
+}
+
+function formatKeyPoint(item) {
+  if (item === null || item === undefined) return '';
+  if (typeof item === 'string') return item;
+  if (typeof item === 'number' || typeof item === 'boolean') return String(item);
+  if (typeof item === 'object') {
+    const text = item.point || item.text || item.summary || item.title || item.label;
+    if (text) return text;
+    try {
+      return JSON.stringify(item);
+    } catch {
+      return String(item);
+    }
+  }
+  return '';
+}
+
+function formatEvidenceItem(item, index) {
+  const snapshotId = extractSnapshotId(item);
+  const ref = getEvidenceRef(item, index);
+  if (item === null || item === undefined) {
+    return { ref, snapshotId, text: '', payload: null };
+  }
+  if (typeof item === 'string') {
+    return {
+      ref,
+      snapshotId,
+      text: item.replace(/^#?\d+\s*[:：-]?\s*/, '').trim(),
+      payload: snapshotId ? { screenshot_id: snapshotId } : null,
+    };
+  }
+  if (typeof item === 'number') {
+    return {
+      ref,
+      snapshotId,
+      text: '',
+      payload: snapshotId ? { screenshot_id: snapshotId } : null,
+    };
+  }
+  if (typeof item !== 'object') {
+    return { ref, snapshotId, text: String(item), payload: null };
+  }
+
+  const parts = [];
+  if (item.label || item.title) parts.push(item.label || item.title);
+  if (item.window_title) parts.push(item.window_title);
+  if (item.excerpt) parts.push(`"${item.excerpt}"`);
+  if (item.text) parts.push(item.text);
+  if (item.time || item.created_at) parts.push(item.time || item.created_at);
+
+  return {
+    ref,
+    snapshotId,
+    text: parts.join(' · '),
+    payload: snapshotId
+      ? {
+        screenshot_id: snapshotId,
+        id: snapshotId,
+        window_title: item.window_title || item.title || item.label || null,
+        process_name: item.process_name || null,
+        category: item.category || null,
+        created_at: item.created_at || item.time || null,
+      }
+      : null,
+  };
+}
+
+function getEvidenceByRef(evidenceItems, ref) {
+  const normalizedRef = String(ref);
+  return evidenceItems.find((item, index) => String(getEvidenceRef(item, index)) === normalizedRef);
+}
+
+function isSafeMarkdownUrl(url) {
+  return /^(https?:|mailto:)/i.test(String(url || '').trim());
+}
+
+function MarkdownInline({ text, evidenceItems, onOpenCitation }) {
+  if (!text) return null;
+
+  const parts = [];
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\)|\[(\d+)\])/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(text.slice(lastIndex, match.index));
+    }
+
+    const token = match[0];
+    const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+    const citationMatch = token.match(/^\[(\d+)\]$/);
+    if (linkMatch) {
+      const [, label, url] = linkMatch;
+      if (isSafeMarkdownUrl(url)) {
+        parts.push(
+          <a
+            key={`link-${match.index}`}
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="text-ide-accent underline decoration-ide-accent/40 underline-offset-2 hover:text-ide-accent/80"
+          >
+            <MarkdownInline text={label} evidenceItems={evidenceItems} onOpenCitation={onOpenCitation} />
+          </a>
+        );
+      } else {
+        parts.push(label);
+      }
+    } else if (citationMatch) {
+      const ref = citationMatch[1];
+      const evidence = getEvidenceByRef(evidenceItems, ref);
+      const snapshotId = extractSnapshotId(evidence);
+      if (evidence && snapshotId) {
+        parts.push(
+          <button
+            key={`${ref}-${match.index}`}
+            type="button"
+            onClick={() => onOpenCitation(evidence)}
+            className="mx-0.5 inline-flex h-5 min-w-5 items-center justify-center rounded border border-ide-accent/40 bg-ide-accent/10 px-1.5 text-[11px] font-medium text-ide-accent hover:bg-ide-accent/20"
+            title={`#${snapshotId}`}
+          >
+            {ref}
+          </button>
+        );
+      } else {
+        parts.push(token);
+      }
+    } else if (token.startsWith('`')) {
+      parts.push(
+        <code key={`code-${match.index}`} className="rounded bg-ide-bg px-1 py-0.5 font-mono text-[0.92em] text-ide-accent">
+          {token.slice(1, -1)}
+        </code>
+      );
+    } else if (token.startsWith('**')) {
+      parts.push(<strong key={`bold-${match.index}`} className="font-bold text-ide-text">{token.slice(2, -2)}</strong>);
+    } else if (token.startsWith('*')) {
+      parts.push(<em key={`em-${match.index}`} className="italic">{token.slice(1, -1)}</em>);
+    } else {
+      parts.push(token);
+    }
+    lastIndex = pattern.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    parts.push(text.slice(lastIndex));
+  }
+
+  return <>{parts}</>;
+}
+
+function parseMarkdownBlocks(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  const blocks = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const raw = lines[i];
+    const line = raw.trim();
+    if (!line) {
+      i += 1;
+      continue;
+    }
+
+    const fence = line.match(/^```(\w+)?\s*$/);
+    if (fence) {
+      const codeLines = [];
+      i += 1;
+      while (i < lines.length && !lines[i].trim().startsWith('```')) {
+        codeLines.push(lines[i]);
+        i += 1;
+      }
+      if (i < lines.length) i += 1;
+      blocks.push({ type: 'code', text: codeLines.join('\n') });
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      blocks.push({ type: 'heading', level: heading[1].length, text: heading[2].trim() });
+      i += 1;
+      continue;
+    }
+
+    const unordered = line.match(/^[-*]\s+(.+)$/);
+    if (unordered) {
+      const items = [];
+      while (i < lines.length) {
+        const item = lines[i].trim().match(/^[-*]\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1].trim());
+        i += 1;
+      }
+      blocks.push({ type: 'ul', items });
+      continue;
+    }
+
+    const ordered = line.match(/^\d+\.\s+(.+)$/);
+    if (ordered) {
+      const items = [];
+      while (i < lines.length) {
+        const item = lines[i].trim().match(/^\d+\.\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1].trim());
+        i += 1;
+      }
+      blocks.push({ type: 'ol', items });
+      continue;
+    }
+
+    const paragraph = [];
+    while (i < lines.length) {
+      const current = lines[i].trim();
+      if (!current) break;
+      if (/^```/.test(current) || /^(#{1,3})\s+/.test(current) || /^[-*]\s+/.test(current) || /^\d+\.\s+/.test(current)) break;
+      paragraph.push(current);
+      i += 1;
+    }
+    blocks.push({ type: 'p', text: paragraph.join(' ') });
+  }
+
+  return blocks;
+}
+
+function MarkdownText({ text, evidenceItems, onOpenCitation, className }) {
+  if (!text) return null;
+  const blocks = parseMarkdownBlocks(text);
+
+  return (
+    <div className={className}>
+      {blocks.map((block, idx) => {
+        if (block.type === 'heading') {
+          const headingClass = block.level === 1
+            ? 'text-[15px] font-bold text-ide-text'
+            : block.level === 2
+              ? 'text-[14px] font-bold text-ide-text'
+              : 'text-[13px] font-semibold text-ide-text';
+          return (
+            <div key={idx} className={headingClass}>
+              <MarkdownInline text={block.text} evidenceItems={evidenceItems} onOpenCitation={onOpenCitation} />
+            </div>
+          );
+        }
+        if (block.type === 'ul' || block.type === 'ol') {
+          const ListTag = block.type;
+          return (
+            <ListTag key={idx} className={`space-y-1 pl-5 ${block.type === 'ul' ? 'list-disc' : 'list-decimal'}`}>
+              {block.items.map((item, itemIdx) => (
+                <li key={itemIdx} className="break-words">
+                  <MarkdownInline text={item} evidenceItems={evidenceItems} onOpenCitation={onOpenCitation} />
+                </li>
+              ))}
+            </ListTag>
+          );
+        }
+        if (block.type === 'code') {
+          return (
+            <pre key={idx} className="overflow-x-auto rounded-md border border-ide-border bg-ide-bg p-3 text-xs leading-5 text-ide-text">
+              <code>{block.text}</code>
+            </pre>
+          );
+        }
+        return (
+          <p key={idx} className="break-words">
+            <MarkdownInline text={block.text} evidenceItems={evidenceItems} onOpenCitation={onOpenCitation} />
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
 function emitAuthRequired() {
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('cp-auth-required'));
@@ -61,6 +360,9 @@ export default function SmartClustersView({
   const [thumbnailCache, setThumbnailCache] = useState({});
 
   const selected = clusters.find(c => c.id === selectedId) || null;
+  const selectedSummary = selected?.summary || null;
+  const selectedKeyPoints = normalizeSummaryList(selectedSummary?.key_points);
+  const selectedEvidence = normalizeSummaryList(selectedSummary?.evidence);
 
   const loadClusters = useCallback(async () => {
     if (!active || !isAuthenticated) {
@@ -244,6 +546,28 @@ export default function SmartClustersView({
     }
   }, [loadClusters, loadStatus]);
 
+  const handleOpenSummaryEvidence = useCallback((item, index = 0) => {
+    const evidence = formatEvidenceItem(item, index);
+    if (!evidence.payload) return;
+    const payload = {
+      ...evidence.payload,
+      sourceLabel: t('smartClusters.aiSummary', 'AI 汇总'),
+      sourceDetail: selected?.anchor_text || null,
+      sourceType: 'smart-cluster-summary',
+    };
+
+    if (onOpenSnapshotPreview) {
+      onOpenSnapshotPreview(payload, {
+        sourceLabel: t('smartClusters.aiSummary', 'AI 汇总'),
+        sourceDetail: selected?.anchor_text || null,
+        sourceType: 'smart-cluster-summary',
+      });
+      return;
+    }
+
+    onSelectScreenshot?.(payload);
+  }, [onOpenSnapshotPreview, onSelectScreenshot, selected?.anchor_text, t]);
+
   // Render the calibration sub-page when creating
   if (creating) {
     return (
@@ -404,6 +728,117 @@ export default function SmartClustersView({
                     </div>
                   </div>
                 </div>
+
+                {selectedSummary && (
+                  <section className="rounded-md border border-ide-border bg-ide-panel/60 p-4 space-y-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 text-[15px] font-bold leading-6 text-ide-text">
+                          <FileText className="w-4 h-4 text-ide-accent" />
+                          <span>{selectedSummary.title || t('smartClusters.aiSummary', 'AI 汇总')}</span>
+                        </div>
+                        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-ide-muted">
+                          {selectedSummary.model_name && (
+                            <span>{selectedSummary.model_provider ? `${selectedSummary.model_provider} · ` : ''}{selectedSummary.model_name}</span>
+                          )}
+                          {selectedSummary.source_snapshot_count !== null && selectedSummary.source_snapshot_count !== undefined && (
+                            <span>{t('smartClusters.summarySources', '{{count}} 张来源快照', { count: selectedSummary.source_snapshot_count })}</span>
+                          )}
+                          {selectedSummary.updated_at && (
+                            <span>{t('smartClusters.summaryUpdatedAt', '汇总于 {{time}}', { time: formatTimestamp(selectedSummary.updated_at) })}</span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {selectedSummary.summary && (
+                      <MarkdownText
+                        text={selectedSummary.summary}
+                        evidenceItems={selectedEvidence}
+                        onOpenCitation={handleOpenSummaryEvidence}
+                        className="space-y-2.5 text-[13px] font-normal leading-[1.65] text-ide-text/90"
+                      />
+                    )}
+
+                    {selectedSummary.ocr_summary && (
+                      <div className="space-y-2">
+                        <div className="text-xs font-semibold text-ide-muted">
+                          {t('smartClusters.ocrSummary', 'OCR 统合概述')}
+                        </div>
+                        <MarkdownText
+                          text={selectedSummary.ocr_summary}
+                          evidenceItems={selectedEvidence}
+                          onOpenCitation={handleOpenSummaryEvidence}
+                          className="space-y-2.5 text-[13px] font-normal leading-[1.65] text-ide-text/85"
+                        />
+                      </div>
+                    )}
+
+                    {selectedKeyPoints.length > 0 && (
+                      <div className="space-y-2">
+                        <div className="text-xs font-semibold text-ide-muted">
+                          {t('smartClusters.keyPoints', '要点')}
+                        </div>
+                        <ul className="space-y-1.5 text-[13px] font-normal leading-[1.6] text-ide-text/85">
+                          {selectedKeyPoints.map((item, idx) => {
+                            const text = formatKeyPoint(item);
+                            return text ? (
+                              <li key={idx} className="flex gap-2">
+                                <span className="mt-2.5 h-1.5 w-1.5 shrink-0 rounded-full bg-ide-muted/70" />
+                                <span className="min-w-0 break-words">
+                                  <MarkdownInline text={text} evidenceItems={selectedEvidence} onOpenCitation={handleOpenSummaryEvidence} />
+                                </span>
+                              </li>
+                            ) : null;
+                          })}
+                        </ul>
+                      </div>
+                    )}
+
+                    {selectedEvidence.length > 0 && (
+                      <details className="group">
+                        <summary className="cursor-pointer select-none text-xs font-semibold text-ide-muted hover:text-ide-text">
+                          {t('smartClusters.evidence', '证据')}
+                        </summary>
+                        <ul className="mt-2 space-y-1 text-[11px] text-ide-muted">
+                          {selectedEvidence.map((item, idx) => {
+                            const evidence = formatEvidenceItem(item, idx);
+                            const label = evidence.text || t('smartClusters.evidenceSnapshot', '来源快照');
+                            const content = (
+                              <>
+                                <span className="inline-flex h-4 min-w-4 items-center justify-center rounded border border-ide-border bg-ide-bg px-1 text-[10px] text-ide-muted">
+                                  {evidence.ref}
+                                </span>
+                                {evidence.snapshotId && (
+                                  <span className="font-mono text-ide-accent">#{evidence.snapshotId}</span>
+                                )}
+                                <span className="min-w-0 break-words">{label}</span>
+                              </>
+                            );
+                            return (
+                              <li key={idx}>
+                                {evidence.payload ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenSummaryEvidence(item, idx)}
+                                    className="flex w-full items-start gap-2 rounded px-1 py-0.5 text-left hover:bg-ide-hover/30 hover:text-ide-text"
+                                    title={evidence.snapshotId ? `#${evidence.snapshotId}` : undefined}
+                                  >
+                                    {content}
+                                  </button>
+                                ) : (
+                                  <div className="flex items-start gap-2 px-1 py-0.5">
+                                    {content}
+                                  </div>
+                                )}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </details>
+                    )}
+                  </section>
+                )}
 
                 {/* Assignments */}
                 {assignments.length === 0 ? (

@@ -101,6 +101,25 @@ fn policy_as_object_mut(
         .ok_or_else(|| "Policy is not a valid JSON object".to_string())
 }
 
+fn mcp_privacy_acknowledged_from_policy_or_db(
+    storage_state: &StorageState,
+    policy: &serde_json::Value,
+) -> bool {
+    let legacy_enabled = policy
+        .get("mcp_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_existing_token = policy
+        .get("mcp_token_encrypted")
+        .and_then(|v| v.as_str())
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    legacy_enabled
+        || has_existing_token
+        || storage_state.is_mcp_privacy_acknowledged().unwrap_or(false)
+}
+
 #[tauri::command]
 pub async fn mcp_set_enabled(
     app: tauri::AppHandle,
@@ -113,6 +132,10 @@ pub async fn mcp_set_enabled(
 
     if enabled {
         let mut policy = storage_state.load_policy()?;
+        let was_enabled = policy
+            .get("mcp_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let existing_token = policy.get("mcp_token_encrypted").and_then(|v| v.as_str());
         let (token_plaintext, is_new_token) = if let Some(encrypted_b64) = existing_token {
             let token = mcp_token::decrypt_token(&credential_state, encrypted_b64)?;
@@ -150,10 +173,12 @@ pub async fn mcp_set_enabled(
         mcp_state.set_token_hash(token_hash);
         if let Err(e) = mcp_server::start_server(app.clone(), port, token_hash).await {
             mcp_state.set_last_error(e.clone());
-            if let Ok(mut rollback_policy) = storage_state.load_policy() {
-                if let Ok(obj) = policy_as_object_mut(&mut rollback_policy) {
-                    obj.insert("mcp_enabled".into(), serde_json::json!(false));
-                    let _ = storage_state.save_policy(&rollback_policy);
+            if !was_enabled {
+                if let Ok(mut rollback_policy) = storage_state.load_policy() {
+                    if let Ok(obj) = policy_as_object_mut(&mut rollback_policy) {
+                        obj.insert("mcp_enabled".into(), serde_json::json!(false));
+                        let _ = storage_state.save_policy(&rollback_policy);
+                    }
                 }
             }
             let _ = app.emit(
@@ -200,6 +225,7 @@ pub async fn mcp_get_status(
     let port = mcp_server::get_port(&storage_state);
     let running = mcp_state.is_running();
     let last_error = mcp_state.get_last_error();
+    let privacy_acknowledged = mcp_privacy_acknowledged_from_policy_or_db(&storage_state, &policy);
     let state = if !enabled {
         "disabled"
     } else if running {
@@ -222,8 +248,16 @@ pub async fn mcp_get_status(
         "port": port,
         "running": running,
         "state": state,
-        "error": last_error
+        "error": last_error,
+        "privacy_acknowledged": privacy_acknowledged
     }))
+}
+
+#[tauri::command]
+pub async fn mcp_ack_privacy_warning(
+    storage_state: tauri::State<'_, Arc<StorageState>>,
+) -> Result<(), String> {
+    storage_state.mark_mcp_privacy_acknowledged()
 }
 
 #[tauri::command]

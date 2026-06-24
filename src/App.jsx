@@ -137,7 +137,7 @@ function App() {
   const backendStatusRef = useRef('unknown');
   const backendStartAtRef = useRef(null);
   const lastBackendErrorRef = useRef('');
-  const [activeTab, setActiveTab] = useState('preview'); // 'preview' | 'advanced-search' | 'tasks'
+  const [activeTab, setActiveTab] = useState('preview'); // 'preview' | 'advanced-search' | 'smart-cluster'
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
   const [searchMode, setSearchMode] = useState('ocr');
   const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });

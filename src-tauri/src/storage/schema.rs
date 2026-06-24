@@ -9,6 +9,8 @@ use std::sync::atomic::Ordering;
 use super::StorageState;
 
 impl StorageState {
+    const MCP_PRIVACY_ACKNOWLEDGED_KEY: &'static str = "mcp_privacy_acknowledged";
+
     /// Initialize storage (create directories and database).
     pub fn initialize(&self) -> Result<(), String> {
         let init_start = std::time::Instant::now();
@@ -260,6 +262,30 @@ impl StorageState {
         Ok(Self::is_startup_vacuum_pending(conn))
     }
 
+    pub fn is_mcp_privacy_acknowledged(&self) -> Result<bool, String> {
+        let guard = self.get_connection_named("mcp_privacy_ack_check")?;
+        let conn = guard.as_ref().unwrap();
+        let acknowledged: bool = conn
+            .query_row(
+                "SELECT 1 FROM app_metadata WHERE key = ?1",
+                params![Self::MCP_PRIVACY_ACKNOWLEDGED_KEY],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        Ok(acknowledged)
+    }
+
+    pub fn mark_mcp_privacy_acknowledged(&self) -> Result<(), String> {
+        let guard = self.get_connection_named("mcp_privacy_ack_mark")?;
+        let conn = guard.as_ref().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, '1')",
+            params![Self::MCP_PRIVACY_ACKNOWLEDGED_KEY],
+        )
+        .map_err(|e| format!("Failed to mark MCP privacy acknowledgement: {}", e))?;
+        Ok(())
+    }
+
     /// Run the versioned one-time full VACUUM if needed.
     pub fn run_startup_vacuum_if_needed(&self) -> Result<bool, String> {
         if self
@@ -480,6 +506,28 @@ impl StorageState {
         )?;
         Self::create_table_if_missing(
             conn,
+            "smart_cluster_summaries",
+            r#"
+            CREATE TABLE IF NOT EXISTS smart_cluster_summaries (
+                smart_cluster_id INTEGER PRIMARY KEY,
+                title TEXT,
+                summary TEXT,
+                ocr_summary TEXT,
+                key_points_json TEXT,
+                evidence_json TEXT,
+                source_snapshot_count INTEGER,
+                source_hash TEXT,
+                model_provider TEXT,
+                model_name TEXT,
+                prompt_version TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (smart_cluster_id) REFERENCES smart_clusters(id) ON DELETE CASCADE
+            )
+            "#,
+        )?;
+        Self::create_table_if_missing(
+            conn,
             "smart_cluster_pending",
             r#"
             CREATE TABLE IF NOT EXISTS smart_cluster_pending (
@@ -492,6 +540,7 @@ impl StorageState {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_smart_cluster_assignments_cluster ON smart_cluster_assignments(smart_cluster_id);
              CREATE INDEX IF NOT EXISTS idx_smart_cluster_assignments_screenshot ON smart_cluster_assignments(screenshot_id);
+             CREATE INDEX IF NOT EXISTS idx_smart_cluster_summaries_updated_at ON smart_cluster_summaries(updated_at);
              CREATE INDEX IF NOT EXISTS idx_smart_cluster_pending_queued_at ON smart_cluster_pending(queued_at);",
         ).map_err(|e| format!("Failed to create smart_cluster indices: {}", e))?;
 

@@ -497,7 +497,7 @@ def _handle_command_impl(req: dict):
 
         try:
             results = _ocr_worker.search_by_natural_language(
-                query,
+                query=query,
                 n_results=limit,
                 offset=offset,
                 process_names=process_names,

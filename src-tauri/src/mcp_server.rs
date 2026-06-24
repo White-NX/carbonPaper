@@ -21,6 +21,7 @@ use crate::credential_manager::CredentialManagerState;
 use crate::mcp_token;
 use crate::monitor::{self, MonitorState};
 use crate::sensitive_filter::SensitiveFilterState;
+use crate::storage::smart_cluster::{SmartClusterSummaryRecord, SmartClusterSummaryUpsert};
 use crate::storage::StorageState;
 use percent_encoding::percent_decode_str;
 use tauri::{Emitter, Manager};
@@ -354,6 +355,71 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                     },
                     "required": ["task_id", "label"]
                 }
+            },
+            {
+                "name": "get_smart_clusters",
+                "description": "List smart clusters with assignment counts and any stored AI-generated summary.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "get_smart_cluster_ocr_corpus",
+                "description": "Get assigned snapshots for a smart cluster with joined OCR text, for AI summarization. Results are paginated and ordered by rerank score.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cluster_id": { "type": "integer", "description": "Smart cluster ID" },
+                        "page": { "type": "integer", "description": "Page number (0-based, default 0)" },
+                        "page_size": { "type": "integer", "description": "Page size (default 50, max 200)" },
+                        "include_empty_ocr": { "type": "boolean", "description": "Include snapshots that have no OCR text (default false)" }
+                    },
+                    "required": ["cluster_id"]
+                }
+            },
+            {
+                "name": "get_smart_cluster_summary",
+                "description": "Get the stored AI-generated summary for a smart cluster, if one exists.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cluster_id": { "type": "integer", "description": "Smart cluster ID" }
+                    },
+                    "required": ["cluster_id"]
+                }
+            },
+            {
+                "name": "upsert_smart_cluster_summary",
+                "description": "Create or replace the stored AI-generated title, cluster overview, OCR summary, key points, evidence, and model metadata for a smart cluster.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cluster_id": { "type": "integer", "description": "Smart cluster ID" },
+                        "title": { "type": "string", "description": "Short AI-generated title" },
+                        "summary": { "type": "string", "description": "Cluster-level introduction or overview" },
+                        "ocr_summary": { "type": "string", "description": "Integrated summary of OCR information across assigned snapshots" },
+                        "key_points": { "description": "Optional JSON array/object of key points" },
+                        "evidence": { "description": "Optional JSON array/object describing source snapshot evidence" },
+                        "source_snapshot_count": { "type": "integer", "description": "Number of source snapshots used" },
+                        "source_hash": { "type": "string", "description": "Optional hash/fingerprint of the source corpus" },
+                        "model_provider": { "type": "string", "description": "Model provider name" },
+                        "model_name": { "type": "string", "description": "Model name" },
+                        "prompt_version": { "type": "string", "description": "Prompt/template version" }
+                    },
+                    "required": ["cluster_id"]
+                }
+            },
+            {
+                "name": "delete_smart_cluster_summary",
+                "description": "Delete the stored AI-generated summary for a smart cluster. The smart cluster and its assigned snapshots are preserved.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cluster_id": { "type": "integer", "description": "Smart cluster ID" }
+                    },
+                    "required": ["cluster_id"]
+                }
             }
         ]
     });
@@ -388,6 +454,11 @@ async fn handle_tools_call(
         "get_task_clusters" => tool_get_task_clusters(state, args).await,
         "get_task_screenshots" => tool_get_task_screenshots(state, args).await,
         "rename_task" => tool_rename_task(state, args).await,
+        "get_smart_clusters" => tool_get_smart_clusters(state, args).await,
+        "get_smart_cluster_ocr_corpus" => tool_get_smart_cluster_ocr_corpus(state, args).await,
+        "get_smart_cluster_summary" => tool_get_smart_cluster_summary(state, args).await,
+        "upsert_smart_cluster_summary" => tool_upsert_smart_cluster_summary(state, args).await,
+        "delete_smart_cluster_summary" => tool_delete_smart_cluster_summary(state, args).await,
         _ => Err(format!("Unknown tool: {}", tool_name)),
     };
 
@@ -570,6 +641,136 @@ const CENSORED_LABEL: &str = "[censored]";
 /// Decode percent-encoded URL to UTF-8 for sensitive content checking.
 fn decode_url_for_filter(url: &str) -> String {
     percent_decode_str(url).decode_utf8_lossy().into_owned()
+}
+
+fn value_contains_sensitive(filter: &SensitiveFilterState, value: &Value) -> bool {
+    match value {
+        Value::String(s) => filter.contains_sensitive(s),
+        Value::Array(items) => items.iter().any(|v| value_contains_sensitive(filter, v)),
+        Value::Object(map) => map.values().any(|v| value_contains_sensitive(filter, v)),
+        _ => false,
+    }
+}
+
+fn mask_json_strings(filter: &SensitiveFilterState, value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            if filter.contains_sensitive(s) {
+                *s = filter.mask_sensitive(s);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                mask_json_strings(filter, item);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                mask_json_strings(filter, item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cleanse_smart_cluster_summary(
+    mut summary: SmartClusterSummaryRecord,
+    filter: &SensitiveFilterState,
+) -> Option<SmartClusterSummaryRecord> {
+    if !filter.is_enabled() {
+        return Some(summary);
+    }
+
+    let contains_sensitive = summary
+        .title
+        .as_deref()
+        .is_some_and(|s| filter.contains_sensitive(s))
+        || summary
+            .summary
+            .as_deref()
+            .is_some_and(|s| filter.contains_sensitive(s))
+        || summary
+            .ocr_summary
+            .as_deref()
+            .is_some_and(|s| filter.contains_sensitive(s))
+        || summary
+            .key_points
+            .as_ref()
+            .is_some_and(|v| value_contains_sensitive(filter, v))
+        || summary
+            .evidence
+            .as_ref()
+            .is_some_and(|v| value_contains_sensitive(filter, v));
+
+    if !contains_sensitive {
+        return Some(summary);
+    }
+
+    match filter.get_mode().as_str() {
+        "mask" => {
+            if let Some(ref mut title) = summary.title {
+                if filter.contains_sensitive(title) {
+                    *title = filter.mask_sensitive(title);
+                }
+            }
+            if let Some(ref mut text) = summary.summary {
+                if filter.contains_sensitive(text) {
+                    *text = filter.mask_sensitive(text);
+                }
+            }
+            if let Some(ref mut text) = summary.ocr_summary {
+                if filter.contains_sensitive(text) {
+                    *text = filter.mask_sensitive(text);
+                }
+            }
+            if let Some(ref mut value) = summary.key_points {
+                mask_json_strings(filter, value);
+            }
+            if let Some(ref mut value) = summary.evidence {
+                mask_json_strings(filter, value);
+            }
+            Some(summary)
+        }
+        "remove_paragraph" => {
+            if summary
+                .title
+                .as_deref()
+                .is_some_and(|s| filter.contains_sensitive(s))
+            {
+                summary.title = Some(CENSORED_LABEL.to_string());
+            }
+            if summary
+                .summary
+                .as_deref()
+                .is_some_and(|s| filter.contains_sensitive(s))
+            {
+                summary.summary = Some(CENSORED_LABEL.to_string());
+            }
+            if summary
+                .ocr_summary
+                .as_deref()
+                .is_some_and(|s| filter.contains_sensitive(s))
+            {
+                summary.ocr_summary = Some(CENSORED_LABEL.to_string());
+            }
+            if summary
+                .key_points
+                .as_ref()
+                .is_some_and(|v| value_contains_sensitive(filter, v))
+            {
+                summary.key_points = None;
+            }
+            if summary
+                .evidence
+                .as_ref()
+                .is_some_and(|v| value_contains_sensitive(filter, v))
+            {
+                summary.evidence = None;
+            }
+            Some(summary)
+        }
+        _ => None,
+    }
 }
 
 async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value, String> {
@@ -1553,6 +1754,245 @@ async fn tool_rename_task(state: &McpServerInner, args: Value) -> Result<Value, 
         .await
         .map_err(|e| format!("Task join error: {:?}", e))?
         .map(|_| serde_json::json!({"status": "ok"}))
+}
+
+async fn tool_get_smart_clusters(state: &McpServerInner, _args: Value) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
+    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = storage.inner().clone();
+    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
+    let filter = filter.inner().clone();
+
+    let clusters = tokio::task::spawn_blocking(move || {
+        let filter_mode = filter.get_mode();
+        let clusters = storage.list_smart_clusters()?;
+        let clusters: Vec<_> = clusters
+            .into_iter()
+            .filter_map(|mut c| {
+                if filter.is_enabled() && filter.contains_sensitive(&c.anchor_text) {
+                    match filter_mode.as_str() {
+                        "mask" => c.anchor_text = filter.mask_sensitive(&c.anchor_text),
+                        "remove_paragraph" => c.anchor_text = CENSORED_LABEL.to_string(),
+                        _ => return None,
+                    }
+                }
+                c.summary = c
+                    .summary
+                    .and_then(|summary| cleanse_smart_cluster_summary(summary, &filter));
+                Some(c)
+            })
+            .collect();
+        Ok::<_, String>(clusters)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))??;
+
+    Ok(serde_json::to_value(&clusters).unwrap_or(Value::Null))
+}
+
+async fn tool_get_smart_cluster_ocr_corpus(
+    state: &McpServerInner,
+    args: Value,
+) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
+    let cluster_id = args
+        .get("cluster_id")
+        .or_else(|| args.get("smart_cluster_id"))
+        .and_then(|v| v.as_i64())
+        .ok_or("Missing required parameter: cluster_id")?;
+    let page = args
+        .get("page")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let page_size = args
+        .get("page_size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let include_empty_ocr = args
+        .get("include_empty_ocr")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = storage.inner().clone();
+    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
+    let filter = filter.inner().clone();
+    let (presidio_enabled, presidio_lang, presidio_entities) = filter.get_presidio_config();
+    let app_handle = state.app_handle.clone();
+
+    let mut items = tokio::task::spawn_blocking(move || {
+        let filter_mode = filter.get_mode();
+        let items = storage.list_smart_cluster_ocr_corpus(cluster_id, page, page_size)?;
+        let items: Vec<_> = items
+            .into_iter()
+            .filter_map(|mut item| {
+                if !include_empty_ocr && item.ocr_text.trim().is_empty() {
+                    return None;
+                }
+                if filter.is_enabled() {
+                    let is_sensitive = filter.is_record_sensitive(
+                        item.window_title.as_deref(),
+                        &[item.ocr_text.as_str()],
+                    );
+                    if is_sensitive {
+                        match filter_mode.as_str() {
+                            "mask" => {
+                                if let Some(ref mut title) = item.window_title {
+                                    if filter.contains_sensitive(title) {
+                                        *title = filter.mask_sensitive(title);
+                                    }
+                                }
+                                if filter.contains_sensitive(&item.ocr_text) {
+                                    item.ocr_text = filter.mask_sensitive(&item.ocr_text);
+                                }
+                            }
+                            "remove_paragraph" | "reject" => return None,
+                            _ => {}
+                        }
+                    }
+                }
+                Some(item)
+            })
+            .collect();
+        Ok::<_, String>(items)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))??;
+
+    if presidio_enabled && !items.is_empty() {
+        let texts: Vec<String> = items.iter().map(|item| item.ocr_text.clone()).collect();
+        let pii_results =
+            presidio_analyze_texts(&app_handle, &texts, &presidio_lang, &presidio_entities).await;
+        let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
+        let mode = filter_reload.get_mode();
+        match mode.as_str() {
+            "reject" | "remove_paragraph" => {
+                let mut keep = Vec::new();
+                for (i, item) in items.into_iter().enumerate() {
+                    if !has_pii(&pii_results[i]) {
+                        keep.push(item);
+                    }
+                }
+                items = keep;
+            }
+            "mask" => {
+                for (i, item) in items.iter_mut().enumerate() {
+                    if has_pii(&pii_results[i]) {
+                        item.ocr_text = mask_pii_in_text(&item.ocr_text, &pii_results[i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(serde_json::json!({
+        "cluster_id": cluster_id,
+        "page": page,
+        "page_size": page_size,
+        "items": items,
+    }))
+}
+
+async fn tool_get_smart_cluster_summary(
+    state: &McpServerInner,
+    args: Value,
+) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
+    let cluster_id = args
+        .get("cluster_id")
+        .or_else(|| args.get("smart_cluster_id"))
+        .and_then(|v| v.as_i64())
+        .ok_or("Missing required parameter: cluster_id")?;
+    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = storage.inner().clone();
+    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
+    let filter = filter.inner().clone();
+
+    let summary = tokio::task::spawn_blocking(move || {
+        let summary = storage.get_smart_cluster_summary(cluster_id)?;
+        Ok::<_, String>(summary.and_then(|s| cleanse_smart_cluster_summary(s, &filter)))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {:?}", e))??;
+
+    Ok(serde_json::json!({
+        "cluster_id": cluster_id,
+        "summary": summary,
+    }))
+}
+
+async fn tool_upsert_smart_cluster_summary(
+    state: &McpServerInner,
+    args: Value,
+) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
+    let cluster_id = args
+        .get("cluster_id")
+        .or_else(|| args.get("smart_cluster_id"))
+        .and_then(|v| v.as_i64())
+        .ok_or("Missing required parameter: cluster_id")?;
+    let as_string = |name: &str| {
+        args.get(name)
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+    };
+    let as_value = |name: &str| args.get(name).filter(|v| !v.is_null()).cloned();
+    let input = SmartClusterSummaryUpsert {
+        smart_cluster_id: cluster_id,
+        title: as_string("title"),
+        summary: as_string("summary"),
+        ocr_summary: as_string("ocr_summary"),
+        key_points: as_value("key_points"),
+        evidence: as_value("evidence"),
+        source_snapshot_count: args.get("source_snapshot_count").and_then(|v| v.as_i64()),
+        source_hash: as_string("source_hash"),
+        model_provider: as_string("model_provider"),
+        model_name: as_string("model_name"),
+        prompt_version: as_string("prompt_version"),
+    };
+
+    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = storage.inner().clone();
+    let saved = tokio::task::spawn_blocking(move || storage.upsert_smart_cluster_summary(&input))
+        .await
+        .map_err(|e| format!("Task join error: {:?}", e))??;
+
+    Ok(serde_json::json!({
+        "status": "ok",
+        "summary": saved,
+    }))
+}
+
+async fn tool_delete_smart_cluster_summary(
+    state: &McpServerInner,
+    args: Value,
+) -> Result<Value, String> {
+    require_authenticated_session(&state.app_handle)?;
+
+    let cluster_id = args
+        .get("cluster_id")
+        .or_else(|| args.get("smart_cluster_id"))
+        .and_then(|v| v.as_i64())
+        .ok_or("Missing required parameter: cluster_id")?;
+    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = storage.inner().clone();
+    let deleted =
+        tokio::task::spawn_blocking(move || storage.delete_smart_cluster_summary(cluster_id))
+            .await
+            .map_err(|e| format!("Task join error: {:?}", e))??;
+
+    Ok(serde_json::json!({
+        "status": "ok",
+        "deleted": deleted,
+        "cluster_id": cluster_id,
+    }))
 }
 
 // ==================== Presidio model lifecycle helpers ====================

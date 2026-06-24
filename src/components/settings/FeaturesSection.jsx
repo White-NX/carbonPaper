@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Layers, Database, ChevronDown, RefreshCw, ExternalLink, Sparkles, Download, Zap, RotateCcw, Loader2, AlertTriangle } from 'lucide-react';
+import { Layers, Database, ChevronDown, RefreshCw, ExternalLink, Sparkles, Download, Zap, RotateCcw, Loader2, AlertTriangle, Play, X } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { withAuth } from '../../lib/auth_api';
+import { getClusteringStatus, runClustering, saveClusteringResults } from '../../lib/task_api';
 
 export default function FeaturesSection({ monitorStatus }) {
   const { t } = useTranslation();
@@ -12,6 +13,13 @@ export default function FeaturesSection({ monitorStatus }) {
   const [models, setModels] = useState([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [clusteringDropdownOpen, setClusteringDropdownOpen] = useState(false);
+  const [clusteringAdvancedOpen, setClusteringAdvancedOpen] = useState(false);
+  const [clusteringRunning, setClusteringRunning] = useState(false);
+  const [clusteringError, setClusteringError] = useState(null);
+  const [clusteringNotice, setClusteringNotice] = useState(null);
+  const [clusteringStatus, setClusteringStatus] = useState(null);
+  const [rangeStart, setRangeStart] = useState('');
+  const [rangeEnd, setRangeEnd] = useState('');
 
   // Smart Cluster state
   const [scModelAvailable, setScModelAvailable] = useState(false);
@@ -70,6 +78,20 @@ export default function FeaturesSection({ monitorStatus }) {
     if (monitorStatus === 'running') {
       loadModels();
     }
+  }, [monitorStatus]);
+
+  const refreshClusteringStatus = async () => {
+    if (monitorStatus !== 'running') return;
+    try {
+      const result = await getClusteringStatus();
+      if (result?.status === 'success') {
+        setClusteringStatus(result);
+      }
+    } catch { /* ignore */ }
+  };
+
+  useEffect(() => {
+    refreshClusteringStatus();
   }, [monitorStatus]);
 
   // Smart Cluster: check model availability + poll status
@@ -159,6 +181,83 @@ export default function FeaturesSection({ monitorStatus }) {
     await saveConfig(newConfig);
   };
 
+  const handleRunClustering = async () => {
+    setClusteringRunning(true);
+    setClusteringError(null);
+    setClusteringNotice(null);
+    try {
+      const options = { manual: true };
+      if (rangeStart) options.startTime = new Date(rangeStart).getTime() / 1000;
+      if (rangeEnd) options.endTime = new Date(rangeEnd).getTime() / 1000;
+
+      let result = await runClustering(options);
+      if (result?.status === 'needs_user_choice') {
+        const hasCompleteRange = Boolean(rangeStart && rangeEnd);
+        const count = result?.estimate?.count ?? result?.n_total ?? 0;
+        const memory = result?.estimate?.memory || {};
+        const scope = hasCompleteRange
+          ? t('tasks.clusteringRangeScope')
+          : t('tasks.clusteringAllScope');
+        const reason = result.reason === 'low_memory'
+          ? t('tasks.clusteringLowMemoryReason')
+          : t('tasks.clusteringLargeRangeReason');
+        const useBatched = window.confirm(t('tasks.clusteringDegradePrompt', {
+          scope,
+          count,
+          reason,
+          estimatedGb: memory.estimated_peak_bytes
+            ? (memory.estimated_peak_bytes / (1024 ** 3)).toFixed(1)
+            : '-',
+        }));
+        result = await runClustering({
+          ...options,
+          clusteringMode: useBatched ? 'batched' : 'full',
+        });
+      }
+
+      if (result?.status === 'empty') {
+        setClusteringError(t('tasks.noData'));
+      }
+
+      if (result?.clusters?.length) {
+        const taskRequests = result.clusters.map((cl) => ({
+          auto_label: cl.dominant_process || null,
+          dominant_process: cl.dominant_process || null,
+          dominant_category: cl.dominant_category || null,
+          start_time: cl.start_time || null,
+          end_time: cl.end_time || null,
+          snapshot_count: cl.snapshot_count || 0,
+          layer: 'hot',
+          screenshot_ids: (cl.snapshot_ids || []).map((id) => Number(id)),
+          confidences: null,
+        }));
+        await saveClusteringResults(taskRequests);
+        setClusteringNotice(t('settings.features.management.clustering.completed', {
+          count: taskRequests.length,
+        }));
+      }
+
+      if (result?.degraded) {
+        setClusteringNotice(t('tasks.clusteringDegradedNotice', {
+          sampleSize: result.sample_size ?? 0,
+          assignedCount: result.assigned_count ?? 0,
+        }));
+      }
+
+      await refreshClusteringStatus();
+    } catch (err) {
+      const msg = String(err?.message || err);
+      if (msg.includes('not found') || msg.includes('ModelNotAvailable') || msg.includes('not downloaded')) {
+        setClusteringError(t('tasks.modelMissing'));
+      } else {
+        setClusteringError(msg);
+      }
+      console.error('Clustering failed:', err);
+    } finally {
+      setClusteringRunning(false);
+    }
+  };
+
   const handleDownloadReranker = async () => {
     if (scDownloadStartedRef.current) return;
     scDownloadStartedRef.current = true;
@@ -212,6 +311,10 @@ export default function FeaturesSection({ monitorStatus }) {
     return sizeStr;
   };
 
+  const lastClusteringRunLabel = clusteringStatus?.config?.last_run
+    ? new Date(clusteringStatus.config.last_run * 1000).toLocaleString()
+    : t('tasks.never');
+
   if (loading || !config) {
     return (
       <div className="flex items-center justify-center py-12 text-ide-muted text-sm">
@@ -249,49 +352,109 @@ export default function FeaturesSection({ monitorStatus }) {
             
             {/* 聚类间隔设置 - 仅在启用时显示 */}
             {config.clustering_enabled && (
-              <div className="mt-4 pt-4 border-t border-ide-border/50 flex items-center justify-between gap-4">
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm text-ide-muted">{t('settings.features.management.clustering.interval_label', '自动聚类间隔')}</p>
-                </div>
-                <div className="relative">
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setClusteringDropdownOpen(!clusteringDropdownOpen);
-                    }}
-                    className="flex items-center gap-2 px-4 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm text-ide-text hover:bg-ide-hover transition-colors min-w-[120px]"
-                  >
-                    <span className="flex-1 text-left">{t(`settings.advanced.clustering.intervals.${config.clustering_interval || '1w'}`)}</span>
-                    <ChevronDown className={`w-4 h-4 text-ide-muted transition-transform ${clusteringDropdownOpen ? 'rotate-180' : ''}`} />
-                  </button>
-                  {clusteringDropdownOpen && (
-                    <div
-                      className="absolute right-0 top-full mt-2 w-40 bg-ide-panel border border-ide-border rounded-xl shadow-xl z-50 overflow-hidden"
-                      onClick={(e) => e.stopPropagation()}
+              <>
+                <div className="mt-4 pt-4 border-t border-ide-border/50 flex items-center justify-between gap-4">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm text-ide-muted">{t('settings.features.management.clustering.interval_label', '自动聚类间隔')}</p>
+                  </div>
+                  <div className="relative">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setClusteringDropdownOpen(!clusteringDropdownOpen);
+                      }}
+                      className="flex items-center gap-2 px-4 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm text-ide-text hover:bg-ide-hover transition-colors min-w-[120px]"
                     >
-                      {['1d', '1w', '1m', '6m'].map((interval) => (
+                      <span className="flex-1 text-left">{t(`settings.advanced.clustering.intervals.${config.clustering_interval || '1w'}`)}</span>
+                      <ChevronDown className={`w-4 h-4 text-ide-muted transition-transform ${clusteringDropdownOpen ? 'rotate-180' : ''}`} />
+                    </button>
+                    {clusteringDropdownOpen && (
+                      <div
+                        className="absolute right-0 top-full mt-2 w-40 bg-ide-panel border border-ide-border rounded-xl shadow-xl z-50 overflow-hidden"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {['1d', '1w', '1m', '6m'].map((interval) => (
+                          <button
+                            key={interval}
+                            onClick={async () => {
+                              setClusteringDropdownOpen(false);
+                              const newConfig = { ...config, clustering_interval: interval };
+                              await saveConfig(newConfig);
+                              try {
+                                await withAuth(() => invoke('monitor_set_clustering_interval', { interval }), { autoPrompt: true });
+                              } catch { /* best-effort */ }
+                            }}
+                            className={`w-full px-4 py-2.5 text-left hover:bg-ide-hover transition-colors flex items-center justify-between ${interval === (config.clustering_interval || '1w') ? 'bg-ide-accent/10' : ''}`}
+                          >
+                            <span className="text-sm text-ide-text">{t(`settings.advanced.clustering.intervals.${interval}`)}</span>
+                            {interval === (config.clustering_interval || '1w') && (
+                              <div className="w-2 h-2 rounded-full bg-ide-accent shrink-0" />
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mt-3 pt-3 border-t border-ide-border/50">
+                  <button
+                    type="button"
+                    onClick={() => setClusteringAdvancedOpen((v) => !v)}
+                    className="flex w-full items-center justify-between gap-3 text-left"
+                  >
+                    <span className="text-sm text-ide-muted">{t('settings.features.management.clustering.advanced_label', '高级')}</span>
+                    <ChevronDown className={`w-4 h-4 text-ide-muted transition-transform ${clusteringAdvancedOpen ? 'rotate-180' : ''}`} />
+                  </button>
+
+                  {clusteringAdvancedOpen && (
+                    <div className="mt-3 space-y-3">
+                      <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto_1fr] gap-2 items-center">
+                        <input
+                          type="date"
+                          value={rangeStart}
+                          onChange={(e) => setRangeStart(e.target.value)}
+                          className="px-3 py-2 text-xs bg-ide-panel border border-ide-border rounded-lg text-ide-text focus:outline-none focus:border-ide-accent"
+                        />
+                        <span className="hidden sm:block text-xs text-ide-muted">-</span>
+                        <input
+                          type="date"
+                          value={rangeEnd}
+                          onChange={(e) => setRangeEnd(e.target.value)}
+                          className="px-3 py-2 text-xs bg-ide-panel border border-ide-border rounded-lg text-ide-text focus:outline-none focus:border-ide-accent"
+                        />
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
                         <button
-                          key={interval}
-                          onClick={async () => {
-                            setClusteringDropdownOpen(false);
-                            const newConfig = { ...config, clustering_interval: interval };
-                            await saveConfig(newConfig);
-                            try {
-                              await withAuth(() => invoke('monitor_set_clustering_interval', { interval }), { autoPrompt: true });
-                            } catch { /* best-effort */ }
-                          }}
-                          className={`w-full px-4 py-2.5 text-left hover:bg-ide-hover transition-colors flex items-center justify-between ${interval === (config.clustering_interval || '1w') ? 'bg-ide-accent/10' : ''}`}
+                          onClick={handleRunClustering}
+                          disabled={clusteringRunning || monitorStatus !== 'running'}
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-ide-accent hover:bg-ide-accent/90 text-white rounded text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                         >
-                          <span className="text-sm text-ide-text">{t(`settings.advanced.clustering.intervals.${interval}`)}</span>
-                          {interval === (config.clustering_interval || '1w') && (
-                            <div className="w-2 h-2 rounded-full bg-ide-accent shrink-0" />
-                          )}
+                          {clusteringRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                          {t('settings.features.management.clustering.run_now', '立即运行聚类')}
                         </button>
-                      ))}
+                        <span className="text-[11px] text-ide-muted">
+                          {t('tasks.lastRun')}: {lastClusteringRunLabel}
+                        </span>
+                      </div>
+
+                      {clusteringError && (
+                        <div className="flex items-start gap-2 px-2.5 py-2 bg-red-500/10 border border-red-500/30 rounded-lg">
+                          <X className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5 cursor-pointer" onClick={() => setClusteringError(null)} />
+                          <span className="text-xs text-red-400">{clusteringError}</span>
+                        </div>
+                      )}
+                      {clusteringNotice && (
+                        <div className="flex items-start gap-2 px-2.5 py-2 bg-ide-accent/10 border border-ide-accent/30 rounded-lg">
+                          <X className="w-3.5 h-3.5 text-ide-accent shrink-0 mt-0.5 cursor-pointer" onClick={() => setClusteringNotice(null)} />
+                          <span className="text-xs text-ide-text">{clusteringNotice}</span>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
-              </div>
+              </>
             )}
           </div>
           

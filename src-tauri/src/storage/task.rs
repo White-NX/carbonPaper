@@ -39,7 +39,11 @@ pub struct TaskScreenshotStub {
     pub process_name: Option<String>,
     pub window_title: Option<String>,
     pub created_at: String,
+    pub timestamp: Option<f64>,
     pub category: Option<String>,
+    pub page_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation: Option<String>,
 }
 
 /// Result for "related screenshots" query — includes task info + screenshot stubs.
@@ -47,6 +51,12 @@ pub struct TaskScreenshotStub {
 pub struct RelatedScreenshotsResult {
     pub task_id: i64,
     pub task_label: Option<String>,
+    pub dominant_process: Option<String>,
+    pub dominant_category: Option<String>,
+    pub start_time: Option<f64>,
+    pub end_time: Option<f64>,
+    pub snapshot_count: i64,
+    pub current_timestamp: Option<f64>,
     pub screenshots: Vec<TaskScreenshotStub>,
 }
 
@@ -231,6 +241,7 @@ impl StorageState {
                 .prepare(
                     "SELECT ta.screenshot_id, ta.confidence, s.image_path, \
                      s.process_name, s.window_title, s.created_at, s.category, \
+                     strftime('%s', s.created_at) AS timestamp, s.page_url_enc, \
                      s.window_title_enc, s.process_name_enc, s.content_key_encrypted \
                      FROM task_assignments ta \
                      JOIN screenshots s ON s.id = ta.screenshot_id \
@@ -242,6 +253,7 @@ impl StorageState {
 
             let rows = stmt
                 .query_map(params![task_id, page_size, offset], |row| {
+                    let timestamp_str: Option<String> = row.get(7)?;
                     Ok((
                         TaskScreenshotStub {
                             screenshot_id: row.get(0)?,
@@ -251,10 +263,14 @@ impl StorageState {
                             window_title: row.get(4)?,
                             created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                             category: row.get(6)?,
+                            timestamp: timestamp_str.and_then(|s| s.parse::<f64>().ok()),
+                            page_url: None,
+                            relation: None,
                         },
-                        row.get::<_, Option<Vec<u8>>>(7)?, // window_title_enc
-                        row.get::<_, Option<Vec<u8>>>(8)?, // process_name_enc
-                        row.get::<_, Option<Vec<u8>>>(9)?, // content_key_enc
+                        row.get::<_, Option<Vec<u8>>>(8)?, // page_url_enc
+                        row.get::<_, Option<Vec<u8>>>(9)?, // window_title_enc
+                        row.get::<_, Option<Vec<u8>>>(10)?, // process_name_enc
+                        row.get::<_, Option<Vec<u8>>>(11)?, // content_key_enc
                     ))
                 })
                 .map_err(|e| format!("Failed to query task screenshots: {}", e))?;
@@ -271,10 +287,18 @@ impl StorageState {
         // Decrypt encrypted fields outside the DB mutex
         let results = raw_results
             .into_iter()
-            .map(|(mut stub, wt_enc, pn_enc, key_enc)| {
+            .map(|(mut stub, url_enc, wt_enc, pn_enc, key_enc)| {
                 let row_key = key_enc
                     .as_ref()
                     .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+
+                if let (Some(data), Some(key)) = (url_enc.as_ref(), row_key.as_ref()) {
+                    if let Ok(decrypted) = decrypt_with_master_key(key, data) {
+                        if let Ok(url) = String::from_utf8(decrypted) {
+                            stub.page_url = Some(url);
+                        }
+                    }
+                }
 
                 if let (Some(data), Some(key)) = (wt_enc.as_ref(), row_key.as_ref()) {
                     if let Ok(decrypted) = decrypt_with_master_key(key, data) {
@@ -310,64 +334,138 @@ impl StorageState {
         let conn = guard.as_ref().unwrap();
 
         // First, find the task this screenshot belongs to
-        let task_row: Option<(i64, Option<String>, Option<String>)> = conn
+        let task_row: Option<(
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+            i64,
+            Option<String>,
+        )> = conn
             .query_row(
-                "SELECT t.id, t.label, t.auto_label \
+                "SELECT t.id, t.label, t.auto_label, t.dominant_process, \
+                 t.dominant_category, t.start_time, t.end_time, t.snapshot_count, \
+                 strftime('%s', s.created_at) AS current_timestamp \
                  FROM task_assignments ta \
                  JOIN screenshots s ON s.id = ta.screenshot_id \
                  JOIN tasks t ON t.id = ta.task_id \
                  WHERE ta.screenshot_id = ? AND s.is_deleted = 0 \
                  LIMIT 1",
                 params![screenshot_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                        row.get(8)?,
+                    ))
+                },
             )
             .ok();
 
-        let (task_id, label, auto_label) = match task_row {
+        let (
+            task_id,
+            label,
+            auto_label,
+            dominant_process,
+            dominant_category,
+            start_time,
+            end_time,
+            snapshot_count,
+            current_timestamp_str,
+        ) = match task_row {
             Some(r) => r,
             None => {
                 return Ok(RelatedScreenshotsResult {
                     task_id: -1,
                     task_label: None,
+                    dominant_process: None,
+                    dominant_category: None,
+                    start_time: None,
+                    end_time: None,
+                    snapshot_count: 0,
+                    current_timestamp: None,
                     screenshots: vec![],
                 });
             }
         };
 
         let display_label = label.or(auto_label);
+        let current_timestamp = current_timestamp_str.and_then(|s| s.parse::<f64>().ok());
 
-        // Then, fetch other screenshots from the same task
+        if limit <= 0 {
+            return Ok(RelatedScreenshotsResult {
+                task_id,
+                task_label: display_label,
+                dominant_process,
+                dominant_category,
+                start_time,
+                end_time,
+                snapshot_count,
+                current_timestamp,
+                screenshots: vec![],
+            });
+        }
+
+        // Then, fetch nearby screenshots from the same task so the UI shows
+        // temporal context around the current snapshot rather than only the
+        // latest items in the cluster.
         let raw_results: Vec<_> = {
             let mut stmt = conn
                 .prepare(
                     "SELECT ta.screenshot_id, ta.confidence, s.image_path, \
                      s.process_name, s.window_title, s.created_at, s.category, \
-                     s.window_title_enc, s.process_name_enc, s.content_key_encrypted \
+                     strftime('%s', s.created_at) AS timestamp, s.page_url_enc, \
+                     s.window_title_enc, s.process_name_enc, s.content_key_encrypted, \
+                     CASE \
+                       WHEN s.created_at < cur.created_at THEN 'before' \
+                       WHEN s.created_at > cur.created_at THEN 'after' \
+                       ELSE 'nearby' \
+                     END AS relation \
                      FROM task_assignments ta \
                      JOIN screenshots s ON s.id = ta.screenshot_id \
+                     JOIN screenshots cur ON cur.id = ? \
                      WHERE ta.task_id = ? AND ta.screenshot_id != ? AND s.is_deleted = 0 \
-                     ORDER BY s.created_at DESC \
+                     ORDER BY ABS(CAST(strftime('%s', s.created_at) AS INTEGER) - \
+                                  CAST(strftime('%s', cur.created_at) AS INTEGER)) ASC, \
+                              s.created_at DESC \
                      LIMIT ?",
                 )
                 .map_err(|e| format!("Failed to prepare get_related_screenshots: {}", e))?;
 
             let rows = stmt
-                .query_map(params![task_id, screenshot_id, limit], |row| {
-                    Ok((
-                        TaskScreenshotStub {
-                            screenshot_id: row.get(0)?,
-                            confidence: row.get(1)?,
-                            image_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                            process_name: row.get(3)?,
-                            window_title: row.get(4)?,
-                            created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                            category: row.get(6)?,
-                        },
-                        row.get::<_, Option<Vec<u8>>>(7)?, // window_title_enc
-                        row.get::<_, Option<Vec<u8>>>(8)?, // process_name_enc
-                        row.get::<_, Option<Vec<u8>>>(9)?, // content_key_enc
-                    ))
-                })
+                .query_map(
+                    params![screenshot_id, task_id, screenshot_id, limit],
+                    |row| {
+                        let timestamp_str: Option<String> = row.get(7)?;
+                        Ok((
+                            TaskScreenshotStub {
+                                screenshot_id: row.get(0)?,
+                                confidence: row.get(1)?,
+                                image_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                                process_name: row.get(3)?,
+                                window_title: row.get(4)?,
+                                created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                                category: row.get(6)?,
+                                timestamp: timestamp_str.and_then(|s| s.parse::<f64>().ok()),
+                                page_url: None,
+                                relation: row.get(12)?,
+                            },
+                            row.get::<_, Option<Vec<u8>>>(8)?, // page_url_enc
+                            row.get::<_, Option<Vec<u8>>>(9)?, // window_title_enc
+                            row.get::<_, Option<Vec<u8>>>(10)?, // process_name_enc
+                            row.get::<_, Option<Vec<u8>>>(11)?, // content_key_enc
+                        ))
+                    },
+                )
                 .map_err(|e| format!("Failed to query related screenshots: {}", e))?;
 
             let mut collected = Vec::new();
@@ -383,10 +481,18 @@ impl StorageState {
         // Decrypt encrypted fields outside the DB mutex
         let screenshots = raw_results
             .into_iter()
-            .map(|(mut stub, wt_enc, pn_enc, key_enc)| {
+            .map(|(mut stub, url_enc, wt_enc, pn_enc, key_enc)| {
                 let row_key = key_enc
                     .as_ref()
                     .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+
+                if let (Some(data), Some(key)) = (url_enc.as_ref(), row_key.as_ref()) {
+                    if let Ok(decrypted) = decrypt_with_master_key(key, data) {
+                        if let Ok(url) = String::from_utf8(decrypted) {
+                            stub.page_url = Some(url);
+                        }
+                    }
+                }
 
                 if let (Some(data), Some(key)) = (wt_enc.as_ref(), row_key.as_ref()) {
                     if let Ok(decrypted) = decrypt_with_master_key(key, data) {
@@ -411,6 +517,12 @@ impl StorageState {
         Ok(RelatedScreenshotsResult {
             task_id,
             task_label: display_label,
+            dominant_process,
+            dominant_category,
+            start_time,
+            end_time,
+            snapshot_count,
+            current_timestamp,
             screenshots,
         })
     }
@@ -499,6 +611,53 @@ impl StorageState {
             .map_err(|e| format!("Failed to delete task: {}", e))?;
 
         Ok(())
+    }
+
+    /// Remove a single screenshot assignment from a task.
+    /// Returns the remaining assigned screenshot count. If the task becomes
+    /// empty, the task record itself is deleted.
+    pub fn remove_task_screenshot(&self, task_id: i64, screenshot_id: i64) -> Result<i64, String> {
+        let mut guard = self.get_connection_named("remove_task_screenshot")?;
+        let conn = guard.as_mut().unwrap();
+
+        let changed = conn
+            .execute(
+                "DELETE FROM task_assignments WHERE task_id = ? AND screenshot_id = ?",
+                params![task_id, screenshot_id],
+            )
+            .map_err(|e| format!("Failed to remove task screenshot assignment: {}", e))?;
+
+        if changed == 0 {
+            return Err("Task screenshot assignment not found".to_string());
+        }
+
+        let (remaining, start_time, end_time): (i64, Option<f64>, Option<f64>) = conn
+            .query_row(
+                "SELECT COUNT(*), \
+                 MIN(CAST(strftime('%s', s.created_at) AS REAL)), \
+                 MAX(CAST(strftime('%s', s.created_at) AS REAL)) \
+                 FROM task_assignments ta \
+                 JOIN screenshots s ON s.id = ta.screenshot_id \
+                 WHERE ta.task_id = ? AND s.is_deleted = 0",
+                params![task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| format!("Failed to recompute task metadata: {}", e))?;
+
+        if remaining == 0 {
+            conn.execute("DELETE FROM tasks WHERE id = ?", params![task_id])
+                .map_err(|e| format!("Failed to delete empty task: {}", e))?;
+            return Ok(0);
+        }
+
+        conn.execute(
+            "UPDATE tasks SET snapshot_count = ?, start_time = ?, end_time = ?, \
+             updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            params![remaining, start_time, end_time, task_id],
+        )
+        .map_err(|e| format!("Failed to update task metadata: {}", e))?;
+
+        Ok(remaining)
     }
 
     /// Merge multiple tasks into the first task in the list.

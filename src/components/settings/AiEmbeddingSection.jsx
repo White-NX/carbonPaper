@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Copy, Check, RefreshCw, HelpCircle, ChevronDown, ChevronUp, Download, Loader2, Paperclip } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
@@ -23,7 +23,10 @@ export default function AiEmbeddingSection() {
   const hasCachedState = localStorage.getItem('mcpEnabled') !== null;
   const [loading, setLoading] = useState(!hasCachedState);
   const [actionLoading, setActionLoading] = useState(false);
+  const [restoreLoading, setRestoreLoading] = useState(false);
   const [error, setError] = useState('');
+  const restoreAttemptRef = useRef('');
+  const [privacyAcknowledged, setPrivacyAcknowledged] = useState(false);
 
   // Privacy warning dialog
   const [showPrivacyDialog, setShowPrivacyDialog] = useState(false);
@@ -66,6 +69,7 @@ export default function AiEmbeddingSection() {
       setRunning(status.running);
       setServiceState(status.state || (status.enabled ? (status.running ? 'running' : 'pending_auth') : 'disabled'));
       setStatusError(status.error || '');
+      setPrivacyAcknowledged(Boolean(status.privacy_acknowledged));
 
       // Sync to localStorage for instant state on next mount
       localStorage.setItem('mcpEnabled', status.enabled ? 'true' : 'false');
@@ -137,10 +141,50 @@ export default function AiEmbeddingSection() {
     return () => { unlisten.then(fn => fn()); };
   }, []);
 
+  const startMcpService = useCallback(async ({ auto = false } = {}) => {
+    const setBusy = auto ? setRestoreLoading : setActionLoading;
+    setBusy(true);
+    if (!auto) setError('');
+    try {
+      const result = await withAuth(
+        () => invoke('mcp_set_enabled', { enabled: true }),
+        { autoPrompt: !auto }
+      );
+      setEnabled(true);
+      setRunning(true);
+      setServiceState('running');
+      setStatusError('');
+      localStorage.setItem('mcpEnabled', 'true');
+      if (result.port) {
+        setPort(result.port);
+        localStorage.setItem('mcpPort', String(result.port));
+      }
+      setTokenCopied(false);
+      return true;
+    } catch (e) {
+      const message = String(e);
+      if (!auto) setError(message);
+      setRunning(false);
+      if (message.includes('AUTH_REQUIRED')) {
+        setServiceState('pending_auth');
+      } else {
+        setServiceState('error');
+        setStatusError(message);
+      }
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
   const handleToggle = async () => {
     if (!enabled) {
-      setShowPrivacyDialog(true);
-      setConfirmText('');
+      if (privacyAcknowledged) {
+        await startMcpService({ auto: false });
+      } else {
+        setShowPrivacyDialog(true);
+        setConfirmText('');
+      }
     } else {
       setActionLoading(true);
       setError('');
@@ -164,22 +208,15 @@ export default function AiEmbeddingSection() {
     setActionLoading(true);
     setError('');
     try {
-      const result = await withAuth(() => invoke('mcp_set_enabled', { enabled: true }), { autoPrompt: true });
-      setEnabled(true);
-      setRunning(true);
-      setServiceState('running');
-      setStatusError('');
-      localStorage.setItem('mcpEnabled', 'true');
-      if (result.port) {
-        setPort(result.port);
-        localStorage.setItem('mcpPort', String(result.port));
-      }
-      setTokenCopied(false);
+      await invoke('mcp_ack_privacy_warning');
+      setPrivacyAcknowledged(true);
     } catch (e) {
       setError(String(e));
-    } finally {
       setActionLoading(false);
+      return;
     }
+    setActionLoading(false);
+    await startMcpService({ auto: false });
   };
 
   const handleResetToken = async () => {
@@ -324,6 +361,7 @@ export default function AiEmbeddingSection() {
   const normalizedServiceState = enabled
     ? (running ? 'running' : serviceState || 'pending_auth')
     : 'disabled';
+  const shouldShowStartButton = enabled && normalizedServiceState !== 'running';
   const statusBadge = {
     running: { label: 'RUNNING', className: 'text-green-500' },
     pending_auth: { label: 'WAITING', className: 'text-amber-400' },
@@ -331,6 +369,7 @@ export default function AiEmbeddingSection() {
     stopped: { label: 'STOPPED', className: 'text-red-500' },
   }[normalizedServiceState] || { label: 'STOPPED', className: 'text-red-500' };
   const statusMessage = (() => {
+    if (restoreLoading) return t('settings.ai_embedding.status.starting');
     if (!enabled) return t('settings.ai_embedding.status.stopped');
     if (normalizedServiceState === 'running') {
       return `${t('settings.ai_embedding.status.port_label')}: ${port}`;
@@ -343,6 +382,30 @@ export default function AiEmbeddingSection() {
     }
     return t('settings.ai_embedding.status.stopped');
   })();
+
+  useEffect(() => {
+    if (!enabled || running) {
+      restoreAttemptRef.current = '';
+      return;
+    }
+    if (normalizedServiceState !== 'stopped' || actionLoading || restoreLoading) return;
+
+    const attemptKey = String(port || 23816);
+    if (restoreAttemptRef.current === attemptKey) return;
+
+    restoreAttemptRef.current = attemptKey;
+    startMcpService({ auto: true });
+  }, [enabled, running, normalizedServiceState, actionLoading, restoreLoading, port, startMcpService]);
+
+  useEffect(() => {
+    if (!enabled || running) return undefined;
+
+    const timer = window.setInterval(() => {
+      loadStatus();
+    }, 5000);
+
+    return () => window.clearInterval(timer);
+  }, [enabled, running, loadStatus]);
 
   if (loading) {
     return (
@@ -388,17 +451,29 @@ export default function AiEmbeddingSection() {
               {statusMessage}
             </p>
           </div>
-          <button
-            onClick={handleToggle}
-            disabled={actionLoading}
-            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${enabled ? 'bg-ide-accent' : 'bg-ide-border'
-              } disabled:opacity-50`}
-          >
-            <div
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${enabled ? 'translate-x-5' : 'translate-x-0.5'
-                }`}
-            />
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {shouldShowStartButton && (
+              <button
+                onClick={() => startMcpService({ auto: false })}
+                disabled={actionLoading || restoreLoading}
+                className="px-3 py-1.5 text-xs text-ide-text hover:bg-ide-hover border border-ide-border rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50"
+              >
+                {restoreLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                {restoreLoading ? t('settings.ai_embedding.starting') : t('settings.ai_embedding.start_button')}
+              </button>
+            )}
+            <button
+              onClick={handleToggle}
+              disabled={actionLoading || restoreLoading}
+              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${enabled ? 'bg-ide-accent' : 'bg-ide-border'
+                } disabled:opacity-50`}
+            >
+              <div
+                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${enabled ? 'translate-x-5' : 'translate-x-0.5'
+                  }`}
+              />
+            </button>
+          </div>
         </div>
 
         {error && (

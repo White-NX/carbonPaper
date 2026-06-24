@@ -61,6 +61,19 @@ export async function deleteTask(taskId) {
 }
 
 /**
+ * Remove a screenshot from a task assignment. The screenshot itself is preserved.
+ * @param {number} taskId
+ * @param {number} screenshotId
+ * @returns {Promise<number>} Remaining assigned screenshots for the task.
+ */
+export async function removeTaskScreenshot(taskId, screenshotId) {
+  return withAuth(() => invoke('storage_remove_task_screenshot', {
+    taskId,
+    screenshotId,
+  }), { autoPrompt: true });
+}
+
+/**
  * Merge multiple tasks into one.
  * @param {number[]} taskIds - First ID becomes the target.
  * @returns {Promise<number>} The surviving task ID.
@@ -238,6 +251,22 @@ export async function toggleSmartClusterEnabled(id, enabled) {
 
 export async function getSmartClusterAssignments(clusterId, page = 0, pageSize = 50) {
   return withAuth(() => invoke('smart_cluster_assignments', { clusterId, page, pageSize }));
+}
+
+export async function getSmartClusterOcrCorpus(clusterId, page = 0, pageSize = 50) {
+  return withAuth(() => invoke('smart_cluster_ocr_corpus', { clusterId, page, pageSize }));
+}
+
+export async function getSmartClusterSummary(clusterId) {
+  return withAuth(() => invoke('smart_cluster_get_summary', { clusterId }));
+}
+
+export async function upsertSmartClusterSummary(summary) {
+  return withAuth(() => invoke('smart_cluster_upsert_summary', { summary }), { autoPrompt: true });
+}
+
+export async function deleteSmartClusterSummary(clusterId) {
+  return withAuth(() => invoke('smart_cluster_delete_summary', { clusterId }), { autoPrompt: true });
 }
 
 export async function rescanSmartCluster(clusterId) {

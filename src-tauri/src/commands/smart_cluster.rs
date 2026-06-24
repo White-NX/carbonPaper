@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use crate::credential_manager::CredentialManagerState;
 use crate::storage::smart_cluster::{
-    SmartClusterAssignmentStub, SmartClusterExample, SmartClusterRecord,
+    SmartClusterAssignmentStub, SmartClusterExample, SmartClusterOcrCorpusItem, SmartClusterRecord,
+    SmartClusterSummaryRecord, SmartClusterSummaryUpsert,
 };
 use crate::storage::StorageState;
 use serde::{Deserialize, Serialize};
@@ -151,6 +152,48 @@ pub fn smart_cluster_assignments(
 ) -> Result<Vec<SmartClusterAssignmentStub>, String> {
     check_auth_required(&credential_state)?;
     state.list_smart_cluster_assignments(cluster_id, page.unwrap_or(0), page_size.unwrap_or(50))
+}
+
+#[tauri::command]
+pub fn smart_cluster_ocr_corpus(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    cluster_id: i64,
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<Vec<SmartClusterOcrCorpusItem>, String> {
+    check_auth_required(&credential_state)?;
+    state.list_smart_cluster_ocr_corpus(cluster_id, page.unwrap_or(0), page_size.unwrap_or(50))
+}
+
+#[tauri::command]
+pub fn smart_cluster_get_summary(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    cluster_id: i64,
+) -> Result<Option<SmartClusterSummaryRecord>, String> {
+    check_auth_required(&credential_state)?;
+    state.get_smart_cluster_summary(cluster_id)
+}
+
+#[tauri::command]
+pub fn smart_cluster_upsert_summary(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    summary: SmartClusterSummaryUpsert,
+) -> Result<SmartClusterSummaryRecord, String> {
+    check_auth_required(&credential_state)?;
+    state.upsert_smart_cluster_summary(&summary)
+}
+
+#[tauri::command]
+pub fn smart_cluster_delete_summary(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    cluster_id: i64,
+) -> Result<bool, String> {
+    check_auth_required(&credential_state)?;
+    state.delete_smart_cluster_summary(cluster_id)
 }
 
 /// Re-enqueue all recent hot-layer screenshots; the worker re-evaluates

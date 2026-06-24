@@ -453,10 +453,27 @@ class RestartableModelWorker(WorkerSupervisor):
     def resume(self):
         logger.info("Model worker proxy resumed")
 
-    def search_by_natural_language(self, **kwargs):
+    def search_by_natural_language(
+        self,
+        query: str,
+        n_results: int = 10,
+        offset: int = 0,
+        process_names=None,
+        start_time=None,
+        end_time=None,
+    ):
         result = self.request(
             "search_by_natural_language",
-            {"args": kwargs},
+            {
+                "args": {
+                    "query": query,
+                    "n_results": n_results,
+                    "offset": offset,
+                    "process_names": process_names,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                }
+            },
             timeout=max(30.0, float(os.environ.get("CARBONPAPER_OCR_TIMEOUT_SECS", "120") or "120")),
         )
         if result.get("status") == "success":

@@ -46,8 +46,8 @@
         "preview": "Jump to main preview page",
         "standalone": "Open in separate window",
         "searchLabel": "Advanced Search Cards",
-        "tasksLabel": "Tasks Cards",
-        "clustersLabel": "Smart Clusters Cards"
+        "clustersLabel": "Smart Clusters Cards",
+        "activityContextLabel": "Activity Context Cards"
       },
       "monitor": {
         "title": "Monitor Service",
@@ -385,6 +385,8 @@
       "mcp_service": "MCP Service",
       "mcp_description": "When enabled, starts a local MCP service that lets AI tools query snapshot data, including screenshot metadata, OCR text, and task cluster information. Be mindful of privacy and only authorize AI tools you trust.",
       "enable_label": "Enable MCP Server",
+      "start_button": "Start",
+      "starting": "Starting",
       "privacy_warning": {
         "title": "Privacy Warning",
         "message": "Enabling the MCP server will allow any application on this machine that knows the token to access your snapshot data, including screenshots, OCR text, and task information.\n\nThe server binds to localhost only and is not accessible from external networks, but any local process with the token can read your data.\n\nPlease make sure you understand the risks before enabling.",
@@ -406,6 +408,7 @@
       "status": {
         "running": "MCP server is running",
         "stopped": "MCP server is stopped",
+        "starting": "Starting MCP server",
         "pending_auth": "Enabled. The MCP server will start automatically after Windows Hello authentication.",
         "error": "MCP server failed to start",
         "port_label": "Port",
@@ -510,7 +513,10 @@
           "label": "Task Clustering",
           "description": "Group similar activities into long-term tasks using MiniLM model",
           "interval_label": "Auto Clustering Interval",
-          "interval_desc": "Set the interval for background auto clustering"
+          "interval_desc": "Set the interval for background auto clustering",
+          "advanced_label": "Advanced",
+          "run_now": "Run clustering now",
+          "completed": "Clustering complete: saved {{count}} activities"
         },
         "classification": {
           "label": "Content Classification",
@@ -548,7 +554,8 @@
   "common": {
     "cancel": "Cancel",
     "close": "Close",
-    "retry": "Retry"
+    "retry": "Retry",
+    "save": "Save"
   },
   "topbar": {
     "settings": "Settings",
@@ -705,9 +712,35 @@
       "currentPage": "Current Page"
     },
     "related": {
-      "title": "Related Snapshots"
+      "title": "Activity Context",
+      "untitled": "Same activity",
+      "count": "{{count}} snapshots",
+      "now": "Current",
+      "before": "{{value}} before",
+      "after": "{{value}} after",
+      "previous": "Previous",
+      "next": "Next",
+      "nearby": "Nearby",
+      "snapshot": "Snapshot"
     },
     "empty": "Select an event from the timeline to view details."
+  },
+  "activityContext": {
+    "title": "Activity Context",
+    "open": "View all",
+    "untitled": "Untitled activity",
+    "snapshot": "Snapshot",
+    "count": "{{count}} snapshots",
+    "refresh": "Refresh",
+    "rename": "Rename activity",
+    "deleteActivity": "Remove activity",
+    "deleteActivityConfirm": "This removes the activity and all of its assignments, but keeps every snapshot. Continue?",
+    "removeSnapshot": "Remove from activity",
+    "removeSnapshotConfirm": "This only removes this snapshot from the current activity. The snapshot itself is kept. Continue?",
+    "previousPage": "Previous page",
+    "nextPage": "Next page",
+    "page": "{{current}} / {{total}}",
+    "empty": "No snapshots in this activity"
   },
   "activityBar": {
     "preview": "Preview",
@@ -736,7 +769,7 @@
     "subtitle": "Automatically group existing snapshots into tasks",
     "description": "This version can automatically cluster your accumulated screenshots into \"Tasks\" based on their content, helping you review and organize your work history by topic.",
     "delay_hint": "After confirming, clustering will start automatically in the background after a 1-minute delay (to allow the embedding model to load). You can continue using the app normally.",
-    "info_note": "You can also skip this step and manually run clustering later from the Tasks panel.",
+    "info_note": "You can also skip this step and manually run clustering later from Settings > Features > Task Clustering.",
     "apply": "Start Organizing",
     "skip": "Skip"
   },
