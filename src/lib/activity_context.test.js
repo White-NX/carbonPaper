@@ -16,6 +16,14 @@ describe('activity_context', () => {
     expect(extractEntityFromUrl('https://github.com/example/carbonPaper/pulls')).toBe('carbonPaper');
   });
 
+  it('does not apply known-site URL rules to lookalike hostnames', () => {
+    expect(extractEntityFromUrl('https://evilgithub.com/example/carbonPaper/pulls')).toBe('example');
+    expect(extractEntityFromUrl('https://evilgitlab.com/example/carbonPaper/-/merge_requests')).toBe('example');
+    expect(extractEntityFromUrl('https://evilbitbucket.org/example/carbonPaper/pull-requests')).toBe('example');
+    expect(extractEntityFromUrl('https://evilnpmjs.com/package/react')).toBe('package');
+    expect(extractEntityFromUrl('https://evilpypi.org/project/requests')).toBe('project');
+  });
+
   it('cleans browser title suffixes and extracts repository names', () => {
     expect(extractEntityFromTitle('Pull requests · example/carbonPaper - GitHub', {
       siteName: 'GitHub',

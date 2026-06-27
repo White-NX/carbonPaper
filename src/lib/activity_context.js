@@ -87,6 +87,10 @@ function rootHost(host) {
   return parts.slice(-2).join('.');
 }
 
+function isHostOrSubdomain(host, domain) {
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
 export function getHostname(url) {
   if (!url) return '';
   try {
@@ -140,13 +144,17 @@ export function extractEntityFromUrl(url) {
   const segments = parsed.pathname.split('/').map(decodeSegment).filter(Boolean);
   if (!segments.length) return '';
 
-  if (host.endsWith('github.com') || host.endsWith('gitlab.com') || host.endsWith('bitbucket.org')) {
+  if (
+    isHostOrSubdomain(host, 'github.com')
+    || isHostOrSubdomain(host, 'gitlab.com')
+    || isHostOrSubdomain(host, 'bitbucket.org')
+  ) {
     if (segments.length >= 2) return segments[1];
     return segments[0];
   }
-  if (host.endsWith('npmjs.com') && segments[0] === 'package' && segments[1]) return segments[1];
-  if (host.endsWith('pypi.org') && segments[0] === 'project' && segments[1]) return segments[1];
-  if (host.endsWith('docs.rs') && segments[0]) return segments[0];
+  if (isHostOrSubdomain(host, 'npmjs.com') && segments[0] === 'package' && segments[1]) return segments[1];
+  if (isHostOrSubdomain(host, 'pypi.org') && segments[0] === 'project' && segments[1]) return segments[1];
+  if (isHostOrSubdomain(host, 'docs.rs') && segments[0]) return segments[0];
 
   const candidate = segments.find((seg) => {
     const lower = seg.toLowerCase();
