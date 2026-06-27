@@ -1,19 +1,21 @@
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
-import { Monitor, Clock, Globe, ExternalLink, Tag, Info, Layers } from 'lucide-react';
+import { Monitor, Clock, Globe, ExternalLink, Tag, Info, Layers, Image as ImageIcon, Maximize2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { computeLinkScores, updateScreenshotCategory, fetchThumbnailBatch } from '../lib/monitor_api';
 import { getRelatedScreenshots } from '../lib/task_api';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { CATEGORY_LIST, CATEGORY_COLORS } from '../lib/categories';
-import { ThumbnailCard } from './ThumbnailCard';
+import { buildActivityContext, getHostname } from '../lib/activity_context';
+import ActivityContextDrawer from './ActivityContextDrawer';
 
-export default function DetailCard({ selectedEvent, selectedDetails, onCategoryChange, onSelectRelated }) {
+export default function DetailCard({ selectedEvent, selectedDetails, onCategoryChange, onSelectRelated, onOpenFloatingPreview }) {
   const { t } = useTranslation();
   const [scoredLinks, setScoredLinks] = useState([]);
   const [editingCategory, setEditingCategory] = useState(false);
   const [localCategory, setLocalCategory] = useState(null);
   const [relatedResult, setRelatedResult] = useState(null);
   const [thumbnailMap, setThumbnailMap] = useState({});
+  const [activityDrawerOpen, setActivityDrawerOpen] = useState(false);
 
   // Card visibility state
   const [isVisible, setIsVisible] = useState(false);
@@ -48,6 +50,11 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
   }, [selectedDetails?.record?.visible_links]);
 
   const pageUrl = selectedDetails?.record?.page_url;
+  const activityContext = useMemo(() => buildActivityContext({
+    selectedEvent,
+    selectedRecord: selectedDetails?.record,
+    relatedResult,
+  }), [selectedDetails?.record, selectedEvent, relatedResult]);
 
   // Category state
   const currentCategory = localCategory ?? selectedDetails?.record?.category ?? selectedEvent?.category ?? null;
@@ -57,25 +64,39 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
     setEditingCategory(false);
   }, [selectedEvent?.id]);
 
-  // Fetch related screenshots (same task cluster)
-  useEffect(() => {
+  const fetchRelated = useCallback(async () => {
     const id = selectedEvent?.id;
     if (!id || id <= 0) {
+      return null;
+    }
+    return getRelatedScreenshots(id, 8);
+  }, [selectedEvent?.id]);
+
+  const commitRelatedResult = useCallback((result, { keepEmpty = false } = {}) => {
+    const hasTask = result?.task_id !== undefined && result.task_id >= 0;
+    const hasRelatedScreenshots = result?.screenshots?.length > 0;
+    setRelatedResult(hasRelatedScreenshots || (keepEmpty && hasTask) ? result : null);
+  }, []);
+
+  // Fetch related screenshots (same task cluster)
+  useEffect(() => {
+    if (!selectedEvent?.id || selectedEvent.id <= 0) {
       setRelatedResult(null);
+      setActivityDrawerOpen(false);
       return;
     }
     let cancelled = false;
-    getRelatedScreenshots(id, 8)
+    fetchRelated()
       .then((result) => {
         if (!cancelled) {
-          setRelatedResult(result?.screenshots?.length ? result : null);
+          commitRelatedResult(result);
         }
       })
       .catch(() => {
         if (!cancelled) setRelatedResult(null);
       });
     return () => { cancelled = true; };
-  }, [selectedEvent?.id]);
+  }, [commitRelatedResult, fetchRelated, selectedEvent?.id]);
 
   // Batch load thumbnails for related screenshots
   useEffect(() => {
@@ -159,17 +180,73 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
     }
   };
 
-  const getHostname = (url) => {
-    try {
-      return new URL(url).hostname;
-    } catch {
-      return url;
-    }
-  };
-
   const handleOpenUrl = (url) => {
     openUrl(url).catch((err) => console.error('Failed to open URL:', err));
   };
+
+  const formatTaskRange = (start, end) => {
+    if (!start || !end) return null;
+    const startDate = new Date(start * 1000);
+    const endDate = new Date(end * 1000);
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return null;
+    const sameDay = startDate.toDateString() === endDate.toDateString();
+    return sameDay
+      ? startDate.toLocaleDateString()
+      : `${startDate.toLocaleDateString()} - ${endDate.toLocaleDateString()}`;
+  };
+
+  const formatRelativeToCurrent = (timestamp) => {
+    const current = activityContext.currentTimestamp;
+    if (!timestamp || !current) return null;
+    const deltaSecs = Math.round(timestamp - current);
+    if (Math.abs(deltaSecs) < 60) return t('sidebar.related.now');
+    const abs = Math.abs(deltaSecs);
+    const value = abs < 3600
+      ? `${Math.round(abs / 60)}m`
+      : abs < 86400
+        ? `${Math.round(abs / 3600)}h`
+        : `${Math.round(abs / 86400)}d`;
+    return deltaSecs < 0
+      ? t('sidebar.related.before', { value })
+      : t('sidebar.related.after', { value });
+  };
+
+  const relationLabel = (relation) => {
+    if (relation === 'before') return t('sidebar.related.previous');
+    if (relation === 'after') return t('sidebar.related.next');
+    return t('sidebar.related.nearby');
+  };
+
+  const relatedRows = useMemo(() => {
+    const rows = relatedResult?.screenshots || [];
+    return rows.slice(0, 5).map((s) => {
+      const host = getHostname(s.page_url);
+      const relative = formatRelativeToCurrent(s.timestamp);
+      const subtitle = [
+        relationLabel(s.relation),
+        relative,
+        host || s.process_name,
+      ].filter(Boolean).join(' - ');
+      return {
+        ...s,
+        title: s.window_title || host || s.process_name || t('sidebar.related.snapshot'),
+        subtitle,
+      };
+    });
+  }, [relatedResult, activityContext.currentTimestamp, t]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleActivityChanged = useCallback((change) => {
+    if (change?.type === 'deleted') {
+      setRelatedResult(null);
+      setActivityDrawerOpen(false);
+      return;
+    }
+    fetchRelated()
+      .then((result) => {
+        commitRelatedResult(result, { keepEmpty: activityDrawerOpen });
+      })
+      .catch(() => {});
+  }, [activityDrawerOpen, commitRelatedResult, fetchRelated]);
 
   // Dismiss on outside press without intercepting the underlying image drag.
   useEffect(() => {
@@ -218,7 +295,7 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
       {/* Detail card */}
       <div
         ref={cardRef}
-        className={`absolute top-4 left-4 w-72 max-h-[calc(100%-2rem)] overflow-y-auto z-20 rounded-xl border border-ide-border bg-ide-panel shadow-lg transition-all duration-300 ${
+        className={`absolute top-4 left-4 w-80 max-h-[calc(100%-2rem)] overflow-y-auto z-20 rounded-xl border border-ide-border bg-ide-panel shadow-lg transition-all duration-300 ${
           isVisible
             ? 'opacity-100 translate-x-0 pointer-events-auto'
             : 'opacity-0 -translate-x-4 pointer-events-none'
@@ -342,39 +419,107 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
             </div>
           )}
 
-          {/* Related screenshots (same task cluster) */}
+          {/* Activity context (same task cluster) */}
           {relatedResult && relatedResult.screenshots.length > 0 && (
-            <div>
-              <label className="text-xs text-ide-muted uppercase font-bold flex items-center gap-1">
-                {t('sidebar.related.title')}
-                <span className="px-1 py-0.5 bg-amber-500/20 text-amber-400 text-[10px] rounded">alpha</span>
-              </label>
-              {relatedResult.task_label && (
-                <div className="mt-0.5 text-[11px] text-ide-muted/70 truncate" title={relatedResult.task_label}>
-                  {relatedResult.task_label}
+            <div className="pt-3 border-t border-ide-border/70">
+              <div className="flex items-center justify-between gap-2">
+                <label className="text-xs text-ide-muted uppercase font-bold flex items-center gap-1.5">
+                  <Layers size={13} className="text-ide-accent" />
+                  {t('sidebar.related.title')}
+                  <span className="px-1 py-0.5 bg-amber-500/20 text-amber-400 text-[10px] rounded">alpha</span>
+                </label>
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1 rounded border border-ide-border px-1.5 py-1 text-[11px] text-ide-muted hover:bg-ide-hover hover:text-ide-text"
+                  onClick={() => {
+                    setActivityDrawerOpen(true);
+                    clearTimer();
+                  }}
+                  title={t('activityContext.open')}
+                >
+                  <Maximize2 size={12} />
+                  {t('activityContext.open')}
+                </button>
+              </div>
+              <div className="mt-1 min-w-0">
+                <div className="text-sm font-medium text-ide-text truncate" title={activityContext.title || relatedResult.task_label || ''}>
+                  {activityContext.title || relatedResult.task_label || t('sidebar.related.untitled')}
                 </div>
-              )}
-              <div className="mt-1.5 grid grid-cols-2 gap-1.5">
-                {relatedResult.screenshots.map((s) => (
-                  <ThumbnailCard
-                    key={s.screenshot_id}
-                    item={{
-                      screenshot_id: s.screenshot_id,
-                      image_path: s.image_path,
-                      process_name: s.process_name,
-                      window_title: s.window_title,
-                      category: s.category,
-                      created_at: s.created_at,
-                    }}
-                    preloadedSrc={thumbnailMap[s.screenshot_id] ?? null}
-                    onSelect={(payload) => onSelectRelated?.(payload)}
-                  />
-                ))}
+                <div className="mt-1 flex flex-wrap gap-1.5 text-[10px] text-ide-muted">
+                  {activityContext.snapshotCount && (
+                    <span className="px-1.5 py-0.5 rounded border border-ide-border bg-ide-bg">
+                      {t('sidebar.related.count', { count: activityContext.snapshotCount })}
+                    </span>
+                  )}
+                  {formatTaskRange(activityContext.startTime, activityContext.endTime) && (
+                    <span className="px-1.5 py-0.5 rounded border border-ide-border bg-ide-bg">
+                      {formatTaskRange(activityContext.startTime, activityContext.endTime)}
+                    </span>
+                  )}
+                  {(activityContext.host || activityContext.category) && (
+                    <span className="px-1.5 py-0.5 rounded border border-ide-border bg-ide-bg truncate max-w-full">
+                      {activityContext.host || activityContext.category}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="mt-2 space-y-1.5">
+                {relatedRows.map((s) => {
+                  const thumb = thumbnailMap[s.screenshot_id] ?? null;
+                  return (
+                    <button
+                      key={s.screenshot_id}
+                      type="button"
+                      className="w-full min-w-0 flex items-center gap-2 rounded p-1.5 text-left transition-colors hover:bg-ide-hover/60"
+                      onClick={() => onSelectRelated?.({
+                        screenshot_id: s.screenshot_id,
+                        id: s.screenshot_id,
+                        image_path: s.image_path,
+                        path: s.image_path,
+                        process_name: s.process_name,
+                        window_title: s.window_title,
+                        category: s.category,
+                        created_at: s.created_at,
+                        page_url: s.page_url,
+                      })}
+                    >
+                      <div className="h-10 w-[4.5rem] shrink-0 overflow-hidden rounded border border-ide-border bg-ide-bg">
+                        {thumb ? (
+                          <img src={thumb} alt="" className="h-full w-full object-cover" loading="lazy" />
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center text-ide-muted">
+                            <ImageIcon size={14} />
+                          </div>
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-xs font-medium text-ide-text" title={s.title}>
+                          {s.title}
+                        </div>
+                        <div className="mt-0.5 truncate text-[11px] text-ide-muted" title={s.subtitle}>
+                          {s.subtitle}
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
           )}
         </div>
       </div>
+      {activityDrawerOpen && relatedResult && (
+        <ActivityContextDrawer
+          relatedResult={relatedResult}
+          activityContext={activityContext}
+          onClose={() => setActivityDrawerOpen(false)}
+          onSelectScreenshot={(payload) => {
+            onSelectRelated?.(payload);
+          }}
+          onOpenFloatingPreview={onOpenFloatingPreview}
+          onActivityChanged={handleActivityChanged}
+        />
+      )}
     </>
   );
 }

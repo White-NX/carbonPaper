@@ -46,8 +46,8 @@
         "preview": "跳转到主预览页面",
         "standalone": "从独立窗口打开",
         "searchLabel": "高级搜索卡片",
-        "tasksLabel": "长期任务卡片",
-        "clustersLabel": "智能聚类卡片"
+        "clustersLabel": "智能聚类卡片",
+        "activityContextLabel": "同一活动卡片"
       },
       "monitor": {
         "title": "Python 子服务",
@@ -385,6 +385,8 @@
       "mcp_service": "MCP 服务",
       "mcp_description": "启用后将启动本地 MCP 服务，允许 AI 工具连接获取快照数据（截图元数据、OCR 文本、任务聚类信息）。请注意隐私安全风险，确保只授权可信的 AI 工具连接。",
       "enable_label": "MCP 服务",
+      "start_button": "启动",
+      "starting": "启动中",
       "privacy_warning": {
         "title": "隐私安全警告",
         "message": "启用此功能后，您的快照数据（包括截图元数据、OCR 文本、任务聚类信息）将通过本地 HTTP 服务对外暴露。虽然服务仅绑定 localhost 且需要令牌认证，但本机上运行的任何程序都有可能访问这些数据。\n\n请确认您理解此风险并自愿启用。",
@@ -406,6 +408,7 @@
       "status": {
         "running": "服务运行中",
         "stopped": "服务已停止",
+        "starting": "正在启动服务",
         "pending_auth": "服务已启用，完成 Windows Hello 认证后会自动启动",
         "error": "服务启动失败",
         "port_label": "端口",
@@ -510,7 +513,10 @@
           "label": "任务聚类",
           "description": "使用 MiniLM 模型将相似活动分组为长期任务",
           "interval_label": "自动聚类间隔",
-          "interval_desc": "设置后台自动运行任务聚类的时间间隔"
+          "interval_desc": "设置后台自动运行任务聚类的时间间隔",
+          "advanced_label": "高级",
+          "run_now": "立即运行聚类",
+          "completed": "聚类完成：已保存 {{count}} 个活动"
         },
         "classification": {
           "label": "内容分类",
@@ -548,7 +554,8 @@
   "common": {
     "cancel": "取消",
     "close": "关闭",
-    "retry": "重试"
+    "retry": "重试",
+    "save": "保存"
   },
   "delete": {
     "failure": "删除失败: {{error}}",
@@ -705,9 +712,35 @@
       "currentPage": "当前页面"
     },
     "related": {
-      "title": "可能相关的快照"
+      "title": "同一活动",
+      "untitled": "同一活动",
+      "count": "{{count}} 张",
+      "now": "当前",
+      "before": "{{value}}前",
+      "after": "{{value}}后",
+      "previous": "之前",
+      "next": "之后",
+      "nearby": "附近",
+      "snapshot": "快照"
     },
     "empty": "从时间线中选择一个事件以查看详情。"
+  },
+  "activityContext": {
+    "title": "同一活动",
+    "open": "查看全部",
+    "untitled": "未命名活动",
+    "snapshot": "快照",
+    "count": "{{count}} 张快照",
+    "refresh": "刷新",
+    "rename": "重命名活动",
+    "deleteActivity": "取消活动关联",
+    "deleteActivityConfirm": "这会删除该活动及其全部关联关系，但不会删除任何快照。确定继续吗？",
+    "removeSnapshot": "从活动中移除",
+    "removeSnapshotConfirm": "只会移除这张快照与当前活动的关联，不会删除快照。确定继续吗？",
+    "previousPage": "上一页",
+    "nextPage": "下一页",
+    "page": "{{current}} / {{total}}",
+    "empty": "这个活动中暂无快照"
   },
   "activityBar": {
     "preview": "预览",
@@ -736,7 +769,7 @@
     "subtitle": "将已有的截图快照自动归类为任务",
     "description": "新版本支持将你积累的截图快照按活动内容自动聚类为「任务」，帮助你按主题回顾和整理历史工作记录。",
     "delay_hint": "确认后将在 1 分钟后于后台自动执行聚类（等待嵌入模型加载完成），期间你可以正常使用应用。",
-    "info_note": "你也可以跳过此步骤，之后随时在「任务」面板中手动执行聚类。",
+    "info_note": "你也可以跳过此步骤，之后随时在 设置 > 功能 > 任务聚类 中手动执行聚类。",
     "apply": "开始整理",
     "skip": "跳过"
   },

@@ -39,6 +39,79 @@ fn thumbnail_warmup_progress_json() -> serde_json::Value {
     })
 }
 
+fn merge_policy_update(
+    mut existing: serde_json::Value,
+    update: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let existing_obj = existing
+        .as_object_mut()
+        .ok_or_else(|| "Existing policy is not a valid JSON object".to_string())?;
+    let update_obj = update
+        .as_object()
+        .ok_or_else(|| "Policy update is not a valid JSON object".to_string())?;
+
+    for (key, value) in update_obj {
+        existing_obj.insert(key.clone(), value.clone());
+    }
+
+    Ok(existing)
+}
+
+fn redact_policy_for_frontend(policy: &mut serde_json::Value) {
+    if let Some(obj) = policy.as_object_mut() {
+        obj.remove("mcp_token_encrypted");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_policy_update, redact_policy_for_frontend};
+    use serde_json::json;
+
+    #[test]
+    fn merge_policy_update_preserves_unmentioned_mcp_fields() {
+        let existing = json!({
+            "mcp_enabled": true,
+            "mcp_port": 23816,
+            "mcp_token_encrypted": "secret",
+            "sensitive_filter": { "enabled": false },
+            "storage_limit": "20"
+        });
+        let update = json!({
+            "storage_limit": "10",
+            "retention_period": "6months"
+        });
+
+        let merged = merge_policy_update(existing, update).unwrap();
+
+        assert_eq!(merged["storage_limit"], "10");
+        assert_eq!(merged["retention_period"], "6months");
+        assert_eq!(merged["mcp_enabled"], true);
+        assert_eq!(merged["mcp_port"], 23816);
+        assert_eq!(merged["mcp_token_encrypted"], "secret");
+        assert_eq!(merged["sensitive_filter"]["enabled"], false);
+    }
+
+    #[test]
+    fn merge_policy_update_rejects_non_object_update() {
+        let err = merge_policy_update(json!({}), json!(null)).unwrap_err();
+        assert!(err.contains("Policy update"));
+    }
+
+    #[test]
+    fn redact_policy_for_frontend_removes_encrypted_mcp_token() {
+        let mut policy = json!({
+            "mcp_enabled": true,
+            "mcp_token_encrypted": "secret"
+        });
+
+        redact_policy_for_frontend(&mut policy);
+
+        assert_eq!(policy["mcp_enabled"], true);
+        assert!(policy.get("mcp_token_encrypted").is_none());
+    }
+}
+
 #[tauri::command]
 pub async fn storage_get_timeline(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -675,10 +748,17 @@ pub async fn storage_set_policy(
 ) -> Result<serde_json::Value, String> {
     check_auth_required(&credential_state)?;
 
+    let existing = state
+        .load_policy()
+        .map_err(|e| format!("Failed to load policy: {}", e))?;
+    let merged = merge_policy_update(existing, policy)?;
+
     state
-        .save_policy(&policy)
+        .save_policy(&merged)
         .map_err(|e| format!("Failed to save policy: {}", e))?;
-    Ok(policy)
+    let mut response = merged;
+    redact_policy_for_frontend(&mut response);
+    Ok(response)
 }
 
 #[tauri::command]
@@ -691,9 +771,7 @@ pub async fn storage_get_policy(
     let mut policy = state
         .load_policy()
         .map_err(|e| format!("Failed to load policy: {}", e))?;
-    if let Some(obj) = policy.as_object_mut() {
-        obj.remove("mcp_token_encrypted");
-    }
+    redact_policy_for_frontend(&mut policy);
     Ok(policy)
 }
 
@@ -873,6 +951,18 @@ pub async fn storage_delete_task(
     check_auth_required(&credential_state)?;
 
     state.delete_task(task_id)
+}
+
+#[tauri::command]
+pub async fn storage_remove_task_screenshot(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    task_id: i64,
+    screenshot_id: i64,
+) -> Result<i64, String> {
+    check_auth_required(&credential_state)?;
+
+    state.remove_task_screenshot(task_id, screenshot_id)
 }
 
 #[tauri::command]

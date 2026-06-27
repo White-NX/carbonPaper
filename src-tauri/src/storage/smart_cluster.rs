@@ -7,8 +7,9 @@
 //! examples. New snapshots are evaluated in a background worker; matches
 //! above the threshold are recorded in `smart_cluster_assignments`.
 
-use rusqlite::params;
+use rusqlite::{params, Row};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::StorageState;
 
@@ -24,6 +25,8 @@ pub struct SmartClusterRecord {
     /// Computed at query time; not stored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignment_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SmartClusterSummaryRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +46,105 @@ pub struct SmartClusterAssignmentStub {
     pub created_at: String,
     pub category: Option<String>,
     pub assigned_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartClusterOcrCorpusItem {
+    pub screenshot_id: i64,
+    pub rerank_score: Option<f64>,
+    pub process_name: Option<String>,
+    pub window_title: Option<String>,
+    pub created_at: String,
+    pub category: Option<String>,
+    pub assigned_at: String,
+    pub ocr_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartClusterSummaryRecord {
+    pub smart_cluster_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ocr_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_points: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_snapshot_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_version: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartClusterSummaryUpsert {
+    pub smart_cluster_id: i64,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub ocr_summary: Option<String>,
+    pub key_points: Option<Value>,
+    pub evidence: Option<Value>,
+    pub source_snapshot_count: Option<i64>,
+    pub source_hash: Option<String>,
+    pub model_provider: Option<String>,
+    pub model_name: Option<String>,
+    pub prompt_version: Option<String>,
+}
+
+fn parse_json_value(raw: Option<String>) -> Option<Value> {
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn encode_json_value(value: &Option<Value>) -> Option<String> {
+    value.as_ref().map(Value::to_string)
+}
+
+fn normalize_optional_text(value: &Option<String>) -> Option<String> {
+    value
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn read_summary_from_row(
+    row: &Row<'_>,
+    start: usize,
+) -> rusqlite::Result<Option<SmartClusterSummaryRecord>> {
+    let smart_cluster_id: Option<i64> = row.get(start)?;
+    match smart_cluster_id {
+        Some(id) => Ok(Some(SmartClusterSummaryRecord {
+            smart_cluster_id: id,
+            title: row.get(start + 1)?,
+            summary: row.get(start + 2)?,
+            ocr_summary: row.get(start + 3)?,
+            key_points: parse_json_value(row.get(start + 4)?),
+            evidence: parse_json_value(row.get(start + 5)?),
+            source_snapshot_count: row.get(start + 6)?,
+            source_hash: row.get(start + 7)?,
+            model_provider: row.get(start + 8)?,
+            model_name: row.get(start + 9)?,
+            prompt_version: row.get(start + 10)?,
+            created_at: row
+                .get::<_, Option<String>>(start + 11)?
+                .unwrap_or_default(),
+            updated_at: row
+                .get::<_, Option<String>>(start + 12)?
+                .unwrap_or_default(),
+        })),
+        None => Ok(None),
+    }
 }
 
 impl StorageState {
@@ -81,8 +183,13 @@ impl StorageState {
                         COALESCE(\
                             (SELECT COUNT(*) FROM smart_cluster_assignments a \
                              JOIN screenshots s ON s.id = a.screenshot_id \
-                             WHERE a.smart_cluster_id = sc.id AND s.is_deleted = 0), 0) AS cnt \
+                             WHERE a.smart_cluster_id = sc.id AND s.is_deleted = 0), 0) AS cnt, \
+                        ss.smart_cluster_id, ss.title, ss.summary, ss.ocr_summary, \
+                        ss.key_points_json, ss.evidence_json, ss.source_snapshot_count, \
+                        ss.source_hash, ss.model_provider, ss.model_name, ss.prompt_version, \
+                        ss.created_at, ss.updated_at \
                  FROM smart_clusters sc \
+                 LEFT JOIN smart_cluster_summaries ss ON ss.smart_cluster_id = sc.id \
                  ORDER BY sc.updated_at DESC",
             )
             .map_err(|e| format!("Failed to prepare list_smart_clusters: {}", e))?;
@@ -97,6 +204,7 @@ impl StorageState {
                     created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                     updated_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     assignment_count: Some(row.get::<_, i64>(7)?),
+                    summary: read_summary_from_row(row, 8)?,
                 })
             })
             .map_err(|e| format!("Failed to query smart clusters: {}", e))?;
@@ -113,8 +221,19 @@ impl StorageState {
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
         match conn.query_row(
-            "SELECT id, anchor_text, threshold, enabled, dominant_color, created_at, updated_at \
-             FROM smart_clusters WHERE id = ?",
+            "SELECT sc.id, sc.anchor_text, sc.threshold, sc.enabled, sc.dominant_color, \
+                    sc.created_at, sc.updated_at, \
+                    COALESCE(\
+                        (SELECT COUNT(*) FROM smart_cluster_assignments a \
+                         JOIN screenshots s ON s.id = a.screenshot_id \
+                         WHERE a.smart_cluster_id = sc.id AND s.is_deleted = 0), 0) AS cnt, \
+                    ss.smart_cluster_id, ss.title, ss.summary, ss.ocr_summary, \
+                    ss.key_points_json, ss.evidence_json, ss.source_snapshot_count, \
+                    ss.source_hash, ss.model_provider, ss.model_name, ss.prompt_version, \
+                    ss.created_at, ss.updated_at \
+             FROM smart_clusters sc \
+             LEFT JOIN smart_cluster_summaries ss ON ss.smart_cluster_id = sc.id \
+             WHERE sc.id = ?",
             params![id],
             |row| {
                 Ok(SmartClusterRecord {
@@ -125,7 +244,8 @@ impl StorageState {
                     dominant_color: row.get(4)?,
                     created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
                     updated_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                    assignment_count: None,
+                    assignment_count: Some(row.get::<_, i64>(7)?),
+                    summary: read_summary_from_row(row, 8)?,
                 })
             },
         ) {
@@ -332,6 +452,146 @@ impl StorageState {
         )
         .map_err(|e| format!("Failed to clear assignments: {}", e))?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Summaries and OCR corpus
+    // ------------------------------------------------------------------
+
+    pub fn list_smart_cluster_ocr_corpus(
+        &self,
+        cluster_id: i64,
+        page: i64,
+        page_size: i64,
+    ) -> Result<Vec<SmartClusterOcrCorpusItem>, String> {
+        let assignments = self.list_smart_cluster_assignments(cluster_id, page, page_size)?;
+        let screenshot_ids: Vec<i64> = assignments.iter().map(|s| s.screenshot_id).collect();
+        let ocr_map = self.get_ocr_results_by_screenshot_ids(&screenshot_ids)?;
+        Ok(assignments
+            .into_iter()
+            .map(|s| SmartClusterOcrCorpusItem {
+                screenshot_id: s.screenshot_id,
+                rerank_score: s.rerank_score,
+                process_name: s.process_name,
+                window_title: s.window_title,
+                created_at: s.created_at,
+                category: s.category,
+                assigned_at: s.assigned_at,
+                ocr_text: ocr_map.get(&s.screenshot_id).cloned().unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    pub fn get_smart_cluster_summary(
+        &self,
+        cluster_id: i64,
+    ) -> Result<Option<SmartClusterSummaryRecord>, String> {
+        let guard = self.get_connection_named("get_smart_cluster_summary")?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
+        match conn.query_row(
+            "SELECT smart_cluster_id, title, summary, ocr_summary, key_points_json, \
+                    evidence_json, source_snapshot_count, source_hash, model_provider, \
+                    model_name, prompt_version, created_at, updated_at \
+             FROM smart_cluster_summaries WHERE smart_cluster_id = ?",
+            params![cluster_id],
+            |row| read_summary_from_row(row, 0).map(|v| v.expect("summary row has id")),
+        ) {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get smart cluster summary: {}", e)),
+        }
+    }
+
+    pub fn upsert_smart_cluster_summary(
+        &self,
+        input: &SmartClusterSummaryUpsert,
+    ) -> Result<SmartClusterSummaryRecord, String> {
+        let title = normalize_optional_text(&input.title);
+        let summary = normalize_optional_text(&input.summary);
+        let ocr_summary = normalize_optional_text(&input.ocr_summary);
+        if title.is_none() && summary.is_none() && ocr_summary.is_none() {
+            return Err("At least one of title, summary, or ocr_summary is required".to_string());
+        }
+
+        let key_points_json = encode_json_value(&input.key_points);
+        let evidence_json = encode_json_value(&input.evidence);
+        let source_hash = normalize_optional_text(&input.source_hash);
+        let model_provider = normalize_optional_text(&input.model_provider);
+        let model_name = normalize_optional_text(&input.model_name);
+        let prompt_version = normalize_optional_text(&input.prompt_version);
+
+        {
+            let guard = self.get_connection_named("upsert_smart_cluster_summary")?;
+            let conn = guard
+                .as_ref()
+                .ok_or_else(|| "Database connection is None".to_string())?;
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM smart_clusters WHERE id = ?",
+                    params![input.smart_cluster_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Failed to check smart cluster existence: {}", e))?;
+            if exists == 0 {
+                return Err(format!(
+                    "Smart cluster {} not found",
+                    input.smart_cluster_id
+                ));
+            }
+
+            conn.execute(
+                "INSERT INTO smart_cluster_summaries \
+                 (smart_cluster_id, title, summary, ocr_summary, key_points_json, \
+                  evidence_json, source_snapshot_count, source_hash, model_provider, \
+                  model_name, prompt_version, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
+                 ON CONFLICT(smart_cluster_id) DO UPDATE SET \
+                   title = excluded.title, \
+                   summary = excluded.summary, \
+                   ocr_summary = excluded.ocr_summary, \
+                   key_points_json = excluded.key_points_json, \
+                   evidence_json = excluded.evidence_json, \
+                   source_snapshot_count = excluded.source_snapshot_count, \
+                   source_hash = excluded.source_hash, \
+                   model_provider = excluded.model_provider, \
+                   model_name = excluded.model_name, \
+                   prompt_version = excluded.prompt_version, \
+                   updated_at = CURRENT_TIMESTAMP",
+                params![
+                    input.smart_cluster_id,
+                    title,
+                    summary,
+                    ocr_summary,
+                    key_points_json,
+                    evidence_json,
+                    input.source_snapshot_count,
+                    source_hash,
+                    model_provider,
+                    model_name,
+                    prompt_version,
+                ],
+            )
+            .map_err(|e| format!("Failed to upsert smart cluster summary: {}", e))?;
+        }
+
+        self.get_smart_cluster_summary(input.smart_cluster_id)?
+            .ok_or_else(|| "Failed to read saved smart cluster summary".to_string())
+    }
+
+    pub fn delete_smart_cluster_summary(&self, cluster_id: i64) -> Result<bool, String> {
+        let guard = self.get_connection_named("delete_smart_cluster_summary")?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM smart_cluster_summaries WHERE smart_cluster_id = ?",
+                params![cluster_id],
+            )
+            .map_err(|e| format!("Failed to delete smart cluster summary: {}", e))?;
+        Ok(deleted > 0)
     }
 
     // ------------------------------------------------------------------

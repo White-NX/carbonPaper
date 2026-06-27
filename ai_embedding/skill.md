@@ -20,6 +20,11 @@ You have access to the user's **CarbonPaper** screenshot history — a continuou
 | `get_task_clusters` | List task clusters with metadata and relevance scores | `layer`, `start_time`, `end_time`, `hide_inactive` |
 | `get_task_screenshots` | List snapshots in a task cluster (paginated) | `task_id`, `page`, `page_size` |
 | `rename_task` | Rename a task cluster | `task_id`, `label` |
+| `get_smart_clusters` | List smart clusters, assignment counts, and stored AI summaries | none |
+| `get_smart_cluster_ocr_corpus` | Get assigned smart-cluster snapshots with joined OCR text for summarization | `cluster_id`, `page`, `page_size`, `include_empty_ocr` |
+| `get_smart_cluster_summary` | Read the stored AI summary for a smart cluster | `cluster_id` |
+| `upsert_smart_cluster_summary` | Create or replace an AI-generated smart-cluster title, overview, OCR summary, key points, evidence, and model metadata | `cluster_id`, `title`, `summary`, `ocr_summary`, `key_points`, `evidence`, `source_snapshot_count`, `source_hash`, `model_provider`, `model_name`, `prompt_version` |
+| `delete_smart_cluster_summary` | Delete an existing smart-cluster summary without deleting the cluster or snapshots | `cluster_id` |
 
 ## Search Strategy Guide
 
@@ -29,6 +34,8 @@ You have access to the user's **CarbonPaper** screenshot history — a continuou
 - **`search_nl`** — Best for: describing what was on screen visually ("a chart showing sales data", "a video call with 4 people", "a dark-themed code editor"). This searches by image embedding similarity, not text.
 - **`get_snapshots_by_time_range`** — Best for: browsing what happened during a known time period ("what was I doing yesterday afternoon").
 - **`get_task_clusters`** — Best for: high-level overview of activities over a time span ("what projects was I working on last week").
+- **`get_smart_clusters`** — Best for: listing user-defined natural-language clusters and checking whether an AI summary already exists.
+- **`get_smart_cluster_ocr_corpus`** — Best for: gathering OCR evidence before creating or refreshing a smart-cluster summary.
 
 ### Retrieval patterns
 
@@ -66,6 +73,22 @@ search_ocr_text(query="API key", process_names=["chrome.exe"], start_time=..., e
 search_nl(query="presentation slides with a blue bar chart")
 → find visually matching screenshots
 → get_snapshot_details(id=...) for OCR text and task info
+```
+
+**6. Smart-cluster summary creation** — User asks to summarize a smart cluster:
+```
+get_smart_clusters()
+→ identify the target cluster_id and current summary state
+→ get_smart_cluster_ocr_corpus(cluster_id=..., page=0, page_size=50)
+→ synthesize title, summary, OCR summary, key points, and evidence from the returned OCR
+→ upsert_smart_cluster_summary(cluster_id=..., title=..., summary=..., ocr_summary=..., key_points=[...], evidence=[...])
+→ get_smart_cluster_summary(cluster_id=...) to verify the saved summary
+```
+
+**7. Smart-cluster summary removal** — User asks to delete a generated summary:
+```
+delete_smart_cluster_summary(cluster_id=...)
+→ confirm that only the stored summary was removed; the smart cluster and snapshots remain
 ```
 
 ## Response Data Schemas
@@ -111,6 +134,42 @@ When `include_coords: true` is passed, each block also includes `"box_coords": [
 }
 ```
 
+### Smart cluster
+```json
+{
+  "id": 12,
+  "anchor_text": "CarbonPaper MCP development",
+  "threshold": 0.62,
+  "enabled": true,
+  "dominant_color": "#4f46e5",
+  "assignment_count": 38,
+  "summary": {
+    "smart_cluster_id": 12,
+    "title": "MCP summary workflow",
+    "summary": "This cluster collects screenshots about adding smart-cluster summaries.",
+    "ocr_summary": "OCR repeatedly mentions MCP tools, smart_cluster_summaries, and frontend display changes.",
+    "key_points": ["Schema update", "MCP write/delete tools", "Frontend summary panel"],
+    "evidence": [{"screenshot_id": 123, "excerpt": "upsert_smart_cluster_summary"}],
+    "source_snapshot_count": 38,
+    "model_name": "gpt-5",
+    "updated_at": "2026-06-21 12:00:00"
+  }
+}
+```
+
+### Smart-cluster OCR corpus item
+```json
+{
+  "screenshot_id": 123,
+  "rerank_score": 0.83,
+  "process_name": "Code.exe",
+  "window_title": "mcp_server.rs",
+  "created_at": "2026-06-21 11:50:00",
+  "assigned_at": "2026-06-21 11:55:00",
+  "ocr_text": "upsert_smart_cluster_summary..."
+}
+```
+
 ### Snapshot detail (with task)
 ```json
 {
@@ -136,9 +195,13 @@ When `include_coords: true` is passed, each block also includes `"box_coords": [
 
 5. **Paginate large result sets.** Use `offset`/`limit` for search results and `page`/`page_size` for task screenshots. Don't request more data than needed.
 
-6. **Present timestamps in human-readable form.** Convert millisecond timestamps to the user's local time format when displaying results.
+6. **Create smart-cluster summaries from evidence.** Before writing a summary, inspect the OCR corpus and include concise evidence entries with snapshot IDs and short excerpts. Do not overwrite an existing summary unless the user asked to create, update, or refresh it.
 
-7. **Respect privacy.** The data may contain sensitive information (passwords, private messages, financial data visible on screen). Present information factually and don't draw unnecessary attention to sensitive content. If the user asks about sensitive data, just help them find it without editorializing.
+7. **Delete only what was requested.** `delete_smart_cluster_summary` removes the generated summary only. It does not delete the smart cluster, assignments, or screenshots.
+
+8. **Present timestamps in human-readable form.** Convert millisecond timestamps to the user's local time format when displaying results.
+
+9. **Respect privacy.** The data may contain sensitive information (passwords, private messages, financial data visible on screen). Present information factually and don't draw unnecessary attention to sensitive content. If the user asks about sensitive data, just help them find it without editorializing.
 
 ## Example Conversations
 

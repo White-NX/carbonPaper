@@ -1,11 +1,10 @@
 import React from 'react';
-import { Layout, Search as SearchIcon, Layers, Sparkles, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
+import { Layout, Search as SearchIcon, Sparkles, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 const NAV_ITEMS = [
   { id: 'preview', icon: Layout, i18nKey: 'activityBar.preview' },
   { id: 'advanced-search', icon: SearchIcon, i18nKey: 'activityBar.advancedSearch' },
-  { id: 'tasks', icon: Layers, i18nKey: 'activityBar.tasks' },
   { id: 'smart-cluster', icon: Sparkles, i18nKey: 'activityBar.smartCluster', fallback: '智能聚类' },
 ];
 

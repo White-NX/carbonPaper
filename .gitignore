@@ -39,6 +39,8 @@ venv/
 monitor/chroma_db/
 monitor/screenshots/
 monitor/monitor_pipe_name.txt
+.tmp_pytest/
+tools/disk-wear-runs/
 
 # Artificial Intelligence
 CLAUDE.md

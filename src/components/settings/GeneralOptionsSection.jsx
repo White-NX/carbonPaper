@@ -83,8 +83,8 @@ export default function GeneralOptionsSection({
   });
 
   const [cardClickBehaviorSearch, setCardClickBehaviorSearch] = useState(() => localStorage.getItem('cardClickBehavior_search') || 'preview');
-  const [cardClickBehaviorTasks, setCardClickBehaviorTasks] = useState(() => localStorage.getItem('cardClickBehavior_tasks') || 'standalone');
   const [cardClickBehaviorClusters, setCardClickBehaviorClusters] = useState(() => localStorage.getItem('cardClickBehavior_clusters') || 'standalone');
+  const [cardClickBehaviorActivityContext, setCardClickBehaviorActivityContext] = useState(() => localStorage.getItem('cardClickBehavior_activityContext') || 'preview');
 
   useEffect(() => {
     getLightweightConfig().then(setLightweightConfigState).catch(console.error);
@@ -390,22 +390,6 @@ export default function GeneralOptionsSection({
               />
             </div>
 
-            {/* Tasks */}
-            <div className="flex items-center justify-between gap-4">
-              <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.tasksLabel')}</label>
-              <DropdownSelect
-                value={cardClickBehaviorTasks}
-                onChange={(val) => {
-                  setCardClickBehaviorTasks(val);
-                  localStorage.setItem('cardClickBehavior_tasks', val);
-                }}
-                options={[
-                  { value: 'preview', label: t('settings.general.cardClickBehavior.preview') },
-                  { value: 'standalone', label: t('settings.general.cardClickBehavior.standalone') },
-                ]}
-              />
-            </div>
-
             {/* Smart Clusters */}
             <div className="flex items-center justify-between gap-4">
               <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.clustersLabel')}</label>
@@ -414,6 +398,22 @@ export default function GeneralOptionsSection({
                 onChange={(val) => {
                   setCardClickBehaviorClusters(val);
                   localStorage.setItem('cardClickBehavior_clusters', val);
+                }}
+                options={[
+                  { value: 'preview', label: t('settings.general.cardClickBehavior.preview') },
+                  { value: 'standalone', label: t('settings.general.cardClickBehavior.standalone') },
+                ]}
+              />
+            </div>
+
+            {/* Activity Context */}
+            <div className="flex items-center justify-between gap-4">
+              <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.activityContextLabel')}</label>
+              <DropdownSelect
+                value={cardClickBehaviorActivityContext}
+                onChange={(val) => {
+                  setCardClickBehaviorActivityContext(val);
+                  localStorage.setItem('cardClickBehavior_activityContext', val);
                 }}
                 options={[
                   { value: 'preview', label: t('settings.general.cardClickBehavior.preview') },

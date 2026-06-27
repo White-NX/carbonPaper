@@ -3,7 +3,6 @@ import { useTranslation } from 'react-i18next';
 import { AdvancedSearch } from './AdvancedSearch';
 import { InspectorImage } from './InspectorImage';
 import DetailCard from './DetailCard';
-import TasksView from './TasksView';
 import SmartClustersView from './SmartClustersView';
 import { Image as ImageIcon, Loader2, Copy, Maximize2, X } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -376,6 +375,7 @@ export default function MainArea({
             selectedEvent={selectedEvent}
             selectedDetails={selectedDetails}
             onSelectRelated={onAdvancedSelect}
+            onOpenFloatingPreview={openSnapshotPreview}
           />
 
           {/* OCR Content Panel */}
@@ -397,16 +397,6 @@ export default function MainArea({
             searchMode={searchMode}
             onSearchModeChange={onSearchModeChange}
             backendOnline={backendOnline}
-          />
-        </div>
-
-        <div className={`${activeTab === 'tasks' ? 'flex flex-col' : 'hidden'} flex-1 w-full min-w-0 min-h-0 overflow-hidden`}>
-          <TasksView
-            backendOnline={backendOnline}
-            onOpenSnapshotPreview={openSnapshotPreview}
-            onSelectScreenshot={(evt) => {
-              onAdvancedSelect?.(evt);
-            }}
           />
         </div>
 
