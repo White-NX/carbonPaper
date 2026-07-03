@@ -365,6 +365,18 @@ export default function FeaturesSection({ monitorStatus }) {
   const lastIndexingErrorAt = indexHealth?.last_indexing_error_at
     ? new Date(indexHealth.last_indexing_error_at * 1000).toLocaleString()
     : null;
+  const storageIpc = indexHealth?.storage_ipc || indexHealth?.python?.storage_ipc || null;
+  const storageIpcState = storageIpc?.circuit_state;
+  const storageIpcLabel = storageIpcState === 'open'
+    ? t('settings.features.management.indexHealth.ipcOpen', '熔断')
+    : storageIpcState === 'half_open'
+      ? t('settings.features.management.indexHealth.ipcHalfOpen', '探测')
+      : storageIpcState === 'closed'
+        ? t('settings.features.management.indexHealth.ipcClosed', '正常')
+        : '—';
+  const storageIpcRetryAfter = typeof storageIpc?.retry_after_secs === 'number'
+    ? Math.ceil(storageIpc.retry_after_secs)
+    : null;
 
   const lastClusteringRunLabel = clusteringStatus?.config?.last_run
     ? new Date(clusteringStatus.config.last_run * 1000).toLocaleString()
@@ -592,6 +604,13 @@ export default function FeaturesSection({ monitorStatus }) {
               <div>
                 <p className="text-ide-muted">{t('settings.features.management.indexHealth.smartPending', '智能聚类待处理')}</p>
                 <p className="mt-1 font-mono text-ide-text">{formatIndexCount(indexHealth?.smart_cluster_pending_count)}</p>
+              </div>
+              <div>
+                <p className="text-ide-muted">{t('settings.features.management.indexHealth.storageIpc', '存储 IPC')}</p>
+                <p className="mt-1 font-mono text-ide-text">
+                  {storageIpcLabel}
+                  {storageIpcRetryAfter ? ` ${storageIpcRetryAfter}s` : ''}
+                </p>
               </div>
             </div>
 

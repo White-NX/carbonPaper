@@ -188,7 +188,7 @@ def test_send_request_reconnects_once_after_empty_response(monkeypatch):
     monkeypatch.setattr(sc.win32file, "ReadFile", fake_read_file)
     monkeypatch.setattr(sc.win32file, "CloseHandle", lambda _h: state.__setitem__("close_calls", state["close_calls"] + 1))
 
-    result = sc.StorageClient("test-pipe")._send_request({"command": "after_idle"})
+    result = sc.StorageClient("test-pipe")._send_request({"command": "get_idle_state"})
 
     assert result == response_obj
     assert state["create_calls"] == 2

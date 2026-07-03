@@ -197,3 +197,104 @@ def test_send_request_watchdog_closes_handle_during_blocking_read(monkeypatch):
     assert result["code"] == "ipc_timeout"
     assert result["phase"] == "watchdog"
     assert close_calls
+
+
+def test_unsafe_write_command_is_not_retried_after_pipe_close(monkeypatch):
+    state = {"create_calls": 0, "write_calls": 0}
+
+    def create_file(*_args, **_kwargs):
+        state["create_calls"] += 1
+        return object()
+
+    def write_file(_h, _payload):
+        state["write_calls"] += 1
+        raise FakePyWinError(232, "pipe is being closed")
+
+    _install_win32(
+        monkeypatch,
+        create_file=create_file,
+        write_file=write_file,
+        read_file=lambda _h, _s: (0, b""),
+        flush_file=lambda _h: None,
+    )
+
+    client = sc.StorageClient("pipe")
+    result = client._send_request({"command": "save_screenshot_temp"})
+
+    assert result["status"] == "error"
+    assert "IPC error" in result["error"]
+    assert state["create_calls"] == 1
+    assert state["write_calls"] == 1
+
+
+def test_circuit_breaker_opens_after_repeated_transport_failures(monkeypatch):
+    attempts = {"create": 0}
+
+    def create_file(*_args, **_kwargs):
+        attempts["create"] += 1
+        raise FakePyWinError(2, "file not found")
+
+    _install_win32(
+        monkeypatch,
+        create_file=create_file,
+        write_file=lambda _h, payload: (0, len(payload)),
+        read_file=lambda _h, _s: (0, b""),
+        flush_file=lambda _h: None,
+    )
+
+    client = sc.StorageClient("pipe")
+    client._circuit_failure_threshold = 2
+    client._circuit_cooldown_secs = 30.0
+
+    first = client._send_request({"command": "get_auth_status"})
+    second = client._send_request({"command": "get_auth_status"})
+    third = client._send_request({"command": "get_auth_status"})
+
+    assert first["status"] == "error"
+    assert second["status"] == "error"
+    assert third["status"] == "error"
+    assert third["code"] == "ipc_circuit_open"
+    assert attempts["create"] == 2
+
+    snapshot = client.ipc_health_snapshot()
+    assert snapshot["circuit_state"] == "open"
+    assert snapshot["failure_count"] == 2
+    assert snapshot["last_command"] == "get_auth_status"
+
+
+def test_circuit_breaker_snapshot_reports_half_open_after_cooldown():
+    client = sc.StorageClient("pipe")
+    client._circuit_failure_threshold = 2
+    client._circuit_cooldown_secs = 1.0
+    client._record_ipc_failure("get_auth_status", "first")
+    client._record_ipc_failure("get_auth_status", "second")
+    client._circuit_open_until = time.monotonic() - 0.01
+
+    snapshot = client.ipc_health_snapshot()
+
+    assert snapshot["circuit_state"] == "half_open"
+    assert snapshot["retry_after_secs"] == 0.0
+
+
+def test_circuit_breaker_half_open_probe_resets_after_success(monkeypatch):
+    _install_win32(
+        monkeypatch,
+        create_file=lambda *_a, **_k: object(),
+        write_file=lambda _h, payload: (0, len(payload)),
+        read_file=_framed_reader(b'{"status":"success"}'),
+        flush_file=lambda _h: None,
+    )
+
+    client = sc.StorageClient("pipe")
+    client._circuit_failure_threshold = 2
+    client._circuit_cooldown_secs = 1.0
+    client._record_ipc_failure("get_auth_status", "first")
+    client._record_ipc_failure("get_auth_status", "second")
+    client._circuit_open_until = time.monotonic() - 0.01
+
+    result = client._send_request({"command": "get_auth_status"})
+
+    assert result["status"] == "success"
+    snapshot = client.ipc_health_snapshot()
+    assert snapshot["circuit_state"] == "closed"
+    assert snapshot["failure_count"] == 0

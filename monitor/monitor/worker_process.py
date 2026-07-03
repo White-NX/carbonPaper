@@ -449,10 +449,19 @@ def _worker_main(conn, storage_pipe: Optional[str], data_dir: str, env: Dict[str
             elif command == "get_stats":
                 send_response({"status": "success", "stats": ocr_worker.get_stats()})
             elif command == "get_index_health":
+                storage_ipc = None
+                try:
+                    from storage_client import get_storage_client
+                    sc = get_storage_client()
+                    if sc and hasattr(sc, "ipc_health_snapshot"):
+                        storage_ipc = sc.ipc_health_snapshot()
+                except Exception as exc:
+                    storage_ipc = {"error": str(exc)}
                 send_response({
                     "status": "success",
                     "stats": ocr_worker.get_stats(),
                     "postprocess": postprocess_queue.status_snapshot(),
+                    "worker_storage_ipc": storage_ipc,
                 })
             elif command == "retry_vector_indexing":
                 limit = int(msg.get("limit", 32) or 32)

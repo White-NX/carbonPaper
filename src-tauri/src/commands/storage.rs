@@ -88,6 +88,14 @@ fn compose_index_health_response(
         .as_ref()
         .and_then(|value| value.get("postprocess"))
         .cloned();
+    let storage_ipc = python
+        .as_ref()
+        .and_then(|value| value.get("storage_ipc"))
+        .cloned();
+    let worker_storage_ipc = python
+        .as_ref()
+        .and_then(|value| value.get("worker_storage_ipc"))
+        .cloned();
     let vector_rows_count = vector_stats
         .as_ref()
         .and_then(|stats| value_as_i64(stats.get("count")));
@@ -132,6 +140,8 @@ fn compose_index_health_response(
             .and_then(|value| value.get("worker_started"))
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        "storage_ipc": storage_ipc.unwrap_or(serde_json::Value::Null),
+        "worker_storage_ipc": worker_storage_ipc.unwrap_or(serde_json::Value::Null),
         "vector_status": vector_stats.unwrap_or(serde_json::Value::Null),
         "postprocess": postprocess.unwrap_or(serde_json::Value::Null),
         "python": python.unwrap_or(serde_json::Value::Null),

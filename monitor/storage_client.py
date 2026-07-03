@@ -7,6 +7,7 @@ import logging
 import threading
 import struct
 import os
+import random
 from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,72 @@ def _default_reverse_ipc_timeout_secs() -> float:
         return 15.0
 
 
+def _env_float(name: str, default: float, minimum: float) -> float:
+    raw = os.environ.get(name, str(default)) or str(default)
+    try:
+        return max(minimum, float(raw))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return float(default)
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw = os.environ.get(name, str(default)) or str(default)
+    try:
+        return max(minimum, int(raw))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return int(default)
+
+
 DEFAULT_REVERSE_IPC_TIMEOUT_SECS = _default_reverse_ipc_timeout_secs()
+DEFAULT_REVERSE_IPC_CIRCUIT_FAILURE_THRESHOLD = _env_int(
+    "CARBONPAPER_REVERSE_IPC_CIRCUIT_FAILURE_THRESHOLD",
+    3,
+    1,
+)
+DEFAULT_REVERSE_IPC_CIRCUIT_COOLDOWN_SECS = _env_float(
+    "CARBONPAPER_REVERSE_IPC_CIRCUIT_COOLDOWN_SECS",
+    15.0,
+    1.0,
+)
+RETRY_BACKOFF_BASE_SECS = _env_float(
+    "CARBONPAPER_REVERSE_IPC_RETRY_BACKOFF_BASE_SECS",
+    0.05,
+    0.01,
+)
+
+READ_RETRY_COMMANDS = {
+    'get_public_key',
+    'encrypt_for_chromadb',
+    'decrypt_from_chromadb',
+    'decrypt_many_from_chromadb',
+    'list_screenshots_for_clustering',
+    'get_screenshots_with_ocr_by_ids',
+    'get_idle_state',
+    'smart_cluster_list_enabled',
+    'smart_cluster_peek_pending',
+    'smart_cluster_count_pending',
+    'get_auth_status',
+    'get_temp_image',
+    'screenshot_exists',
+}
+
+IDEMPOTENT_RETRY_COMMANDS = {
+    'update_screenshot_category',
+    'smart_cluster_enqueue_pending',
+    'smart_cluster_delete_pending',
+    'smart_cluster_record_assignment',
+    'abort_screenshot',
+}
+
+UNSAFE_AFTER_SEND_COMMANDS = {
+    'save_screenshot',
+    'save_screenshot_temp',
+    'commit_screenshot',
+}
+
+SAFE_RETRY_AFTER_SEND_COMMANDS = READ_RETRY_COMMANDS | IDEMPOTENT_RETRY_COMMANDS
 
 
 class ReverseIpcTimeoutError(TimeoutError):
@@ -143,6 +209,16 @@ class StorageClient:
         self._seq_no = 0
         self._last_timeout_at: Optional[float] = None
         self._last_timeout_command: Optional[str] = None
+        self._circuit_lock = threading.Lock()
+        self._circuit_failure_threshold = DEFAULT_REVERSE_IPC_CIRCUIT_FAILURE_THRESHOLD
+        self._circuit_cooldown_secs = DEFAULT_REVERSE_IPC_CIRCUIT_COOLDOWN_SECS
+        self._circuit_failure_count = 0
+        self._circuit_open_until = 0.0
+        self._circuit_opened_at: Optional[float] = None
+        self._circuit_half_open_probe = False
+        self._circuit_last_failure_at: Optional[float] = None
+        self._circuit_last_error: Optional[str] = None
+        self._circuit_last_command: Optional[str] = None
 
     def _timeout_response(self, exc: ReverseIpcTimeoutError) -> Dict[str, Any]:
         self._last_timeout_at = time.time()
@@ -155,6 +231,113 @@ class StorageClient:
             'timeout_secs': exc.timeout_secs,
             'error': str(exc),
         }
+
+    def _build_request_bytes(self, request: Dict[str, Any]) -> bytes:
+        framed_request = dict(request)
+        framed_request['_ipc_keepalive'] = True
+        framed_request['_auth_token'] = self._auth_token
+        self._seq_no += 1
+        framed_request['_seq_no'] = self._seq_no
+        return json.dumps(framed_request).encode('utf-8')
+
+    def _can_retry_after_send(self, command: str) -> bool:
+        return command in SAFE_RETRY_AFTER_SEND_COMMANDS
+
+    def _sleep_before_retry(self, attempt: int, command: str) -> None:
+        delay = RETRY_BACKOFF_BASE_SECS * (2 ** max(0, attempt))
+        delay += random.uniform(0.0, delay * 0.2)
+        logger.debug(
+            "[storage_client] reverse IPC retry backoff command=%s attempt=%s delay=%.3fs",
+            command,
+            attempt + 1,
+            delay,
+        )
+        time.sleep(delay)
+
+    def _circuit_state_locked(self, now: Optional[float] = None) -> str:
+        now = time.monotonic() if now is None else now
+        if self._circuit_open_until > now:
+            return "open"
+        if self._circuit_half_open_probe or self._circuit_failure_count >= self._circuit_failure_threshold:
+            return "half_open"
+        return "closed"
+
+    def _circuit_block_response(self, command: str, state: str, retry_after_secs: float) -> Dict[str, Any]:
+        return {
+            'status': 'error',
+            'code': 'ipc_circuit_open',
+            'command': command,
+            'circuit_state': state,
+            'retry_after_secs': max(0.0, retry_after_secs),
+            'failure_count': self._circuit_failure_count,
+            'failure_threshold': self._circuit_failure_threshold,
+            'error': (
+                "Reverse IPC circuit breaker is open after repeated transport failures; "
+                "skipping reconnect attempt"
+            ),
+        }
+
+    def _check_circuit_before_request(self, command: str) -> Optional[Dict[str, Any]]:
+        with self._circuit_lock:
+            now = time.monotonic()
+            if self._circuit_open_until > now:
+                return self._circuit_block_response(
+                    command,
+                    "open",
+                    self._circuit_open_until - now,
+                )
+            if self._circuit_failure_count >= self._circuit_failure_threshold:
+                if self._circuit_half_open_probe:
+                    return self._circuit_block_response(command, "half_open", 0.0)
+                self._circuit_half_open_probe = True
+                return None
+            return None
+
+    def _record_ipc_success(self) -> None:
+        with self._circuit_lock:
+            self._circuit_failure_count = 0
+            self._circuit_open_until = 0.0
+            self._circuit_opened_at = None
+            self._circuit_half_open_probe = False
+            self._circuit_last_error = None
+            self._circuit_last_command = None
+
+    def _record_ipc_failure(self, command: str, error: str) -> None:
+        with self._circuit_lock:
+            now = time.monotonic()
+            self._circuit_failure_count += 1
+            self._circuit_half_open_probe = False
+            self._circuit_last_failure_at = time.time()
+            self._circuit_last_error = error
+            self._circuit_last_command = command
+            if self._circuit_failure_count >= self._circuit_failure_threshold:
+                self._circuit_open_until = now + self._circuit_cooldown_secs
+                self._circuit_opened_at = time.time()
+                logger.error(
+                    "[storage_client] reverse IPC circuit opened command=%s failures=%s cooldown=%.1fs last_error=%s",
+                    command,
+                    self._circuit_failure_count,
+                    self._circuit_cooldown_secs,
+                    error,
+                )
+
+    def ipc_health_snapshot(self) -> Dict[str, Any]:
+        with self._circuit_lock:
+            now = time.monotonic()
+            retry_after = max(0.0, self._circuit_open_until - now)
+            return {
+                'circuit_state': self._circuit_state_locked(now),
+                'failure_count': self._circuit_failure_count,
+                'failure_threshold': self._circuit_failure_threshold,
+                'cooldown_secs': self._circuit_cooldown_secs,
+                'retry_after_secs': retry_after,
+                'opened_at': self._circuit_opened_at,
+                'last_failure_at': self._circuit_last_failure_at,
+                'last_error': self._circuit_last_error,
+                'last_command': self._circuit_last_command,
+                'last_timeout_at': self._last_timeout_at,
+                'last_timeout_command': self._last_timeout_command,
+            }
 
     def _remaining_deadline(self, deadline: float, command: str, timeout_secs: float, phase: str) -> float:
         remaining = deadline - time.monotonic()
@@ -260,6 +443,10 @@ class StorageClient:
         timeout_event = threading.Event()
 
         try:
+            circuit_response = self._check_circuit_before_request(command)
+            if circuit_response is not None:
+                return circuit_response
+
             remaining = self._remaining_deadline(deadline, command, timeout_secs, "semaphore")
             semaphore_acquired = self._semaphore.acquire(timeout=remaining)
             if not semaphore_acquired:
@@ -279,16 +466,10 @@ class StorageClient:
             watchdog_timer.daemon = True
             watchdog_timer.start()
 
-            framed_request = dict(request)
-            framed_request['_ipc_keepalive'] = True
-            framed_request['_auth_token'] = self._auth_token
-            self._seq_no += 1
-            framed_request['_seq_no'] = self._seq_no
-            request_bytes = json.dumps(framed_request).encode('utf-8')
-
             for attempt in range(2):
                 self._remaining_deadline(deadline, command, timeout_secs, "connect")
                 handle = self._connect_persistent_handle()
+                request_bytes = self._build_request_bytes(request)
                 try:
                     self._remaining_deadline(deadline, command, timeout_secs, "write")
                     _write_framed_json(handle, request_bytes)
@@ -312,7 +493,12 @@ class StorageClient:
                 except pywintypes.error as e:
                     if timeout_event.is_set():
                         raise ReverseIpcTimeoutError(command, timeout_secs, phase="watchdog")
-                    if e.winerror not in PIPE_CLOSED_WINERRORS or attempt >= 1:
+                    can_retry = (
+                        e.winerror in PIPE_CLOSED_WINERRORS
+                        and attempt < 1
+                        and self._can_retry_after_send(command)
+                    )
+                    if not can_retry:
                         raise
                     logger.warning(
                         "[storage_client] persistent pipe closed during request command=%s winerror=%s; reconnecting and retrying once",
@@ -320,28 +506,37 @@ class StorageClient:
                         e.winerror,
                     )
                     self._close_persistent_handle()
+                    self._sleep_before_retry(attempt, command)
                     continue
 
                 if response == {'status': 'error', 'error': 'Empty response'}:
                     self._close_persistent_handle()
-                    if attempt < 1:
+                    if attempt < 1 and self._can_retry_after_send(command):
                         logger.warning(
                             "[storage_client] persistent pipe returned empty response command=%s; reconnecting and retrying once",
                             request.get('command'),
                         )
+                        self._sleep_before_retry(attempt, command)
                         continue
+                    self._record_ipc_failure(command, "Empty response")
+                    return response
+                self._record_ipc_success()
                 return response
 
             raise RuntimeError("Failed to send request to pipe")
                 
         except ReverseIpcTimeoutError as e:
             self._close_persistent_handle()
+            if e.phase not in ("semaphore", "request_lock"):
+                self._record_ipc_failure(command, str(e))
             return self._timeout_response(e)
         except pywintypes.error as e:
             self._close_persistent_handle()
+            self._record_ipc_failure(command, f"IPC error: {e}")
             return {'status': 'error', 'error': f'IPC error: {e}'}
         except Exception as e:
             self._close_persistent_handle()
+            self._record_ipc_failure(command, f"Error: {e}")
             return {'status': 'error', 'error': f'Error: {e}'}
         finally:
             if watchdog_timer is not None:
