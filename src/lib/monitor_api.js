@@ -5,6 +5,19 @@ import { withAuth, requestAuth, checkAuthSession } from './auth_api';
 export { requestAuth, checkAuthSession };
 export { initAuthListeners, lockSession } from './auth_api';
 
+export const REQUEST_DEADLINES = Object.freeze({
+    imageMs: 15_000,
+    thumbnailMs: 15_000,
+    timelineImageMs: 15_000,
+    detailMs: 15_000,
+});
+
+const createDeadlineError = (deadlineMs) => {
+    const err = new Error(`deadline exceeded after ${deadlineMs}ms`);
+    err.code = 'deadline_exceeded';
+    return err;
+};
+
 // Simple request queue to limit concurrent pipe connections
 export class RequestQueue {
     constructor(maxConcurrent = 3, maxPending = 200) {
@@ -17,7 +30,7 @@ export class RequestQueue {
     }
 
     async enqueue(fn, options = {}) {
-        const { priority = 'normal', key = null, dedupe = true } = options;
+        const { priority = 'normal', key = null, dedupe = true, deadlineMs = null } = options;
 
         if (dedupe && key !== null && key !== undefined) {
             const existing = this.pendingByKey.get(key) || this.runningByKey.get(key);
@@ -34,6 +47,8 @@ export class RequestQueue {
         }
 
         let settled = false;
+        let state = 'pending';
+        let deadlineTimer = null;
         let resolveRef;
         let rejectRef;
         const promise = new Promise((resolve, reject) => {
@@ -41,15 +56,34 @@ export class RequestQueue {
             rejectRef = reject;
         });
 
-        const safeResolve = (value) => {
+        const settle = (kind, value) => {
             if (settled) return;
             settled = true;
-            resolveRef(value);
-        };
-        const safeReject = (error) => {
-            if (settled) return;
-            settled = true;
-            rejectRef(error);
+            if (deadlineTimer) {
+                clearTimeout(deadlineTimer);
+                deadlineTimer = null;
+            }
+
+            const wasRunning = state === 'running';
+            state = 'settled';
+            this.queue = this.queue.filter((item) => item !== entry);
+            if (entry.key !== null && entry.key !== undefined) {
+                this.pendingByKey.delete(entry.key);
+                this.runningByKey.delete(entry.key);
+            }
+            if (wasRunning) {
+                this.running = Math.max(0, this.running - 1);
+            }
+
+            if (kind === 'resolve') {
+                resolveRef(value);
+            } else {
+                rejectRef(value);
+            }
+
+            if (wasRunning) {
+                this.processNext();
+            }
         };
 
         const entry = {
@@ -58,36 +92,35 @@ export class RequestQueue {
             cancelled: false,
             promise,
             run: async () => {
+                if (settled) return;
+                state = 'running';
                 if (entry.key !== null && entry.key !== undefined) {
                     this.pendingByKey.delete(entry.key);
                     this.runningByKey.set(entry.key, entry);
                 }
                 if (entry.cancelled) {
-                    safeReject(new Error('cancelled'));
+                    settle('reject', new Error('cancelled'));
                     return;
                 }
                 try {
                     const result = await fn();
-                    safeResolve(result);
+                    settle('resolve', result);
                 } catch (e) {
-                    safeReject(e);
-                } finally {
-                    this.running--;
-                    if (entry.key !== null && entry.key !== undefined) {
-                        this.runningByKey.delete(entry.key);
-                    }
-                    this.processNext();
+                    settle('reject', e);
                 }
             },
             cancel: () => {
                 entry.cancelled = true;
-                if (entry.key !== null && entry.key !== undefined) {
-                    this.pendingByKey.delete(entry.key);
-                    this.runningByKey.delete(entry.key);
-                }
-                safeReject(new Error('cancelled'));
+                settle('reject', new Error('cancelled'));
             }
         };
+
+        if (Number.isFinite(deadlineMs) && deadlineMs > 0) {
+            deadlineTimer = setTimeout(() => {
+                entry.cancelled = true;
+                settle('reject', createDeadlineError(deadlineMs));
+            }, deadlineMs);
+        }
 
         if (this.queue.length >= this.maxPending) {
             const dropped = priority === 'high' ? this.queue.pop() : this.queue.shift();
@@ -136,6 +169,7 @@ const imageQueue = new RequestQueue(3, 100);
 const thumbnailQueue = new RequestQueue(6, 100);
 // Timeline thumbnails should load in parallel to avoid long UI delays after pan/zoom
 const timelineImageQueue = new RequestQueue(20, 800);
+const detailQueue = new RequestQueue(3, 100);
 
 const imageRequestKey = (prefix, id, path) => {
     if (id !== null && id !== undefined && id !== '') return `${prefix}:id:${id}`;
@@ -215,14 +249,14 @@ export const fetchImage = async (id, path = null) => {
             }
             return null;
         });
-    }, { priority: 'high', key });
+    }, { priority: 'high', key, deadlineMs: REQUEST_DEADLINES.imageMs });
 };
 
 /**
  * 时间线缩略图专用获取（低优先级，使用 thumbnail API）
  */
 export const fetchTimelineImage = async (id, path = null, options = {}) => {
-    const { priority = 'normal', key = null } = options || {};
+    const { priority = 'normal', key = null, deadlineMs = REQUEST_DEADLINES.timelineImageMs } = options || {};
     return timelineImageQueue.enqueue(async () => {
         return withAuth(async () => {
             try {
@@ -241,7 +275,7 @@ export const fetchTimelineImage = async (id, path = null, options = {}) => {
                 throw err;
             }
         });
-    }, { priority, key });
+    }, { priority, key, deadlineMs });
 };
 
 export const clearTimelineImageQueue = () => {
@@ -261,7 +295,7 @@ export const fetchThumbnail = async (id, path = null) => {
             }
             return null;
         });
-    }, { priority: 'normal', key });
+    }, { priority: 'normal', key, deadlineMs: REQUEST_DEADLINES.thumbnailMs });
 };
 
 /**
@@ -405,9 +439,13 @@ export const getSoftDeleteQueueStatus = async () => {
 };
 
 export const getScreenshotDetails = async (id, path = null) => {
+    const key = imageRequestKey('detail', id, path);
     try {
-        const response = await withAuth(() => invoke('storage_get_screenshot_details', { id, path }));
-        if (response.error) {
+        const response = await detailQueue.enqueue(
+            () => withAuth(() => invoke('storage_get_screenshot_details', { id, path })),
+            { priority: 'high', key, deadlineMs: REQUEST_DEADLINES.detailMs }
+        );
+        if (response?.error) {
             console.error("Details error:", response.error);
             return { error: response.error };
         }

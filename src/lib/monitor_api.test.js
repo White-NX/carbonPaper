@@ -1,9 +1,13 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RequestQueue } from './monitor_api';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe('RequestQueue', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('limits concurrent task execution', async () => {
     const queue = new RequestQueue(2, 20);
     let running = 0;
@@ -64,5 +68,43 @@ describe('RequestQueue', () => {
 
     releaseFirst('first');
     await expect(first).resolves.toBe('first');
+  });
+
+  it('rejects pending tasks that exceed their deadline before running', async () => {
+    vi.useFakeTimers();
+    const queue = new RequestQueue(1, 10);
+    let releaseFirst;
+    const secondFn = vi.fn(() => Promise.resolve('second'));
+
+    const first = queue.enqueue(
+      () =>
+        new Promise((resolve) => {
+          releaseFirst = resolve;
+        }),
+      { deadlineMs: 1000 }
+    );
+    const second = queue.enqueue(secondFn, { deadlineMs: 50 });
+    const secondAssertion = expect(second).rejects.toMatchObject({ code: 'deadline_exceeded' });
+
+    await vi.advanceTimersByTimeAsync(51);
+    await secondAssertion;
+    expect(secondFn).not.toHaveBeenCalled();
+
+    releaseFirst('first');
+    await expect(first).resolves.toBe('first');
+  });
+
+  it('releases a running queue slot when a task exceeds its deadline', async () => {
+    vi.useFakeTimers();
+    const queue = new RequestQueue(1, 10);
+
+    const hung = queue.enqueue(() => new Promise(() => {}), { deadlineMs: 50 });
+    const hungAssertion = expect(hung).rejects.toMatchObject({ code: 'deadline_exceeded' });
+    const second = queue.enqueue(() => Promise.resolve('second'), { deadlineMs: 500 });
+
+    await vi.advanceTimersByTimeAsync(51);
+
+    await hungAssertion;
+    await expect(second).resolves.toBe('second');
   });
 });
