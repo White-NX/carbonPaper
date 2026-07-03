@@ -866,7 +866,7 @@ class VectorStore:
         image: Optional[Union[Image.Image, np.ndarray]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         ocr_text: Optional[str] = None
-    ) -> str:
+    ) -> Dict[str, Any]:
         """
         Add an image to the vector store.
 
@@ -877,7 +877,7 @@ class VectorStore:
             ocr_text: OCR-recognised text (stored as searchable document).
 
         Returns:
-            Stored document ID.
+            {'status': 'success', 'id': doc_id} or {'status': 'error', ...}.
         """
         doc_id = self._compute_id(image_path)
 
@@ -899,7 +899,7 @@ class VectorStore:
 
         if existing and existing.get('ids'):
             logger.info("[vector_store] add_image skipped, already exists: %s", doc_id)
-            return doc_id
+            return {'status': 'success', 'id': doc_id, 'skipped': True}
 
         # Encode image
         if image is None:
@@ -958,16 +958,33 @@ class VectorStore:
                     logger.info("[vector_store] client.persist() called")
             except Exception as e:
                 logger.error("[vector_store] client.persist() call failed: %s", e)
+                return {
+                    'status': 'error',
+                    'id': doc_id,
+                    'stage': 'persist',
+                    'error': str(e),
+                }
 
             try:
                 after = self.collection.count()
             except Exception:
                 after = None
             logger.info("[vector_store] add_image success id=%s before=%s after=%s", doc_id, before, after)
+            return {
+                'status': 'success',
+                'id': doc_id,
+                'skipped': False,
+                'before': before,
+                'after': after,
+            }
         except Exception as e:
             logger.error("[vector_store] add_image failed id=%s error=%s", doc_id, e)
-
-        return doc_id
+            return {
+                'status': 'error',
+                'id': doc_id,
+                'stage': 'add',
+                'error': str(e),
+            }
     
     def add_images_batch(
         self,

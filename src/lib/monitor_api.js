@@ -641,3 +641,17 @@ export const getSmartClusterWorkerStatus = async () => {
         }
     });
 };
+
+export const getIndexHealth = async ({ refreshVector = false } = {}) => {
+    return withAuth(
+        () => invoke('storage_get_index_health', { refreshVector }),
+        { autoPrompt: true },
+    );
+};
+
+export const retryVectorIndexing = async (limit = 32) => {
+    return withAuth(
+        () => invoke('storage_retry_vector_indexing', { limit }),
+        { autoPrompt: true },
+    );
+};

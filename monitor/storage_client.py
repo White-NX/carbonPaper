@@ -22,6 +22,31 @@ MAX_PIPE_BINARY_BYTES = 64 * 1024 * 1024
 PIPE_CLOSED_WINERRORS = (109, 232)
 
 
+def _default_reverse_ipc_timeout_secs() -> float:
+    raw = os.environ.get("CARBONPAPER_REVERSE_IPC_TIMEOUT_SECS", "15") or "15"
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning("Invalid CARBONPAPER_REVERSE_IPC_TIMEOUT_SECS=%r; using 15s", raw)
+        return 15.0
+
+
+DEFAULT_REVERSE_IPC_TIMEOUT_SECS = _default_reverse_ipc_timeout_secs()
+
+
+class ReverseIpcTimeoutError(TimeoutError):
+    """Raised when a reverse IPC storage request exceeds its deadline."""
+
+    def __init__(self, command: str, timeout_secs: float, phase: str = "request"):
+        self.command = command or "<unknown>"
+        self.timeout_secs = float(timeout_secs)
+        self.phase = phase
+        super().__init__(
+            f"Reverse IPC {phase} timed out after {self.timeout_secs:.1f}s "
+            f"(command={self.command})"
+        )
+
+
 def _write_framed_json(handle, payload: bytes) -> None:
     if len(payload) > MAX_PIPE_MESSAGE_BYTES:
         raise ValueError(f"Request too large (max {MAX_PIPE_MESSAGE_BYTES} bytes)")
@@ -116,6 +141,40 @@ class StorageClient:
         self._cache_limit = 512
         self._auth_token = os.environ.get("CARBONPAPER_REVERSE_IPC_TOKEN", "")
         self._seq_no = 0
+        self._last_timeout_at: Optional[float] = None
+        self._last_timeout_command: Optional[str] = None
+
+    def _timeout_response(self, exc: ReverseIpcTimeoutError) -> Dict[str, Any]:
+        self._last_timeout_at = time.time()
+        self._last_timeout_command = exc.command
+        return {
+            'status': 'error',
+            'code': 'ipc_timeout',
+            'command': exc.command,
+            'phase': exc.phase,
+            'timeout_secs': exc.timeout_secs,
+            'error': str(exc),
+        }
+
+    def _remaining_deadline(self, deadline: float, command: str, timeout_secs: float, phase: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReverseIpcTimeoutError(command, timeout_secs, phase=phase)
+        return remaining
+
+    def _trip_request_watchdog(
+        self,
+        timeout_event: threading.Event,
+        command: str,
+        timeout_secs: float,
+    ) -> None:
+        timeout_event.set()
+        logger.error(
+            "[storage_client] reverse IPC watchdog fired command=%s timeout=%.1fs; closing persistent pipe",
+            command,
+            timeout_secs,
+        )
+        self._close_persistent_handle()
 
     def _close_persistent_handle(self) -> None:
         handle = self._persistent_handle
@@ -179,7 +238,7 @@ class StorageClient:
         if len(cache) > self._cache_limit:
             cache.popitem(last=False)
     
-    def _send_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+    def _send_request(self, request: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
         """
         Send a request to the Rust storage service.
 
@@ -189,55 +248,95 @@ class StorageClient:
         Returns:
             Response data.
         """
+        command = str(request.get('command') or '<unknown>')
+        timeout_secs = max(
+            0.1,
+            float(timeout if timeout is not None else DEFAULT_REVERSE_IPC_TIMEOUT_SECS),
+        )
+        deadline = time.monotonic() + timeout_secs
+        semaphore_acquired = False
+        lock_acquired = False
+        watchdog_timer = None
+        timeout_event = threading.Event()
+
         try:
-            self._semaphore.acquire()
-            with self._request_lock:
-                framed_request = dict(request)
-                framed_request['_ipc_keepalive'] = True
-                framed_request['_auth_token'] = self._auth_token
-                self._seq_no += 1
-                framed_request['_seq_no'] = self._seq_no
-                request_bytes = json.dumps(framed_request).encode('utf-8')
+            remaining = self._remaining_deadline(deadline, command, timeout_secs, "semaphore")
+            semaphore_acquired = self._semaphore.acquire(timeout=remaining)
+            if not semaphore_acquired:
+                raise ReverseIpcTimeoutError(command, timeout_secs, phase="semaphore")
 
-                for attempt in range(2):
-                    handle = self._connect_persistent_handle()
+            remaining = self._remaining_deadline(deadline, command, timeout_secs, "request_lock")
+            lock_acquired = self._request_lock.acquire(timeout=remaining)
+            if not lock_acquired:
+                raise ReverseIpcTimeoutError(command, timeout_secs, phase="request_lock")
+
+            remaining = self._remaining_deadline(deadline, command, timeout_secs, "request")
+            watchdog_timer = threading.Timer(
+                remaining,
+                self._trip_request_watchdog,
+                args=(timeout_event, command, timeout_secs),
+            )
+            watchdog_timer.daemon = True
+            watchdog_timer.start()
+
+            framed_request = dict(request)
+            framed_request['_ipc_keepalive'] = True
+            framed_request['_auth_token'] = self._auth_token
+            self._seq_no += 1
+            framed_request['_seq_no'] = self._seq_no
+            request_bytes = json.dumps(framed_request).encode('utf-8')
+
+            for attempt in range(2):
+                self._remaining_deadline(deadline, command, timeout_secs, "connect")
+                handle = self._connect_persistent_handle()
+                try:
+                    self._remaining_deadline(deadline, command, timeout_secs, "write")
+                    _write_framed_json(handle, request_bytes)
+
+                    # Flush pipe to ensure all data has been sent.
                     try:
-                        _write_framed_json(handle, request_bytes)
-
-                        # Flush pipe to ensure all data has been sent.
-                        try:
-                            win32file.FlushFileBuffers(handle)
-                        except pywintypes.error as e:
-                            if e.winerror not in PIPE_CLOSED_WINERRORS:
-                                raise
-                            logger.debug(
-                                "[storage_client] FlushFileBuffers returned %s; continue reading response",
-                                e.winerror,
-                            )
-                        response = _read_framed_json(handle)
+                        self._remaining_deadline(deadline, command, timeout_secs, "flush")
+                        win32file.FlushFileBuffers(handle)
                     except pywintypes.error as e:
-                        if e.winerror not in PIPE_CLOSED_WINERRORS or attempt >= 1:
+                        if e.winerror not in PIPE_CLOSED_WINERRORS:
                             raise
-                        logger.warning(
-                            "[storage_client] persistent pipe closed during request command=%s winerror=%s; reconnecting and retrying once",
-                            request.get('command'),
+                        logger.debug(
+                            "[storage_client] FlushFileBuffers returned %s; continue reading response",
                             e.winerror,
                         )
-                        self._close_persistent_handle()
+
+                    self._remaining_deadline(deadline, command, timeout_secs, "read")
+                    response = _read_framed_json(handle)
+                    if timeout_event.is_set():
+                        raise ReverseIpcTimeoutError(command, timeout_secs, phase="watchdog")
+                except pywintypes.error as e:
+                    if timeout_event.is_set():
+                        raise ReverseIpcTimeoutError(command, timeout_secs, phase="watchdog")
+                    if e.winerror not in PIPE_CLOSED_WINERRORS or attempt >= 1:
+                        raise
+                    logger.warning(
+                        "[storage_client] persistent pipe closed during request command=%s winerror=%s; reconnecting and retrying once",
+                        request.get('command'),
+                        e.winerror,
+                    )
+                    self._close_persistent_handle()
+                    continue
+
+                if response == {'status': 'error', 'error': 'Empty response'}:
+                    self._close_persistent_handle()
+                    if attempt < 1:
+                        logger.warning(
+                            "[storage_client] persistent pipe returned empty response command=%s; reconnecting and retrying once",
+                            request.get('command'),
+                        )
                         continue
+                return response
 
-                    if response == {'status': 'error', 'error': 'Empty response'}:
-                        self._close_persistent_handle()
-                        if attempt < 1:
-                            logger.warning(
-                                "[storage_client] persistent pipe returned empty response command=%s; reconnecting and retrying once",
-                                request.get('command'),
-                            )
-                            continue
-                    return response
-
-                raise RuntimeError("Failed to send request to pipe")
+            raise RuntimeError("Failed to send request to pipe")
                 
+        except ReverseIpcTimeoutError as e:
+            self._close_persistent_handle()
+            return self._timeout_response(e)
         except pywintypes.error as e:
             self._close_persistent_handle()
             return {'status': 'error', 'error': f'IPC error: {e}'}
@@ -245,7 +344,15 @@ class StorageClient:
             self._close_persistent_handle()
             return {'status': 'error', 'error': f'Error: {e}'}
         finally:
-            self._semaphore.release()
+            if watchdog_timer is not None:
+                watchdog_timer.cancel()
+            if lock_acquired:
+                try:
+                    self._request_lock.release()
+                except RuntimeError:
+                    pass
+            if semaphore_acquired:
+                self._semaphore.release()
     
     def get_public_key(self) -> Optional[bytes]:
         """

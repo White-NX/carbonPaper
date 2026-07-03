@@ -1,5 +1,7 @@
 import storage_client as sc
 import struct
+import threading
+import time
 
 
 class FakePyWinError(Exception):
@@ -130,3 +132,68 @@ def test_send_request_non_benign_flush_error_becomes_ipc_error(monkeypatch):
 
     assert result["status"] == "error"
     assert "IPC error" in result["error"]
+
+
+def test_send_request_times_out_waiting_for_semaphore():
+    client = sc.StorageClient("pipe")
+    assert client._semaphore.acquire(blocking=False)
+    assert client._semaphore.acquire(blocking=False)
+    try:
+        result = client._send_request({"command": "status"}, timeout=0.01)
+    finally:
+        client._semaphore.release()
+        client._semaphore.release()
+
+    assert result["status"] == "error"
+    assert result["code"] == "ipc_timeout"
+    assert result["phase"] == "semaphore"
+    assert result["command"] == "status"
+
+
+def test_send_request_times_out_waiting_for_request_lock():
+    client = sc.StorageClient("pipe")
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        client._request_lock.acquire()
+        ready.set()
+        release.wait(timeout=1.0)
+        client._request_lock.release()
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert ready.wait(timeout=1.0)
+    try:
+        result = client._send_request({"command": "status"}, timeout=0.01)
+    finally:
+        release.set()
+        holder.join(timeout=1.0)
+
+    assert result["status"] == "error"
+    assert result["code"] == "ipc_timeout"
+    assert result["phase"] == "request_lock"
+
+
+def test_send_request_watchdog_closes_handle_during_blocking_read(monkeypatch):
+    client = sc.StorageClient("pipe")
+    close_calls = []
+    fake_handle = object()
+
+    monkeypatch.setattr(client, "_connect_persistent_handle", lambda: fake_handle)
+    monkeypatch.setattr(sc, "_write_framed_json", lambda _handle, _payload: None)
+    monkeypatch.setattr(sc.win32file, "FlushFileBuffers", lambda _handle: None)
+
+    def slow_read(_handle):
+        time.sleep(0.15)
+        return {"status": "success"}
+
+    monkeypatch.setattr(sc, "_read_framed_json", slow_read)
+    monkeypatch.setattr(client, "_close_persistent_handle", lambda: close_calls.append(True))
+
+    result = client._send_request({"command": "slow_read"}, timeout=0.1)
+
+    assert result["status"] == "error"
+    assert result["code"] == "ipc_timeout"
+    assert result["phase"] == "watchdog"
+    assert close_calls

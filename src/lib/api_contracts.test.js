@@ -13,8 +13,10 @@ import {
   classifyDebug,
   deleteRecordsByTimeRange,
   deleteScreenshot,
+  getIndexHealth,
   getSmartClusterWorkerStatus,
   removeLocalAnchorsByProcess,
+  retryVectorIndexing,
 } from './monitor_api';
 import {
   createSmartCluster,
@@ -40,7 +42,9 @@ describe('API contract payloads', () => {
       .mockResolvedValueOnce({ status: 'success', removed_count: 2 })
       .mockResolvedValueOnce({ status: 'success', deleted: true })
       .mockResolvedValueOnce({ status: 'success', deleted_count: 3 })
-      .mockResolvedValueOnce({ pending_count: 4, is_running: true, is_force_running: false });
+      .mockResolvedValueOnce({ pending_count: 4, is_running: true, is_force_running: false })
+      .mockResolvedValueOnce({ status: 'success', screenshots_count: 10 })
+      .mockResolvedValueOnce({ status: 'success', enqueued: 2 });
 
     await classifyDebug({ title: 'Editor', ocrText: 'text', processName: 'code.exe' });
     await removeLocalAnchorsByProcess('Development', 'code.exe');
@@ -51,6 +55,8 @@ describe('API contract payloads', () => {
       running: true,
       forceRunning: false,
     });
+    await getIndexHealth({ refreshVector: true });
+    await retryVectorIndexing(12);
 
     expect(invoke).toHaveBeenNthCalledWith(1, 'monitor_classify_debug', {
       title: 'Editor',
@@ -69,6 +75,12 @@ describe('API contract payloads', () => {
       endTime: 1000000,
     });
     expect(invoke).toHaveBeenNthCalledWith(5, 'monitor_smart_cluster_worker_status');
+    expect(invoke).toHaveBeenNthCalledWith(6, 'storage_get_index_health', {
+      refreshVector: true,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(7, 'storage_retry_vector_indexing', {
+      limit: 12,
+    });
   });
 
   it('sends task and natural-language clustering payloads', async () => {

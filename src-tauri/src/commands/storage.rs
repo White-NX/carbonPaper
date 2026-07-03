@@ -63,9 +63,85 @@ fn redact_policy_for_frontend(policy: &mut serde_json::Value) {
     }
 }
 
+fn value_as_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    value.and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+    })
+}
+
+fn compose_index_health_response(
+    storage_stats: storage::IndexStorageStats,
+    monitor_health: Result<serde_json::Value, String>,
+) -> serde_json::Value {
+    let (monitor_available, python, transport_error) = match monitor_health {
+        Ok(value) => (true, Some(value), None),
+        Err(error) => (false, None, Some(error)),
+    };
+
+    let vector_stats = python
+        .as_ref()
+        .and_then(|value| value.get("stats"))
+        .and_then(|stats| stats.get("vector_stats"))
+        .cloned();
+    let postprocess = python
+        .as_ref()
+        .and_then(|value| value.get("postprocess"))
+        .cloned();
+    let vector_rows_count = vector_stats
+        .as_ref()
+        .and_then(|stats| value_as_i64(stats.get("count")));
+    let pending_retry_queue_count = postprocess
+        .as_ref()
+        .and_then(|stats| value_as_i64(stats.get("vector_retry_backlog_count")));
+    let last_indexing_error = postprocess
+        .as_ref()
+        .and_then(|stats| stats.get("last_indexing_error"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let last_indexing_error_at = postprocess
+        .as_ref()
+        .and_then(|stats| stats.get("last_indexing_error_at"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let monitor_error = transport_error
+        .map(serde_json::Value::String)
+        .or_else(|| {
+            python
+                .as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(|value| value.as_str())
+                .map(|s| serde_json::Value::String(s.to_string()))
+        })
+        .unwrap_or(serde_json::Value::Null);
+
+    serde_json::json!({
+        "status": "success",
+        "screenshots_count": storage_stats.screenshots_count,
+        "ocr_rows_count": storage_stats.ocr_rows_count,
+        "vector_rows_count": vector_rows_count,
+        "pending_retry_queue_count": pending_retry_queue_count,
+        "smart_cluster_pending_count": storage_stats.smart_cluster_pending_count,
+        "delete_queue": storage_stats.delete_queue,
+        "last_indexing_error": last_indexing_error,
+        "last_indexing_error_at": last_indexing_error_at,
+        "monitor_available": monitor_available,
+        "monitor_error": monitor_error,
+        "worker_started": python
+            .as_ref()
+            .and_then(|value| value.get("worker_started"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "vector_status": vector_stats.unwrap_or(serde_json::Value::Null),
+        "postprocess": postprocess.unwrap_or(serde_json::Value::Null),
+        "python": python.unwrap_or(serde_json::Value::Null),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{merge_policy_update, redact_policy_for_frontend};
+    use super::{compose_index_health_response, merge_policy_update, redact_policy_for_frontend};
+    use crate::storage::{DeleteQueueStatus, IndexStorageStats};
     use serde_json::json;
 
     #[test]
@@ -109,6 +185,61 @@ mod tests {
 
         assert_eq!(policy["mcp_enabled"], true);
         assert!(policy.get("mcp_token_encrypted").is_none());
+    }
+
+    #[test]
+    fn compose_index_health_response_merges_storage_and_monitor_counts() {
+        let storage_stats = IndexStorageStats {
+            screenshots_count: 10,
+            ocr_rows_count: 12,
+            smart_cluster_pending_count: 3,
+            delete_queue: DeleteQueueStatus {
+                pending_screenshots: 1,
+                pending_ocr: 2,
+                running: false,
+            },
+        };
+        let monitor_health = Ok(json!({
+            "status": "success",
+            "worker_started": true,
+            "stats": { "vector_stats": { "count": 9 } },
+            "postprocess": {
+                "vector_retry_backlog_count": 4,
+                "last_indexing_error": "chroma down",
+                "last_indexing_error_at": 123.0
+            }
+        }));
+
+        let response = compose_index_health_response(storage_stats, monitor_health);
+
+        assert_eq!(response["screenshots_count"], 10);
+        assert_eq!(response["ocr_rows_count"], 12);
+        assert_eq!(response["vector_rows_count"], 9);
+        assert_eq!(response["pending_retry_queue_count"], 4);
+        assert_eq!(response["monitor_available"], true);
+        assert_eq!(response["last_indexing_error"], "chroma down");
+    }
+
+    #[test]
+    fn compose_index_health_response_keeps_storage_counts_when_monitor_unavailable() {
+        let storage_stats = IndexStorageStats {
+            screenshots_count: 10,
+            ocr_rows_count: 12,
+            smart_cluster_pending_count: 3,
+            delete_queue: DeleteQueueStatus {
+                pending_screenshots: 1,
+                pending_ocr: 2,
+                running: false,
+            },
+        };
+
+        let response =
+            compose_index_health_response(storage_stats, Err("Monitor not started".to_string()));
+
+        assert_eq!(response["screenshots_count"], 10);
+        assert_eq!(response["vector_rows_count"], serde_json::Value::Null);
+        assert_eq!(response["monitor_available"], false);
+        assert_eq!(response["monitor_error"], "Monitor not started");
     }
 }
 
@@ -708,6 +839,51 @@ pub async fn storage_get_delete_queue_status(
     tokio::task::spawn_blocking(move || state.get_delete_queue_status())
         .await
         .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
+#[tauri::command]
+pub async fn storage_get_index_health(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    monitor_state: tauri::State<'_, MonitorState>,
+    refresh_vector: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
+    let storage_state = state.inner().clone();
+    let storage_stats =
+        tokio::task::spawn_blocking(move || storage_state.get_index_storage_stats())
+            .await
+            .map_err(|e| format!("Task join error: {:?}", e))??;
+
+    let monitor_health = monitor::forward_command_to_python(
+        &monitor_state,
+        serde_json::json!({
+            "command": "index_health",
+            "refresh": refresh_vector.unwrap_or(false),
+        }),
+    )
+    .await;
+
+    Ok(compose_index_health_response(storage_stats, monitor_health))
+}
+
+#[tauri::command]
+pub async fn storage_retry_vector_indexing(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    monitor_state: tauri::State<'_, MonitorState>,
+    limit: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    check_auth_required(&credential_state)?;
+
+    monitor::forward_command_to_python(
+        &monitor_state,
+        serde_json::json!({
+            "command": "retry_vector_indexing",
+            "limit": limit.unwrap_or(32).clamp(1, 256),
+        }),
+    )
+    .await
 }
 
 #[tauri::command]

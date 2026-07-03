@@ -742,7 +742,11 @@ function App() {
         const payload = event?.payload || {};
         const code = payload.code || 'unknown';
         const errMsg = payload.error ? `; ${payload.error}` : '';
-        const message = `子服务已退出（code: ${code}${errMsg}）`;
+        const recovery = payload.recovery || {};
+        const recoveryMsg = recovery.policy === 'manual_restart'
+          ? '；恢复策略：手动重启，旧 IPC 状态已清理'
+          : '';
+        const message = `子服务已退出（code: ${code}${errMsg}）${recoveryMsg}`;
         const details = formatErrorDetails(payload);
         setBackendStatus('offline');
         backendStatusRef.current = 'offline';

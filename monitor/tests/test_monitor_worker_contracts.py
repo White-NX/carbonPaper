@@ -224,3 +224,53 @@ def test_model_worker_classifier_proxy_payload_contract(monkeypatch):
             "timeout": 30,
         },
     ]
+
+
+def test_model_worker_index_health_does_not_cold_start_by_default(monkeypatch):
+    worker = RestartableModelWorker(storage_pipe=None, data_dir="unused", env={})
+    calls = []
+
+    monkeypatch.setattr(worker, "status_snapshot", lambda: {"alive": False, "state": "stopped"})
+    monkeypatch.setattr(
+        worker,
+        "request",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {"status": "success"},
+    )
+
+    result = worker.get_index_health(refresh=False)
+
+    assert result["status"] == "success"
+    assert result["worker_available"] is True
+    assert result["worker_started"] is False
+    assert result["stats"]["watchdog"]["alive"] is False
+    assert calls == []
+
+
+def test_model_worker_index_health_and_retry_payload_contract(monkeypatch):
+    worker = RestartableModelWorker(storage_pipe=None, data_dir="unused", env={})
+    calls = []
+    responses = {
+        "get_index_health": {
+            "status": "success",
+            "stats": {"vector_stats": {"count": 3}},
+            "postprocess": {"vector_retry_backlog_count": 1},
+        },
+        "retry_vector_indexing": {"status": "success", "enqueued": 1},
+    }
+
+    def fake_request(command, payload=None, timeout=120.0):
+        calls.append({"command": command, "payload": payload, "timeout": timeout})
+        return responses[command]
+
+    monkeypatch.setattr(worker, "request", fake_request)
+
+    health = worker.get_index_health(refresh=True)
+    retry = worker.retry_vector_indexing(limit=5)
+
+    assert health["worker_available"] is True
+    assert health["worker_started"] is True
+    assert retry == {"status": "success", "enqueued": 1}
+    assert calls == [
+        {"command": "get_index_health", "payload": None, "timeout": 30},
+        {"command": "retry_vector_indexing", "payload": {"limit": 5}, "timeout": 30},
+    ]

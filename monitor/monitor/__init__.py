@@ -341,6 +341,40 @@ def _handle_command_impl(req: dict):
             status['ocr_stats'] = _ocr_worker.get_stats()
         return status
 
+    if cmd == 'index_health':
+        if not _ocr_worker:
+            return {
+                'status': 'success',
+                'worker_available': False,
+                'worker_started': False,
+                'stats': {},
+                'postprocess': None,
+            }
+        try:
+            refresh = bool(req.get('refresh', False))
+            if hasattr(_ocr_worker, 'get_index_health'):
+                return _ocr_worker.get_index_health(refresh=refresh)
+            return {
+                'status': 'success',
+                'worker_available': True,
+                'worker_started': None,
+                'stats': _ocr_worker.get_stats() if hasattr(_ocr_worker, 'get_stats') else {},
+                'postprocess': None,
+            }
+        except Exception as e:
+            logger.warning('Index health query failed: %s', e)
+            return {'status': 'error', 'error': str(e)}
+
+    if cmd == 'retry_vector_indexing':
+        if not _ocr_worker or not hasattr(_ocr_worker, 'retry_vector_indexing'):
+            return {'status': 'error', 'error': 'Vector indexing retry is not available'}
+        try:
+            limit = int(req.get('limit', 32) or 32)
+            return _ocr_worker.retry_vector_indexing(limit=limit)
+        except Exception as e:
+            logger.warning('Vector indexing retry failed: %s', e)
+            return {'status': 'error', 'error': str(e)}
+
     # ----- Configuration commands -----
     if cmd == 'update_filters':
         filters = req.get('filters', {}) if isinstance(req, dict) else {}
