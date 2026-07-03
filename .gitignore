@@ -42,6 +42,10 @@ monitor/monitor_pipe_name.txt
 .tmp_pytest/
 tools/disk-wear-runs/
 
+# Release assets downloaded and verified during packaging
+/aria2c.exe
+/python-3.12.10-amd64.exe
+
 # Artificial Intelligence
 CLAUDE.md
 .claude/

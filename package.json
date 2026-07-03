@@ -25,8 +25,11 @@
     "bump:version": "node scripts/bump-version.mjs",
     "build:nmh": "node scripts/build-nmh.mjs",
     "build:nmh:release": "node scripts/build-nmh.mjs --release",
+    "prepare:release-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1",
+    "verify:release-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1 -VerifyOnly",
+    "test:release-assets": "node scripts/verify-release-assets.mjs",
     "pack:portable": "node scripts/pack-portable.mjs",
-    "tauri:build": "node scripts/build-nmh.mjs --release && tauri build && node scripts/pack-portable.mjs"
+    "tauri:build": "npm run prepare:release-assets && node scripts/build-nmh.mjs --release && tauri build && node scripts/pack-portable.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "~2.9.0",

@@ -192,6 +192,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../monitor");
     println!("cargo:rerun-if-changed=../compliance_process");
     println!("cargo:rerun-if-changed=../python-3.12.10-amd64.exe");
+    println!("cargo:rerun-if-changed=../aria2c.exe");
     println!("cargo:rerun-if-changed=../browser-extension");
     println!("cargo:rerun-if-changed=build_pyz.py");
 

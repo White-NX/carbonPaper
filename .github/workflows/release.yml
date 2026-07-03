@@ -31,6 +31,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Prepare release assets
+        run: npm run prepare:release-assets
+
       - name: Build NMH binary
         run: npm run build:nmh:release
 
