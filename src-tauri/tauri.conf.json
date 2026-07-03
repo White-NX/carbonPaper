@@ -36,8 +36,7 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "pre-bundle": ".",
-      "../ai_embedding": "ai_embedding"
+      "pre-bundle": "."
     },
     "windows": {
       "nsis": {

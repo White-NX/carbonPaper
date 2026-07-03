@@ -419,6 +419,16 @@
         "endpoint": "端点",
         "auth_header": "认证头"
       },
+      "agent_setup": {
+        "title": "Agent 配置",
+        "description": "复制一段配置提示词，让 Agent 自行获取 Skill 并连接本地 MCP 服务。",
+        "skill": "Skill",
+        "source": "来源",
+        "endpoint": "端点",
+        "copy": "复制配置提示词",
+        "copied": "配置提示词已复制",
+        "prompt": "请配置 CarbonPaper MCP 访问。\n\n1. 从 GitHub 仓库 {{repo}} 的 {{skillName}} 目录获取 Skill，并安装到你的 Agent/Skill 环境中。该仓库可能是私有仓库；如果当前环境没有访问权限，请使用已配置的 GitHub 凭据或向我请求授权。\n2. 使用该 Skill 处理 CarbonPaper 截图历史、OCR、任务聚类和智能聚类摘要相关请求。\n3. MCP endpoint：{{endpoint}}，使用 Streamable HTTP/HTTP POST。\n4. 认证头：Authorization: Bearer <CarbonPaper token>。不要让我把 token 写进长提示词；请让我在 CarbonPaper 中单独点击“复制令牌”，然后将其配置到你的 MCP 客户端。\n5. 如果工具返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 应用中完成 Windows Hello 解锁。\n6. 该 MCP 可能暴露本机截图历史、OCR 文本、窗口标题、URL、任务聚类和智能聚类数据；只在我明确要求时读取相关内容。"
+      },
       "content_filter": {
         "title": "内容过滤",
         "description": "基于合规规则过滤 MCP 服务返回结果中的标记内容。",

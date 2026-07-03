@@ -419,6 +419,16 @@
         "endpoint": "Endpoint",
         "auth_header": "Authorization Header"
       },
+      "agent_setup": {
+        "title": "Agent Setup",
+        "description": "Copy setup instructions so an Agent can fetch the Skill and connect to the local MCP server.",
+        "skill": "Skill",
+        "source": "Source",
+        "endpoint": "Endpoint",
+        "copy": "Copy setup prompt",
+        "copied": "Setup prompt copied",
+        "prompt": "Configure CarbonPaper MCP access.\n\n1. Fetch the Skill from the {{skillName}} directory in GitHub repository {{repo}}, then install it into your Agent/Skill environment. The repository may be private; if this environment lacks access, use configured GitHub credentials or ask me for access.\n2. Use that Skill for CarbonPaper screenshot history, OCR, task cluster, and smart-cluster summary workflows.\n3. MCP endpoint: {{endpoint}}, using Streamable HTTP/HTTP POST.\n4. Authorization header: Authorization: Bearer <CarbonPaper token>. Do not ask me to paste the token into this long setup prompt; ask me to click Copy token in CarbonPaper and configure it separately in your MCP client.\n5. If a tool returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello before retrying.\n6. This MCP server may expose local screenshot history, OCR text, window titles, URLs, task clusters, and smart-cluster data. Read only the content needed for my explicit request."
+      },
       "content_filter": {
         "title": "Content Filter",
         "description": "Filter flagged content from MCP server responses based on compliance rules.",

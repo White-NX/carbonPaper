@@ -36,6 +36,7 @@ __pycache__/
 venv/
 
 # Runtime data (monitor)
+monitor/ocr_data.db
 monitor/chroma_db/
 monitor/screenshots/
 monitor/monitor_pipe_name.txt

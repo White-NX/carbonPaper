@@ -7,6 +7,9 @@ import { Dialog } from '../Dialog';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { withAuth } from '../../lib/auth_api';
 
+const AGENT_SKILL_NAME = 'carbonpaper-memory';
+const AGENT_SKILL_REPO = 'https://github.com/White-NX/carbonPaperSkill';
+
 export default function AiEmbeddingSection() {
   const { t } = useTranslation();
   const [enabled, setEnabled] = useState(() => localStorage.getItem('mcpEnabled') === 'true');
@@ -33,6 +36,7 @@ export default function AiEmbeddingSection() {
   const [confirmText, setConfirmText] = useState('');
 
   const [tokenCopied, setTokenCopied] = useState(false);
+  const [agentPromptCopied, setAgentPromptCopied] = useState(false);
 
   // Token reset confirmation
   const [showResetConfirm, setShowResetConfirm] = useState(false);
@@ -358,6 +362,21 @@ export default function AiEmbeddingSection() {
     }
   };
 
+  const handleCopyAgentSetupPrompt = async () => {
+    const endpoint = `http://localhost:${port}/mcp`;
+    const prompt = t('settings.ai_embedding.agent_setup.prompt', {
+      skillName: AGENT_SKILL_NAME,
+      repo: AGENT_SKILL_REPO,
+      endpoint,
+    });
+    try {
+      await navigator.clipboard.writeText(prompt);
+      setAgentPromptCopied(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const normalizedServiceState = enabled
     ? (running ? 'running' : serviceState || 'pending_auth')
     : 'disabled';
@@ -514,7 +533,50 @@ export default function AiEmbeddingSection() {
           </>
         )}
 
-        {/* Row 3: Connection info */}
+        {/* Row 3: Agent setup */}
+        {enabled && (
+          <>
+            <div className="w-full h-px bg-ide-border/50" />
+            <div className="flex items-center justify-between gap-4">
+              <div className="min-w-0 flex-1">
+                <label className="block mb-1 font-semibold text-ide-text">{t('settings.ai_embedding.agent_setup.title')}</label>
+                <div className="space-y-1.5">
+                  <p className="text-xs text-ide-muted">{t('settings.ai_embedding.agent_setup.description')}</p>
+                  <div className="grid gap-1.5 text-xs">
+                    <div className="min-w-0">
+                      <span className="text-ide-muted">{t('settings.ai_embedding.agent_setup.skill')}</span>{' '}
+                      <code className="text-ide-text font-mono">{AGENT_SKILL_NAME}</code>
+                    </div>
+                    <div className="min-w-0">
+                      <span className="text-ide-muted">{t('settings.ai_embedding.agent_setup.source')}</span>{' '}
+                      <code className="break-all text-ide-text font-mono">{AGENT_SKILL_REPO}</code>
+                    </div>
+                    <div className="min-w-0">
+                      <span className="text-ide-muted">{t('settings.ai_embedding.agent_setup.endpoint')}</span>{' '}
+                      <code className="break-all text-ide-text font-mono">POST http://localhost:{port}/mcp</code>
+                    </div>
+                    <div className="min-w-0">
+                      <span className="text-ide-muted">{t('settings.ai_embedding.connection_info.auth_header')}</span>{' '}
+                      <code className="break-all text-ide-text font-mono">Authorization: Bearer &lt;CarbonPaper token&gt;</code>
+                    </div>
+                  </div>
+                  {agentPromptCopied && (
+                    <p className="text-xs text-green-400">{t('settings.ai_embedding.agent_setup.copied')}</p>
+                  )}
+                </div>
+              </div>
+              <button
+                onClick={handleCopyAgentSetupPrompt}
+                className="shrink-0 px-3 py-1.5 text-xs text-ide-text hover:bg-ide-hover border border-ide-border rounded-lg transition-colors flex items-center gap-1.5"
+              >
+                {agentPromptCopied ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
+                {t('settings.ai_embedding.agent_setup.copy')}
+              </button>
+            </div>
+          </>
+        )}
+
+        {/* Row 4: Connection info */}
         {enabled && running && (
           <>
             <div className="w-full h-px bg-ide-border/50" />
