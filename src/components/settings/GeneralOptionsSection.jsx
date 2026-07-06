@@ -1,10 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
-import { Circle, ChevronDown } from 'lucide-react';
-import { getLightweightConfig, setLightweightConfig, switchToLightweightMode } from '../../lib/lightweight_api';
-import { withAuth } from '../../lib/auth_api';
+import { ChevronDown, Minimize2 } from 'lucide-react';
+import { SettingsButton, SettingsSegmentedControl, SettingsSwitch } from './SettingsControls';
+import { useGeneralOptionsController } from './useGeneralOptionsController';
 
 function DropdownSelect({ value, onChange, options }) {
   const [open, setOpen] = useState(false);
@@ -67,122 +65,29 @@ export default function GeneralOptionsSection({
   onTogglePowerSaving,
 }) {
   const { t } = useTranslation();
-  const [powerSavingMode, setPowerSavingMode] = useState(externalPowerSavingMode !== false);
-  const [gameModeEnabled, setGameModeEnabled] = useState(false);
-  const [gameModeActive, setGameModeActive] = useState(false);
-  const [gameModePermanent, setGameModePermanent] = useState(false);
-  const [fullscreenPaused, setFullscreenPaused] = useState(false);
-  const [useDml, setUseDml] = useState(false);
-  const [gameModeLoading, setGameModeLoading] = useState(true);
-
-  // 轻量模式状态
-  const [lightweightConfig, setLightweightConfigState] = useState({
-    start_with_window_hidden: false,
-    auto_lightweight_enabled: false,
-    auto_lightweight_delay_minutes: 5,
-  });
-
-  const [cardClickBehaviorSearch, setCardClickBehaviorSearch] = useState(() => localStorage.getItem('cardClickBehavior_search') || 'preview');
-  const [cardClickBehaviorClusters, setCardClickBehaviorClusters] = useState(() => localStorage.getItem('cardClickBehavior_clusters') || 'standalone');
-  const [cardClickBehaviorActivityContext, setCardClickBehaviorActivityContext] = useState(() => localStorage.getItem('cardClickBehavior_activityContext') || 'preview');
-
-  useEffect(() => {
-    getLightweightConfig().then(setLightweightConfigState).catch(console.error);
-  }, []);
-
-  // Sync with external power saving mode
-  useEffect(() => {
-    setPowerSavingMode(externalPowerSavingMode !== false);
-  }, [externalPowerSavingMode]);
-
-  // Listen for power-saving-changed events from Rust
-  useEffect(() => {
-    const unlisten = listen('power-saving-changed', (event) => {
-      const payload = event.payload || {};
-      setPowerSavingMode(payload.enabled !== false);
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, []);
-
-  const handleTogglePowerSaving = async () => {
-    const next = !powerSavingMode;
-    // Optimistic update
-    setPowerSavingMode(next);
-    onTogglePowerSaving(next);
-    try {
-      await invoke('set_power_saving_enabled', { enabled: next });
-    } catch (err) {
-      console.error('Failed to toggle power saving mode:', err);
-      // Revert on error
-      setPowerSavingMode(!next);
-      onTogglePowerSaving(!next);
-    }
-  };
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const config = await invoke('get_advanced_config');
-        setUseDml(config.use_dml || false);
-        setGameModeEnabled(config.game_mode_enabled || false);
-
-        // get initial game mode status
-        const status = await invoke('get_game_mode_status');
-        setGameModeActive(status.active || false);
-        setGameModePermanent(status.permanent || false);
-        setFullscreenPaused(status.fullscreen_paused || false);
-      } catch (err) {
-        console.error('Failed to load config for game mode:', err);
-      } finally {
-        setGameModeLoading(false);
-      }
-    })();
-  }, []);
-
-  useEffect(() => {
-    const unlisten = listen('game-mode-status', (event) => {
-      setGameModeActive(event.payload?.active || false);
-      setGameModePermanent(event.payload?.permanent || false);
-      if (event.payload?.fullscreen_paused !== undefined) {
-        setFullscreenPaused(event.payload.fullscreen_paused);
-      }
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, []);
-
-  const handleToggleGameMode = async () => {
-    const next = !gameModeEnabled;
-    setGameModeEnabled(next);
-    try {
-      await withAuth(() => invoke('toggle_game_mode', { enabled: next }), { autoPrompt: true });
-    } catch (err) {
-      console.error('Failed to toggle game mode:', err);
-      setGameModeEnabled(!next);
-    }
-  };
-
-  const handleLightweightConfigChange = async (key, value) => {
-    const newConfig = { ...lightweightConfig, [key]: value };
-    setLightweightConfigState(newConfig);
-    try {
-      await setLightweightConfig(newConfig);
-    } catch (error) {
-      console.error('Failed to save lightweight config:', error);
-    }
-  };
-
-  const handleSwitchToLightweight = async () => {
-    try {
-      await switchToLightweightMode();
-      // 窗口将被销毁，此代码不会执行
-    } catch (error) {
-      console.error('Failed to switch to lightweight mode:', error);
-    }
-  };
+  const {
+    powerSavingMode,
+    gameModeEnabled,
+    gameModeActive,
+    gameModePermanent,
+    fullscreenPaused,
+    useDml,
+    gameModeLoading,
+    resourcePolicyLoading,
+    lightweightConfig,
+    cardClickBehaviorSearch,
+    cardClickBehaviorClusters,
+    cardClickBehaviorActivityContext,
+    resourcePolicy,
+    resourcePolicyOptions,
+    selectedResourcePolicy,
+    handleSetPowerSaving,
+    handleSetGameMode,
+    handleResourcePolicyChange,
+    handleLightweightConfigChange,
+    handleSwitchToLightweight,
+    setCardClickBehavior,
+  } = useGeneralOptionsController({ externalPowerSavingMode, onTogglePowerSaving, t });
 
   return (
     <div className="space-y-3">
@@ -195,53 +100,69 @@ export default function GeneralOptionsSection({
               {t('settings.general.telemetry.description')}
             </p>
           </div>
-          <button
-            onClick={onToggleTelemetry}
-            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${sendTelemetryDiagnostics ? 'bg-ide-accent' : 'bg-ide-border'
-              }`}
+          <SettingsSwitch
+            checked={sendTelemetryDiagnostics}
+            onChange={onToggleTelemetry}
             title={t('settings.general.telemetry.label')}
-          >
-            <div
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${sendTelemetryDiagnostics ? 'translate-x-5' : 'translate-x-0.5'
-                }`}
-            />
-          </button>
+          />
         </div>
 
-        {/* Power saving */}
+        {/* Resource policy */}
         <div className="w-full h-px bg-ide-border/50" />
 
-        <div className="flex items-center justify-between gap-4">
+        <div className="space-y-3">
           <div>
-            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.powerSaving.label')}</label>
-            <p className="text-xs text-ide-muted">
-              {t('settings.general.powerSaving.description')}
-            </p>
+            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.resourcePolicy.label')}</label>
+            <p className="text-xs text-ide-muted">{t('settings.general.resourcePolicy.description')}</p>
           </div>
-          <button
-            onClick={onTogglePowerSaving}
-            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${powerSavingMode ? 'bg-ide-accent' : 'bg-ide-border'
-              }`}
-            title={t('settings.general.powerSaving.label')}
-          >
-            <div
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${powerSavingMode ? 'translate-x-5' : 'translate-x-0.5'
-                }`}
-            />
-          </button>
-        </div>
 
-        {/* Game Mode */}
-        <div className="w-full h-px bg-ide-border/50" />
+          <SettingsSegmentedControl
+            value={resourcePolicy}
+            options={resourcePolicyOptions}
+            onChange={handleResourcePolicyChange}
+            columns={4}
+            disabled={resourcePolicyLoading || gameModeLoading}
+          />
 
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-1">
-              <label className="block font-semibold text-ide-text">{t('settings.general.gameMode.label')}</label>
+          <p className="text-xs text-ide-muted">{selectedResourcePolicy.description}</p>
+
+          {(resourcePolicy === 'custom') && (
+            <div className="space-y-3 rounded-lg border border-ide-border/70 bg-ide-panel/40 p-3">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <label className="block font-semibold text-ide-text mb-1">{t('settings.general.powerSaving.label')}</label>
+                  <p className="text-xs text-ide-muted">
+                    {t('settings.general.powerSaving.description')}
+                  </p>
+                </div>
+                <SettingsSwitch
+                  checked={powerSavingMode}
+                  onChange={(next) => handleSetPowerSaving(next)}
+                  disabled={resourcePolicyLoading}
+                  title={t('settings.general.powerSaving.label')}
+                />
+              </div>
+
+              <div className="w-full h-px bg-ide-border/50" />
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1 min-w-0">
+                  <label className="block font-semibold text-ide-text mb-1">{t('settings.general.gameMode.label')}</label>
+                  <p className="text-xs text-ide-muted">
+                    {t('settings.general.gameMode.description')}
+                  </p>
+                </div>
+                <SettingsSwitch
+                  checked={gameModeEnabled}
+                  onChange={(next) => handleSetGameMode(next)}
+                  disabled={gameModeLoading || resourcePolicyLoading}
+                  title={t('settings.general.gameMode.label')}
+                />
+              </div>
             </div>
-            <p className="text-xs text-ide-muted">
-              {t('settings.general.gameMode.description')}
-            </p>
+          )}
+
+          <div>
             {gameModeEnabled && useDml && (
               <p className={`text-xs mt-1 ${gameModeActive ? 'text-ide-warning' : 'text-ide-info-success'}`}>
                 {gameModePermanent
@@ -258,108 +179,111 @@ export default function GeneralOptionsSection({
               </p>
             )}
           </div>
-          <button
-            onClick={handleToggleGameMode}
-            disabled={gameModeLoading}
-            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${gameModeLoading
-              ? 'bg-ide-border opacity-50 cursor-not-allowed'
-              : gameModeEnabled
-                ? 'bg-ide-accent'
-                : 'bg-ide-border'
-              }`}
-            title={t('settings.general.gameMode.label')}
-          >
-            <div
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${gameModeEnabled ? 'translate-x-5' : 'translate-x-0.5'
-                }`}
-            />
-          </button>
         </div>
 
-        {/* 轻量模式 */}
+        {/* Window and background behavior */}
         <div className="w-full h-px bg-ide-border/50" />
 
-        <div className="flex items-center justify-between gap-4">
+        <div className="space-y-4">
           <div>
-            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.lightweightMode.startHidden.label')}</label>
+            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.windowBehavior.label')}</label>
             <p className="text-xs text-ide-muted">
-              {t('settings.general.lightweightMode.startHidden.description')}
+              {t('settings.general.windowBehavior.description')}
             </p>
           </div>
-          <button
-            onClick={() => handleLightweightConfigChange('start_with_window_hidden', !lightweightConfig.start_with_window_hidden)}
-            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${lightweightConfig.start_with_window_hidden ? 'bg-ide-accent' : 'bg-ide-border'}`}
-          >
-            <div
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${lightweightConfig.start_with_window_hidden ? 'translate-x-5' : 'translate-x-0.5'}`}
-            />
-          </button>
-        </div>
 
-        <div className="w-full h-px bg-ide-border/50" />
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <label className="block text-xs font-medium text-ide-text">{t('settings.general.windowBehavior.startup.label')}</label>
+              <SettingsSegmentedControl
+                value={lightweightConfig.start_with_window_hidden}
+                options={[
+                  {
+                    value: false,
+                    label: t('settings.general.windowBehavior.startup.showWindow.label'),
+                    description: t('settings.general.windowBehavior.startup.showWindow.description'),
+                  },
+                  {
+                    value: true,
+                    label: t('settings.general.windowBehavior.startup.background.label'),
+                    description: t('settings.general.windowBehavior.startup.background.description'),
+                  },
+                ]}
+                onChange={(next) => handleLightweightConfigChange('start_with_window_hidden', next)}
+                columns={2}
+              />
+              <p className="text-xs text-ide-muted">
+                {lightweightConfig.start_with_window_hidden
+                  ? t('settings.general.windowBehavior.startup.background.description')
+                  : t('settings.general.windowBehavior.startup.showWindow.description')}
+              </p>
+            </div>
 
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex-1">
-            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.lightweightMode.autoSwitch.label')}</label>
-            <p className="text-xs text-ide-muted">
-              {t('settings.general.lightweightMode.autoSwitch.description')}
-            </p>
-            {lightweightConfig.auto_lightweight_enabled && (
-              <div className="flex items-center gap-2 mt-2">
-                <span className="text-xs text-ide-muted">{t('settings.general.lightweightMode.autoSwitch.delayLabel')}</span>
-                <input
-                  type="number"
-                  min="1"
-                  max="60"
-                  value={lightweightConfig.auto_lightweight_delay_minutes}
-                  onChange={(e) => {
-                    const val = parseInt(e.target.value, 10);
-                    // 只有当值是有效数字时才更新，否则使用默认值 5
-                    if (!isNaN(val) && val >= 1 && val <= 60) {
-                      handleLightweightConfigChange('auto_lightweight_delay_minutes', val);
-                    } else if (e.target.value === '') {
-                      // 如果用户清空输入框，暂时不更新状态，等待用户输入
-                      // 但为了避免显示 NaN，我们保持当前值
-                    }
-                  }}
-                  onBlur={(e) => {
-                    // 失焦时，如果值无效，恢复为默认值 5
-                    const val = parseInt(e.target.value, 10);
-                    if (isNaN(val) || val < 1 || val > 60) {
-                      handleLightweightConfigChange('auto_lightweight_delay_minutes', 5);
-                    }
-                  }}
-                  className="w-16 px-2 py-1 bg-ide-panel border border-ide-border rounded text-ide-text text-xs"
-                />
-                <span className="text-xs text-ide-muted">{t('settings.general.lightweightMode.autoSwitch.delayUnit')}</span>
-              </div>
-            )}
+            <div className="space-y-2">
+              <label className="block text-xs font-medium text-ide-text">{t('settings.general.windowBehavior.closeWindow.label')}</label>
+              <SettingsSegmentedControl
+                value={lightweightConfig.auto_lightweight_enabled}
+                options={[
+                  {
+                    value: false,
+                    label: t('settings.general.windowBehavior.closeWindow.current.label'),
+                    description: t('settings.general.windowBehavior.closeWindow.current.description'),
+                  },
+                  {
+                    value: true,
+                    label: t('settings.general.windowBehavior.closeWindow.background.label'),
+                    description: t('settings.general.windowBehavior.closeWindow.background.description'),
+                  },
+                ]}
+                onChange={(next) => handleLightweightConfigChange('auto_lightweight_enabled', next)}
+                columns={2}
+              />
+              <p className="text-xs text-ide-muted">
+                {lightweightConfig.auto_lightweight_enabled
+                  ? t('settings.general.windowBehavior.closeWindow.background.description')
+                  : t('settings.general.windowBehavior.closeWindow.current.description')}
+              </p>
+              {lightweightConfig.auto_lightweight_enabled && (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-ide-muted">{t('settings.general.windowBehavior.delay.label')}</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="60"
+                    value={lightweightConfig.auto_lightweight_delay_minutes}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      if (!isNaN(val) && val >= 1 && val <= 60) {
+                        handleLightweightConfigChange('auto_lightweight_delay_minutes', val);
+                      }
+                    }}
+                    onBlur={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      if (isNaN(val) || val < 1 || val > 60) {
+                        handleLightweightConfigChange('auto_lightweight_delay_minutes', 5);
+                      }
+                    }}
+                    className="w-16 px-2 py-1 bg-ide-panel border border-ide-border rounded text-ide-text text-xs"
+                  />
+                  <span className="text-xs text-ide-muted">{t('settings.general.windowBehavior.delay.unit')}</span>
+                </div>
+              )}
+            </div>
           </div>
-          <button
-            onClick={() => handleLightweightConfigChange('auto_lightweight_enabled', !lightweightConfig.auto_lightweight_enabled)}
-            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${lightweightConfig.auto_lightweight_enabled ? 'bg-ide-accent' : 'bg-ide-border'}`}
-          >
-            <div
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${lightweightConfig.auto_lightweight_enabled ? 'translate-x-5' : 'translate-x-0.5'}`}
-            />
-          </button>
-        </div>
 
-        <div className="w-full h-px bg-ide-border/50" />
-
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.lightweightMode.switchNow.label')}</label>
-            <p className="text-xs text-ide-muted">
-              {t('settings.general.lightweightMode.switchNow.description')}
-            </p>
+          <div className="flex items-center justify-between gap-4 rounded-lg border border-ide-border/70 bg-ide-panel/40 px-3 py-2.5">
+            <div className="min-w-0">
+              <label className="block text-xs font-medium text-ide-text">{t('settings.general.windowBehavior.switchNow.label')}</label>
+              <p className="text-xs text-ide-muted">{t('settings.general.windowBehavior.switchNow.description')}</p>
+            </div>
+            <SettingsButton
+              onClick={handleSwitchToLightweight}
+              icon={Minimize2}
+              className="shrink-0"
+            >
+              {t('settings.general.windowBehavior.switchNow.button')}
+            </SettingsButton>
           </div>
-          <button
-            onClick={handleSwitchToLightweight}
-            className="px-3 py-1.5 bg-ide-panel border border-ide-border rounded text-ide-text text-sm hover:bg-ide-bg transition-colors"
-          >
-            {t('settings.general.lightweightMode.switchNow.button')}
-          </button>
         </div>
 
         {/* Card Click Behavior */}
@@ -379,10 +303,7 @@ export default function GeneralOptionsSection({
               <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.searchLabel')}</label>
               <DropdownSelect
                 value={cardClickBehaviorSearch}
-                onChange={(val) => {
-                  setCardClickBehaviorSearch(val);
-                  localStorage.setItem('cardClickBehavior_search', val);
-                }}
+                onChange={(val) => setCardClickBehavior('search', val)}
                 options={[
                   { value: 'preview', label: t('settings.general.cardClickBehavior.preview') },
                   { value: 'standalone', label: t('settings.general.cardClickBehavior.standalone') },
@@ -395,10 +316,7 @@ export default function GeneralOptionsSection({
               <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.clustersLabel')}</label>
               <DropdownSelect
                 value={cardClickBehaviorClusters}
-                onChange={(val) => {
-                  setCardClickBehaviorClusters(val);
-                  localStorage.setItem('cardClickBehavior_clusters', val);
-                }}
+                onChange={(val) => setCardClickBehavior('clusters', val)}
                 options={[
                   { value: 'preview', label: t('settings.general.cardClickBehavior.preview') },
                   { value: 'standalone', label: t('settings.general.cardClickBehavior.standalone') },
@@ -411,10 +329,7 @@ export default function GeneralOptionsSection({
               <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.activityContextLabel')}</label>
               <DropdownSelect
                 value={cardClickBehaviorActivityContext}
-                onChange={(val) => {
-                  setCardClickBehaviorActivityContext(val);
-                  localStorage.setItem('cardClickBehavior_activityContext', val);
-                }}
+                onChange={(val) => setCardClickBehavior('activityContext', val)}
                 options={[
                   { value: 'preview', label: t('settings.general.cardClickBehavior.preview') },
                   { value: 'standalone', label: t('settings.general.cardClickBehavior.standalone') },

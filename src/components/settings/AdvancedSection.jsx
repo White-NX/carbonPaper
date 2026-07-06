@@ -1,185 +1,46 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Cpu, ListOrdered, ChevronDown, AlertTriangle, Info, Zap, Monitor, Layers, Database, Loader2, Globe, Clock } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
-import { withAuth } from '../../lib/auth_api';
+import SettingsHelpTooltip from './SettingsHelpTooltip';
+import { SettingsSwitch } from './SettingsControls';
+import { useAdvancedSectionController } from './useAdvancedSectionController';
 
 const CPU_PERCENT_OPTIONS = [5, 10, 15, 20, 30, 50];
 const OCR_QUEUE_SIZE_OPTIONS = [1, 2, 3, 5, 10];
 
 export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
   const { t } = useTranslation();
-  const [config, setConfig] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [cpuDropdownOpen, setCpuDropdownOpen] = useState(false);
-  const [queueDropdownOpen, setQueueDropdownOpen] = useState(false);
-  const [gpuDropdownOpen, setGpuDropdownOpen] = useState(false);
-  const [clusteringDropdownOpen, setClusteringDropdownOpen] = useState(false);
-  const [cpuChanged, setCpuChanged] = useState(false);
-  const [dmlChanged, setDmlChanged] = useState(false);
-  const [onnxChanged, setOnnxChanged] = useState(false);
-  const [gpus, setGpus] = useState([]);
-  const [gpuLoading, setGpuLoading] = useState(false);
-  const [vacuumRunning, setVacuumRunning] = useState(false);
-  const [vacuumMessage, setVacuumMessage] = useState('');
-
-  const loadConfig = async () => {
-    try {
-      const result = await invoke('get_advanced_config');
-      setConfig(result);
-    } catch (err) {
-      console.error('Failed to load advanced config:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    loadConfig();
-  }, []);
-
-  // Load GPU list when DML is enabled
-  useEffect(() => {
-    if (config?.use_dml) {
-      loadGpus();
-    }
-  }, [config?.use_dml]);
-
-  const loadGpus = async () => {
-    setGpuLoading(true);
-    try {
-      const result = await invoke('enumerate_gpus');
-      const gpuList = result || [];
-      setGpus(gpuList);
-      // if current dml_device_id is not in the new gpu list, reset to first gpu or null
-      if (config && gpuList.length > 0 && !gpuList.some((g) => g.id === config.dml_device_id)) {
-        const fallbackId = gpuList[0].id;
-        const newConfig = { ...config, dml_device_id: fallbackId };
-        await saveConfig(newConfig);
-      }
-    } catch (err) {
-      console.error('Failed to enumerate GPUs:', err);
-      setGpus([]);
-    } finally {
-      setGpuLoading(false);
-    }
-  };
-
-  const saveConfig = async (newConfig) => {
-    setConfig(newConfig);
-    try {
-      await withAuth(() => invoke('set_advanced_config', { config: newConfig }), { autoPrompt: true });
-    } catch (err) {
-      console.error('Failed to save advanced config:', err);
-    }
-  };
-
-  const syncOcrConfigToMonitor = async (newConfig) => {
-    if (monitorStatus !== 'running') return;
-    try {
-      await withAuth(() => invoke('monitor_update_advanced_config', {
-        captureOnOcrBusy: newConfig.capture_on_ocr_busy,
-        ocrQueueMaxSize: newConfig.ocr_queue_limit_enabled
-          ? newConfig.ocr_queue_max_size
-          : 999999,
-        ocrTimeoutSecs: newConfig.ocr_timeout_secs || 120,
-        clusteringAllowFullLowMemory: Boolean(newConfig.clustering_allow_full_low_memory),
-      }), { autoPrompt: true });
-    } catch (err) {
-      console.error('Failed to sync OCR config to monitor:', err);
-    }
-  };
-
-  const handleToggle = async (key) => {
-    const newConfig = { ...config, [key]: !config[key] };
-    await saveConfig(newConfig);
-    if (key === 'cpu_limit_enabled') {
-      setCpuChanged(true);
-    }
-    if (key === 'use_dml') {
-      setDmlChanged(true);
-    }
-    if (key === 'use_onnx') {
-      setOnnxChanged(true);
-    }
-    if (key === 'capture_on_ocr_busy' || key === 'ocr_queue_limit_enabled' || key === 'clustering_allow_full_low_memory') {
-      await syncOcrConfigToMonitor(newConfig);
-    }
-  };
-
-  const handleCpuPercentChange = async (value) => {
-    setCpuDropdownOpen(false);
-    const newConfig = { ...config, cpu_limit_percent: value };
-    await saveConfig(newConfig);
-    setCpuChanged(true);
-  };
-
-  const handleQueueSizeChange = async (value) => {
-    setQueueDropdownOpen(false);
-    const newConfig = { ...config, ocr_queue_max_size: value };
-    await saveConfig(newConfig);
-    await syncOcrConfigToMonitor(newConfig);
-  };
-
-  const handleOcrTimeoutChange = async (value) => {
-    const parsed = Number.parseInt(value, 10);
-    const next = Number.isFinite(parsed) ? Math.min(600, Math.max(30, parsed)) : 120;
-    const newConfig = { ...config, ocr_timeout_secs: next };
-    await saveConfig(newConfig);
-    await syncOcrConfigToMonitor(newConfig);
-  };
-
-  const handleGpuChange = async (deviceId) => {
-    setGpuDropdownOpen(false);
-    const newConfig = { ...config, dml_device_id: deviceId };
-    await saveConfig(newConfig);
-    setDmlChanged(true);
-  };
-
-  const refreshVacuumRunningStatus = async () => {
-    try {
-      const status = await invoke('storage_get_startup_vacuum_status');
-      setVacuumRunning(Boolean(status?.in_progress));
-    } catch {
-      setVacuumRunning(false);
-    }
-  };
-
-  const handleManualVacuum = async () => {
-    setVacuumMessage('');
-    setVacuumRunning(true);
-    try {
-      const result = await withAuth(() => invoke('storage_run_manual_vacuum'), { autoPrompt: true });
-      if (result?.already_running) {
-        setVacuumMessage(t('settings.advanced.vacuum.already_running', '已有数据库优化任务正在执行，请稍候。'));
-      } else {
-        setVacuumMessage(t('settings.advanced.vacuum.success', '数据库优化已完成。'));
-      }
-    } catch (err) {
-      const msg = err?.message || err?.toString() || t('settings.advanced.vacuum.error', '数据库优化失败');
-      setVacuumMessage(t('settings.advanced.vacuum.error_with_detail', '数据库优化失败：{{error}}', { error: msg }));
-    } finally {
-      await refreshVacuumRunningStatus();
-    }
-  };
-
-  // Close dropdowns on outside click
-  useEffect(() => {
-    const handler = () => {
-      setCpuDropdownOpen(false);
-      setQueueDropdownOpen(false);
-      setGpuDropdownOpen(false);
-      setClusteringDropdownOpen(false);
-    };
-    if (cpuDropdownOpen || queueDropdownOpen || gpuDropdownOpen || clusteringDropdownOpen) {
-      document.addEventListener('click', handler);
-      return () => document.removeEventListener('click', handler);
-    }
-  }, [cpuDropdownOpen, queueDropdownOpen, gpuDropdownOpen]);
-
-  useEffect(() => {
-    refreshVacuumRunningStatus();
-  }, []);
+  const {
+    config,
+    loading,
+    cpuDropdownOpen,
+    queueDropdownOpen,
+    gpuDropdownOpen,
+    clusteringDropdownOpen,
+    cpuChanged,
+    dmlChanged,
+    onnxChanged,
+    gpus,
+    gpuLoading,
+    vacuumRunning,
+    vacuumMessage,
+    selectedGpu,
+    setCpuDropdownOpen,
+    setQueueDropdownOpen,
+    setGpuDropdownOpen,
+    setClusteringDropdownOpen,
+    clearCpuChanged,
+    clearDmlChanged,
+    clearOnnxChanged,
+    handleToggle,
+    handleCpuPercentChange,
+    handleQueueSizeChange,
+    handleOcrTimeoutDraftChange,
+    handleOcrTimeoutChange,
+    handleGpuChange,
+    handleClusteringIntervalChange,
+    handleManualVacuum,
+  } = useAdvancedSectionController({ monitorStatus, t });
 
   if (loading || !config) {
     return (
@@ -188,8 +49,6 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
       </div>
     );
   }
-
-  const selectedGpu = gpus.find((g) => g.id === config.dml_device_id) || gpus[0];
 
   return (
     <div className="space-y-6">
@@ -212,16 +71,10 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
               <p className="text-sm text-ide-text font-medium">{t('settings.advanced.cpu.label')}</p>
               <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.cpu.description')}</p>
             </div>
-            <button
-              onClick={() => handleToggle('cpu_limit_enabled')}
-              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${config.cpu_limit_enabled ? 'bg-ide-accent' : 'bg-ide-border'
-                }`}
-            >
-              <div
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.cpu_limit_enabled ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-              />
-            </button>
+            <SettingsSwitch
+              checked={config.cpu_limit_enabled}
+              onChange={() => handleToggle('cpu_limit_enabled')}
+            />
           </div>
 
           {config.cpu_limit_enabled && (
@@ -270,7 +123,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
               <p className="text-xs text-ide-warning-muted flex-1">{t('settings.advanced.cpu.changed_notice')}</p>
               {monitorStatus === 'running' && onRestartMonitor && (
                 <button
-                  onClick={() => { onRestartMonitor(); setCpuChanged(false); }}
+                  onClick={() => { onRestartMonitor(); clearCpuChanged(); }}
                   className="text-xs text-ide-warning hover:opacity-80 underline shrink-0 transition-colors"
                 >
                   {t('settings.advanced.quick_restart')}
@@ -295,16 +148,10 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
               <p className="text-sm text-ide-text font-medium">{t('settings.advanced.ocr.pause_label')}</p>
               <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.ocr.pause_desc')}</p>
             </div>
-            <button
-              onClick={() => handleToggle('capture_on_ocr_busy')}
-              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${!config.capture_on_ocr_busy ? 'bg-ide-accent' : 'bg-ide-border'
-                }`}
-            >
-              <div
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${!config.capture_on_ocr_busy ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-              />
-            </button>
+            <SettingsSwitch
+              checked={!config.capture_on_ocr_busy}
+              onChange={() => handleToggle('capture_on_ocr_busy')}
+            />
           </div>
 
           {/* 队列大小限制 */}
@@ -313,16 +160,10 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
               <p className="text-sm text-ide-text font-medium">{t('settings.advanced.ocr.queue_limit_label')}</p>
               <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.ocr.queue_limit_desc')}</p>
             </div>
-            <button
-              onClick={() => handleToggle('ocr_queue_limit_enabled')}
-              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${config.ocr_queue_limit_enabled ? 'bg-ide-accent' : 'bg-ide-border'
-                }`}
-            >
-              <div
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.ocr_queue_limit_enabled ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-              />
-            </button>
+            <SettingsSwitch
+              checked={config.ocr_queue_limit_enabled}
+              onChange={() => handleToggle('ocr_queue_limit_enabled')}
+            />
           </div>
 
           {config.ocr_queue_limit_enabled && (
@@ -382,10 +223,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
                 max="600"
                 step="10"
                 value={config.ocr_timeout_secs || 120}
-                onChange={(e) => {
-                  const newConfig = { ...config, ocr_timeout_secs: e.target.value };
-                  setConfig(newConfig);
-                }}
+                onChange={(e) => handleOcrTimeoutDraftChange(e.target.value)}
                 onBlur={(e) => handleOcrTimeoutChange(e.target.value)}
                 className="w-24 px-3 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm text-ide-text text-right"
               />
@@ -410,20 +248,17 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1 min-w-0">
-              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.dml.label')}</p>
+              <p className="text-sm text-ide-text font-medium">
+                {t('settings.advanced.dml.label')}
+                <SettingsHelpTooltip variant="term">{t('settings.advanced.terms.directml')}</SettingsHelpTooltip>
+              </p>
               <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.dml.description')}</p>
               <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.dml.notice')}</p>
             </div>
-            <button
-              onClick={() => handleToggle('use_dml')}
-              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${config.use_dml ? 'bg-ide-accent' : 'bg-ide-border'
-                }`}
-            >
-              <div
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.use_dml ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-              />
-            </button>
+            <SettingsSwitch
+              checked={config.use_dml}
+              onChange={() => handleToggle('use_dml')}
+            />
           </div>
 
           {config.use_dml && (
@@ -483,7 +318,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
               <p className="text-xs text-ide-warning-muted flex-1">{t('settings.advanced.dml.changed_notice')}</p>
               {monitorStatus === 'running' && onRestartMonitor && (
                 <button
-                  onClick={() => { onRestartMonitor(); setDmlChanged(false); }}
+                  onClick={() => { onRestartMonitor(); clearDmlChanged(); }}
                   className="text-xs text-ide-warning hover:opacity-80 underline shrink-0 transition-colors"
                 >
                   {t('settings.advanced.quick_restart')}
@@ -504,20 +339,17 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1 min-w-0">
-              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.onnx.label')}</p>
+              <p className="text-sm text-ide-text font-medium">
+                {t('settings.advanced.onnx.label')}
+                <SettingsHelpTooltip variant="term">{t('settings.advanced.terms.onnx')}</SettingsHelpTooltip>
+              </p>
               <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.onnx.description')}</p>
               <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.onnx.notice')}</p>
             </div>
-            <button
-              onClick={() => handleToggle('use_onnx')}
-              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${config.use_onnx ? 'bg-ide-accent' : 'bg-ide-border'
-                }`}
-            >
-              <div
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.use_onnx ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-              />
-            </button>
+            <SettingsSwitch
+              checked={config.use_onnx}
+              onChange={() => handleToggle('use_onnx')}
+            />
           </div>
 
           {onnxChanged && (
@@ -526,7 +358,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
               <p className="text-xs text-ide-warning-muted flex-1">{t('settings.advanced.onnx.changed_notice')}</p>
               {monitorStatus === 'running' && onRestartMonitor && (
                 <button
-                  onClick={() => { onRestartMonitor(); setOnnxChanged(false); }}
+                  onClick={() => { onRestartMonitor(); clearOnnxChanged(); }}
                   className="text-xs text-ide-warning hover:opacity-80 underline shrink-0 transition-colors"
                 >
                   {t('settings.advanced.quick_restart')}
@@ -571,15 +403,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
                   {['1d', '1w', '1m', '6m'].map((interval) => (
                     <button
                       key={interval}
-                      onClick={async () => {
-                        setClusteringDropdownOpen(false);
-                        const newConfig = { ...config, clustering_interval: interval };
-                        await saveConfig(newConfig);
-                        // Also sync to Python backend
-                        try {
-                          await withAuth(() => invoke('monitor_set_clustering_interval', { interval }), { autoPrompt: true });
-                        } catch { /* best-effort */ }
-                      }}
+                      onClick={() => handleClusteringIntervalChange(interval)}
                       className={`w-full px-4 py-2.5 text-left hover:bg-ide-hover transition-colors flex items-center justify-between ${interval === (config.clustering_interval || '1w') ? 'bg-ide-accent/10' : ''
                         }`}
                     >
@@ -596,24 +420,24 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
 
           <div className="flex items-center justify-between gap-4 border-t border-ide-border/50 pt-4">
             <div className="flex-1 min-w-0">
-              <p className="text-sm text-ide-text font-medium">{t('settings.advanced.clustering.allow_full_low_memory_label')}</p>
+              <p className="text-sm text-ide-text font-medium">
+                {t('settings.advanced.clustering.allow_full_low_memory_label')}
+                <SettingsHelpTooltip variant="term">{t('settings.advanced.terms.pacmap_hdbscan')}</SettingsHelpTooltip>
+              </p>
               <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.clustering.allow_full_low_memory_desc')}</p>
             </div>
-            <button
-              onClick={() => handleToggle('clustering_allow_full_low_memory')}
-              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${config.clustering_allow_full_low_memory ? 'bg-ide-accent' : 'bg-ide-border'
-                }`}
-            >
-              <div
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.clustering_allow_full_low_memory ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-              />
-            </button>
+            <SettingsSwitch
+              checked={config.clustering_allow_full_low_memory}
+              onChange={() => handleToggle('clustering_allow_full_low_memory')}
+            />
           </div>
 
           <div className="flex items-start gap-2 p-2.5 bg-ide-panel/50 border border-ide-border/30 rounded-lg">
             <Info className="w-4 h-4 text-ide-muted shrink-0 mt-0.5" />
-            <p className="text-xs text-ide-muted leading-relaxed">{t('settings.advanced.clustering.info')}</p>
+            <p className="text-xs text-ide-muted leading-relaxed">
+              {t('settings.advanced.clustering.info')}
+              <SettingsHelpTooltip variant="term">{t('settings.advanced.terms.minilm')}</SettingsHelpTooltip>
+            </p>
           </div>
         </div>
       </div>
@@ -631,16 +455,10 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
               <p className="text-sm text-ide-text font-medium">{t('settings.advanced.network.label')}</p>
               <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.network.description')}</p>
             </div>
-            <button
-              onClick={() => handleToggle('network_enabled')}
-              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${config.network_enabled ? 'bg-ide-accent' : 'bg-ide-border'
-                }`}
-            >
-              <div
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${config.network_enabled ? 'translate-x-5' : 'translate-x-0.5'
-                  }`}
-              />
-            </button>
+            <SettingsSwitch
+              checked={config.network_enabled}
+              onChange={() => handleToggle('network_enabled')}
+            />
           </div>
         </div>
       </div>

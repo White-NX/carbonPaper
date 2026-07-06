@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, Loader2, Trash2, AlertTriangle, Clock } from 'lucide-react';
+import { SettingsSwitch } from './SettingsControls';
 
 export default function CaptureFiltersSection({
   filterSettings,
@@ -132,18 +133,10 @@ export default function CaptureFiltersSection({
               <label className="block mb-1 font-semibold text-ide-text">{t('settings.captureFilters.ignoreProtected.label')}</label>
               <p className="text-xs text-ide-muted">{t('settings.captureFilters.ignoreProtected.description')}</p>
             </div>
-            <button
-              onClick={onToggleProtected}
-              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${
-                filterSettings.ignoreProtected ? 'bg-ide-accent' : 'bg-ide-border'
-              }`}
-            >
-              <div
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                  filterSettings.ignoreProtected ? 'translate-x-5' : 'translate-x-0.5'
-                }`}
-              />
-            </button>
+            <SettingsSwitch
+              checked={filterSettings.ignoreProtected}
+              onChange={onToggleProtected}
+            />
           </div>
 
           <div className="flex items-center justify-between gap-3 pt-2">
