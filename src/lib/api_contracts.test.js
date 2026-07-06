@@ -2,13 +2,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 
 vi.mock('./auth_api', () => ({
-  withAuth: async (fn) => fn(),
+  withAuth: vi.fn(async (fn) => fn()),
   requestAuth: vi.fn(),
   checkAuthSession: vi.fn(),
   initAuthListeners: vi.fn(),
   lockSession: vi.fn(),
 }));
 
+import { withAuth } from './auth_api';
 import {
   classifyDebug,
   deleteRecordsByTimeRange,
@@ -34,7 +35,18 @@ import {
 describe('API contract payloads', () => {
   beforeEach(() => {
     invoke.mockReset();
+    withAuth.mockClear();
   });
+
+  const expectWithAuth = (callNumber, options) => {
+    const call = withAuth.mock.calls[callNumber - 1];
+    expect(call?.[0]).toEqual(expect.any(Function));
+    if (options === undefined) {
+      expect(call).toHaveLength(1);
+    } else {
+      expect(call?.[1]).toEqual(options);
+    }
+  };
 
   it('sends monitor classification and maintenance payloads', async () => {
     invoke
@@ -81,6 +93,15 @@ describe('API contract payloads', () => {
     expect(invoke).toHaveBeenNthCalledWith(7, 'storage_retry_vector_indexing', {
       limit: 12,
     });
+
+    expect(withAuth).toHaveBeenCalledTimes(7);
+    expectWithAuth(1, { autoPrompt: true });
+    expectWithAuth(2, { autoPrompt: true });
+    expectWithAuth(3, { autoPrompt: true });
+    expectWithAuth(4, { autoPrompt: true });
+    expectWithAuth(5);
+    expectWithAuth(6, { autoPrompt: true });
+    expectWithAuth(7, { autoPrompt: true });
   });
 
   it('sends task and natural-language clustering payloads', async () => {
@@ -121,6 +142,13 @@ describe('API contract payloads', () => {
     expect(invoke).toHaveBeenNthCalledWith(5, 'storage_save_clustering_results', {
       tasks: [{ label: 'Work', screenshot_ids: [42] }],
     });
+
+    expect(withAuth).toHaveBeenCalledTimes(5);
+    expectWithAuth(1);
+    expectWithAuth(2, { autoPrompt: true });
+    expectWithAuth(3);
+    expectWithAuth(4, { autoPrompt: true });
+    expectWithAuth(5, { autoPrompt: true });
   });
 
   it('sends smart cluster CRUD payloads', async () => {
@@ -158,5 +186,12 @@ describe('API contract payloads', () => {
       page: 2,
       pageSize: 20,
     });
+
+    expect(withAuth).toHaveBeenCalledTimes(5);
+    expectWithAuth(1, { autoPrompt: true });
+    expectWithAuth(2, { autoPrompt: true });
+    expectWithAuth(3, { autoPrompt: true });
+    expectWithAuth(4, { autoPrompt: true });
+    expectWithAuth(5);
   });
 });

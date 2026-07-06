@@ -213,7 +213,6 @@ export const getTimeline = async (startTime, endTime, maxRecords = null) => {
             params.maxRecords = maxRecords;
         }
         const records = await invoke('storage_get_timeline', params);
-        console.log('[Timeline] Fetched records:', records?.length || 0, 'range:', new Date(startTime).toLocaleString(), '-', new Date(endTime).toLocaleString());
         return records || [];
     });
 };

@@ -302,7 +302,6 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         try {
             const records = await getTimeline(startTime, endTime);
             if (fetchEpochRef.current !== epoch) return; // stale response, discard
-            console.log('[Timeline] Raw records from API:', records);
             const mapped = (records || [])
                 .filter(r => r.timestamp != null) // Filter out records without timestamp
                 .map(r => {
@@ -327,7 +326,6 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                     };
                 })
                 .filter(e => !isNaN(e.timestamp)); // Filter out invalid timestamps
-            console.log('[Timeline] Mapped events:', mapped.length);
             
             setEvents(prev => {
                 const combined = [...mapped, ...prev];
@@ -341,7 +339,6 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
                     }
                 }
                 const sorted = unique.sort((a, b) => a.timestamp - b.timestamp);
-                console.log('[Timeline] Total unique events:', sorted.length);
                 return sorted;
             });
         } catch (err) {

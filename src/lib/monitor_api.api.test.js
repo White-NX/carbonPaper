@@ -2,13 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 
 vi.mock('./auth_api', () => ({
-  withAuth: async (fn) => fn(),
+  withAuth: vi.fn(async (fn) => fn()),
   requestAuth: vi.fn(),
   checkAuthSession: vi.fn(),
   initAuthListeners: vi.fn(),
   lockSession: vi.fn(),
 }));
 
+import { withAuth } from './auth_api';
 import {
   fetchImage,
   fetchThumbnail,
@@ -27,6 +28,7 @@ describe('monitor_api command wrappers', () => {
 
   beforeEach(() => {
     invoke.mockReset();
+    withAuth.mockClear();
     consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
   });
 
@@ -34,6 +36,16 @@ describe('monitor_api command wrappers', () => {
     vi.useRealTimers();
     consoleErrorSpy.mockRestore();
   });
+
+  const expectWithAuth = (callNumber, options) => {
+    const call = withAuth.mock.calls[callNumber - 1];
+    expect(call?.[0]).toEqual(expect.any(Function));
+    if (options === undefined) {
+      expect(call).toHaveLength(1);
+    } else {
+      expect(call?.[1]).toEqual(options);
+    }
+  };
 
   it('calls nl search with monitor command payload', async () => {
     invoke.mockResolvedValue({ results: [{ id: 1 }] });
@@ -57,12 +69,14 @@ describe('monitor_api command wrappers', () => {
       endTime: 20,
       fuzzy: false,
     });
+    expectWithAuth(1);
   });
 
   it('throws for nl search when backend returns error', async () => {
     invoke.mockResolvedValue({ error: 'bad_request' });
 
     await expect(searchScreenshots('x', 'nl')).rejects.toThrow('bad_request');
+    expectWithAuth(1);
   });
 
   it('calls ocr search with normalized filters', async () => {
@@ -84,24 +98,28 @@ describe('monitor_api command wrappers', () => {
       startTime: null,
       endTime: null,
     });
+    expectWithAuth(1);
   });
 
   it('returns empty array when listProcesses invoke fails', async () => {
     invoke.mockRejectedValue(new Error('pipe error'));
 
     await expect(listProcesses()).resolves.toEqual([]);
+    expectWithAuth(1);
   });
 
   it('returns normalized error object when getScreenshotDetails throws', async () => {
     invoke.mockRejectedValue(new Error('boom'));
 
     await expect(getScreenshotDetails(1)).resolves.toEqual({ error: 'Error: boom' });
+    expectWithAuth(1);
   });
 
   it('maps unknown command to unsupported code in updateMonitorFilters', async () => {
     invoke.mockResolvedValue({ error: 'unknown command' });
 
     await expect(updateMonitorFilters({})).rejects.toMatchObject({ code: 'unsupported' });
+    expectWithAuth(1, { autoPrompt: true });
   });
 
   it('dedupes concurrent full image requests by id', async () => {
@@ -116,6 +134,7 @@ describe('monitor_api command wrappers', () => {
     expect(second).toBe(first);
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith('storage_get_image', { id: 42, path: null });
+    expectWithAuth(1);
   });
 
   it('rejects full image requests that exceed the queue deadline', async () => {
@@ -129,6 +148,7 @@ describe('monitor_api command wrappers', () => {
 
     await assertion;
     expect(invoke).toHaveBeenCalledWith('storage_get_image', { id: 9001, path: null });
+    expectWithAuth(1);
   });
 
   it('rejects thumbnail requests that exceed the queue deadline', async () => {
@@ -142,6 +162,7 @@ describe('monitor_api command wrappers', () => {
 
     await assertion;
     expect(invoke).toHaveBeenCalledWith('storage_get_thumbnail', { id: 9003, path: null });
+    expectWithAuth(1);
   });
 
   it('rejects timeline image requests that exceed the queue deadline', async () => {
@@ -155,6 +176,7 @@ describe('monitor_api command wrappers', () => {
 
     await assertion;
     expect(invoke).toHaveBeenCalledWith('storage_get_thumbnail', { id: 9004, path: null });
+    expectWithAuth(1);
   });
 
   it('returns an error object when screenshot details exceed the queue deadline', async () => {
@@ -170,6 +192,7 @@ describe('monitor_api command wrappers', () => {
 
     await assertion;
     expect(invoke).toHaveBeenCalledWith('storage_get_screenshot_details', { id: 9002, path: null });
+    expectWithAuth(1);
   });
 
   it('dedupes concurrent thumbnail requests by path', async () => {
@@ -187,5 +210,6 @@ describe('monitor_api command wrappers', () => {
     expect(second).toBe(first);
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith('storage_get_thumbnail', { id: null, path: 'D:/shots/a.jpg' });
+    expectWithAuth(1);
   });
 });

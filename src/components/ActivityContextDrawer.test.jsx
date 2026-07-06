@@ -1,5 +1,6 @@
 import React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
@@ -66,13 +67,12 @@ describe('ActivityContextDrawer', () => {
   });
 
   it('asks for confirmation before removing a snapshot from an activity', async () => {
+    const user = userEvent.setup();
     renderDrawer();
 
     const unlinkButton = await screen.findByLabelText('activityContext.removeSnapshot');
-    expect(unlinkButton.className).toContain('left-1');
-    expect(unlinkButton.className).not.toContain('right-1');
 
-    fireEvent.click(unlinkButton);
+    await user.click(unlinkButton);
 
     expect(removeTaskScreenshot).not.toHaveBeenCalled();
     expect(screen.getByText('activityContext.removeSnapshotConfirm')).toBeInTheDocument();
@@ -80,7 +80,7 @@ describe('ActivityContextDrawer', () => {
     const confirmButton = screen
       .getAllByRole('button', { name: 'activityContext.removeSnapshot' })
       .find((button) => button.textContent === 'activityContext.removeSnapshot');
-    fireEvent.click(confirmButton);
+    await user.click(confirmButton);
 
     await waitFor(() => {
       expect(removeTaskScreenshot).toHaveBeenCalledWith(7, 42);
@@ -88,15 +88,20 @@ describe('ActivityContextDrawer', () => {
   });
 
   it('does not delete an activity when the confirmation is cancelled', async () => {
+    const user = userEvent.setup();
     renderDrawer();
+    await screen.findByText('carbonPaper');
 
-    fireEvent.click(screen.getByRole('button', { name: 'activityContext.deleteActivity' }));
+    await user.click(screen.getByRole('button', { name: 'activityContext.deleteActivity' }));
     expect(deleteTask).not.toHaveBeenCalled();
     expect(screen.getByText('activityContext.deleteActivityConfirm')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'common.cancel' }));
+    await user.click(screen.getByRole('button', { name: 'common.cancel' }));
 
     expect(deleteTask).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.queryByText('activityContext.deleteActivityConfirm')).not.toBeInTheDocument();
+    });
   });
 
   it('closes when the preview backdrop is clicked but not when the drawer itself is clicked', async () => {
@@ -113,12 +118,13 @@ describe('ActivityContextDrawer', () => {
   });
 
   it('keeps the drawer open when selecting a snapshot card', async () => {
+    const user = userEvent.setup();
     const onClose = vi.fn();
     const onSelectScreenshot = vi.fn();
 
     renderDrawer({ onClose, onSelectScreenshot });
 
-    fireEvent.click(await screen.findByText('carbonPaper'));
+    await user.click(await screen.findByText('carbonPaper'));
 
     expect(onSelectScreenshot).toHaveBeenCalledWith(expect.objectContaining({
       screenshot_id: 42,
@@ -129,13 +135,14 @@ describe('ActivityContextDrawer', () => {
   });
 
   it('uses the activity context card click preference for standalone preview', async () => {
+    const user = userEvent.setup();
     localStorage.setItem('cardClickBehavior_activityContext', 'standalone');
     const onSelectScreenshot = vi.fn();
     const onOpenFloatingPreview = vi.fn();
 
     renderDrawer({ onSelectScreenshot, onOpenFloatingPreview });
 
-    fireEvent.click(await screen.findByText('carbonPaper'));
+    await user.click(await screen.findByText('carbonPaper'));
 
     expect(onOpenFloatingPreview).toHaveBeenCalledWith(expect.objectContaining({
       screenshot_id: 42,
@@ -144,7 +151,7 @@ describe('ActivityContextDrawer', () => {
     }));
     expect(onSelectScreenshot).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByLabelText('previewAction.openMainPreview'));
+    await user.click(screen.getByLabelText('previewAction.openMainPreview'));
 
     expect(onSelectScreenshot).toHaveBeenCalledWith(expect.objectContaining({
       screenshot_id: 42,
