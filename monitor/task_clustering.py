@@ -1334,6 +1334,23 @@ class ClusteringScheduler:
             return False
         if self._running:
             return False
+        storage_client = self._storage_client or getattr(self._manager, "_storage_client", None)
+        if storage_client:
+            try:
+                idle = storage_client.get_idle_state()
+            except Exception as e:
+                logger.warning("Skipping scheduled clustering: idle state unavailable: %s", e)
+                return False
+            if not isinstance(idle, dict):
+                logger.warning("Skipping scheduled clustering: idle state malformed: %r", idle)
+                return False
+            if not idle.get("is_idle", False):
+                logger.debug(
+                    "Skipping scheduled clustering: system not idle (idle_secs=%s fullscreen=%s)",
+                    idle.get("idle_secs"),
+                    idle.get("fullscreen_exclusive"),
+                )
+                return False
         if not TaskEmbedder.is_model_available():
             logger.debug("Skipping scheduled clustering: MiniLM model not downloaded")
             return False

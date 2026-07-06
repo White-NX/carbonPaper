@@ -251,6 +251,21 @@ def test_is_session_valid_reads_response_flag(monkeypatch):
     assert client.is_session_valid() is False
 
 
+def test_get_idle_state_treats_success_null_data_as_not_idle(monkeypatch):
+    client = sc.StorageClient("test-pipe")
+    monkeypatch.setattr(
+        client,
+        "_send_request",
+        lambda _req: {"status": "success", "data": None},
+    )
+
+    assert client.get_idle_state() == {
+        "is_idle": False,
+        "idle_secs": 0,
+        "fullscreen_exclusive": True,
+    }
+
+
 def test_list_screenshots_for_clustering_uses_expected_payload(monkeypatch):
     client = sc.StorageClient("test-pipe")
     captured = {}

@@ -176,6 +176,9 @@ class SmartClusterWorker:
 
         if not force:
             idle = self._storage_client.get_idle_state()
+            if not isinstance(idle, dict):
+                logger.warning("[smart_cluster_worker] skipping tick — malformed idle state: %r", idle)
+                return False
             if not idle.get("is_idle", False):
                 logger.debug(
                     "[smart_cluster_worker] skipping tick — system not idle (idle_secs=%s fullscreen=%s)",
@@ -427,7 +430,7 @@ class SmartClusterWorker:
         """Cheap idle re-check used to abort heavy work mid-batch."""
         try:
             idle = self._storage_client.get_idle_state()
-            return bool(idle.get("is_idle", False))
+            return isinstance(idle, dict) and bool(idle.get("is_idle", False))
         except Exception:
             return False
 

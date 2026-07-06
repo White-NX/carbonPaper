@@ -751,7 +751,9 @@ class StorageClient:
         """
         response = self._send_request({'command': 'get_idle_state'})
         if response.get('status') == 'success':
-            return response.get('data', {'is_idle': False, 'idle_secs': 0, 'fullscreen_exclusive': True})
+            data = response.get('data')
+            if isinstance(data, dict):
+                return data
         return {'is_idle': False, 'idle_secs': 0, 'fullscreen_exclusive': True}
 
     def smart_cluster_list_enabled(self) -> List[Dict[str, Any]]:
