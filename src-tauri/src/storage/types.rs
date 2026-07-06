@@ -359,6 +359,15 @@ pub struct DeleteQueueStatus {
     pub running: bool,
 }
 
+/// Counts used by the index health panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexStorageStats {
+    pub screenshots_count: i64,
+    pub ocr_rows_count: i64,
+    pub smart_cluster_pending_count: i64,
+    pub delete_queue: DeleteQueueStatus,
+}
+
 /// Internal batch row for screenshot queue processing.
 #[derive(Debug, Clone)]
 pub struct QueueScreenshotCandidate {

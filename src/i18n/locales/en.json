@@ -23,6 +23,28 @@
         "permanent": "DirectML disabled (too many switches, will restore on restart)",
         "fullscreen_paused": "Active: Non-browser fullscreen app detected, capture paused"
       },
+      "resourcePolicy": {
+        "label": "Resource Usage",
+        "description": "Choose how aggressively CarbonPaper should protect battery life and foreground performance.",
+        "options": {
+          "complete": {
+            "label": "Complete",
+            "description": "Keep capture and analysis running whenever possible. Best for a complete history, but may affect games and battery life."
+          },
+          "balanced": {
+            "label": "Balanced",
+            "description": "Pause heavier background services on battery power, then resume when plugged in."
+          },
+          "performance": {
+            "label": "Performance",
+            "description": "Default. Protect battery life and reduce load during games or fullscreen apps."
+          },
+          "custom": {
+            "label": "Custom",
+            "description": "Tune battery saving and game protection separately."
+          }
+        }
+      },
       "lightweightMode": {
         "startHidden": {
           "label": "Start with Hidden Window (Lightweight Mode)",
@@ -38,6 +60,41 @@
           "label": "Switch to Lightweight Mode Now",
           "description": "Close UI and free memory, can reopen via tray menu",
           "button": "Switch"
+        }
+      },
+      "windowBehavior": {
+        "label": "Window and Background",
+        "description": "Control whether CarbonPaper shows a window on startup and keeps running in the background after closing.",
+        "startup": {
+          "label": "Startup",
+          "showWindow": {
+            "label": "Show window",
+            "description": "Open the main window when CarbonPaper starts."
+          },
+          "background": {
+            "label": "Background",
+            "description": "Start hidden in the tray and run in the background."
+          }
+        },
+        "closeWindow": {
+          "label": "When closing the window",
+          "current": {
+            "label": "Just hide window",
+            "description": "Hide the UI to the tray and keep current background services as they are."
+          },
+          "background": {
+            "label": "Run in background",
+            "description": "Hide the UI immediately, then switch to background running after the delay."
+          }
+        },
+        "delay": {
+          "label": "Delay before background running:",
+          "unit": "minutes"
+        },
+        "switchNow": {
+          "label": "Run in background now",
+          "description": "Hide the main window immediately and switch to background running.",
+          "button": "Run in background"
         }
       },
       "cardClickBehavior": {
@@ -135,6 +192,12 @@
       "loading": "Loading...",
       "warning": "These settings may affect monitor service performance and system stability. Adjust carefully.",
       "quick_restart": "Quick Restart",
+      "terms": {
+        "directml": "DirectML is Microsoft's GPU inference interface. It can accelerate OCR on compatible GPUs, but may compete with games or graphics-heavy apps.",
+        "onnx": "ONNX is a portable model format/runtime. It usually uses less memory than PyTorch and starts faster.",
+        "pacmap_hdbscan": "PaCMAP reduces high-dimensional text vectors into a shape that is easier to cluster; HDBSCAN then groups dense regions without needing a fixed cluster count.",
+        "minilm": "MiniLM-L12 is the compact language model used to encode OCR text before task clustering."
+      },
       "cpu": {
         "title": "Python subprocess CPU limits",
         "label": "Limit CPU usage",
@@ -419,6 +482,16 @@
         "endpoint": "Endpoint",
         "auth_header": "Authorization Header"
       },
+      "agent_setup": {
+        "title": "Agent Setup",
+        "description": "Copy setup instructions so an Agent can fetch the Skill and connect to the local MCP server.",
+        "skill": "Skill",
+        "source": "Source",
+        "endpoint": "Endpoint",
+        "copy": "Copy setup prompt",
+        "copied": "Setup prompt copied",
+        "prompt": "Configure CarbonPaper MCP access.\n\n1. Fetch the Skill from the {{skillName}} directory in GitHub repository {{repo}}, then install it into your Agent/Skill environment.\n2. Use that Skill for CarbonPaper screenshot history, OCR, task cluster, and smart-cluster summary workflows.\n3. MCP endpoint: {{endpoint}}, using Streamable HTTP/HTTP POST.\n4. Authorization header: Authorization: Bearer <CarbonPaper token>. Do not ask me to paste the token into this long setup prompt; ask me to click Copy token in CarbonPaper and configure it separately in your MCP client.\n5. If a tool returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello before retrying.\n6. This MCP server may expose local screenshot history, OCR text, window titles, URLs, task clusters, and smart-cluster data. Read only the content needed for my explicit request."
+      },
       "content_filter": {
         "title": "Content Filter",
         "description": "Filter flagged content from MCP server responses based on compliance rules.",
@@ -509,6 +582,35 @@
       "title": "Features",
       "management": {
         "title": "Feature Management",
+        "featureMode": {
+          "label": "Feature Level",
+          "description": "Choose how much semantic functionality CarbonPaper should enable. Higher levels provide more automation and may use more background resources.",
+          "customControls": {
+            "label": "Adjust individually"
+          },
+          "options": {
+            "minimal": {
+              "label": "Minimal",
+              "description": "Keep basic screenshots and OCR search without semantic classification or clustering."
+            },
+            "basic": {
+              "label": "Basic",
+              "description": "Enable content classification for filtering, statistics, and later organization."
+            },
+            "organized": {
+              "label": "Organized",
+              "description": "Enable content classification and task clustering to organize long-running activity."
+            },
+            "smart": {
+              "label": "Smart",
+              "description": "Enable all semantic features, including automatic archive by description."
+            },
+            "custom": {
+              "label": "Custom",
+              "description": "The current feature combination came from individual settings or an older configuration."
+            }
+          }
+        },
         "clustering": {
           "label": "Task Clustering",
           "description": "Group similar activities into long-term tasks using MiniLM model",

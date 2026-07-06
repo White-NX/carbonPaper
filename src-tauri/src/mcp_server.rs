@@ -30,8 +30,6 @@ use tauri::{Emitter, Manager};
 
 const DEFAULT_MCP_PORT: u16 = 23816;
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
-/// Fallback instructions embedded at compile time.
-const SKILL_INSTRUCTIONS_FALLBACK: &str = include_str!("../../ai_embedding/skill.md");
 
 // ==================== Runtime state ====================
 
@@ -100,7 +98,6 @@ impl McpRuntimeState {
 struct McpServerInner {
     app_handle: tauri::AppHandle,
     token_hash: [u8; 32],
-    skill_instructions: String,
 }
 
 fn require_authenticated_session(app_handle: &tauri::AppHandle) -> Result<(), String> {
@@ -223,7 +220,7 @@ async fn handle_mcp(
     tracing::info!("MCP request: method={}", req.method);
 
     let resp = match req.method.as_str() {
-        "initialize" => handle_initialize(req.id, &state.skill_instructions),
+        "initialize" => handle_initialize(req.id),
         "notifications/initialized" => JsonRpcResponse::success(req.id, serde_json::json!({})),
         "ping" => JsonRpcResponse::success(req.id, serde_json::json!({})),
         "tools/list" => handle_tools_list(req.id),
@@ -237,7 +234,7 @@ async fn handle_mcp(
     (StatusCode::OK, headers, Json(resp))
 }
 
-fn handle_initialize(id: Option<Value>, instructions: &str) -> JsonRpcResponse {
+fn handle_initialize(id: Option<Value>) -> JsonRpcResponse {
     JsonRpcResponse::success(
         id,
         serde_json::json!({
@@ -248,8 +245,7 @@ fn handle_initialize(id: Option<Value>, instructions: &str) -> JsonRpcResponse {
             "serverInfo": {
                 "name": "CarbonPaper",
                 "version": env!("CARGO_PKG_VERSION")
-            },
-            "instructions": instructions
+            }
         }),
     )
 }
@@ -2061,24 +2057,9 @@ pub async fn start_server(
         stop_server(&mcp_runtime).await;
     }
 
-    // Load skill instructions from bundled resource, fall back to compile-time embedded version.
-    let skill_instructions = app_handle
-        .path()
-        .resource_dir()
-        .ok()
-        .map(|dir| dir.join("ai_embedding").join("skill.md"))
-        .and_then(|path| std::fs::read_to_string(&path).ok())
-        .unwrap_or_else(|| {
-            tracing::warn!(
-                "Failed to load ai_embedding/skill.md from resource dir, using embedded fallback"
-            );
-            SKILL_INSTRUCTIONS_FALLBACK.to_string()
-        });
-
     let inner = Arc::new(McpServerInner {
         app_handle: app_handle.clone(),
         token_hash,
-        skill_instructions,
     });
 
     let app = Router::new()

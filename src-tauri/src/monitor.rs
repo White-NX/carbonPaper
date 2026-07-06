@@ -32,6 +32,45 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Performance::*;
 
+#[derive(Clone, Debug)]
+struct MonitorRecoveryState {
+    state: String,
+    policy: String,
+    restart_available: bool,
+    last_exit_code: Option<String>,
+    last_error: Option<String>,
+    last_crashed_at_ms: Option<u64>,
+    crash_count: u64,
+}
+
+impl Default for MonitorRecoveryState {
+    fn default() -> Self {
+        Self {
+            state: "stopped".to_string(),
+            policy: "manual_restart".to_string(),
+            restart_available: true,
+            last_exit_code: None,
+            last_error: None,
+            last_crashed_at_ms: None,
+            crash_count: 0,
+        }
+    }
+}
+
+impl MonitorRecoveryState {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state": self.state,
+            "policy": self.policy,
+            "restart_available": self.restart_available,
+            "last_exit_code": self.last_exit_code,
+            "last_error": self.last_error,
+            "last_crashed_at_ms": self.last_crashed_at_ms,
+            "crash_count": self.crash_count,
+        })
+    }
+}
+
 pub struct MonitorState {
     pub process: Mutex<Option<Child>>,
     pub pipe_name: Mutex<Option<String>>,
@@ -53,6 +92,7 @@ pub struct MonitorState {
     pub stopping: AtomicBool,
     /// Prevents the monitor from restarting during migration tasks
     pub migration_lock: AtomicBool,
+    recovery: Mutex<MonitorRecoveryState>,
     python_ipc_client: AsyncMutex<Option<PersistentIpcClient>>,
 }
 
@@ -77,6 +117,7 @@ impl MonitorState {
             game_mode_task: Mutex::new(None),
             stopping: AtomicBool::new(false),
             migration_lock: AtomicBool::new(false),
+            recovery: Mutex::new(MonitorRecoveryState::default()),
             python_ipc_client: AsyncMutex::new(None),
         }
     }
@@ -118,6 +159,110 @@ const STARTUP_LOG_TAIL_LINES: usize = 50;
 use serde_json::Value;
 
 const MAX_MONITOR_COMMAND_PAYLOAD_BYTES: usize = 256 * 1024;
+
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn monitor_recovery_snapshot(state: &MonitorState) -> Value {
+    state
+        .recovery
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .to_json()
+}
+
+fn stopped_monitor_status(state: &MonitorState) -> Value {
+    serde_json::json!({
+        "paused": false,
+        "stopped": true,
+        "interval": 0,
+        "recovery": monitor_recovery_snapshot(state),
+    })
+}
+
+fn set_monitor_recovery_starting(state: &MonitorState) {
+    let mut recovery = state.recovery.lock().unwrap_or_else(|e| e.into_inner());
+    recovery.state = "starting".to_string();
+    recovery.restart_available = false;
+    recovery.last_error = None;
+}
+
+fn set_monitor_recovery_running(state: &MonitorState) {
+    let mut recovery = state.recovery.lock().unwrap_or_else(|e| e.into_inner());
+    recovery.state = "running".to_string();
+    recovery.restart_available = false;
+    recovery.last_error = None;
+    recovery.last_exit_code = None;
+    recovery.last_crashed_at_ms = None;
+}
+
+fn set_monitor_recovery_stopped(state: &MonitorState) {
+    let mut recovery = state.recovery.lock().unwrap_or_else(|e| e.into_inner());
+    recovery.state = "stopped".to_string();
+    recovery.restart_available = true;
+    recovery.last_error = None;
+    recovery.last_exit_code = None;
+    recovery.last_crashed_at_ms = None;
+}
+
+fn set_monitor_recovery_failed(state: &MonitorState, error: String) -> Value {
+    let mut recovery = state.recovery.lock().unwrap_or_else(|e| e.into_inner());
+    recovery.state = "failed".to_string();
+    recovery.restart_available = true;
+    recovery.last_error = Some(error);
+    recovery.to_json()
+}
+
+fn set_monitor_recovery_crashed(
+    state: &MonitorState,
+    exit_code: String,
+    error: Option<String>,
+) -> Value {
+    let mut recovery = state.recovery.lock().unwrap_or_else(|e| e.into_inner());
+    recovery.state = "crashed".to_string();
+    recovery.restart_available = true;
+    recovery.last_exit_code = Some(exit_code);
+    recovery.last_error = error;
+    recovery.last_crashed_at_ms = Some(current_epoch_ms());
+    recovery.crash_count = recovery.crash_count.saturating_add(1);
+    recovery.to_json()
+}
+
+fn cleanup_monitor_runtime_after_unexpected_exit(state: &MonitorState) {
+    {
+        let mut guard = state.reverse_ipc.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref mut server) = *guard {
+            server.stop();
+        }
+        *guard = None;
+    }
+    {
+        let mut guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    {
+        let mut guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    {
+        let mut guard = state
+            .reverse_pipe_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    {
+        let mut guard = state.job_handle.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    if let Ok(mut guard) = state.python_ipc_client.try_lock() {
+        *guard = None;
+    }
+}
 
 // Windows error code for ERROR_PIPE_BUSY
 #[cfg(windows)]
@@ -994,6 +1139,7 @@ pub async fn start_monitor_impl(
 
     // Reset the stopping flag for a fresh start
     state.stopping.store(false, Ordering::SeqCst);
+    set_monitor_recovery_starting(&state);
 
     let stdout_cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1490,8 +1636,14 @@ pub async fn start_monitor_impl(
                                 .code()
                                 .map(|c| c.to_string())
                                 .unwrap_or_else(|| "unknown".to_string());
-                            let _ =
-                                app_clone.emit("monitor-exited", serde_json::json!({"code": code}));
+                            cleanup_monitor_runtime_after_unexpected_exit(&state);
+                            let recovery = set_monitor_recovery_crashed(&state, code.clone(), None);
+                            crate::refresh_tray_menu(&app_clone);
+                            let _ = app_clone.emit("monitor-recovery", recovery.clone());
+                            let _ = app_clone.emit(
+                                "monitor-exited",
+                                serde_json::json!({"code": code, "recovery": recovery}),
+                            );
                         }
                         break;
                     }
@@ -1501,9 +1653,21 @@ pub async fn start_monitor_impl(
                         drop(guard);
                         // Don't emit monitor-exited during intentional stop
                         if !state.stopping.load(Ordering::SeqCst) {
+                            cleanup_monitor_runtime_after_unexpected_exit(&state);
+                            let recovery = set_monitor_recovery_crashed(
+                                &state,
+                                "unknown".to_string(),
+                                Some(e.to_string()),
+                            );
+                            crate::refresh_tray_menu(&app_clone);
+                            let _ = app_clone.emit("monitor-recovery", recovery.clone());
                             let _ = app_clone.emit(
                                 "monitor-exited",
-                                serde_json::json!({"code": "unknown", "error": e.to_string()}),
+                                serde_json::json!({
+                                    "code": "unknown",
+                                    "error": e.to_string(),
+                                    "recovery": recovery,
+                                }),
                             );
                         }
                         break;
@@ -1522,6 +1686,7 @@ pub async fn start_monitor_impl(
         match connect_to_pipe(&pipe_name).await {
             Ok(_) => {
                 // 管道可连接，说明服务已就绪 — 启动 Rust 截图循环
+                set_monitor_recovery_running(&state);
                 spawn_capture_loop(&app);
                 crate::refresh_tray_menu(&app);
                 return Ok("Monitor started".into());
@@ -1542,16 +1707,22 @@ pub async fn start_monitor_impl(
                             .code()
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "unknown".to_string());
-                        return Err(format!("Monitor exited during startup (code: {})", code));
+                        let message = format!("Monitor exited during startup (code: {})", code);
+                        set_monitor_recovery_failed(&state, message.clone());
+                        return Err(message);
                     }
                     Ok(None) => {}
                     Err(e) => {
                         *guard = None;
-                        return Err(format!("Monitor startup check failed: {}", e));
+                        let message = format!("Monitor startup check failed: {}", e);
+                        set_monitor_recovery_failed(&state, message.clone());
+                        return Err(message);
                     }
                 }
             } else {
-                return Err("Monitor process handle missing during startup".into());
+                let message = "Monitor process handle missing during startup".to_string();
+                set_monitor_recovery_failed(&state, message.clone());
+                return Err(message);
             }
         }
 
@@ -1575,7 +1746,7 @@ pub async fn start_monitor_impl(
         }
     };
 
-    Err(format!(
+    let message = format!(
         "Monitor startup timed out: {} | cwd: {} | script: {} | script_abs: {} | python: {} (exists: {}) | pipe: {} | stderr_tail: {}",
         last_error.unwrap_or_else(|| "pipe unavailable".to_string()),
         cwd,
@@ -1585,7 +1756,9 @@ pub async fn start_monitor_impl(
         python_exists_for_error,
         pipe_name,
         stderr_tail
-    ))
+    );
+    set_monitor_recovery_failed(&state, message.clone());
+    Err(message)
 }
 
 #[tauri::command]
@@ -1823,6 +1996,7 @@ pub async fn stop_monitor_impl(
         *guard = None;
     }
 
+    set_monitor_recovery_stopped(&state);
     crate::refresh_tray_menu(&app);
     let _ = app.emit("monitor-stopped", serde_json::json!({"intentional": true}));
 
@@ -1893,16 +2067,16 @@ pub async fn resume_monitor(
 #[tauri::command]
 pub async fn get_monitor_status(state: State<'_, MonitorState>) -> Result<String, String> {
     if state.stopping.load(Ordering::SeqCst) {
-        let stopped = serde_json::json!({
-            "paused": false,
-            "stopped": true,
-            "interval": 0
-        });
-        return Ok(stopped.to_string());
+        return Ok(stopped_monitor_status(&state).to_string());
     }
 
-    match send_ipc_command_internal(&state, "status").await {
-        Ok(status) => Ok(status),
+    match forward_command_to_python(&state, serde_json::json!({ "command": "status" })).await {
+        Ok(mut status) => {
+            if let Some(obj) = status.as_object_mut() {
+                obj.insert("recovery".to_string(), monitor_recovery_snapshot(&state));
+            }
+            Ok(status.to_string())
+        }
         Err(e) => {
             // 如果进程未运行，则返回“stopped”而不是抛错，避免前端冷启动误报
             let mut running = false;
@@ -1924,12 +2098,7 @@ pub async fn get_monitor_status(state: State<'_, MonitorState>) -> Result<String
             }
 
             if !running {
-                let stopped = serde_json::json!({
-                    "paused": false,
-                    "stopped": true,
-                    "interval": 0
-                });
-                return Ok(stopped.to_string());
+                return Ok(stopped_monitor_status(&state).to_string());
             }
 
             Err(e)
@@ -2385,5 +2554,22 @@ mod tests {
         let bytes = br#"{"status":"success""#;
         let err = parse_ipc_response(bytes).unwrap_err();
         assert!(err.contains("Invalid JSON response"));
+    }
+
+    #[test]
+    fn test_monitor_recovery_crash_snapshot_uses_manual_restart_policy() {
+        let state = MonitorState::new();
+        set_monitor_recovery_running(&state);
+
+        let recovery =
+            set_monitor_recovery_crashed(&state, "9".to_string(), Some("pipe failed".to_string()));
+
+        assert_eq!(recovery["state"], "crashed");
+        assert_eq!(recovery["policy"], "manual_restart");
+        assert_eq!(recovery["restart_available"], true);
+        assert_eq!(recovery["last_exit_code"], "9");
+        assert_eq!(recovery["last_error"], "pipe failed");
+        assert_eq!(recovery["crash_count"], 1);
+        assert!(recovery["last_crashed_at_ms"].as_u64().unwrap_or(0) > 0);
     }
 }

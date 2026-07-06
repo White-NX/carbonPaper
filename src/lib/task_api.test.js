@@ -1,5 +1,15 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
+
+vi.mock('./auth_api', () => ({
+  withAuth: vi.fn(async (fn) => fn()),
+  requestAuth: vi.fn(),
+  checkAuthSession: vi.fn(),
+  initAuthListeners: vi.fn(),
+  lockSession: vi.fn(),
+}));
+
+import { withAuth } from './auth_api';
 import {
   getTasks,
   getTaskScreenshots,
@@ -13,6 +23,21 @@ import {
 } from './task_api';
 
 describe('task_api', () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    withAuth.mockClear();
+  });
+
+  const expectWithAuth = (callNumber, options) => {
+    const call = withAuth.mock.calls[callNumber - 1];
+    expect(call?.[0]).toEqual(expect.any(Function));
+    if (options === undefined) {
+      expect(call).toHaveLength(1);
+    } else {
+      expect(call?.[1]).toEqual(options);
+    }
+  };
+
   it('calls getTasks with default payload', async () => {
     invoke.mockResolvedValue([]);
 
@@ -26,6 +51,7 @@ describe('task_api', () => {
       hideEntertainment: true,
       hideSocial: true,
     });
+    expectWithAuth(1);
   });
 
   it('calls getTaskScreenshots with defaults', async () => {
@@ -38,6 +64,7 @@ describe('task_api', () => {
       page: 0,
       pageSize: 50,
     });
+    expectWithAuth(1);
   });
 
   it('calls removeTaskScreenshot with expected payload', async () => {
@@ -49,12 +76,14 @@ describe('task_api', () => {
       taskId: 123,
       screenshotId: 456,
     });
+    expectWithAuth(1, { autoPrompt: true });
   });
 
   it('throws when runClustering returns error', async () => {
     invoke.mockResolvedValue({ error: 'AUTH_REQUIRED' });
 
     await expect(runClustering()).rejects.toThrow('AUTH_REQUIRED');
+    expectWithAuth(1, { autoPrompt: false });
   });
 
   it('sends clustering commands with provided params', async () => {
@@ -71,6 +100,8 @@ describe('task_api', () => {
     });
 
     expect(invoke).toHaveBeenNthCalledWith(2, 'monitor_set_clustering_interval', { interval: '1w' });
+    expectWithAuth(1, { autoPrompt: false });
+    expectWithAuth(2, { autoPrompt: true });
   });
 
   it('calls smart cluster summary commands with expected payloads', async () => {
@@ -96,5 +127,9 @@ describe('task_api', () => {
     expect(invoke).toHaveBeenNthCalledWith(2, 'smart_cluster_get_summary', { clusterId: 7 });
     expect(invoke).toHaveBeenNthCalledWith(3, 'smart_cluster_upsert_summary', { summary });
     expect(invoke).toHaveBeenNthCalledWith(4, 'smart_cluster_delete_summary', { clusterId: 7 });
+    expectWithAuth(1);
+    expectWithAuth(2);
+    expectWithAuth(3, { autoPrompt: true });
+    expectWithAuth(4, { autoPrompt: true });
   });
 });

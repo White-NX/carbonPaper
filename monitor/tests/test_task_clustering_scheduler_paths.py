@@ -29,6 +29,80 @@ def test_scheduler_skips_when_model_not_available(monkeypatch):
     assert scheduler.get_config()["running"] is False
 
 
+def test_scheduler_skips_when_system_not_idle_before_model_check(monkeypatch):
+    class Manager:
+        def __init__(self):
+            self.calls = 0
+
+        def run_clustering(
+            self,
+            auto_compress=True,
+            clustering_mode="auto",
+            manual=False,
+            allow_full_low_memory=False,
+        ):
+            self.calls += 1
+            return {"status": "success"}
+
+    class StorageClient:
+        def __init__(self):
+            self.calls = 0
+
+        def get_idle_state(self):
+            self.calls += 1
+            return {"is_idle": False, "idle_secs": 2, "fullscreen_exclusive": False}
+
+    manager = Manager()
+    storage_client = StorageClient()
+    scheduler = tc.ClusteringScheduler(manager, storage_client=storage_client)
+    monkeypatch.setattr(
+        tc.TaskEmbedder,
+        "is_model_available",
+        staticmethod(lambda: (_ for _ in ()).throw(AssertionError("model check should wait for idle"))),
+    )
+
+    result = scheduler._do_run()
+
+    assert result is False
+    assert storage_client.calls == 1
+    assert manager.calls == 0
+    assert scheduler.get_config()["running"] is False
+
+
+def test_scheduler_skips_when_idle_state_is_malformed(monkeypatch):
+    class Manager:
+        def __init__(self):
+            self.calls = 0
+
+        def run_clustering(
+            self,
+            auto_compress=True,
+            clustering_mode="auto",
+            manual=False,
+            allow_full_low_memory=False,
+        ):
+            self.calls += 1
+            return {"status": "success"}
+
+    class StorageClient:
+        def get_idle_state(self):
+            return None
+
+    manager = Manager()
+    scheduler = tc.ClusteringScheduler(manager, storage_client=StorageClient())
+    monkeypatch.setattr(
+        tc.TaskEmbedder,
+        "is_model_available",
+        staticmethod(lambda: (_ for _ in ()).throw(AssertionError("model check should wait for valid idle state"))),
+    )
+
+    result = scheduler._do_run()
+
+    assert result is False
+    assert manager.calls == 0
+    assert scheduler.get_config()["running"] is False
+
+
 def test_run_now_returns_already_running():
     class Manager:
         def run_clustering(

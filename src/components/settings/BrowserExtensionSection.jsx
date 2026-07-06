@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { Globe } from 'lucide-react';
 import { withAuth } from '../../lib/auth_api';
+import { SettingsSwitch } from './SettingsControls';
 
 export default function BrowserExtensionSection() {
   const { t } = useTranslation();
@@ -94,18 +95,11 @@ export default function BrowserExtensionSection() {
           <span className="text-xs text-ide-text-secondary">
             {t(`settings.extension.enhance.${browser}`)}
           </span>
-          <button
-            onClick={() => handleEnhanceToggle(browser, !enhance[browser])}
-            className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${enhance[browser] ? 'bg-ide-accent' : 'bg-ide-border'
-              }`}
+          <SettingsSwitch
+            checked={enhance[browser]}
+            onChange={(next) => handleEnhanceToggle(browser, next)}
             title={t(`settings.extension.enhance.${browser}`)}
-          >
-            <div
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                enhance[browser] ? 'translate-x-5' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          />
         </div>
       )}
     </div>

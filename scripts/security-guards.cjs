@@ -49,6 +49,8 @@ const COMMAND_TIERS = {
   'commands::storage::storage_soft_delete': 'session_required',
   'commands::storage::storage_soft_delete_screenshots': 'session_required',
   'commands::storage::storage_get_delete_queue_status': 'session_required',
+  'commands::storage::storage_get_index_health': 'session_required',
+  'commands::storage::storage_retry_vector_indexing': 'session_required',
   'commands::storage::storage_save_screenshot': 'session_required',
   'commands::storage::storage_set_policy': 'session_required',
   'commands::storage::storage_get_policy': 'session_required',

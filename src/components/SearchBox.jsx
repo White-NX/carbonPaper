@@ -1,372 +1,55 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
-import { searchScreenshots, fetchThumbnailBatch, fetchThumbnail, getSoftDeleteQueueStatus, getSmartClusterWorkerStatus } from '../lib/monitor_api';
-import { smartClusterStopDrain } from '../lib/task_api';
-
-// Simple debounce hook
-function useDebounce(value, delay) {
-    const [debouncedValue, setDebouncedValue] = useState(value);
-    useEffect(() => {
-        const handler = setTimeout(() => {
-            setDebouncedValue(value);
-        }, delay);
-        return () => {
-            clearTimeout(handler);
-        };
-    }, [value, delay]);
-    return debouncedValue;
-}
+import { fetchThumbnail } from '../lib/monitor_api';
+import { useSearchBoxController } from '../hooks/useSearchBoxController';
 
 export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, backendOnline, monitorPaused, handlePauseMonitor, handleResumeMonitor }) {
     const { t } = useTranslation();
-    const [query, setQuery] = useState('');
-    const [localMode, setLocalMode] = useState('ocr'); // 'ocr' | 'nl'
-    const [showModeMenu, setShowModeMenu] = useState(false);
-    const [results, setResults] = useState([]);
-    const [error, setError] = useState(null);
-    const [loading, setLoading] = useState(false);
-    const [showResults, setShowResults] = useState(false);
-    const debouncedQuery = useDebounce(query, 500);
-    const wrapperRef = useRef(null);
-    const inputRef = useRef(null);
-    const mode = controlledMode ?? localMode;
-    const setMode = onModeChange ?? setLocalMode;
-    // Track if mode change came from user interaction within this component
-    const userInteractionRef = useRef(false);
-
-    // Auto-switch back to OCR mode when backend goes offline
-    useEffect(() => {
-        if (backendOnline === false && mode === 'nl') {
-            setMode('ocr');
-        }
-    }, [backendOnline, mode, setMode]);
-
-    useEffect(() => {
-        function handleClickOutside(event) {
-            if (wrapperRef.current && !wrapperRef.current.contains(event.target)) {
-                setShowModeMenu(false);
-                setShowResults(false);
-            }
-        }
-        document.addEventListener("mousedown", handleClickOutside);
-        return () => {
-            document.removeEventListener("mousedown", handleClickOutside);
-        };
-    }, [wrapperRef]);
-
-    useEffect(() => {
-        if (debouncedQuery.trim().length === 0) {
-            setResults([]);
-            setError(null);
-            return;
-        }
-
-        const doSearch = async () => {
-            setLoading(true);
-            setError(null);
-            try {
-                const res = await searchScreenshots(debouncedQuery, mode);
-                setResults(res);
-                // Only show results if the input is focused or user triggered the mode change
-                const isFocused = document.activeElement === inputRef.current;
-                if (isFocused || userInteractionRef.current) {
-                    setShowResults(true);
-                }
-                userInteractionRef.current = false;
-            } catch (e) {
-                console.error("Search failed:", e);
-                setError(e.message || String(e));
-                setResults([]);
-                setShowResults(true);
-            } finally {
-                setLoading(false);
-            }
-        };
-
-        doSearch();
-    }, [debouncedQuery, mode]);
-
-    // Batch-load thumbnails when results change
-    const [thumbCache, setThumbCache] = useState({});
-    useEffect(() => {
-        if (!results.length) { setThumbCache({}); return; }
-        let active = true;
-        const ids = results.map(item => {
-            const sid = mode === 'nl' ? item.metadata?.screenshot_id : item.screenshot_id;
-            return typeof sid === 'number' && sid > 0 ? sid : null;
-        }).filter(Boolean);
-        if (ids.length === 0) return;
-        fetchThumbnailBatch([...new Set(ids)])
-            .then(batch => { if (active && batch) setThumbCache(batch); })
-            .catch(() => {});
-        return () => { active = false; };
-    }, [results, mode]);
-
-    const handleSelect = (item) => {
-        // Determine ID based on mode/structure
-        let id = null;
-        if (mode === 'ocr') {
-            id = item.screenshot_id;
-        } else {
-            // NL search returns metadata with screenshot_id if we have it
-            id = item.metadata?.screenshot_id;
-            // Fallback to -1 or parse from image path hash if we really had to, but keeping it simple for now
-        }
-
-        // Normalize the path field - search results use 'image_path', but App.jsx expects 'path'
-        const normalizedItem = {
-            id: id,
-            ...item,
-            path: item.image_path || item.path, // Ensure 'path' is set
-        };
-        
-        onSelectResult(normalizedItem);
-        setShowResults(false);
-    };
-
-    const [isMigrating, setIsMigrating] = useState(false);
-    const [deleteQueueStatus, setDeleteQueueStatus] = useState({
-        pending_screenshots: 0,
-        pending_ocr: 0,
-        running: false,
+    const {
+        query,
+        setQuery,
+        mode,
+        showModeMenu,
+        setShowModeMenu,
+        results,
+        error,
+        loading,
+        showResults,
+        setShowResults,
+        debouncedQuery,
+        wrapperRef,
+        inputRef,
+        thumbCache,
+        isMigrating,
+        deleteQueueStatus,
+        smartClusterQueueStatus,
+        downloadProgress,
+        hasDeleteTask,
+        deleteProgress,
+        hasClusterTask,
+        canCancelClusterTask,
+        clusterProgress,
+        showProgressBar,
+        progressFillPercent,
+        taskSummaryPlaceholder,
+        isDownloadingModels,
+        toggleMode,
+        selectMode,
+        handleSelect,
+        handleSubmit,
+        handleCancelCluster,
+    } = useSearchBoxController({
+        onSelectResult,
+        onSubmit,
+        controlledMode,
+        onModeChange,
+        backendOnline,
+        monitorPaused,
+        handlePauseMonitor,
+        handleResumeMonitor,
+        t,
     });
-    const [deleteQueuePeak, setDeleteQueuePeak] = useState(0);
-
-    const [smartClusterQueueStatus, setSmartClusterQueueStatus] = useState({
-        pending_count: 0,
-        running: false,
-    });
-    const [smartClusterQueuePeak, setSmartClusterQueuePeak] = useState(0);
-
-    const [downloadProgress, setDownloadProgress] = useState(0);
-    const [isDownloadingModels, setIsDownloadingModels] = useState(false);
-
-    useEffect(() => {
-        const handleProgress = (e) => {
-            if (e.detail) {
-                setDownloadProgress(e.detail.progress ?? 0);
-                setIsDownloadingModels(e.detail.active ?? false);
-            }
-        };
-        window.addEventListener('model-download-progress', handleProgress);
-        return () => {
-            window.removeEventListener('model-download-progress', handleProgress);
-        };
-    }, []);
-
-    const pendingDeleteTotal = Number(deleteQueueStatus?.pending_ocr || 0) + Number(deleteQueueStatus?.pending_screenshots || 0);
-    const hasDeleteTask = Boolean(deleteQueueStatus?.running) || pendingDeleteTotal > 120;
-    const deleteProgress = (() => {
-        if (!hasDeleteTask) return 0;
-        if (pendingDeleteTotal <= 0) return 100;
-        if (deleteQueuePeak <= 0) return 0;
-        const ratio = ((deleteQueuePeak - pendingDeleteTotal) / deleteQueuePeak) * 100;
-        return Math.max(0, Math.min(100, ratio));
-    })();
-
-    const hasClusterTask = Boolean(smartClusterQueueStatus?.running) && Number(smartClusterQueueStatus?.pending_count || 0) > 0;
-    const canCancelClusterTask = hasClusterTask && Boolean(smartClusterQueueStatus?.forceRunning);
-    const clusterProgress = (() => {
-        if (!hasClusterTask) return 0;
-        const pending = Number(smartClusterQueueStatus.pending_count || 0);
-        if (pending <= 0) return 100;
-        if (smartClusterQueuePeak <= 0) return 0;
-        const ratio = ((smartClusterQueuePeak - pending) / smartClusterQueuePeak) * 100;
-        return Math.max(0, Math.min(100, ratio));
-    })();
-
-    const showProgressBar = hasDeleteTask || hasClusterTask || isDownloadingModels;
-    const progressFillPercent = (() => {
-        if (hasDeleteTask) {
-            return deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress);
-        }
-        if (hasClusterTask) {
-            return clusterProgress <= 0 ? 8 : Math.min(100, clusterProgress);
-        }
-        if (isDownloadingModels) {
-            return downloadProgress <= 0 ? 8 : Math.min(100, downloadProgress);
-        }
-        return 0;
-    })();
-
-    const taskSummaryPlaceholder = (() => {
-        if (hasDeleteTask) {
-            return t('search.task.summaryPlaceholder', { progress: Math.round(deleteProgress) });
-        }
-        if (hasClusterTask) {
-            return t('search.task.smartClusterSummaryPlaceholder', { progress: Math.round(clusterProgress) });
-        }
-        if (isDownloadingModels) {
-            return t('search.task.modelDownloadSummaryPlaceholder', { progress: Math.round(downloadProgress) });
-        }
-        return '';
-    })();
-
-    // Active detection: check on mount and listen for progress events
-    useEffect(() => {
-        let active = true;
-        const check = async () => {
-            try {
-                const status = await invoke('storage_check_hmac_migration_status');
-                if (active && (status.needs_migration || status.is_running)) {
-                    setIsMigrating(true);
-                }
-            } catch (e) { console.error(e); }
-        };
-        check();
-
-        // Listen for progress events to catch an ongoing migration immediately
-        let unlistenProgress = null;
-        listen('hmac-migration-progress', () => {
-            if (active) setIsMigrating(true);
-        }).then(fn => unlistenProgress = fn);
-
-        // Listen for completion to clear the warning
-        let unlistenComplete = null;
-        listen('hmac-migration-complete', () => {
-            if (active) setIsMigrating(false);
-        }).then(fn => unlistenComplete = fn);
-
-        return () => { 
-            active = false; 
-            if (unlistenProgress) unlistenProgress();
-            if (unlistenComplete) unlistenComplete();
-        };
-    }, []);
-
-    useEffect(() => {
-        let cancelled = false;
-        const loadQueueStatus = async () => {
-            try {
-                const status = await getSoftDeleteQueueStatus();
-                if (cancelled) return;
-                setDeleteQueueStatus(status || { pending_screenshots: 0, pending_ocr: 0, running: false });
-            } catch {
-                if (cancelled) return;
-                setDeleteQueueStatus({ pending_screenshots: 0, pending_ocr: 0, running: false });
-            }
-        };
-
-        loadQueueStatus();
-        const timer = setInterval(loadQueueStatus, 4000);
-        return () => {
-            cancelled = true;
-            clearInterval(timer);
-        };
-    }, []);
-
-    useEffect(() => {
-        let cancelled = false;
-        const loadClusterStatus = async () => {
-            try {
-                const config = await invoke('get_advanced_config');
-                if (cancelled) return;
-                if (config && config.smart_cluster_enabled) {
-                    const status = await getSmartClusterWorkerStatus();
-                    if (cancelled) return;
-                    setSmartClusterQueueStatus(status || { pending_count: 0, running: false });
-                } else {
-                    setSmartClusterQueueStatus({ pending_count: 0, running: false });
-                }
-            } catch {
-                if (cancelled) return;
-                setSmartClusterQueueStatus({ pending_count: 0, running: false });
-            }
-        };
-
-        loadClusterStatus();
-        const timer = setInterval(loadClusterStatus, 4000);
-        return () => {
-            cancelled = true;
-            clearInterval(timer);
-        };
-    }, []);
-
-    useEffect(() => {
-        if (!hasDeleteTask) {
-            setDeleteQueuePeak(0);
-            return;
-        }
-        if (pendingDeleteTotal > 0) {
-            setDeleteQueuePeak((prev) => Math.max(prev, pendingDeleteTotal));
-        }
-    }, [hasDeleteTask, pendingDeleteTotal]);
-
-    useEffect(() => {
-        const running = Boolean(smartClusterQueueStatus?.running);
-        const pending = Number(smartClusterQueueStatus?.pending_count || 0);
-        if (!running || pending <= 0) {
-            setSmartClusterQueuePeak(0);
-            return;
-        }
-        if (pending > 0) {
-            setSmartClusterQueuePeak((prev) => Math.max(prev, pending));
-        }
-    }, [smartClusterQueueStatus?.running, smartClusterQueueStatus?.pending_count]);
-
-    const wasPausedRef = useRef(null);
-    // Hold the latest resume handler in a ref so the unmount-cleanup
-    // effect (empty deps) can call it without re-subscribing on every
-    // render. Without this, a SearchBox unmounted mid-task (route
-    // change, dialog close) would leave OCR capture indefinitely
-    // paused — a silent feature-killing bug.
-    const handleResumeMonitorRef = useRef(handleResumeMonitor);
-    useEffect(() => {
-        handleResumeMonitorRef.current = handleResumeMonitor;
-    }, [handleResumeMonitor]);
-
-    useEffect(() => {
-        if (hasClusterTask) {
-            if (wasPausedRef.current === null) {
-                wasPausedRef.current = !!monitorPaused;
-                if (!monitorPaused && handlePauseMonitor) {
-                    console.log("[SmartCluster] Auto-pausing OCR capture loop during task");
-                    handlePauseMonitor();
-                }
-            }
-        } else {
-            if (wasPausedRef.current !== null) {
-                const wasPaused = wasPausedRef.current;
-                wasPausedRef.current = null;
-                if (!wasPaused && handleResumeMonitor) {
-                    console.log("[SmartCluster] Auto-resuming OCR capture loop after task");
-                    handleResumeMonitor();
-                }
-            }
-        }
-    }, [hasClusterTask, monitorPaused, handlePauseMonitor, handleResumeMonitor]);
-
-    // Failsafe: if this component unmounts while we are still holding a
-    // pause we initiated, resume on the way out. wasPausedRef === false
-    // means "we paused capture on behalf of a cluster task that hasn't
-    // resolved" — exactly the case that would otherwise strand OCR.
-    useEffect(() => {
-        return () => {
-            if (wasPausedRef.current === false && handleResumeMonitorRef.current) {
-                console.log("[SmartCluster] Resuming OCR on SearchBox unmount (cleanup)");
-                try {
-                    handleResumeMonitorRef.current();
-                } catch (e) {
-                    console.warn("[SmartCluster] resume on unmount failed", e);
-                }
-            }
-            wasPausedRef.current = null;
-        };
-    }, []);
-
-    const handleCancelCluster = async (e) => {
-        if (e) e.stopPropagation();
-        try {
-            await smartClusterStopDrain();
-            const status = await getSmartClusterWorkerStatus();
-            setSmartClusterQueueStatus(status || { pending_count: 0, running: false });
-        } catch (err) {
-            console.error("Failed to cancel cluster process:", err);
-        }
-    };
 
     return (
         <div
@@ -385,12 +68,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 <div className="relative z-10 flex items-center border-r border-ide-border mr-2">
                 <button
                     className={`p-2 text-ide-muted hover:text-ide-text transition-colors ${backendOnline === false && mode === 'ocr' ? 'opacity-50 cursor-not-allowed' : ''}`}
-                    onClick={() => {
-                        // 如果后端离线且当前是 OCR 模式，不允许切换到 NL 模式
-                        if (backendOnline === false && mode === 'ocr') return;
-                        userInteractionRef.current = true;
-                        setMode(mode === 'ocr' ? 'nl' : 'ocr');
-                    }}
+                    onClick={toggleMode}
                     title={backendOnline === false && mode === 'ocr' ? t('search.nl.disabled_hint') : (mode === 'ocr' ? t('search.switchToNL') : t('search.switchToOCR'))}
                 >
                     {mode === 'ocr' ? <Type size={16} /> : <ImageIcon size={16} />}
@@ -399,7 +77,6 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                     className="p-2 pl-0 text-ide-muted hover:text-ide-text transition-colors"
                     onClick={(e) => {
                         e.stopPropagation();
-                        console.log('ChevronDown clicked, current showModeMenu:', showModeMenu);
                         setShowModeMenu(!showModeMenu);
                     }}
                     title={t('search.selectMode')}
@@ -416,15 +93,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onFocus={() => setShowResults(true)}
-                onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                        event.preventDefault();
-                        setShowResults(false);
-                        if (onSubmit) {
-                            onSubmit({ query, mode });
-                        }
-                    }
-                }}
+                onKeyDown={handleSubmit}
             />
             {canCancelClusterTask && (
                 <button
@@ -450,7 +119,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 <div className="absolute top-full left-0 mt-2 w-72 bg-ide-panel border border-ide-border rounded-md shadow-xl z-[60] p-1 flex flex-col gap-1">
                     <button
                         className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'ocr' ? 'bg-ide-active border border-ide-border' : ''}`}
-                        onClick={() => { userInteractionRef.current = true; setMode('ocr'); setShowModeMenu(false); }}
+                        onClick={() => selectMode('ocr')}
                     >
                         <div className="mt-1 text-ide-accent"><Type size={18} /></div>
                         <div>
@@ -460,7 +129,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                     </button>
                     <button
                         className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'nl' ? 'bg-ide-active border border-ide-border' : ''} ${backendOnline === false ? 'opacity-50 cursor-not-allowed' : ''}`}
-                        onClick={() => { if (backendOnline === false) return; userInteractionRef.current = true; setMode('nl'); setShowModeMenu(false); }}
+                        onClick={() => selectMode('nl')}
                         title={backendOnline === false ? t('search.nl.disabled_hint') : ''}
                     >
                         <div className="mt-1 text-ide-success"><ImageIcon size={18} /></div>

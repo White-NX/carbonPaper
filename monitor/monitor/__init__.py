@@ -289,6 +289,17 @@ def _handle_command(req: dict):
     return result
 
 
+def _storage_ipc_health_snapshot():
+    try:
+        from storage_client import get_storage_client
+        sc = get_storage_client()
+        if sc and hasattr(sc, 'ipc_health_snapshot'):
+            return sc.ipc_health_snapshot()
+    except Exception as exc:
+        return {'error': str(exc)}
+    return None
+
+
 def _handle_command_impl(req: dict):
     """Actual command dispatch logic."""
     global _last_seq_no
@@ -340,6 +351,46 @@ def _handle_command_impl(req: dict):
         if _ocr_worker:
             status['ocr_stats'] = _ocr_worker.get_stats()
         return status
+
+    if cmd == 'index_health':
+        storage_ipc = _storage_ipc_health_snapshot()
+        if not _ocr_worker:
+            return {
+                'status': 'success',
+                'worker_available': False,
+                'worker_started': False,
+                'stats': {},
+                'postprocess': None,
+                'storage_ipc': storage_ipc,
+            }
+        try:
+            refresh = bool(req.get('refresh', False))
+            if hasattr(_ocr_worker, 'get_index_health'):
+                result = _ocr_worker.get_index_health(refresh=refresh)
+                if isinstance(result, dict):
+                    result['storage_ipc'] = storage_ipc
+                return result
+            return {
+                'status': 'success',
+                'worker_available': True,
+                'worker_started': None,
+                'stats': _ocr_worker.get_stats() if hasattr(_ocr_worker, 'get_stats') else {},
+                'postprocess': None,
+                'storage_ipc': storage_ipc,
+            }
+        except Exception as e:
+            logger.warning('Index health query failed: %s', e)
+            return {'status': 'error', 'error': str(e)}
+
+    if cmd == 'retry_vector_indexing':
+        if not _ocr_worker or not hasattr(_ocr_worker, 'retry_vector_indexing'):
+            return {'status': 'error', 'error': 'Vector indexing retry is not available'}
+        try:
+            limit = int(req.get('limit', 32) or 32)
+            return _ocr_worker.retry_vector_indexing(limit=limit)
+        except Exception as e:
+            logger.warning('Vector indexing retry failed: %s', e)
+            return {'status': 'error', 'error': str(e)}
 
     # ----- Configuration commands -----
     if cmd == 'update_filters':

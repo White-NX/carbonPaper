@@ -6,6 +6,8 @@ class DummyOcrWorker:
         self.enable_vector_store = enabled
         self.should_raise = should_raise
         self.calls = []
+        self.index_health_calls = []
+        self.retry_calls = []
 
     def search_by_natural_language(self, query, n_results, offset, process_names, start_time, end_time):
         self.calls.append(
@@ -21,6 +23,23 @@ class DummyOcrWorker:
         if self.should_raise:
             raise RuntimeError("search failed")
         return [{"id": "doc-1", "metadata": {"process_name": "chrome.exe"}}]
+
+    def get_stats(self):
+        return {"processed_count": 1}
+
+    def get_index_health(self, refresh=False):
+        self.index_health_calls.append(refresh)
+        return {
+            "status": "success",
+            "worker_available": True,
+            "worker_started": bool(refresh),
+            "stats": {"vector_stats": {"count": 7}},
+            "postprocess": {"vector_retry_backlog_count": 2},
+        }
+
+    def retry_vector_indexing(self, limit=32):
+        self.retry_calls.append(limit)
+        return {"status": "success", "enqueued": min(limit, 2)}
 
 
 class DummyScheduler:
@@ -207,5 +226,58 @@ def test_status_uses_cached_clustering_auth_without_sync_gate(monkeypatch):
 
         assert result["clustering_auth_unlocked"] is True
         assert result["clustering_scheduler_active"] is True
+    finally:
+        _restore_globals(snapshot)
+
+
+def test_index_health_dispatches_to_worker_with_refresh_flag():
+    snapshot = _snapshot_globals()
+    worker = DummyOcrWorker(enabled=True)
+
+    try:
+        mm._auth_token = None
+        mm._last_seq_no = -1
+        mm._ocr_worker = worker
+
+        result = mm._handle_command_impl({"command": "index_health", "refresh": True})
+
+        assert result["status"] == "success"
+        assert result["worker_started"] is True
+        assert result["stats"]["vector_stats"]["count"] == 7
+        assert result["postprocess"]["vector_retry_backlog_count"] == 2
+        assert worker.index_health_calls == [True]
+    finally:
+        _restore_globals(snapshot)
+
+
+def test_index_health_reports_unavailable_without_worker():
+    snapshot = _snapshot_globals()
+    try:
+        mm._auth_token = None
+        mm._last_seq_no = -1
+        mm._ocr_worker = None
+
+        result = mm._handle_command_impl({"command": "index_health"})
+
+        assert result["status"] == "success"
+        assert result["worker_available"] is False
+        assert result["worker_started"] is False
+    finally:
+        _restore_globals(snapshot)
+
+
+def test_retry_vector_indexing_dispatches_to_worker():
+    snapshot = _snapshot_globals()
+    worker = DummyOcrWorker(enabled=True)
+
+    try:
+        mm._auth_token = None
+        mm._last_seq_no = -1
+        mm._ocr_worker = worker
+
+        result = mm._handle_command_impl({"command": "retry_vector_indexing", "limit": 5})
+
+        assert result == {"status": "success", "enqueued": 2}
+        assert worker.retry_calls == [5]
     finally:
         _restore_globals(snapshot)

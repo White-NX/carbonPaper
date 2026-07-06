@@ -1,24 +1,14 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
-import { listen } from '@tauri-apps/api/event';
 import { Dialog } from '../Dialog';
 import { ConfirmDialog } from '../ConfirmDialog';
 import MigrationProgressDialog from './MigrationProgressDialog';
-import { HardDrive, RefreshCw, Clock, Database, Activity, FolderOpen, AlertTriangle, PieChart, ArrowLeft, Trash2, ChevronLeft, ChevronRight, FileUp, FileDown } from 'lucide-react';
+import { HardDrive, RefreshCw, Clock, Database, Activity, FolderOpen, AlertTriangle, PieChart, ArrowLeft, Trash2, ChevronLeft, ChevronRight, FileUp, FileDown, RotateCcw, Loader2 } from 'lucide-react';
 import { formatBytes, formatTimestamp } from './analysisUtils';
 import { ThumbnailCard } from '../ThumbnailCard';
 import BackupMigrationDialog from '../BackupMigrationDialog';
-import {
-  fetchThumbnailBatch,
-  getProcessStorageStats,
-  getProcessMonthlyThumbnails,
-  getSoftDeleteQueueStatus,
-  softDeleteScreenshots,
-  softDeleteProcessMonth,
-} from '../../lib/monitor_api';
-import { withAuth } from '../../lib/auth_api';
+import { SettingsButton } from './SettingsControls';
+import { useStorageManagementController } from './useStorageManagementController';
 
 const PROCESS_PALETTE = ['#0ea5e9', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4', '#84cc16', '#8b5cf6', '#f97316'];
 
@@ -250,6 +240,111 @@ function StoragePathOption({
   );
 }
 
+function IndexHealthCard({
+  indexHealth,
+  indexHealthLoading,
+  indexHealthError,
+  vectorRetrying,
+  vectorRetryBacklog,
+  deleteQueuePending,
+  lastIndexingError,
+  lastIndexingErrorAt,
+  storageIpcLabel,
+  storageIpcRetryAfter,
+  monitorStatus,
+  onRefresh,
+  onRetryVectorIndexing,
+  formatIndexCount,
+}) {
+  const { t } = useTranslation();
+  const canUseMonitor = monitorStatus === 'running' || indexHealth?.monitor_available;
+
+  return (
+    <div className="bg-ide-panel/60 border border-ide-border rounded-2xl p-5">
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-2 min-w-0">
+          <div className="p-2 rounded-lg bg-ide-bg border border-ide-border">
+            <Database className="w-4 h-4" />
+          </div>
+          <div className="min-w-0">
+            <h3 className="font-semibold">{t('settings.features.management.indexHealth.label', '索引健康')}</h3>
+            <p className="text-[11px] text-ide-muted">
+              {t('settings.features.management.indexHealth.description', '截图、OCR、向量索引和后台重试队列的当前状态')}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={() => onRefresh({ refreshVector: canUseMonitor })}
+            disabled={indexHealthLoading}
+            className="p-1.5 text-ide-muted hover:text-ide-text hover:bg-ide-hover rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title={t('settings.features.management.indexHealth.refresh', '刷新')}
+          >
+            <RefreshCw className={`w-4 h-4 ${indexHealthLoading ? 'animate-spin' : ''}`} />
+          </button>
+          <SettingsButton
+            onClick={onRetryVectorIndexing}
+            disabled={vectorRetrying || !vectorRetryBacklog || !canUseMonitor}
+            title={t('settings.features.management.indexHealth.retry', '重试失败向量')}
+            icon={vectorRetrying ? <Loader2 className="w-3 h-3 animate-spin" /> : RotateCcw}
+          >
+            {t('settings.features.management.indexHealth.retry', '重试失败向量')}
+          </SettingsButton>
+        </div>
+      </div>
+
+      <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-3 text-xs">
+        <div>
+          <p className="text-ide-muted">{t('settings.features.management.indexHealth.screenshots', '截图')}</p>
+          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(indexHealth?.screenshots_count)}</p>
+        </div>
+        <div>
+          <p className="text-ide-muted">{t('settings.features.management.indexHealth.ocrRows', 'OCR 行')}</p>
+          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(indexHealth?.ocr_rows_count)}</p>
+        </div>
+        <div>
+          <p className="text-ide-muted">{t('settings.features.management.indexHealth.vectorRows', '向量')}</p>
+          <p className="mt-1 font-mono text-ide-text">
+            {formatIndexCount(indexHealth?.vector_rows_count, indexHealth?.worker_started === false ? t('settings.features.management.indexHealth.notLoaded', '未加载') : '—')}
+          </p>
+        </div>
+        <div>
+          <p className="text-ide-muted">{t('settings.features.management.indexHealth.vectorRetry', '向量重试')}</p>
+          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(vectorRetryBacklog)}</p>
+        </div>
+        <div>
+          <p className="text-ide-muted">{t('settings.features.management.indexHealth.deleteQueue', '删除队列')}</p>
+          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(deleteQueuePending)}</p>
+        </div>
+        <div>
+          <p className="text-ide-muted">{t('settings.features.management.indexHealth.smartPending', '智能聚类待处理')}</p>
+          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(indexHealth?.smart_cluster_pending_count)}</p>
+        </div>
+        <div>
+          <p className="text-ide-muted">{t('settings.features.management.indexHealth.storageIpc', '存储 IPC')}</p>
+          <p className="mt-1 font-mono text-ide-text">
+            {storageIpcLabel}
+            {storageIpcRetryAfter ? ` ${storageIpcRetryAfter}s` : ''}
+          </p>
+        </div>
+      </div>
+
+      {(indexHealthError || indexHealth?.monitor_error || lastIndexingError) && (
+        <div className="mt-4 flex items-start gap-2 px-2.5 py-2 bg-red-500/10 border border-red-500/30 rounded-lg">
+          <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
+          <div className="min-w-0 text-xs text-red-300">
+            <p className="break-all">{indexHealthError || indexHealth?.monitor_error || lastIndexingError}</p>
+            {lastIndexingErrorAt && (
+              <p className="mt-1 text-red-300/70">{lastIndexingErrorAt}</p>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function StorageManagementSection({
   storageSegments,
   totalStorage,
@@ -258,405 +353,69 @@ export default function StorageManagementSection({
   refreshing,
   error,
   onRefresh,
+  monitorStatus,
 }) {
-  // Storage settings from localStorage
-  const [storageLimit, setStorageLimit] = useState(() => {
-    return localStorage.getItem('snapshotStorageLimit') || 'unlimited';
-  });
-
-  const [retentionPeriod, setRetentionPeriod] = useState(() => {
-    return localStorage.getItem('snapshotRetentionPeriod') || 'permanent';
-  });
-
   const { t } = useTranslation();
-
-  // Migration state
-  const [isMigrating, setIsMigrating] = useState(false);
-  const [migrationProgress, setMigrationProgress] = useState({ total_files: 0, copied_files: 0, current_file: '' });
-  const [migrationError, setMigrationError] = useState('');
-  const [isUpdatingStoragePath, setIsUpdatingStoragePath] = useState(false);
-  const [isMigrationChoiceDialogOpen, setIsMigrationChoiceDialogOpen] = useState(false);
-  const [pendingTargetPath, setPendingTargetPath] = useState('');
-  const [panelView, setPanelView] = useState('overview');
-  const [processStats, setProcessStats] = useState([]);
-  const [processStatsLoading, setProcessStatsLoading] = useState(false);
-  const [processStatsError, setProcessStatsError] = useState('');
-  const [selectedProcess, setSelectedProcess] = useState('');
-  const [processPage, setProcessPage] = useState(0);
-  const [processMonthData, setProcessMonthData] = useState(null);
-  const [processMonthLoading, setProcessMonthLoading] = useState(false);
-  const [processMonthError, setProcessMonthError] = useState('');
-  const [processThumbMap, setProcessThumbMap] = useState({});
-  const [selectedScreenshotIds, setSelectedScreenshotIds] = useState(() => new Set());
-  const [deletingTarget, setDeletingTarget] = useState('');
-  const [pendingDeleteIntent, setPendingDeleteIntent] = useState(null);
-  const [isBackupDialogOpen, setIsBackupDialogOpen] = useState(false);
-  const [backupMode, setBackupMode] = useState('export'); // 'export' or 'import'
-  const [deleteQueueStatus, setDeleteQueueStatus] = useState({
-    pending_screenshots: 0,
-    pending_ocr: 0,
-    running: false,
-  });
-
-  // Save settings to localStorage
-  useEffect(() => {
-    localStorage.setItem('snapshotStorageLimit', storageLimit);
-    // try to persist to backend; if backend not available, fall back to localStorage
-    (async () => {
-      try {
-        await withAuth(() => invoke('storage_set_policy', { policy: { storage_limit: storageLimit, retention_period: retentionPeriod } }));
-      } catch (e) {
-        // backend may be unavailable in dev; ignore and rely on localStorage
-      }
-    })();
-  }, [storageLimit]);
-
-  useEffect(() => {
-    localStorage.setItem('snapshotRetentionPeriod', retentionPeriod);
-    // persist to backend as well
-    (async () => {
-      try {
-        await withAuth(() => invoke('storage_set_policy', { policy: { storage_limit: storageLimit, retention_period: retentionPeriod } }));
-      } catch (e) {
-        // ignore
-      }
-    })();
-  }, [retentionPeriod]);
-
-  // On mount try to read policy from backend and sync UI
-  useEffect(() => {
-    (async () => {
-      try {
-        const resp = await withAuth(() => invoke('storage_get_policy'));
-        if (resp && typeof resp === 'object') {
-          const backendPolicy = resp;
-          if (backendPolicy.storage_limit) setStorageLimit(String(backendPolicy.storage_limit));
-          if (backendPolicy.retention_period) setRetentionPeriod(String(backendPolicy.retention_period));
-        }
-      } catch (e) {
-        // backend not available — keep localStorage values
-      }
-    })();
-  }, []);
-
-  const loadDeleteQueueStatus = useCallback(async () => {
-    const status = await getSoftDeleteQueueStatus();
-    setDeleteQueueStatus(status || { pending_screenshots: 0, pending_ocr: 0, running: false });
-  }, []);
-
-  const loadProcessStats = useCallback(async () => {
-    setProcessStatsLoading(true);
-    setProcessStatsError('');
-    try {
-      const stats = await getProcessStorageStats();
-      setProcessStats(Array.isArray(stats) ? stats : []);
-    } catch (e) {
-      setProcessStats([]);
-      setProcessStatsError(String(e));
-    } finally {
-      setProcessStatsLoading(false);
-    }
-  }, []);
-
-  const loadProcessMonthPage = useCallback(async (processName, page = 0) => {
-    if (!processName) return;
-    setProcessMonthLoading(true);
-    setProcessMonthError('');
-    try {
-      const data = await getProcessMonthlyThumbnails(processName, page, 60);
-      setProcessMonthData(data);
-      setProcessPage(page);
-      setSelectedScreenshotIds(new Set());
-    } catch (e) {
-      setProcessMonthData(null);
-      setProcessMonthError(String(e));
-    } finally {
-      setProcessMonthLoading(false);
-    }
-  }, []);
-
-  const openProcessDetail = useCallback((processName) => {
-    setSelectedProcess(processName);
-    setPanelView('process-detail');
-    setProcessThumbMap({});
-    setSelectedScreenshotIds(new Set());
-    loadProcessMonthPage(processName, 0);
-  }, [loadProcessMonthPage]);
-
-  const toggleScreenshotSelection = useCallback((screenshotId) => {
-    if (typeof screenshotId !== 'number' || screenshotId <= 0) return;
-    setSelectedScreenshotIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(screenshotId)) {
-        next.delete(screenshotId);
-      } else {
-        next.add(screenshotId);
-      }
-      return next;
-    });
-  }, []);
-
-  const requestSoftDelete = useCallback((processName, month = null, screenshotIds = []) => {
-    if (!processName) return;
-    const selectedIds = [...new Set((screenshotIds || []).filter((id) => typeof id === 'number' && id > 0))];
-    const hasSelectedIds = selectedIds.length > 0;
-
-    setPendingDeleteIntent({
-      processName,
-      month,
-      screenshotIds: selectedIds,
-      hasSelectedIds,
-      targetKey: `${processName}::${month || 'all'}`,
-      title: t('settings.storageManagement.deleteConfirm.title'),
-      message: hasSelectedIds
-        ? t('settings.storageManagement.deleteConfirm.messageSelected', { count: selectedIds.length })
-        : month
-          ? t('settings.storageManagement.deleteConfirm.messageMonth', { processName, month })
-          : t('settings.storageManagement.deleteConfirm.messageProcess', { processName }),
-      confirmLabel: hasSelectedIds
-        ? t('settings.storageManagement.processDetails.deleteSelected', { count: selectedIds.length })
-        : month
-          ? t('settings.storageManagement.processDetails.deleteMonth')
-          : t('settings.storageManagement.processDetails.deleteProcess'),
-    });
-  }, [t]);
-
-  const executeSoftDelete = useCallback(async (intent) => {
-    if (!intent?.processName) return;
-    const {
-      processName,
-      month,
-      screenshotIds,
-      hasSelectedIds,
-      targetKey,
-    } = intent;
-
-    setDeletingTarget(targetKey);
-    try {
-      if (hasSelectedIds) {
-        await softDeleteScreenshots(screenshotIds);
-        setSelectedScreenshotIds((prev) => {
-          const next = new Set(prev);
-          screenshotIds.forEach((id) => next.delete(id));
-          return next;
-        });
-      } else {
-        await softDeleteProcessMonth(processName, month);
-      }
-      await loadDeleteQueueStatus();
-      await loadProcessStats();
-      if (selectedProcess && selectedProcess === processName) {
-        await loadProcessMonthPage(processName, processPage);
-      }
-      onRefresh?.();
-    } catch (e) {
-      setProcessMonthError(String(e));
-    } finally {
-      setDeletingTarget('');
-    }
-  }, [loadDeleteQueueStatus, loadProcessMonthPage, loadProcessStats, onRefresh, processPage, selectedProcess]);
-
-  const handleConfirmSoftDelete = useCallback(async () => {
-    if (!pendingDeleteIntent) return;
-    await executeSoftDelete(pendingDeleteIntent);
-    setPendingDeleteIntent(null);
-  }, [executeSoftDelete, pendingDeleteIntent]);
-
-  const handleCancelSoftDelete = useCallback(() => {
-    if (deletingTarget) return;
-    setPendingDeleteIntent(null);
-  }, [deletingTarget]);
-
-  useEffect(() => {
-    loadDeleteQueueStatus();
-    const timer = setInterval(loadDeleteQueueStatus, 5000);
-    return () => clearInterval(timer);
-  }, [loadDeleteQueueStatus]);
-
-  useEffect(() => {
-    if (panelView === 'overview') {
-      loadProcessStats();
-    }
-  }, [panelView, loadProcessStats]);
-
-  useEffect(() => {
-    const items = processMonthData?.items || [];
-    if (!items.length) {
-      setProcessThumbMap({});
-      return;
-    }
-
-    const ids = items.map((item) => item.screenshot_id).filter((id) => typeof id === 'number');
-    fetchThumbnailBatch(ids)
-      .then((batch) => setProcessThumbMap(batch || {}))
-      .catch(() => setProcessThumbMap({}));
-  }, [processMonthData]);
-
-  const groupedMonthItems = useMemo(() => {
-    const grouped = {};
-    for (const item of processMonthData?.items || []) {
-      const key = item.month || 'unknown';
-      if (!grouped[key]) grouped[key] = [];
-      grouped[key].push(item);
-    }
-    return Object.entries(grouped);
-  }, [processMonthData]);
-
-  const selectedCountByMonth = useMemo(() => {
-    const counts = {};
-    for (const item of processMonthData?.items || []) {
-      if (!selectedScreenshotIds.has(item.screenshot_id)) continue;
-      const month = item.month || 'unknown';
-      counts[month] = (counts[month] || 0) + 1;
-    }
-    return counts;
-  }, [processMonthData, selectedScreenshotIds]);
-
-  const handleRefresh = useCallback(() => {
-    onRefresh?.();
-    loadDeleteQueueStatus();
-    if (panelView === 'overview') {
-      loadProcessStats();
-    }
-    if (panelView === 'process-detail' && selectedProcess) {
-      loadProcessMonthPage(selectedProcess, processPage);
-    }
-  }, [loadDeleteQueueStatus, loadProcessMonthPage, loadProcessStats, onRefresh, panelView, processPage, selectedProcess]);
-
-  // Storage limit options
-  const storageLimitOptions = [
-    { value: '10', label: t('settings.storageManagement.storageLimit.options.10') },
-    { value: '20', label: t('settings.storageManagement.storageLimit.options.20') },
-    { value: '50', label: t('settings.storageManagement.storageLimit.options.50') },
-    { value: '120', label: t('settings.storageManagement.storageLimit.options.120') },
-    { value: 'unlimited', label: t('settings.storageManagement.storageLimit.options.unlimited') },
-  ];
-
-  // Retention period options
-  const retentionOptions = [
-    { value: '1month', label: t('settings.storageManagement.retention.options.1month') },
-    { value: '6months', label: t('settings.storageManagement.retention.options.6months') },
-    { value: '1year', label: t('settings.storageManagement.retention.options.1year') },
-    { value: '2years', label: t('settings.storageManagement.retention.options.2years') },
-    { value: 'permanent', label: t('settings.storageManagement.retention.options.permanent') },
-  ];
-
-  // Mock disk info - in real implementation this would come from backend
-  const diskInfo = useMemo(() => {
-    // Extract disk path from storage root path
-    const rootPath = storage?.root_path || '';
-    const driveLetter = rootPath.charAt(0);
-
-    // For demo purposes, estimate disk usage
-    // In production, this would come from a Rust backend call
-    return {
-      driveLetter: driveLetter || 'C',
-      totalSize: 500 * 1024 * 1024 * 1024, // 500GB placeholder
-      usedSize: 320 * 1024 * 1024 * 1024,   // 320GB placeholder
-    };
-  }, [storage]);
-
-  const currentStoragePath = storage?.root_path || 'LocalAppData/CarbonPaper';
-
-  const executeStoragePathChange = async (targetPath, shouldMigrateData) => {
-    let unlistenProgress = null;
-    let unlistenError = null;
-    let shouldRestartMonitor = true;
-
-    try {
-      if (!targetPath) return;
-
-      setMigrationError('');
-      setIsUpdatingStoragePath(true);
-      try {
-        const monitorStatusRaw = await invoke('get_monitor_status');
-        const monitorStatus = typeof monitorStatusRaw === 'string' ? JSON.parse(monitorStatusRaw) : monitorStatusRaw;
-        shouldRestartMonitor = !monitorStatus?.stopped;
-      } catch (_) {
-        shouldRestartMonitor = true;
-      }
-
-      if (shouldRestartMonitor) {
-        await withAuth(() => invoke('stop_monitor'), { autoPrompt: true });
-      }
-
-      if (shouldMigrateData) {
-        setIsMigrating(true);
-        setMigrationProgress({ total_files: 0, copied_files: 0, current_file: '' });
-
-        unlistenProgress = await listen('storage-migration-progress', (evt) => {
-          const p = evt.payload;
-          setMigrationProgress(p);
-        });
-
-        unlistenError = await listen('storage-migration-error', (evt) => {
-          setMigrationError(evt.payload?.message || t('settings.storageManagement.migration.error_default'));
-        });
-      }
-
-      await withAuth(() => invoke('storage_migrate_data_dir', {
-        target: targetPath,
-        migrateDataFiles: shouldMigrateData,
-      }), { autoPrompt: true });
-
-      if (shouldMigrateData) {
-        setMigrationProgress((s) => ({ ...s, current_file: t('settings.storageManagement.migration.completed') }));
-        await new Promise((resolve) => setTimeout(resolve, 600));
-      }
-
-      onRefresh?.();
-    } catch (e) {
-      console.error('change storage path failed', e);
-      setMigrationError(String(e));
-    } finally {
-      if (unlistenProgress) {
-        try { await unlistenProgress(); } catch (_) { }
-      }
-      if (unlistenError) {
-        try { await unlistenError(); } catch (_) { }
-      }
-
-      setIsMigrating(false);
-      setIsUpdatingStoragePath(false);
-      if (shouldRestartMonitor) {
-        try { await withAuth(() => invoke('start_monitor'), { autoPrompt: true }); } catch (_) { }
-      }
-    }
-  };
-
-  const handleChangeStoragePath = async () => {
-    try {
-      const selected = await open({ directory: true });
-      if (!selected) return;
-
-      const targetPath = Array.isArray(selected) ? selected[0] : selected;
-      if (!targetPath) return;
-
-      const normalizedCurrent = currentStoragePath.replace(/[\\/]+$/, '');
-      const normalizedTarget = targetPath.replace(/[\\/]+$/, '');
-      if (normalizedCurrent && normalizedCurrent === normalizedTarget) {
-        return;
-      }
-
-      setPendingTargetPath(targetPath);
-      setIsMigrationChoiceDialogOpen(true);
-    } catch (e) {
-      console.error('select storage path failed', e);
-      setMigrationError(String(e));
-    }
-  };
-
-  const handleCancelMigrationChoice = () => {
-    setIsMigrationChoiceDialogOpen(false);
-    setPendingTargetPath('');
-  };
-
-  const handleApplyStoragePath = async (shouldMigrateData) => {
-    const targetPath = pendingTargetPath;
-    setIsMigrationChoiceDialogOpen(false);
-    setPendingTargetPath('');
-    await executeStoragePathChange(targetPath, shouldMigrateData);
-  };
+  const {
+    storageLimit,
+    setStorageLimit,
+    retentionPeriod,
+    setRetentionPeriod,
+    isMigrating,
+    migrationProgress,
+    migrationError,
+    isUpdatingStoragePath,
+    isMigrationChoiceDialogOpen,
+    pendingTargetPath,
+    panelView,
+    setPanelView,
+    processStats,
+    processStatsLoading,
+    processStatsError,
+    selectedProcess,
+    processPage,
+    processMonthData,
+    processMonthLoading,
+    processMonthError,
+    processThumbMap,
+    selectedScreenshotIds,
+    deletingTarget,
+    pendingDeleteIntent,
+    isBackupDialogOpen,
+    setIsBackupDialogOpen,
+    backupMode,
+    setBackupMode,
+    deleteQueueStatus,
+    indexHealth,
+    indexHealthLoading,
+    indexHealthError,
+    vectorRetrying,
+    groupedMonthItems,
+    selectedCountByMonth,
+    storageLimitOptions,
+    retentionOptions,
+    diskInfo,
+    currentStoragePath,
+    vectorRetryBacklog,
+    indexHealthDeleteQueuePending,
+    lastIndexingError,
+    lastIndexingErrorAt,
+    storageIpcLabel,
+    storageIpcRetryAfter,
+    handleRefresh,
+    loadIndexHealth,
+    handleRetryVectorIndexing,
+    formatIndexCount,
+    openProcessDetail,
+    toggleScreenshotSelection,
+    requestSoftDelete,
+    handleConfirmSoftDelete,
+    handleCancelSoftDelete,
+    loadProcessMonthPage,
+    handleChangeStoragePath,
+    handleCancelMigrationChoice,
+    handleApplyStoragePath,
+  } = useStorageManagementController({ storage, onRefresh, t, monitorStatus });
 
   return (
     <div className="flex flex-col gap-6">
@@ -758,6 +517,23 @@ export default function StorageManagementSection({
               </div>
             </div>
           </div>
+
+          <IndexHealthCard
+            indexHealth={indexHealth}
+            indexHealthLoading={indexHealthLoading}
+            indexHealthError={indexHealthError}
+            vectorRetrying={vectorRetrying}
+            vectorRetryBacklog={vectorRetryBacklog}
+            deleteQueuePending={indexHealthDeleteQueuePending}
+            lastIndexingError={lastIndexingError}
+            lastIndexingErrorAt={lastIndexingErrorAt}
+            storageIpcLabel={storageIpcLabel}
+            storageIpcRetryAfter={storageIpcRetryAfter}
+            monitorStatus={monitorStatus}
+            onRefresh={loadIndexHealth}
+            onRetryVectorIndexing={handleRetryVectorIndexing}
+            formatIndexCount={formatIndexCount}
+          />
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <StoragePathOption

@@ -15,6 +15,7 @@ import queue
 import threading
 import time
 import traceback
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 from .worker_supervisor import WorkerSupervisor, attach_response_metadata
@@ -42,6 +43,16 @@ class OcrPostprocessQueue:
         self.dropped = 0
         self.processed = 0
         self.failed = 0
+        self.vector_failed = 0
+        self.vector_retry_enqueued = 0
+        self.last_indexing_error: Optional[str] = None
+        self.last_indexing_error_at: Optional[float] = None
+        self.max_vector_retry_backlog = max(
+            1,
+            int(os.environ.get("CARBONPAPER_VECTOR_RETRY_BACKLOG_MAX", "32") or "32"),
+        )
+        self._vector_retry_backlog = OrderedDict()
+        self._stats_lock = threading.Lock()
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -98,24 +109,43 @@ class OcrPostprocessQueue:
             finally:
                 self._queue.task_done()
 
-    def _handle_job(self, job: Dict[str, Any]):
+    def _record_vector_failure(self, job: Dict[str, Any], reason: str):
+        screenshot_id = job.get("screenshot_id")
+        key = str(screenshot_id or job.get("image_hash") or time.time())
+        retry_job = dict(job)
+        retry_job["_vector_retry_only"] = True
+        with self._stats_lock:
+            self.vector_failed += 1
+            self.last_indexing_error = reason
+            self.last_indexing_error_at = time.time()
+            if key in self._vector_retry_backlog:
+                self._vector_retry_backlog.move_to_end(key)
+            self._vector_retry_backlog[key] = retry_job
+            while len(self._vector_retry_backlog) > self.max_vector_retry_backlog:
+                self._vector_retry_backlog.popitem(last=False)
+
+    def _clear_vector_failure(self, job: Dict[str, Any]):
+        screenshot_id = job.get("screenshot_id")
+        key = str(screenshot_id or job.get("image_hash") or "")
+        if not key:
+            return
+        with self._stats_lock:
+            self._vector_retry_backlog.pop(key, None)
+
+    def _handle_vector_indexing(self, job: Dict[str, Any]) -> bool:
         from PIL import Image
-        from storage_client import get_storage_client
-        from . import config
 
         screenshot_id = job.get("screenshot_id")
         image_hash = job.get("image_hash", "")
         ocr_text = job.get("ocr_text", "")
         image_bytes = job.get("image_bytes") or b""
-        started = time.perf_counter()
 
-        image_pil = None
         if self.ocr_worker.enable_vector_store and self.ocr_worker.vector_store and ocr_text.strip():
             try:
                 image_pil = Image.open(io.BytesIO(image_bytes))
                 image_pil.load()
                 t_vector = time.perf_counter()
-                self.ocr_worker.vector_store.add_image(
+                result = self.ocr_worker.vector_store.add_image(
                     image_path=f"memory://{image_hash}",
                     image=image_pil,
                     metadata={
@@ -125,13 +155,46 @@ class OcrPostprocessQueue:
                     },
                     ocr_text=ocr_text,
                 )
+                if not isinstance(result, dict) or result.get("status") != "success":
+                    reason = result.get("error") if isinstance(result, dict) else str(result)
+                    self._record_vector_failure(job, reason or "Vector index write failed")
+                    logger.warning(
+                        "[DIAG:ocr_postprocess] vector add failed screenshot_id=%s reason=%s",
+                        screenshot_id,
+                        reason,
+                    )
+                    return False
+                self._clear_vector_failure(job)
                 logger.debug(
                     "[DIAG:ocr_postprocess] vector add done screenshot_id=%s elapsed=%.3fs",
                     screenshot_id,
                     time.perf_counter() - t_vector,
                 )
+                return True
             except Exception as exc:
+                self._record_vector_failure(job, str(exc))
                 logger.warning("Vector store add failed: %s", exc)
+                return False
+        return True
+
+    def _handle_job(self, job: Dict[str, Any]):
+        from storage_client import get_storage_client
+        from . import config
+
+        screenshot_id = job.get("screenshot_id")
+        ocr_text = job.get("ocr_text", "")
+        started = time.perf_counter()
+
+        self._handle_vector_indexing(job)
+
+        if job.get("_vector_retry_only"):
+            logger.info(
+                "[DIAG:ocr_postprocess] vector retry done screenshot_id=%s total=%.3fs queue_size=%s",
+                screenshot_id,
+                time.perf_counter() - started,
+                self._queue.qsize(),
+            )
+            return
 
         if self.classifier and config.CLASSIFICATION_ENABLED:
             try:
@@ -172,6 +235,49 @@ class OcrPostprocessQueue:
             time.perf_counter() - started,
             self._queue.qsize(),
         )
+
+    def retry_failed_vector_indexing(self, limit: int = 32) -> Dict[str, Any]:
+        limit = max(1, min(int(limit or 32), self.max_vector_retry_backlog))
+        enqueued = 0
+        with self._stats_lock:
+            retry_items = list(self._vector_retry_backlog.items())[:limit]
+        for _key, job in retry_items:
+            try:
+                self._queue.put_nowait(dict(job))
+                enqueued += 1
+            except queue.Full:
+                break
+        with self._stats_lock:
+            self.vector_retry_enqueued += enqueued
+        return {
+            "status": "success",
+            "requested": len(retry_items),
+            "enqueued": enqueued,
+            "queue_full": enqueued < len(retry_items),
+            "backlog_count": self.vector_retry_backlog_count(),
+        }
+
+    def vector_retry_backlog_count(self) -> int:
+        with self._stats_lock:
+            return len(self._vector_retry_backlog)
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        with self._stats_lock:
+            last_error = self.last_indexing_error
+            last_error_at = self.last_indexing_error_at
+            backlog_count = len(self._vector_retry_backlog)
+        return {
+            "queue_size": self._queue.qsize(),
+            "queue_max_size": self._queue.maxsize,
+            "dropped": self.dropped,
+            "processed": self.processed,
+            "failed": self.failed,
+            "vector_failed": self.vector_failed,
+            "vector_retry_enqueued": self.vector_retry_enqueued,
+            "vector_retry_backlog_count": backlog_count,
+            "last_indexing_error": last_error,
+            "last_indexing_error_at": last_error_at,
+        }
 
 
 def _json_safe(obj):
@@ -342,6 +448,24 @@ def _worker_main(conn, storage_pipe: Optional[str], data_dir: str, env: Dict[str
                 send_response(result)
             elif command == "get_stats":
                 send_response({"status": "success", "stats": ocr_worker.get_stats()})
+            elif command == "get_index_health":
+                storage_ipc = None
+                try:
+                    from storage_client import get_storage_client
+                    sc = get_storage_client()
+                    if sc and hasattr(sc, "ipc_health_snapshot"):
+                        storage_ipc = sc.ipc_health_snapshot()
+                except Exception as exc:
+                    storage_ipc = {"error": str(exc)}
+                send_response({
+                    "status": "success",
+                    "stats": ocr_worker.get_stats(),
+                    "postprocess": postprocess_queue.status_snapshot(),
+                    "worker_storage_ipc": storage_ipc,
+                })
+            elif command == "retry_vector_indexing":
+                limit = int(msg.get("limit", 32) or 32)
+                send_response(postprocess_queue.retry_failed_vector_indexing(limit=limit))
             elif command == "search_by_natural_language":
                 args = msg.get("args", {})
                 send_response({
@@ -446,6 +570,30 @@ class RestartableModelWorker(WorkerSupervisor):
         stats = dict(self._stats)
         stats["watchdog"] = self.status_snapshot()
         return stats
+
+    def get_index_health(self, refresh: bool = False):
+        snapshot = self.status_snapshot()
+        if not refresh and not snapshot.get("alive"):
+            return {
+                "status": "success",
+                "worker_available": True,
+                "worker_started": False,
+                "stats": self.get_stats(),
+                "postprocess": None,
+            }
+
+        result = self.request("get_index_health", timeout=30)
+        if result.get("status") == "success":
+            result["worker_available"] = True
+            result["worker_started"] = True
+            return result
+        raise RuntimeError(result.get("error", "Model worker index health failed"))
+
+    def retry_vector_indexing(self, limit: int = 32):
+        result = self.request("retry_vector_indexing", {"limit": int(limit or 32)}, timeout=30)
+        if result.get("status") == "success":
+            return result
+        raise RuntimeError(result.get("error", "Model worker vector retry failed"))
 
     def pause(self):
         logger.info("Model worker proxy paused")

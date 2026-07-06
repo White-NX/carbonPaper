@@ -13,18 +13,28 @@ describe('categories constants', () => {
     expect(CATEGORY_LIST).toContain('未分类');
   });
 
-  it('provides colors for primary categories', () => {
-    expect(CATEGORY_COLORS['编程开发']).toBe('#3b82f6');
-    expect(CATEGORY_COLORS['办公文档']).toBe('#f59e0b');
-    expect(CATEGORY_COLORS['阅读资讯']).toBe('#f97316');
+  it('keeps display colors aligned with selectable categories', () => {
+    const categoriesWithDedicatedColors = CATEGORY_LIST.filter((category) => category !== '未分类');
+
+    expect(Object.keys(CATEGORY_COLORS).sort()).toEqual([...categoriesWithDedicatedColors].sort());
+    expect(CATEGORY_COLORS['未分类']).toBeUndefined();
+
+    for (const color of Object.values(CATEGORY_COLORS)) {
+      expect(color).toMatch(/^#[0-9a-f]{6}$/i);
+    }
   });
 
-  it('marks entertainment and social groups', () => {
-    expect(ENTERTAINMENT_CATEGORIES.has('影音娱乐')).toBe(true);
-    expect(ENTERTAINMENT_CATEGORIES.has('游戏')).toBe(true);
-    expect(ENTERTAINMENT_CATEGORIES.has('编程开发')).toBe(false);
+  it('keeps task filter groups known and non-overlapping', () => {
+    const knownCategories = new Set(CATEGORY_LIST);
 
-    expect(SOCIAL_CATEGORIES.has('社交通讯')).toBe(true);
-    expect(SOCIAL_CATEGORIES.has('办公文档')).toBe(false);
+    for (const category of ENTERTAINMENT_CATEGORIES) {
+      expect(knownCategories.has(category)).toBe(true);
+      expect(SOCIAL_CATEGORIES.has(category)).toBe(false);
+    }
+
+    for (const category of SOCIAL_CATEGORIES) {
+      expect(knownCategories.has(category)).toBe(true);
+      expect(ENTERTAINMENT_CATEGORIES.has(category)).toBe(false);
+    }
   });
 });

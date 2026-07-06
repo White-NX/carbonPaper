@@ -986,6 +986,8 @@ pub fn run() {
             commands::storage::storage_soft_delete,
             commands::storage::storage_soft_delete_screenshots,
             commands::storage::storage_get_delete_queue_status,
+            commands::storage::storage_get_index_health,
+            commands::storage::storage_retry_vector_indexing,
             commands::storage::storage_save_screenshot,
             commands::storage::storage_set_policy,
             commands::storage::storage_get_policy,

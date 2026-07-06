@@ -23,6 +23,28 @@
         "permanent": "DirectML 已关闭（频繁切换，将在重启后恢复）",
         "fullscreen_paused": "已激活：检测到全屏非浏览器程序，截图已暂停"
       },
+      "resourcePolicy": {
+        "label": "资源占用策略",
+        "description": "选择 CarbonPaper 在电量和前台性能之间的取舍方式。",
+        "options": {
+          "complete": {
+            "label": "完整记录",
+            "description": "尽量保持截图和分析持续运行，适合优先保证历史完整性，但可能影响游戏性能和电池续航。"
+          },
+          "balanced": {
+            "label": "均衡",
+            "description": "使用电池供电时暂停较重的后台服务，接入电源后自动恢复。"
+          },
+          "performance": {
+            "label": "性能保护",
+            "description": "默认选项。推荐。保护电池续航，并在游戏或全屏应用运行时降低负载。"
+          },
+          "custom": {
+            "label": "自定义",
+            "description": "分别调整电池节能和游戏性能保护。"
+          }
+        }
+      },
       "lightweightMode": {
         "startHidden": {
           "label": "启动时隐藏窗口（轻量模式启动）",
@@ -38,6 +60,41 @@
           "label": "立即切换到轻量模式",
           "description": "关闭界面并释放内存，可通过托盘菜单重新打开",
           "button": "切换"
+        }
+      },
+      "windowBehavior": {
+        "label": "窗口与后台运行",
+        "description": "控制 CarbonPaper 启动时是否显示窗口，以及关闭窗口后是否在后台运行。",
+        "startup": {
+          "label": "启动方式",
+          "showWindow": {
+            "label": "显示窗口",
+            "description": "CarbonPaper 启动时打开主窗口。"
+          },
+          "background": {
+            "label": "后台启动",
+            "description": "启动后直接隐藏到托盘，在后台运行。"
+          }
+        },
+        "closeWindow": {
+          "label": "关闭窗口时",
+          "current": {
+            "label": "仅隐藏窗口",
+            "description": "将界面隐藏到托盘，后台服务保持当前状态。"
+          },
+          "background": {
+            "label": "在后台运行",
+            "description": "界面会立即隐藏到托盘，并在延迟结束后转为后台运行。"
+          }
+        },
+        "delay": {
+          "label": "转为后台运行前延迟：",
+          "unit": "分钟"
+        },
+        "switchNow": {
+          "label": "立即在后台运行",
+          "description": "马上隐藏主窗口，并转为后台运行。",
+          "button": "在后台运行"
         }
       },
       "cardClickBehavior": {
@@ -135,6 +192,12 @@
       "loading": "加载中...",
       "warning": "这些设置可能会影响监控服务的性能和稳定性，甚至影响操作系统整体性能。请谨慎调整。",
       "quick_restart": "快速重启",
+      "terms": {
+        "directml": "DirectML 是微软的 GPU 推理接口。它可以在兼容显卡上加速 OCR，但可能与游戏或图形密集应用争用 GPU。",
+        "onnx": "ONNX 是一种通用模型格式和运行时。相比 PyTorch，它通常占用更少内存，启动也更快。",
+        "pacmap_hdbscan": "PaCMAP 会把高维文本向量压缩成更容易聚类的形状；HDBSCAN 再按密度自动分组，不需要预先指定分组数量。",
+        "minilm": "MiniLM-L12 是用于把 OCR 文本编码成向量的轻量语言模型，供任务聚类使用。"
+      },
       "cpu": {
         "title": "Python 子进程 CPU 限制",
         "label": "限制 CPU 占用率",
@@ -419,6 +482,16 @@
         "endpoint": "端点",
         "auth_header": "认证头"
       },
+      "agent_setup": {
+        "title": "Agent 配置",
+        "description": "复制一段配置提示词，让 Agent 自行获取 Skill 并连接本地 MCP 服务。",
+        "skill": "Skill",
+        "source": "来源",
+        "endpoint": "端点",
+        "copy": "复制配置提示词",
+        "copied": "配置提示词已复制",
+        "prompt": "请配置 CarbonPaper MCP 访问。\n\n1. 从 GitHub 仓库 {{repo}} 的 {{skillName}} 目录获取 Skill，并安装到你的 Agent/Skill 环境中。\n2. 使用该 Skill 处理 CarbonPaper 截图历史、OCR、任务聚类和智能聚类摘要相关请求。\n3. MCP endpoint：{{endpoint}}，使用 Streamable HTTP/HTTP POST。\n4. 认证头：Authorization: Bearer <CarbonPaper token>。不要让我把 token 写进长提示词；请让我在 CarbonPaper 中单独点击“复制令牌”，然后将其配置到你的 MCP 客户端。\n5. 如果工具返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 应用中完成 Windows Hello 解锁。\n6. 该 MCP 可能暴露本机截图历史、OCR 文本、窗口标题、URL、任务聚类和智能聚类数据；只在我明确要求时读取相关内容。"
+      },
       "content_filter": {
         "title": "内容过滤",
         "description": "基于合规规则过滤 MCP 服务返回结果中的标记内容。",
@@ -509,6 +582,35 @@
       "title": "功能",
       "management": {
         "title": "功能管理",
+        "featureMode": {
+          "label": "功能等级",
+          "description": "选择截图语义功能的启用深度。等级越高，自动整理能力越强，后台资源占用也可能更高。",
+          "customControls": {
+            "label": "单独调整"
+          },
+          "options": {
+            "minimal": {
+              "label": "最小功能",
+              "description": "保留基础截图与 OCR 搜索，不启用语义分类和聚类。"
+            },
+            "basic": {
+              "label": "基础功能",
+              "description": "启用内容分类，帮助筛选、统计和后续整理。"
+            },
+            "organized": {
+              "label": "整理功能",
+              "description": "启用内容分类和任务聚类，自动整理长期活动。"
+            },
+            "smart": {
+              "label": "智能功能",
+              "description": "启用全部语义功能，支持按描述自动归档快照。"
+            },
+            "custom": {
+              "label": "自定义",
+              "description": "当前功能组合来自单独设置或旧版本配置。"
+            }
+          }
+        },
         "clustering": {
           "label": "任务聚类",
           "description": "使用 MiniLM 模型将相似活动分组为长期任务",

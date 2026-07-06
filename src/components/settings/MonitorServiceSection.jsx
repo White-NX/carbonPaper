@@ -1,6 +1,8 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Play, Pause, Square as StopSquare, Loader2, RotateCw, HelpCircle, Squirrel, Circle } from 'lucide-react';
+import { Play, Pause, Square as StopSquare, Loader2, RotateCw, Squirrel, Circle } from 'lucide-react';
+import SettingsHelpTooltip from './SettingsHelpTooltip';
+import { SettingsSwitch } from './SettingsControls';
 
 export default function MonitorServiceSection({
   monitorStatus,
@@ -23,12 +25,7 @@ export default function MonitorServiceSection({
       <div className="flex items-center gap-1.5 px-1">
         <Squirrel className="w-4 h-4 text-ide-accent" />
         <label className="text-sm font-semibold text-ide-accent block">{t('settings.general.monitor.title')}</label>
-        <div className="relative group">
-          <HelpCircle className="w-3.5 h-3.5 text-ide-muted cursor-help" />
-          <div className="absolute left-1/2 -translate-x-1/2 top-full mt-2 w-60 px-3 py-2 bg-ide-panel border border-ide-border rounded-lg shadow-lg text-xs text-ide-muted opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity z-50">
-            {t('settings.general.monitor.tooltip')}
-          </div>
-        </div>
+        <SettingsHelpTooltip>{t('settings.general.monitor.tooltip')}</SettingsHelpTooltip>
       </div>
       <div className="p-4 bg-ide-bg border border-ide-border rounded-xl text-sm text-ide-muted space-y-3">
         <div className="flex items-center justify-between gap-4">
@@ -114,19 +111,11 @@ export default function MonitorServiceSection({
               <label className="block mb-1 font-semibold text-ide-text">{t('settings.general.monitor.autoStart.label')}</label>
               <p className="text-xs text-ide-muted">{t('settings.general.monitor.autoStart.description')}</p>
             </div>
-            <button
-              onClick={() => onAutoStartMonitorChange?.(!autoStartMonitor)}
-              className={`relative w-10 h-5 rounded-full transition-colors shrink-0 ${
-                autoStartMonitor ? 'bg-ide-accent' : 'bg-ide-border'
-              }`}
+            <SettingsSwitch
+              checked={autoStartMonitor}
+              onChange={(next) => onAutoStartMonitorChange?.(next)}
               title={t('settings.general.monitor.autoStart.tooltip')}
-            >
-              <div
-                className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                  autoStartMonitor ? 'translate-x-5' : 'translate-x-0.5'
-                }`}
-              />
-            </button>
+            />
           </div>
 
         <div className="flex items-center justify-between gap-4">
