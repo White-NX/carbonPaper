@@ -132,6 +132,15 @@
           "disabledMessage": "未开启：不会随系统启动",
           "enable": "开启开机自启",
           "disable": "关闭开机自启"
+        },
+        "errors": {
+          "startFailedTitle": "Python 子服务启动失败",
+          "unavailableTitle": "Python 子服务不可用",
+          "exitedTitle": "Python 子服务异常退出",
+          "startFailedFallback": "启动后端服务失败",
+          "offlineFallback": "后端服务离线",
+          "manualRestartRecovery": "；恢复策略：手动重启，旧 IPC 状态已清理",
+          "exitedMessage": "子服务已退出（code: {{code}}{{error}}）{{recovery}}"
         }
       }
     },
@@ -212,6 +221,9 @@
         "queue_limit_label": "限制 OCR 任务队列大小",
         "queue_limit_desc": "超过此大小时，暂停所有截图直到队列消化",
         "max_queue_label": "最大队列大小",
+        "timeout_label": "OCR 超时时间",
+        "timeout_desc": "设定 OCR 任务的超时时间。冷启动固定允许 180 秒。",
+        "seconds": "秒",
         "info": "OCR 队列设置会即时生效，无需重启监控服务"
       },
       "dml": {
@@ -249,6 +261,17 @@
         "description": "启用后将使用 ONNX 模型代替 PyTorch 模型。大幅减少内存占用（~250-400MB）并加快启动与推理速度。",
         "notice": "提示：开启此选项后，关闭设置页时将自动下载所需 ONNX 模型文件。",
         "changed_notice": "ONNX 推理设置将在下次启动监控服务时生效"
+      },
+      "vacuum": {
+        "title": "数据库维护",
+        "label": "手动执行数据库优化",
+        "description": "执行 VACUUM 可回收数据库空间并整理存储结构，过程可能持续数秒到数分钟。",
+        "running": "优化中...",
+        "action": "立即优化",
+        "already_running": "已有数据库优化任务正在执行，请稍候。",
+        "success": "数据库优化已完成。",
+        "error": "数据库优化失败",
+        "error_with_detail": "数据库优化失败：{{error}}"
       }
     },
     "storageManagement": {
@@ -316,6 +339,11 @@
         "indexing_detailed": "正在构建安全索引: {{processed}} / {{total}}",
         "search_unavailable_title": "搜索功能受限",
         "search_unavailable_desc": "数据库正在进行安全升级，搜索索引正在重建中。在此期间，搜索结果可能不完整或暂时不可用。升级完成后将自动恢复。"
+      },
+      "vacuum": {
+        "dialog_title": "数据库优化中",
+        "running": "正在执行 VACUUM 数据库优化，请稍候...",
+        "tip": "优化期间将暂时锁定数据库，窗口不可关闭。完成后会自动恢复。"
       },
       "deleteConfirm": {
         "title": "确认删除",
@@ -391,7 +419,8 @@
       }
     },
     "delete": {
-      "failure": ""
+      "failure": "",
+      "success": "已删除 {{count}} 条记录"
     },
     "save_filters": {
       "synced": "",
@@ -580,6 +609,7 @@
     },
     "features": {
       "title": "功能",
+      "loading": "加载中...",
       "management": {
         "title": "功能管理",
         "featureMode": {
@@ -639,6 +669,23 @@
           "retry": "重试下载",
           "openManagement": "打开智能聚类管理",
           "clusteringDisabledWarning": "任务聚类已关闭。智能聚类仍可在重扫时运行，但由于缺少截图采集阶段的自动文本向量化，候选召回需要临时编码，可能导致处理速度显著下降并增加资源占用。"
+        },
+        "indexHealth": {
+          "label": "索引健康",
+          "description": "截图、OCR、向量索引和后台重试队列的当前状态",
+          "refresh": "刷新",
+          "retry": "重试失败向量",
+          "screenshots": "截图",
+          "ocrRows": "OCR 行",
+          "vectorRows": "向量",
+          "notLoaded": "未加载",
+          "vectorRetry": "向量重试",
+          "deleteQueue": "删除队列",
+          "smartPending": "智能聚类待处理",
+          "storageIpc": "存储 IPC",
+          "ipcOpen": "熔断",
+          "ipcHalfOpen": "探测",
+          "ipcClosed": "正常"
         },
         "disabled_notice": "此功能已禁用"
       },
@@ -795,7 +842,9 @@
       "smartClusterRunningDesc": "当前进度 {{progress}}%，待处理快照 {{pending}} 条。",
       "modelDownloadSummaryPlaceholder": "模型文件下载中 ({{progress}}%)",
       "modelDownloadRunningTitle": "后台模型下载中",
-      "modelDownloadRunningDesc": "正在下载所需的模型文件，当前进度 {{progress}}%。"
+      "modelDownloadRunningDesc": "正在下载所需的模型文件，当前进度 {{progress}}%。",
+      "stopTooltip": "停止处理智能聚类",
+      "stop": "停止"
     }
   },
   "sidebar": {
@@ -875,6 +924,58 @@
     "apply": "开始整理",
     "skip": "跳过"
   },
+  "clusterCard": {
+    "statusActive": "活跃",
+    "statusScoring": "评分中",
+    "statusPaused": "已暂停",
+    "statusIdle": "空闲",
+    "actionResume": "继续",
+    "actionPause": "暂停",
+    "actionRename": "重命名",
+    "actionDelete": "删除"
+  },
+  "nlCluster": {
+    "errorMinPositives": "需要至少 {{count}} 个正例才能保存",
+    "errorCalculateThreshold": "无法从正例分数计算阈值，请重新检索后再标记",
+    "createSmartCluster": "创建智能聚类",
+    "experimentalTitle": "自然语言聚类（demo）",
+    "badgeCalibration": "calibration",
+    "badgeExperimental": "experimental",
+    "cancelTooltip": "取消并返回",
+    "cancel": "取消",
+    "calibratePlaceholder": "描述你想自动归档的内容，例如“对加利福尼亚地区山脉的研究”",
+    "explorePlaceholder": "试试“关于神经网络训练的代码与文档”",
+    "resultsLimitTooltip": "返回结果数量",
+    "topLimit": "top {{count}}",
+    "previewCandidates": "预览候选",
+    "search": "检索",
+    "enableReranker": "启用 reranker",
+    "onnxVariantTooltip": "ONNX 变体（切换会触发模型重新加载）",
+    "currentlyLoaded": "当前已加载: ",
+    "modelNotFoundMsg": "未检测到 bge-reranker-v2-m3 模型（{{path}}）",
+    "samplePrefix": "示例：",
+    "markedPositives": "已标记正例: ",
+    "markedNegatives": "已标记反例: ",
+    "clearMarksTooltip": "清除所有标记",
+    "clearMarks": "清除标记",
+    "predictedThreshold": "预计逆值: ",
+    "calibrationTip1": "提示：点击卡片可跳转到预览查看内容；返回此页时标记不会丢失。",
+    "calibrationTip2": " 至少需要 {{count}} 个正例才能保存。",
+    "loadingReranking": "编码 -> 召回 -> 加载 reranker -> 重排...",
+    "loadingSearching": "正在编码查询并匹配快照...",
+    "noResults": "没有匹配的快照",
+    "calibrateInstruction": "输入描述并点击“预览候选”，系统会列出最相关的快照供你标记",
+    "exploreInstruction": "输入一个自然语言描述，系统会从 hot 层向量索引中召回最相似的快照",
+    "demoWarning": "本演示直接复用任务聚类的 MiniLM 向量库（仅限近 30 天 hot 层数据）",
+    "queryPrefix": "查询：",
+    "resultsCount": "{{count}} 个结果",
+    "scoreDetail": "rerank {{score}} · 相似度 {{sim}}",
+    "similarityValue": "相似度 {{sim}}",
+    "markPosTooltip": "标记为正例",
+    "markNegTooltip": "标记为反例",
+    "saveButton": "保存为智能聚类",
+    "needMorePositives": "还需 {{count}} 个正例"
+  },
   "smartClusterSetup": {
     "title": "智能聚类",
     "subtitle": "按自然语言描述自动归档快照",
@@ -916,6 +1017,13 @@
     "threshold": "阈值:",
     "archived": "已归档:",
     "snapshotsCount": "张快照",
+    "aiSummary": "AI 汇总",
+    "summarySources": "{{count}} 张来源快照",
+    "summaryUpdatedAt": "汇总于 {{time}}",
+    "ocrSummary": "OCR 统合概述",
+    "keyPoints": "要点",
+    "evidence": "证据",
+    "evidenceSnapshot": "来源快照",
     "noAssignments": "暂无已分配的快照",
     "idleProcessingHint": "后台工作线程会在系统空闲时陆续处理待评分队列",
     "selectClusterToView": "选择左侧聚类查看已归档的快照"
@@ -1021,7 +1129,9 @@
       "auto_install": {
         "log_start": "正在自动安装 Python...",
         "success": "安装成功。",
-        "finished": "自动安装流程已结束。"
+        "finished": "自动安装流程已结束。",
+        "installing": "安装中...",
+        "button": "自动安装 Python"
       },
       "discovered_label": "自动发现的 Python 版本（你可以在此选择一个）",
       "unsupported": "不受支持",
@@ -1072,7 +1182,8 @@
       "downloading_clip": "正在下载 Chinese-CLIP 模型...",
       "downloading_bge": "正在下载分类模型 (BGE-small-zh-v1.5)...",
       "downloading_minilm": "正在下载聚类模型 (MiniLM-L12-v2)...",
-      "complete": "模型下载完成。"
+      "complete": "模型下载完成。",
+      "run_in_background": "后台运行"
     }
   },
   "tasks": {

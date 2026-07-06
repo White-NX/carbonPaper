@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import Timeline from './components/Timeline';
 import SettingsDialog from './components/settings/SettingsDialog';
 import Mask from './components/Mask';
@@ -28,6 +29,8 @@ import { useStartupWizards } from './hooks/useStartupWizards';
 import { useUpdateManager } from './hooks/useUpdateManager';
 
 function App() {
+  const { t } = useTranslation();
+
   useEffect(() => {
     const handleContextMenu = (e) => {
       if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
@@ -107,6 +110,7 @@ function App() {
     formatErrorDetails,
     reportBackendError,
     resetBackendErrorDedupe,
+    t,
   });
   const {
     showExtensionSetup,

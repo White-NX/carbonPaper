@@ -132,6 +132,15 @@
           "disabledMessage": "Disabled: Will not start with system",
           "enable": "Enable Auto Launch",
           "disable": "Disable Auto Launch"
+        },
+        "errors": {
+          "startFailedTitle": "Python subservice failed to start",
+          "unavailableTitle": "Python subservice unavailable",
+          "exitedTitle": "Python subservice exited unexpectedly",
+          "startFailedFallback": "Failed to start backend",
+          "offlineFallback": "Backend offline",
+          "manualRestartRecovery": "; recovery policy: manual restart, stale IPC state cleaned",
+          "exitedMessage": "Subservice exited (code: {{code}}{{error}}){{recovery}}"
         }
       }
     },
@@ -212,6 +221,9 @@
         "queue_limit_label": "Limit OCR task queue size",
         "queue_limit_desc": "Pause captures until queue is drained when above this size",
         "max_queue_label": "Max queue size",
+        "timeout_label": "OCR timeout",
+        "timeout_desc": "Set the timeout for OCR tasks. Cold starts always allow 180 seconds.",
+        "seconds": "seconds",
         "info": "OCR queue settings take effect immediately without restarting the monitor service"
       },
       "dml": {
@@ -249,6 +261,17 @@
         "description": "When enabled, uses ONNX models instead of PyTorch models. This significantly reduces memory usage (~250-400MB) and speeds up startup and inference.",
         "notice": "Note: Enabling this option will automatically download the required ONNX model files when the settings dialog is closed.",
         "changed_notice": "ONNX settings will take effect when the monitor service restarts"
+      },
+      "vacuum": {
+        "title": "Database maintenance",
+        "label": "Run database optimization manually",
+        "description": "VACUUM can reclaim database space and reorganize storage. It may take a few seconds to several minutes.",
+        "running": "Optimizing...",
+        "action": "Optimize now",
+        "already_running": "A database optimization task is already running. Please wait.",
+        "success": "Database optimization completed.",
+        "error": "Database optimization failed",
+        "error_with_detail": "Database optimization failed: {{error}}"
       }
     },
     "storageManagement": {
@@ -316,6 +339,11 @@
         "indexing_detailed": "Upgrading secure index: {{processed}} / {{total}}",
         "search_unavailable_title": "Search Limited",
         "search_unavailable_desc": "The database is undergoing a security upgrade and the search index is being rebuilt. During this time, search results may be incomplete or temporarily unavailable. Normal service will resume automatically once the upgrade completes."
+      },
+      "vacuum": {
+        "dialog_title": "Optimizing database",
+        "running": "Running VACUUM database optimization. Please wait...",
+        "tip": "The database is temporarily locked during optimization. This window cannot be closed and will resume automatically when complete."
       },
       "deleteConfirm": {
         "title": "Confirm deletion",
@@ -391,7 +419,8 @@
       }
     },
     "delete": {
-      "failure": ""
+      "failure": "",
+      "success": "Deleted {{count}} records"
     },
     "save_filters": {
       "synced": "",
@@ -580,6 +609,7 @@
     },
     "features": {
       "title": "Features",
+      "loading": "Loading...",
       "management": {
         "title": "Feature Management",
         "featureMode": {
@@ -639,6 +669,23 @@
           "retry": "Retry Download",
           "openManagement": "Open Smart Cluster Management",
           "clusteringDisabledWarning": "Task Clustering is disabled. Smart Clusters can still run during rescans, but without automatic text vectorization at screenshot capture time, candidate retrieval must encode text on demand, which may significantly reduce processing performance and increase resource usage."
+        },
+        "indexHealth": {
+          "label": "Index Health",
+          "description": "Current status of screenshots, OCR, vector indexes, and background retry queues",
+          "refresh": "Refresh",
+          "retry": "Retry failed vectors",
+          "screenshots": "Screenshots",
+          "ocrRows": "OCR rows",
+          "vectorRows": "Vectors",
+          "notLoaded": "Not loaded",
+          "vectorRetry": "Vector retry",
+          "deleteQueue": "Delete queue",
+          "smartPending": "Smart cluster pending",
+          "storageIpc": "Storage IPC",
+          "ipcOpen": "Circuit open",
+          "ipcHalfOpen": "Probing",
+          "ipcClosed": "Normal"
         },
         "disabled_notice": "This feature is disabled"
       },
@@ -795,7 +842,9 @@
       "smartClusterRunningDesc": "Current progress {{progress}}%, pending screenshots {{pending}}.",
       "modelDownloadSummaryPlaceholder": "Downloading models ({{progress}}%)",
       "modelDownloadRunningTitle": "Downloading Model Files",
-      "modelDownloadRunningDesc": "Downloading required model files in background, progress: {{progress}}%."
+      "modelDownloadRunningDesc": "Downloading required model files in background, progress: {{progress}}%.",
+      "stopTooltip": "Stop smart clustering",
+      "stop": "Stop"
     }
   },
   "sidebar": {
@@ -875,6 +924,58 @@
     "apply": "Start Organizing",
     "skip": "Skip"
   },
+  "clusterCard": {
+    "statusActive": "active",
+    "statusScoring": "scoring",
+    "statusPaused": "paused",
+    "statusIdle": "idle",
+    "actionResume": "Resume",
+    "actionPause": "Pause",
+    "actionRename": "Rename",
+    "actionDelete": "Delete"
+  },
+  "nlCluster": {
+    "errorMinPositives": "At least {{count}} positive examples are required before saving",
+    "errorCalculateThreshold": "Could not calculate a threshold from positive scores. Search again, then mark examples.",
+    "createSmartCluster": "Create Smart Cluster",
+    "experimentalTitle": "Natural-language clustering (demo)",
+    "badgeCalibration": "calibration",
+    "badgeExperimental": "experimental",
+    "cancelTooltip": "Cancel and return",
+    "cancel": "Cancel",
+    "calibratePlaceholder": "Describe what you want to auto-archive, for example \"research about California mountain ranges\"",
+    "explorePlaceholder": "Try \"code and documents about neural network training\"",
+    "resultsLimitTooltip": "Number of results to return",
+    "topLimit": "top {{count}}",
+    "previewCandidates": "Preview candidates",
+    "search": "Search",
+    "enableReranker": "Enable reranker",
+    "onnxVariantTooltip": "ONNX variant. Switching reloads the model.",
+    "currentlyLoaded": "Currently loaded: ",
+    "modelNotFoundMsg": "bge-reranker-v2-m3 model was not found ({{path}})",
+    "samplePrefix": "Example:",
+    "markedPositives": "Marked positives: ",
+    "markedNegatives": "Marked negatives: ",
+    "clearMarksTooltip": "Clear all marks",
+    "clearMarks": "Clear marks",
+    "predictedThreshold": "Estimated inverse value: ",
+    "calibrationTip1": "Tip: click a card to open it in preview. Your marks are kept when you return.",
+    "calibrationTip2": " At least {{count}} positive examples are required before saving.",
+    "loadingReranking": "Encoding -> recall -> loading reranker -> reranking...",
+    "loadingSearching": "Encoding the query and matching snapshots...",
+    "noResults": "No matching snapshots",
+    "calibrateInstruction": "Enter a description and click Preview candidates to list the most relevant snapshots for marking",
+    "exploreInstruction": "Enter a natural-language description to retrieve the most similar snapshots from the hot-layer vector index",
+    "demoWarning": "This demo reuses the task-clustering MiniLM vector store and is limited to hot-layer data from the last 30 days",
+    "queryPrefix": "Query:",
+    "resultsCount": "{{count}} results",
+    "scoreDetail": "rerank {{score}} · similarity {{sim}}",
+    "similarityValue": "similarity {{sim}}",
+    "markPosTooltip": "Mark as positive",
+    "markNegTooltip": "Mark as negative",
+    "saveButton": "Save as smart cluster",
+    "needMorePositives": "{{count}} more positive examples needed"
+  },
   "smartClusterSetup": {
     "title": "Smart Clusters",
     "subtitle": "Auto-archive snapshots by natural language description",
@@ -916,6 +1017,13 @@
     "threshold": "Threshold:",
     "archived": "Archived:",
     "snapshotsCount": "snapshots",
+    "aiSummary": "AI summary",
+    "summarySources": "{{count}} source snapshots",
+    "summaryUpdatedAt": "Summarized at {{time}}",
+    "ocrSummary": "OCR combined overview",
+    "keyPoints": "Key points",
+    "evidence": "Evidence",
+    "evidenceSnapshot": "Source snapshot",
     "noAssignments": "No assigned snapshots yet",
     "idleProcessingHint": "The background worker will process pending snapshots while the system is idle",
     "selectClusterToView": "Select a cluster on the left to view archived snapshots"
@@ -1021,7 +1129,9 @@
       "auto_install": {
         "log_start": "Starting automated Python install...",
         "success": "Installation succeeded.",
-        "finished": "Auto-install process finished."
+        "finished": "Auto-install process finished.",
+        "installing": "Installing...",
+        "button": "Auto-install Python"
       },
       "discovered_label": "Discovered Python versions (you may select one)",
       "unsupported": "Not supported",
@@ -1072,7 +1182,8 @@
       "downloading_clip": "Downloading Chinese-CLIP model...",
       "downloading_bge": "Downloading classification model (BGE-small-zh-v1.5)...",
       "downloading_minilm": "Downloading clustering model (MiniLM-L12-v2)...",
-      "complete": "Model download complete."
+      "complete": "Model download complete.",
+      "run_in_background": "Run in background"
     }
   },
   "tasks": {

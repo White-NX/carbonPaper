@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const localesDir = path.join(__dirname, '..', 'src', 'i18n', 'locales');
+const sourceDir = path.join(__dirname, '..', 'src');
 
 function collectKeys(obj, prefix = '') {
   const keys = [];
@@ -31,6 +32,45 @@ function findLocaleFiles(dir) {
   return fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
 }
 
+function hasKey(obj, key) {
+  let current = obj;
+  for (const part of key.split('.')) {
+    if (!current || typeof current !== 'object' || !(part in current)) {
+      return false;
+    }
+    current = current[part];
+  }
+  return true;
+}
+
+function findSourceFiles(dir, result = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      findSourceFiles(fullPath, result);
+      continue;
+    }
+    if (!/\.(js|jsx|ts|tsx)$/.test(entry.name)) continue;
+    if (/\.(test|spec)\.(js|jsx|ts|tsx)$/.test(entry.name)) continue;
+    result.push(fullPath);
+  }
+  return result;
+}
+
+function collectLiteralTranslationKeys(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const keys = [];
+  const regex = /\bt\(\s*(['"])([^'"`]+)\1/g;
+  let match;
+  while ((match = regex.exec(raw)) !== null) {
+    const key = match[2];
+    if (!key || key.includes('${')) continue;
+    const line = raw.slice(0, match.index).split(/\r?\n/).length;
+    keys.push({ key, line });
+  }
+  return keys;
+}
+
 function main() {
   if (!fs.existsSync(localesDir)) {
     console.error('Locales directory not found:', localesDir);
@@ -43,9 +83,11 @@ function main() {
   }
 
   const locales = {};
+  const localeData = {};
   for (const file of files) {
     const full = path.join(localesDir, file);
     const data = loadLocaleFile(full);
+    localeData[file] = data;
     const keys = collectKeys(data).sort();
     locales[file] = keys;
   }
@@ -66,11 +108,35 @@ function main() {
     }
   }
 
+  const baseData = localeData[filenames[0]];
+  const missingSourceKeys = [];
+  for (const filePath of findSourceFiles(sourceDir)) {
+    for (const { key, line } of collectLiteralTranslationKeys(filePath)) {
+      if (hasKey(baseData, key)) continue;
+      missingSourceKeys.push({
+        file: path.relative(path.join(__dirname, '..'), filePath),
+        line,
+        key,
+      });
+    }
+  }
+
+  if (missingSourceKeys.length) {
+    ok = false;
+    console.error('Missing locale keys referenced by source:');
+    for (const item of missingSourceKeys.slice(0, 50)) {
+      console.error(`  ${item.file}:${item.line} ${item.key}`);
+    }
+    if (missingSourceKeys.length > 50) {
+      console.error(`  ...and ${missingSourceKeys.length - 50} more`);
+    }
+  }
+
   if (!ok) {
-    console.error('i18n check failed: key mismatches detected');
+    console.error('i18n check failed');
     process.exit(3);
   }
-  console.log('i18n check passed: all locale files have matching keys');
+  console.log('i18n check passed: locale files match and source keys exist');
 }
 
 if (require.main === module) main();

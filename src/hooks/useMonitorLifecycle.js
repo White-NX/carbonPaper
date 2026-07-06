@@ -13,6 +13,7 @@ export function useMonitorLifecycle({
   formatErrorDetails,
   reportBackendError,
   resetBackendErrorDedupe,
+  t,
 }) {
   const [autoStartMonitor, setAutoStartMonitorState] = useState(() => {
     if (typeof window === 'undefined') return true;
@@ -60,13 +61,13 @@ export function useMonitorLifecycle({
     } catch (err) {
       setBackendStatus('offline');
       backendStatusRef.current = 'offline';
-      const message = err?.message || 'Failed to start backend';
+      const message = err?.message || t('settings.general.monitor.errors.startFailedFallback');
       const details = formatErrorDetails(err);
       setBackendError(message);
       setAutoStartSuppressed(true);
-      reportBackendError('Python 子服务启动失败', message, details);
+      reportBackendError(t('settings.general.monitor.errors.startFailedTitle'), message, details);
     }
-  }, [formatErrorDetails, reportBackendError]);
+  }, [formatErrorDetails, reportBackendError, t]);
 
   const handlePauseMonitor = useCallback(async () => {
     try {
@@ -130,12 +131,12 @@ export function useMonitorLifecycle({
       }
       setBackendStatus('offline');
       backendStatusRef.current = 'offline';
-      const message = err?.message || 'Backend offline';
+      const message = err?.message || t('settings.general.monitor.errors.offlineFallback');
       const details = formatErrorDetails(err);
       setBackendError(message);
-      reportBackendError('Python 子服务不可用', message, details);
+      reportBackendError(t('settings.general.monitor.errors.unavailableTitle'), message, details);
     }
-  }, [formatErrorDetails, reportBackendError, resetBackendErrorDedupe]);
+  }, [formatErrorDetails, reportBackendError, resetBackendErrorDedupe, t]);
 
   useEffect(() => {
     checkBackendStatus();
@@ -149,15 +150,19 @@ export function useMonitorLifecycle({
     const errMsg = payload.error ? `; ${payload.error}` : '';
     const recovery = payload.recovery || {};
     const recoveryMsg = recovery.policy === 'manual_restart'
-      ? '；恢复策略：手动重启，旧 IPC 状态已清理'
+      ? t('settings.general.monitor.errors.manualRestartRecovery')
       : '';
-    const message = `子服务已退出（code: ${code}${errMsg}）${recoveryMsg}`;
+    const message = t('settings.general.monitor.errors.exitedMessage', {
+      code,
+      error: errMsg,
+      recovery: recoveryMsg,
+    });
     const details = formatErrorDetails(payload);
     setBackendStatus('offline');
     backendStatusRef.current = 'offline';
     setBackendError(message);
-    reportBackendError('Python 子服务异常退出', message, details);
-  }, [formatErrorDetails, reportBackendError]);
+    reportBackendError(t('settings.general.monitor.errors.exitedTitle'), message, details);
+  }, [formatErrorDetails, reportBackendError, t]);
 
   useTauriEventListener('monitor-stopped', () => {
     setBackendStatus('offline');
