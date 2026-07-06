@@ -217,19 +217,28 @@ describe('AdvancedSearch', () => {
   });
 
   it('displays search error banner when search fails', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     searchScreenshots.mockRejectedValueOnce(new Error('Chroma database is offline'));
 
-    render(
-      <AdvancedSearch
-        active
-        searchParams={{ query: 'hello', mode: 'ocr' }}
-        onSelectResult={vi.fn()}
-        backendOnline
-      />
-    );
+    try {
+      render(
+        <AdvancedSearch
+          active
+          searchParams={{ query: 'hello', mode: 'ocr' }}
+          onSelectResult={vi.fn()}
+          backendOnline
+        />
+      );
 
-    await waitFor(() => {
-      expect(screen.getByText('advancedSearch.search.error')).toBeInTheDocument();
-    });
+      await waitFor(() => {
+        expect(screen.getByText('advancedSearch.search.error')).toBeInTheDocument();
+      });
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        'Advanced search resetAndFetch failed:',
+        expect.any(Error)
+      );
+    } finally {
+      consoleErrorSpy.mockRestore();
+    }
   });
 });

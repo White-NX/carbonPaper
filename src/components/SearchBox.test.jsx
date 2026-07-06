@@ -68,21 +68,27 @@ describe('SearchBox', () => {
   });
 
   it('displays search error message when search fails', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const { searchScreenshots } = await import('../lib/monitor_api');
     searchScreenshots.mockRejectedValueOnce(new Error('Database locked'));
 
-    render(
-      <SearchBox
-        onSelectResult={vi.fn()}
-        backendOnline
-      />
-    );
+    try {
+      render(
+        <SearchBox
+          onSelectResult={vi.fn()}
+          backendOnline
+        />
+      );
 
-    const input = screen.getByPlaceholderText('search.placeholder.ocr');
-    await userEvent.type(input, 'invoice');
+      const input = screen.getByPlaceholderText('search.placeholder.ocr');
+      await userEvent.type(input, 'invoice');
 
-    await waitFor(() => {
-      expect(screen.getByText('search.searchError')).toBeInTheDocument();
-    });
+      await waitFor(() => {
+        expect(screen.getByText('search.searchError')).toBeInTheDocument();
+      });
+      expect(consoleErrorSpy).toHaveBeenCalledWith('Search failed:', expect.any(Error));
+    } finally {
+      consoleErrorSpy.mockRestore();
+    }
   });
 });
