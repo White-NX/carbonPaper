@@ -21,51 +21,6 @@ from typing import Callable
 
 MAX_PIPE_MESSAGE_BYTES = 16 * 1024 * 1024
 IPC_PROTOCOL_VERSION = 2
-DEFAULT_CONNECTION_TIMEOUT_SECONDS = 30.0
-DEFAULT_MAX_REQUESTS_PER_CONNECTION = 32
-
-
-class _ConnectionDeadline:
-    """Close a pipe handle when a connection exceeds its deadline."""
-    def __init__(self, handle, timeout_seconds):
-        self.handle = handle
-        self.timeout_seconds = max(0.1, float(timeout_seconds))
-        self._lock = threading.Lock()
-        self._closed = False
-        self._timer = None
-
-    def arm(self):
-        with self._lock:
-            if self._closed:
-                return
-            if self._timer is not None:
-                self._timer.cancel()
-            self._timer = threading.Timer(self.timeout_seconds, self.abort)
-            self._timer.daemon = True
-            self._timer.start()
-
-    def abort(self):
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-        try:
-            cancel_io = getattr(win32file, "CancelIoEx", None)
-            if cancel_io is not None:
-                cancel_io(self.handle, None)
-        except Exception:
-            pass
-        try:
-            win32file.CloseHandle(self.handle)
-        except Exception:
-            pass
-
-    def close(self):
-        with self._lock:
-            if self._timer is not None:
-                self._timer.cancel()
-                self._timer = None
-        self.abort()
 
 
 def _is_authorized_client_pid(client_pid: int, expected_pid: int | None, curr_ppid: int) -> bool:
@@ -161,14 +116,6 @@ class _NamedPipeServer(threading.Thread):
         self.stop_event = threading.Event()
         self.security_attrs = _make_security_attributes_for_current_user()
         self.max_workers = int(os.environ.get('CARBONPAPER_IPC_MAX_WORKERS', '8'))
-        self.connection_timeout = float(os.environ.get(
-            'CARBONPAPER_IPC_CONNECTION_TIMEOUT',
-            str(DEFAULT_CONNECTION_TIMEOUT_SECONDS),
-        ))
-        self.max_requests_per_connection = int(os.environ.get(
-            'CARBONPAPER_IPC_MAX_REQUESTS_PER_CONNECTION',
-            str(DEFAULT_MAX_REQUESTS_PER_CONNECTION),
-        ))
         self._worker_slots = threading.BoundedSemaphore(self.max_workers)
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_workers,
@@ -246,11 +193,6 @@ class _NamedPipeServer(threading.Thread):
         """Handle a single client connection"""
         import pywintypes
         handler_started = _time.perf_counter()
-        deadline = _ConnectionDeadline(
-            handle,
-            getattr(self, 'connection_timeout', DEFAULT_CONNECTION_TIMEOUT_SECONDS),
-        )
-        deadline.arm()
         try:
             # 1. Security Verification
             client_pid = win32pipe.GetNamedPipeClientProcessId(handle)
@@ -303,12 +245,6 @@ class _NamedPipeServer(threading.Thread):
                 command = req.get('command')
                 is_process_ocr = command == 'process_ocr'
                 requests_handled += 1
-                if requests_handled >= getattr(
-                    self,
-                    'max_requests_per_connection',
-                    DEFAULT_MAX_REQUESTS_PER_CONNECTION,
-                ):
-                    keep_alive = False
                 if is_process_ocr:
                     logger.debug(
                         '[DIAG:PIPE] request received command=%s bytes=%s from_pid=%s keepalive=%s',
@@ -365,8 +301,6 @@ class _NamedPipeServer(threading.Thread):
                         requests_handled,
                         len(resp_str),
                     )
-                if keep_alive:
-                    deadline.arm()
 
         except Exception as e:
             logger.error(f"Error handling IPC client: {e}", exc_info=True)
@@ -375,7 +309,7 @@ class _NamedPipeServer(threading.Thread):
                 # Do NOT call DisconnectNamedPipe here. 
                 # It invalidates the client's handle before they can finish reading the response.
                 # Simply closing the handle sends a proper EOF.
-                deadline.close()
+                win32file.CloseHandle(handle)
             except:
                 pass
 

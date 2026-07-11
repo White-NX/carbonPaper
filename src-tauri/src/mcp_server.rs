@@ -31,51 +31,6 @@ use tauri::{Emitter, Manager};
 const DEFAULT_MCP_PORT: u16 = 23816;
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
-fn bounded_i64_arg(
-    args: &Value,
-    name: &str,
-    default: i64,
-    min: i64,
-    max: i64,
-) -> Result<i64, String> {
-    let Some(value) = args.get(name) else {
-        return Ok(default);
-    };
-    let number = value
-        .as_i64()
-        .ok_or_else(|| format!("{} must be an integer", name))?;
-    if !(min..=max).contains(&number) {
-        return Err(format!("{} must be between {} and {}", name, min, max));
-    }
-    Ok(number)
-}
-
-#[cfg(test)]
-mod parameter_tests {
-    use super::bounded_i64_arg;
-    use serde_json::json;
-
-    #[test]
-    fn bounded_i64_uses_default_and_accepts_bounds() {
-        assert_eq!(bounded_i64_arg(&json!({}), "limit", 20, 1, 200), Ok(20));
-        assert_eq!(
-            bounded_i64_arg(&json!({"limit": 1}), "limit", 20, 1, 200),
-            Ok(1)
-        );
-        assert_eq!(
-            bounded_i64_arg(&json!({"limit": 200}), "limit", 20, 1, 200),
-            Ok(200)
-        );
-    }
-
-    #[test]
-    fn bounded_i64_rejects_invalid_values() {
-        assert!(bounded_i64_arg(&json!({"limit": 0}), "limit", 20, 1, 200).is_err());
-        assert!(bounded_i64_arg(&json!({"limit": 201}), "limit", 20, 1, 200).is_err());
-        assert!(bounded_i64_arg(&json!({"limit": "20"}), "limit", 20, 1, 200).is_err());
-    }
-}
-
 // ==================== Runtime state ====================
 
 /// Tauri-managed state for the MCP server lifecycle.
@@ -825,7 +780,7 @@ async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value
         .get("end_time")
         .and_then(|v| v.as_f64())
         .ok_or("Missing required parameter: end_time")?;
-    let max_records = Some(bounded_i64_arg(&args, "max_records", 500, 1, 1000)?);
+    let max_records = args.get("max_records").and_then(|v| v.as_i64());
 
     // Convert ms to seconds if needed
     let start_ts = if start_time > 10_000_000_000.0 {
@@ -848,8 +803,11 @@ async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value
 
     let mut records: Vec<_> = tokio::task::spawn_blocking(move || {
         let filter_mode = filter.get_mode();
-        let records =
-            storage.get_screenshots_by_time_range_limited(start_ts, end_ts, max_records)?;
+        let records = storage.get_screenshots_by_time_range_limited(
+            start_ts,
+            end_ts,
+            max_records.or(Some(500)),
+        )?;
         let records: Vec<_> = records
             .into_iter()
             .filter(|r| {
@@ -1289,10 +1247,8 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
         .and_then(|v| v.as_str())
         .ok_or("Missing required parameter: query")?
         .to_string();
-    let limit = i32::try_from(bounded_i64_arg(&args, "limit", 20, 1, 200)?)
-        .map_err(|_| "limit is out of range".to_string())?;
-    let offset = i32::try_from(bounded_i64_arg(&args, "offset", 0, 0, 100_000)?)
-        .map_err(|_| "offset is out of range".to_string())?;
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20) as i32;
+    let offset = args.get("offset").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     let fuzzy = args.get("fuzzy").and_then(|v| v.as_bool()).unwrap_or(true);
     let process_names: Option<Vec<String>> = args
         .get("process_names")
@@ -1693,8 +1649,8 @@ async fn tool_get_task_screenshots(state: &McpServerInner, args: Value) -> Resul
         .get("task_id")
         .and_then(|v| v.as_i64())
         .ok_or("Missing required parameter: task_id")?;
-    let page = bounded_i64_arg(&args, "page", 0, 0, 2_000)?;
-    let page_size = bounded_i64_arg(&args, "page_size", 50, 1, 200)?;
+    let page = args.get("page").and_then(|v| v.as_i64()).unwrap_or(0);
+    let page_size = args.get("page_size").and_then(|v| v.as_i64()).unwrap_or(50);
 
     let storage = state.app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();

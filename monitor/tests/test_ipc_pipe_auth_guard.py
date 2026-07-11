@@ -106,27 +106,3 @@ def test_client_handler_reuses_connection_when_keepalive(monkeypatch):
     second_len = struct.unpack("<I", wire[second_start:second_start + 4])[0]
     assert b'"ok": "status"' in wire[4:4 + first_len]
     assert b'"ok": "pause"' in wire[second_start + 4:second_start + 4 + second_len]
-
-
-def test_client_handler_caps_keepalive_requests(monkeypatch):
-    server = object.__new__(ipc_pipe._NamedPipeServer)
-    state = {"requests": 0}
-    server.handler = lambda _req: state.__setitem__("requests", state["requests"] + 1) or {"ok": True}
-    server.stop_event = type("StopEvent", (), {"is_set": lambda self: False})()
-    server.max_requests_per_connection = 2
-
-    monkeypatch.setenv("CARBON_PARENT_PID", "4242")
-    monkeypatch.setattr(ipc_pipe.win32pipe, "GetNamedPipeClientProcessId", lambda _h: 4242)
-    monkeypatch.setattr(ipc_pipe.os, "getppid", lambda: 1111)
-    monkeypatch.setattr(
-        ipc_pipe,
-        "_read_framed_json_message",
-        lambda _h: '{"command":"status","_ipc_keepalive":true}',
-    )
-    monkeypatch.setattr(ipc_pipe.win32file, "WriteFile", lambda _h, data: (0, len(data)))
-    monkeypatch.setattr(ipc_pipe.win32file, "FlushFileBuffers", lambda _h: None)
-    monkeypatch.setattr(ipc_pipe.win32file, "CloseHandle", lambda _h: None)
-
-    server._client_handler(object())
-
-    assert state["requests"] == 2
