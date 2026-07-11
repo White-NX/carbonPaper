@@ -154,7 +154,11 @@
       "about": "关于",
       "extension": "浏览器扩展",
       "ai_embedding": "人工智能嵌入",
-      "features": "功能"
+      "features": "功能",
+      "capture": "记录与搜索",
+      "organize": "整理与智能",
+      "privacy": "隐私与访问",
+      "maintenance": "存储与维护"
     },
     "security": {
       "protection": {

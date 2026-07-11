@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../../lib/auth_api';
 import { getClusteringStatus, runClustering, saveClusteringResults } from '../../lib/task_api';
-import { useTauriEventListener } from '../../hooks/useTauriEventListener';
+import { useModelInventory } from './organize/useModelInventory';
+import { useSmartClusterControls } from './organize/useSmartClusterControls';
 
 export function useFeaturesController({
   monitorStatus,
@@ -12,8 +13,6 @@ export function useFeaturesController({
 }) {
   const [config, setConfig] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [models, setModels] = useState([]);
-  const [modelsLoading, setModelsLoading] = useState(false);
   const [clusteringDropdownOpen, setClusteringDropdownOpen] = useState(false);
   const [clusteringAdvancedOpen, setClusteringAdvancedOpen] = useState(false);
   const [clusteringRunning, setClusteringRunning] = useState(false);
@@ -23,12 +22,9 @@ export function useFeaturesController({
   const [rangeStart, setRangeStart] = useState('');
   const [rangeEnd, setRangeEnd] = useState('');
   const [customControlsOpen, setCustomControlsOpen] = useState(false);
-  const [scModelAvailable, setScModelAvailable] = useState(false);
-  const [scStatus, setScStatus] = useState(null);
-  const [scDownloading, setScDownloading] = useState(false);
-  const [scDownloadLog, setScDownloadLog] = useState([]);
-  const [scDownloadError, setScDownloadError] = useState(null);
-  const scDownloadStartedRef = useRef(false);
+  const modelInventory = useModelInventory({ monitorStatus });
+  const smartCluster = useSmartClusterControls();
+  const { scModelAvailable } = smartCluster;
 
   const loadConfig = async () => {
     try {
@@ -43,35 +39,9 @@ export function useFeaturesController({
     }
   };
 
-  const loadModels = async () => {
-    if (monitorStatus !== 'running') {
-      return;
-    }
-    setModelsLoading(true);
-    try {
-      const res = await withAuth(() => invoke('monitor_get_all_models'));
-      const parsedRes = typeof res === 'string' ? JSON.parse(res) : res;
-      if (parsedRes && parsedRes.status === 'success' && parsedRes.models) {
-        setModels(parsedRes.models);
-      } else {
-        console.warn('[FeaturesSection] Response format unexpected or not successful:', parsedRes);
-      }
-    } catch (err) {
-      console.error('[FeaturesSection] Failed to fetch models:', err);
-    } finally {
-      setModelsLoading(false);
-    }
-  };
-
   useEffect(() => {
     loadConfig();
   }, []);
-
-  useEffect(() => {
-    if (monitorStatus === 'running') {
-      loadModels();
-    }
-  }, [monitorStatus]);
 
   const refreshClusteringStatus = async () => {
     if (monitorStatus !== 'running') return;
@@ -86,38 +56,6 @@ export function useFeaturesController({
   useEffect(() => {
     refreshClusteringStatus();
   }, [monitorStatus]);
-
-  const refreshSmartClusterModel = async () => {
-    try {
-      const modelStatus = await invoke('check_model_files');
-      const reranker = modelStatus?.['bge-reranker-v2-m3'];
-      setScModelAvailable(reranker?.complete === true);
-    } catch (err) {
-      console.warn('Failed to check reranker model:', err);
-    }
-  };
-
-  const refreshSmartClusterStatus = async () => {
-    try {
-      const s = await withAuth(() => invoke('smart_cluster_status'));
-      setScStatus(s);
-    } catch { /* ignore */ }
-  };
-
-  useEffect(() => {
-    refreshSmartClusterModel();
-    refreshSmartClusterStatus();
-    const interval = setInterval(() => {
-      refreshSmartClusterStatus();
-    }, 10000);
-    return () => clearInterval(interval);
-  }, []);
-
-  useTauriEventListener('install-log', (event) => {
-    const line = event?.payload?.line || JSON.stringify(event?.payload || {});
-    const ts = new Date().toLocaleTimeString();
-    setScDownloadLog((prev) => [...prev, `[${ts}] ${line}`]);
-  }, [scDownloading], scDownloading);
 
   useEffect(() => {
     const handler = () => {
@@ -139,14 +77,6 @@ export function useFeaturesController({
       }), { autoPrompt: true });
     } catch (err) {
       console.error('Failed to save advanced config:', err);
-    }
-  };
-
-  const handleOpenLocation = async (path) => {
-    try {
-      await invoke('open_path', { path });
-    } catch (err) {
-      console.error('Failed to open location:', err);
     }
   };
 
@@ -263,58 +193,6 @@ export function useFeaturesController({
     }
   };
 
-  const handleDownloadReranker = async () => {
-    if (scDownloadStartedRef.current) return;
-    scDownloadStartedRef.current = true;
-    setScDownloading(true);
-    setScDownloadLog([]);
-    setScDownloadError(null);
-    try {
-      setScDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] Downloading bge-reranker-v2-m3 (uint8, ~570MB)...`]);
-      await invoke('download_model', {
-        repo: 'onnx-community/bge-reranker-v2-m3-ONNX',
-        subdir: 'bge-reranker-v2-m3',
-        files: [
-          'config.json',
-          'tokenizer.json',
-          'tokenizer_config.json',
-          'special_tokens_map.json',
-          'onnx/model_uint8.onnx',
-        ],
-      });
-      await invoke('mark_smart_cluster_setup_done', { dismissedPermanently: false });
-      await refreshSmartClusterModel();
-    } catch (err) {
-      setScDownloadError(err?.message || String(err));
-      scDownloadStartedRef.current = false;
-    } finally {
-      setScDownloading(false);
-    }
-  };
-
-  const handleDrainNow = async () => {
-    try {
-      await withAuth(() => invoke('monitor_smart_cluster_drain_now'), { autoPrompt: true });
-      setTimeout(refreshSmartClusterStatus, 500);
-    } catch (err) {
-      console.warn('Failed to trigger drain_now:', err);
-    }
-  };
-
-  const handleRescanAll = async () => {
-    try {
-      await withAuth(() => invoke('smart_cluster_rescan_all'), { autoPrompt: true });
-      setTimeout(refreshSmartClusterStatus, 500);
-    } catch (err) {
-      console.warn('Failed to trigger rescan:', err);
-    }
-  };
-
-  const formatSize = (sizeStr) => {
-    if (!sizeStr) return '-';
-    return sizeStr;
-  };
-
   const lastClusteringRunLabel = clusteringStatus?.config?.last_run
     ? new Date(clusteringStatus.config.last_run * 1000).toLocaleString()
     : t('tasks.never');
@@ -339,8 +217,7 @@ export function useFeaturesController({
   return {
     config,
     loading,
-    models,
-    modelsLoading,
+    ...modelInventory,
     clusteringDropdownOpen,
     setClusteringDropdownOpen,
     clusteringAdvancedOpen,
@@ -355,23 +232,16 @@ export function useFeaturesController({
     customControlsOpen,
     setCustomControlsOpen,
     scModelAvailable,
-    scStatus,
-    scDownloading,
-    scDownloadLog,
-    scDownloadError,
-    handleOpenLocation,
+    ...smartCluster,
     handleFeatureModeChange,
     handleCustomFeatureToggle,
     handleClusteringIntervalChange,
     handleRunClustering,
-    handleDownloadReranker,
-    handleDrainNow,
-    handleRescanAll,
-    formatSize,
+    clearClusteringError: () => setClusteringError(null),
+    clearClusteringNotice: () => setClusteringNotice(null),
     lastClusteringRunLabel,
     featureMode,
     featureModeOptions,
     selectedFeatureMode,
-    loadModels,
   };
 }

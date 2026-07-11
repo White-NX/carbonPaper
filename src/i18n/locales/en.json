@@ -154,7 +154,11 @@
       "about": "About",
       "extension": "Browser Extension",
       "ai_embedding": "AI Embedding",
-      "features": "Features"
+      "features": "Features",
+      "capture": "Record & Search",
+      "organize": "Organize",
+      "privacy": "Privacy & Access",
+      "maintenance": "Maintenance"
     },
     "security": {
       "protection": {
