@@ -230,6 +230,12 @@ impl StorageState {
         page: i64,
         page_size: i64,
     ) -> Result<Vec<TaskScreenshotStub>, String> {
+        if !(0..=2_000).contains(&page) {
+            return Err("page must be between 0 and 2000".to_string());
+        }
+        if !(1..=200).contains(&page_size) {
+            return Err("page_size must be between 1 and 200".to_string());
+        }
         let guard = self.get_connection_named("get_task_screenshots")?;
         let conn = guard.as_ref().unwrap();
 

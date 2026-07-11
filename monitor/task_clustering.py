@@ -487,6 +487,9 @@ class HotColdManager:
         # run_clustering calls helpers/properties that also acquire this lock.
         # Use RLock to avoid self-deadlock on nested acquisitions.
         self._lock = threading.RLock()
+        # Serialize expensive clustering runs without blocking foreground
+        # ingestion, which only needs the short-lived manager lock above.
+        self._clustering_lock = threading.Lock()
 
         logger.info("[task_clustering] HotColdManager ready (lazy loading collections)")
 
@@ -930,7 +933,7 @@ class HotColdManager:
 
         Returns clustering results dict.
         """
-        with self._lock:
+        with self._clustering_lock:
             logger.info("Starting clustering run (range=%s–%s) …",
                         start_time or "auto", end_time or "auto")
 
@@ -1062,10 +1065,10 @@ class HotColdManager:
                     "clustering_mode": "batched" if use_approximate else "full",
                 }
             finally:
-                # Always unload the model after clustering to free memory
-                self._embedder.unload()
-                # Unload collections to save HNSW memory overhead when idle
-                self.unload_collections()
+                # Do not unload shared model/collection objects here. Foreground
+                # ingestion may be using them now that clustering runs outside
+                # the manager lock; idle maintenance owns resource unloading.
+                pass
 
     # ---- Scheduled re-run helper -----------------------------------------
 

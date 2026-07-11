@@ -846,6 +846,11 @@ impl StorageState {
         end_ts: f64,
         max_records: Option<i64>,
     ) -> Result<Vec<ScreenshotRecord>, String> {
+        if let Some(n) = max_records {
+            if !(1..=1000).contains(&n) {
+                return Err("max_records must be between 1 and 1000".to_string());
+            }
+        }
         let diag_start = std::time::Instant::now();
 
         // Phase 1: Hold mutex only for SQL query, extract raw data without decryption

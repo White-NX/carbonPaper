@@ -107,9 +107,10 @@ def test_run_clustering_does_not_deadlock_add_snapshot(monkeypatch):
     add_thread = threading.Thread(target=add_worker, daemon=True)
     add_thread.start()
 
-    # add_snapshot should be blocked by clustering lock before release.
-    time.sleep(0.15)
-    assert add_thread.is_alive(), "add_snapshot should block while clustering holds lock"
+    # Foreground ingestion must not wait for the expensive clustering run.
+    add_thread.join(timeout=1.0)
+    assert not add_thread.is_alive(), "add_snapshot was blocked by clustering"
+    assert collection.add_calls == 1
 
     run_release.set()
 
@@ -120,7 +121,6 @@ def test_run_clustering_does_not_deadlock_add_snapshot(monkeypatch):
     assert not add_thread.is_alive(), "add_snapshot remained blocked"
     assert run_error == []
     assert add_error == []
-    assert collection.add_calls == 1
 
 
 def test_scheduler_can_recover_after_failed_run(monkeypatch):
