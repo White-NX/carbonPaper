@@ -40,7 +40,7 @@ export default function BrowserExtensionSection() {
     setInstalling(browser);
     setMessage('');
     try {
-      await invoke('install_browser_extension', { browser });
+      await withAuth(() => invoke('install_browser_extension', { browser }), { autoPrompt: true });
       setMessage(t('settings.extension.success'));
       setMessageType('success');
       await checkStatus();

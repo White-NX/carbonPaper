@@ -1763,10 +1763,28 @@ pub async fn start_monitor_impl(
 
 #[tauri::command]
 pub async fn start_monitor(
+    window: tauri::Window,
     state: State<'_, MonitorState>,
     app: AppHandle,
 ) -> Result<String, String> {
+    crate::commands::check_main_window(&window)?;
     start_monitor_impl(state, app).await
+}
+
+#[tauri::command]
+pub fn get_monitor_autostart() -> bool {
+    crate::registry_config::get_bool("autoStartMonitor").unwrap_or(true)
+}
+
+#[tauri::command]
+pub fn set_monitor_autostart(
+    window: tauri::Window,
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+    crate::registry_config::set_bool("autoStartMonitor", enabled)
 }
 
 /// Spawn the Rust-side capture loop using CaptureState
@@ -2005,12 +2023,12 @@ pub async fn stop_monitor_impl(
 
 #[tauri::command]
 pub async fn stop_monitor(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    window: tauri::Window,
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
     app: AppHandle,
 ) -> Result<String, String> {
-    crate::commands::check_auth_required(&credential_state)?;
+    crate::commands::check_main_window(&window)?;
     stop_monitor_impl(state, capture_state, app).await
 }
 
@@ -2031,12 +2049,12 @@ pub async fn pause_monitor_impl(
 /// Resumes screenshot capture after a pause.
 #[tauri::command]
 pub async fn pause_monitor(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    window: tauri::Window,
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
     app: AppHandle,
 ) -> Result<String, String> {
-    crate::commands::check_auth_required(&credential_state)?;
+    crate::commands::check_main_window(&window)?;
     pause_monitor_impl(state, capture_state, app).await
 }
 
@@ -2055,12 +2073,12 @@ pub async fn resume_monitor_impl(
 
 #[tauri::command]
 pub async fn resume_monitor(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    window: tauri::Window,
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
     app: AppHandle,
 ) -> Result<String, String> {
-    crate::commands::check_auth_required(&credential_state)?;
+    crate::commands::check_main_window(&window)?;
     resume_monitor_impl(state, capture_state, app).await
 }
 

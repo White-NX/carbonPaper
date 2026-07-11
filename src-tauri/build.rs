@@ -1,12 +1,53 @@
 // src-tauri/build.rs
 
+use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use walkdir::WalkDir;
 
+const UPDATE_PUBLIC_KEY_FILE: &str = "update-public-key.txt";
+
+fn configure_update_public_key() {
+    let path = Path::new(UPDATE_PUBLIC_KEY_FILE);
+    println!("cargo:rerun-if-changed={}", UPDATE_PUBLIC_KEY_FILE);
+
+    let public_key = fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "Build failed: cannot read checked-in update public key {}: {}",
+            path.display(),
+            e
+        )
+    });
+    let public_key = public_key.trim();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(public_key)
+        .unwrap_or_else(|e| panic!("Build failed: update public key is not valid base64: {}", e));
+    if decoded.len() != 32 {
+        panic!(
+            "Build failed: update public key must decode to 32 bytes, got {}",
+            decoded.len()
+        );
+    }
+
+    if let Ok(configured) = std::env::var("CARBONPAPER_UPDATE_PUBLIC_KEY") {
+        if configured.trim() != public_key {
+            panic!(
+                "Build failed: CARBONPAPER_UPDATE_PUBLIC_KEY does not match {}",
+                UPDATE_PUBLIC_KEY_FILE
+            );
+        }
+    }
+
+    println!(
+        "cargo:rustc-env=CARBONPAPER_UPDATE_PUBLIC_KEY={}",
+        public_key
+    );
+}
+
 fn main() {
+    configure_update_public_key();
     // --- 1. 定义路径 ---
     // 源文件夹
     let source_dir = Path::new("../monitor");

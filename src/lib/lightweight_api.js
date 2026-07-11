@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { withAuth } from './auth_api';
 
 /**
  * 切换到轻量模式（销毁窗口）
@@ -32,5 +33,8 @@ export async function getLightweightConfig() {
  * 设置轻量模式配置
  */
 export async function setLightweightConfig(config) {
-  return await invoke('set_lightweight_config', { config });
+  return await withAuth(
+    () => invoke('set_lightweight_config', { config }),
+    { autoPrompt: true },
+  );
 }

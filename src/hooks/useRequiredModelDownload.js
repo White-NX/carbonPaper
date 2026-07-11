@@ -91,9 +91,6 @@ export function useRequiredModelDownload({
 
     (async () => {
       try {
-        const config = await invoke('get_advanced_config');
-        const useOnnx = config?.use_onnx || false;
-
         const keysToDownload = [];
         if (missingModels['chinese-clip'] && !missingModels['chinese-clip'].complete) {
           keysToDownload.push('chinese-clip');
@@ -121,39 +118,13 @@ export function useRequiredModelDownload({
 
           if (key === 'chinese-clip') {
             setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_clip')}`]);
-            await invoke('download_model');
+            await invoke('download_model', { modelId: 'chinese-clip' });
           } else if (key === 'bge-small-zh') {
             setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_bge')}`]);
-            if (useOnnx) {
-              await invoke('download_model', {
-                repo: 'Xenova/bge-small-zh-v1.5',
-                subdir: 'bge-small-zh-v1.5',
-                files: ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'onnx/model_quantized.onnx'],
-                modelRuntime: 'onnx',
-              });
-            } else {
-              await invoke('download_model', {
-                repo: 'BAAI/bge-small-zh-v1.5',
-                subdir: 'bge-small-zh-v1.5',
-                files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'vocab.txt', 'special_tokens_map.json'],
-              });
-            }
+            await invoke('download_model', { modelId: 'bge-small-zh' });
           } else if (key === 'minilm-l12') {
             setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.downloading_minilm')}`]);
-            if (useOnnx) {
-              await invoke('download_model', {
-                repo: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2',
-                subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
-                files: ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'onnx/model_quantized.onnx'],
-                modelRuntime: 'onnx',
-              });
-            } else {
-              await invoke('download_model', {
-                repo: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
-                subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
-                files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'sentencepiece.bpe.model'],
-              });
-            }
+            await invoke('download_model', { modelId: 'minilm-l12' });
           }
         }
 

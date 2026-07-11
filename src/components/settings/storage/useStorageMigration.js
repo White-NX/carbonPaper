@@ -62,7 +62,7 @@ export function useStorageMigration({ storage, onRefresh, t }) {
       }
 
       if (shouldRestartMonitor) {
-        await withAuth(() => invoke('stop_monitor'), { autoPrompt: true });
+        await invoke('stop_monitor');
       }
 
       if (shouldMigrateData) {
@@ -105,7 +105,7 @@ export function useStorageMigration({ storage, onRefresh, t }) {
         setIsUpdatingStoragePath(false);
       }
       if (shouldRestartMonitor) {
-        try { await withAuth(() => invoke('start_monitor'), { autoPrompt: true }); } catch { }
+        try { await invoke('start_monitor'); } catch { }
       }
     }
   };

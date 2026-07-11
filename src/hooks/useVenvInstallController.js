@@ -126,41 +126,16 @@ export function useVenvInstallController({
         try {
           const res = await invoke('install_python_venv', { python_path: processedPythonPath });
           appendDepsLog(res);
-          const config = await invoke('get_advanced_config');
-          const useOnnx = config?.use_onnx || false;
-
           appendDepsLog(t('mask.venv.step2.download_models'));
-          const modelRes = await invoke('download_model');
+          const modelRes = await invoke('download_model', { modelId: 'chinese-clip' });
           appendDepsLog(modelRes);
 
           appendDepsLog(t('mask.venv.step2.download_bge'));
-          const bgeRes = useOnnx
-            ? await invoke('download_model', {
-              repo: 'Xenova/bge-small-zh-v1.5',
-              subdir: 'bge-small-zh-v1.5',
-              files: ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'onnx/model_quantized.onnx'],
-              modelRuntime: 'onnx',
-            })
-            : await invoke('download_model', {
-              repo: 'BAAI/bge-small-zh-v1.5',
-              subdir: 'bge-small-zh-v1.5',
-              files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'vocab.txt', 'special_tokens_map.json'],
-            });
+          const bgeRes = await invoke('download_model', { modelId: 'bge-small-zh' });
           appendDepsLog(bgeRes);
 
           appendDepsLog(t('mask.venv.step2.download_minilm'));
-          const minilmRes = useOnnx
-            ? await invoke('download_model', {
-              repo: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2',
-              subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
-              files: ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'onnx/model_quantized.onnx'],
-              modelRuntime: 'onnx',
-            })
-            : await invoke('download_model', {
-              repo: 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
-              subdir: 'paraphrase-multilingual-MiniLM-L12-v2',
-              files: ['config.json', 'pytorch_model.bin', 'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'sentencepiece.bpe.model'],
-            });
+          const minilmRes = await invoke('download_model', { modelId: 'minilm-l12' });
           appendDepsLog(minilmRes);
           appendDepsLog(t('mask.venv.step2.deps_complete'));
           setDepsInstallSuccess(true);

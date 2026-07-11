@@ -938,11 +938,11 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::utility::greet,
             commands::utility::close_process,
-            commands::utility::set_updating_flag,
             commands::utility::set_app_language,
             monitor::start_monitor,
+            monitor::get_monitor_autostart,
+            monitor::set_monitor_autostart,
             monitor::stop_monitor,
             monitor::pause_monitor,
             monitor::resume_monitor,
@@ -1062,9 +1062,7 @@ pub fn run() {
             model_management::check_model_files,
             // Updater commands
             updater::updater_check,
-            updater::updater_download,
-            updater::updater_extract,
-            updater::updater_apply,
+            updater::updater_install,
             // Native messaging commands
             native_messaging::get_nm_host_status,
             native_messaging::register_nm_host_chrome,

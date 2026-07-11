@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { formatInvokeError } from '../filterUtils';
+import { withAuth } from '../../../lib/auth_api';
 
 export function useAutoLaunchStatus({ isOpen, t }) {
   const [autoLaunchEnabled, setAutoLaunchEnabled] = useState(null);
@@ -26,7 +27,10 @@ export function useAutoLaunchStatus({ isOpen, t }) {
     setAutoLaunchMessage('');
     try {
       const next = !(autoLaunchEnabled ?? false);
-      const result = await invoke('set_autostart', { enabled: next });
+      const result = await withAuth(
+        () => invoke('set_autostart', { enabled: next }),
+        { autoPrompt: true },
+      );
       setAutoLaunchEnabled(Boolean(result));
       setAutoLaunchMessage(Boolean(result) ? t('settings.autolaunch.enabled') : t('settings.autolaunch.disabled'));
     } catch (e) {

@@ -1,4 +1,7 @@
+use std::sync::Arc;
 use tauri::AppHandle;
+
+use crate::credential_manager::CredentialManagerState;
 
 #[cfg(windows)]
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE};
@@ -80,7 +83,15 @@ pub fn get_autostart_status() -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
+pub fn set_autostart(
+    app: AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    enabled: bool,
+) -> Result<bool, String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+
     #[cfg(windows)]
     {
         let _ = app;

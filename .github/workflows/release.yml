@@ -23,6 +23,15 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify update signing secrets
+        shell: pwsh
+        env:
+          CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CARBONPAPER_UPDATE_SIGNING_KEY)) {
+            throw "CARBONPAPER_UPDATE_SIGNING_KEY secret is required"
+          }
+
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
@@ -62,6 +71,8 @@ jobs:
       - name: Generate latest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
+          CARBONPAPER_UPDATE_PUBLIC_KEY_FILE: src-tauri/update-public-key.txt
         run: node scripts/generate-latest-json.mjs ${{ github.ref_name }} release_body.txt
 
       - name: Smoke test previous stable portable update

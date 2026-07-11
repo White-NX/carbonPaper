@@ -1,6 +1,6 @@
 use crate::{
     capture::CaptureState, monitor, monitor::MonitorState, registry_config, storage::StorageState,
-    LightweightModeState, IS_QUITTING, IS_UPDATING,
+    LightweightModeState, IS_QUITTING,
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -26,24 +26,33 @@ pub fn get_log_dir() -> String {
 }
 
 #[tauri::command]
-pub fn restart_app(app: tauri::AppHandle) {
-    tauri::process::restart(&app.env());
+pub fn restart_app(app: tauri::AppHandle, window: tauri::Window) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    tauri::process::restart(&app.env())
 }
 
 #[tauri::command]
-pub async fn trigger_test_error() {
+pub async fn trigger_test_error(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
     let _ = tokio::task::spawn_blocking(|| {
         panic!("This is a test panic triggered from Rust!");
     })
     .await;
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn exit_app(
     app: tauri::AppHandle,
+    window: tauri::Window,
     monitor_state: tauri::State<'_, MonitorState>,
     capture_state: tauri::State<'_, Arc<CaptureState>>,
 ) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
     IS_QUITTING.store(true, Ordering::Relaxed);
     monitor_state.stopping.store(true, Ordering::SeqCst);
     capture_state.stopped.store(true, Ordering::SeqCst);
@@ -67,17 +76,8 @@ pub fn set_app_language(app: tauri::AppHandle, language: String) -> Result<(), S
 }
 
 #[tauri::command]
-pub fn set_updating_flag(updating: bool) {
-    IS_UPDATING.store(updating, Ordering::Relaxed);
-}
-
-#[tauri::command]
-pub fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
-#[tauri::command]
-pub fn close_process() {
+pub fn close_process(window: tauri::Window) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
     std::process::exit(0);
 }
 
@@ -408,7 +408,14 @@ pub fn get_lightweight_config() -> Result<serde_json::Value, String> {
 
 /// 设置轻量模式配置
 #[tauri::command]
-pub fn set_lightweight_config(config: serde_json::Value) -> Result<(), String> {
+pub fn set_lightweight_config(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    config: serde_json::Value,
+) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+
     if let Some(start_hidden) = config
         .get("start_with_window_hidden")
         .and_then(|v| v.as_bool())
@@ -434,7 +441,14 @@ pub fn set_lightweight_config(config: serde_json::Value) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn open_path(path: String) -> Result<(), String> {
+pub fn open_path(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    path: String,
+) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+
     let p = std::path::Path::new(&path);
     if !p.exists() {
         return Err("Path does not exist".to_string());

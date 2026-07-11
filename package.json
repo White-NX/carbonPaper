@@ -29,6 +29,7 @@
     "verify:release-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1 -VerifyOnly",
     "test:release-assets": "node scripts/verify-release-assets.mjs",
     "pack:portable": "node scripts/pack-portable.mjs",
+    "generate:update-signing-key": "node scripts/generate-update-signing-key.mjs",
     "tauri:build": "npm run prepare:release-assets && node scripts/build-nmh.mjs --release && tauri build && node scripts/pack-portable.mjs"
   },
   "dependencies": {

@@ -32,15 +32,35 @@ export function useMonitorLifecycle({
   }, [backendStatus]);
 
   useEffect(() => {
+    let cancelled = false;
+    invoke('get_monitor_autostart')
+      .then((enabled) => {
+        if (!cancelled) setAutoStartMonitorState(Boolean(enabled));
+      })
+      .catch(() => {
+        // Keep the legacy local preference as a compatibility fallback.
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
     localStorage.setItem('autoStartMonitor', autoStartMonitor ? 'true' : 'false');
   }, [autoStartMonitor]);
 
-  const setAutoStartMonitor = useCallback((next) => {
+  const setAutoStartMonitor = useCallback(async (next) => {
+    const previous = autoStartMonitor;
     setAutoStartMonitorState(next);
-    if (next) {
-      setAutoStartSuppressed(false);
+    try {
+      await withAuth(
+        () => invoke('set_monitor_autostart', { enabled: next }),
+        { autoPrompt: true },
+      );
+      if (next) setAutoStartSuppressed(false);
+    } catch (err) {
+      setAutoStartMonitorState(previous);
+      console.warn('Failed to update monitor auto-start policy:', err);
     }
-  }, []);
+  }, [autoStartMonitor]);
 
   const handleManualStartMonitor = useCallback(() => {
     setAutoStartSuppressed(false);
@@ -71,7 +91,7 @@ export function useMonitorLifecycle({
 
   const handlePauseMonitor = useCallback(async () => {
     try {
-      await withAuth(() => invoke('pause_monitor'), { autoPrompt: true });
+      await invoke('pause_monitor');
       setMonitorPaused(true);
     } catch (err) {
       console.warn('Failed to pause monitor:', err);
@@ -80,7 +100,7 @@ export function useMonitorLifecycle({
 
   const handleResumeMonitor = useCallback(async () => {
     try {
-      await withAuth(() => invoke('resume_monitor'), { autoPrompt: true });
+      await invoke('resume_monitor');
       setMonitorPaused(false);
     } catch (err) {
       console.warn('Failed to resume monitor:', err);

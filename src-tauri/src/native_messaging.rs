@@ -5,6 +5,9 @@
 
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::credential_manager::CredentialManagerState;
 
 const NM_HOST_NAME: &str = "com.carbonpaper.nmh";
 const CHROME_REG_KEY: &str = r"Software\Google\Chrome\NativeMessagingHosts\com.carbonpaper.nmh";
@@ -244,20 +247,39 @@ pub async fn get_nm_host_status() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-pub async fn register_nm_host_chrome() -> Result<(), String> {
+pub async fn register_nm_host_chrome(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+
     // Use wildcard for allowed_origins to support any extension ID during development
     let manifest_path = write_nm_manifest(&[EXTENSION_ID])?;
     register_nm_host(CHROME_REG_KEY, &manifest_path)
 }
 
 #[tauri::command]
-pub async fn register_nm_host_edge() -> Result<(), String> {
+pub async fn register_nm_host_edge(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+
     let manifest_path = write_nm_manifest(&[EXTENSION_ID])?;
     register_nm_host(EDGE_REG_KEY, &manifest_path)
 }
 
 #[tauri::command]
-pub async fn install_browser_extension(browser: String) -> Result<serde_json::Value, String> {
+pub async fn install_browser_extension(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    browser: String,
+) -> Result<serde_json::Value, String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+
     // 1. Copy extension files
     let ext_path = copy_extension_to_data_dir()?;
 

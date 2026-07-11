@@ -18,27 +18,35 @@ describe('downloadAndInstallUpdate', () => {
   });
 
   it('reports explicit phases after download reaches 100 percent', async () => {
-    const unlisten = vi.fn();
+    const unlistenProgress = vi.fn();
+    const unlistenPhase = vi.fn();
     const progressEvents = [];
+    const listeners = {};
 
-    listen.mockResolvedValue(unlisten);
-    invoke.mockResolvedValue(undefined);
+    listen.mockImplementation(async (name, handler) => {
+      listeners[name] = handler;
+      return name === 'updater-download-progress' ? unlistenProgress : unlistenPhase;
+    });
+    invoke.mockImplementation(async (command) => {
+      if (command === 'updater_install') {
+        listeners['updater-phase']?.({ payload: { phase: 'extracting' } });
+        listeners['updater-phase']?.({ payload: { phase: 'applying' } });
+      }
+    });
 
     await downloadAndInstallUpdate((progress) => {
       progressEvents.push(progress);
     });
 
     expect(listen).toHaveBeenCalledWith('updater-download-progress', expect.any(Function));
-    expect(invoke.mock.calls.map(([command]) => command)).toEqual([
-      'updater_download',
-      'updater_extract',
-      'updater_apply',
-    ]);
+    expect(listen).toHaveBeenCalledWith('updater-phase', expect.any(Function));
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual(['updater_install']);
     expect(progressEvents).toEqual([
       { phase: 'downloading', downloaded: 0, contentLength: 0 },
       { phase: 'extracting', downloaded: 1, contentLength: 1 },
       { phase: 'applying', downloaded: 1, contentLength: 1 },
     ]);
-    expect(unlisten).toHaveBeenCalledOnce();
+    expect(unlistenProgress).toHaveBeenCalledOnce();
+    expect(unlistenPhase).toHaveBeenCalledOnce();
   });
 });

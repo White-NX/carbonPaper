@@ -28,7 +28,7 @@ export function useModelInventory({ monitorStatus }) {
 
   const handleOpenLocation = async (path) => {
     try {
-      await invoke('open_path', { path });
+      await withAuth(() => invoke('open_path', { path }), { autoPrompt: true });
     } catch (err) {
       console.error('Failed to open location:', err);
     }

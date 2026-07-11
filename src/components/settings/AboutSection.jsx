@@ -4,6 +4,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import { APP_VERSION } from '../../lib/version';
+import { withAuth } from '../../lib/auth_api';
 
 export default function AboutSection({
   checking,
@@ -176,14 +177,14 @@ export default function AboutSection({
             <section className="space-y-2">
               <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl flex flex-col gap-2">
                 <button
-                  onClick={() => invoke('trigger_test_error').catch(console.error)}
+                  onClick={() => withAuth(() => invoke('trigger_test_error'), { autoPrompt: true }).catch(console.error)}
                   className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
                 >
                   <Bug className="w-3.5 h-3.5" />
                   {t('errorWindow.triggerTest')}
                 </button>
                 <button
-                  onClick={() => invoke('debug_trigger_security_alert').catch(console.error)}
+                  onClick={() => withAuth(() => invoke('debug_trigger_security_alert'), { autoPrompt: true }).catch(console.error)}
                   className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
                 >
                   <ShieldAlert className="w-3.5 h-3.5" />

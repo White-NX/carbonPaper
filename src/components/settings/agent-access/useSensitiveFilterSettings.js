@@ -174,7 +174,10 @@ export function useSensitiveFilterSettings({ t, onError }) {
   const handleDownloadModel = async (modelName) => {
     setDownloadingModel(modelName);
     try {
-      await invoke('install_spacy_model', { modelName });
+      await withAuth(
+        () => invoke('install_spacy_model', { modelName }),
+        { autoPrompt: true },
+      );
       const models = await invoke('check_spacy_models');
       setSpacyModels(models);
     } catch (e) {

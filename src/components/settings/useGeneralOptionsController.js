@@ -90,7 +90,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
     setPowerSavingMode(next);
     onTogglePowerSaving?.(next);
     try {
-      await invoke('set_power_saving_enabled', { enabled: next });
+      await withAuth(() => invoke('set_power_saving_enabled', { enabled: next }), { autoPrompt: true });
     } catch (err) {
       console.error('Failed to set power saving mode:', err);
       setPowerSavingMode(previous);
@@ -161,7 +161,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
         await withAuth(() => invoke('toggle_game_mode', { enabled: option.gameMode }), { autoPrompt: true });
       }
       if (previousPowerSaving !== option.powerSaving) {
-        await invoke('set_power_saving_enabled', { enabled: option.powerSaving });
+        await withAuth(() => invoke('set_power_saving_enabled', { enabled: option.powerSaving }), { autoPrompt: true });
       }
     } catch (err) {
       console.error('Failed to change resource policy:', err);
@@ -174,7 +174,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
       }
       if (previousPowerSaving !== option.powerSaving) {
         try {
-          await invoke('set_power_saving_enabled', { enabled: previousPowerSaving });
+          await withAuth(() => invoke('set_power_saving_enabled', { enabled: previousPowerSaving }), { autoPrompt: true });
         } catch (rollbackErr) {
           console.error('Failed to roll back power saving mode:', rollbackErr);
         }

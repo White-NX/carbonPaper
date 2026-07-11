@@ -53,17 +53,10 @@ export function useSmartClusterControls() {
     setScDownloadError(null);
     try {
       setScDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] Downloading bge-reranker-v2-m3 (uint8, ~570MB)...`]);
-      await invoke('download_model', {
-        repo: 'onnx-community/bge-reranker-v2-m3-ONNX',
-        subdir: 'bge-reranker-v2-m3',
-        files: [
-          'config.json',
-          'tokenizer.json',
-          'tokenizer_config.json',
-          'special_tokens_map.json',
-          'onnx/model_uint8.onnx',
-        ],
-      });
+      await withAuth(
+        () => invoke('download_model', { modelId: 'bge-reranker-v2-m3' }),
+        { autoPrompt: true },
+      );
       await invoke('mark_smart_cluster_setup_done', { dismissedPermanently: false });
       await refreshSmartClusterModel();
     } catch (err) {

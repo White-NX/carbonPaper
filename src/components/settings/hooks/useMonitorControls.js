@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { withAuth } from '../../../lib/auth_api';
 
 export function useMonitorControls({
   isOpen,
@@ -43,7 +42,7 @@ export function useMonitorControls({
     monitorStatusRef.current = 'waiting';
     onManualStartMonitor?.();
     try {
-      await withAuth(() => invoke('start_monitor'), { autoPrompt: true });
+      await invoke('start_monitor');
     } catch (e) {
       console.error('Failed to start monitor', e);
       setMonitorStatus('stopped');
@@ -55,7 +54,7 @@ export function useMonitorControls({
     setMonitorStatus('loading');
     monitorStatusRef.current = 'loading';
     try {
-      await withAuth(() => invoke('stop_monitor'), { autoPrompt: true });
+      await invoke('stop_monitor');
     } catch (e) {
       console.error('Failed to stop monitor', e);
     } finally {
@@ -69,10 +68,10 @@ export function useMonitorControls({
     setMonitorStatus('loading');
     monitorStatusRef.current = 'loading';
     try {
-      await withAuth(() => invoke('stop_monitor'), { autoPrompt: true });
+      await invoke('stop_monitor');
       setMonitorStatus('waiting');
       monitorStatusRef.current = 'waiting';
-      await withAuth(() => invoke('start_monitor'), { autoPrompt: true });
+      await invoke('start_monitor');
       await checkMonitorStatus();
     } catch (e) {
       console.error('Failed to restart monitor', e);
@@ -84,7 +83,7 @@ export function useMonitorControls({
 
   const handlePauseMonitor = async () => {
     try {
-      await withAuth(() => invoke('pause_monitor'), { autoPrompt: true });
+      await invoke('pause_monitor');
       await checkMonitorStatus();
     } catch (e) {
       console.error(e);
@@ -93,7 +92,7 @@ export function useMonitorControls({
 
   const handleResumeMonitor = async () => {
     try {
-      await withAuth(() => invoke('resume_monitor'), { autoPrompt: true });
+      await invoke('resume_monitor');
       await checkMonitorStatus();
     } catch (e) {
       console.error(e);

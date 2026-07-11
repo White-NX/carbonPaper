@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Loader2, Globe, Check } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { withAuth } from '../lib/auth_api';
 
 export default function ExtensionSetupWizard({ isVisible, onComplete }) {
   const { t } = useTranslation();
@@ -31,7 +32,10 @@ export default function ExtensionSetupWizard({ isVisible, onComplete }) {
     try {
       let lastPath = '';
       for (const browser of browsers) {
-        const result = await invoke('install_browser_extension', { browser });
+        const result = await withAuth(
+          () => invoke('install_browser_extension', { browser }),
+          { autoPrompt: true },
+        );
         if (result?.extension_path) lastPath = result.extension_path;
       }
       setExtensionPath(lastPath);

@@ -160,6 +160,22 @@ impl CredentialManagerState {
         }
     }
 
+    pub fn is_recently_authenticated(&self, max_age_secs: u64) -> bool {
+        let in_foreground = *self
+            .app_in_foreground
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !in_foreground {
+            return false;
+        }
+
+        self.last_auth_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|auth_time| auth_time.elapsed().as_secs() < max_age_secs)
+            .unwrap_or(false)
+    }
+
     /// 更新认证时间戳
     pub fn update_auth_time(&self) {
         let mut last_auth = self
@@ -220,6 +236,10 @@ impl CredentialManagerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *state = in_foreground;
+        // Do not hold app_in_foreground while invalidating the session.
+        // is_session_valid acquires last_auth_time before app_in_foreground,
+        // so retaining this guard here would create an AB-BA lock inversion.
+        drop(state);
 
         // 如果进入后台，立即使会话失效（除非设置为永不超时）
         let timeout = *self
@@ -1157,6 +1177,25 @@ pub fn decrypt_row_key_with_cng(_ciphertext: &[u8]) -> Result<Vec<u8>, Credentia
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locking_ui_session_preserves_background_master_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = CredentialManagerState::new(temp.path().to_path_buf());
+        *state
+            .cached_master_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(vec![9u8; MASTER_KEY_LEN]);
+        state.update_auth_time();
+
+        state.invalidate_session();
+
+        assert!(!state.is_session_valid());
+        assert_eq!(
+            get_cached_master_key(&state),
+            Some(vec![9u8; MASTER_KEY_LEN])
+        );
+    }
 
     #[test]
     fn test_encrypt_decrypt() {

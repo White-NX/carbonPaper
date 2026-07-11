@@ -1,8 +1,10 @@
 use crate::registry_config;
-use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources, get_log_path};
+use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources};
 use anyhow::{anyhow, Context, Result};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::json;
+use std::collections::HashMap;
+use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
@@ -16,6 +18,21 @@ use tauri::Emitter; // 或者你当前代码中实际使用的类型
 
 use tokio::sync::Semaphore;
 use tokio::task;
+
+static MODEL_DOWNLOAD_LOCKS: once_cell::sync::Lazy<
+    Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn model_download_lock(model_id: &str, use_onnx: bool) -> Arc<tokio::sync::Mutex<()>> {
+    let key = format!("{}:{}", model_id, if use_onnx { "onnx" } else { "pytorch" });
+    let mut locks = MODEL_DOWNLOAD_LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks
+        .entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 /// percent-encode 用于 path segment
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -36,24 +53,134 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'\'')
     .add(b'%');
 
-fn build_file_url(repo: &str, relpath: &str) -> String {
+fn build_file_url(repo: &str, revision: &str, relpath: &str) -> String {
     let encoded = relpath
         .split('/')
         .map(|seg| utf8_percent_encode(seg, PATH_SEGMENT_ENCODE_SET).to_string())
         .collect::<Vec<_>>()
         .join("/");
-    format!("https://hf-mirror.com/{}/resolve/main/{}", repo, encoded)
+    format!(
+        "https://hf-mirror.com/{}/resolve/{}/{}",
+        repo, revision, encoded
+    )
 }
 
-/// 简易宏：从字符串字面量创建 `Vec<String>`，调用处无需逐个 `.to_string()`。
-macro_rules! svec {
-    ($($x:expr),* $(,)?) => {
-        vec![$($x.to_string()),*]
-    };
+struct ModelDownloadSpec {
+    repo: &'static str,
+    revision: &'static str,
+    root: &'static str,
+    subdir: Option<&'static str>,
+    files: &'static [&'static str],
+}
+
+fn model_download_spec(model_id: &str, use_onnx: bool) -> Option<ModelDownloadSpec> {
+    match (model_id, use_onnx) {
+        ("chinese-clip", true) => Some(ModelDownloadSpec {
+            repo: "Xenova/chinese-clip-vit-base-patch16",
+            revision: "f26904860903e70e050b8f48255e5f48401816e9",
+            root: "models-onnx",
+            subdir: None,
+            files: &[
+                "vocab.txt",
+                "config.json",
+                "preprocessor_config.json",
+                "onnx/model_q4.onnx",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+            ],
+        }),
+        ("chinese-clip", false) => Some(ModelDownloadSpec {
+            repo: "OFA-Sys/chinese-clip-vit-base-patch16",
+            revision: "36e679e65c2a2fead755ae21162091293ad37834",
+            root: "models",
+            subdir: None,
+            files: &[
+                "vocab.txt",
+                "pytorch_model.bin",
+                "config.json",
+                "preprocessor_config.json",
+            ],
+        }),
+        ("bge-small-zh", true) => Some(ModelDownloadSpec {
+            repo: "Xenova/bge-small-zh-v1.5",
+            revision: "75c43b069aac4d136ba6bc1122f995fedcfd2781",
+            root: "models-onnx",
+            subdir: Some("bge-small-zh-v1.5"),
+            files: &[
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+                "onnx/model_quantized.onnx",
+            ],
+        }),
+        ("bge-small-zh", false) => Some(ModelDownloadSpec {
+            repo: "BAAI/bge-small-zh-v1.5",
+            revision: "7999e1d3359715c523056ef9478215996d62a620",
+            root: "models",
+            subdir: Some("bge-small-zh-v1.5"),
+            files: &[
+                "config.json",
+                "pytorch_model.bin",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "vocab.txt",
+                "special_tokens_map.json",
+            ],
+        }),
+        ("minilm-l12", true) => Some(ModelDownloadSpec {
+            repo: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+            revision: "2c4055b12046f11709e9df2c122e59ffbdc2f900",
+            root: "models-onnx",
+            subdir: Some("paraphrase-multilingual-MiniLM-L12-v2"),
+            files: &[
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+                "onnx/model_quantized.onnx",
+            ],
+        }),
+        ("minilm-l12", false) => Some(ModelDownloadSpec {
+            repo: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+            revision: "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
+            root: "models",
+            subdir: Some("paraphrase-multilingual-MiniLM-L12-v2"),
+            files: &[
+                "config.json",
+                "pytorch_model.bin",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+                "sentencepiece.bpe.model",
+            ],
+        }),
+        ("bge-reranker-v2-m3", _) => Some(ModelDownloadSpec {
+            repo: "onnx-community/bge-reranker-v2-m3-ONNX",
+            revision: "6f5ff65298512715a1e669753bc754d2bc8f367b",
+            root: "models",
+            subdir: Some("bge-reranker-v2-m3"),
+            files: &[
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+                "onnx/model_uint8.onnx",
+            ],
+        }),
+        _ => None,
+    }
 }
 
 fn file_exists_nonempty(path: &std::path::Path) -> bool {
     path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+}
+
+fn model_files_complete(base: &Path, files: &[&str]) -> bool {
+    files
+        .iter()
+        .all(|file| file_exists_nonempty(&base.join(file)))
 }
 
 fn missing_files(base: &std::path::Path, files: &[&str]) -> Vec<String> {
@@ -466,6 +593,7 @@ async fn perform_download_hf_repo(
     aria2_path: PathBuf,
     download_path: PathBuf,
     repo: &str,
+    revision: &str,
     files: Vec<String>,
     concurrency: usize,
     log_file: Arc<Mutex<File>>,
@@ -520,7 +648,7 @@ async fn perform_download_hf_repo(
             }
         }
 
-        let url = build_file_url(repo, &relpath);
+        let url = build_file_url(repo, revision, &relpath);
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
@@ -561,36 +689,33 @@ async fn perform_download_hf_repo(
     }
 }
 
-fn is_safe_relative_path(rel: &str) -> bool {
-    use std::path::{Component, Path};
-    !rel.trim().is_empty()
-        && Path::new(rel)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
-}
-
-fn is_valid_repo(repo: &str) -> bool {
-    let trimmed = repo.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    !trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
-}
-
 #[tauri::command]
-/// Download model files from Hugging Face repository using aria2 with concurrency and logging.
-/// - `app`: Tauri AppHandle for emitting events
-/// - `files`: List of file paths (relative to repo root) to download
-/// - `subdir`: Optional subdirectory under `models/` to download into
-/// - `concurrency`: Optional maximum number of concurrent downloads
 pub async fn download_model(
     app: AppHandle,
-    files: Option<Vec<String>>,
-    repo: Option<&str>,
-    subdir: Option<&str>,
-    concurrency: Option<usize>,
-    model_runtime: Option<&str>,
+    window: tauri::Window,
+    model_id: String,
 ) -> Result<String, String> {
+    crate::commands::check_main_window(&window)?;
+    let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
+    let spec = model_download_spec(&model_id, use_onnx)
+        .ok_or_else(|| format!("Unsupported model id: {}", model_id))?;
+    let download_lock = model_download_lock(&model_id, use_onnx);
+    let _download_guard = download_lock.lock().await;
+
+    let mut download_path = file_in_local_appdata()
+        .ok_or_else(|| "Could not determine resource directory.".to_string())?
+        .join(spec.root);
+    if let Some(sub) = spec.subdir {
+        download_path = download_path.join(sub);
+    }
+    std::fs::create_dir_all(&download_path).map_err(|e| e.to_string())?;
+
+    // Bootstrap downloads are idempotent. Existing complete models require no
+    // network or authentication and should not break a partially restored setup.
+    if model_files_complete(&download_path, spec.files) {
+        return Ok(download_path.to_string_lossy().to_string());
+    }
+
     if !registry_config::get_bool("network_enabled").unwrap_or(true) {
         return Err("Network features are disabled".to_string());
     }
@@ -600,88 +725,29 @@ pub async fn download_model(
             .to_string()
     })?;
 
-    // Validate inputs
-    if let Some(sub) = subdir {
-        if !is_safe_relative_path(sub) {
-            return Err("Invalid subdir relative path".to_string());
-        }
-    }
-    if let Some(r) = repo {
-        if !is_valid_repo(r) {
-            return Err("Invalid model repository name".to_string());
-        }
-    }
-
-    // prepare cache dir. Core ONNX models are isolated from PyTorch weights to
-    // avoid mixing incompatible config/tokenizer files in the same directory.
-    let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
-    let runtime = model_runtime.unwrap_or("").trim().to_ascii_lowercase();
-    let use_onnx_root =
-        runtime == "onnx" || (runtime.is_empty() && use_onnx && subdir.is_none() && repo.is_none());
-    let mut download_path = file_in_local_appdata()
-        .ok_or_else(|| "Could not determine resource directory.".to_string())?
-        .join(if use_onnx_root {
-            "models-onnx"
-        } else {
-            "models"
-        });
-    if let Some(sub) = subdir {
-        download_path = download_path.join(sub);
-    }
-    std::fs::create_dir_all(&download_path).map_err(|e| e.to_string())?;
-
     // prepare log file under log path
-    let log_dir = get_log_path();
-    let log_path = log_dir;
+    let runtime = if use_onnx { "onnx" } else { "pytorch" };
+    let log_path = env::temp_dir().join(format!(
+        "carbonpaper_model_{}_{}.log",
+        model_id.replace(|c: char| !c.is_ascii_alphanumeric(), "_"),
+        runtime
+    ));
     if log_path.exists() {
         std::fs::remove_file(&log_path).map_err(|e| e.to_string())?;
     }
     let f = File::create(&log_path).map_err(|e| e.to_string())?;
     let log_file = Arc::new(Mutex::new(f));
 
-    let conc = concurrency.unwrap_or(8);
-    let repo = repo.unwrap_or_else(|| {
-        if use_onnx_root {
-            "Xenova/chinese-clip-vit-base-patch16"
-        } else {
-            "OFA-Sys/chinese-clip-vit-base-patch16"
-        }
-    });
-    let files = files.unwrap_or_else(|| {
-        if use_onnx_root {
-            svec![
-                "vocab.txt",
-                "config.json",
-                "preprocessor_config.json",
-                "onnx/model_q4.onnx",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "special_tokens_map.json",
-            ]
-        } else {
-            svec![
-                "vocab.txt",
-                "pytorch_model.bin",
-                "config.json",
-                "preprocessor_config.json",
-            ]
-        }
-    });
-
-    // Validate each file relative path
-    for file in &files {
-        if !is_safe_relative_path(file) {
-            return Err(format!("Invalid file relative path: {}", file));
-        }
-    }
+    let files = spec.files.iter().map(|file| (*file).to_string()).collect();
 
     match perform_download_hf_repo(
         app.clone(),
         aria2,
         download_path,
-        repo,
+        spec.repo,
+        spec.revision,
         files,
-        conc,
+        8,
         log_file,
     )
     .await
@@ -896,29 +962,31 @@ mod tests {
     }
 
     #[test]
-    fn test_is_safe_relative_path() {
-        assert!(is_safe_relative_path("onnx/model.onnx"));
-        assert!(is_safe_relative_path("config.json"));
-        assert!(is_safe_relative_path("a/b/c"));
-
-        assert!(!is_safe_relative_path(""));
-        assert!(!is_safe_relative_path(" "));
-        assert!(!is_safe_relative_path(".."));
-        assert!(!is_safe_relative_path("../a"));
-        assert!(!is_safe_relative_path("a/../b"));
-        assert!(!is_safe_relative_path("/etc/passwd"));
-        assert!(!is_safe_relative_path("C:\\Windows\\temp"));
-        assert!(!is_safe_relative_path("\\\\?\\C:\\Windows"));
+    fn test_model_catalog_rejects_unknown_ids_and_pins_revisions() {
+        assert!(model_download_spec("unknown", true).is_none());
+        for model_id in [
+            "chinese-clip",
+            "bge-small-zh",
+            "minilm-l12",
+            "bge-reranker-v2-m3",
+        ] {
+            let spec = model_download_spec(model_id, true).expect("known model");
+            assert_eq!(spec.revision.len(), 40);
+            assert!(!spec.files.is_empty());
+            assert!(spec.files.iter().all(|file| !file.contains("..")));
+        }
     }
 
     #[test]
-    fn test_is_valid_repo() {
-        assert!(is_valid_repo("Xenova/chinese-clip-vit-base-patch16"));
-        assert!(is_valid_repo("OFA-Sys/chinese-clip-vit-base-patch16"));
+    fn model_completeness_requires_every_file_to_be_nonempty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path();
+        std::fs::write(base.join("a.bin"), b"ready").expect("write a");
+        std::fs::write(base.join("b.bin"), b"").expect("write b");
 
-        assert!(!is_valid_repo(""));
-        assert!(!is_valid_repo("  "));
-        assert!(!is_valid_repo("repo name"));
-        assert!(!is_valid_repo("repo\nname"));
+        assert!(!model_files_complete(base, &["a.bin", "b.bin"]));
+
+        std::fs::write(base.join("b.bin"), b"ready").expect("rewrite b");
+        assert!(model_files_complete(base, &["a.bin", "b.bin"]));
     }
 }
