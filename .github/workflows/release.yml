@@ -18,7 +18,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.18.0
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -40,11 +40,26 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Restore release asset cache
+        uses: actions/cache@v4
+        with:
+          path: .release-assets
+          key: release-assets-${{ runner.os }}-${{ hashFiles('scripts/release-assets/ocr-models.json') }}
+
       - name: Prepare release assets
         run: npm run prepare:release-assets
 
       - name: Build NMH binary
         run: npm run build:nmh:release
+
+      - name: Build Rust OCR worker
+        run: npm run build:ml:release
+
+      - name: Smoke test bundled Rust OCR runtime
+        run: npm run verify:ml-runtime
+
+      - name: Verify staged release assets
+        run: npm run test:release-assets
 
       - name: Build Tauri draft release
         uses: tauri-apps/tauri-action@v0
@@ -56,6 +71,9 @@ jobs:
 
       - name: Build portable zip
         run: npm run pack:portable
+
+      - name: Verify release assets after packaging
+        run: npm run test:release-assets && npm run verify:release-bundles
 
       - name: Fetch Release Notes
         env:
@@ -111,6 +129,8 @@ jobs:
           "CARBONPAPER_FORWARD_SMOKE_VERSION=$futureVersion" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           node scripts/bump-version.mjs $futureVersion --label ""
+          npm run build:ml:release
+          npm run verify:ml-runtime
           npm run tauri -- build --no-bundle
           npm run pack:portable
 

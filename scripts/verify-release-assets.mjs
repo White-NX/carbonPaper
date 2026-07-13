@@ -37,6 +37,14 @@ function sha256(relPath) {
     .digest('hex');
 }
 
+function fileSize(relPath) {
+  const fullPath = path.join(root, relPath);
+  if (!existsSync(fullPath)) {
+    fail(`Missing ${relPath}`);
+  }
+  return readFileSync(fullPath).length;
+}
+
 function assertEqual(actual, expected, label) {
   if (actual !== expected) {
     fail(`${label}: expected ${expected}, got ${actual}`);
@@ -67,6 +75,28 @@ for (const asset of assets) {
   console.log(`${asset.name} verified: ${asset.sha256}`);
 }
 
+const ocrManifestPath = path.join('scripts', 'release-assets', 'ocr-models.json');
+const ocrManifest = JSON.parse(readText(ocrManifestPath));
+assertEqual(ocrManifest.model_id, 'ppocrv5-ch-mobile', 'OCR model id');
+assertEqual(ocrManifest.revision, 'r1', 'OCR model revision');
+
+const generatedModelPaths = [];
+for (const asset of ocrManifest.files) {
+  const cachePath = path.join('.release-assets', 'ocr', ocrManifest.directory, asset.name);
+  const bundledPath = path.join('src-tauri', 'pre-bundle', ocrManifest.bundle_path, asset.name);
+  assertEqual(fileSize(cachePath), asset.size, `${asset.name} cache size`);
+  assertEqual(sha256(cachePath), asset.sha256, `${asset.name} cache checksum`);
+  assertEqual(fileSize(bundledPath), asset.size, `${asset.name} pre-bundle size`);
+  assertEqual(sha256(bundledPath), asset.sha256, `${asset.name} pre-bundle checksum`);
+  generatedModelPaths.push(cachePath, bundledPath);
+  console.log(`Rust OCR model asset verified: ${asset.name} ${asset.sha256}`);
+}
+assertEqual(
+  sha256(path.join('THIRD_PARTY_NOTICES.md')),
+  sha256(path.join('src-tauri', 'pre-bundle', 'THIRD_PARTY_NOTICES.md')),
+  'third-party notice pre-bundle copy',
+);
+
 const buildRs = readText(path.join('src-tauri', 'build.rs'));
 assertIncludes(buildRs, 'Path::new("../python-3.12.10-amd64.exe")', 'build.rs Python source path');
 assertIncludes(buildRs, 'Path::new("pre-bundle/python-3.12.10-amd64.exe")', 'build.rs Python destination path');
@@ -77,23 +107,46 @@ assertIncludes(buildRs, 'cargo:rerun-if-changed=../aria2c.exe', 'build.rs aria2 
 
 const tauriConf = JSON.parse(readText(path.join('src-tauri', 'tauri.conf.json')));
 assertEqual(tauriConf.bundle?.resources?.['pre-bundle'], '.', 'Tauri pre-bundle resource mapping');
+assertIncludes(tauriConf.build?.beforeBuildCommand ?? '', 'npm run test:release-assets', 'Tauri release asset build gate');
+
+const mlBuild = readText(path.join('scripts', 'build-ml.mjs'));
+assertIncludes(mlBuild, "'carbonpaper-ml.exe'", 'ML worker build output');
+assertIncludes(mlBuild, "path.join(tauriDir, 'target', profile", 'ML worker target destination');
+assertIncludes(mlBuild, "rmSync(path.join(tauriDir, 'pre-bundle', 'carbonpaper-ml.exe')", 'ML worker stale pre-bundle cleanup');
+
+const nmhBuild = readText(path.join('scripts', 'build-nmh.mjs'));
+assertIncludes(nmhBuild, "path.join(tauriDir, 'target', profile", 'NMH target destination');
+assertIncludes(nmhBuild, "rmSync(path.join(tauriDir, 'pre-bundle', 'carbonpaper-nmh.exe')", 'NMH stale pre-bundle cleanup');
 
 const packPortable = readText(path.join('scripts', 'pack-portable.mjs'));
 assertIncludes(packPortable, "const preBundleDir = path.join(tauriDir, 'pre-bundle');", 'portable pre-bundle input');
 assertIncludes(packPortable, 'await walkDir(preBundleDir, \'\');', 'portable recursive pre-bundle packaging');
+assertIncludes(packPortable, "'carbonpaper-ml.exe'", 'portable required ML worker');
+assertIncludes(packPortable, 'ocr-models/ppocrv5-ch-mobile-r1', 'portable required OCR model directory');
 
 const releaseWorkflow = readText(path.join('.github', 'workflows', 'release.yml'));
 assertIncludes(releaseWorkflow, 'npm run prepare:release-assets', 'release workflow asset preparation');
+assertIncludes(releaseWorkflow, 'npm run build:ml:release', 'release workflow ML worker build');
+assertIncludes(releaseWorkflow, 'npm run test:release-assets', 'release workflow asset verification');
 assertBefore(releaseWorkflow, 'npm run prepare:release-assets', 'Build Tauri draft release', 'release workflow order');
+assertBefore(releaseWorkflow, 'npm run build:ml:release', 'Build Tauri draft release', 'release workflow ML order');
+assertBefore(releaseWorkflow, 'npm run test:release-assets', 'Build Tauri draft release', 'release workflow verification order');
 
 const packageJson = JSON.parse(readText('package.json'));
 assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run prepare:release-assets', 'local tauri:build asset preparation');
+assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run build:ml:release', 'local tauri:build ML worker preparation');
+assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run verify:ml-runtime', 'local tauri:build ML worker smoke test');
+assertIncludes(packageJson.scripts?.['verify:ml-runtime'] ?? '', '--verify-models', 'ML worker verification command');
+assertIncludes(packageJson.scripts?.['verify:release-bundles'] ?? '', 'verify-release-bundles.ps1', 'release bundle verification command');
+assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run verify:release-bundles', 'local bundle verification gate');
 assertIncludes(packageJson.scripts?.['prepare:release-assets'] ?? '', 'scripts/prepare-release-assets.ps1', 'prepare script command');
+assertIncludes(packageJson.scripts?.['prepare:ocr-assets'] ?? '', '-OcrOnly', 'OCR-only preparation command');
 
 const gitignore = readText('.gitignore');
 for (const asset of assets) {
   assertIncludes(gitignore, `/${asset.file}`, `.gitignore ${asset.file}`);
 }
+assertIncludes(gitignore, '/.release-assets/', '.gitignore release asset cache');
 
 const trackedAssets = execFileSync('git', ['ls-files', '--', ...assets.map((asset) => asset.file)], {
   cwd: root,
@@ -101,6 +154,14 @@ const trackedAssets = execFileSync('git', ['ls-files', '--', ...assets.map((asse
 }).trim();
 if (trackedAssets) {
   fail(`Release asset binaries are still tracked:\n${trackedAssets}`);
+}
+
+const trackedGeneratedModels = execFileSync('git', ['ls-files', '--', ...generatedModelPaths], {
+  cwd: root,
+  encoding: 'utf8',
+}).trim();
+if (trackedGeneratedModels) {
+  fail(`Generated OCR model binaries are still tracked:\n${trackedGeneratedModels}`);
 }
 
 console.log('Release asset build and packaging checks passed.');

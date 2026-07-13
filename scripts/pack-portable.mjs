@@ -30,13 +30,13 @@ if (!existsSync(mainExe)) {
 }
 filesToPack.push({ src: mainExe, dest: `${productName}.exe` });
 
-// 1b. NMH (Native Messaging Host) binary
-const nmhExe = path.join(releaseDir, 'carbonpaper-nmh.exe');
-if (existsSync(nmhExe)) {
-  filesToPack.push({ src: nmhExe, dest: 'carbonpaper-nmh.exe' });
-  console.log('  Including: carbonpaper-nmh.exe');
-} else {
-  console.warn('  Warning: carbonpaper-nmh.exe not found, skipping');
+for (const binaryName of ['carbonpaper-ml.exe', 'carbonpaper-nmh.exe']) {
+  const binaryPath = path.join(releaseDir, binaryName);
+  if (!existsSync(binaryPath)) {
+    console.error(`Required portable binary not found: ${binaryPath}`);
+    process.exit(1);
+  }
+  filesToPack.push({ src: binaryPath, dest: binaryName });
 }
 
 // 2. All pre-bundle resources
@@ -55,6 +55,22 @@ async function walkDir(dir, prefix) {
 
 if (existsSync(preBundleDir)) {
   await walkDir(preBundleDir, '');
+}
+
+const requiredPortableEntries = [
+  'carbonpaper-ml.exe',
+  'carbonpaper-nmh.exe',
+  'THIRD_PARTY_NOTICES.md',
+  'ocr-models/ppocrv5-ch-mobile-r1/ch_PP-OCRv5_det_mobile.onnx',
+  'ocr-models/ppocrv5-ch-mobile-r1/ch_PP-OCRv5_rec_mobile.onnx',
+  'ocr-models/ppocrv5-ch-mobile-r1/ppocrv5_dict.txt',
+];
+const packedDestinations = new Set(filesToPack.map(({ dest }) => dest.replace(/\\/g, '/')));
+for (const requiredEntry of requiredPortableEntries) {
+  if (!packedDestinations.has(requiredEntry)) {
+    console.error(`Required portable runtime resource not found: ${requiredEntry}`);
+    process.exit(1);
+  }
 }
 
 // Simple ZIP creator using Node.js built-ins

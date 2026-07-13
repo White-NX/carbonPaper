@@ -9,6 +9,46 @@ use walkdir::WalkDir;
 
 const UPDATE_PUBLIC_KEY_FILE: &str = "update-public-key.txt";
 
+fn prune_monitor_staging(prebundle_dir: &Path) {
+    if !prebundle_dir.starts_with(Path::new("pre-bundle")) || !prebundle_dir.exists() {
+        return;
+    }
+    let mut stale = WalkDir::new(prebundle_dir)
+        .contents_first(true)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path == prebundle_dir {
+                return None;
+            }
+            let name = path.file_name()?.to_string_lossy();
+            let remove_dir = path.is_dir()
+                && (name == "tests"
+                    || name == "tests_tmp"
+                    || name == "__pycache__"
+                    || name == ".pytest_cache"
+                    || name == ".tmp_pytest"
+                    || name.starts_with(".pytest"));
+            let remove_file = path.is_file()
+                && (name.ends_with(".pyc")
+                    || name == "test.py"
+                    || name.starts_with("test_")
+                    || name.ends_with("_test.py")
+                    || name.contains("_test_"));
+            (remove_dir || remove_file).then(|| path.to_path_buf())
+        })
+        .collect::<Vec<_>>();
+    stale.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in stale {
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 fn configure_update_public_key() {
     let path = Path::new(UPDATE_PUBLIC_KEY_FILE);
     println!("cargo:rerun-if-changed={}", UPDATE_PUBLIC_KEY_FILE);
@@ -56,6 +96,7 @@ fn main() {
 
     // --- 2. 确保临时目录存在（避免每次清空导致热重载循环） ---
     fs::create_dir_all(prebundle_dir).expect("Failed to create pre-bundle directory");
+    prune_monitor_staging(prebundle_dir);
 
     // 只在内容变更时复制，避免无谓的文件时间戳抖动触发重建
     fn copy_file_if_needed(src: &Path, dst: &Path) {
@@ -92,10 +133,14 @@ fn main() {
         // 检查是否是需要被完全排除的文件夹
         if path.is_dir() {
             let file_name = path.file_name().unwrap_or_default();
+            let file_name = file_name.to_string_lossy();
             if file_name == ".venv"
                 || file_name == ".pytest_cache"
                 || file_name == "__pycache__"
                 || file_name == "tests"
+                || file_name == "tests_tmp"
+                || file_name == ".tmp_pytest"
+                || file_name.starts_with(".pytest")
             {
                 // 如果是，返回 false，`walkdir` 将不会进入这个目录
                 // 排除 tests/ 是为了不把测试代码打进生产 monitor.pyz
@@ -143,6 +188,16 @@ fn main() {
             // 规则 3: 排除 `chroma_db` 文件夹内的所有文件
             if src_path.starts_with(source_dir.join("chroma_db")) {
                 should_copy = false;
+            }
+
+            if let Some(file_name) = src_path.file_name().and_then(|name| name.to_str()) {
+                if file_name == "test.py"
+                    || file_name.starts_with("test_")
+                    || file_name.ends_with("_test.py")
+                    || file_name.contains("_test_")
+                {
+                    should_copy = false;
+                }
             }
 
             // 如果满足复制条件，就执行复制

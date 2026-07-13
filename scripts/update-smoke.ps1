@@ -32,6 +32,51 @@ function Read-ProjectVersion {
     return [string]$tauriConf.version
 }
 
+function Assert-UpdatedRustOcrRuntime {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string]$InstallDir
+    )
+
+    $worker = Join-Path $InstallDir "carbonpaper-ml.exe"
+    if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) {
+        throw "Updated installation is missing carbonpaper-ml.exe: $worker"
+    }
+
+    $manifestPath = Join-Path $RepoRoot "scripts\release-assets\ocr-models.json"
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $bundleDir = Join-Path $InstallDir ([string]$manifest.bundle_path).Replace('/', '\')
+    foreach ($asset in $manifest.files) {
+        $path = Join-Path $bundleDir ([string]$asset.name)
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Updated installation is missing Rust OCR model asset: $path"
+        }
+        $size = (Get-Item -LiteralPath $path).Length
+        if ($size -ne [long]$asset.size) {
+            throw "Updated Rust OCR model asset has wrong size: $path expected=$($asset.size) actual=$size"
+        }
+        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+        if ($hash -ne ([string]$asset.sha256).ToLowerInvariant()) {
+            throw "Updated Rust OCR model asset checksum mismatch: $path expected=$($asset.sha256) actual=$hash"
+        }
+    }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $verifyOutput = & $worker --verify-models --model-dir $bundleDir 2>&1
+        $workerExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($workerExitCode -ne 0) {
+        throw "Updated Rust OCR runtime failed model verification (exit $workerExitCode): $($verifyOutput -join "`n")"
+    }
+    if (($verifyOutput -join "`n") -notmatch '"model_id":"ppocrv5-ch-mobile"') {
+        throw "Updated Rust OCR runtime returned an unexpected verification result: $($verifyOutput -join "`n")"
+    }
+}
+
 function Compare-SemVerCore {
     param(
         [Parameter(Mandatory = $true)][string]$Left,
@@ -493,6 +538,7 @@ try {
                 if ($result.current_version -ne $ExpectedAppVersion) {
                     throw "Updated app reported version $($result.current_version), expected $ExpectedAppVersion."
                 }
+                Assert-UpdatedRustOcrRuntime -RepoRoot $repoRoot -InstallDir (Split-Path -Parent $oldExe)
                 if (Test-Path -LiteralPath $updateErrorLog) {
                     $updateError = Get-Content -LiteralPath $updateErrorLog -Raw
                     throw "Update script wrote update_error.log: $updateError"

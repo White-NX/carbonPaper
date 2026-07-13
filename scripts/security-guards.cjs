@@ -164,6 +164,11 @@ const COMMAND_TIERS = {
   'commands::utility::open_path': 'session_required',
   'power::get_power_saving_status': 'public',
   'power::set_power_saving_enabled': 'session_required',
+  'ml_runtime::get_ml_ocr_status': 'public',
+  'ml_runtime::restart_ml_ocr_worker': 'session_required',
+  'ml_runtime::get_rust_ocr_model_status': 'public',
+  'ml_runtime::download_rust_ocr_model': 'session_required',
+  'ml_runtime::retry_failed_ocr': 'session_required',
 };
 
 function read(file) {
@@ -236,7 +241,7 @@ function commandFunctionBody(command) {
 }
 
 function checkCommandGuardImplementations() {
-  const acceptedSessionGuards = /\b(check_auth_required|check_recent_auth_required|authenticated_monitor_command)\b/;
+  const acceptedSessionGuards = /\b(check_auth_required|authenticated_monitor_command)\b/;
   const missing = Object.entries(COMMAND_TIERS)
     .filter(([, tier]) => tier === 'session_required')
     .filter(([command]) => !acceptedSessionGuards.test(commandFunctionBody(command)))
@@ -256,6 +261,9 @@ function checkCommandGuardImplementations() {
     'commands::utility::set_lightweight_config',
     'commands::utility::open_path',
     'power::set_power_saving_enabled',
+    'ml_runtime::restart_ml_ocr_worker',
+    'ml_runtime::download_rust_ocr_model',
+    'ml_runtime::retry_failed_ocr',
     'monitor::start_monitor',
     'monitor::stop_monitor',
     'monitor::pause_monitor',
