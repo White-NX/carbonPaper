@@ -133,6 +133,7 @@ const COMMAND_TIERS = {
   'commands::utility::mark_smart_cluster_setup_done': 'public',
   'commands::utility::get_extension_enhancement_config': 'public',
   'commands::utility::set_extension_enhancement': 'session_required',
+  'commands::utility::get_nmh_sessions': 'public',
   'commands::smart_cluster::smart_cluster_list': 'session_required',
   'commands::smart_cluster::smart_cluster_get': 'session_required',
   'commands::smart_cluster::smart_cluster_get_examples': 'session_required',

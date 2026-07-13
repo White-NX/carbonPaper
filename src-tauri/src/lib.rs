@@ -824,6 +824,18 @@ pub fn run() {
                     if let Err(e) = storage.initialize() {
                         tracing::error!("Failed to initialize storage: {}", e);
                     } else {
+                        match storage.discard_incomplete_ocr_postprocess() {
+                            Ok(discarded) if discarded > 0 => tracing::info!(
+                                "[ML:POSTPROCESS] discarded {} incomplete rows from the previous application process",
+                                discarded
+                            ),
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(
+                                "[ML:POSTPROCESS] failed to discard incomplete startup rows: {}",
+                                error
+                            ),
+                        }
+
                         let storage_clone = storage.inner().clone();
                         std::thread::spawn(move || {
                             StorageState::backfill_plaintext_process_names(storage_clone);
@@ -835,7 +847,7 @@ pub fn run() {
                         });
                         let app_handle_postprocess = app.handle().clone();
                         tauri::async_runtime::spawn(async move {
-                            ml_runtime::run_postprocess_recovery_loop(app_handle_postprocess).await;
+                            ml_runtime::run_postprocess_retry_loop(app_handle_postprocess).await;
                         });
                     }
                 } else {
@@ -856,6 +868,8 @@ pub fn run() {
                     Ok(false) => {}
                     Err(e) => tracing::warn!("Extension sync check failed: {}", e),
                 }
+
+                commands::utility::migrate_extension_enhancement_config();
 
                 {
                     let data_dir_clone = data_dir.clone();
@@ -1092,6 +1106,7 @@ pub fn run() {
             commands::utility::mark_smart_cluster_setup_done,
             commands::utility::get_extension_enhancement_config,
             commands::utility::set_extension_enhancement,
+            commands::utility::get_nmh_sessions,
             // Smart Cluster commands
             commands::smart_cluster::smart_cluster_list,
             commands::smart_cluster::smart_cluster_get,

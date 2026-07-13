@@ -1354,7 +1354,78 @@ async fn process_nmh_request(
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
 
     match command {
+        "register_nmh" => {
+            let browser_pid = req.get("browser_pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let nmh_pid = req.get("nmh_pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let cmd_pipe_name = req
+                .get("cmd_pipe_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let browser_exe_path = req
+                .get("browser_exe_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let browser_exe_name = req
+                .get("browser_exe_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if browser_pid == 0 || nmh_pid == 0 || !cmd_pipe_name.starts_with(NMH_CMD_PIPE_PREFIX) {
+                return StorageResponse::error("Invalid register_nmh request");
+            }
+
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            {
+                let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+                upsert_session(
+                    &mut sessions,
+                    NmhSession {
+                        browser_pid,
+                        browser_exe_path,
+                        browser_exe_name: browser_exe_name.clone(),
+                        nmh_pid,
+                        cmd_pipe_name,
+                        registered_at_ms: now_ms,
+                        last_seen_ms: now_ms,
+                    },
+                );
+            }
+            tracing::info!(
+                "NMH session registered: browser={} pid={} nmh_pid={}",
+                browser_exe_name,
+                browser_pid,
+                nmh_pid
+            );
+            StorageResponse::success(serde_json::json!({"registered": true}))
+        }
+        "unregister_nmh" => {
+            let nmh_pid = req.get("nmh_pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let cmd_pipe_name = req
+                .get("cmd_pipe_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            {
+                let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+                remove_session(&mut sessions, nmh_pid, cmd_pipe_name);
+            }
+            tracing::info!("NMH session unregistered: nmh_pid={}", nmh_pid);
+            StorageResponse::success(serde_json::json!({"unregistered": true}))
+        }
         "save_extension_screenshot" => {
+            // Keep the sender's session fresh (liveness signal)
+            if let Some(nmh_pid) = req.get("nmh_pid").and_then(|v| v.as_u64()) {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+                for s in sessions.iter_mut() {
+                    if s.nmh_pid == nmh_pid as u32 {
+                        s.last_seen_ms = now_ms;
+                    }
+                }
+            }
+
             // Check if capture is paused
             if capture_state
                 .paused
@@ -1541,46 +1612,164 @@ async fn process_nmh_request(
     }
 }
 
-/// Check if extension enhancement is enabled for a given browser process name.
-/// Reads from Windows registry settings.
-fn is_extension_enhanced_browser(browser_name: &str) -> bool {
-    let lower = browser_name.to_lowercase();
-    if lower.contains("chrome") {
-        crate::registry_config::get_bool("extension_enhanced_chrome").unwrap_or(false)
-    } else if lower.contains("edge") || lower.contains("msedge") {
-        crate::registry_config::get_bool("extension_enhanced_edge").unwrap_or(false)
-    } else {
-        false
+/// Check if extension enhancement is enabled (single global toggle).
+fn is_extension_enhanced_browser(_browser_name: &str) -> bool {
+    extension_enhancement_enabled()
+}
+
+/// The single global "browser extension enhancement" toggle.
+fn extension_enhancement_enabled() -> bool {
+    crate::registry_config::get_bool("extension_enhanced_global").unwrap_or(false)
+}
+
+// ==================== NMH session table ====================
+//
+// Each NMH instance registers itself at runtime with the browser main
+// process it belongs to (PID + exe path) and a random-suffix command pipe.
+// The capture loop routes capture requests by matching the foreground
+// window's PID against this table — no browser-name lists anywhere, so any
+// Chromium-based browser works without per-browser support code.
+
+/// A live NMH registration: one browser instance with the extension connected.
+#[derive(Debug, Clone, Serialize)]
+pub struct NmhSession {
+    pub browser_pid: u32,
+    pub browser_exe_path: String,
+    pub browser_exe_name: String,
+    pub nmh_pid: u32,
+    pub cmd_pipe_name: String,
+    pub registered_at_ms: i64,
+    pub last_seen_ms: i64,
+}
+
+static NMH_SESSIONS: once_cell::sync::Lazy<std::sync::Mutex<Vec<NmhSession>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Only accept command pipes created by our NMH (random-suffix namespace).
+const NMH_CMD_PIPE_PREFIX: &str = r"\\.\pipe\carbon_nmh_cmd_r_";
+
+/// Insert or replace a session, keyed by nmh_pid (an NMH re-registering —
+/// e.g. after an app restart rotated the token — replaces its old entry).
+fn upsert_session(sessions: &mut Vec<NmhSession>, session: NmhSession) {
+    sessions.retain(|s| s.nmh_pid != session.nmh_pid);
+    sessions.push(session);
+}
+
+/// Remove a session by nmh_pid + cmd_pipe_name.
+fn remove_session(sessions: &mut Vec<NmhSession>, nmh_pid: u32, cmd_pipe_name: &str) {
+    sessions.retain(|s| !(s.nmh_pid == nmh_pid && s.cmd_pipe_name == cmd_pipe_name));
+}
+
+/// Pick the session serving a foreground window: exact browser-PID match
+/// first; otherwise same exe path + ancestor check (covers windows owned by
+/// a child process of the browser main process). Ties (multi-profile: several
+/// NMHs on one browser process) go to the most recently seen session.
+fn select_session<'a>(
+    sessions: &'a [NmhSession],
+    window_pid: u32,
+    process_path: &str,
+    is_descendant: impl Fn(u32, u32) -> bool,
+) -> Option<&'a NmhSession> {
+    let exact = sessions
+        .iter()
+        .filter(|s| s.browser_pid == window_pid)
+        .max_by_key(|s| s.last_seen_ms);
+    if exact.is_some() {
+        return exact;
+    }
+    if process_path.is_empty() {
+        return None;
+    }
+    sessions
+        .iter()
+        .filter(|s| {
+            s.browser_exe_path.eq_ignore_ascii_case(process_path)
+                && is_descendant(window_pid, s.browser_pid)
+        })
+        .max_by_key(|s| s.last_seen_ms)
+}
+
+/// Query the full executable path of a process by PID (empty on failure).
+fn query_process_image_path(pid: u32) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        if result.is_ok() && size > 0 {
+            Some(String::from_utf16_lossy(&buf[..size as usize]))
+        } else {
+            None
+        }
     }
 }
 
-/// Compute deterministic NMH command pipe name for a given browser type.
-/// Must match the formula in nmh.rs `compute_nmh_cmd_pipe_name`.
-pub fn compute_nmh_cmd_pipe_name(browser_type: &str) -> Result<String, String> {
-    let sid = get_current_user_sid()?;
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{}carbonpaper_nmh_cmd_salt_{}", sid, browser_type));
-    let hash = hasher.finalize();
-    let hex_hash = hex::encode(hash);
-    Ok(format!(r"\\.\pipe\carbon_nmh_cmd_{}", &hex_hash[..16]))
+/// Drop sessions whose browser process is gone, or whose PID now belongs to
+/// a different executable (PID-reuse guard).
+pub fn prune_dead_sessions() {
+    let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    sessions.retain(|s| match query_process_image_path(s.browser_pid) {
+        Some(path) => {
+            s.browser_exe_path.is_empty() || path.eq_ignore_ascii_case(&s.browser_exe_path)
+        }
+        None => false,
+    });
 }
 
-/// Request the browser extension to capture the current tab.
-/// Opens the NMH command pipe and sends a `request_capture` command.
-/// Fails silently (returns Err) if the NMH is not running — this is expected.
-pub async fn request_extension_capture(process_name: &str) -> Result<(), String> {
-    let browser_type = process_name_to_browser_type(process_name);
-    let pipe_name = compute_nmh_cmd_pipe_name(&browser_type)?;
+/// Snapshot of live sessions (pruned first) for the settings UI.
+pub fn nmh_sessions_snapshot() -> Vec<NmhSession> {
+    prune_dead_sessions();
+    NMH_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
-    tracing::info!(
-        "request_extension_capture: process={} browser_type={} pipe={}",
-        process_name,
-        browser_type,
+/// Find the NMH session that should capture for the given foreground window,
+/// if extension enhancement is enabled. Used by the capture loop.
+pub fn find_nmh_session_for_pid(window_pid: u32, process_path: &str) -> Option<NmhSession> {
+    if !extension_enhancement_enabled() {
+        return None;
+    }
+    {
+        let sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if sessions.is_empty() {
+            return None;
+        }
+    }
+    prune_dead_sessions();
+    let sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    select_session(&sessions, window_pid, process_path, is_pid_descendant_of).cloned()
+}
+
+/// Request the browser extension behind `session` to capture its current tab.
+/// Opens the session's command pipe and sends a `request_capture` command.
+/// On failure the session is dropped from the table (dead pipe) so the
+/// capture loop falls back to normal screen capture immediately.
+pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(), String> {
+    let pipe_name = session.cmd_pipe_name.clone();
+
+    tracing::debug!(
+        "request_extension_capture: browser={} pid={} pipe={}",
+        session.browser_exe_name,
+        session.browser_pid,
         pipe_name
     );
 
     // Run blocking pipe I/O on a separate thread
-    tokio::task::spawn_blocking(move || {
+    let result: Result<(), String> = tokio::task::spawn_blocking(move || {
         use std::fs::OpenOptions;
         use std::io::{Read, Write};
 
@@ -1599,37 +1788,32 @@ pub async fn request_extension_capture(process_name: &str) -> Result<(), String>
         pipe.flush()
             .map_err(|e| format!("Pipe flush failed: {}", e))?;
 
-        // Read response (best-effort, don't care much about content)
+        // The NMH replies ok only after successfully forwarding the request
+        // to the extension over its Native Messaging port.
         let mut response_buf = vec![0u8; 1024];
-        let _ = pipe.read(&mut response_buf);
-
-        Ok(())
+        let n = pipe
+            .read(&mut response_buf)
+            .map_err(|e| format!("Pipe read failed: {}", e))?;
+        let response: serde_json::Value = serde_json::from_slice(&response_buf[..n])
+            .map_err(|e| format!("Invalid NMH cmd response: {}", e))?;
+        if response.get("status").and_then(|s| s.as_str()) == Some("ok") {
+            Ok(())
+        } else {
+            Err(response
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("NMH reported failure")
+                .to_string())
+        }
     })
     .await
-    .map_err(|e| format!("Task join failed: {}", e))?
-}
+    .map_err(|e| format!("Task join failed: {}", e))?;
 
-/// Map process name (e.g. "chrome.exe") to browser type string for pipe name computation.
-fn process_name_to_browser_type(process_name: &str) -> String {
-    let lower = process_name.to_lowercase();
-    if lower.contains("msedge") || lower.contains("edge") {
-        "edge".to_string()
-    } else {
-        "chrome".to_string()
+    if result.is_err() {
+        let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        remove_session(&mut sessions, session.nmh_pid, &session.cmd_pipe_name);
     }
-}
-
-/// Check if a process name belongs to a browser with extension enhancement enabled.
-/// Used by the capture loop to skip OCR for extension-enhanced browsers.
-pub fn is_process_extension_enhanced(process_name: &str) -> bool {
-    let lower = process_name.to_lowercase();
-    if lower == "chrome.exe" || lower == "chrome" {
-        crate::registry_config::get_bool("extension_enhanced_chrome").unwrap_or(false)
-    } else if lower == "msedge.exe" || lower == "msedge" {
-        crate::registry_config::get_bool("extension_enhanced_edge").unwrap_or(false)
-    } else {
-        false
-    }
+    result
 }
 
 /// Send extension screenshot to Python OCR pipeline and commit results
@@ -1717,20 +1901,94 @@ mod tests {
         assert!(!json.contains("\"data\""));
     }
 
-    #[test]
-    fn test_process_name_to_browser_type_chrome() {
-        assert_eq!(process_name_to_browser_type("chrome.exe"), "chrome");
+    fn make_session(browser_pid: u32, nmh_pid: u32, last_seen_ms: i64) -> NmhSession {
+        NmhSession {
+            browser_pid,
+            browser_exe_path: format!(r"C:\browsers\b{}.exe", browser_pid),
+            browser_exe_name: format!("b{}.exe", browser_pid),
+            nmh_pid,
+            cmd_pipe_name: format!(r"\\.\pipe\carbon_nmh_cmd_r_{:032x}", nmh_pid),
+            registered_at_ms: last_seen_ms,
+            last_seen_ms,
+        }
     }
 
     #[test]
-    fn test_process_name_to_browser_type_edge() {
-        assert_eq!(process_name_to_browser_type("msedge.exe"), "edge");
+    fn test_upsert_session_replaces_same_nmh_pid() {
+        let mut sessions = vec![make_session(100, 1, 1000)];
+        upsert_session(&mut sessions, make_session(200, 1, 2000));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].browser_pid, 200);
+        assert_eq!(sessions[0].last_seen_ms, 2000);
     }
 
     #[test]
-    fn test_process_name_to_browser_type_unknown() {
-        // Unknown browsers default to "chrome"
-        assert_eq!(process_name_to_browser_type("firefox.exe"), "chrome");
+    fn test_upsert_session_keeps_other_sessions() {
+        let mut sessions = vec![make_session(100, 1, 1000)];
+        upsert_session(&mut sessions, make_session(200, 2, 2000));
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_session_matches_both_keys() {
+        let mut sessions = vec![make_session(100, 1, 1000), make_session(200, 2, 2000)];
+        let pipe = sessions[0].cmd_pipe_name.clone();
+        remove_session(&mut sessions, 1, &pipe);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].nmh_pid, 2);
+        // Wrong pipe name doesn't remove
+        remove_session(&mut sessions, 2, r"\\.\pipe\other");
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_select_session_exact_pid_match() {
+        let sessions = vec![make_session(100, 1, 1000), make_session(200, 2, 2000)];
+        let s = select_session(&sessions, 200, "", |_, _| false).unwrap();
+        assert_eq!(s.nmh_pid, 2);
+    }
+
+    #[test]
+    fn test_select_session_no_match() {
+        let sessions = vec![make_session(100, 1, 1000)];
+        assert!(select_session(&sessions, 999, "", |_, _| false).is_none());
+    }
+
+    #[test]
+    fn test_select_session_same_pid_picks_most_recent() {
+        // Multi-profile: two NMHs registered against the same browser process
+        let sessions = vec![make_session(100, 1, 1000), {
+            let mut s = make_session(100, 2, 5000);
+            s.browser_exe_path = sessions_path_of(100);
+            s
+        }];
+        let s = select_session(&sessions, 100, "", |_, _| false).unwrap();
+        assert_eq!(s.nmh_pid, 2);
+    }
+
+    fn sessions_path_of(pid: u32) -> String {
+        format!(r"C:\browsers\b{}.exe", pid)
+    }
+
+    #[test]
+    fn test_select_session_descendant_fallback() {
+        let sessions = vec![make_session(100, 1, 1000)];
+        // Window owned by a child process (pid 555) of the browser (pid 100),
+        // same exe path (case-insensitive)
+        let path = r"c:\BROWSERS\B100.EXE";
+        let s = select_session(&sessions, 555, path, |pid, ancestor| {
+            pid == 555 && ancestor == 100
+        });
+        assert!(s.is_some());
+        // Different exe path → no fallback even if descendant
+        let s2 = select_session(&sessions, 555, r"C:\other\b.exe", |_, _| true);
+        assert!(s2.is_none());
+    }
+
+    #[test]
+    fn test_select_session_empty_path_no_fallback() {
+        let sessions = vec![make_session(100, 1, 1000)];
+        assert!(select_session(&sessions, 555, "", |_, _| true).is_none());
     }
 
     #[test]

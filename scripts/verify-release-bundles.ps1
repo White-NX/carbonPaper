@@ -48,7 +48,7 @@ try {
     if ($duplicates) {
         throw "Portable bundle contains duplicate entries: $($duplicates.Name -join ', ')"
     }
-    foreach ($required in @("carbonpaper.exe", "carbonpaper-ml.exe", "carbonpaper-nmh.exe", "THIRD_PARTY_NOTICES.md")) {
+    foreach ($required in @("carbonpaper.exe", "carbonpaper-ml.exe", "carbonpaper-nmh.exe")) {
         if (-not $archive.GetEntry($required)) {
             throw "Portable bundle is missing $required"
         }
@@ -88,7 +88,7 @@ if (-not $sevenZip) {
 }
 
 $listing = @(& $sevenZip.Source l $installer)
-foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-nmh.exe", "THIRD_PARTY_NOTICES.md")) {
+foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-nmh.exe")) {
     $count = @($listing | Where-Object { $_ -match ("\s" + [regex]::Escape($required) + "$") }).Count
     if ($count -ne 1) {
         throw "NSIS installer must contain exactly one $required entry; found $count"

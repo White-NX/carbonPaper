@@ -466,12 +466,14 @@
       "title": "浏览器扩展",
       "description": "管理 CarbonPaper 浏览器扩展",
       "chrome": {
-        "label": "添加到 Chrome",
+        "name": "Chrome / Chromium 内核浏览器",
+        "label": "安装",
         "registered": "已注册",
         "registering": "注册中..."
       },
       "edge": {
-        "label": "添加到 Edge",
+        "name": "Microsoft Edge",
+        "label": "安装",
         "registered": "已注册",
         "registering": "注册中..."
       },
@@ -481,19 +483,23 @@
       },
       "enhance": {
         "label": "扩展增强",
-        "description": "启用后，浏览器扩展将接管该浏览器的截图捕获，提供更丰富的元数据（页面 URL、标题、网站图标、链接）。自带的截图循环将跳过该浏览器的 OCR 处理。",
-        "chrome": "启用 Chrome 扩展增强",
-        "edge": "启用 Edge 扩展增强"
+        "description": "启用后，已连接扩展的浏览器将由扩展接管截图捕获，提供更丰富的元数据（页面 URL、标题、网站图标、链接）。支持任意 Chromium 内核浏览器。",
+        "global": "启用扩展增强"
+      },
+      "sessions": {
+        "title": "已连接的浏览器",
+        "empty": "当前没有浏览器连接。请打开已安装并启用扩展的浏览器。",
+        "pid": "PID {{pid}}"
       },
       "success": "扩展安装成功。请在浏览器中启用该未打包扩展。",
       "error": "安装失败：{{error}}",
       "help": "点击按钮后，请在浏览器扩展管理页面中加载显示路径的未打包扩展。",
       "tutorial": {
         "title": "安装步骤",
-        "step1": "点击上方对应浏览器（Chrome 或 Edge）的安装按钮。",
+        "step1": "点击上方的安装按钮。「Chrome / Chromium 内核浏览器」同样适用于其他 Chromium 内核浏览器（360、百分、Brave 等）。",
         "step2": "打开浏览器扩展页面，启用「开发者模式」。",
         "step3": "点击「加载已解压的扩展程序」，选择安装后显示的扩展文件夹。",
-        "step4": "CarbonPaper 扩展图标将出现在浏览器工具栏中。"
+        "step4": "CarbonPaper 扩展图标将出现在浏览器工具栏中，且该浏览器会显示在「已连接的浏览器」列表里。"
       }
     },
     "ai_embedding": {
@@ -932,13 +938,14 @@
     "subtitle": "捕获浏览器截图并附带丰富的元数据",
     "description": "CarbonPaper 浏览器扩展可以捕获浏览器视口截图，并附带页面元数据（URL、标题、可见链接）。选择你使用的浏览器来安装扩展。",
     "select_browser": "选择要安装的浏览器",
-    "chrome": "Google Chrome",
+    "chrome": "Google Chrome / 其他 Chromium 内核浏览器",
     "edge": "Microsoft Edge",
     "installing": "安装中...",
     "apply": "安装扩展",
     "skip": "跳过",
     "done": "完成",
     "success_message": "扩展安装成功。请在浏览器中启用开发者模式，然后从以下路径加载已解压的扩展。",
+    "connected": "已连接的浏览器：",
     "error_message": "安装失败"
   },
   "clusteringSetup": {

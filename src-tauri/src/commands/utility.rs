@@ -295,27 +295,59 @@ pub fn mark_smart_cluster_setup_done(dismissed_permanently: bool) -> Result<(), 
 
 #[tauri::command]
 pub fn get_extension_enhancement_config() -> Result<serde_json::Value, String> {
-    let chrome = registry_config::get_bool("extension_enhanced_chrome").unwrap_or(false);
-    let edge = registry_config::get_bool("extension_enhanced_edge").unwrap_or(false);
+    let enabled = registry_config::get_bool("extension_enhanced_global").unwrap_or(false);
     Ok(serde_json::json!({
-        "chrome": chrome,
-        "edge": edge,
+        "enabled": enabled,
     }))
 }
 
 #[tauri::command]
 pub fn set_extension_enhancement(
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    browser: String,
     enabled: bool,
 ) -> Result<(), String> {
     crate::commands::check_auth_required(&credential_state)?;
+    registry_config::set_bool("extension_enhanced_global", enabled)
+}
 
-    match browser.as_str() {
-        "chrome" => registry_config::set_bool("extension_enhanced_chrome", enabled),
-        "edge" => registry_config::set_bool("extension_enhanced_edge", enabled),
-        _ => Err(format!("Unknown browser: {}", browser)),
+/// One-time migration: the per-browser enhancement toggles
+/// (extension_enhanced_chrome/edge) were replaced by a single global toggle.
+/// If either old toggle was on, the user wanted enhancement — carry it over.
+/// Called once from app setup.
+pub fn migrate_extension_enhancement_config() {
+    if registry_config::get_bool("extension_enhanced_global").is_some() {
+        return; // already migrated (or set directly)
     }
+    let chrome = registry_config::get_bool("extension_enhanced_chrome");
+    let edge = registry_config::get_bool("extension_enhanced_edge");
+    if chrome.is_none() && edge.is_none() {
+        return; // fresh install, nothing to migrate
+    }
+    let enabled = migrated_enhancement_value(chrome, edge);
+    if let Err(e) = registry_config::set_bool("extension_enhanced_global", enabled) {
+        tracing::warn!("Failed to migrate extension enhancement toggle: {}", e);
+        return;
+    }
+    let _ = registry_config::delete_value("extension_enhanced_chrome");
+    let _ = registry_config::delete_value("extension_enhanced_edge");
+    tracing::info!(
+        "Migrated extension enhancement toggles (chrome={:?}, edge={:?}) -> global={}",
+        chrome,
+        edge,
+        enabled
+    );
+}
+
+/// Pure mapping from the old per-browser toggles to the new global one.
+fn migrated_enhancement_value(chrome: Option<bool>, edge: Option<bool>) -> bool {
+    chrome.unwrap_or(false) || edge.unwrap_or(false)
+}
+
+/// Live browser-extension sessions (NMH registrations), for the settings UI.
+#[tauri::command]
+pub fn get_nmh_sessions() -> Result<serde_json::Value, String> {
+    let sessions = crate::reverse_ipc::nmh_sessions_snapshot();
+    serde_json::to_value(sessions).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -501,4 +533,18 @@ pub fn open_path(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::migrated_enhancement_value;
+
+    #[test]
+    fn test_migrated_enhancement_value() {
+        assert!(migrated_enhancement_value(Some(true), None));
+        assert!(migrated_enhancement_value(None, Some(true)));
+        assert!(migrated_enhancement_value(Some(true), Some(false)));
+        assert!(!migrated_enhancement_value(Some(false), Some(false)));
+        assert!(!migrated_enhancement_value(None, None));
+    }
 }

@@ -466,12 +466,14 @@
       "title": "Browser Extension",
       "description": "Manage browser extension",
       "chrome": {
-        "label": "Add to Chrome",
+        "name": "Chrome / Chromium browsers",
+        "label": "Install",
         "registered": "Registered",
         "registering": "Registering..."
       },
       "edge": {
-        "label": "Add to Edge",
+        "name": "Microsoft Edge",
+        "label": "Install",
         "registered": "Registered",
         "registering": "Registering..."
       },
@@ -481,19 +483,23 @@
       },
       "enhance": {
         "label": "Extension Enhancement",
-        "description": "Install the CarbonPaper browser extension to capture viewport screenshots with page metadata (URL, title, visible links).",
-        "chrome": "Enable Chrome extension enhancement",
-        "edge": "Enable Edge extension enhancement"
+        "description": "Install the CarbonPaper browser extension to capture viewport screenshots with page metadata (URL, title, visible links). Works with any Chromium-based browser.",
+        "global": "Enable extension enhancement"
+      },
+      "sessions": {
+        "title": "Connected browsers",
+        "empty": "No browser is currently connected. Open a browser with the extension installed and enabled.",
+        "pid": "PID {{pid}}"
       },
       "success": "Extension installed successfully. Please enable the unpacked extension in your browser.",
       "error": "Installation failed: {{error}}",
       "help": "After clicking the button, load the unpacked extension from the path shown in your browser's extension settings page.",
       "tutorial": {
         "title": "How to install",
-        "step1": "Click the install button for your browser (Chrome or Edge) above.",
+        "step1": "Click the install button above. \"Chrome / Chromium browsers\" also covers other Chromium-based browsers (360, Cent, Brave, ...).",
         "step2": "Open the browser extensions page and enable \"Developer mode\".",
         "step3": "Click \"Load unpacked\" and select the extension folder shown after installation.",
-        "step4": "The CarbonPaper extension icon will appear in your browser toolbar."
+        "step4": "The CarbonPaper extension icon will appear in your browser toolbar, and the browser shows up under \"Connected browsers\"."
       }
     },
     "ai_embedding": {
@@ -932,13 +938,14 @@
     "subtitle": "Capture browser screenshots with rich metadata",
     "description": "The CarbonPaper browser extension captures viewport screenshots along with page metadata such as URL, title, and visible links. Select the browsers you use to install the extension.",
     "select_browser": "Select browsers to install",
-    "chrome": "Google Chrome",
+    "chrome": "Google Chrome / other Chromium browsers",
     "edge": "Microsoft Edge",
     "installing": "Installing...",
     "apply": "Install Extension",
     "skip": "Skip",
     "done": "Done",
     "success_message": "Extension installed successfully. Enable Developer mode in your browser and load the unpacked extension from the path below.",
+    "connected": "Connected browsers:",
     "error_message": "Installation failed"
   },
   "clusteringSetup": {

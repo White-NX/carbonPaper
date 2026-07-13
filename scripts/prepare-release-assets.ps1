@@ -281,7 +281,4 @@ foreach ($asset in $ocrManifest.files) {
     Ensure-OcrModelAsset -Asset $asset -CacheDir $ocrCacheDir
 }
 Stage-OcrModelAssets -Manifest $ocrManifest -CacheDir $ocrCacheDir -BundleDir $ocrBundleDir
-$noticeSource = Join-Path $RootDir "THIRD_PARTY_NOTICES.md"
-$noticeDestination = Join-Path $RootDir "src-tauri\pre-bundle\THIRD_PARTY_NOTICES.md"
-Copy-Item -LiteralPath $noticeSource -Destination $noticeDestination -Force
 Write-Host "Release assets are ready."

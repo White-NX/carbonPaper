@@ -52,17 +52,6 @@ pub async fn credential_verify_user(
         state.update_auth_time();
         storage_state.try_dedup_migration();
         storage_state.try_bitmap_index_migration();
-        match storage_state.resume_waiting_ocr_postprocess() {
-            Ok(resumed) if resumed > 0 => tracing::info!(
-                "Resumed {} OCR postprocess rows after explicit authentication",
-                resumed
-            ),
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
-                "Failed to resume OCR postprocess after authentication: {}",
-                error
-            ),
-        }
         if let Err(e) =
             mcp_server::restore_if_enabled(app, &state, &storage_state, &mcp_state).await
         {

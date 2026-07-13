@@ -61,3 +61,13 @@ pub fn set_u32(name: &str, value: u32) -> Result<(), String> {
     key.set_value(name, &value)
         .map_err(|e| format!("Failed to set registry value '{}': {}", name, e))
 }
+
+/// 删除配置项（不存在视为成功）
+pub fn delete_value(name: &str) -> Result<(), String> {
+    let key = open_app_key(true)?;
+    match key.delete_value(name) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Failed to delete registry value '{}': {}", name, e)),
+    }
+}

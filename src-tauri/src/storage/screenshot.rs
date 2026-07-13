@@ -158,6 +158,7 @@ impl StorageState {
             "waiting_for_auth",
             "completed",
             "failed",
+            "discarded",
         ];
         if !VALID_STATUSES.contains(&status) {
             return Err(format!("Invalid OCR postprocess status: {status}"));
@@ -218,34 +219,23 @@ impl StorageState {
         Ok(())
     }
 
-    pub fn recover_interrupted_ocr_postprocess(&self) -> Result<usize, String> {
-        let guard = self.get_connection_named("recover_interrupted_ocr_postprocess")?;
+    /// Discard postprocess work left over from a previous application process.
+    ///
+    /// Screenshot data and Rust OCR results are already durable at this point;
+    /// only best-effort derived work (vector indexing/classification) is dropped.
+    pub fn discard_incomplete_ocr_postprocess(&self) -> Result<usize, String> {
+        let guard = self.get_connection_named("discard_incomplete_ocr_postprocess")?;
         let conn = guard.as_ref().unwrap();
         conn.execute(
             "UPDATE screenshot_ocr_status
-             SET postprocess_status = 'waiting_for_auth',
-                 postprocess_error = 'Waiting for user authentication after application restart',
+             SET postprocess_status = 'discarded',
+                 postprocess_error = 'Discarded after application restart',
                  postprocess_next_retry_at = NULL,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE postprocess_status IN ('queued', 'processing')",
+             WHERE postprocess_status IN ('pending', 'queued', 'processing', 'waiting_for_auth')",
             [],
         )
-        .map_err(|e| format!("Failed to recover interrupted OCR postprocess rows: {e}"))
-    }
-
-    pub fn resume_waiting_ocr_postprocess(&self) -> Result<usize, String> {
-        let guard = self.get_connection_named("resume_waiting_ocr_postprocess")?;
-        let conn = guard.as_ref().unwrap();
-        conn.execute(
-            "UPDATE screenshot_ocr_status
-             SET postprocess_status = 'pending',
-                 postprocess_error = NULL,
-                 postprocess_next_retry_at = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE postprocess_status = 'waiting_for_auth'",
-            [],
-        )
-        .map_err(|e| format!("Failed to resume auth-gated OCR postprocess rows: {e}"))
+        .map_err(|e| format!("Failed to discard incomplete OCR postprocess rows: {e}"))
     }
 
     pub fn list_pending_ocr_postprocess_ids(&self, limit: i64) -> Result<Vec<i64>, String> {
@@ -2613,7 +2603,7 @@ mod ocr_lifecycle_tests {
     }
 
     #[test]
-    fn interrupted_postprocess_waits_for_explicit_auth_without_consuming_attempts() {
+    fn incomplete_postprocess_is_discarded_on_restart_without_consuming_attempts() {
         let temp = tempfile::tempdir().expect("temp storage directory");
         let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
@@ -2630,58 +2620,63 @@ mod ocr_lifecycle_tests {
                  );
                  INSERT INTO screenshot_ocr_status (
                     screenshot_id, postprocess_status, postprocess_attempts
-                 ) VALUES (42, 'queued', 2);",
+                 ) VALUES
+                    (41, 'pending', 1),
+                    (42, 'queued', 2),
+                    (43, 'processing', 3),
+                    (44, 'waiting_for_auth', 4),
+                    (45, 'completed', 0),
+                    (46, 'failed', 5);",
             )
             .expect("OCR lifecycle fixture");
         *storage.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection);
 
         assert_eq!(
             storage
-                .recover_interrupted_ocr_postprocess()
-                .expect("defer interrupted row"),
-            1
+                .discard_incomplete_ocr_postprocess()
+                .expect("discard incomplete rows"),
+            4
         );
         {
             let guard = storage.db.lock().unwrap_or_else(|e| e.into_inner());
             let connection = guard.as_ref().expect("database");
-            let (status, attempts): (String, i64) = connection
+            for (id, attempts) in [(41, 1), (42, 2), (43, 3), (44, 4)] {
+                let (status, stored_attempts, error): (String, i64, Option<String>) = connection
+                    .query_row(
+                        "SELECT postprocess_status, postprocess_attempts, postprocess_error
+                         FROM screenshot_ocr_status WHERE screenshot_id = ?1",
+                        [id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .expect("discarded row");
+                assert_eq!(status, "discarded");
+                assert_eq!(stored_attempts, attempts);
+                assert_eq!(
+                    error.as_deref(),
+                    Some("Discarded after application restart")
+                );
+            }
+
+            let completed: String = connection
                 .query_row(
-                    "SELECT postprocess_status, postprocess_attempts
-                     FROM screenshot_ocr_status WHERE screenshot_id = 42",
+                    "SELECT postprocess_status FROM screenshot_ocr_status WHERE screenshot_id = 45",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| row.get(0),
                 )
-                .expect("deferred row");
-            assert_eq!(status, "waiting_for_auth");
-            assert_eq!(attempts, 2);
+                .expect("completed row");
+            let failed: String = connection
+                .query_row(
+                    "SELECT postprocess_status FROM screenshot_ocr_status WHERE screenshot_id = 46",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("failed row");
+            assert_eq!(completed, "completed");
+            assert_eq!(failed, "failed");
         }
         assert!(storage
             .list_pending_ocr_postprocess_ids(10)
-            .expect("pending rows before auth")
+            .expect("pending rows after startup discard")
             .is_empty());
-
-        assert_eq!(
-            storage
-                .resume_waiting_ocr_postprocess()
-                .expect("resume after auth"),
-            1
-        );
-        assert_eq!(
-            storage
-                .list_pending_ocr_postprocess_ids(10)
-                .expect("pending rows after auth"),
-            vec![42]
-        );
-        let guard = storage.db.lock().unwrap_or_else(|e| e.into_inner());
-        let attempts: i64 = guard
-            .as_ref()
-            .expect("database")
-            .query_row(
-                "SELECT postprocess_attempts FROM screenshot_ocr_status WHERE screenshot_id = 42",
-                [],
-                |row| row.get(0),
-            )
-            .expect("attempt count");
-        assert_eq!(attempts, 2);
     }
 }

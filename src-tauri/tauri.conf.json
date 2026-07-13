@@ -4,7 +4,7 @@
   "version": "0.8.3",
   "identifier": "com.eyling.carbonpaper",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run build:nmh && npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build && npm run test:release-assets",
     "frontendDist": "../dist"

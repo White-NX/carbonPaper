@@ -20,7 +20,11 @@ function ensureNativeConnection(reason = 'unknown') {
   connectNative();
 }
 
-// Detect browser process name
+// Detect browser process name (legacy compat shim).
+// The NMH now injects the real browser exe name detected from its own
+// process tree — this UA-sniffed value (which reports every Chromium fork
+// as chrome.exe) is only used as a fallback by older NMH binaries that may
+// survive an app update until the browser restarts.
 function getBrowserName() {
   const ua = navigator.userAgent;
   if (ua.includes('Edg/')) return 'msedge.exe';
@@ -63,8 +67,17 @@ function connectNative() {
         captureCurrentTab();
       } else if (message.type === 'nmh_ready') {
         // Startup diagnostic from NMH
-        console.log('[CarbonPaper] NMH ready — browser:', message.browser_type,
+        console.log('[CarbonPaper] NMH ready — browser:', message.browser_exe,
+          '(pid', message.browser_pid + ')',
           'cmd_pipe:', message.cmd_pipe, 'data_pipe:', message.data_pipe);
+      } else if (message.type === 'nmh_registered') {
+        // NMH successfully registered its capture session with the main app
+        console.log('[CarbonPaper] NMH session registered — browser:',
+          message.browser_exe, '(pid', message.browser_pid + ')');
+      } else if (message.type === 'nmh_registration_failed') {
+        // Capture requests won't reach this browser until this is resolved;
+        // screenshot relay (data path) still works.
+        console.error('[CarbonPaper] NMH registration failed:', message.error);
       } else if (message.status === 'error') {
         // Suppress expected cold-start errors — the main app hasn't started
         // yet or has restarted with a new auth token.

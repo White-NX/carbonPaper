@@ -1383,22 +1383,33 @@ pub async fn run_capture_loop(
             String::new()
         };
 
-        // Request extension capture for browsers with extension enhancement enabled
-        // The browser extension captures with richer metadata (URL, title, favicon, links)
-        // If extension capture fails, fall through to normal capture path
-        if crate::reverse_ipc::is_process_extension_enhanced(&process_name) {
-            tracing::debug!("Requesting extension capture for: {}", process_name);
-            match crate::reverse_ipc::request_extension_capture(&process_name).await {
+        // Route to a registered browser-extension session (matched by the
+        // foreground window's PID) when extension enhancement is enabled.
+        // The extension captures with richer metadata (URL, title, favicon,
+        // links). If no session matches or the request fails, fall through
+        // to the normal capture path — never skip a frame on a guess.
+        if let Some(session) =
+            crate::reverse_ipc::find_nmh_session_for_pid(window_info.pid, &process_path)
+        {
+            tracing::debug!(
+                "Requesting extension capture from {} (pid {})",
+                session.browser_exe_name,
+                session.browser_pid
+            );
+            match crate::reverse_ipc::request_extension_capture_session(&session).await {
                 Ok(()) => {
-                    // Extension capture request sent successfully, skip normal capture
+                    // Extension confirmed it received the capture request;
+                    // skip normal capture for this frame.
                     last_capture_time = std::time::Instant::now();
                     last_hwnd_raw = current_hwnd_raw;
                     continue;
                 }
                 Err(e) => {
-                    // Extension capture failed, fall back to normal capture path
+                    // Session dropped by request_extension_capture_session;
+                    // fall back to normal capture path.
                     tracing::warn!(
-                        "Extension capture failed, falling back to normal capture: {}",
+                        "Extension capture via {} failed, falling back to normal capture: {}",
+                        session.browser_exe_name,
                         e
                     );
                 }

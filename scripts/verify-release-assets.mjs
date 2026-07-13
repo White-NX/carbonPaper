@@ -91,12 +91,6 @@ for (const asset of ocrManifest.files) {
   generatedModelPaths.push(cachePath, bundledPath);
   console.log(`Rust OCR model asset verified: ${asset.name} ${asset.sha256}`);
 }
-assertEqual(
-  sha256(path.join('THIRD_PARTY_NOTICES.md')),
-  sha256(path.join('src-tauri', 'pre-bundle', 'THIRD_PARTY_NOTICES.md')),
-  'third-party notice pre-bundle copy',
-);
-
 const buildRs = readText(path.join('src-tauri', 'build.rs'));
 assertIncludes(buildRs, 'Path::new("../python-3.12.10-amd64.exe")', 'build.rs Python source path');
 assertIncludes(buildRs, 'Path::new("pre-bundle/python-3.12.10-amd64.exe")', 'build.rs Python destination path');

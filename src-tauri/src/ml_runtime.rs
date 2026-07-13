@@ -1138,28 +1138,15 @@ pub async fn retry_failed_ocr(
     }))
 }
 
-pub async fn run_postprocess_recovery_loop(app: AppHandle) {
+pub async fn run_postprocess_retry_loop(app: AppHandle) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    if let Some(storage) = app.try_state::<Arc<crate::storage::StorageState>>() {
-        match storage.recover_interrupted_ocr_postprocess() {
-            Ok(recovered) if recovered > 0 => tracing::info!(
-                "[ML:POSTPROCESS] deferred {} interrupted rows until explicit authentication",
-                recovered
-            ),
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
-                "[ML:POSTPROCESS] failed to recover interrupted rows: {}",
-                error
-            ),
-        }
-    }
     // Let storage and the Python monitor finish startup before the first pass.
     tokio::time::sleep(Duration::from_secs(10)).await;
     loop {
         interval.tick().await;
         if let Err(error) = drain_pending_postprocess(&app).await {
-            tracing::debug!("[ML:POSTPROCESS] recovery pass deferred: {}", error);
+            tracing::debug!("[ML:POSTPROCESS] retry pass deferred: {}", error);
         }
     }
 }
@@ -1169,6 +1156,9 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
         .state::<Arc<crate::storage::StorageState>>()
         .inner()
         .clone();
+    if !storage.is_session_valid() {
+        return Ok(());
+    }
     let capture = app
         .state::<Arc<crate::capture::CaptureState>>()
         .inner()

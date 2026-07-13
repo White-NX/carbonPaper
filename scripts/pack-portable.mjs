@@ -60,7 +60,6 @@ if (existsSync(preBundleDir)) {
 const requiredPortableEntries = [
   'carbonpaper-ml.exe',
   'carbonpaper-nmh.exe',
-  'THIRD_PARTY_NOTICES.md',
   'ocr-models/ppocrv5-ch-mobile-r1/ch_PP-OCRv5_det_mobile.onnx',
   'ocr-models/ppocrv5-ch-mobile-r1/ch_PP-OCRv5_rec_mobile.onnx',
   'ocr-models/ppocrv5-ch-mobile-r1/ppocrv5_dict.txt',

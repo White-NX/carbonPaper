@@ -286,13 +286,17 @@ pub async fn install_browser_extension(
     // 2. Write manifest and register
     let manifest_path = write_nm_manifest(&[EXTENSION_ID])?;
 
-    let (reg_key, extensions_url) = match browser.as_str() {
-        "chrome" => (CHROME_REG_KEY, "chrome://extensions"),
-        "edge" => (EDGE_REG_KEY, "edge://extensions"),
+    let extensions_url = match browser.as_str() {
+        "chrome" => "chrome://extensions",
+        "edge" => "edge://extensions",
         _ => return Err(format!("Unsupported browser: {}", browser)),
     };
 
-    register_nm_host(reg_key, &manifest_path)?;
+    // Register both NM host registry keys regardless of which button was
+    // clicked: Chromium forks (360, Cent, etc.) read Chrome's key, and having
+    // the other key present is harmless.
+    register_nm_host(CHROME_REG_KEY, &manifest_path)?;
+    register_nm_host(EDGE_REG_KEY, &manifest_path)?;
 
     // 3. Open the browser extensions page using the browser executable directly
     //    open::that() can't handle chrome:// or edge:// protocol URLs
