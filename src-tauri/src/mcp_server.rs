@@ -223,7 +223,7 @@ async fn handle_mcp(
         "initialize" => handle_initialize(req.id),
         "notifications/initialized" => JsonRpcResponse::success(req.id, serde_json::json!({})),
         "ping" => JsonRpcResponse::success(req.id, serde_json::json!({})),
-        "tools/list" => handle_tools_list(req.id),
+        "tools/list" => handle_tools_list(&state, req.id),
         "tools/call" => handle_tools_call(&state, req.id, req.params).await,
         other => {
             tracing::warn!("MCP unknown method: {}", other);
@@ -252,8 +252,8 @@ fn handle_initialize(id: Option<Value>) -> JsonRpcResponse {
 
 // ==================== Tool definitions ====================
 
-fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
-    let tools = serde_json::json!({
+fn handle_tools_list(state: &McpServerInner, id: Option<Value>) -> JsonRpcResponse {
+    let mut tools = serde_json::json!({
         "tools": [
             {
                 "name": "get_snapshots_by_time_range",
@@ -419,6 +419,22 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
             }
         ]
     });
+    let python_running = state
+        .app_handle
+        .try_state::<crate::monitor::MonitorState>()
+        .map(|monitor| {
+            monitor
+                .process
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        })
+        .unwrap_or(false);
+    if !python_running {
+        if let Some(items) = tools.get_mut("tools").and_then(Value::as_array_mut) {
+            items.retain(|tool| tool.get("name").and_then(Value::as_str) != Some("search_nl"));
+        }
+    }
     JsonRpcResponse::success(id, tools)
 }
 

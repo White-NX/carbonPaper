@@ -8,16 +8,6 @@ pub fn check_auth_required(credential_state: &CredentialManagerState) -> Result<
     Ok(())
 }
 
-pub fn check_recent_auth_required(
-    credential_state: &CredentialManagerState,
-    max_age_secs: u64,
-) -> Result<(), String> {
-    if !credential_state.is_recently_authenticated(max_age_secs) {
-        return Err("AUTH_REQUIRED".to_string());
-    }
-    Ok(())
-}
-
 pub fn check_main_window(window: &tauri::Window) -> Result<(), String> {
     if window.label() != "main" {
         return Err("WINDOW_NOT_AUTHORIZED".to_string());

@@ -9,6 +9,11 @@ mod idle;
 mod logging;
 mod mcp_server;
 mod mcp_token;
+#[allow(dead_code)]
+mod ml_contracts;
+#[allow(dead_code)]
+mod ml_protocol;
+mod ml_runtime;
 mod model_management;
 mod monitor;
 mod monitor_ipc;
@@ -695,6 +700,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
+        .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(CaptureState::default()))
         .manage(AnalysisState::default())
         .manage(updater::UpdaterState::new())
@@ -826,6 +832,10 @@ pub fn run() {
                         let app_handle_cleanup = app.handle().clone();
                         tauri::async_runtime::spawn(async move {
                             run_delete_queue_maintenance_loop(app_handle_cleanup).await;
+                        });
+                        let app_handle_postprocess = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            ml_runtime::run_postprocess_recovery_loop(app_handle_postprocess).await;
                         });
                     }
                 } else {
@@ -964,6 +974,11 @@ pub fn run() {
             monitor::monitor_smart_cluster_calibrate_preview,
             monitor::monitor_presidio_set_language,
             monitor::monitor_classify_debug,
+            ml_runtime::get_ml_ocr_status,
+            ml_runtime::restart_ml_ocr_worker,
+            ml_runtime::get_rust_ocr_model_status,
+            ml_runtime::download_rust_ocr_model,
+            ml_runtime::retry_failed_ocr,
             monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）
             script_integrity::debug_trigger_security_alert,

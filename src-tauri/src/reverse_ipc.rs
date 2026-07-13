@@ -75,6 +75,14 @@ pub enum StorageCommand {
     /// Check whether a screenshot with the given hash already exists.
     #[serde(rename = "screenshot_exists")]
     ScreenshotExists { image_hash: String },
+    #[serde(rename = "set_ocr_postprocess_status")]
+    SetOcrPostprocessStatus {
+        screenshot_id: i64,
+        status: String,
+        error: Option<String>,
+    },
+    #[serde(rename = "record_ocr_postprocess_retry")]
+    RecordOcrPostprocessRetry { screenshot_id: i64, error: String },
 }
 
 // Use OcrResultInput from crate::storage to keep a single canonical type
@@ -634,6 +642,41 @@ fn process_request(
                     "exists": exists
                 })),
                 Err(e) => StorageResponse::error(&e),
+            }
+        }
+        "set_ocr_postprocess_status" => {
+            let screenshot_id = req
+                .get("screenshot_id")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(-1);
+            let status = req
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let error = req.get("error").and_then(|value| value.as_str());
+            if screenshot_id < 0 {
+                return StorageResponse::error("Invalid screenshot_id");
+            }
+            match storage.set_ocr_postprocess_status(screenshot_id, status, error) {
+                Ok(()) => StorageResponse::success(serde_json::json!({ "updated": true })),
+                Err(error) => StorageResponse::error(&error),
+            }
+        }
+        "record_ocr_postprocess_retry" => {
+            let screenshot_id = req
+                .get("screenshot_id")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(-1);
+            let error = req
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("OCR postprocess failed");
+            if screenshot_id < 0 {
+                return StorageResponse::error("Invalid screenshot_id");
+            }
+            match storage.record_ocr_postprocess_retry(screenshot_id, error) {
+                Ok(()) => StorageResponse::success(serde_json::json!({ "updated": true })),
+                Err(error) => StorageResponse::error(&error),
             }
         }
         "save_screenshot_temp" => {
@@ -1414,7 +1457,7 @@ async fn process_nmh_request(
                                     .ocr_image_cache
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner());
-                                cache.insert(screenshot_id, jpeg_bytes);
+                                cache.insert(screenshot_id, jpeg_bytes.clone());
                             }
 
                             // Spawn async OCR task
@@ -1430,15 +1473,17 @@ async fn process_nmh_request(
                                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                             tokio::spawn(async move {
-                                let monitor_state = app_clone.state::<MonitorState>();
+                                let route = crate::capture::OcrRouteConfig::from_registry();
                                 let result = process_extension_ocr(
-                                    &monitor_state,
+                                    &app_clone,
                                     &storage_arc,
                                     screenshot_id,
+                                    &jpeg_bytes,
                                     &image_hash,
                                     &window_title,
                                     &browser_name,
                                     timestamp_ms,
+                                    route,
                                 )
                                 .await;
 
@@ -1462,14 +1507,26 @@ async fn process_nmh_request(
                                         screenshot_id,
                                         e
                                     );
-                                    if let Err(abort_err) =
-                                        storage_arc.abort_screenshot(screenshot_id, Some(&e))
-                                    {
+                                    if let Err(commit_err) = storage_arc.commit_screenshot(
+                                        screenshot_id,
+                                        None,
+                                        None,
+                                        None,
+                                    ) {
                                         tracing::error!(
-                                            "abort_screenshot also failed: {}",
-                                            abort_err
+                                            "Failed to preserve extension screenshot: {}",
+                                            commit_err
                                         );
                                     }
+                                    let _ = storage_arc.set_ocr_status(
+                                        screenshot_id,
+                                        "failed",
+                                        Some(if route.use_rust { "rust" } else { "python" }),
+                                        Some("ppocrv5-ch-mobile"),
+                                        None,
+                                        Some(&e),
+                                        None,
+                                    );
                                 }
                             });
                         }
@@ -1577,84 +1634,45 @@ pub fn is_process_extension_enhanced(process_name: &str) -> bool {
 
 /// Send extension screenshot to Python OCR pipeline and commit results
 async fn process_extension_ocr(
-    monitor_state: &MonitorState,
+    app: &tauri::AppHandle,
     storage: &StorageState,
     screenshot_id: i64,
+    jpeg_bytes: &[u8],
     image_hash: &str,
     window_title: &str,
     process_name: &str,
     timestamp_ms: i64,
+    route: crate::capture::OcrRouteConfig,
 ) -> Result<(), String> {
-    let pipe_name = {
-        let guard = monitor_state
-            .pipe_name
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard
-            .clone()
-            .ok_or_else(|| "Monitor pipe not available".to_string())?
+    let provider = if route.use_rust && route.use_directml_beta {
+        "directml_beta"
+    } else if route.use_rust {
+        "cpu"
+    } else {
+        "legacy_python"
     };
-
-    let req = serde_json::json!({
-        "command": "process_ocr",
-        "screenshot_id": screenshot_id,
-        "image_hash": image_hash,
-        "window_title": window_title,
-        "process_name": process_name,
-        "timestamp": timestamp_ms,
-    });
-
-    let (auth_token, seq_no) = {
-        let token = monitor_state
-            .auth_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .ok_or_else(|| "Auth token not available".to_string())?;
-        let seq = monitor_state
-            .request_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        (token, seq)
-    };
-
-    let response = crate::monitor::send_ipc_request_reused(
-        monitor_state,
-        &pipe_name,
-        &auth_token,
-        seq_no,
-        req,
-    )
-    .await?;
-
-    if let Some(error) = response.get("error").and_then(|v| v.as_str()) {
-        return Err(format!("Python OCR error: {}", error));
-    }
-
-    let ocr_results: Option<Vec<OcrResultInput>> = response
-        .get("ocr_results")
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-    // Extract category from Python response
-    let category = response
-        .get("category")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let category_confidence = response.get("category_confidence").and_then(|v| v.as_f64());
-
-    storage.commit_screenshot(
+    storage.set_ocr_status(
         screenshot_id,
-        ocr_results.as_ref(),
-        category.as_deref(),
-        category_confidence,
+        "running",
+        Some(if route.use_rust { "rust" } else { "python" }),
+        Some("ppocrv5-ch-mobile"),
+        Some(provider),
+        None,
+        None,
     )?;
-
-    tracing::info!(
-        "Extension screenshot {} committed with {} OCR results",
+    crate::capture::process_ocr_inner(
+        app,
+        storage,
         screenshot_id,
-        ocr_results.as_ref().map(|r| r.len()).unwrap_or(0)
-    );
-
-    Ok(())
+        jpeg_bytes,
+        image_hash,
+        window_title,
+        process_name,
+        timestamp_ms,
+        crate::registry_config::get_u32("ocr_timeout_secs").unwrap_or(120),
+        route,
+    )
+    .await
 }
 
 #[cfg(test)]

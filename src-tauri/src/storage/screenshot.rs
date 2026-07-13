@@ -9,12 +9,265 @@ use std::sync::atomic::Ordering;
 
 use super::types::RawScreenshotRow;
 use super::{
-    DeleteQueueStatus, DensityBucket, IndexStorageStats, OcrResultInput, QueueScreenshotCandidate,
-    SaveScreenshotRequest, SaveScreenshotResponse, ScreenshotRecord, SoftDeleteResult,
-    SoftDeleteScreenshotsResult, StorageState,
+    BackgroundReadError, DeleteQueueStatus, DensityBucket, IndexStorageStats, OcrResultInput,
+    QueueScreenshotCandidate, SaveScreenshotRequest, SaveScreenshotResponse, ScreenshotRecord,
+    SoftDeleteResult, SoftDeleteScreenshotsResult, StorageState,
 };
 
+const MAX_OCR_POSTPROCESS_ATTEMPTS: i64 = 5;
+
+struct EncryptedOcrResultRow {
+    id: i64,
+    screenshot_id: i64,
+    text_enc: Option<Vec<u8>>,
+    text_key_encrypted: Option<Vec<u8>>,
+    confidence: f64,
+    box_coords: Vec<Vec<f64>>,
+    created_at: String,
+}
+
+fn ocr_postprocess_retry_decision(current_attempts: i64) -> (&'static str, Option<i64>, i64) {
+    let next_attempts = current_attempts.saturating_add(1);
+    if next_attempts >= MAX_OCR_POSTPROCESS_ATTEMPTS {
+        ("failed", None, next_attempts)
+    } else {
+        let delay_secs = match next_attempts {
+            1 => 30,
+            2 => 60,
+            3 => 120,
+            _ => 300,
+        };
+        ("pending", Some(delay_secs), next_attempts)
+    }
+}
+
+fn validate_ocr_result(result: &OcrResultInput) -> Result<(), String> {
+    if result.box_coords.len() != 4 || result.box_coords.iter().any(|point| point.len() != 2) {
+        return Err("OCR box must contain exactly four 2D points".to_string());
+    }
+    if !result.confidence.is_finite()
+        || result
+            .box_coords
+            .iter()
+            .flatten()
+            .any(|coordinate| !coordinate.is_finite())
+    {
+        return Err("OCR result contains a non-finite value".to_string());
+    }
+    if result.text.chars().count() > 16_384 {
+        return Err("OCR result text exceeds the storage limit".to_string());
+    }
+    Ok(())
+}
+
 impl StorageState {
+    pub fn set_ocr_status(
+        &self,
+        screenshot_id: i64,
+        status: &str,
+        engine: Option<&str>,
+        model_id: Option<&str>,
+        execution_provider: Option<&str>,
+        error: Option<&str>,
+        elapsed_ms: Option<f64>,
+    ) -> Result<(), String> {
+        const VALID_STATUSES: &[&str] = &[
+            "pending",
+            "running",
+            "completed",
+            "fallback_completed",
+            "failed",
+        ];
+        if !VALID_STATUSES.contains(&status) {
+            return Err(format!("Invalid OCR status: {status}"));
+        }
+        let error = error.map(|value| value.chars().take(500).collect::<String>());
+        let guard = self.get_connection_named("set_ocr_status")?;
+        let conn = guard.as_ref().unwrap();
+        conn.execute(
+            "INSERT INTO screenshot_ocr_status (
+                screenshot_id, status, engine, model_id, execution_provider,
+                error, elapsed_ms, attempted_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT(screenshot_id) DO UPDATE SET
+                status = excluded.status,
+                engine = excluded.engine,
+                model_id = excluded.model_id,
+                execution_provider = excluded.execution_provider,
+                error = excluded.error,
+                elapsed_ms = excluded.elapsed_ms,
+                attempted_at = excluded.attempted_at,
+                updated_at = CURRENT_TIMESTAMP",
+            params![
+                screenshot_id,
+                status,
+                engine,
+                model_id,
+                execution_provider,
+                error,
+                elapsed_ms,
+            ],
+        )
+        .map_err(|e| format!("Failed to update OCR status: {e}"))?;
+        Ok(())
+    }
+
+    pub fn count_failed_ocr(&self) -> Result<i64, String> {
+        let guard = self.get_connection_named("count_failed_ocr")?;
+        let conn = guard.as_ref().unwrap();
+        let count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM screenshot_ocr_status WHERE status = 'failed'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to count OCR failures: {e}"))?;
+        Ok(count)
+    }
+
+    pub fn list_failed_ocr_ids(&self, limit: i64) -> Result<Vec<i64>, String> {
+        let guard = self.get_connection_named("list_failed_ocr_ids")?;
+        let conn = guard.as_ref().unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT screenshot_id FROM screenshot_ocr_status
+                 WHERE status = 'failed' ORDER BY updated_at ASC LIMIT ?1",
+            )
+            .map_err(|e| format!("Failed to prepare OCR failure query: {e}"))?;
+        let ids = statement
+            .query_map([limit.clamp(1, 100)], |row| row.get(0))
+            .map_err(|e| format!("Failed to query OCR failures: {e}"))?
+            .collect::<Result<Vec<i64>, _>>()
+            .map_err(|e| format!("Failed to read OCR failure IDs: {e}"))?;
+        drop(statement);
+        drop(guard);
+        Ok(ids)
+    }
+
+    pub fn set_ocr_postprocess_status(
+        &self,
+        screenshot_id: i64,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        const VALID_STATUSES: &[&str] = &[
+            "none",
+            "pending",
+            "queued",
+            "processing",
+            "waiting_for_auth",
+            "completed",
+            "failed",
+        ];
+        if !VALID_STATUSES.contains(&status) {
+            return Err(format!("Invalid OCR postprocess status: {status}"));
+        }
+        let error = error.map(|value| value.chars().take(500).collect::<String>());
+        let guard = self.get_connection_named("set_ocr_postprocess_status")?;
+        let conn = guard.as_ref().unwrap();
+        conn.execute(
+            "UPDATE screenshot_ocr_status
+             SET postprocess_status = ?2,
+                 postprocess_error = ?3,
+                 postprocess_attempts = CASE
+                    WHEN ?2 IN ('none', 'pending', 'completed') THEN 0
+                    ELSE postprocess_attempts
+                 END,
+                 postprocess_next_retry_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE screenshot_id = ?1",
+            params![screenshot_id, status, error],
+        )
+        .map_err(|e| format!("Failed to update OCR postprocess status: {e}"))?;
+        Ok(())
+    }
+
+    pub fn record_ocr_postprocess_retry(
+        &self,
+        screenshot_id: i64,
+        error: &str,
+    ) -> Result<(), String> {
+        let error = error.chars().take(500).collect::<String>();
+        let guard = self.get_connection_named("record_ocr_postprocess_retry")?;
+        let conn = guard.as_ref().unwrap();
+        let current_attempts = conn
+            .query_row(
+                "SELECT postprocess_attempts FROM screenshot_ocr_status WHERE screenshot_id = ?1",
+                [screenshot_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to read OCR postprocess attempts: {e}"))?
+            .ok_or_else(|| format!("OCR status row not found for screenshot {screenshot_id}"))?;
+        let (status, delay_secs, next_attempts) = ocr_postprocess_retry_decision(current_attempts);
+        let retry_modifier = delay_secs.map(|seconds| format!("+{seconds} seconds"));
+        conn.execute(
+            "UPDATE screenshot_ocr_status
+             SET postprocess_attempts = ?2,
+                 postprocess_status = ?3,
+                 postprocess_error = ?4,
+                 postprocess_next_retry_at = CASE
+                    WHEN ?5 IS NULL THEN NULL
+                    ELSE datetime('now', ?5)
+                 END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE screenshot_id = ?1",
+            params![screenshot_id, next_attempts, status, error, retry_modifier,],
+        )
+        .map_err(|e| format!("Failed to schedule OCR postprocess retry: {e}"))?;
+        Ok(())
+    }
+
+    pub fn recover_interrupted_ocr_postprocess(&self) -> Result<usize, String> {
+        let guard = self.get_connection_named("recover_interrupted_ocr_postprocess")?;
+        let conn = guard.as_ref().unwrap();
+        conn.execute(
+            "UPDATE screenshot_ocr_status
+             SET postprocess_status = 'waiting_for_auth',
+                 postprocess_error = 'Waiting for user authentication after application restart',
+                 postprocess_next_retry_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE postprocess_status IN ('queued', 'processing')",
+            [],
+        )
+        .map_err(|e| format!("Failed to recover interrupted OCR postprocess rows: {e}"))
+    }
+
+    pub fn resume_waiting_ocr_postprocess(&self) -> Result<usize, String> {
+        let guard = self.get_connection_named("resume_waiting_ocr_postprocess")?;
+        let conn = guard.as_ref().unwrap();
+        conn.execute(
+            "UPDATE screenshot_ocr_status
+             SET postprocess_status = 'pending',
+                 postprocess_error = NULL,
+                 postprocess_next_retry_at = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE postprocess_status = 'waiting_for_auth'",
+            [],
+        )
+        .map_err(|e| format!("Failed to resume auth-gated OCR postprocess rows: {e}"))
+    }
+
+    pub fn list_pending_ocr_postprocess_ids(&self, limit: i64) -> Result<Vec<i64>, String> {
+        let guard = self.get_connection_named("list_pending_ocr_postprocess_ids")?;
+        let conn = guard.as_ref().unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT screenshot_id FROM screenshot_ocr_status
+                 WHERE postprocess_status = 'pending'
+                   AND postprocess_attempts < 5
+                   AND (postprocess_next_retry_at IS NULL OR postprocess_next_retry_at <= CURRENT_TIMESTAMP)
+                 ORDER BY updated_at ASC LIMIT ?1",
+            )
+            .map_err(|e| format!("Failed to prepare OCR postprocess query: {e}"))?;
+        let ids = statement
+            .query_map([limit.clamp(1, 100)], |row| row.get(0))
+            .map_err(|e| format!("Failed to query OCR postprocess backlog: {e}"))?
+            .collect::<Result<Vec<i64>, _>>()
+            .map_err(|e| format!("Failed to read OCR postprocess backlog: {e}"))?;
+        Ok(ids)
+    }
+
     /// Get all screenshot image paths (for thumbnail warmup).
     pub fn get_all_image_paths(&self) -> Result<Vec<String>, String> {
         let conn = self.open_read_connection_named("get_all_image_paths")?;
@@ -234,6 +487,11 @@ impl StorageState {
 
         if let Some(ocr_results) = &request.ocr_results {
             for result in ocr_results {
+                if let Err(error) = validate_ocr_result(result) {
+                    tracing::warn!("Skipping invalid OCR result during save: {}", error);
+                    skipped += 1;
+                    continue;
+                }
                 let (text_enc, text_key_encrypted) =
                     self.encrypt_payload_with_row_key(result.text.as_bytes())?;
 
@@ -453,10 +711,6 @@ impl StorageState {
         let screenshot_id = conn.last_insert_rowid();
         let in_lock_dur = t3.elapsed();
 
-        // Clear lock holder on drop
-        if let Ok(mut h) = self.lock_holder.lock() {
-            *h = "";
-        }
         drop(guard);
 
         let total_dur = fn_start.elapsed();
@@ -499,9 +753,6 @@ impl StorageState {
                 )
                 .optional()
                 .map_err(|e| format!("Failed to query screenshot: {}", e))?;
-            if let Ok(mut h) = self.lock_holder.lock() {
-                *h = "";
-            }
             drop(guard);
             image_path.ok_or_else(|| "Screenshot not found".to_string())?
         };
@@ -525,7 +776,7 @@ impl StorageState {
         }
 
         let mut added = 0;
-        let skipped = 0;
+        let mut skipped = 0;
 
         // Timing accumulators for OCR processing
         let mut total_encrypt_dur = std::time::Duration::ZERO;
@@ -537,6 +788,15 @@ impl StorageState {
         let mut encrypted_results = Vec::new();
         if let Some(results) = ocr_results {
             for result in results {
+                if let Err(error) = validate_ocr_result(result) {
+                    skipped += 1;
+                    tracing::warn!(
+                        "Skipping invalid OCR result while committing screenshot {}: {}",
+                        screenshot_id,
+                        error
+                    );
+                    continue;
+                }
                 let te0 = std::time::Instant::now();
                 let (text_enc, text_key_encrypted) =
                     self.encrypt_payload_with_row_key(result.text.as_bytes())?;
@@ -598,18 +858,12 @@ impl StorageState {
             .map_err(|e| format!("Failed to mark screenshot committed: {}", e))?;
 
             if updated == 0 {
-                if let Ok(mut h) = self.lock_holder.lock() {
-                    *h = "";
-                }
                 return Err("Screenshot not found".to_string());
             }
 
             tx.commit()
                 .map_err(|e| format!("Failed to commit screenshot transaction: {}", e))?;
 
-            if let Ok(mut h) = self.lock_holder.lock() {
-                *h = "";
-            }
             drop(guard);
         }
         total_db_insert_dur = td0.elapsed();
@@ -1325,6 +1579,82 @@ impl StorageState {
         Ok(results)
     }
 
+    /// Get OCR results for unattended recovery without allowing CNG to display UI.
+    /// Encrypted rows are loaded while holding the DB lock, then decrypted after
+    /// the lock is released so an authentication deferral cannot block storage.
+    pub(crate) fn get_screenshot_ocr_results_silent(
+        &self,
+        screenshot_id: i64,
+    ) -> Result<Vec<super::OcrResult>, BackgroundReadError> {
+        let encrypted_rows = {
+            let guard = self
+                .get_connection_named("get_screenshot_ocr_results_silent")
+                .map_err(BackgroundReadError::Other)?;
+            let conn = guard.as_ref().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, screenshot_id, text_enc, text_key_encrypted, confidence,
+                            box_x1, box_y1, box_x2, box_y2,
+                            box_x3, box_y3, box_x4, box_y4, created_at
+                     FROM ocr_results WHERE screenshot_id = ? AND is_deleted = 0
+                     ORDER BY box_y1, box_x1",
+                )
+                .map_err(|e| {
+                    BackgroundReadError::Other(format!("Failed to prepare query: {}", e))
+                })?;
+
+            let rows = stmt
+                .query_map([screenshot_id], |row| {
+                    Ok(EncryptedOcrResultRow {
+                        id: row.get(0)?,
+                        screenshot_id: row.get(1)?,
+                        text_enc: row.get(2)?,
+                        text_key_encrypted: row.get(3)?,
+                        confidence: row.get(4)?,
+                        box_coords: vec![
+                            vec![row.get::<_, f64>(5)?, row.get::<_, f64>(6)?],
+                            vec![row.get::<_, f64>(7)?, row.get::<_, f64>(8)?],
+                            vec![row.get::<_, f64>(9)?, row.get::<_, f64>(10)?],
+                            vec![row.get::<_, f64>(11)?, row.get::<_, f64>(12)?],
+                        ],
+                        created_at: row.get(13)?,
+                    })
+                })
+                .map_err(|e| BackgroundReadError::Other(format!("Failed to execute query: {}", e)))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    BackgroundReadError::Other(format!("Failed to read OCR row: {}", e))
+                })?;
+            rows
+        };
+
+        encrypted_rows
+            .into_iter()
+            .map(|row| {
+                let text = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
+                    (Some(data), Some(key)) => {
+                        String::from_utf8(self.decrypt_payload_with_row_key_silent(data, key)?)
+                            .map_err(|e| {
+                                BackgroundReadError::Other(format!(
+                                    "Invalid OCR text encoding: {}",
+                                    e
+                                ))
+                            })?
+                    }
+                    _ => String::new(),
+                };
+                Ok(super::OcrResult {
+                    id: row.id,
+                    screenshot_id: row.screenshot_id,
+                    text,
+                    confidence: row.confidence,
+                    box_coords: row.box_coords,
+                    created_at: row.created_at,
+                })
+            })
+            .collect()
+    }
+
     /// Get combined OCR texts for a batch of screenshot IDs in a single query.
     /// Returns a map of screenshot_id -> joined OCR text.
     pub fn get_ocr_results_by_screenshot_ids(
@@ -1444,9 +1774,6 @@ impl StorageState {
                 // Clean up orphaned dedup entries while the DB connection is held.
                 let _ = Self::cleanup_orphaned_dedup_entries(conn);
             }
-            if let Ok(mut h) = self.lock_holder.lock() {
-                *h = "";
-            }
             drop(guard);
             (deleted, image_path, ocr_count)
         };
@@ -1518,9 +1845,6 @@ impl StorageState {
             if deleted > 0 {
                 // Clean up orphaned dedup entries while the DB connection is held.
                 let _ = Self::cleanup_orphaned_dedup_entries(conn);
-            }
-            if let Ok(mut h) = self.lock_holder.lock() {
-                *h = "";
             }
             drop(stmt);
             drop(guard);
@@ -2269,5 +2593,95 @@ impl StorageState {
         )
         .map_err(|e| format!("Failed to cleanup orphaned dedup entries: {}", e))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ocr_lifecycle_tests {
+    use super::*;
+    use crate::credential_manager::CredentialManagerState;
+    use std::sync::Arc;
+
+    #[test]
+    fn postprocess_retry_uses_bounded_exponential_backoff() {
+        assert_eq!(ocr_postprocess_retry_decision(0), ("pending", Some(30), 1));
+        assert_eq!(ocr_postprocess_retry_decision(1), ("pending", Some(60), 2));
+        assert_eq!(ocr_postprocess_retry_decision(2), ("pending", Some(120), 3));
+        assert_eq!(ocr_postprocess_retry_decision(3), ("pending", Some(300), 4));
+        assert_eq!(ocr_postprocess_retry_decision(4), ("failed", None, 5));
+        assert_eq!(ocr_postprocess_retry_decision(99), ("failed", None, 100));
+    }
+
+    #[test]
+    fn interrupted_postprocess_waits_for_explicit_auth_without_consuming_attempts() {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE screenshot_ocr_status (
+                    screenshot_id INTEGER PRIMARY KEY,
+                    postprocess_status TEXT NOT NULL,
+                    postprocess_error TEXT,
+                    postprocess_attempts INTEGER NOT NULL DEFAULT 0,
+                    postprocess_next_retry_at TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 INSERT INTO screenshot_ocr_status (
+                    screenshot_id, postprocess_status, postprocess_attempts
+                 ) VALUES (42, 'queued', 2);",
+            )
+            .expect("OCR lifecycle fixture");
+        *storage.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection);
+
+        assert_eq!(
+            storage
+                .recover_interrupted_ocr_postprocess()
+                .expect("defer interrupted row"),
+            1
+        );
+        {
+            let guard = storage.db.lock().unwrap_or_else(|e| e.into_inner());
+            let connection = guard.as_ref().expect("database");
+            let (status, attempts): (String, i64) = connection
+                .query_row(
+                    "SELECT postprocess_status, postprocess_attempts
+                     FROM screenshot_ocr_status WHERE screenshot_id = 42",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("deferred row");
+            assert_eq!(status, "waiting_for_auth");
+            assert_eq!(attempts, 2);
+        }
+        assert!(storage
+            .list_pending_ocr_postprocess_ids(10)
+            .expect("pending rows before auth")
+            .is_empty());
+
+        assert_eq!(
+            storage
+                .resume_waiting_ocr_postprocess()
+                .expect("resume after auth"),
+            1
+        );
+        assert_eq!(
+            storage
+                .list_pending_ocr_postprocess_ids(10)
+                .expect("pending rows after auth"),
+            vec![42]
+        );
+        let guard = storage.db.lock().unwrap_or_else(|e| e.into_inner());
+        let attempts: i64 = guard
+            .as_ref()
+            .expect("database")
+            .query_row(
+                "SELECT postprocess_attempts FROM screenshot_ocr_status WHERE screenshot_id = 42",
+                [],
+                |row| row.get(0),
+            )
+            .expect("attempt count");
+        assert_eq!(attempts, 2);
     }
 }

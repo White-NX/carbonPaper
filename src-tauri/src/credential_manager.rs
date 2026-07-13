@@ -160,6 +160,11 @@ impl CredentialManagerState {
         }
     }
 
+    /// Returns whether the user authenticated within the specified window.
+    ///
+    /// Reserve this for exceptional operations that explicitly require a fresh
+    /// proof of user presence. Normal protected application actions should use
+    /// `is_session_valid` so an unlocked session remains sufficient.
     pub fn is_recently_authenticated(&self, max_age_secs: u64) -> bool {
         let in_foreground = *self
             .app_in_foreground
@@ -1048,28 +1053,33 @@ fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialE
 
 #[cfg(windows)]
 pub fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    use windows::Win32::Security::Cryptography::{
-        NCryptDecrypt, NCryptFreeObject, NCRYPT_HANDLE, NCRYPT_PAD_PKCS1_FLAG,
-    };
+    use windows::Win32::Security::Cryptography::NCRYPT_PAD_PKCS1_FLAG;
+
+    decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG)
+}
+
+#[cfg(windows)]
+fn decrypt_master_key_with_cng_flags(
+    ciphertext: &[u8],
+    flags: windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
+) -> Result<Vec<u8>, CredentialError> {
+    use windows::Win32::Foundation::NTE_SILENT_CONTEXT;
+    use windows::Win32::Security::Cryptography::{NCryptDecrypt, NCryptFreeObject, NCRYPT_HANDLE};
 
     let key = open_or_create_cng_key()?;
 
     // 第一次调用获取输出大小
     let mut out_len: u32 = 0;
-    unsafe {
-        NCryptDecrypt(
-            key,
-            Some(ciphertext),
-            None,
-            None,
-            &mut out_len,
-            NCRYPT_PAD_PKCS1_FLAG,
-        )
-    }
-    .map_err(|e| {
-        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-        CredentialError::SystemError(format!("NCryptDecrypt size failed: {}", e))
-    })?;
+    unsafe { NCryptDecrypt(key, Some(ciphertext), None, None, &mut out_len, flags) }.map_err(
+        |e| {
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+            if e.code() == NTE_SILENT_CONTEXT {
+                CredentialError::AuthRequired
+            } else {
+                CredentialError::SystemError(format!("NCryptDecrypt size failed: {}", e))
+            }
+        },
+    )?;
 
     let mut output = vec![0u8; out_len as usize];
     unsafe {
@@ -1079,12 +1089,16 @@ pub fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, Credent
             None,
             Some(output.as_mut_slice()),
             &mut out_len,
-            NCRYPT_PAD_PKCS1_FLAG,
+            flags,
         )
     }
     .map_err(|e| {
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-        CredentialError::SystemError(format!("NCryptDecrypt failed: {}", e))
+        if e.code() == NTE_SILENT_CONTEXT {
+            CredentialError::AuthRequired
+        } else {
+            CredentialError::SystemError(format!("NCryptDecrypt failed: {}", e))
+        }
     })?;
 
     let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
@@ -1095,6 +1109,15 @@ pub fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, Credent
 /// 使用 CNG 私钥解封装行密钥（触发系统级 UI）
 pub fn decrypt_row_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
     decrypt_master_key_with_cng(ciphertext)
+}
+
+/// 使用 CNG 私钥静默解封装行密钥。此路径绝不显示系统认证 UI；需要用户交互时
+/// 返回 `CredentialError::AuthRequired`，由调用方等待用户主动解锁。
+#[cfg(windows)]
+pub fn decrypt_row_key_with_cng_silent(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+    use windows::Win32::Security::Cryptography::{NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG};
+
+    decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG)
 }
 
 fn encode_master_key_file(ciphertext: &[u8]) -> Vec<u8> {
@@ -1169,6 +1192,13 @@ pub fn save_public_key_to_file(
 
 #[cfg(not(windows))]
 pub fn decrypt_row_key_with_cng(_ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+    Err(CredentialError::SystemError(
+        "CNG is only available on Windows".to_string(),
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn decrypt_row_key_with_cng_silent(_ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
     Err(CredentialError::SystemError(
         "CNG is only available on Windows".to_string(),
     ))

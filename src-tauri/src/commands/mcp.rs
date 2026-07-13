@@ -213,9 +213,12 @@ pub async fn mcp_set_enabled(
 
 #[tauri::command]
 pub async fn mcp_get_status(
+    app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
     mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
+    monitor_state: tauri::State<'_, crate::monitor::MonitorState>,
+    ml_state: tauri::State<'_, Arc<crate::ml_runtime::MlRuntimeState>>,
 ) -> Result<serde_json::Value, String> {
     let policy = storage_state.load_policy()?;
     let enabled = policy
@@ -226,6 +229,20 @@ pub async fn mcp_get_status(
     let running = mcp_state.is_running();
     let last_error = mcp_state.get_last_error();
     let privacy_acknowledged = mcp_privacy_acknowledged_from_policy_or_db(&storage_state, &policy);
+    let python_running = monitor_state
+        .process
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    let rust_ocr_enabled = crate::registry_config::get_bool("rust_ocr_enabled").unwrap_or(true);
+    let ml_status = ml_state.status(storage_state.count_failed_ocr().unwrap_or(0));
+    let app_for_model_status = app.clone();
+    let ocr_model_status = tokio::task::spawn_blocking(move || {
+        crate::ml_runtime::ocr_model_status(&app_for_model_status)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
     let state = if !enabled {
         "disabled"
     } else if running {
@@ -250,6 +267,23 @@ pub async fn mcp_get_status(
         "state": state,
         "error": last_error,
         "privacy_acknowledged": privacy_acknowledged
+        ,"server_version": env!("CARGO_PKG_VERSION")
+        ,"skill": {
+            "id": "carbonpaper-memory",
+            "source_repository": "https://github.com/White-NX/carbonPaperSkill",
+            "tool_schema_version": 1
+        }
+        ,"capabilities": {
+            "ocr_engine": if rust_ocr_enabled { "rust" } else { "python" },
+            "rust_ml_state": ml_status.state,
+            "ocr_model_id": ocr_model_status.as_ref().map(|status| status.model_id.as_str()),
+            "ocr_model_revision": ocr_model_status.as_ref().map(|status| status.revision.as_str()),
+            "ocr_model_source": ocr_model_status.as_ref().map(|status| status.source.as_str()),
+            "ocr_model_verified": ocr_model_status.as_ref().map(|status| status.installed).unwrap_or(false),
+            "search_ocr_text": true,
+            "search_nl": python_running,
+            "search_nl_disabled_reason": if python_running { serde_json::Value::Null } else { serde_json::json!("legacy_python_monitor_not_running") }
+        }
     }))
 }
 

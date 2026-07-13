@@ -215,6 +215,7 @@ fn chinese_clip_onnx_missing(base: &Path) -> Vec<String> {
             "config.json",
             "preprocessor_config.json",
             "onnx/model_q4.onnx",
+            "tokenizer.json",
         ],
     )
 }
@@ -902,6 +903,7 @@ mod tests {
             "config.json",
             "preprocessor_config.json",
             "onnx/model_q4.onnx",
+            "tokenizer.json",
         ] {
             touch(base, rel);
         }
@@ -931,6 +933,23 @@ mod tests {
             &models_dir
         ));
         assert!(required_pytorch_complete(&models_dir));
+    }
+
+    #[test]
+    fn chinese_clip_onnx_requires_fast_tokenizer_contract() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        for rel in [
+            "vocab.txt",
+            "config.json",
+            "preprocessor_config.json",
+            "onnx/model_q4.onnx",
+        ] {
+            touch(tmp.path(), rel);
+        }
+        assert_eq!(
+            chinese_clip_onnx_missing(tmp.path()),
+            vec!["tokenizer.json".to_string()]
+        );
     }
 
     #[test]

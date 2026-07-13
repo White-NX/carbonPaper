@@ -1,12 +1,13 @@
 //! Row-level and ChromaDB encryption/decryption helpers.
 
 use crate::credential_manager::{
-    decrypt_row_key_with_cng, decrypt_with_master_key, encrypt_with_exported_public_key,
-    encrypt_with_master_key, get_cached_public_key, load_public_key_from_file,
+    decrypt_row_key_with_cng, decrypt_row_key_with_cng_silent, decrypt_with_master_key,
+    encrypt_with_exported_public_key, encrypt_with_master_key, get_cached_public_key,
+    load_public_key_from_file, CredentialError,
 };
 use rand::RngCore;
 
-use super::StorageState;
+use super::{BackgroundReadError, StorageState};
 
 impl StorageState {
     /// Zeroize sensitive data in memory to reduce risk of leakage.
@@ -53,6 +54,24 @@ impl StorageState {
 
         Self::zeroize_bytes(&mut row_key);
         Ok(decrypted)
+    }
+
+    pub(crate) fn decrypt_payload_with_row_key_silent(
+        &self,
+        encrypted_data: &[u8],
+        encrypted_key: &[u8],
+    ) -> Result<Vec<u8>, BackgroundReadError> {
+        let mut row_key =
+            decrypt_row_key_with_cng_silent(encrypted_key).map_err(|error| match error {
+                CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
+                other => BackgroundReadError::Other(format!("Failed to unwrap row key: {}", other)),
+            })?;
+
+        let decrypted = decrypt_with_master_key(&row_key, encrypted_data)
+            .map_err(|e| BackgroundReadError::Other(format!("Failed to decrypt payload: {}", e)));
+
+        Self::zeroize_bytes(&mut row_key);
+        decrypted
     }
 
     /// Encrypt text for ChromaDB storage.

@@ -1409,6 +1409,22 @@ pub async fn start_monitor_impl(
             .env("CARBONPAPER_REVERSE_IPC_TOKEN", &reverse_ipc_auth_token)
             .env("PROFILING_ENABLED", "1");
 
+        match crate::ml_runtime::resolve_ocr_model_path(&app) {
+            Ok(path) => {
+                cmd_proc.env("CARBONPAPER_OCR_MODEL_DIR", path);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Bundled PP-OCRv5 Mobile model is unavailable; monitor will start with OCR degraded until the model is repaired: {}",
+                    error
+                );
+            }
+        }
+        cmd_proc.env(
+            "CARBONPAPER_REQUIRE_OCR_MODEL",
+            (!cfg!(debug_assertions)).to_string(),
+        );
+
         // Pass the current storage.data_dir to the child process to ensure that Python uses the correct data directory at startup.
         if let Some(storage_state) = app.try_state::<Arc<StorageState>>() {
             let dd = storage_state

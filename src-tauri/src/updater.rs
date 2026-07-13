@@ -747,7 +747,7 @@ pub async fn updater_install(
     capture_state: tauri::State<'_, std::sync::Arc<crate::capture::CaptureState>>,
 ) -> Result<(), String> {
     crate::commands::check_main_window(&window)?;
-    crate::commands::check_recent_auth_required(&credential_state, 300)?;
+    crate::commands::check_auth_required(&credential_state)?;
     let _install_guard = state
         .install_lock
         .try_lock()
