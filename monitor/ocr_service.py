@@ -6,10 +6,33 @@ provides OCR inference and vector-store management through IPC commands.
 """
 
 import datetime
+import gc
 import logging
+import math
+import os
+import threading
+import time
 from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_ocr_idle_unload_secs(raw_value: Optional[str]) -> float:
+    try:
+        value = float(raw_value or "300")
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid CARBONPAPER_PYTHON_OCR_IDLE_UNLOAD_SECS=%r; using 300 seconds",
+            raw_value,
+        )
+        return 300.0
+    if not math.isfinite(value):
+        logger.warning(
+            "Non-finite CARBONPAPER_PYTHON_OCR_IDLE_UNLOAD_SECS=%r; using 300 seconds",
+            raw_value,
+        )
+        return 300.0
+    return max(30.0, value)
 
 from ocr_engine import OCREngine, get_ocr_engine
 from vector_store import VectorStore
@@ -47,15 +70,17 @@ class OCRService:
             self.storage_client = init_storage_client(storage_pipe)
             logger.info("Storage client initialised: %s", storage_pipe)
 
-        # OCR engine (thread-safe singleton)
-        logger.info("Initialising OCR engine...")
-        try:
-            self.ocr_engine: OCREngine = get_ocr_engine()
-            logger.info("OCR engine initialised successfully.")
-        except Exception as e:
-            logger.error("OCR engine initialisation failed: %s", e)
-            logger.exception("OCR engine initialisation error")
-            raise
+        # OCR is deliberately lazy. In Rust-provider mode this worker is still
+        # needed for vector/classification post-processing, but loading a second
+        # ONNX OCR pipeline would otherwise keep both runtimes resident.
+        self.ocr_engine: Optional[OCREngine] = None
+        self._ocr_lock = threading.RLock()
+        self._ocr_last_used_monotonic: Optional[float] = None
+        self._rust_ocr_provider_active = True
+        self._ocr_idle_unload_secs = _parse_ocr_idle_unload_secs(
+            os.environ.get("CARBONPAPER_PYTHON_OCR_IDLE_UNLOAD_SECS", "300")
+        )
+        logger.info("Python OCR engine configured for lazy loading")
 
         # Vector store
         self.enable_vector_store = enable_vector_store
@@ -85,6 +110,33 @@ class OCRService:
         """Mark the service as started (records start time)."""
         self.stats["start_time"] = datetime.datetime.now()
         logger.info("OCR service started.")
+
+    def set_rust_ocr_provider_active(self, active: bool):
+        with self._ocr_lock:
+            self._rust_ocr_provider_active = bool(active)
+
+    def get_ocr_engine_for_inference(self) -> OCREngine:
+        with self._ocr_lock:
+            if self.ocr_engine is None:
+                logger.info("Initialising Python OCR engine on demand...")
+                self.ocr_engine = get_ocr_engine()
+                logger.info("Python OCR engine initialised successfully")
+            self._ocr_last_used_monotonic = time.monotonic()
+            return self.ocr_engine
+
+    def maybe_unload_idle_ocr_engine(self, now: Optional[float] = None) -> bool:
+        with self._ocr_lock:
+            if not self._rust_ocr_provider_active or self.ocr_engine is None:
+                return False
+            current = time.monotonic() if now is None else float(now)
+            last_used = self._ocr_last_used_monotonic
+            if last_used is None or current - last_used < self._ocr_idle_unload_secs:
+                return False
+            self.ocr_engine = None
+            self._ocr_last_used_monotonic = None
+        gc.collect()
+        logger.info("Released idle Python OCR engine while Rust OCR is active")
+        return True
 
     def pause(self):
         """Pause the service (handled via config.paused_event)."""
@@ -203,5 +255,9 @@ class OCRService:
 
         if self.vector_store:
             stats["vector_stats"] = self.vector_store.get_collection_stats()
+
+        with self._ocr_lock:
+            stats["python_ocr_loaded"] = self.ocr_engine is not None
+            stats["rust_ocr_provider_active"] = self._rust_ocr_provider_active
 
         return stats

@@ -96,9 +96,29 @@ class OCREngine:
             'use_doc_orientation_classify': False,
             'use_doc_unwarping': False,
         }
-        
-        # If no model directories specified, default to PP-OCRv5 mobile and let PaddleOCR download them
-        if not (det_model_dir and rec_model_dir and cls_model_dir):
+
+        bundled_model_dir = os.environ.get('CARBONPAPER_OCR_MODEL_DIR', '').strip()
+        require_bundled_model = os.environ.get('CARBONPAPER_REQUIRE_OCR_MODEL', '').strip().lower() in {
+            '1', 'true', 'yes', 'on'
+        }
+        if bundled_model_dir:
+            bundled_paths = {
+                'det_model_path': os.path.join(bundled_model_dir, 'ch_PP-OCRv5_det_mobile.onnx'),
+                'rec_model_path': os.path.join(bundled_model_dir, 'ch_PP-OCRv5_rec_mobile.onnx'),
+                'rec_keys_path': os.path.join(bundled_model_dir, 'ppocrv5_dict.txt'),
+            }
+            missing = [path for path in bundled_paths.values() if not os.path.isfile(path)]
+            if missing:
+                raise RuntimeError(f"Bundled PP-OCRv5 Mobile files are missing: {missing}")
+            init_params.update(bundled_paths)
+            # The Rust pipeline intentionally runs without the orientation
+            # classifier. Keep the Python fallback on the same model set.
+            init_params['use_angle_cls'] = False
+            logger.info("Using bundled PP-OCRv5 Mobile model directory: %s", bundled_model_dir)
+        elif require_bundled_model:
+            raise RuntimeError("CARBONPAPER_OCR_MODEL_DIR is required in release builds")
+        # Development/legacy fallback: ask RapidOCR for PP-OCRv5 mobile.
+        elif not (det_model_dir and rec_model_dir and cls_model_dir):
             ppocr_root = _get_ppocr_base_dir()
             os.makedirs(ppocr_root, exist_ok=True)
             normalized_size = str(model_size).strip().lower()
@@ -124,22 +144,18 @@ class OCREngine:
             rec_model_dir = rec_model_dir or os.path.join(ppocr_root, f"ch_PP-OCRv5_{rec_suffix}_infer")
             cls_model_dir = cls_model_dir or os.path.join(ppocr_root, "ch_ppocr_mobile_v2.0_cls_infer")
 
-        # Add optional model directories (only pass if the directory exists to avoid PaddleX assertion failures)
-        if det_model_dir and os.path.exists(det_model_dir):
-            init_params['det_model_dir'] = det_model_dir
-        elif det_model_dir:
-            logger.warning("det_model_dir NOT FOUND, using default download path: %s", det_model_dir)
-
-        if rec_model_dir and os.path.exists(rec_model_dir):
-            init_params['rec_model_dir'] = rec_model_dir
-        elif rec_model_dir:
-            logger.warning("rec_model_dir NOT FOUND, using default download path: %s", rec_model_dir)
-
-        if cls_model_dir and os.path.exists(cls_model_dir):
-            init_params['cls_model_dir'] = cls_model_dir
-        elif cls_model_dir:
-            logger.warning("cls_model_dir NOT FOUND, disabling angle classification: %s", cls_model_dir)
-            init_params['use_angle_cls'] = False
+        if not bundled_model_dir:
+            # The compatibility wrapper uses ONNX file paths, not Paddle model
+            # directories. Retain the legacy arguments only as diagnostics.
+            for label, directory in (
+                ('det_model_dir', det_model_dir),
+                ('rec_model_dir', rec_model_dir),
+                ('cls_model_dir', cls_model_dir),
+            ):
+                if directory and os.path.exists(directory):
+                    logger.warning("Ignoring legacy %s=%s; an ONNX model file is required", label, directory)
+                elif directory:
+                    logger.debug("Legacy %s does not exist: %s", label, directory)
             
         # Use a lock to ensure only one concurrent initialisation
         with self._init_lock:

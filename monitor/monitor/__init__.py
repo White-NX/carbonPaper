@@ -46,6 +46,9 @@ _clustering_ingest_thread = None
 _clustering_ingest_stop = threading.Event()
 _auth_token = None           # Auth token for IPC validation
 _last_seq_no = -1            # Last processed sequence number
+_seen_seq_nos = set()        # Accepted sequence numbers inside the replay window
+_seq_lock = threading.Lock()
+_SEQ_REPLAY_WINDOW = 4096
 _storage_pipe = None         # Storage service pipe name
 
 # Cache for dynamically extracted icons by process name
@@ -314,9 +317,24 @@ def _handle_command_impl(req: dict):
 
     # Replay-attack prevention
     if req_seq_no is not None:
-        if req_seq_no <= _last_seq_no:
-            return {'error': f'Authentication failed: Invalid sequence number (got {req_seq_no}, expected > {_last_seq_no})'}
-        _last_seq_no = req_seq_no
+        if not isinstance(req_seq_no, int) or isinstance(req_seq_no, bool) or req_seq_no < 0:
+            return {'error': 'Authentication failed: Invalid sequence number type'}
+        with _seq_lock:
+            minimum_retained = max(0, _last_seq_no - _SEQ_REPLAY_WINDOW + 1)
+            if req_seq_no in _seen_seq_nos or req_seq_no < minimum_retained:
+                return {
+                    'error': (
+                        'Authentication failed: Replayed or expired sequence number '
+                        f'(got {req_seq_no}, highest {_last_seq_no})'
+                    )
+                }
+            _seen_seq_nos.add(req_seq_no)
+            if req_seq_no > _last_seq_no:
+                _last_seq_no = req_seq_no
+                cutoff = max(0, _last_seq_no - _SEQ_REPLAY_WINDOW + 1)
+                _seen_seq_nos.difference_update(
+                    seq for seq in tuple(_seen_seq_nos) if seq < cutoff
+                )
 
     cmd = (req.get('command') or '').lower()
 
@@ -642,6 +660,37 @@ def _handle_command_impl(req: dict):
             logger.error('[DIAG:process_ocr] worker failed screenshot_id=%s error=%s', screenshot_id, e, exc_info=True)
             return {'error': str(e)}
 
+    if cmd == 'enqueue_ocr_postprocess':
+        screenshot_id = req.get('screenshot_id')
+        if screenshot_id is None:
+            return {'error': 'screenshot_id is required'}
+        if not _ocr_worker or not hasattr(_ocr_worker, 'request'):
+            return {'error': 'OCR postprocess service is not initialised'}
+        try:
+            result = _ocr_worker.request(
+                'enqueue_ocr_postprocess',
+                {'request': req},
+                timeout=30,
+            )
+            if result.get('status') == 'success':
+                _enqueue_clustering_snapshot({
+                    'screenshot_id': screenshot_id,
+                    'process_name': req.get('process_name', ''),
+                    'window_title': req.get('window_title', ''),
+                    'ocr_text': req.get('ocr_text', ''),
+                    'timestamp': req.get('timestamp', 0),
+                    'category': '',
+                })
+            return result
+        except Exception as e:
+            logger.error(
+                '[DIAG:enqueue_ocr_postprocess] failed screenshot_id=%s error=%s',
+                screenshot_id,
+                e,
+                exc_info=True,
+            )
+            return {'error': str(e)}
+
     # ----- Classification commands -----
     if cmd == 'classify':
         title = req.get('title', '')
@@ -849,7 +898,9 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     global _server, _ocr_worker, _classifier, _storage_pipe, _clustering_manager, _clustering_scheduler, _clustering_scheduler_active, _clustering_auth_monitor_thread, _auth_token, _last_seq_no, _last_clustering_auth_check, _last_clustering_session_valid
 
     _auth_token = auth_token
-    _last_seq_no = -1
+    with _seq_lock:
+        _last_seq_no = -1
+        _seen_seq_nos.clear()
     _storage_pipe = storage_pipe
     _clustering_scheduler_active = False
     _clustering_auth_monitor_thread = None

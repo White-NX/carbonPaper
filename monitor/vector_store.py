@@ -4,6 +4,7 @@ Uses OFA-Sys/chinese-clip-vit-base-patch16 for image and text encoding.
 """
 import os
 import hashlib
+import json
 import logging
 import time as _time
 import threading
@@ -23,6 +24,7 @@ class ChineseCLIPSingleton:
     _instance = None
     _model = None
     _processor = None
+    _tokenizer = None
     _initialized = False
     _is_onnx = False
     _session = None
@@ -34,6 +36,9 @@ class ChineseCLIPSingleton:
     _image_output_name = None
     _text_output_name = None
     _image_size = 224
+    _image_mean = np.asarray([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+    _image_std = np.asarray([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+    _rescale_factor = np.float32(1.0 / 255.0)
     
     def __new__(cls):
         if cls._instance is None:
@@ -70,11 +75,16 @@ class ChineseCLIPSingleton:
                 onnx_file = get_onnx_model_path(model_name, os.path.join("onnx", "model_q4.onnx"))
                 if onnx_file:
                     logger.info("Loading Chinese-CLIP from ONNX: %s...", onnx_file)
-                    from transformers import ChineseCLIPProcessor
-                    self._processor = ChineseCLIPProcessor.from_pretrained(
-                        model_name,
-                        use_fast=False,
-                    )
+                    from numpy_tokenizer import NumpyTokenizer
+                    self._tokenizer = NumpyTokenizer(model_name)
+                    preprocessor_path = os.path.join(model_name, "preprocessor_config.json")
+                    with open(preprocessor_path, "r", encoding="utf-8") as config_file:
+                        image_config = json.load(config_file)
+                    size = image_config.get("size", {})
+                    self._image_size = int(size.get("height", size.get("shortest_edge", 224)))
+                    self._image_mean = np.asarray(image_config.get("image_mean", self._image_mean), dtype=np.float32)
+                    self._image_std = np.asarray(image_config.get("image_std", self._image_std), dtype=np.float32)
+                    self._rescale_factor = np.float32(image_config.get("rescale_factor", 1.0 / 255.0))
                     self._session = create_onnx_session(onnx_file)
                     self._is_onnx = True
                     
@@ -122,38 +132,19 @@ class ChineseCLIPSingleton:
                     self._image_output_name = image_embed_name
                     self._text_output_name = text_embed_name
                     
-                    # 2. Extract visual image size from processor configs dynamically
-                    self._image_size = 224
-                    try:
-                        if hasattr(self._processor, "image_processor") and self._processor.image_processor is not None:
-                            size_config = getattr(self._processor.image_processor, "size", None)
-                            if isinstance(size_config, dict):
-                                self._image_size = size_config.get("height", size_config.get("shortest_edge", 224))
-                            elif isinstance(size_config, int):
-                                self._image_size = size_config
-                        elif hasattr(self._processor, "feature_extractor") and self._processor.feature_extractor is not None:
-                            size_config = getattr(self._processor.feature_extractor, "size", None)
-                            if isinstance(size_config, dict):
-                                self._image_size = size_config.get("height", size_config.get("shortest_edge", 224))
-                            elif isinstance(size_config, int):
-                                self._image_size = size_config
-                    except Exception as e:
-                        logger.warning("Failed to extract image size from processor configuration: %s. Using default 224", e)
-                        
-                    # 3. Load-time smoke test
+                    # 2. Load-time smoke test
                     try:
                         logger.info("Running Chinese-CLIP ONNX smoke test...")
                         dummy_image = Image.new("RGB", (10, 10), color="red")
                         dummy_text = "测试"
                         
-                        img_inputs = self._processor(images=dummy_image, return_tensors="np")
-                        img_feeds = self._build_clip_feeds(pixel_values=img_inputs["pixel_values"])
+                        img_feeds = self._build_clip_feeds(pixel_values=self.preprocess_images([dummy_image]))
                         img_outputs = self._session.run([self._image_output_name], img_feeds)
                         img_emb = img_outputs[0]
                         if img_emb.ndim != 2 or not np.isfinite(img_emb).all():
                             raise ValueError(f"Invalid image embedding output shape or values: shape={img_emb.shape}")
                             
-                        txt_inputs = self._processor(text=[dummy_text], return_tensors="np", padding=True)
+                        txt_inputs = self.tokenize_texts([dummy_text])
                         txt_feeds = self._build_clip_feeds(input_ids=txt_inputs["input_ids"], attention_mask=txt_inputs.get("attention_mask"))
                         txt_outputs = self._session.run([self._text_output_name], txt_feeds)
                         txt_emb = txt_outputs[0]
@@ -165,6 +156,7 @@ class ChineseCLIPSingleton:
                         logger.error("Chinese-CLIP ONNX smoke test failed: %s", e)
                         self._session = None
                         self._processor = None
+                        self._tokenizer = None
                         self._is_onnx = False
                         raise RuntimeError(f"Chinese-CLIP ONNX smoke test failed: {e}") from e
 
@@ -190,6 +182,28 @@ class ChineseCLIPSingleton:
             except Exception as e:
                 logger.error("Chinese-CLIP model loading failed: %s", e)
                 raise
+
+    def preprocess_images(self, images) -> np.ndarray:
+        """Prepare Chinese-CLIP ONNX pixels without importing Torch."""
+        batches = []
+        for image in images:
+            if isinstance(image, str):
+                image = Image.open(image)
+            elif isinstance(image, np.ndarray):
+                image = Image.fromarray(image)
+            image = image.convert("RGB").resize(
+                (self._image_size, self._image_size), Image.Resampling.BICUBIC
+            )
+            pixels = np.asarray(image, dtype=np.float32) * self._rescale_factor
+            pixels = (pixels - self._image_mean) / self._image_std
+            batches.append(np.transpose(pixels, (2, 0, 1)))
+        return np.ascontiguousarray(np.stack(batches), dtype=np.float32)
+
+    def tokenize_texts(self, texts) -> dict:
+        """Tokenize Chinese-CLIP text directly to NumPy arrays."""
+        return self._tokenizer(
+            list(texts), padding=True, truncation=False, return_tensors="np"
+        )
                 
     def _build_clip_feeds(self, pixel_values=None, input_ids=None, attention_mask=None) -> dict:
         feeds = {}
@@ -264,8 +278,7 @@ class ImageVectorizer:
         if not self._singleton._initialized:
             self._singleton.initialize()
         if self._singleton._is_onnx:
-            if self.processor is None:
-                _, self.processor = self._singleton.get_components()
+            return
         else:
             if self.model is None:
                 self.model, self.processor = self._singleton.get_components()
@@ -290,8 +303,8 @@ class ImageVectorizer:
             elif isinstance(image, Image.Image):
                 image = image.convert('RGB')
 
-            inputs = self.processor(images=image, return_tensors="np")
-            feeds = self._singleton._build_clip_feeds(pixel_values=inputs["pixel_values"])
+            pixels = self._singleton.preprocess_images([image])
+            feeds = self._singleton._build_clip_feeds(pixel_values=pixels)
             outputs = self._singleton._session.run([self._singleton._image_output_name], feeds)
             image_features = outputs[0]
             norm = np.linalg.norm(image_features, axis=-1, keepdims=True)
@@ -431,7 +444,7 @@ class ImageVectorizer:
         self._ensure_initialized()
         if self._singleton._is_onnx:
             _t0 = _time.perf_counter()
-            inputs = self.processor(text=[text], return_tensors="np", padding=True)
+            inputs = self._singleton.tokenize_texts([text])
             _t_tokenize = _time.perf_counter() - _t0
 
             _t0 = _time.perf_counter()
@@ -498,8 +511,8 @@ class ImageVectorizer:
                 else:
                     pil_images.append(img.convert('RGB'))
 
-            inputs = self.processor(images=pil_images, return_tensors="np", padding=True)
-            feeds = self._singleton._build_clip_feeds(pixel_values=inputs["pixel_values"])
+            pixels = self._singleton.preprocess_images(pil_images)
+            feeds = self._singleton._build_clip_feeds(pixel_values=pixels)
             outputs = self._singleton._session.run([self._singleton._image_output_name], feeds)
             image_features = outputs[0]
             norm = np.linalg.norm(image_features, axis=-1, keepdims=True)

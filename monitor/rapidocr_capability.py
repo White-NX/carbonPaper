@@ -97,6 +97,9 @@ class PaddleOCR:
         text_detection_model_name: Optional[str] = None,
         text_recognition_model_name: Optional[str] = None,
         ocr_version: Optional[str] = None,
+        det_model_path: Optional[str] = None,
+        rec_model_path: Optional[str] = None,
+        rec_keys_path: Optional[str] = None,
     ):
         """
         Initialise the OCR engine.
@@ -122,6 +125,23 @@ class PaddleOCR:
 
         if use_dml:
             params["EngineConfig.onnxruntime.use_dml"] = True
+        if det_model_path:
+            params["Det.model_path"] = det_model_path
+        if rec_model_path:
+            params["Rec.model_path"] = rec_model_path
+        if rec_keys_path:
+            params["Rec.rec_keys_path"] = rec_keys_path
+
+        if ocr_version:
+            from rapidocr.utils.typings import OCRVersion
+
+            normalized_version = str(ocr_version).strip().upper().replace('_', '-')
+            if normalized_version == "PP-OCRV5":
+                params["Det.ocr_version"] = OCRVersion.PPOCRV5
+                params["Rec.ocr_version"] = OCRVersion.PPOCRV5
+            elif normalized_version == "PP-OCRV4":
+                params["Det.ocr_version"] = OCRVersion.PPOCRV4
+                params["Rec.ocr_version"] = OCRVersion.PPOCRV4
         self.engine = RapidOCR(params=params)
 
         self.lang = lang

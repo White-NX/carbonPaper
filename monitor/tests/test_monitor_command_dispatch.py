@@ -60,6 +60,7 @@ def _snapshot_globals():
     return {
         "_auth_token": mm._auth_token,
         "_last_seq_no": mm._last_seq_no,
+        "_seen_seq_nos": set(mm._seen_seq_nos),
         "_ocr_worker": mm._ocr_worker,
         "_clustering_scheduler": mm._clustering_scheduler,
         "_clustering_manager": mm._clustering_manager,
@@ -72,6 +73,8 @@ def _snapshot_globals():
 def _restore_globals(snapshot):
     mm._auth_token = snapshot["_auth_token"]
     mm._last_seq_no = snapshot["_last_seq_no"]
+    mm._seen_seq_nos.clear()
+    mm._seen_seq_nos.update(snapshot["_seen_seq_nos"])
     mm._ocr_worker = snapshot["_ocr_worker"]
     mm._clustering_scheduler = snapshot["_clustering_scheduler"]
     mm._clustering_manager = snapshot["_clustering_manager"]
@@ -187,6 +190,8 @@ def test_auth_token_and_sequence_number_guard():
     try:
         mm._auth_token = "secret-token"
         mm._last_seq_no = 8
+        mm._seen_seq_nos.clear()
+        mm._seen_seq_nos.add(8)
 
         auth_fail = mm._handle_command_impl(
             {"command": "status", "_auth_token": "wrong", "_seq_no": 9}
@@ -196,12 +201,37 @@ def test_auth_token_and_sequence_number_guard():
         seq_fail = mm._handle_command_impl(
             {"command": "status", "_auth_token": "secret-token", "_seq_no": 8}
         )
-        assert "Invalid sequence number" in seq_fail["error"]
+        assert "Replayed or expired sequence number" in seq_fail["error"]
 
         ok = mm._handle_command_impl(
             {"command": "status", "_auth_token": "secret-token", "_seq_no": 10}
         )
         assert "error" not in ok
+    finally:
+        _restore_globals(snapshot)
+
+
+def test_sequence_guard_accepts_out_of_order_concurrent_window_and_rejects_replay():
+    snapshot = _snapshot_globals()
+    try:
+        mm._auth_token = "secret-token"
+        mm._last_seq_no = -1
+        mm._seen_seq_nos.clear()
+
+        high = mm._handle_command_impl(
+            {"command": "status", "_auth_token": "secret-token", "_seq_no": 11}
+        )
+        lower = mm._handle_command_impl(
+            {"command": "status", "_auth_token": "secret-token", "_seq_no": 10}
+        )
+        replay = mm._handle_command_impl(
+            {"command": "status", "_auth_token": "secret-token", "_seq_no": 10}
+        )
+
+        assert "error" not in high
+        assert "error" not in lower
+        assert "Replayed or expired sequence number" in replay["error"]
+        assert mm._last_seq_no == 11
     finally:
         _restore_globals(snapshot)
 

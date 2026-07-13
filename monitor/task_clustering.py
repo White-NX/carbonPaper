@@ -14,6 +14,7 @@ and finally marked as unclustered noise awaiting the next HDBSCAN run.
 
 import os
 import gc
+import sys
 import json
 import time
 import logging
@@ -145,8 +146,8 @@ class TaskEmbedder:
                     from logging_config import log_model_loading
                     log_model_loading("MiniLM-L12-v2 (ONNX)")
                     logger.info("Loading MiniLM-L12-v2 from ONNX: %s ...", onnx_file)
-                    from transformers import AutoTokenizer
-                    self._tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+                    from numpy_tokenizer import NumpyTokenizer
+                    self._tokenizer = NumpyTokenizer(model_path)
                     self._model = create_onnx_session(onnx_file)
                     self._is_onnx = True
                     logger.info("MiniLM-L12-v2 loaded successfully via ONNX")
@@ -165,16 +166,20 @@ class TaskEmbedder:
     def unload(self):
         """Release model & tokenizer to free memory."""
         with self._lock:
+            was_onnx = self._is_onnx
             self._model = None
             self._tokenizer = None
             self._is_onnx = False
         gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        # Never import Torch merely to clear its cache. In ONNX mode that
+        # would load hundreds of MiB of native DLLs during model teardown.
+        if not was_onnx and "torch" in sys.modules:
+            try:
+                torch = sys.modules["torch"]
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
         logger.info("MiniLM-L12-v2 unloaded — memory released")
 
     # ---- encoding --------------------------------------------------------

@@ -1,5 +1,6 @@
 import monitor.config as config
 from monitor.worker_process import OcrPostprocessQueue, _process_ocr
+from ocr_service import OCRService, _parse_ocr_idle_unload_secs
 
 
 class DummyOcrWorker:
@@ -143,6 +144,41 @@ def test_process_ocr_enqueues_postprocess_even_when_ocr_text_is_empty(monkeypatc
     assert len(postprocess.jobs) == 1
     assert postprocess.jobs[0]["ocr_text"] == ""
     assert postprocess.jobs[0]["window_title"] == "Editor"
+
+
+def test_ocr_service_loads_python_engine_only_on_first_inference(monkeypatch):
+    created = []
+    engine = DummyOcrEngine()
+    monkeypatch.setattr("ocr_service.get_ocr_engine", lambda: created.append(True) or engine)
+    service = OCRService(enable_vector_store=False)
+
+    assert service.ocr_engine is None
+    assert service.get_ocr_engine_for_inference() is engine
+    assert service.get_ocr_engine_for_inference() is engine
+    assert created == [True]
+
+
+def test_ocr_service_unloads_idle_engine_only_in_rust_provider_mode(monkeypatch):
+    engine = DummyOcrEngine()
+    monkeypatch.setattr("ocr_service.get_ocr_engine", lambda: engine)
+    service = OCRService(enable_vector_store=False)
+    service.get_ocr_engine_for_inference()
+    service._ocr_idle_unload_secs = 30.0
+    service._ocr_last_used_monotonic = 100.0
+
+    service.set_rust_ocr_provider_active(False)
+    assert service.maybe_unload_idle_ocr_engine(now=200.0) is False
+    assert service.ocr_engine is engine
+
+    service.set_rust_ocr_provider_active(True)
+    assert service.maybe_unload_idle_ocr_engine(now=200.0) is True
+    assert service.ocr_engine is None
+
+
+def test_invalid_ocr_idle_unload_value_falls_back_to_default():
+    assert _parse_ocr_idle_unload_secs("5m") == 300.0
+    assert _parse_ocr_idle_unload_secs("nan") == 300.0
+    assert _parse_ocr_idle_unload_secs("10") == 30.0
 
 
 def test_vector_indexing_failure_records_retry_backlog():
