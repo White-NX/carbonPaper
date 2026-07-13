@@ -4,7 +4,7 @@ import AdvancedWarning from './advanced/AdvancedWarning';
 import ClusteringTechnicalCard from './advanced/ClusteringTechnicalCard';
 import CpuLimitCard from './advanced/CpuLimitCard';
 import DatabaseMaintenanceCard from './advanced/DatabaseMaintenanceCard';
-import { DmlAccelerationCard, OnnxRuntimeCard } from './advanced/InferenceCards';
+import { DmlAccelerationCard, OcrEngineCard, OnnxRuntimeCard } from './advanced/InferenceCards';
 import NetworkAccessCard from './advanced/NetworkAccessCard';
 import OcrQueueCard from './advanced/OcrQueueCard';
 import { useAdvancedSectionController } from './useAdvancedSectionController';
@@ -26,6 +26,10 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     vacuumRunning,
     vacuumMessage,
     selectedGpu,
+    mlOcrStatus,
+    mlOcrStatusLoading,
+    rustOcrModelStatus,
+    rustOcrModelDownloading,
     setCpuDropdownOpen,
     setQueueDropdownOpen,
     setGpuDropdownOpen,
@@ -41,6 +45,9 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     handleGpuChange,
     handleClusteringIntervalChange,
     handleManualVacuum,
+    handleRestartMlOcr,
+    handleDownloadRustOcrModel,
+    handleRetryFailedOcr,
   } = useAdvancedSectionController({ monitorStatus, t });
 
   if (loading || !config) {
@@ -75,6 +82,18 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         onQueueSizeChange={handleQueueSizeChange}
         onOcrTimeoutDraftChange={handleOcrTimeoutDraftChange}
         onOcrTimeoutChange={handleOcrTimeoutChange}
+      />
+
+      <OcrEngineCard
+        config={config}
+        status={mlOcrStatus}
+        statusLoading={mlOcrStatusLoading}
+        modelStatus={rustOcrModelStatus}
+        modelDownloading={rustOcrModelDownloading}
+        onToggle={handleToggle}
+        onRestart={handleRestartMlOcr}
+        onDownloadModel={handleDownloadRustOcrModel}
+        onRetryFailed={handleRetryFailedOcr}
       />
 
       <DmlAccelerationCard

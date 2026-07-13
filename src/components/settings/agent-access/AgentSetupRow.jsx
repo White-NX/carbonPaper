@@ -1,12 +1,17 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Check, Copy } from 'lucide-react';
-import { AGENT_SKILL_NAME, AGENT_SKILL_REPO } from './agentAccessConstants';
+import {
+  AGENT_SKILL_NAME,
+  AGENT_SKILL_REPO,
+} from './agentAccessConstants';
 
 export default function AgentSetupRow({
   port,
   agentPromptCopied,
+  diagnosticsCopied,
   onCopyAgentSetupPrompt,
+  onCopyDiagnostics,
 }) {
   const { t } = useTranslation();
 
@@ -39,13 +44,22 @@ export default function AgentSetupRow({
           )}
         </div>
       </div>
-      <button
-        onClick={onCopyAgentSetupPrompt}
-        className="shrink-0 px-3 py-1.5 text-xs text-ide-text hover:bg-ide-hover border border-ide-border rounded-lg transition-colors flex items-center gap-1.5"
-      >
-        {agentPromptCopied ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
-        {t('settings.ai_embedding.agent_setup.copy')}
-      </button>
+      <div className="shrink-0 flex flex-col gap-2">
+        <button
+          onClick={onCopyAgentSetupPrompt}
+          className="px-3 py-1.5 text-xs text-ide-text hover:bg-ide-hover border border-ide-border rounded-lg transition-colors flex items-center gap-1.5"
+        >
+          {agentPromptCopied ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
+          {t('settings.ai_embedding.agent_setup.copy')}
+        </button>
+        <button
+          onClick={onCopyDiagnostics}
+          className="px-3 py-1.5 text-xs text-ide-text hover:bg-ide-hover border border-ide-border rounded-lg transition-colors flex items-center gap-1.5"
+        >
+          {diagnosticsCopied ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
+          {t('settings.ai_embedding.agent_setup.copy_diagnostics', '复制诊断')}
+        </button>
+      </div>
     </div>
   );
 }

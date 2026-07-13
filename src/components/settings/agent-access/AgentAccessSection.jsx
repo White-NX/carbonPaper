@@ -22,6 +22,7 @@ export default function AgentAccessSection() {
     setConfirmText,
     tokenCopied,
     agentPromptCopied,
+    diagnosticsCopied,
     showResetConfirm,
     setShowResetConfirm,
     filterEnabled,
@@ -51,6 +52,7 @@ export default function AgentAccessSection() {
     handleForceRecheck,
     handleCopyCurrentToken,
     handleCopyAgentSetupPrompt,
+    handleCopyAgentDiagnostics,
     shouldShowStartButton,
     statusBadge,
     statusMessage,
@@ -81,6 +83,7 @@ export default function AgentAccessSection() {
         error={error}
         tokenCopied={tokenCopied}
         agentPromptCopied={agentPromptCopied}
+        diagnosticsCopied={diagnosticsCopied}
         filterEnabled={filterEnabled}
         filterCategories={filterCategories}
         filterMode={filterMode}
@@ -109,6 +112,7 @@ export default function AgentAccessSection() {
         onTogglePiiAdvanced={() => setShowPiiAdvanced(!showPiiAdvanced)}
         onCopyCurrentToken={handleCopyCurrentToken}
         onCopyAgentSetupPrompt={handleCopyAgentSetupPrompt}
+        onCopyAgentDiagnostics={handleCopyAgentDiagnostics}
       />
 
       <AgentAccessDialogs

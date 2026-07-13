@@ -230,6 +230,27 @@
         "seconds": "秒",
         "info": "OCR 队列设置会即时生效，无需重启监控服务"
       },
+      "rust_ocr": {
+        "title": "OCR 引擎",
+        "use_rust": "使用 Rust OCR",
+        "rust_desc": "使用隔离的 Rust ML 进程；失败时自动回退到 Python。",
+        "python_desc": "当前使用兼容的 Python OCR。",
+        "dml_beta": "DirectML Beta",
+        "dml_beta_desc": "临时实验开关，默认关闭；未来会废弃并合并到统一的 DirectML 设置。",
+        "model_ready": "PP-OCRv5 Mobile 已安装",
+        "model_missing": "需要安装 PP-OCRv5 Mobile 模型",
+        "model_bundled": "PP-OCRv5 Mobile 随 CarbonPaper 安装",
+        "model_repaired": "PP-OCRv5 Mobile 已通过在线修复安装",
+        "model_damaged": "PP-OCRv5 Mobile 安装资源缺失或损坏",
+        "model_checking": "正在检查模型…",
+        "model_downloading": "下载中…",
+        "model_download": "下载模型",
+        "model_repair": "在线修复",
+        "status_loading": "正在读取状态…",
+        "status_counts": "成功 {{success}} · 失败 {{failure}} · 最近 {{elapsed}} ms",
+        "restart": "重启 Rust ML 进程",
+        "retry_failed": "重试失败截图（{{count}}）"
+      },
       "dml": {
         "title": "OCR 推理加速",
         "label": "使用 DirectML 进行推理",
@@ -522,6 +543,7 @@
         "source": "来源",
         "endpoint": "端点",
         "copy": "复制配置提示词",
+        "copy_diagnostics": "复制诊断",
         "copied": "配置提示词已复制",
         "prompt": "请配置 CarbonPaper MCP 访问。\n\n1. 从 GitHub 仓库 {{repo}} 的 {{skillName}} 目录获取 Skill，并安装到你的 Agent/Skill 环境中。\n2. 使用该 Skill 处理 CarbonPaper 截图历史、OCR、任务聚类和智能聚类摘要相关请求。\n3. MCP endpoint：{{endpoint}}，使用 Streamable HTTP/HTTP POST。\n4. 认证头：Authorization: Bearer <CarbonPaper token>。不要让我把 token 写进长提示词；请让我在 CarbonPaper 中单独点击“复制令牌”，然后将其配置到你的 MCP 客户端。\n5. 如果工具返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 应用中完成 Windows Hello 解锁。\n6. 该 MCP 可能暴露本机截图历史、OCR 文本、窗口标题、URL、任务聚类和智能聚类数据；只在我明确要求时读取相关内容。"
       },

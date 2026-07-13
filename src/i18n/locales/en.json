@@ -230,6 +230,27 @@
         "seconds": "seconds",
         "info": "OCR queue settings take effect immediately without restarting the monitor service"
       },
+      "rust_ocr": {
+        "title": "OCR engine",
+        "use_rust": "Use Rust OCR",
+        "rust_desc": "Runs OCR in an isolated Rust ML process and falls back to Python on failure.",
+        "python_desc": "The compatible Python OCR engine is currently selected.",
+        "dml_beta": "DirectML Beta",
+        "dml_beta_desc": "Temporary experimental switch, off by default. It will be removed in favor of the unified DirectML setting.",
+        "model_ready": "PP-OCRv5 Mobile is installed",
+        "model_missing": "PP-OCRv5 Mobile must be installed",
+        "model_bundled": "PP-OCRv5 Mobile is bundled with CarbonPaper",
+        "model_repaired": "PP-OCRv5 Mobile was installed by online repair",
+        "model_damaged": "PP-OCRv5 Mobile installation resources are missing or corrupt",
+        "model_checking": "Checking model…",
+        "model_downloading": "Downloading…",
+        "model_download": "Download model",
+        "model_repair": "Repair online",
+        "status_loading": "Reading status…",
+        "status_counts": "Success {{success}} · Failed {{failure}} · Last {{elapsed}} ms",
+        "restart": "Restart Rust ML process",
+        "retry_failed": "Retry failed screenshots ({{count}})"
+      },
       "dml": {
         "title": "OCR inference acceleration",
         "label": "Use DirectML for inference",
@@ -522,6 +543,7 @@
         "source": "Source",
         "endpoint": "Endpoint",
         "copy": "Copy setup prompt",
+        "copy_diagnostics": "Copy diagnostics",
         "copied": "Setup prompt copied",
         "prompt": "Configure CarbonPaper MCP access.\n\n1. Fetch the Skill from the {{skillName}} directory in GitHub repository {{repo}}, then install it into your Agent/Skill environment.\n2. Use that Skill for CarbonPaper screenshot history, OCR, task cluster, and smart-cluster summary workflows.\n3. MCP endpoint: {{endpoint}}, using Streamable HTTP/HTTP POST.\n4. Authorization header: Authorization: Bearer <CarbonPaper token>. Do not ask me to paste the token into this long setup prompt; ask me to click Copy token in CarbonPaper and configure it separately in your MCP client.\n5. If a tool returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello before retrying.\n6. This MCP server may expose local screenshot history, OCR text, window titles, URLs, task clusters, and smart-cluster data. Read only the content needed for my explicit request."
       },

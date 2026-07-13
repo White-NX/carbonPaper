@@ -16,13 +16,21 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [gpuLoading, setGpuLoading] = useState(false);
   const [vacuumRunning, setVacuumRunning] = useState(false);
   const [vacuumMessage, setVacuumMessage] = useState('');
+  const [mlOcrStatus, setMlOcrStatus] = useState(null);
+  const [mlOcrStatusLoading, setMlOcrStatusLoading] = useState(false);
+  const [rustOcrModelStatus, setRustOcrModelStatus] = useState(null);
+  const [rustOcrModelDownloading, setRustOcrModelDownloading] = useState(false);
 
   const saveConfig = async (newConfig) => {
+    const previousConfig = config;
     setConfig(newConfig);
     try {
       await withAuth(() => invoke('set_advanced_config', { config: newConfig }), { autoPrompt: true });
+      return true;
     } catch (err) {
+      setConfig(previousConfig);
       console.error('Failed to save advanced config:', err);
+      return false;
     }
   };
 
@@ -107,14 +115,97 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     refreshVacuumRunningStatus();
   }, []);
 
+  const refreshMlOcrStatus = async () => {
+    setMlOcrStatusLoading(true);
+    try {
+      setMlOcrStatus(await invoke('get_ml_ocr_status'));
+    } catch (err) {
+      console.warn('Failed to read Rust ML OCR status:', err);
+    } finally {
+      setMlOcrStatusLoading(false);
+    }
+  };
+
+  const refreshRustOcrModelStatus = async () => {
+    try {
+      setRustOcrModelStatus(await invoke('get_rust_ocr_model_status'));
+    } catch (err) {
+      console.warn('Failed to read Rust OCR model status:', err);
+    }
+  };
+
+  useEffect(() => {
+    refreshRustOcrModelStatus();
+  }, []);
+
+  useEffect(() => {
+    if (!config?.rust_ocr_enabled) return undefined;
+    refreshMlOcrStatus();
+    const timer = window.setInterval(refreshMlOcrStatus, 5000);
+    return () => window.clearInterval(timer);
+  }, [config?.rust_ocr_enabled]);
+
+  const handleDownloadRustOcrModel = async () => {
+    setRustOcrModelDownloading(true);
+    try {
+      const status = await withAuth(
+        () => invoke('download_rust_ocr_model'),
+        { autoPrompt: true },
+      );
+      setRustOcrModelStatus(status);
+      await withAuth(
+        () => invoke('restart_ml_ocr_worker'),
+        { autoPrompt: true },
+      );
+      await refreshMlOcrStatus();
+    } catch (err) {
+      console.error('Failed to download Rust OCR model:', err);
+    } finally {
+      setRustOcrModelDownloading(false);
+    }
+  };
+
   const handleToggle = async (key) => {
     const newConfig = { ...config, [key]: !config[key] };
-    await saveConfig(newConfig);
+    const saved = await saveConfig(newConfig);
+    if (!saved) return;
     if (key === 'cpu_limit_enabled') setCpuChanged(true);
     if (key === 'use_dml') setDmlChanged(true);
     if (key === 'use_onnx') setOnnxChanged(true);
     if (key === 'capture_on_ocr_busy' || key === 'ocr_queue_limit_enabled' || key === 'clustering_allow_full_low_memory') {
       await syncOcrConfigToMonitor(newConfig);
+    }
+    if (key === 'rust_ocr_enabled' || key === 'rust_ocr_dml_beta') {
+      try {
+        await withAuth(
+          () => invoke('restart_ml_ocr_worker'),
+          { autoPrompt: true },
+        );
+      } catch (err) {
+        console.warn('Failed to restart Rust ML OCR worker:', err);
+      }
+      await refreshMlOcrStatus();
+    }
+  };
+
+  const handleRestartMlOcr = async () => {
+    try {
+      await withAuth(
+        () => invoke('restart_ml_ocr_worker'),
+        { autoPrompt: true },
+      );
+    } finally {
+      await refreshMlOcrStatus();
+    }
+  };
+
+  const handleRetryFailedOcr = async () => {
+    try {
+      await withAuth(() => invoke('retry_failed_ocr', { limit: 10 }), { autoPrompt: true });
+    } catch (err) {
+      console.error('Failed to retry OCR failures:', err);
+    } finally {
+      await refreshMlOcrStatus();
     }
   };
 
@@ -195,6 +286,10 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     vacuumRunning,
     vacuumMessage,
     selectedGpu,
+    mlOcrStatus,
+    mlOcrStatusLoading,
+    rustOcrModelStatus,
+    rustOcrModelDownloading,
     setCpuDropdownOpen,
     setQueueDropdownOpen,
     setGpuDropdownOpen,
@@ -210,5 +305,8 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     handleGpuChange,
     handleClusteringIntervalChange,
     handleManualVacuum,
+    handleRestartMlOcr,
+    handleDownloadRustOcrModel,
+    handleRetryFailedOcr,
   };
 }

@@ -22,6 +22,7 @@ export default function McpServiceCard({
   error,
   tokenCopied,
   agentPromptCopied,
+  diagnosticsCopied,
   filterEnabled,
   filterCategories,
   filterMode,
@@ -50,6 +51,7 @@ export default function McpServiceCard({
   onTogglePiiAdvanced,
   onCopyCurrentToken,
   onCopyAgentSetupPrompt,
+  onCopyAgentDiagnostics,
 }) {
   const { t } = useTranslation();
 
@@ -112,7 +114,9 @@ export default function McpServiceCard({
           <AgentSetupRow
             port={port}
             agentPromptCopied={agentPromptCopied}
+            diagnosticsCopied={diagnosticsCopied}
             onCopyAgentSetupPrompt={onCopyAgentSetupPrompt}
+            onCopyDiagnostics={onCopyAgentDiagnostics}
           />
         </>
       )}

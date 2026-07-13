@@ -26,6 +26,7 @@ export function useAiEmbeddingController({ t, agentSkillName, agentSkillRepo }) 
   const [confirmText, setConfirmText] = useState('');
   const [tokenCopied, setTokenCopied] = useState(false);
   const [agentPromptCopied, setAgentPromptCopied] = useState(false);
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
 
   const CONFIRM_TEXT = t('settings.ai_embedding.privacy_warning.confirm_text');
@@ -182,6 +183,23 @@ export function useAiEmbeddingController({ t, agentSkillName, agentSkillRepo }) 
     }
   };
 
+  const handleCopyAgentDiagnostics = async () => {
+    try {
+      const status = await invoke('mcp_get_status');
+      const diagnostics = {
+        carbonpaper_version: status.server_version,
+        mcp_endpoint: `http://localhost:${status.port}/mcp`,
+        mcp_state: status.state,
+        skill: status.skill,
+        capabilities: status.capabilities,
+      };
+      await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
+      setDiagnosticsCopied(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const normalizedServiceState = enabled
     ? (running ? 'running' : serviceState || 'pending_auth')
     : 'disabled';
@@ -245,6 +263,7 @@ export function useAiEmbeddingController({ t, agentSkillName, agentSkillRepo }) 
     setConfirmText,
     tokenCopied,
     agentPromptCopied,
+    diagnosticsCopied,
     showResetConfirm,
     setShowResetConfirm,
     ...sensitiveFilter,
@@ -255,6 +274,7 @@ export function useAiEmbeddingController({ t, agentSkillName, agentSkillRepo }) 
     handleResetToken,
     handleCopyCurrentToken,
     handleCopyAgentSetupPrompt,
+    handleCopyAgentDiagnostics,
     shouldShowStartButton,
     statusBadge,
     statusMessage,
