@@ -488,7 +488,7 @@
       },
       "sessions": {
         "title": "Connected browsers",
-        "empty": "No browser is currently connected. Open a browser with the extension installed and enabled.",
+        "empty": "No browser is currently connected.",
         "pid": "PID {{pid}}"
       },
       "success": "Extension installed successfully. Please enable the unpacked extension in your browser.",

@@ -1240,7 +1240,7 @@ pub fn run_python_launcher(args: &[String]) -> i32 {
     python_launcher::run_python_launcher(args)
 }
 
-pub fn run_cng_unlock(key_file_path: &str) {
+pub fn run_cng_unlock(key_file_path: &str, owner_hwnd: Option<isize>) {
     use std::process::exit;
 
     let file_data = match std::fs::read(key_file_path) {
@@ -1259,7 +1259,7 @@ pub fn run_cng_unlock(key_file_path: &str) {
         }
     };
 
-    match credential_manager::decrypt_master_key_with_cng(&ciphertext) {
+    match credential_manager::decrypt_master_key_with_cng_for_window(&ciphertext, owner_hwnd) {
         Ok(master_key) => {
             print!("{}", hex::encode(&master_key));
             exit(0);

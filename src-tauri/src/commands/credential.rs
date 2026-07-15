@@ -40,13 +40,17 @@ pub async fn credential_initialize(
 #[tauri::command]
 pub async fn credential_verify_user(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: tauri::State<'_, Arc<CredentialManagerState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
     mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
 ) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        credential_manager::force_verify_and_unlock_master_key(&state)
+        let owner_hwnd = window
+            .hwnd()
+            .map_err(|e| format!("Failed to get main window handle: {}", e))?;
+        credential_manager::force_verify_and_unlock_master_key(&state, Some(owner_hwnd.0 as isize))
             .map_err(|e| format!("Verification failed: {}", e))?;
 
         state.update_auth_time();
@@ -64,6 +68,7 @@ pub async fn credential_verify_user(
     #[cfg(not(windows))]
     {
         let _ = &app;
+        let _ = &window;
         let _ = &state;
         let _ = &storage_state;
         let _ = &mcp_state;

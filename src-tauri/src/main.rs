@@ -12,7 +12,8 @@ fn main() {
         std::process::exit(carbonpaper_lib::run_python_launcher(&args[2..]));
     }
     if args.len() > 2 && args[1] == "--cng-unlock" {
-        carbonpaper_lib::run_cng_unlock(&args[2]);
+        let owner_hwnd = args.get(3).and_then(|value| value.parse::<isize>().ok());
+        carbonpaper_lib::run_cng_unlock(&args[2], owner_hwnd);
         return;
     }
 

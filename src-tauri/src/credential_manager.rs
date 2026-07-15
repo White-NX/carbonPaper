@@ -589,6 +589,7 @@ mod windows_impl {
     ///   → 子进程无 PIN 缓存，强制弹窗；主进程 CNG 缓存仍在，row key 解密无额外弹窗
     pub fn force_verify_and_unlock_master_key(
         state: &CredentialManagerState,
+        owner_hwnd: Option<isize>,
     ) -> Result<Vec<u8>, CredentialError> {
         let key_file = state.master_key_file_path();
         if !key_file.exists() {
@@ -599,14 +600,14 @@ mod windows_impl {
 
         let master_key = if already_cached {
             // 锁定后解锁：主进程 CNG 已缓存不会弹窗，用子进程强制验证
-            verify_via_subprocess(&key_file)?
+            verify_via_subprocess(&key_file, owner_hwnd)?
         } else {
             // 冷启动：主进程内直接解密，让 CNG PIN 缓存留在主进程中
             let file_data = std::fs::read(&key_file).map_err(|e| {
                 CredentialError::SystemError(format!("Failed to read master key file: {}", e))
             })?;
             let ciphertext = decode_master_key_file(&file_data)?;
-            decrypt_master_key_with_cng(&ciphertext)?
+            decrypt_master_key_with_cng_for_window(&ciphertext, owner_hwnd)?
         };
 
         {
@@ -621,14 +622,20 @@ mod windows_impl {
     }
 
     /// 通过独立子进程执行 CNG 解密，绕过主进程的 PIN 缓存
-    fn verify_via_subprocess(key_file: &std::path::Path) -> Result<Vec<u8>, CredentialError> {
+    fn verify_via_subprocess(
+        key_file: &std::path::Path,
+        owner_hwnd: Option<isize>,
+    ) -> Result<Vec<u8>, CredentialError> {
         let exe_path = std::env::current_exe().map_err(|e| {
             CredentialError::SystemError(format!("Failed to get current exe: {}", e))
         })?;
 
-        let output = std::process::Command::new(&exe_path)
-            .arg("--cng-unlock")
-            .arg(key_file)
+        let mut command = std::process::Command::new(&exe_path);
+        command.arg("--cng-unlock").arg(key_file);
+        if let Some(hwnd) = owner_hwnd {
+            command.arg(hwnd.to_string());
+        }
+        let output = command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -1053,20 +1060,47 @@ fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialE
 
 #[cfg(windows)]
 pub fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+    decrypt_master_key_with_cng_for_window(ciphertext, None)
+}
+
+#[cfg(windows)]
+pub fn decrypt_master_key_with_cng_for_window(
+    ciphertext: &[u8],
+    owner_hwnd: Option<isize>,
+) -> Result<Vec<u8>, CredentialError> {
     use windows::Win32::Security::Cryptography::NCRYPT_PAD_PKCS1_FLAG;
 
-    decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG)
+    decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG, owner_hwnd)
 }
 
 #[cfg(windows)]
 fn decrypt_master_key_with_cng_flags(
     ciphertext: &[u8],
     flags: windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
+    owner_hwnd: Option<isize>,
 ) -> Result<Vec<u8>, CredentialError> {
     use windows::Win32::Foundation::NTE_SILENT_CONTEXT;
     use windows::Win32::Security::Cryptography::{NCryptDecrypt, NCryptFreeObject, NCRYPT_HANDLE};
 
     let key = open_or_create_cng_key()?;
+    if let Some(hwnd) = owner_hwnd {
+        use windows::Win32::Security::Cryptography::{
+            NCryptSetProperty, NCRYPT_WINDOW_HANDLE_PROPERTY,
+        };
+        let hwnd_bytes = (hwnd as usize).to_ne_bytes();
+        unsafe {
+            NCryptSetProperty(
+                key,
+                NCRYPT_WINDOW_HANDLE_PROPERTY,
+                &hwnd_bytes,
+                windows::Win32::Security::Cryptography::NCRYPT_FLAGS(0),
+            )
+        }
+        .map_err(|e| {
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+            CredentialError::SystemError(format!("Failed to set CNG owner window: {}", e))
+        })?;
+    }
 
     // 第一次调用获取输出大小
     let mut out_len: u32 = 0;
@@ -1117,7 +1151,7 @@ pub fn decrypt_row_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, Credential
 pub fn decrypt_row_key_with_cng_silent(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
     use windows::Win32::Security::Cryptography::{NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG};
 
-    decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG)
+    decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG, None)
 }
 
 fn encode_master_key_file(ciphertext: &[u8]) -> Vec<u8> {
