@@ -1,6 +1,9 @@
 //! Screenshot CRUD operations (save, get, delete, commit, abort).
 
-use crate::credential_manager::encrypt_with_master_key;
+use crate::credential_manager::{
+    decrypt_row_key_with_cng_silent, decrypt_with_master_key, encrypt_with_master_key,
+    CredentialError,
+};
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use roaring::RoaringBitmap;
@@ -9,9 +12,10 @@ use std::sync::atomic::Ordering;
 
 use super::types::RawScreenshotRow;
 use super::{
-    BackgroundReadError, DeleteQueueStatus, DensityBucket, IndexStorageStats, OcrResultInput,
-    QueueScreenshotCandidate, SaveScreenshotRequest, SaveScreenshotResponse, ScreenshotRecord,
-    SoftDeleteResult, SoftDeleteScreenshotsResult, StorageState,
+    BackgroundReadError, BackgroundScreenshotSummary, DeleteQueueStatus, DensityBucket,
+    IndexStorageStats, OcrResultInput, QueueScreenshotCandidate, SaveScreenshotRequest,
+    SaveScreenshotResponse, ScreenshotRecord, SoftDeleteResult, SoftDeleteScreenshotsResult,
+    StorageState,
 };
 
 const MAX_OCR_POSTPROCESS_ATTEMPTS: i64 = 5;
@@ -24,6 +28,35 @@ struct EncryptedOcrResultRow {
     confidence: f64,
     box_coords: Vec<Vec<f64>>,
     created_at: String,
+}
+
+struct EncryptedScreenshotSummaryRow {
+    id: i64,
+    window_title_plain: Option<String>,
+    process_name_plain: Option<String>,
+    window_title_enc: Option<Vec<u8>>,
+    process_name_enc: Option<Vec<u8>>,
+    content_key_enc: Option<Vec<u8>>,
+    timestamp: Option<i64>,
+    category: Option<String>,
+}
+
+impl EncryptedScreenshotSummaryRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let timestamp = row
+            .get::<_, Option<String>>(6)?
+            .and_then(|value| value.parse::<i64>().ok());
+        Ok(Self {
+            id: row.get(0)?,
+            window_title_plain: row.get(1)?,
+            process_name_plain: row.get(2)?,
+            window_title_enc: row.get(3)?,
+            process_name_enc: row.get(4)?,
+            content_key_enc: row.get(5)?,
+            timestamp,
+            category: row.get(7)?,
+        })
+    }
 }
 
 fn ocr_postprocess_retry_decision(current_attempts: i64) -> (&'static str, Option<i64>, i64) {
@@ -1391,6 +1424,210 @@ impl StorageState {
         Ok(raw_rows.into_iter().map(|raw| raw.into_record()).collect())
     }
 
+    fn decrypt_screenshot_summary_silent(
+        &self,
+        row: EncryptedScreenshotSummaryRow,
+    ) -> Result<BackgroundScreenshotSummary, BackgroundReadError> {
+        let needs_row_key = row.window_title_enc.is_some() || row.process_name_enc.is_some();
+        let mut row_key = if needs_row_key {
+            let encrypted_key = row.content_key_enc.as_deref().ok_or_else(|| {
+                BackgroundReadError::Other(format!(
+                    "Missing content key for screenshot summary id={}",
+                    row.id
+                ))
+            })?;
+            Some(
+                decrypt_row_key_with_cng_silent(encrypted_key).map_err(|error| match error {
+                    CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
+                    other => BackgroundReadError::Other(format!(
+                        "Failed to unwrap screenshot summary key id={}: {}",
+                        row.id, other
+                    )),
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let window_title_result = match (row.window_title_enc.as_deref(), row_key.as_deref()) {
+            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                .map_err(|error| {
+                    BackgroundReadError::Other(format!(
+                        "Failed to decrypt window title id={}: {}",
+                        row.id, error
+                    ))
+                })
+                .and_then(|bytes| {
+                    String::from_utf8(bytes).map_err(|error| {
+                        BackgroundReadError::Other(format!(
+                            "Invalid window title encoding id={}: {}",
+                            row.id, error
+                        ))
+                    })
+                })
+                .map(Some),
+            _ => Ok(row.window_title_plain),
+        };
+        let process_name_result = match (row.process_name_enc.as_deref(), row_key.as_deref()) {
+            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                .map_err(|error| {
+                    BackgroundReadError::Other(format!(
+                        "Failed to decrypt process name id={}: {}",
+                        row.id, error
+                    ))
+                })
+                .and_then(|bytes| {
+                    String::from_utf8(bytes).map_err(|error| {
+                        BackgroundReadError::Other(format!(
+                            "Invalid process name encoding id={}: {}",
+                            row.id, error
+                        ))
+                    })
+                })
+                .map(Some),
+            _ => Ok(row.process_name_plain),
+        };
+
+        if let Some(ref mut key) = row_key {
+            Self::zeroize_bytes(key);
+        }
+
+        Ok(BackgroundScreenshotSummary {
+            id: row.id,
+            window_title: window_title_result?,
+            process_name: process_name_result?,
+            timestamp: row.timestamp,
+            category: row.category,
+        })
+    }
+
+    /// Fetch only the metadata required by unattended clustering.
+    /// CNG is always called with `NCRYPT_SILENT_FLAG`; a locked session fails
+    /// the whole batch with `AuthRequired` instead of displaying system UI.
+    pub(crate) fn get_screenshot_summaries_by_ids_silent(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<BackgroundScreenshotSummary>, BackgroundReadError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.is_session_valid() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
+
+        let raw_rows = {
+            let conn = self
+                .open_read_connection_named("get_screenshot_summaries_by_ids_silent")
+                .map_err(BackgroundReadError::Other)?;
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT id, window_title, process_name, window_title_enc,
+                        process_name_enc, content_key_encrypted,
+                        strftime('%s', created_at) AS timestamp, category
+                 FROM screenshots
+                 WHERE is_deleted = 0 AND id IN ({})",
+                placeholders
+            );
+            let id_params: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let mut stmt = conn.prepare(&sql).map_err(|error| {
+                BackgroundReadError::Other(format!(
+                    "Failed to prepare background screenshot query: {}",
+                    error
+                ))
+            })?;
+            let rows = stmt
+                .query_map(
+                    id_params.as_slice(),
+                    EncryptedScreenshotSummaryRow::from_row,
+                )
+                .map_err(|error| {
+                    BackgroundReadError::Other(format!(
+                        "Failed to execute background screenshot query: {}",
+                        error
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    BackgroundReadError::Other(format!(
+                        "Failed to read background screenshot row: {}",
+                        error
+                    ))
+                })?;
+            rows
+        };
+
+        raw_rows
+            .into_iter()
+            .map(|row| self.decrypt_screenshot_summary_silent(row))
+            .collect()
+    }
+
+    pub(crate) fn get_screenshot_summaries_by_time_range_paged_silent(
+        &self,
+        start_ts: f64,
+        end_ts: f64,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<BackgroundScreenshotSummary>, BackgroundReadError> {
+        if !self.is_session_valid() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
+
+        let raw_rows = {
+            let conn = self
+                .open_read_connection_named("get_screenshot_summaries_by_time_range_paged_silent")
+                .map_err(BackgroundReadError::Other)?;
+            let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            let end_dt = DateTime::<Utc>::from_timestamp(end_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, window_title, process_name, window_title_enc,
+                            process_name_enc, content_key_encrypted,
+                            strftime('%s', created_at) AS timestamp, category
+                     FROM screenshots
+                     WHERE is_deleted = 0
+                       AND created_at BETWEEN ?1 AND ?2
+                     ORDER BY created_at ASC
+                     LIMIT ?3 OFFSET ?4",
+                )
+                .map_err(|error| {
+                    BackgroundReadError::Other(format!(
+                        "Failed to prepare background screenshot page query: {}",
+                        error
+                    ))
+                })?;
+            let rows = stmt
+                .query_map(
+                    params![start_dt, end_dt, limit.clamp(1, 1000), offset.max(0)],
+                    EncryptedScreenshotSummaryRow::from_row,
+                )
+                .map_err(|error| {
+                    BackgroundReadError::Other(format!(
+                        "Failed to execute background screenshot page query: {}",
+                        error
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    BackgroundReadError::Other(format!(
+                        "Failed to read background screenshot page row: {}",
+                        error
+                    ))
+                })?;
+            rows
+        };
+
+        raw_rows
+            .into_iter()
+            .map(|row| self.decrypt_screenshot_summary_silent(row))
+            .collect()
+    }
+
     pub fn get_screenshot_by_id(&self, id: i64) -> Result<Option<ScreenshotRecord>, String> {
         tracing::debug!("get_screenshot_by_id called with id={}", id);
 
@@ -1651,13 +1888,40 @@ impl StorageState {
         &self,
         screenshot_ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, String>, String> {
+        self.get_ocr_results_by_screenshot_ids_with_mode(screenshot_ids, false)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Batch OCR read for unattended workers. Authentication failures abort
+    /// immediately and CNG is never allowed to display interactive UI.
+    pub(crate) fn get_ocr_results_by_screenshot_ids_silent(
+        &self,
+        screenshot_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, String>, BackgroundReadError> {
+        if !screenshot_ids.is_empty() && !self.is_session_valid() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
+        self.get_ocr_results_by_screenshot_ids_with_mode(screenshot_ids, true)
+    }
+
+    fn get_ocr_results_by_screenshot_ids_with_mode(
+        &self,
+        screenshot_ids: &[i64],
+        silent: bool,
+    ) -> Result<std::collections::HashMap<i64, String>, BackgroundReadError> {
         if screenshot_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
         // Phase 1: Use an independent read-only connection to retrieve the raw encrypted rows.
         let raw_rows = {
-            let conn = self.open_read_connection_named("get_ocr_results_by_screenshot_ids")?;
+            let conn = self
+                .open_read_connection_named(if silent {
+                    "get_ocr_results_by_screenshot_ids_silent"
+                } else {
+                    "get_ocr_results_by_screenshot_ids"
+                })
+                .map_err(BackgroundReadError::Other)?;
 
             let mut raw_rows = Vec::new();
 
@@ -1674,9 +1938,9 @@ impl StorageState {
                 let params: Vec<&dyn rusqlite::ToSql> =
                     chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
 
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(|e| format!("Failed to prepare batch OCR query: {}", e))?;
+                let mut stmt = conn.prepare(&sql).map_err(|e| {
+                    BackgroundReadError::Other(format!("Failed to prepare batch OCR query: {}", e))
+                })?;
 
                 let rows = stmt
                     .query_map(params.as_slice(), |row| {
@@ -1685,7 +1949,12 @@ impl StorageState {
                         let text_key_enc: Option<Vec<u8>> = row.get(2)?;
                         Ok((screenshot_id, text_enc, text_key_enc))
                     })
-                    .map_err(|e| format!("Failed to execute batch OCR query: {}", e))?;
+                    .map_err(|e| {
+                        BackgroundReadError::Other(format!(
+                            "Failed to execute batch OCR query: {}",
+                            e
+                        ))
+                    })?;
 
                 for row in rows.filter_map(|r| r.ok()) {
                     raw_rows.push(row);
@@ -1704,6 +1973,15 @@ impl StorageState {
 
         for (screenshot_id, text_enc, text_key_enc) in raw_rows {
             let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
+                (Some(data), Some(key)) if silent => Some(
+                    String::from_utf8(self.decrypt_payload_with_row_key_silent(data, key)?)
+                        .map_err(|error| {
+                            BackgroundReadError::Other(format!(
+                                "Invalid OCR text encoding for screenshot id={}: {}",
+                                screenshot_id, error
+                            ))
+                        })?,
+                ),
                 (Some(data), Some(key)) => self
                     .decrypt_payload_with_row_key(data, key)
                     .ok()
@@ -2600,6 +2878,31 @@ mod ocr_lifecycle_tests {
         assert_eq!(ocr_postprocess_retry_decision(3), ("pending", Some(300), 4));
         assert_eq!(ocr_postprocess_retry_decision(4), ("failed", None, 5));
         assert_eq!(ocr_postprocess_retry_decision(99), ("failed", None, 100));
+    }
+
+    #[test]
+    fn silent_clustering_reads_fail_fast_while_session_is_locked() {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
+
+        assert!(matches!(
+            storage.get_ocr_results_by_screenshot_ids_silent(&[1]),
+            Err(BackgroundReadError::AuthRequired)
+        ));
+        assert!(matches!(
+            storage.get_screenshot_summaries_by_ids_silent(&[1]),
+            Err(BackgroundReadError::AuthRequired)
+        ));
+        assert!(matches!(
+            storage.get_screenshot_summaries_by_time_range_paged_silent(
+                0.0,
+                4_102_444_800.0,
+                0,
+                32,
+            ),
+            Err(BackgroundReadError::AuthRequired)
+        ));
     }
 
     #[test]

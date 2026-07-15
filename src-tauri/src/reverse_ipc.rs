@@ -12,7 +12,12 @@ use crate::monitor::MonitorState;
 use crate::reverse_ipc_protocol::{
     read_ipc_frame, write_ipc_binary_frame, write_ipc_frame, StorageResponse,
 };
-use crate::storage::{OcrResultInput, SaveScreenshotRequest, ScreenshotRecord, StorageState};
+#[cfg(test)]
+use crate::storage::ScreenshotRecord;
+use crate::storage::{
+    BackgroundReadError, BackgroundScreenshotSummary, OcrResultInput, SaveScreenshotRequest,
+    StorageState,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::os::windows::io::AsRawHandle;
@@ -87,6 +92,7 @@ pub enum StorageCommand {
 
 // Use OcrResultInput from crate::storage to keep a single canonical type
 
+#[cfg(test)]
 fn screenshot_record_with_ocr_json(
     rec: ScreenshotRecord,
     ocr_map: &std::collections::HashMap<i64, String>,
@@ -100,6 +106,28 @@ fn screenshot_record_with_ocr_json(
         "timestamp": rec.timestamp.unwrap_or(0) as f64,
         "category": rec.category.unwrap_or_default(),
     })
+}
+
+fn background_screenshot_with_ocr_json(
+    rec: BackgroundScreenshotSummary,
+    ocr_map: &std::collections::HashMap<i64, String>,
+) -> serde_json::Value {
+    let ocr_text = ocr_map.get(&rec.id).cloned().unwrap_or_default();
+    serde_json::json!({
+        "id": rec.id,
+        "process_name": rec.process_name.unwrap_or_default(),
+        "window_title": rec.window_title.unwrap_or_default(),
+        "ocr_text": ocr_text,
+        "timestamp": rec.timestamp.unwrap_or(0) as f64,
+        "category": rec.category.unwrap_or_default(),
+    })
+}
+
+fn background_read_error_response(error: BackgroundReadError) -> StorageResponse {
+    match error {
+        BackgroundReadError::AuthRequired => StorageResponse::error("AUTH_REQUIRED"),
+        BackgroundReadError::Other(message) => StorageResponse::error(&message),
+    }
 }
 
 use windows::Win32::Security::GetTokenInformation;
@@ -825,6 +853,10 @@ fn process_request(
             }
         }
         "list_screenshots_for_clustering" => {
+            if !storage.is_session_valid() {
+                return StorageResponse::error("AUTH_REQUIRED");
+            }
+
             let start_ts = req.get("start_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let end_ts = req.get("end_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let offset = req.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -847,14 +879,15 @@ fn process_request(
                 Err(err) => return StorageResponse::error(&err),
             };
 
-            // Paged query with SQL LIMIT/OFFSET (only decrypt this page)
-            match storage.get_screenshots_by_time_range_paged(s, e, offset, limit) {
+            // Paged unattended query: decrypt only clustering metadata and
+            // force CNG silent mode so a state race can never display UI.
+            match storage.get_screenshot_summaries_by_time_range_paged_silent(s, e, offset, limit) {
                 Ok(records) => {
                     let ids: Vec<i64> = records.iter().map(|rec| rec.id).collect();
                     let ocr_batch_started = std::time::Instant::now();
-                    let ocr_map = match storage.get_ocr_results_by_screenshot_ids(&ids) {
+                    let ocr_map = match storage.get_ocr_results_by_screenshot_ids_silent(&ids) {
                         Ok(map) => map,
-                        Err(e) => return StorageResponse::error(&e),
+                        Err(error) => return background_read_error_response(error),
                     };
                     tracing::debug!(
                         "[DIAG:CLUSTERING] batch OCR fetch ids={} elapsed={}ms",
@@ -863,18 +896,22 @@ fn process_request(
                     );
                     let page: Vec<serde_json::Value> = records
                         .into_iter()
-                        .map(|rec| screenshot_record_with_ocr_json(rec, &ocr_map))
+                        .map(|rec| background_screenshot_with_ocr_json(rec, &ocr_map))
                         .collect();
                     StorageResponse::success(serde_json::json!({
                         "screenshots": page,
                         "total": total,
                     }))
                 }
-                Err(e) => StorageResponse::error(&e),
+                Err(error) => background_read_error_response(error),
             }
         }
 
         "get_screenshots_with_ocr_by_ids" => {
+            if !storage.is_session_valid() {
+                return StorageResponse::error("AUTH_REQUIRED");
+            }
+
             let ids: Vec<i64> = req
                 .get("ids")
                 .and_then(|v| v.as_array())
@@ -889,21 +926,22 @@ fn process_request(
             const MAX_BATCH: usize = 500;
             let ids: Vec<i64> = ids.into_iter().take(MAX_BATCH).collect();
 
-            // Fetch OCR results in batch first
-            let ocr_map = match storage.get_ocr_results_by_screenshot_ids(&ids) {
+            // Fetch OCR results in silent mode. Authentication loss aborts the
+            // entire batch instead of retrying CNG once per OCR row.
+            let ocr_map = match storage.get_ocr_results_by_screenshot_ids_silent(&ids) {
                 Ok(map) => map,
-                Err(e) => return StorageResponse::error(&e),
+                Err(error) => return background_read_error_response(error),
             };
 
-            match storage.get_screenshots_by_ids(&ids) {
+            match storage.get_screenshot_summaries_by_ids_silent(&ids) {
                 Ok(records) => {
                     let out: Vec<serde_json::Value> = records
                         .into_iter()
-                        .map(|rec| screenshot_record_with_ocr_json(rec, &ocr_map))
+                        .map(|rec| background_screenshot_with_ocr_json(rec, &ocr_map))
                         .collect();
                     StorageResponse::success(serde_json::json!({ "screenshots": out }))
                 }
-                Err(e) => StorageResponse::error(&e),
+                Err(error) => background_read_error_response(error),
             }
         }
 
@@ -1899,6 +1937,14 @@ mod tests {
         assert!(json.contains("\"error\":\"bad request\""));
         // data field should be skipped
         assert!(!json.contains("\"data\""));
+    }
+
+    #[test]
+    fn background_auth_error_uses_stable_auth_required_code() {
+        let response = background_read_error_response(BackgroundReadError::AuthRequired);
+        assert_eq!(response.status, "error");
+        assert_eq!(response.error.as_deref(), Some("AUTH_REQUIRED"));
+        assert!(response.data.is_none());
     }
 
     fn make_session(browser_pid: u32, nmh_pid: u32, last_seen_ms: i64) -> NmhSession {
