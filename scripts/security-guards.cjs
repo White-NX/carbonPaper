@@ -156,6 +156,7 @@ const COMMAND_TIERS = {
   'commands::utility::restart_app': 'lifecycle_public',
   'commands::utility::trigger_test_error': 'session_required',
   'commands::utility::exit_app': 'lifecycle_public',
+  'commands::utility::hide_to_tray': 'lifecycle_public',
   'commands::utility::frontend_log': 'public',
   'commands::utility::switch_to_lightweight_mode': 'public',
   'commands::utility::switch_to_standard_mode': 'public',
@@ -273,6 +274,7 @@ function checkCommandGuardImplementations() {
     'commands::utility::close_process',
     'commands::utility::restart_app',
     'commands::utility::exit_app',
+    'commands::utility::hide_to_tray',
     'commands::utility::trigger_test_error',
     'script_integrity::debug_trigger_security_alert',
   ];

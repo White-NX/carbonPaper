@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use storage::StorageState;
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
@@ -387,6 +387,56 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
     }
 }
 
+fn is_open_tray_click(button: MouseButton, button_state: MouseButtonState) -> bool {
+    matches!(
+        (button, button_state),
+        (MouseButton::Left, MouseButtonState::Up)
+    )
+}
+
+fn open_main_window_from_tray(app: &tauri::AppHandle) {
+    cancel_auto_lightweight_timer(app);
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        if let Some(lightweight_state) = app.try_state::<Arc<LightweightModeState>>() {
+            *lightweight_state
+                .is_lightweight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = false;
+        }
+        refresh_tray_menu(app);
+        return;
+    }
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match create_main_window(&app_handle) {
+            Ok(()) => {
+                let lightweight_state = app_handle.state::<Arc<LightweightModeState>>();
+                *lightweight_state
+                    .is_lightweight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = false;
+                tracing::info!("Window recreated from lightweight mode");
+                refresh_tray_menu(&app_handle);
+            }
+            Err(e) => {
+                tracing::error!("Failed to create main window: {}", e);
+                let texts = tray_texts();
+                let _ = app_handle
+                    .notification()
+                    .builder()
+                    .title("CarbonPaper")
+                    .body(&format!("{}: {}", texts.open_error, e))
+                    .show();
+            }
+        }
+    });
+}
+
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let app_handle = app.handle().clone();
     let texts = tray_texts();
@@ -411,51 +461,28 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .item(&quit_item)
         .build()?;
 
-    let mut tray_builder = TrayIconBuilder::new().menu(&menu);
+    let mut tray_builder = TrayIconBuilder::new()
+        .menu(&menu)
+        .show_menu_on_left_click(false);
     if let Some(icon) = app.default_window_icon().cloned() {
         tray_builder = tray_builder.icon(icon);
     }
     let tray = tray_builder
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button,
+                button_state,
+                ..
+            } = event
+            {
+                if is_open_tray_click(button, button_state) {
+                    open_main_window_from_tray(tray.app_handle());
+                }
+            }
+        })
         .on_menu_event(|app, event| match event.id.as_ref() {
             MENU_ID_OPEN => {
-                // 取消自动切换定时器
-                cancel_auto_lightweight_timer(app);
-
-                // 检查窗口是否存在
-                if let Some(window) = app.get_webview_window("main") {
-                    // 窗口存在，显示并聚焦
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                    if let Some(lightweight_state) = app.try_state::<Arc<LightweightModeState>>() {
-                        *lightweight_state.is_lightweight.lock().unwrap() = false;
-                    }
-                    refresh_tray_menu(app);
-                } else {
-                    // 窗口不存在（轻量模式），重建窗口
-                    let app_handle = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        match create_main_window(&app_handle) {
-                            Ok(()) => {
-                                // 更新轻量模式状态
-                                let lightweight_state =
-                                    app_handle.state::<Arc<LightweightModeState>>();
-                                *lightweight_state.is_lightweight.lock().unwrap() = false;
-                                tracing::info!("Window recreated from lightweight mode");
-                                refresh_tray_menu(&app_handle);
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to create main window: {}", e);
-                                let texts = tray_texts();
-                                let _ = app_handle
-                                    .notification()
-                                    .builder()
-                                    .title("CarbonPaper")
-                                    .body(&format!("{}: {}", texts.open_error, e))
-                                    .show();
-                            }
-                        }
-                    });
-                }
+                open_main_window_from_tray(app);
             }
             MENU_ID_TOGGLE_CAPTURE => {
                 let app_handle = app.clone();
@@ -660,6 +687,14 @@ fn start_auto_lightweight_timer(app: tauri::AppHandle) {
     *lightweight_state.auto_switch_timer.lock().unwrap() = Some(timer);
 }
 
+pub(crate) fn hide_main_window_to_tray(window: &tauri::Window) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())?;
+    let app = window.app_handle();
+    let _ = app.emit("app-hidden", ());
+    start_auto_lightweight_timer(app.clone());
+    Ok(())
+}
+
 // 取消自动切换定时器
 fn cancel_auto_lightweight_timer(app: &tauri::AppHandle) {
     let lightweight_state = app.state::<Arc<LightweightModeState>>();
@@ -719,11 +754,9 @@ pub fn run() {
                     }
                     if !IS_UPDATING.load(Ordering::Relaxed) {
                         api.prevent_close();
-                        let _ = window.hide();
-                        let _ = window.app_handle().emit("app-hidden", ());
-
-                        // 启动自动切换定时器
-                        start_auto_lightweight_timer(window.app_handle().clone());
+                        if let Err(e) = hide_main_window_to_tray(window) {
+                            tracing::error!("Failed to hide main window to tray: {}", e);
+                        }
                     }
                 }
             }
@@ -1132,6 +1165,7 @@ pub fn run() {
             commands::utility::restart_app,
             commands::utility::trigger_test_error,
             commands::utility::exit_app,
+            commands::utility::hide_to_tray,
             commands::utility::frontend_log,
             // 轻量模式命令
             commands::utility::switch_to_lightweight_mode,
@@ -1182,6 +1216,24 @@ pub fn run() {
 
 pub fn run_silent_install() {
     python::run_silent_install();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_left_button_release_opens_window_from_tray() {
+        assert!(is_open_tray_click(MouseButton::Left, MouseButtonState::Up));
+        assert!(!is_open_tray_click(
+            MouseButton::Left,
+            MouseButtonState::Down
+        ));
+        assert!(!is_open_tray_click(
+            MouseButton::Right,
+            MouseButtonState::Up
+        ));
+    }
 }
 
 pub fn run_python_launcher(args: &[String]) -> i32 {

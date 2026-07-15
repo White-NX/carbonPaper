@@ -119,7 +119,7 @@ export function useAppWindowActions() {
   const toggleMaximize = () => getCurrentWindow().toggleMaximize();
 
   const hideToTray = async () => {
-    await getCurrentWindow().hide();
+    await invoke('hide_to_tray');
 
     let permissionGranted = await isPermissionGranted();
     if (!permissionGranted) {

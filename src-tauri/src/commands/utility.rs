@@ -71,6 +71,12 @@ pub async fn exit_app(
 }
 
 #[tauri::command]
+pub fn hide_to_tray(window: tauri::Window) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::hide_main_window_to_tray(&window)
+}
+
+#[tauri::command]
 pub fn set_app_language(app: tauri::AppHandle, language: String) -> Result<(), String> {
     crate::set_app_language(&app, &language)
 }
