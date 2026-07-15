@@ -1,3 +1,10 @@
+//! Tauri command boundary shared by the React frontend and native backend.
+//!
+//! Command functions document their authentication requirements, serialized return
+//! contract, and the frontend module that invokes them. Keep privileged operations
+//! behind [`check_auth_required`] and restrict window-management commands with
+//! [`check_main_window`].
+
 use crate::credential_manager::CredentialManagerState;
 
 /// Checks whether the current session requires re-authentication.
@@ -8,6 +15,7 @@ pub fn check_auth_required(credential_state: &CredentialManagerState) -> Result<
     Ok(())
 }
 
+/// Rejects calls that did not originate from CarbonPaper's main Tauri window.
 pub fn check_main_window(window: &tauri::Window) -> Result<(), String> {
     if window.label() != "main" {
         return Err("WINDOW_NOT_AUTHORIZED".to_string());

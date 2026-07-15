@@ -1,3 +1,8 @@
+//! CarbonPaper's Tauri backend composition root.
+//!
+//! This crate wires native capture, encrypted storage, monitor/ML processes, IPC,
+//! commands, tray behavior, and application lifecycle into the desktop runtime.
+
 mod analysis;
 mod autostart;
 mod capture;

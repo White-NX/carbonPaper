@@ -1,3 +1,5 @@
+//! Framing and validation for the reverse named-pipe storage protocol.
+
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::NamedPipeServer;

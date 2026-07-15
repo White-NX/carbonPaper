@@ -151,6 +151,8 @@ struct PipeSecurityContext {
 
 /// Create SECURITY_ATTRIBUTES that only allow the current user to access the pipe.
 fn get_security_context() -> Result<PipeSecurityContext, String> {
+    // SAFETY: `token_handle` is writable output storage; on success this function owns
+    // the process-token handle and closes it exactly once after the inner helper returns.
     unsafe {
         let mut token_handle = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
@@ -164,6 +166,9 @@ fn get_security_context() -> Result<PipeSecurityContext, String> {
 
 /// Inner helper so that `?` returns to `get_security_context` which always closes token_handle.
 fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContext, String> {
+    // SAFETY: `token_handle` is live for this call; queried buffer sizes determine every
+    // allocation, SID/ACL pointers refer into owned buffers retained by the returned
+    // context, and Windows does not retain temporary Rust pointers beyond each call.
     unsafe {
         let mut return_length = 0u32;
         let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut return_length);
@@ -243,6 +248,8 @@ fn is_pid_descendant_of(pid: u32, expected_ancestor_pid: u32) -> bool {
     }
 
     let mut parent_by_pid = std::collections::HashMap::<u32, u32>::new();
+    // SAFETY: the snapshot handle is checked before use, `PROCESSENTRY32.dwSize` is set as
+    // required, and the owned snapshot is closed after synchronous enumeration.
     unsafe {
         let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
             Ok(snapshot) => snapshot,
@@ -333,8 +340,10 @@ impl ReverseIpcServer {
                         }
                     };
 
-                    // 应用安全描述符和 PIPE_REJECT_REMOTE_CLIENTS。
+                    // Apply the current-user ACL and reject remote clients.
                     // Use byte-mode pipes for robust streaming of large JSON payloads.
+                    // SAFETY: the pipe name is NUL-terminated; `sec_ctx` retains the
+                    // security descriptor and ACL backing memory for the entire call.
                     let handle = unsafe {
                         windows::Win32::System::Pipes::CreateNamedPipeW(
                             windows::core::PCWSTR(wide_pipe_name.as_ptr()),
@@ -349,12 +358,16 @@ impl ReverseIpcServer {
                     };
 
                     if handle.is_invalid() {
+                        // SAFETY: `GetLastError` reads thread-local Win32 state and takes
+                        // no pointers or handles.
                         tracing::error!("Failed to create pipe via Win32 API: {:?}", unsafe { windows::Win32::Foundation::GetLastError() });
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue;
                     }
 
-                    // 将 Raw Handle 转换为 tokio NamedPipeServer
+                    // Transfer the raw pipe handle into Tokio's owning server wrapper.
+                    // SAFETY: `handle` is valid and uniquely owned. On success ownership
+                    // transfers to `NamedPipeServer`; on failure it is closed below.
                     let server = unsafe {
                         match NamedPipeServer::from_raw_handle(handle.0) {
                             Ok(s) => s,
@@ -366,7 +379,7 @@ impl ReverseIpcServer {
                         }
                     };
 
-                    // 等待客户端连接或关闭信号
+                    // Wait for either a client connection or the shutdown signal.
                     tokio::select! {
                         _ = shutdown_rx.recv() => {
                             tracing::info!("Reverse IPC server shutting down, goodbye");
@@ -421,7 +434,7 @@ impl ReverseIpcServer {
     }
 }
 
-/// 处理单个客户端连接
+/// Handles one authenticated reverse-IPC client connection.
 async fn handle_client(
     mut server: NamedPipeServer,
     storage: Arc<StorageState>,
@@ -429,7 +442,9 @@ async fn handle_client(
     app_handle: tauri::AppHandle,
     expected_auth_token: String,
 ) {
-    // 安全校验：验证客户端 PID
+    // Validate the client PID before reading any application request.
+    // SAFETY: Tokio owns a live pipe handle for the duration of the call and `pid` points
+    // to writable stack storage that Windows fills synchronously.
     let client_pid_raw = unsafe {
         let mut pid: u32 = 0;
         let handle = HANDLE(server.as_raw_handle() as *mut _);
@@ -1190,6 +1205,9 @@ fn get_current_user_sid() -> Result<String, String> {
     use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+    // SAFETY: token and SID buffers are allocated from sizes returned by Windows; all
+    // handles and `LocalAlloc` strings are released once, and every output pointer refers
+    // to live writable storage for the duration of its synchronous call.
     unsafe {
         let mut token_handle = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
@@ -1735,6 +1753,8 @@ fn query_process_image_path(pid: u32) -> Option<String> {
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
+    // SAFETY: the process handle is checked and owned locally; the UTF-16 buffer and size
+    // pointer are valid for the query, and the handle is closed exactly once.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];

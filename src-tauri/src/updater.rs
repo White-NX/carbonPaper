@@ -1,3 +1,5 @@
+//! Signed-update discovery, download verification, and installer handoff.
+
 use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};

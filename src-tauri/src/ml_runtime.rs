@@ -1,3 +1,8 @@
+//! Lifecycle and request routing for the isolated Rust OCR worker.
+//!
+//! The runtime starts `carbonpaper-ml` in a Windows Job Object, validates the framed
+//! protocol, manages model installation/readiness, and exposes health to Tauri commands.
+
 use crate::ml_protocol::{
     read_response, write_request, MlOcrBlock, MlOcrTimings, MlProvider, MlRequest, MlResponse,
     ML_PROTOCOL_VERSION,
@@ -124,13 +129,19 @@ impl Drop for PendingMlChild {
 
 impl Drop for MlJobHandle {
     fn drop(&mut self) {
+        // SAFETY: `self.0` is a live Job Object handle owned by this RAII wrapper and is
+        // closed exactly once here after all shared references to the wrapper are gone.
         unsafe {
             let _ = CloseHandle(self.0);
         }
     }
 }
 
+// SAFETY: a Job Object HANDLE is an opaque kernel reference whose operations are
+// thread-safe; ownership and single-close semantics are enforced by the wrapper.
 unsafe impl Send for MlJobHandle {}
+// SAFETY: shared access does not expose mutable Rust memory, and Windows permits Job
+// Object handles to be used concurrently from multiple threads.
 unsafe impl Sync for MlJobHandle {}
 
 impl MlChild {
@@ -803,6 +814,9 @@ fn truncate_error(error: &str) -> String {
 }
 
 fn assign_kill_on_close_job(child: &Child) -> Result<MlJobHandle, String> {
+    // SAFETY: all structure pointers and byte sizes match the documented Job Object
+    // information classes; `child` owns a live process handle for the duration of the
+    // call, and the newly created Job handle is closed on every error path or by RAII.
     unsafe {
         let handle = CreateJobObjectW(None, None)
             .map_err(|error| format!("failed to create ML job object: {error:?}"))?;

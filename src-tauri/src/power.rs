@@ -1,3 +1,5 @@
+//! AC-power monitoring and automatic power-saving state transitions.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
@@ -30,6 +32,8 @@ impl PowerState {
 
 /// Check if AC power is connected (not on battery)
 fn is_ac_power_connected() -> bool {
+    // SAFETY: `status` is initialized writable storage of the exact Win32 structure
+    // type, and `GetSystemPowerStatus` does not retain its pointer.
     unsafe {
         let mut status = windows::Win32::System::Power::SYSTEM_POWER_STATUS::default();
         if GetSystemPowerStatus(&mut status).is_ok() {

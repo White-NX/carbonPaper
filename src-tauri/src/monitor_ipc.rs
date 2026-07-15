@@ -1,3 +1,5 @@
+//! Authenticated framed IPC helpers for requests sent to the Python monitor.
+
 use rand::Rng;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

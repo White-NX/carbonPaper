@@ -1,3 +1,8 @@
+//! Isolated Rust OCR worker process.
+//!
+//! Requests and responses use the bounded protocol in `ml_protocol`; model loading and
+//! image inference stay outside the Tauri UI process to contain failures and memory use.
+
 #[path = "../ml_protocol.rs"]
 mod ml_protocol;
 

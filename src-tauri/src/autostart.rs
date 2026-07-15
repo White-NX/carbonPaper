@@ -1,3 +1,5 @@
+//! Windows startup registration and authenticated autostart commands.
+
 use std::sync::Arc;
 use tauri::AppHandle;
 

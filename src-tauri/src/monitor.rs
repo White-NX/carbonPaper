@@ -1,3 +1,8 @@
+//! Python monitor process orchestration and resource-control policy.
+//!
+//! This module owns monitor startup, authenticated named-pipe communication, Job Object
+//! limits, game-mode suppression, restart behavior, and frontend lifecycle events.
+
 use crate::capture::CaptureState;
 #[cfg(test)]
 use crate::monitor_ipc::parse_ipc_response;
@@ -141,16 +146,22 @@ impl Deref for JobHandle {
 
 impl Drop for JobHandle {
     fn drop(&mut self) {
+        // SAFETY: this wrapper exclusively owns the live Job Object handle and closes it
+        // exactly once after the monitor state releases the wrapper.
         unsafe {
             let _ = CloseHandle(self.0);
         }
     }
 }
 
+// SAFETY: Windows Job Object handles are opaque kernel references that may be moved
+// between threads; Rust ownership still guarantees a single close.
 unsafe impl Send for JobHandle {}
+// SAFETY: concurrent Job Object operations do not expose aliased Rust memory and are
+// supported by the Windows kernel handle model.
 unsafe impl Sync for JobHandle {}
 
-// 重试配置
+// Retry policy for monitor startup and named-pipe connection establishment.
 const MAX_RETRIES: u32 = 10;
 const RETRY_DELAY_MS: u64 = 100;
 const STARTUP_MAX_WAIT_MS: u64 = 15_000;
@@ -442,8 +453,10 @@ pub async fn send_ipc_request_reused(
     result
 }
 
-/// 动态设置 Job Object 的 CPU 限制
+/// Updates the Job Object CPU cap at runtime.
 fn set_job_cpu_limit(handle: HANDLE, enabled: bool, percent: u32) -> Result<(), String> {
+    // SAFETY: `handle` is a live Job Object owned by monitor state; `cpu_info` has the
+    // exact layout and byte size required by `JobObjectCpuRateControlInformation`.
     unsafe {
         let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
         if enabled && percent > 0 {
@@ -463,11 +476,14 @@ fn set_job_cpu_limit(handle: HANDLE, enabled: bool, percent: u32) -> Result<(), 
     }
 }
 
-/// RAII guard：在 drop 时自动恢复 Job Object 的 CPU 限制
+/// RAII guard that restores the configured Job Object CPU cap on drop.
 struct CpuLimitGuard {
-    job_handle_raw: isize, // 存储原始值，避免 HANDLE (*mut c_void) 导致 !Send
+    // Store the value rather than HANDLE so the guard can cross async thread boundaries.
+    job_handle_raw: isize,
 }
 
+// SAFETY: the stored value names a Job Object kept alive by `MonitorState` for the
+// guard's lifetime; moving the integer between threads does not transfer ownership.
 unsafe impl Send for CpuLimitGuard {}
 
 impl Drop for CpuLimitGuard {
@@ -962,12 +978,15 @@ pub async fn forward_command_to_python(
 }
 
 fn create_job_object(cpu_limit_enabled: bool, cpu_limit_percent: u32) -> Result<JobHandle, String> {
+    // SAFETY: information structures match their Job Object information classes and
+    // remain alive for each call. The new handle is closed on all error paths or moved
+    // into `JobHandle`, which enforces single-close ownership.
     unsafe {
-        // 创建 Job Object
+        // Create the Job Object before applying resource and lifetime policies.
         let handle = CreateJobObjectW(None, None)
             .map_err(|e| format!("Failed to create job object: {:?}", e))?;
 
-        // 设置 CPU 限制（仅在启用时）
+        // Apply the CPU cap only when enabled.
         if cpu_limit_enabled && cpu_limit_percent > 0 {
             let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
             cpu_info.ControlFlags =
@@ -980,12 +999,12 @@ fn create_job_object(cpu_limit_enabled: bool, cpu_limit_percent: u32) -> Result<
                 &cpu_info as *const _ as *const _,
                 std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
             ) {
-                let _ = CloseHandle(handle); // 确保清理资源
+                let _ = CloseHandle(handle);
                 return Err(format!("Failed to set CPU limit: {:?}", e));
             }
         }
 
-        // 设置"父进程退出则子进程自杀"
+        // Ensure children terminate when CarbonPaper closes the last Job handle.
         let mut limit_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limit_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
@@ -1542,7 +1561,9 @@ pub async fn start_monitor_impl(
             .spawn()
             .map_err(|e| format!("Failed to start python: {}", e))?;
 
-        // 将子进程加入 Job 对象，以便随主进程退出时自动清理以及限制CPU使用
+        // Add the child to the Job Object for lifetime and CPU-limit enforcement.
+        // SAFETY: `child` owns a live process handle, `job` owns a live Job Object, and
+        // both remain valid for the synchronous assignment call.
         unsafe {
             let process_handle = HANDLE(child.as_raw_handle() as _);
             AssignProcessToJobObject(*job, process_handle)
@@ -2140,10 +2161,12 @@ pub async fn get_monitor_status(state: State<'_, MonitorState>) -> Result<String
     }
 }
 
-// ==================== GPU 枚举与游戏模式 ====================
+// GPU enumeration and game-mode resource suppression.
 
-/// 枚举系统中的 GPU 设备（排除软件渲染器）
+/// Enumerates hardware GPU adapters, excluding software renderers.
 pub fn enumerate_gpus_internal() -> Result<Vec<serde_json::Value>, String> {
+    // SAFETY: DXGI returns reference-counted COM interfaces whose lifetimes are managed
+    // by windows-rs; adapter indices are enumerated until Windows reports exhaustion.
     unsafe {
         let factory: IDXGIFactory1 =
             CreateDXGIFactory1().map_err(|e| format!("Failed to create DXGI factory: {:?}", e))?;
@@ -2154,7 +2177,7 @@ pub fn enumerate_gpus_internal() -> Result<Vec<serde_json::Value>, String> {
             let desc = adapter
                 .GetDesc1()
                 .map_err(|e| format!("Failed to get adapter desc: {:?}", e))?;
-            // 排除软件渲染器
+            // Exclude software renderers from user-selectable acceleration devices.
             if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
                 let name = String::from_utf16_lossy(
                     &desc.Description[..desc
@@ -2179,8 +2202,11 @@ pub fn enumerate_gpus() -> Result<Vec<serde_json::Value>, String> {
     enumerate_gpus_internal()
 }
 
-/// 查询指定 GPU 的系统级显存占用率（使用 Windows Performance Counter，与任务管理器一致）
+/// Queries system-wide dedicated-memory use for one GPU via Windows PDH.
 fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
+    // SAFETY: DXGI COM interfaces are managed by windows-rs; the PDH path is
+    // NUL-terminated, output pointers reference correctly typed stack storage, and the
+    // query handle is closed on every path after it is opened.
     unsafe {
         let factory: IDXGIFactory1 =
             CreateDXGIFactory1().map_err(|e| format!("Failed to create DXGI factory: {:?}", e))?;
@@ -2198,7 +2224,7 @@ fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
             return Ok(0.0);
         }
 
-        // 使用 LUID 构造 Performance Counter 路径
+        // Build the PDH adapter instance name from the DXGI LUID.
         let luid = desc.AdapterLuid;
         let counter_path = format!(
             "\\GPU Adapter Memory(luid_0x{:08X}_0x{:08X}_phys_0)\\Dedicated Usage",
@@ -2209,7 +2235,7 @@ fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
             .chain(std::iter::once(0))
             .collect();
 
-        // PDH 查询
+        // Open and populate the PDH query.
         let mut query = 0isize;
         let status = PdhOpenQueryW(None, 0, &mut query);
         if status != 0 {
@@ -2231,7 +2257,7 @@ fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
             ));
         }
 
-        // 需要收集两次数据，第一次建立基线
+        // Collect once to establish the counter baseline before formatting the value.
         let status = PdhCollectQueryData(query);
         if status != 0 {
             PdhCloseQuery(query);

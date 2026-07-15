@@ -1,3 +1,5 @@
+//! Download, verification, installation, and discovery of local ML model artifacts.
+
 use crate::registry_config;
 use crate::resource_utils::{file_in_local_appdata, find_existing_file_in_resources};
 use anyhow::{anyhow, Context, Result};

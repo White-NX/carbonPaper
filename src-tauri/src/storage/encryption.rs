@@ -14,6 +14,8 @@ impl StorageState {
     pub(crate) fn zeroize_bytes(bytes: &mut [u8]) {
         use std::sync::atomic::{compiler_fence, Ordering};
         for b in bytes.iter_mut() {
+            // SAFETY: `b` is a unique, valid mutable reference into `bytes`; volatile
+            // writes prevent this best-effort zeroization from being optimized away.
             unsafe { std::ptr::write_volatile(b, 0) };
         }
         compiler_fence(Ordering::SeqCst);

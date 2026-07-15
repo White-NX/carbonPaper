@@ -1,3 +1,5 @@
+//! Python 3.12 discovery, installation, virtual-environment setup, and progress logging.
+
 use std::path::{Path, PathBuf};
 use winreg::enums::*;
 use winreg::RegKey;

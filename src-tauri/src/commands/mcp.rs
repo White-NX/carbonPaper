@@ -1,3 +1,9 @@
+//! Tauri commands for local MCP server configuration and credential delivery.
+//!
+//! The server binds only to loopback and authenticates clients with a bearer token.
+//! Status and privacy acknowledgement are readable before authentication; operations
+//! that expose or change credentials and policy require a valid user session.
+
 use crate::credential_manager::CredentialManagerState;
 use crate::mcp_server;
 use crate::mcp_token;
@@ -16,6 +22,8 @@ struct GlobalMemGuard {
 impl Drop for GlobalMemGuard {
     fn drop(&mut self) {
         if !self.transferred {
+            // SAFETY: `handle` came from `GlobalAlloc`, remains owned by this guard, and
+            // is freed only when ownership was not transferred to the clipboard.
             unsafe {
                 let _ = windows::Win32::Foundation::GlobalFree(self.handle);
             }
@@ -37,6 +45,9 @@ fn copy_mcp_token_to_clipboard(window: &tauri::Window, token: &str) -> Result<()
     wide.push(0);
     let byte_len = wide.len() * size_of::<u16>();
 
+    // SAFETY: all UTF-16 and byte buffers remain alive for the duration of the Win32
+    // calls; the allocated HGLOBAL is locked before copying and its ownership is either
+    // retained by `global_mem` or transferred exactly once to the clipboard.
     unsafe {
         let owner_hwnd = window
             .hwnd()
@@ -82,6 +93,8 @@ struct ClipboardGuard;
 #[cfg(windows)]
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
+        // SAFETY: this guard is created only after `OpenClipboard` succeeds and closes
+        // that thread-owned clipboard exactly once on early-return paths.
         unsafe {
             let _ = windows::Win32::System::DataExchange::CloseClipboard();
         }
@@ -120,6 +133,11 @@ fn mcp_privacy_acknowledged_from_policy_or_db(
         || storage_state.is_mcp_privacy_acknowledged().unwrap_or(false)
 }
 
+/// Enables or disables the loopback MCP server and persists the choice.
+///
+/// Authentication: required. `enabled` selects the desired state. Returns
+/// `{ "status": "ok", "port"?: number }`. Frontend:
+/// `components/settings/useAiEmbeddingController.js`.
 #[tauri::command]
 pub async fn mcp_set_enabled(
     app: tauri::AppHandle,
@@ -211,6 +229,12 @@ pub async fn mcp_set_enabled(
     }
 }
 
+/// Returns runtime, privacy, model, and search-capability status for MCP settings.
+///
+/// Authentication: not required; no token or encrypted secret is returned. The JSON
+/// object contains `enabled`, `port`, `running`, `state`, `error`,
+/// `privacy_acknowledged`, `server_version`, `skill`, and `capabilities`.
+/// Frontend: `components/settings/useAiEmbeddingController.js`.
 #[tauri::command]
 pub async fn mcp_get_status(
     app: tauri::AppHandle,
@@ -287,6 +311,10 @@ pub async fn mcp_get_status(
     }))
 }
 
+/// Persists acknowledgement of the MCP data-exposure warning.
+///
+/// Authentication: not required. Returns JSON `null`.
+/// Frontend: `components/settings/useAiEmbeddingController.js`.
 #[tauri::command]
 pub async fn mcp_ack_privacy_warning(
     storage_state: tauri::State<'_, Arc<StorageState>>,
@@ -294,6 +322,11 @@ pub async fn mcp_ack_privacy_warning(
     storage_state.mark_mcp_privacy_acknowledged()
 }
 
+/// Rotates the MCP bearer token and copies the new plaintext token to the clipboard.
+///
+/// Authentication: required. Returns `{ "status": "ok", "token_delivery":
+/// "clipboard", "copied_to_clipboard": boolean }`; the token is never serialized to
+/// JavaScript. Frontend: `components/settings/useAiEmbeddingController.js`.
 #[tauri::command]
 pub async fn mcp_reset_token(
     app: tauri::AppHandle,
@@ -332,6 +365,11 @@ pub async fn mcp_reset_token(
     }))
 }
 
+/// Decrypts the existing MCP token directly into the Windows clipboard.
+///
+/// Authentication: required. Returns `{ "status": "ok", "token_delivery":
+/// "clipboard", "copied_to_clipboard": true }`; plaintext never crosses IPC.
+/// Frontend: `components/settings/useAiEmbeddingController.js`.
 #[tauri::command]
 pub async fn mcp_copy_token_to_clipboard(
     window: tauri::Window,
@@ -354,6 +392,10 @@ pub async fn mcp_copy_token_to_clipboard(
     }))
 }
 
+/// Returns the configured loopback MCP port as a JSON integer.
+///
+/// Authentication: not required. The settings UI currently obtains this through
+/// [`mcp_get_status`].
 #[tauri::command]
 pub async fn mcp_get_port(
     storage_state: tauri::State<'_, Arc<StorageState>>,
@@ -361,6 +403,10 @@ pub async fn mcp_get_port(
     Ok(mcp_server::get_port(&storage_state))
 }
 
+/// Persists the loopback MCP listening port.
+///
+/// Authentication: required. `port` is a `u16`; returns JSON `null`. A running server
+/// uses the new value after it is restarted.
 #[tauri::command]
 pub async fn mcp_set_port(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -374,6 +420,11 @@ pub async fn mcp_set_port(
     storage_state.save_policy(&policy)
 }
 
+/// Returns the active sensitive-content filter configuration.
+///
+/// Authentication: required. The serialized object is
+/// [`sensitive_filter::SensitiveFilterConfig`]. Frontend:
+/// `components/settings/agent-access/useSensitiveFilterSettings.js`.
 #[tauri::command]
 pub async fn mcp_get_sensitive_filter_config(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -384,6 +435,11 @@ pub async fn mcp_get_sensitive_filter_config(
     Ok(filter_state.get_config())
 }
 
+/// Replaces and persists the sensitive-content filter configuration.
+///
+/// Authentication: required. `config` uses the
+/// [`sensitive_filter::SensitiveFilterConfig`] JSON shape; returns JSON `null`.
+/// Frontend: `components/settings/agent-access/useSensitiveFilterSettings.js`.
 #[tauri::command]
 pub async fn mcp_set_sensitive_filter_config(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,

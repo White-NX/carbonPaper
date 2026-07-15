@@ -1,3 +1,5 @@
+//! Cached analysis summaries assembled from monitor and encrypted-storage state.
+
 use crate::monitor::MonitorState;
 use crate::resource_utils::file_in_local_appdata;
 use crate::storage::StorageState;

@@ -1,3 +1,8 @@
+//! Windows screenshot capture pipeline and capture-session lifecycle.
+//!
+//! The module prefers Windows Graphics Capture, falls back to GDI where necessary,
+//! applies exclusion and activity policy, and commits encoded frames to storage.
+
 use crate::monitor::MonitorState;
 use crate::storage::{OcrResultInput, SaveScreenshotRequest, StorageState};
 use base64::Engine;
@@ -315,6 +320,8 @@ pub struct ActiveWindowInfo {
 /// Retrieves information about the currently focused foreground window,
 /// including its handle, title, screen bounds, and the owning process ID.
 pub fn get_active_window_info() -> Option<ActiveWindowInfo> {
+    // SAFETY: all output pointers reference initialized stack buffers of the documented
+    // size, and the foreground HWND is checked for null before further Win32 calls.
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
@@ -422,6 +429,8 @@ pub fn is_system_window_class(class_name: &str) -> bool {
 /// Returns `Some((process_name, window_class, is_fullscreen))` or `None` if the
 /// foreground window cannot be determined.
 pub fn check_foreground_fullscreen() -> Option<(String, String, bool)> {
+    // SAFETY: the foreground HWND is checked for null; every mutable pointer targets a
+    // correctly sized stack structure or buffer that remains alive for the call.
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
@@ -474,6 +483,8 @@ pub fn check_foreground_fullscreen() -> Option<(String, String, bool)> {
 
 /// Retrieves the full executable path of a process given its PID, using Windows `QueryFullProcessImageNameW`.
 pub fn get_process_path_from_pid(pid: u32) -> Option<String> {
+    // SAFETY: `OpenProcess` returns an owned live handle; the UTF-16 output buffer and
+    // length pointer are valid for the synchronous query, and the handle is closed once.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];
@@ -524,6 +535,8 @@ fn get_process_command_line(pid: u32) -> Option<String> {
 // ==================== Window Exclusion ====================
 
 fn is_window_protected(hwnd_raw: isize) -> bool {
+    // SAFETY: `hwnd_raw` was obtained from Windows foreground-window enumeration; the
+    // affinity output points to valid stack storage and is not retained.
     unsafe {
         let hwnd = HWND(hwnd_raw as *mut _);
         let mut affinity: u32 = 0;
@@ -655,6 +668,9 @@ fn capture_foreground_window(
     jpeg_quality: u8,
     wgc_state: &Mutex<Option<WgcCaptureSession>>,
 ) -> Option<CapturedImage> {
+    // SAFETY: the WGC/Direct3D calls below use COM objects owned by the session guard;
+    // mapped texture pointers are read only within their reported row pitch and are
+    // unmapped before the guard or backing resources can be released.
     unsafe {
         let mut session_guard = wgc_state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -1051,6 +1067,9 @@ fn extract_process_icon_base64(exe_path: &str) -> Option<String> {
     use windows::Win32::UI::Shell::ExtractIconExW;
     use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
 
+    // SAFETY: the executable path is NUL-terminated and live for extraction; icon, DC,
+    // bitmap, and GDI handles returned by Windows are checked and released exactly once,
+    // while pixel buffers are sized from the queried bitmap dimensions.
     unsafe {
         // Convert path to wide string
         let wide_path: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();

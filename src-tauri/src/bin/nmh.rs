@@ -590,6 +590,9 @@ fn detect_browser() -> Option<BrowserInfo> {
             sz_exe_file: [u16; 260],
         }
 
+        // SAFETY: the Toolhelp snapshot is checked before use, the local structure layout
+        // matches PROCESSENTRY32W and has `dw_size` initialized, and the snapshot handle
+        // is closed after synchronous enumeration.
         unsafe {
             let current_pid = GetCurrentProcessId();
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -677,6 +680,8 @@ fn query_process_image_path(pid: u32) -> Option<String> {
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
+    // SAFETY: the process handle is checked and owned locally; the UTF-16 output buffer
+    // and size pointer are valid for the synchronous query, then the handle is closed.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
@@ -754,6 +759,8 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
 
     loop {
         // Create a new pipe instance
+        // SAFETY: `wide_name` is NUL-terminated and remains live; null security attributes
+        // request Windows defaults, and the returned handle is owned by this loop.
         let pipe = unsafe {
             CreateNamedPipeW(
                 wide_name.as_ptr(),
@@ -773,6 +780,7 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
             // the extension console instead of silently retrying forever.
             if !create_failure_reported {
                 create_failure_reported = true;
+                // SAFETY: `GetLastError` reads thread-local Win32 state without pointers.
                 let err = unsafe { GetLastError() };
                 send_nm_response(
                     stdout_mutex,
@@ -788,10 +796,16 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
         create_failure_reported = false;
 
         // Wait for client connection
+        // SAFETY: `pipe` is a live, uniquely owned named-pipe handle; a null OVERLAPPED
+        // pointer selects the synchronous connection mode used when the pipe was created.
         let connected = unsafe { ConnectNamedPipe(pipe, ptr::null()) };
         if connected == 0 {
+            // SAFETY: `GetLastError` reads thread-local state for the immediately preceding
+            // failed `ConnectNamedPipe` call.
             let err = unsafe { GetLastError() };
             if err != ERROR_PIPE_CONNECTED {
+                // SAFETY: ownership of the live pipe handle remains local on this error
+                // path and is released exactly once.
                 unsafe {
                     CloseHandle(pipe);
                 }
@@ -803,6 +817,8 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
         // Read request from the command pipe
         let mut buf = vec![0u8; 4096];
         let mut bytes_read: u32 = 0;
+        // SAFETY: `pipe` is connected and live; `buf` is uniquely writable for its full
+        // advertised length and `bytes_read` is valid output storage.
         let read_ok = unsafe {
             ReadFile(
                 pipe,
@@ -846,6 +862,8 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
                     };
                     let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
                     let mut written: u32 = 0;
+                    // SAFETY: the pipe is connected; the response slice is live for the
+                    // synchronous write and `written` is valid output storage.
                     unsafe {
                         WriteFile(
                             pipe,
@@ -861,6 +879,8 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
         }
 
         // Disconnect and loop to accept next connection
+        // SAFETY: this loop still uniquely owns the live pipe handle; disconnect happens
+        // before the single closing call and no later code reuses the handle.
         unsafe {
             DisconnectNamedPipe(pipe);
             CloseHandle(pipe);
@@ -902,6 +922,9 @@ fn get_current_user_sid() -> Result<String, String> {
         const TOKEN_QUERY: u32 = 0x0008;
         const TOKEN_USER_INFO: u32 = 1; // TokenUser
 
+        // SAFETY: buffer lengths are obtained from Windows, token and allocated SID-string
+        // handles are released exactly once, and all pointers target live writable storage
+        // for the duration of synchronous Win32 calls.
         unsafe {
             let process = GetCurrentProcess();
             let mut token: *mut std::ffi::c_void = ptr::null_mut();

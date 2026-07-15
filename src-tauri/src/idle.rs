@@ -56,6 +56,8 @@ impl IdleState {
 
 /// Returns seconds since last keyboard/mouse input.
 fn get_idle_seconds() -> u64 {
+    // SAFETY: `info` has the required `cbSize`, points to writable initialized memory,
+    // and Windows writes it synchronously without retaining the pointer.
     unsafe {
         let mut info = LASTINPUTINFO {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,

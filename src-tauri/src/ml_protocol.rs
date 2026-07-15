@@ -1,3 +1,8 @@
+//! Versioned framed protocol shared by the desktop process and Rust ML worker.
+//!
+//! Header and image-size limits are enforced before allocation to keep the local pipe
+//! boundary predictable even when a peer is malformed or compromised.
+
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
