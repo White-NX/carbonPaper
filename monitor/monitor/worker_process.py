@@ -327,98 +327,8 @@ def _json_safe(obj):
     return obj
 
 
-def _process_ocr(req: Dict[str, Any], ocr_worker, postprocess_queue: Optional[OcrPostprocessQueue]) -> Dict[str, Any]:
-    from PIL import Image
-    from storage_client import get_storage_client
-
-    screenshot_id = req.get("screenshot_id")
-    if screenshot_id is None:
-        return {"error": "screenshot_id is required"}
-
-    cmd_started = time.perf_counter()
-    sc = get_storage_client()
-    if not sc:
-        return {"error": "Storage client not available"}
-
-    fetch_started = time.perf_counter()
-    resp = sc.get_temp_image_bytes(screenshot_id)
-    if resp.get("status") != "success":
-        return {"error": f"Failed to fetch image: {resp.get('error', 'unknown')}"}
-
-    image_bytes = resp.get("data", {}).get("image_bytes")
-    if not image_bytes:
-        return {"error": "No image data returned from storage"}
-    fetch_elapsed = time.perf_counter() - fetch_started
-
-    image_pil = Image.open(io.BytesIO(image_bytes))
-    image_pil.load()
-    image_size = getattr(image_pil, "size", None)
-    image_mode = getattr(image_pil, "mode", "")
-    if image_pil.mode not in ("RGB", "L"):
-        image_pil = image_pil.convert("RGB")
-
-    rust_provider_active = bool(req.get("rust_provider_active", False))
-    set_provider = getattr(ocr_worker, "set_rust_ocr_provider_active", None)
-    if callable(set_provider):
-        set_provider(rust_provider_active)
-    get_engine = getattr(ocr_worker, "get_ocr_engine_for_inference", None)
-    ocr_engine = get_engine() if callable(get_engine) else ocr_worker.ocr_engine
-    ocr_started = time.perf_counter()
-    ocr_results = ocr_engine.recognize(image_pil)
-    ocr_elapsed = time.perf_counter() - ocr_started
-    filtered = [r for r in ocr_results if r.get("confidence", 0) >= 0.5]
-    ocr_worker.stats["processed_count"] += 1
-    ocr_worker.stats["total_texts_found"] += len(filtered)
-
-    image_hash = req.get("image_hash", "")
-    ocr_text = " ".join([r.get("text", "") for r in filtered])
-    postprocess_enqueued = False
-    if postprocess_queue:
-        postprocess_enqueued = postprocess_queue.enqueue({
-            "screenshot_id": screenshot_id,
-            "image_hash": image_hash,
-            "window_title": req.get("window_title", ""),
-            "process_name": req.get("process_name", ""),
-            "timestamp": req.get("timestamp", 0),
-            "ocr_text": ocr_text,
-            "image_bytes": image_bytes,
-        })
-
-    ocr_diag = {
-        "worker_protocol": WORKER_PROTOCOL_VERSION,
-        "image_bytes": len(image_bytes),
-        "image_size": list(image_size) if image_size else None,
-        "image_mode": image_mode,
-        "fetch_elapsed": fetch_elapsed,
-        "ocr_elapsed": ocr_elapsed,
-        "raw_blocks": len(ocr_results),
-        "filtered_blocks": len(filtered),
-    }
-    logger.info(
-        "[DIAG:process_ocr_worker] screenshot_id=%s image_bytes=%s image_size=%s image_mode=%s raw_blocks=%s filtered_blocks=%s fetch=%.3fs ocr=%.3fs",
-        screenshot_id,
-        ocr_diag["image_bytes"],
-        ocr_diag["image_size"],
-        ocr_diag["image_mode"],
-        ocr_diag["raw_blocks"],
-        ocr_diag["filtered_blocks"],
-        fetch_elapsed,
-        ocr_elapsed,
-    )
-
-    return {
-        "status": "success",
-        "ocr_results": filtered,
-        "ocr_text": ocr_text,
-        "postprocess_enqueued": postprocess_enqueued,
-        "elapsed": time.perf_counter() - cmd_started,
-        "worker_protocol": WORKER_PROTOCOL_VERSION,
-        "ocr_diag": ocr_diag,
-    }
-
-
 def _enqueue_ocr_postprocess(req: Dict[str, Any], postprocess_queue: Optional[OcrPostprocessQueue]) -> Dict[str, Any]:
-    """Enqueue legacy vector/classification work for OCR produced by Rust.
+    """Enqueue vector/classification work for OCR produced by Rust.
 
     Image bytes are fetched through the existing authenticated reverse IPC so
     the Rust caller never duplicates a potentially large binary payload.
@@ -531,11 +441,7 @@ def _worker_main(conn, storage_pipe: Optional[str], data_dir: str, env: Dict[str
                 postprocess_queue.stop()
                 send_response({"status": "success"})
                 return
-            if command == "process_ocr":
-                result = _process_ocr(msg.get("request", {}), ocr_worker, postprocess_queue)
-                result.setdefault("worker_protocol", WORKER_PROTOCOL_VERSION)
-                send_response(result)
-            elif command == "enqueue_ocr_postprocess":
+            if command == "enqueue_ocr_postprocess":
                 send_response(_enqueue_ocr_postprocess(msg.get("request", {}), postprocess_queue))
             elif command == "get_stats":
                 send_response({"status": "success", "stats": ocr_worker.get_stats()})
@@ -647,10 +553,7 @@ class RestartableModelWorker(WorkerSupervisor):
         except Exception:
             self._stats["failed_count"] += 1
             raise
-        if command == "process_ocr" and result.get("status") == "success":
-            self._stats["processed_count"] += 1
-            self._stats["total_texts_found"] += len(result.get("ocr_results") or [])
-        elif result.get("error"):
+        if result.get("error"):
             self._stats["failed_count"] += 1
         return result
 

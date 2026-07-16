@@ -93,37 +93,14 @@ where
 pub(crate) async fn send_ipc_request_on_client<C>(
     client: &mut C,
     req: &Value,
-    command_name: &str,
-    seq_no: u64,
     ipc_timeout_secs: u64,
-    ipc_started: std::time::Instant,
-    is_process_ocr: bool,
 ) -> Result<Value, String>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
     let req_bytes = serde_json::to_vec(req).map_err(|e| format!("Serialize error: {}", e))?;
     if let Err(e) = write_ipc_frame(client, &req_bytes).await {
-        if is_process_ocr {
-            tracing::error!(
-                "[DIAG:IPC] write failed command={} seq_no={} elapsed={}ms error={}",
-                command_name,
-                seq_no,
-                ipc_started.elapsed().as_millis(),
-                e
-            );
-        }
         return Err(e);
-    }
-
-    if is_process_ocr {
-        tracing::debug!(
-            "[DIAG:IPC] write done command={} seq_no={} request_bytes={} elapsed={}ms",
-            command_name,
-            seq_no,
-            req_bytes.len(),
-            ipc_started.elapsed().as_millis()
-        );
     }
 
     match tokio::time::timeout(
@@ -132,55 +109,10 @@ where
     )
     .await
     {
-        Ok(Ok(buf)) => {
-            if is_process_ocr {
-                tracing::debug!(
-                    "[DIAG:IPC] read done command={} seq_no={} response_bytes={} elapsed={}ms",
-                    command_name,
-                    seq_no,
-                    buf.len(),
-                    ipc_started.elapsed().as_millis()
-                );
-            }
-            match parse_ipc_response(&buf) {
-                Ok(value) => Ok(value),
-                Err(e) => {
-                    if is_process_ocr {
-                        tracing::error!(
-                            "[DIAG:IPC] invalid json command={} seq_no={} elapsed={}ms error={}",
-                            command_name,
-                            seq_no,
-                            ipc_started.elapsed().as_millis(),
-                            e
-                        );
-                    }
-                    Err(e)
-                }
-            }
-        }
-        Ok(Err(e)) => {
-            if is_process_ocr {
-                tracing::error!(
-                    "[DIAG:IPC] read failed command={} seq_no={} elapsed={}ms error={}",
-                    command_name,
-                    seq_no,
-                    ipc_started.elapsed().as_millis(),
-                    e
-                );
-            }
-            Err(e)
-        }
+        Ok(Ok(buf)) => parse_ipc_response(&buf),
+        Ok(Err(e)) => Err(e),
         Err(_) => {
             let e = format!("IPC response timed out after {}s", ipc_timeout_secs);
-            if is_process_ocr {
-                tracing::error!(
-                    "[DIAG:IPC] read timeout command={} seq_no={} elapsed={}ms error={}",
-                    command_name,
-                    seq_no,
-                    ipc_started.elapsed().as_millis(),
-                    e
-                );
-            }
             Err(e)
         }
     }

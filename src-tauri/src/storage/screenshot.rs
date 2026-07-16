@@ -104,13 +104,7 @@ impl StorageState {
         error: Option<&str>,
         elapsed_ms: Option<f64>,
     ) -> Result<(), String> {
-        const VALID_STATUSES: &[&str] = &[
-            "pending",
-            "running",
-            "completed",
-            "fallback_completed",
-            "failed",
-        ];
+        const VALID_STATUSES: &[&str] = &["pending", "running", "completed", "failed"];
         if !VALID_STATUSES.contains(&status) {
             return Err(format!("Invalid OCR status: {status}"));
         }
@@ -579,6 +573,23 @@ impl StorageState {
         &self,
         request: &SaveScreenshotRequest,
     ) -> Result<SaveScreenshotResponse, String> {
+        self.save_screenshot_temp_impl(request, None)
+    }
+
+    /// Internal capture path that avoids an unnecessary bytes -> Base64 -> bytes round trip.
+    pub fn save_screenshot_temp_bytes(
+        &self,
+        request: &SaveScreenshotRequest,
+        image_data: &[u8],
+    ) -> Result<SaveScreenshotResponse, String> {
+        self.save_screenshot_temp_impl(request, Some(image_data))
+    }
+
+    fn save_screenshot_temp_impl(
+        &self,
+        request: &SaveScreenshotRequest,
+        image_data_bytes: Option<&[u8]>,
+    ) -> Result<SaveScreenshotResponse, String> {
         let fn_start = std::time::Instant::now();
 
         // Return duplicate if already exists
@@ -593,13 +604,21 @@ impl StorageState {
         }
         let exists_dur = fn_start.elapsed();
 
-        // Decode image
+        // Decode only external JSON/IPC callers. Native capture paths pass bytes directly.
         let t0 = std::time::Instant::now();
-        let image_data = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            &request.image_data,
-        )
-        .map_err(|e| format!("Failed to decode image data: {}", e))?;
+        let decoded_image = match image_data_bytes {
+            Some(_) => None,
+            None => Some(
+                base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &request.image_data,
+                )
+                .map_err(|e| format!("Failed to decode image data: {}", e))?,
+            ),
+        };
+        let image_data = image_data_bytes
+            .or_else(|| decoded_image.as_deref())
+            .ok_or_else(|| "Missing screenshot image bytes".to_string())?;
         let decode_dur = t0.elapsed();
 
         // Generate row key and encrypt image
@@ -607,7 +626,7 @@ impl StorageState {
         let mut row_key = vec![0u8; 32];
         rand::thread_rng().fill_bytes(&mut row_key);
 
-        let encrypted_image = encrypt_with_master_key(&row_key, &image_data)
+        let encrypted_image = encrypt_with_master_key(&row_key, image_data)
             .map_err(|e| format!("Failed to encrypt image: {}", e))?;
         let encrypted_row_key = self
             .wrap_row_key_for_storage(&row_key)
@@ -644,8 +663,7 @@ impl StorageState {
                 image_path.clone()
             }
         };
-        if let Err(e) = self.generate_thumbnail_from_data(&image_data, &final_image_path, &row_key)
-        {
+        if let Err(e) = self.generate_thumbnail_from_data(image_data, &final_image_path, &row_key) {
             tracing::warn!("Failed to generate thumbnail during temp save: {}", e);
         }
 

@@ -346,7 +346,6 @@ pub async fn send_ipc_request_reused(
         .and_then(|v| v.as_str())
         .unwrap_or("<unknown>")
         .to_string();
-    let is_process_ocr = command_name == "process_ocr";
     let requested_timeout_secs = req
         .get("timeout_secs")
         .and_then(|v| v.as_u64())
@@ -356,23 +355,13 @@ pub async fn send_ipc_request_reused(
         "status" | "pause" | "resume" | "continue" => 5,
         _ => 30,
     };
-    let min_timeout_secs = if is_process_ocr { 30 } else { 1 };
     let ipc_timeout_secs = requested_timeout_secs
         .unwrap_or(default_timeout_secs)
-        .clamp(min_timeout_secs, 605);
+        .clamp(1, 605);
     let ipc_started = std::time::Instant::now();
     let keepalive = command_name != "stop";
     if let Some(obj) = req.as_object_mut() {
         obj.insert("_ipc_keepalive".to_string(), Value::Bool(keepalive));
-    }
-
-    if is_process_ocr {
-        tracing::debug!(
-            "[DIAG:IPC] start reused command={} seq_no={} pipe={}",
-            command_name,
-            seq_no,
-            pipe_name
-        );
     }
 
     let mut persistent = {
@@ -395,21 +384,12 @@ pub async fn send_ipc_request_reused(
         }
     };
 
-    let result = send_ipc_request_on_client(
-        &mut persistent.client,
-        &req,
-        &command_name,
-        seq_no,
-        ipc_timeout_secs,
-        ipc_started,
-        is_process_ocr,
-    )
-    .await;
+    let result = send_ipc_request_on_client(&mut persistent.client, &req, ipc_timeout_secs).await;
 
     match &result {
         Ok(_) if keepalive => {
             persistent.requests = persistent.requests.saturating_add(1);
-            if is_process_ocr || persistent.requests % 100 == 0 {
+            if persistent.requests % 100 == 0 {
                 tracing::debug!(
                     "[DIAG:IPC] persistent request done command={} seq_no={} reused_count={} elapsed={}ms",
                     command_name,
@@ -561,15 +541,6 @@ fn apply_monitor_side_effects(
             let Some(capture_state) = capture_state else {
                 return;
             };
-            // Update Rust-side backpressure config
-            let capture_on_ocr_busy = payload
-                .get("capture_on_ocr_busy")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let ocr_queue_max_size = payload
-                .get("ocr_queue_max_size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
             let ocr_timeout_secs = payload
                 .get("ocr_timeout_secs")
                 .and_then(|v| v.as_u64())
@@ -578,12 +549,6 @@ fn apply_monitor_side_effects(
                 })
                 .clamp(30, 600) as u32;
 
-            capture_state
-                .capture_on_ocr_busy
-                .store(capture_on_ocr_busy, Ordering::SeqCst);
-            capture_state
-                .ocr_queue_max_size
-                .store(ocr_queue_max_size, Ordering::SeqCst);
             capture_state
                 .ocr_timeout_secs
                 .store(ocr_timeout_secs, Ordering::SeqCst);
@@ -666,16 +631,12 @@ pub async fn monitor_update_advanced_config(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
-    capture_on_ocr_busy: bool,
-    ocr_queue_max_size: u32,
     ocr_timeout_secs: u32,
     clustering_allow_full_low_memory: bool,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let payload = serde_json::json!({
         "command": "update_advanced_config",
-        "capture_on_ocr_busy": capture_on_ocr_busy,
-        "ocr_queue_max_size": ocr_queue_max_size,
         "ocr_timeout_secs": ocr_timeout_secs,
         "clustering_allow_full_low_memory": clustering_allow_full_low_memory,
     });
@@ -1851,18 +1812,9 @@ fn spawn_capture_loop(app: &AppHandle) {
 
     // Load advanced config from registry
     {
-        let capture_on_ocr_busy =
-            crate::registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
-        let ocr_queue_max_size = crate::registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
         let ocr_timeout_secs = crate::registry_config::get_u32("ocr_timeout_secs")
             .unwrap_or(120)
             .clamp(30, 600);
-        capture_state
-            .capture_on_ocr_busy
-            .store(capture_on_ocr_busy, Ordering::SeqCst);
-        capture_state
-            .ocr_queue_max_size
-            .store(ocr_queue_max_size, Ordering::SeqCst);
         capture_state
             .ocr_timeout_secs
             .store(ocr_timeout_secs, Ordering::SeqCst);

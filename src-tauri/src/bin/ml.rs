@@ -118,6 +118,9 @@ fn run() -> Result<(), String> {
             MlRequest::Ocr {
                 request_id,
                 timeout_ms,
+                width,
+                height,
+                stride: _,
                 body_len,
             } => {
                 let request_started = Instant::now();
@@ -125,22 +128,16 @@ fn run() -> Result<(), String> {
                     "[ML] OCR start request_id={} bytes={} timeout_ms={} provider={:?}",
                     request_id, body_len, timeout_ms, provider
                 );
-                let decode_started = Instant::now();
-                let image = match image::load_from_memory(&body) {
-                    Ok(image) => Arc::new(image.to_rgb8()),
-                    Err(error) => {
-                        write_response(
-                            &mut writer,
-                            &MlResponse::Error {
-                                request_id,
-                                kind: "image_decode".to_string(),
-                                message: error.to_string(),
-                            },
-                        )?;
-                        continue;
-                    }
-                };
-                let image_decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+                let prepare_started = Instant::now();
+                let image = image::RgbImage::from_raw(width, height, body)
+                    .map(Arc::new)
+                    .ok_or_else(|| {
+                        format!(
+                            "validated RGB body could not construct image: {}x{} bytes={}",
+                            width, height, body_len
+                        )
+                    })?;
+                let image_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
                 let model_started = Instant::now();
                 let result = runtime.block_on(
                     engine.run_image_with_timeout(image, Duration::from_millis(timeout_ms.max(1))),
@@ -171,7 +168,7 @@ fn run() -> Result<(), String> {
                                 request_id,
                                 blocks,
                                 timings: MlOcrTimings {
-                                    image_decode_ms,
+                                    image_prepare_ms,
                                     model_total_ms,
                                     request_total_ms: request_started.elapsed().as_secs_f64()
                                         * 1000.0,

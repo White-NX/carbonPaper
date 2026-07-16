@@ -424,19 +424,15 @@ def _handle_command_impl(req: dict):
             return {'error': str(e)}
 
     if cmd == 'update_advanced_config':
-        capture_on_ocr_busy = bool(req.get('capture_on_ocr_busy', False))
-        ocr_queue_max_size = int(req.get('ocr_queue_max_size', 1))
         ocr_timeout_secs = int(req.get('ocr_timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
         allow_full_low_memory = bool(req.get(
             'clustering_allow_full_low_memory',
             getattr(config, 'CLUSTERING_ALLOW_FULL_LOW_MEMORY', False),
         ))
-        update_advanced_capture_config(capture_on_ocr_busy, ocr_queue_max_size, ocr_timeout_secs)
+        update_advanced_capture_config(ocr_timeout_secs)
         update_clustering_resource_config(allow_full_low_memory)
         return {
             'status': 'success',
-            'capture_on_ocr_busy': capture_on_ocr_busy,
-            'ocr_queue_max_size': ocr_queue_max_size,
             'ocr_timeout_secs': ocr_timeout_secs,
             'clustering_allow_full_low_memory': allow_full_low_memory,
         }
@@ -599,66 +595,6 @@ def _handle_command_impl(req: dict):
             'status': 'success',
             'vector_deleted': vector_info.get('deleted', 0),
         }
-
-    # ----- OCR processing (called by Rust capture loop) -----
-    if cmd == 'process_ocr':
-        screenshot_id = req.get('screenshot_id')
-        if screenshot_id is None:
-            return {'error': 'screenshot_id is required'}
-        if not _ocr_worker:
-            return {'error': 'OCR service not initialised'}
-
-        logger.debug(
-            '[DIAG:process_ocr] start screenshot_id=%s image_hash=%s process=%s',
-            screenshot_id,
-            req.get('image_hash', ''),
-            req.get('process_name', ''),
-        )
-
-        if not hasattr(_ocr_worker, 'request'):
-            return {'error': 'OCR service requires RestartableModelWorker'}
-
-        timeout_secs = int(req.get('timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
-        try:
-            result = _ocr_worker.request(
-                'process_ocr',
-                {'request': req},
-                timeout=max(30, min(600, timeout_secs)),
-            )
-            if result.get('status') == 'success':
-                ocr_text = result.get('ocr_text', '')
-                ocr_results = result.get('ocr_results') or []
-                ocr_diag = result.get('ocr_diag') or {}
-                logger.info(
-                    '[DIAG:process_ocr] success screenshot_id=%s returned_blocks=%s text_len=%s postprocess_enqueued=%s elapsed=%.3fs worker_protocol=%s image_bytes=%s image_size=%s raw_blocks=%s filtered_blocks=%s ocr_elapsed=%.3fs',
-                    screenshot_id,
-                    len(ocr_results) if isinstance(ocr_results, list) else 0,
-                    len(ocr_text or ''),
-                    result.get('postprocess_enqueued'),
-                    float(result.get('elapsed') or 0.0),
-                    result.get('worker_protocol'),
-                    ocr_diag.get('image_bytes'),
-                    ocr_diag.get('image_size'),
-                    ocr_diag.get('raw_blocks'),
-                    ocr_diag.get('filtered_blocks'),
-                    float(ocr_diag.get('ocr_elapsed') or 0.0),
-                )
-                _enqueue_clustering_snapshot({
-                    'screenshot_id': screenshot_id,
-                    'process_name': req.get('process_name', ''),
-                    'window_title': req.get('window_title', ''),
-                    'ocr_text': ocr_text,
-                    'timestamp': req.get('timestamp', 0),
-                    'category': '',
-                })
-                result.pop('ocr_text', None)
-            return result
-        except TimeoutError as e:
-            logger.error('[DIAG:process_ocr] worker timeout screenshot_id=%s error=%s', screenshot_id, e)
-            return {'error': str(e)}
-        except Exception as e:
-            logger.error('[DIAG:process_ocr] worker failed screenshot_id=%s error=%s', screenshot_id, e, exc_info=True)
-            return {'error': str(e)}
 
     if cmd == 'enqueue_ocr_postprocess':
         screenshot_id = req.get('screenshot_id')
@@ -1004,8 +940,8 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     except Exception as e:
         logger.warning('Smart Cluster worker failed to start (non-fatal): %s', e)
 
-    # NOTE: Screenshot capture loop is handled by Rust (capture.rs).
-    # Python only provides OCR via the 'process_ocr' IPC command.
+    # NOTE: Screenshot capture and OCR are handled by Rust. Python provides only
+    # classification, vector indexing, clustering, and related post-processing.
 
     return _server
 

@@ -129,12 +129,7 @@ pub fn close_process(window: tauri::Window) -> Result<(), String> {
 pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let cpu_limit_enabled = registry_config::get_bool("cpu_limit_enabled").unwrap_or(true);
     let cpu_limit_percent = registry_config::get_u32("cpu_limit_percent").unwrap_or(10);
-    let capture_on_ocr_busy = registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
-    let ocr_queue_limit_enabled =
-        registry_config::get_bool("ocr_queue_limit_enabled").unwrap_or(true);
-    let ocr_queue_max_size = registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
     let ocr_timeout_secs = registry_config::get_u32("ocr_timeout_secs").unwrap_or(120);
-    let rust_ocr_enabled = registry_config::get_bool("rust_ocr_enabled").unwrap_or(true);
     let rust_ocr_dml_beta = registry_config::get_bool("rust_ocr_dml_beta").unwrap_or(false);
     let use_dml = registry_config::get_bool("use_dml").unwrap_or(false);
     let dml_device_id = registry_config::get_u32("dml_device_id").unwrap_or(0);
@@ -153,11 +148,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
         "cpu_limit_percent": cpu_limit_percent,
-        "capture_on_ocr_busy": capture_on_ocr_busy,
-        "ocr_queue_limit_enabled": ocr_queue_limit_enabled,
-        "ocr_queue_max_size": ocr_queue_max_size,
         "ocr_timeout_secs": ocr_timeout_secs,
-        "rust_ocr_enabled": rust_ocr_enabled,
         "rust_ocr_dml_beta": rust_ocr_dml_beta,
         "use_dml": use_dml,
         "dml_device_id": dml_device_id,
@@ -188,24 +179,9 @@ pub fn set_advanced_config(
     if let Some(v) = config.get("cpu_limit_percent").and_then(|v| v.as_u64()) {
         registry_config::set_u32("cpu_limit_percent", v as u32)?;
     }
-    if let Some(v) = config.get("capture_on_ocr_busy").and_then(|v| v.as_bool()) {
-        registry_config::set_bool("capture_on_ocr_busy", v)?;
-    }
-    if let Some(v) = config
-        .get("ocr_queue_limit_enabled")
-        .and_then(|v| v.as_bool())
-    {
-        registry_config::set_bool("ocr_queue_limit_enabled", v)?;
-    }
-    if let Some(v) = config.get("ocr_queue_max_size").and_then(|v| v.as_u64()) {
-        registry_config::set_u32("ocr_queue_max_size", v as u32)?;
-    }
     if let Some(v) = config.get("ocr_timeout_secs").and_then(|v| v.as_u64()) {
         let clamped = (v as u32).clamp(30, 600);
         registry_config::set_u32("ocr_timeout_secs", clamped)?;
-    }
-    if let Some(v) = config.get("rust_ocr_enabled").and_then(|v| v.as_bool()) {
-        registry_config::set_bool("rust_ocr_enabled", v)?;
     }
     if let Some(v) = config.get("rust_ocr_dml_beta").and_then(|v| v.as_bool()) {
         // Temporary migration setting. It intentionally does not mirror the

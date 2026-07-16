@@ -7,7 +7,7 @@ use crate::monitor::MonitorState;
 use crate::storage::{OcrResultInput, SaveScreenshotRequest, StorageState};
 use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, GenericImageView, ImageEncoder, RgbImage};
+use image::{ImageEncoder, RgbImage};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -156,11 +156,10 @@ impl Drop for WgcCaptureSession {
 
 // ==================== Capture State ====================
 
-/// In-memory cache for JPEG bytes awaiting OCR.
-/// Keyed by screenshot_id. Entries are inserted before sending to Python
-/// and removed after OCR completes (commit or abort). This avoids reading
-/// from encrypted storage (which triggers Windows Hello CNG decryption).
-pub type OcrImageCache = Arc<Mutex<HashMap<i64, Vec<u8>>>>;
+/// In-memory cache for storage JPEG bytes used by Python post-processing.
+/// Rust OCR never reads this cache. Entries avoid re-reading encrypted storage,
+/// which could otherwise trigger Windows Hello authentication.
+pub type OcrImageCache = Arc<Mutex<HashMap<i64, Arc<[u8]>>>>;
 
 /// Shared state for the capture subsystem, including pause/stop flags and OCR backpressure.
 pub struct CaptureState {
@@ -169,8 +168,6 @@ pub struct CaptureState {
     pub config: Mutex<CaptureConfig>,
     pub exclusion_settings: Mutex<ExclusionSettings>,
     pub in_flight_ocr_count: AtomicU32,
-    pub capture_on_ocr_busy: AtomicBool,
-    pub ocr_queue_max_size: AtomicU32,
     pub ocr_timeout_secs: AtomicU32,
     pub ocr_cold_start_pending: AtomicBool,
     pub startup_pending_cleanup_cancelled: AtomicBool,
@@ -179,6 +176,63 @@ pub struct CaptureState {
     pub wgc_state: Mutex<Option<WgcCaptureSession>>,
     /// Game mode: capture paused because a non-browser fullscreen app is in the foreground
     pub game_mode_capture_paused: AtomicBool,
+}
+
+pub(crate) struct OcrSlotReservation {
+    capture_state: Arc<CaptureState>,
+    active: bool,
+}
+
+impl OcrSlotReservation {
+    pub(crate) fn into_task_guard(mut self, screenshot_id: i64) -> OcrTaskGuard {
+        self.active = false;
+        OcrTaskGuard {
+            capture_state: self.capture_state.clone(),
+            screenshot_id,
+        }
+    }
+}
+
+impl Drop for OcrSlotReservation {
+    fn drop(&mut self) {
+        if self.active {
+            release_ocr_slot(&self.capture_state);
+        }
+    }
+}
+
+/// Owns the OCR slot for the complete lifetime of a spawned OCR task.
+///
+/// The guard also removes the temporary image cache entry. Both operations
+/// therefore happen on normal return, error, panic, task cancellation, and
+/// runtime shutdown when Tokio drops the task future.
+pub(crate) struct OcrTaskGuard {
+    capture_state: Arc<CaptureState>,
+    screenshot_id: i64,
+}
+
+impl Drop for OcrTaskGuard {
+    fn drop(&mut self) {
+        {
+            let mut cache = self
+                .capture_state
+                .ocr_image_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cache.remove(&self.screenshot_id);
+        }
+        release_ocr_slot(&self.capture_state);
+    }
+}
+
+fn release_ocr_slot(capture_state: &CaptureState) {
+    // Saturating subtraction avoids wrapping to u32::MAX if an old task
+    // finishes after a monitor restart reset the counter to zero.
+    let _ = capture_state.in_flight_ocr_count.fetch_update(
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+        |count| Some(count.saturating_sub(1)),
+    );
 }
 
 impl Default for CaptureState {
@@ -196,8 +250,6 @@ impl CaptureState {
             config: Mutex::new(CaptureConfig::default()),
             exclusion_settings: Mutex::new(ExclusionSettings::default()),
             in_flight_ocr_count: AtomicU32::new(0),
-            capture_on_ocr_busy: AtomicBool::new(false),
-            ocr_queue_max_size: AtomicU32::new(1),
             ocr_timeout_secs: AtomicU32::new(120),
             ocr_cold_start_pending: AtomicBool::new(true),
             startup_pending_cleanup_cancelled: AtomicBool::new(false),
@@ -206,6 +258,16 @@ impl CaptureState {
             wgc_state: Mutex::new(None),
             game_mode_capture_paused: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn try_reserve_ocr_slot(self: &Arc<Self>) -> Option<OcrSlotReservation> {
+        self.in_flight_ocr_count
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| OcrSlotReservation {
+                capture_state: self.clone(),
+                active: true,
+            })
     }
 
     /// Explicitly drops the current WGC session and releases capture resources.
@@ -607,8 +669,8 @@ fn is_excluded(info: &ActiveWindowInfo, settings: &ExclusionSettings) -> bool {
 
 type DHash = [u64; 4];
 
-fn compute_dhash(img: &DynamicImage, hash_size: u32) -> DHash {
-    let gray = img.to_luma8();
+fn compute_dhash(img: &RgbImage, hash_size: u32) -> DHash {
+    let gray = image::imageops::grayscale(img);
     let resized = image::imageops::resize(
         &gray,
         hash_size + 1,
@@ -655,10 +717,24 @@ fn is_redundant(current: &DHash, history: &[DHash], threshold: u32) -> bool {
 
 #[derive(Clone)]
 struct CapturedImage {
-    jpeg_bytes: Vec<u8>,
+    jpeg_bytes: Arc<[u8]>,
     width: u32,
     height: u32,
-    dynamic_image: DynamicImage,
+    rgb_image: Arc<RgbImage>,
+}
+
+pub(crate) fn encode_rgb_jpeg(image: &RgbImage, quality: u8) -> Result<Vec<u8>, String> {
+    let mut jpeg = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg, quality);
+    encoder
+        .encode(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .map_err(|error| format!("JPEG encoding failed: {error}"))?;
+    Ok(jpeg)
 }
 
 fn capture_foreground_window(
@@ -1026,33 +1102,39 @@ fn capture_foreground_window(
             }
         };
 
-        let mut dynamic = DynamicImage::ImageRgb8(rgb_image);
         let max_dim = width.max(height);
-        if max_dim > max_side {
+        let rgb_image = if max_dim > max_side {
             let ratio = max_side as f64 / max_dim as f64;
             let new_w = (width as f64 * ratio) as u32;
             let new_h = (height as f64 * ratio) as u32;
-            dynamic = dynamic.resize(new_w, new_h, image::imageops::FilterType::Lanczos3);
-        }
+            image::imageops::resize(
+                &rgb_image,
+                new_w,
+                new_h,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            rgb_image
+        };
 
-        let (final_w, final_h) = dynamic.dimensions();
+        let final_w = rgb_image.width();
+        let final_h = rgb_image.height();
 
         // 8. Encode as JPEG
-        let mut jpeg_buf = Vec::new();
-        {
-            let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, jpeg_quality);
-            if let Err(e) = encoder.encode_image(&dynamic) {
-                tracing::warn!("JPEG encoding failed: {}", e);
+        let jpeg_buf = match encode_rgb_jpeg(&rgb_image, jpeg_quality) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!("{}", error);
                 *session_guard = None;
                 return None;
             }
-        }
+        };
 
         let captured = CapturedImage {
-            jpeg_bytes: jpeg_buf,
+            jpeg_bytes: Arc::from(jpeg_buf),
             width: final_w,
             height: final_h,
-            dynamic_image: dynamic,
+            rgb_image: Arc::new(rgb_image),
         };
 
         session.last_image = Some(captured.clone());
@@ -1219,7 +1301,7 @@ fn extract_process_icon_base64(exe_path: &str) -> Option<String> {
 // ==================== Main Capture Loop ====================
 
 /// Main loop that periodically captures screenshots of the active window,
-/// deduplicates via dHash, and dispatches OCR tasks to the Python backend.
+/// deduplicates via dHash, and dispatches raw RGB frames to the Rust ML worker.
 pub async fn run_capture_loop(
     capture_state: Arc<CaptureState>,
     storage: Arc<StorageState>,
@@ -1303,40 +1385,24 @@ pub async fn run_capture_loop(
             }
         }
 
-        // Backpressure check
+        // Raw RGB frames are never queued. Keep capture and OCR strictly single-flight.
         let in_flight = capture_state.in_flight_ocr_count.load(Ordering::SeqCst);
-        let capture_on_busy = capture_state.capture_on_ocr_busy.load(Ordering::SeqCst);
-        let max_queue = capture_state.ocr_queue_max_size.load(Ordering::SeqCst);
+        if in_flight > 0 {
+            continue;
+        }
 
         let mut should_capture = false;
         let mut scan_reason = "";
 
         // Focus change detection
         if current_hwnd_raw != last_hwnd_raw {
-            if !capture_on_busy {
-                // Conservative: skip if any OCR in flight
-                if in_flight == 0 {
-                    should_capture = true;
-                    scan_reason = "focus_change";
-                }
-            } else {
-                // Relaxed: skip only if over max queue
-                if in_flight <= max_queue {
-                    should_capture = true;
-                    scan_reason = "focus_change";
-                }
-            }
+            should_capture = true;
+            scan_reason = "focus_change";
         }
         // Interval trigger
         else if force_first_capture || last_capture_time.elapsed().as_secs() >= interval_secs {
-            if !capture_on_busy && in_flight > 0 {
-                // Conservative: skip
-            } else if in_flight > max_queue {
-                // Over max queue: skip
-            } else {
-                should_capture = true;
-                scan_reason = "interval";
-            }
+            should_capture = true;
+            scan_reason = "interval";
         }
 
         if !should_capture {
@@ -1381,7 +1447,7 @@ pub async fn run_capture_loop(
         };
 
         // dHash dedup
-        let current_hash = compute_dhash(&captured.dynamic_image, 16);
+        let current_hash = compute_dhash(&captured.rgb_image, 16);
         if is_redundant(&current_hash, &history_hashes, dhash_threshold) {
             last_capture_time = std::time::Instant::now();
             last_hwnd_raw = current_hwnd_raw;
@@ -1486,11 +1552,18 @@ pub async fn run_capture_loop(
             "timestamp": ts_str,
         });
 
-        // Save screenshot temp (directly, no IPC needed)
-        let image_data_b64 = base64::engine::general_purpose::STANDARD.encode(&captured.jpeg_bytes);
+        let Some(ocr_slot) = capture_state.try_reserve_ocr_slot() else {
+            tracing::debug!(
+                "OCR slot was claimed while capture was being prepared; dropping frame"
+            );
+            last_capture_time = std::time::Instant::now();
+            last_hwnd_raw = current_hwnd_raw;
+            continue;
+        };
 
+        // Save screenshot temp (directly, no IPC needed)
         let save_request = SaveScreenshotRequest {
-            image_data: image_data_b64.clone(),
+            image_data: String::new(),
             image_hash: image_hash.clone(),
             width: captured.width as i32,
             height: captured.height as i32,
@@ -1504,31 +1577,32 @@ pub async fn run_capture_loop(
             visible_links: None,
         };
 
-        let screenshot_id = match storage.save_screenshot_temp(&save_request) {
-            Ok(resp) => {
-                if resp.status == "duplicate" {
-                    tracing::debug!("Duplicate screenshot, skipping OCR");
-                    last_capture_time = std::time::Instant::now();
-                    last_hwnd_raw = current_hwnd_raw;
-                    continue;
-                }
-                match resp.screenshot_id {
-                    Some(id) => id,
-                    None => {
-                        tracing::error!("save_screenshot_temp returned no ID");
+        let screenshot_id =
+            match storage.save_screenshot_temp_bytes(&save_request, &captured.jpeg_bytes) {
+                Ok(resp) => {
+                    if resp.status == "duplicate" {
+                        tracing::debug!("Duplicate screenshot, skipping OCR");
                         last_capture_time = std::time::Instant::now();
                         last_hwnd_raw = current_hwnd_raw;
                         continue;
                     }
+                    match resp.screenshot_id {
+                        Some(id) => id,
+                        None => {
+                            tracing::error!("save_screenshot_temp returned no ID");
+                            last_capture_time = std::time::Instant::now();
+                            last_hwnd_raw = current_hwnd_raw;
+                            continue;
+                        }
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::error!("save_screenshot_temp failed: {}", e);
-                last_capture_time = std::time::Instant::now();
-                last_hwnd_raw = current_hwnd_raw;
-                continue;
-            }
-        };
+                Err(e) => {
+                    tracing::error!("save_screenshot_temp failed: {}", e);
+                    last_capture_time = std::time::Instant::now();
+                    last_hwnd_raw = current_hwnd_raw;
+                    continue;
+                }
+            };
         capture_state
             .startup_pending_cleanup_cancelled
             .store(true, Ordering::SeqCst);
@@ -1537,19 +1611,23 @@ pub async fn run_capture_loop(
         let storage_clone = storage.clone();
         let capture_state_clone = capture_state.clone();
         let jpeg_bytes = captured.jpeg_bytes.clone();
+        let rgb_image = captured.rgb_image.clone();
         let image_hash_clone = image_hash.clone();
         let window_title_clone = window_info.title.clone();
         let process_name_clone = process_name.clone();
         let timestamp_ms = chrono::Utc::now().timestamp_millis();
         let app_clone = app.clone();
 
+        let ocr_guard = ocr_slot.into_task_guard(screenshot_id);
         tokio::spawn(async move {
+            let _ocr_guard = ocr_guard;
             process_ocr_async(
                 &app_clone,
                 storage_clone,
                 capture_state_clone,
                 screenshot_id,
                 jpeg_bytes,
+                rgb_image,
                 image_hash_clone,
                 window_title_clone,
                 process_name_clone,
@@ -1571,27 +1649,23 @@ async fn process_ocr_async(
     storage: Arc<StorageState>,
     capture_state: Arc<CaptureState>,
     screenshot_id: i64,
-    jpeg_bytes: Vec<u8>,
+    jpeg_bytes: Arc<[u8]>,
+    rgb_image: Arc<RgbImage>,
     image_hash: String,
     window_title: String,
     process_name: String,
     timestamp_ms: i64,
 ) {
     const OCR_ASYNC_WARN_MS: u128 = 60_000;
-    let in_flight_after_inc = capture_state
-        .in_flight_ocr_count
-        .fetch_add(1, Ordering::SeqCst)
-        + 1;
+    let in_flight_after_inc = capture_state.in_flight_ocr_count.load(Ordering::SeqCst);
 
     let task_started = std::time::Instant::now();
     let route = OcrRouteConfig::from_registry();
-    let initial_engine = if route.use_rust { "rust" } else { "python" };
-    let initial_provider = if route.use_rust && route.use_directml_beta {
+    let initial_engine = "rust";
+    let initial_provider = if route.use_directml_beta {
         "directml_beta"
-    } else if route.use_rust {
-        "cpu"
     } else {
-        "legacy_python"
+        "cpu"
     };
     if let Err(error) = storage.set_ocr_status(
         screenshot_id,
@@ -1634,15 +1708,11 @@ async fn process_ocr_async(
         capture_state.ocr_timeout_secs.load(Ordering::SeqCst).max(1)
     };
 
-    // Each provider owns its timeout and cleanup policy. Wrapping the complete
-    // Rust -> Python fallback chain in a shorter timeout would cancel the Rust
-    // watchdog before it can kill a stuck worker and make Python fallback
-    // unreachable.
     let result = process_ocr_inner(
         app,
         &storage,
         screenshot_id,
-        &jpeg_bytes,
+        rgb_image,
         &image_hash,
         &window_title,
         &process_name,
@@ -1652,16 +1722,8 @@ async fn process_ocr_async(
     )
     .await;
 
-    // Always remove from cache regardless of success/failure
-    {
-        let mut cache = capture_state
-            .ocr_image_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        cache.remove(&screenshot_id);
-    }
-
     if let Err(e) = result {
+        crate::ml_runtime::schedule_ocr_model_health_notification(app.clone());
         tracing::error!(
             "OCR processing failed for screenshot {}: {}",
             screenshot_id,
@@ -1687,39 +1749,33 @@ async fn process_ocr_async(
         );
     }
 
-    let in_flight_after_dec = capture_state
-        .in_flight_ocr_count
-        .fetch_sub(1, Ordering::SeqCst)
-        .saturating_sub(1);
-
     let total_ms = task_started.elapsed().as_millis();
+    let in_flight_after = capture_state.in_flight_ocr_count.load(Ordering::SeqCst);
     if total_ms >= OCR_ASYNC_WARN_MS {
         tracing::warn!(
             "[DIAG:CAPTURE] process_ocr_async slow screenshot_id={} total={}ms in_flight_after={}",
             screenshot_id,
             total_ms,
-            in_flight_after_dec
+            in_flight_after
         );
     } else {
         tracing::debug!(
             "[DIAG:CAPTURE] process_ocr_async end screenshot_id={} total={}ms in_flight_after={}",
             screenshot_id,
             total_ms,
-            in_flight_after_dec
+            in_flight_after
         );
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OcrRouteConfig {
-    pub(crate) use_rust: bool,
     pub(crate) use_directml_beta: bool,
 }
 
 impl OcrRouteConfig {
     pub(crate) fn from_registry() -> Self {
         Self {
-            use_rust: crate::registry_config::get_bool("rust_ocr_enabled").unwrap_or(true),
             use_directml_beta: crate::registry_config::get_bool("rust_ocr_dml_beta")
                 .unwrap_or(false),
         }
@@ -1730,7 +1786,7 @@ pub(crate) async fn process_ocr_inner(
     app: &tauri::AppHandle,
     storage: &StorageState,
     screenshot_id: i64,
-    jpeg_bytes: &[u8],
+    rgb_image: Arc<RgbImage>,
     image_hash: &str,
     window_title: &str,
     process_name: &str,
@@ -1738,311 +1794,98 @@ pub(crate) async fn process_ocr_inner(
     timeout_secs: u32,
     route: OcrRouteConfig,
 ) -> Result<(), String> {
-    let mut rust_attempted = false;
-    if route.use_rust {
-        rust_attempted = true;
-        // Temporary migration-only switch. This Beta setting is intentionally
-        // independent from the existing Python DML preference and will be
-        // removed once Rust becomes the only OCR runtime. Future Rust DML will
-        // respect the app's unified DML setting instead.
-        let use_directml_beta = route.use_directml_beta;
-        tracing::info!(
-            "[ML:ROUTER] Rust OCR selected screenshot_id={} dml_beta={} bytes={} timeout_secs={}",
-            screenshot_id,
+    let use_directml_beta = route.use_directml_beta;
+    tracing::info!(
+        "[ML:ROUTER] Raw RGB Rust OCR selected screenshot_id={} dml_beta={} dimensions={}x{} bytes={} timeout_secs={}",
+        screenshot_id,
+        use_directml_beta,
+        rgb_image.width(),
+        rgb_image.height(),
+        rgb_image.as_raw().len(),
+        timeout_secs
+    );
+    let ml_state = app
+        .state::<Arc<crate::ml_runtime::MlRuntimeState>>()
+        .inner()
+        .clone();
+    let output = ml_state
+        .run_ocr(
+            app.clone(),
+            rgb_image,
+            std::time::Duration::from_secs(timeout_secs as u64),
             use_directml_beta,
-            jpeg_bytes.len(),
-            timeout_secs
-        );
-        let ml_state = app
-            .state::<Arc<crate::ml_runtime::MlRuntimeState>>()
-            .inner()
-            .clone();
-        match ml_state
-            .run_ocr(
-                app.clone(),
-                jpeg_bytes.to_vec(),
-                std::time::Duration::from_secs(timeout_secs as u64),
-                use_directml_beta,
-            )
-            .await
-        {
-            Ok(output) => {
-                let ocr_results = convert_ml_ocr_blocks(output.blocks)?;
-                tracing::info!(
-                    "[ML:ROUTER] Rust OCR commit screenshot_id={} blocks={} decode_ms={:.1} model_ms={:.1} worker_total_ms={:.1}",
-                    screenshot_id,
-                    ocr_results.len(),
-                    output.timings.image_decode_ms,
-                    output.timings.model_total_ms,
-                    output.timings.request_total_ms
-                );
-                storage.commit_screenshot(screenshot_id, Some(&ocr_results), None, None)?;
-                if let Err(error) = storage.set_ocr_status(
-                    screenshot_id,
-                    "completed",
-                    Some("rust"),
-                    Some("ppocrv5-ch-mobile"),
-                    Some(if use_directml_beta {
-                        "directml_beta"
-                    } else {
-                        "cpu"
-                    }),
-                    None,
-                    Some(output.timings.request_total_ms),
-                ) {
-                    tracing::warn!(
-                        "Rust OCR data was committed but completion status update failed screenshot_id={}: {}",
-                        screenshot_id,
-                        error
-                    );
-                }
-                if let Err(error) =
-                    storage.set_ocr_postprocess_status(screenshot_id, "pending", None)
-                {
-                    tracing::warn!(
-                        "Rust OCR data was committed but postprocess status initialization failed screenshot_id={}: {}",
-                        screenshot_id,
-                        error
-                    );
-                }
-                match enqueue_python_ocr_postprocess(
-                    app,
-                    screenshot_id,
-                    image_hash,
-                    window_title,
-                    process_name,
-                    timestamp_ms,
-                    &ocr_results,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        if let Err(error) =
-                            storage.set_ocr_postprocess_status(screenshot_id, "queued", None)
-                        {
-                            tracing::warn!(
-                                "OCR postprocess was queued but status update failed screenshot_id={}: {}",
-                                screenshot_id,
-                                error
-                            );
-                        }
-                    }
-                    Ok(false) => {
-                        let error = "Python OCR postprocess queue is full";
-                        let _ = storage.record_ocr_postprocess_retry(screenshot_id, error);
-                        tracing::warn!(
-                            "[ML:POSTPROCESS] {} screenshot_id={}",
-                            error,
-                            screenshot_id
-                        );
-                    }
-                    Err(error) => {
-                        let _ = storage.record_ocr_postprocess_retry(screenshot_id, &error);
-                        tracing::warn!(
-                            "[ML:POSTPROCESS] Rust OCR saved but legacy postprocess enqueue failed screenshot_id={}: {}",
-                            screenshot_id,
-                            error
-                        );
-                    }
-                }
-                return Ok(());
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "[ML:ROUTER] Rust OCR failed; falling back to Python screenshot_id={} error={}",
-                    screenshot_id,
-                    error
-                );
-            }
-        }
-    } else {
-        tracing::info!(
-            "[ML:ROUTER] Python OCR selected screenshot_id={} timeout_secs={}",
+        )
+        .await?;
+    let ocr_results = convert_ml_ocr_blocks(output.blocks)?;
+    tracing::info!(
+        "[ML:ROUTER] Rust OCR commit screenshot_id={} blocks={} prepare_ms={:.1} model_ms={:.1} worker_total_ms={:.1}",
+        screenshot_id,
+        ocr_results.len(),
+        output.timings.image_prepare_ms,
+        output.timings.model_total_ms,
+        output.timings.request_total_ms
+    );
+    storage.commit_screenshot(screenshot_id, Some(&ocr_results), None, None)?;
+    if let Err(error) = storage.set_ocr_status(
+        screenshot_id,
+        "completed",
+        Some("rust"),
+        Some("ppocrv5-ch-mobile"),
+        Some(if use_directml_beta {
+            "directml_beta"
+        } else {
+            "cpu"
+        }),
+        None,
+        Some(output.timings.request_total_ms),
+    ) {
+        tracing::warn!(
+            "Rust OCR data was committed but completion status update failed screenshot_id={}: {}",
             screenshot_id,
-            timeout_secs
+            error
         );
     }
-
-    let monitor_state = app.state::<MonitorState>();
-    process_python_ocr_inner(
-        &monitor_state,
-        storage,
+    if let Err(error) = storage.set_ocr_postprocess_status(screenshot_id, "pending", None) {
+        tracing::warn!(
+            "Rust OCR data was committed but postprocess status initialization failed screenshot_id={}: {}",
+            screenshot_id,
+            error
+        );
+    }
+    match enqueue_python_ocr_postprocess(
+        app,
         screenshot_id,
         image_hash,
         window_title,
         process_name,
         timestamp_ms,
-        timeout_secs,
-        rust_attempted,
+        &ocr_results,
     )
-    .await?;
-    if let Err(error) = storage.set_ocr_status(
-        screenshot_id,
-        if rust_attempted {
-            "fallback_completed"
-        } else {
-            "completed"
-        },
-        Some("python"),
-        Some("ppocrv5-ch-mobile"),
-        Some("legacy_python"),
-        None,
-        None,
-    ) {
-        tracing::warn!(
-            "Python OCR data was committed but completion status update failed screenshot_id={}: {}",
-            screenshot_id,
-            error
-        );
+    .await
+    {
+        Ok(true) => {
+            if let Err(error) = storage.set_ocr_postprocess_status(screenshot_id, "queued", None) {
+                tracing::warn!(
+                    "OCR postprocess was queued but status update failed screenshot_id={}: {}",
+                    screenshot_id,
+                    error
+                );
+            }
+        }
+        Ok(false) => {
+            let error = "Python postprocess queue is full";
+            let _ = storage.record_ocr_postprocess_retry(screenshot_id, error);
+            tracing::warn!("[ML:POSTPROCESS] {} screenshot_id={}", error, screenshot_id);
+        }
+        Err(error) => {
+            let _ = storage.record_ocr_postprocess_retry(screenshot_id, &error);
+            tracing::warn!(
+                "[ML:POSTPROCESS] Rust OCR saved but postprocess enqueue failed screenshot_id={}: {}",
+                screenshot_id,
+                error
+            );
+        }
     }
-    Ok(())
-}
-
-async fn process_python_ocr_inner(
-    monitor_state: &MonitorState,
-    storage: &StorageState,
-    screenshot_id: i64,
-    image_hash: &str,
-    window_title: &str,
-    process_name: &str,
-    timestamp_ms: i64,
-    timeout_secs: u32,
-    rust_provider_active: bool,
-) -> Result<(), String> {
-    const OCR_IPC_ROUNDTRIP_WARN_MS: u128 = 60_000;
-    const COMMIT_SLOW_WARN_MS: u128 = 2_000;
-
-    let cmd_started = std::time::Instant::now();
-
-    // Get pipe info for sending to Python
-    let pipe_name = {
-        let guard = monitor_state
-            .pipe_name
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard
-            .clone()
-            .ok_or_else(|| "Monitor pipe not available".to_string())?
-    };
-
-    // Send process_ocr command to Python with only screenshot_id (small payload).
-    // Python will fetch the image via reverse IPC (get_temp_image) from in-memory cache.
-    let req = serde_json::json!({
-        "command": "process_ocr",
-        "screenshot_id": screenshot_id,
-        "image_hash": image_hash,
-        "window_title": window_title,
-        "process_name": process_name,
-        "timestamp": timestamp_ms,
-        "timeout_secs": timeout_secs,
-        "rust_provider_active": rust_provider_active,
-    });
-
-    let (auth_token, seq_no) = {
-        let token = monitor_state
-            .auth_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .ok_or_else(|| "Auth token not available".to_string())?;
-        let seq = monitor_state
-            .request_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        (token, seq)
-    };
-
-    tracing::debug!(
-        "[DIAG:CAPTURE] process_ocr IPC send screenshot_id={} seq_no={} pipe={}",
-        screenshot_id,
-        seq_no,
-        pipe_name
-    );
-
-    let ipc_started = std::time::Instant::now();
-    let response = crate::monitor::send_ipc_request_reused(
-        monitor_state,
-        &pipe_name,
-        &auth_token,
-        seq_no,
-        req,
-    )
-    .await?;
-
-    let ipc_ms = ipc_started.elapsed().as_millis();
-    // NOTE: This is IPC roundtrip time and includes Python OCR inference + post-processing.
-    // Use a high threshold to avoid mislabeling normal OCR cost as transport slowness.
-    if ipc_ms >= OCR_IPC_ROUNDTRIP_WARN_MS {
-        tracing::warn!(
-            "[DIAG:CAPTURE] process_ocr IPC roundtrip very slow screenshot_id={} seq_no={} elapsed={}ms",
-            screenshot_id,
-            seq_no,
-            ipc_ms
-        );
-    } else {
-        tracing::debug!(
-            "[DIAG:CAPTURE] process_ocr IPC recv screenshot_id={} seq_no={} elapsed={}ms",
-            screenshot_id,
-            seq_no,
-            ipc_ms
-        );
-    }
-
-    // Check response
-    if let Some(error) = response.get("error").and_then(|v| v.as_str()) {
-        return Err(format!("Python OCR error: {}", error));
-    }
-
-    // Extract OCR results from response
-    let ocr_results: Option<Vec<OcrResultInput>> = response
-        .get("ocr_results")
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-    // Extract category from Python response
-    let category = response
-        .get("category")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let category_confidence = response.get("category_confidence").and_then(|v| v.as_f64());
-
-    // Commit screenshot with OCR results and category
-    let commit_started = std::time::Instant::now();
-    tracing::debug!(
-        "[DIAG:CAPTURE] commit_screenshot start screenshot_id={} ocr_results={} category={}",
-        screenshot_id,
-        ocr_results.as_ref().map(|r| r.len()).unwrap_or(0),
-        category.as_deref().unwrap_or("")
-    );
-
-    storage.commit_screenshot(
-        screenshot_id,
-        ocr_results.as_ref(),
-        category.as_deref(),
-        category_confidence,
-    )?;
-
-    let commit_ms = commit_started.elapsed().as_millis();
-    let total_ms = cmd_started.elapsed().as_millis();
-    if commit_ms >= COMMIT_SLOW_WARN_MS {
-        tracing::warn!(
-            "[DIAG:CAPTURE] commit_screenshot slow screenshot_id={} commit={}ms total={}ms",
-            screenshot_id,
-            commit_ms,
-            total_ms
-        );
-    } else {
-        tracing::debug!(
-            "[DIAG:CAPTURE] commit_screenshot done screenshot_id={} commit={}ms total={}ms",
-            screenshot_id,
-            commit_ms,
-            total_ms
-        );
-    }
-
-    tracing::info!(
-        "Screenshot {} committed with {} OCR results",
-        screenshot_id,
-        ocr_results.as_ref().map(|r| r.len()).unwrap_or(0)
-    );
 
     Ok(())
 }
@@ -2124,7 +1967,7 @@ pub(crate) async fn enqueue_python_ocr_postprocess(
 
 // ==================== Utility ====================
 
-fn md5_hash(data: &[u8]) -> String {
+pub(crate) fn md5_hash(data: &[u8]) -> String {
     use md5::{Digest, Md5};
     let mut hasher = Md5::new();
     hasher.update(data);
@@ -2197,15 +2040,14 @@ mod tests {
     #[test]
     fn test_compute_dhash_uniform_image() {
         // A uniform white image should produce all-zero hash (no gradient differences)
-        let img =
-            DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255])));
+        let img = RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255]));
         let hash = compute_dhash(&img, 8);
         assert_eq!(hash, [0u64; 4]);
     }
 
     #[test]
     fn test_compute_dhash_uniform_black() {
-        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(16, 16, image::Rgb([0, 0, 0])));
+        let img = RgbImage::from_pixel(16, 16, image::Rgb([0, 0, 0]));
         let hash = compute_dhash(&img, 8);
         assert_eq!(hash, [0u64; 4]);
     }
@@ -2259,5 +2101,43 @@ mod tests {
         ])
         .unwrap();
         assert!(converted.is_empty());
+    }
+
+    #[test]
+    fn ocr_slot_reservation_is_strictly_single_flight() {
+        let state = Arc::new(CaptureState::new());
+        let first = state.try_reserve_ocr_slot().expect("first slot");
+        assert!(state.try_reserve_ocr_slot().is_none());
+        drop(first);
+        assert!(state.try_reserve_ocr_slot().is_some());
+    }
+
+    #[test]
+    fn ocr_task_guard_releases_slot_and_cache_on_drop() {
+        let state = Arc::new(CaptureState::new());
+        let reservation = state.try_reserve_ocr_slot().expect("first slot");
+        state
+            .ocr_image_cache
+            .lock()
+            .unwrap()
+            .insert(42, Arc::<[u8]>::from(vec![1, 2, 3]));
+
+        let guard = reservation.into_task_guard(42);
+        drop(guard);
+
+        assert_eq!(state.in_flight_ocr_count.load(Ordering::SeqCst), 0);
+        assert!(state.ocr_image_cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ocr_task_guard_release_does_not_underflow_after_reset() {
+        let state = Arc::new(CaptureState::new());
+        let guard = OcrTaskGuard {
+            capture_state: state.clone(),
+            screenshot_id: 7,
+        };
+        drop(guard);
+
+        assert_eq!(state.in_flight_ocr_count.load(Ordering::SeqCst), 0);
     }
 }

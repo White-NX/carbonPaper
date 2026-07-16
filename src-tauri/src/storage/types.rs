@@ -94,7 +94,9 @@ pub struct SearchResult {
 /// The image data is expected to be Base64 encoded to allow passing through JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveScreenshotRequest {
-    pub image_data: String, // Base64 encoded image data
+    /// Base64-encoded image for external JSON/IPC callers. Internal byte-oriented
+    /// storage paths may leave this empty and call `save_screenshot_temp_bytes`.
+    pub image_data: String,
     pub image_hash: String,
     pub width: i32,
     pub height: i32,

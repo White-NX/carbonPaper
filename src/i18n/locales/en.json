@@ -1,4 +1,11 @@
 {
+  "notifications": {
+    "ocr_model_repair": {
+      "title": "CarbonPaper OCR model needs repair",
+      "body": "Screenshots will still be saved, but OCR text is unavailable until the model is repaired.",
+      "action": "Repair model"
+    }
+  },
   "settings": {
     "general": {
       "title": "General Options",
@@ -219,7 +226,10 @@
         "changed_notice": "CPU limit changes take effect when the monitor service restarts"
       },
       "ocr": {
-        "title": "OCR processing queue",
+        "title": "OCR processing",
+        "single_flight": "Fixed single-task mode",
+        "single_flight_desc": "OCR processes RGB capture frames before JPEG encoding. To cap memory use, full RGB frames are not queued while OCR is running.",
+        "raw_info": "JPEG is used only for encrypted storage and Python post-processing. It is never OCR input or an OCR failure fallback.",
         "pause_label": "Pause captures when OCR queue has work",
         "pause_desc": "When enabled, pauses captures while there are unprocessed OCR tasks to reduce resource usage",
         "queue_limit_label": "Limit OCR task queue size",
@@ -232,9 +242,11 @@
       },
       "rust_ocr": {
         "title": "OCR engine",
+        "raw_rgb": "Rust Raw RGB OCR",
+        "raw_rgb_desc": "The isolated Rust ML process reads RGB capture frames directly, without JPEG encoding or Python OCR fallback.",
         "use_rust": "Use Rust OCR",
-        "rust_desc": "Runs OCR in an isolated Rust ML process and falls back to Python on failure.",
-        "python_desc": "The compatible Python OCR engine is currently selected.",
+        "rust_desc": "Runs OCR directly on RGB capture frames in an isolated Rust ML process.",
+        "python_desc": "Python OCR is no longer used as the screenshot OCR fallback.",
         "dml_beta": "DirectML Beta",
         "dml_beta_desc": "Temporary experimental switch, off by default. It will be removed in favor of the unified DirectML setting.",
         "model_ready": "PP-OCRv5 Mobile is installed",
@@ -1256,7 +1268,8 @@
   },
   "aboutSection": {
     "debug": {
-      "trigger_security_alert": "Preview Security Alert Mask"
+      "trigger_security_alert": "Preview Security Alert Mask",
+      "trigger_ocr_model_repair_notification": "Test OCR Model Repair Notification"
     }
   },
   "securityAlert": {
@@ -1280,6 +1293,20 @@
     "switchToNormal": "Switch to Normal Mode",
     "switchToXibao": "Switch to Celebration Mode",
     "triggerTest": "Trigger Test Error Window"
+  },
+  "ocrModelRepair": {
+    "title": "OCR Model Repair",
+    "ready": "OCR model is ready",
+    "missing": "OCR is currently unavailable",
+    "readyDescription": "New screenshots will resume generating OCR text.",
+    "description": "CarbonPaper will continue saving screenshots safely, but no OCR text will be generated until the model is repaired. It will not fall back to JPEG or Python OCR.",
+    "noAuth": "Repair does not require unlocking or Windows Hello verification. Downloads are checked for size and SHA-256, and the new model loads automatically on the next OCR request.",
+    "preparing": "Preparing download…",
+    "checking": "Checking model status…",
+    "later": "Later",
+    "close": "Close",
+    "repairing": "Repairing…",
+    "repair": "Repair model now"
   },
   "timeline": {
     "month": "1M",

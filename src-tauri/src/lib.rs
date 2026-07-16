@@ -10,6 +10,7 @@ pub mod commands;
 mod credential_manager;
 pub mod error;
 mod error_window;
+mod i18n;
 mod idle;
 mod logging;
 mod mcp_server;
@@ -115,17 +116,13 @@ const TRAY_TEXTS_EN: TrayTexts = TrayTexts {
     auto_switched_lightweight: "Automatically switched to lightweight mode to save memory.",
 };
 
-fn normalize_app_language(language: &str) -> &'static str {
-    if language.to_ascii_lowercase().starts_with("en") {
-        "en"
-    } else {
-        "zh-CN"
-    }
+fn normalize_app_language(language: &str) -> String {
+    i18n::supported_locale(language)
 }
 
 fn tray_texts() -> &'static TrayTexts {
     let language = registry_config::get_string("language").unwrap_or_else(|| "zh-CN".to_string());
-    match normalize_app_language(&language) {
+    match normalize_app_language(&language).as_str() {
         "en" => &TRAY_TEXTS_EN,
         _ => &TRAY_TEXTS_ZH,
     }
@@ -140,7 +137,7 @@ fn tray_text_auto_lightweight_switched() -> &'static str {
 }
 
 pub(crate) fn set_app_language(app: &tauri::AppHandle, language: &str) -> Result<(), String> {
-    registry_config::set_string("language", normalize_app_language(language))?;
+    registry_config::set_string("language", &normalize_app_language(language))?;
     refresh_tray_menu(app);
     Ok(())
 }
@@ -399,13 +396,16 @@ fn is_open_tray_click(button: MouseButton, button_state: MouseButtonState) -> bo
     )
 }
 
-fn open_main_window_from_tray(app: &tauri::AppHandle) {
+fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
     cancel_auto_lightweight_timer(app);
 
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        if show_ocr_model_repair {
+            let _ = app.emit("show-ocr-model-repair", ());
+        }
         if let Some(lightweight_state) = app.try_state::<Arc<LightweightModeState>>() {
             *lightweight_state
                 .is_lightweight
@@ -427,6 +427,9 @@ fn open_main_window_from_tray(app: &tauri::AppHandle) {
                     .unwrap_or_else(|e| e.into_inner()) = false;
                 tracing::info!("Window recreated from lightweight mode");
                 refresh_tray_menu(&app_handle);
+                if show_ocr_model_repair {
+                    let _ = app_handle.emit("show-ocr-model-repair", ());
+                }
             }
             Err(e) => {
                 tracing::error!("Failed to create main window: {}", e);
@@ -440,6 +443,14 @@ fn open_main_window_from_tray(app: &tauri::AppHandle) {
             }
         }
     });
+}
+
+fn open_main_window_from_tray(app: &tauri::AppHandle) {
+    open_main_window(app, false);
+}
+
+pub(crate) fn open_main_window_for_ocr_model_repair(app: &tauri::AppHandle) {
+    open_main_window(app, true);
 }
 
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -982,6 +993,8 @@ pub fn run() {
 
                 python::auto_install_spacy_models(app.handle().clone());
 
+                ml_runtime::schedule_ocr_model_health_notification(app.handle().clone());
+
                 // 轻量模式下自动启动监控
                 if start_hidden
                     && registry_config::get_bool("lightweight_auto_start_monitor").unwrap_or(true)
@@ -1030,7 +1043,8 @@ pub fn run() {
             ml_runtime::restart_ml_ocr_worker,
             ml_runtime::get_rust_ocr_model_status,
             ml_runtime::download_rust_ocr_model,
-            ml_runtime::retry_failed_ocr,
+            ml_runtime::take_ocr_model_repair_request,
+            ml_runtime::debug_trigger_ocr_model_repair_notification,
             monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）
             script_integrity::debug_trigger_security_alert,

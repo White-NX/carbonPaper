@@ -1113,7 +1113,7 @@ fn get_temp_image_bytes(
     };
 
     if let Some(jpeg_bytes) = cached {
-        return Ok((jpeg_bytes, "image/jpeg".to_string()));
+        return Ok((jpeg_bytes.to_vec(), "image/jpeg".to_string()));
     }
 
     match storage.get_screenshot_by_id(screenshot_id) {
@@ -1491,15 +1491,12 @@ async fn process_nmh_request(
             }
 
             let image_data = match req.get("image_data").and_then(|v| v.as_str()) {
-                Some(d) => d.to_string(),
+                Some(d) => d,
                 None => return StorageResponse::error("Missing image_data"),
             };
-            let image_hash = match req.get("image_hash").and_then(|v| v.as_str()) {
-                Some(h) => h.to_string(),
-                None => return StorageResponse::error("Missing image_hash"),
-            };
-            let width = req.get("width").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let height = req.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            if req.get("image_hash").and_then(|v| v.as_str()).is_none() {
+                return StorageResponse::error("Missing image_hash");
+            }
             let page_url = req
                 .get("page_url")
                 .and_then(|v| v.as_str())
@@ -1528,22 +1525,60 @@ async fn process_nmh_request(
                 );
             }
 
-            // OCR queue backpressure check (same logic as capture loop)
-            let in_flight = capture_state
-                .in_flight_ocr_count
-                .load(std::sync::atomic::Ordering::SeqCst);
-            let capture_on_busy = capture_state
-                .capture_on_ocr_busy
-                .load(std::sync::atomic::Ordering::SeqCst);
-            let max_queue = capture_state
-                .ocr_queue_max_size
-                .load(std::sync::atomic::Ordering::SeqCst);
+            let Some(ocr_slot) = capture_state.try_reserve_ocr_slot() else {
+                return StorageResponse::error("OCR is busy (single-flight mode)");
+            };
 
-            if !capture_on_busy && in_flight > 0 {
-                return StorageResponse::error("OCR queue busy (conservative mode)");
-            } else if in_flight > max_queue {
-                return StorageResponse::error("OCR queue full");
+            let encoded_image = match base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                image_data,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return StorageResponse::error(&format!(
+                        "Invalid extension image base64: {error}"
+                    ));
+                }
+            };
+            match image::guess_format(&encoded_image) {
+                Ok(image::ImageFormat::Png) => {}
+                Ok(format) => {
+                    return StorageResponse::error(&format!(
+                        "Extension OCR requires lossless PNG input, received {format:?}"
+                    ));
+                }
+                Err(error) => {
+                    return StorageResponse::error(&format!(
+                        "Cannot determine extension image format: {error}"
+                    ));
+                }
             }
+            let decoded_rgb_image = match image::load_from_memory_with_format(
+                &encoded_image,
+                image::ImageFormat::Png,
+            ) {
+                Ok(image) => Arc::new(image.to_rgb8()),
+                Err(error) => {
+                    return StorageResponse::error(&format!(
+                        "Cannot decode extension PNG: {error}"
+                    ));
+                }
+            };
+            drop(encoded_image);
+            let ocr_rgb_image = resize_extension_ocr_image(decoded_rgb_image.clone());
+            let jpeg_quality = capture_state
+                .config
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .jpeg_quality;
+            let jpeg_bytes = match crate::capture::encode_rgb_jpeg(&decoded_rgb_image, jpeg_quality)
+            {
+                Ok(bytes) => Arc::<[u8]>::from(bytes),
+                Err(error) => return StorageResponse::error(&error),
+            };
+            let image_hash = crate::capture::md5_hash(&jpeg_bytes);
+            let width = decoded_rgb_image.width() as i32;
+            let height = decoded_rgb_image.height() as i32;
 
             // Build metadata with process_icon (same mechanism as capture loop)
             let metadata = Some(serde_json::json!({
@@ -1551,7 +1586,7 @@ async fn process_nmh_request(
             }));
 
             let request = SaveScreenshotRequest {
-                image_data: image_data.clone(),
+                image_data: String::new(),
                 image_hash: image_hash.clone(),
                 width,
                 height,
@@ -1565,7 +1600,7 @@ async fn process_nmh_request(
                 visible_links,
             };
 
-            match storage.save_screenshot_temp(&request) {
+            match storage.save_screenshot_temp_bytes(&request, &jpeg_bytes) {
                 Ok(result) => {
                     if result.status == "duplicate" {
                         return StorageResponse::success(serde_json::to_value(result).unwrap());
@@ -1573,90 +1608,66 @@ async fn process_nmh_request(
 
                     // Dispatch to OCR pipeline if we have a screenshot_id
                     if let Some(screenshot_id) = result.screenshot_id {
-                        // Decode image bytes for OCR cache
-                        if let Ok(jpeg_bytes) = base64::Engine::decode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &image_data,
-                        ) {
-                            // Store in OCR cache so Python can fetch via get_temp_image
-                            {
-                                let mut cache = capture_state
-                                    .ocr_image_cache
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                cache.insert(screenshot_id, jpeg_bytes.clone());
-                            }
-
-                            // Spawn async OCR task
-                            let storage_arc = storage.clone();
-                            let capture_arc = capture_state.clone();
-                            let app_clone = app_handle.clone();
-                            let window_title = page_title.unwrap_or_default();
-                            let timestamp_ms = chrono::Utc::now().timestamp_millis();
-
-                            // Increment in-flight OCR counter
-                            capture_state
-                                .in_flight_ocr_count
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-                            tokio::spawn(async move {
-                                let route = crate::capture::OcrRouteConfig::from_registry();
-                                let result = process_extension_ocr(
-                                    &app_clone,
-                                    &storage_arc,
-                                    screenshot_id,
-                                    &jpeg_bytes,
-                                    &image_hash,
-                                    &window_title,
-                                    &browser_name,
-                                    timestamp_ms,
-                                    route,
-                                )
-                                .await;
-
-                                // Remove from OCR cache
-                                {
-                                    let mut cache = capture_arc
-                                        .ocr_image_cache
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    cache.remove(&screenshot_id);
-                                }
-
-                                // Decrement in-flight OCR counter
-                                capture_arc
-                                    .in_flight_ocr_count
-                                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-
-                                if let Err(e) = result {
-                                    tracing::error!(
-                                        "Extension OCR failed for screenshot {}: {}",
-                                        screenshot_id,
-                                        e
-                                    );
-                                    if let Err(commit_err) = storage_arc.commit_screenshot(
-                                        screenshot_id,
-                                        None,
-                                        None,
-                                        None,
-                                    ) {
-                                        tracing::error!(
-                                            "Failed to preserve extension screenshot: {}",
-                                            commit_err
-                                        );
-                                    }
-                                    let _ = storage_arc.set_ocr_status(
-                                        screenshot_id,
-                                        "failed",
-                                        Some(if route.use_rust { "rust" } else { "python" }),
-                                        Some("ppocrv5-ch-mobile"),
-                                        None,
-                                        Some(&e),
-                                        None,
-                                    );
-                                }
-                            });
+                        // Store storage JPEG in cache for Python post-processing only.
+                        {
+                            let mut cache = capture_state
+                                .ocr_image_cache
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            cache.insert(screenshot_id, jpeg_bytes.clone());
                         }
+
+                        // Spawn async OCR task
+                        let storage_arc = storage.clone();
+                        let app_clone = app_handle.clone();
+                        let window_title = page_title.unwrap_or_default();
+                        let timestamp_ms = chrono::Utc::now().timestamp_millis();
+
+                        let ocr_guard = ocr_slot.into_task_guard(screenshot_id);
+                        tokio::spawn(async move {
+                            let _ocr_guard = ocr_guard;
+                            let route = crate::capture::OcrRouteConfig::from_registry();
+                            let result = process_extension_ocr(
+                                &app_clone,
+                                &storage_arc,
+                                screenshot_id,
+                                ocr_rgb_image,
+                                &image_hash,
+                                &window_title,
+                                &browser_name,
+                                timestamp_ms,
+                                route,
+                            )
+                            .await;
+
+                            if let Err(e) = result {
+                                crate::ml_runtime::schedule_ocr_model_health_notification(
+                                    app_clone.clone(),
+                                );
+                                tracing::error!(
+                                    "Extension OCR failed for screenshot {}: {}",
+                                    screenshot_id,
+                                    e
+                                );
+                                if let Err(commit_err) =
+                                    storage_arc.commit_screenshot(screenshot_id, None, None, None)
+                                {
+                                    tracing::error!(
+                                        "Failed to preserve extension screenshot: {}",
+                                        commit_err
+                                    );
+                                }
+                                let _ = storage_arc.set_ocr_status(
+                                    screenshot_id,
+                                    "failed",
+                                    Some("rust"),
+                                    Some("ppocrv5-ch-mobile"),
+                                    None,
+                                    Some(&e),
+                                    None,
+                                );
+                            }
+                        });
                     }
 
                     StorageResponse::success(serde_json::to_value(result).unwrap())
@@ -1666,6 +1677,25 @@ async fn process_nmh_request(
         }
         _ => StorageResponse::error(&format!("Unknown NMH command: {}", command)),
     }
+}
+
+const EXTENSION_OCR_MAX_SIDE: u32 = 1600;
+
+fn resize_extension_ocr_image(image: Arc<image::RgbImage>) -> Arc<image::RgbImage> {
+    let max_dim = image.width().max(image.height());
+    if max_dim <= EXTENSION_OCR_MAX_SIDE {
+        return image;
+    }
+
+    let ratio = EXTENSION_OCR_MAX_SIDE as f64 / max_dim as f64;
+    let new_width = ((image.width() as f64 * ratio).round() as u32).max(1);
+    let new_height = ((image.height() as f64 * ratio).round() as u32).max(1);
+    Arc::new(image::imageops::resize(
+        image.as_ref(),
+        new_width,
+        new_height,
+        image::imageops::FilterType::Lanczos3,
+    ))
 }
 
 /// Check if extension enhancement is enabled (single global toggle).
@@ -1874,29 +1904,27 @@ pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(
     result
 }
 
-/// Send extension screenshot to Python OCR pipeline and commit results
+/// Send losslessly decoded extension pixels to the Rust OCR pipeline and commit results.
 async fn process_extension_ocr(
     app: &tauri::AppHandle,
     storage: &StorageState,
     screenshot_id: i64,
-    jpeg_bytes: &[u8],
+    rgb_image: Arc<image::RgbImage>,
     image_hash: &str,
     window_title: &str,
     process_name: &str,
     timestamp_ms: i64,
     route: crate::capture::OcrRouteConfig,
 ) -> Result<(), String> {
-    let provider = if route.use_rust && route.use_directml_beta {
+    let provider = if route.use_directml_beta {
         "directml_beta"
-    } else if route.use_rust {
-        "cpu"
     } else {
-        "legacy_python"
+        "cpu"
     };
     storage.set_ocr_status(
         screenshot_id,
         "running",
-        Some(if route.use_rust { "rust" } else { "python" }),
+        Some("rust"),
         Some("ppocrv5-ch-mobile"),
         Some(provider),
         None,
@@ -1906,7 +1934,7 @@ async fn process_extension_ocr(
         app,
         storage,
         screenshot_id,
-        jpeg_bytes,
+        rgb_image,
         image_hash,
         window_title,
         process_name,
@@ -2130,6 +2158,29 @@ mod tests {
             validate_reverse_ipc_request(&req, "secret", &mut last).unwrap();
         }
         assert_eq!(last, Some(2));
+    }
+
+    #[test]
+    fn extension_ocr_image_is_scaled_to_maximum_side() {
+        let image = Arc::new(image::RgbImage::from_pixel(
+            5120,
+            2880,
+            image::Rgb([0, 0, 0]),
+        ));
+        let resized = resize_extension_ocr_image(image);
+        assert_eq!(resized.dimensions(), (1600, 900));
+        assert!(resized.as_raw().len() <= 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn extension_ocr_image_keeps_small_input_dimensions() {
+        let image = Arc::new(image::RgbImage::from_pixel(
+            1200,
+            800,
+            image::Rgb([0, 0, 0]),
+        ));
+        let resized = resize_extension_ocr_image(image);
+        assert_eq!(resized.dimensions(), (1200, 800));
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::ml_protocol::{
 use crate::resource_utils::{
     file_in_local_appdata, file_in_resources, find_existing_file_in_resources,
 };
+use image::RgbImage;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::{BufReader, BufWriter};
@@ -17,7 +18,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::Emitter;
@@ -42,6 +43,8 @@ const BUNDLED_MODEL_RELATIVE_DIR: &str = "ocr-models/ppocrv5-ch-mobile-r1";
 static MODEL_DOWNLOAD_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static MODEL_STATUS_CACHE: OnceLock<Mutex<Option<CachedModelStatus>>> = OnceLock::new();
 static MODEL_ASSET_SIZES: OnceLock<std::collections::HashMap<String, u64>> = OnceLock::new();
+static MODEL_REPAIR_NOTIFICATION_SHOWN: AtomicBool = AtomicBool::new(false);
+static MODEL_REPAIR_UI_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MlRuntimeStatus {
@@ -151,12 +154,13 @@ impl MlChild {
         let _ = child.wait();
     }
 
-    fn request(&self, request: &MlRequest, body: &[u8]) -> Result<MlResponse, String> {
+    fn request_rgb(&self, request: &MlRequest, image: Arc<RgbImage>) -> Result<MlResponse, String> {
         let _request_guard = self.request_lock.lock().unwrap_or_else(|e| e.into_inner());
         {
             let mut stdin = self.stdin.lock().unwrap_or_else(|e| e.into_inner());
-            write_request(&mut *stdin, request, body)?;
+            write_request(&mut *stdin, request, image.as_raw())?;
         }
+        drop(image);
         let mut stdout = self.stdout.lock().unwrap_or_else(|e| e.into_inner());
         read_response(&mut *stdout)
     }
@@ -179,7 +183,6 @@ pub struct MlRuntimeState {
     inner: Mutex<MlRuntimeInner>,
     lifecycle_lock: Mutex<()>,
     request_gate: tokio::sync::Mutex<()>,
-    retry_lock: tokio::sync::Mutex<()>,
     next_request_id: AtomicU64,
 }
 
@@ -206,7 +209,6 @@ impl MlRuntimeState {
             }),
             lifecycle_lock: Mutex::new(()),
             request_gate: tokio::sync::Mutex::new(()),
-            retry_lock: tokio::sync::Mutex::new(()),
             next_request_id: AtomicU64::new(1),
         }
     }
@@ -214,7 +216,7 @@ impl MlRuntimeState {
     pub async fn run_ocr(
         self: &Arc<Self>,
         app: AppHandle,
-        image_bytes: Vec<u8>,
+        image: Arc<RgbImage>,
         timeout: Duration,
         use_directml_beta: bool,
     ) -> Result<MlOcrResult, String> {
@@ -253,23 +255,31 @@ impl MlRuntimeState {
             }
         };
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let width = image.width();
+        let height = image.height();
+        let stride = usize::try_from(width)
+            .map_err(|_| "OCR image width does not fit usize".to_string())?
+            .checked_mul(3)
+            .ok_or_else(|| "OCR image stride overflow".to_string())?;
         let request = MlRequest::Ocr {
             request_id,
             timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
-            body_len: image_bytes.len(),
+            width,
+            height,
+            stride,
+            body_len: image.as_raw().len(),
         };
         let started = Instant::now();
         tracing::info!(
             "[ML:OCR] submit request_id={} provider={:?} bytes={} timeout_ms={}",
             request_id,
             provider,
-            image_bytes.len(),
+            image.as_raw().len(),
             timeout.as_millis()
         );
         let process_for_request = process.clone();
-        let request_task = tokio::task::spawn_blocking(move || {
-            process_for_request.request(&request, &image_bytes)
-        });
+        let request_task =
+            tokio::task::spawn_blocking(move || process_for_request.request_rgb(&request, image));
         let response = match tokio::time::timeout(timeout + CANCEL_GRACE, request_task).await {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => Err(format!("ML request task failed: {error}")),
@@ -713,6 +723,104 @@ fn invalidate_model_status_cache() {
     *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+pub fn schedule_ocr_model_health_notification(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let app_for_status = app.clone();
+        let status =
+            tokio::task::spawn_blocking(move || inspect_model_status(&app_for_status)).await;
+        match status {
+            Ok(Ok(status)) if !status.installed => show_ocr_model_repair_notification(&app),
+            Ok(Ok(_)) => {
+                MODEL_REPAIR_NOTIFICATION_SHOWN.store(false, Ordering::SeqCst);
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("Failed to inspect OCR model for notification: {}", error);
+            }
+            Err(error) => {
+                tracing::warn!("OCR model notification task failed: {}", error);
+            }
+        }
+    });
+}
+
+#[cfg(windows)]
+fn show_ocr_model_repair_notification(app: &AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+    use tauri_winrt_notification::{Duration as ToastDuration, Toast};
+
+    if MODEL_REPAIR_NOTIFICATION_SHOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let language =
+        crate::registry_config::get_string("language").unwrap_or_else(|| "zh-CN".to_string());
+    let title = crate::i18n::t(&language, "notifications.ocr_model_repair.title");
+    let body = crate::i18n::t(&language, "notifications.ocr_model_repair.body");
+    let button = crate::i18n::t(&language, "notifications.ocr_model_repair.action");
+    let app_id = if cfg!(debug_assertions) {
+        Toast::POWERSHELL_APP_ID
+    } else {
+        app.config().identifier.as_str()
+    };
+    let app_for_activation = app.clone();
+    let result = Toast::new(app_id)
+        .title(&title)
+        .text1(&body)
+        .duration(ToastDuration::Long)
+        .add_button(&button, "repair-ocr-model")
+        .on_activated(move |_| {
+            MODEL_REPAIR_UI_REQUESTED.store(true, Ordering::SeqCst);
+            crate::open_main_window_for_ocr_model_repair(&app_for_activation);
+            Ok(())
+        })
+        .show();
+    if let Err(error) = result {
+        MODEL_REPAIR_NOTIFICATION_SHOWN.store(false, Ordering::SeqCst);
+        tracing::warn!("Failed to show clickable OCR model notification: {}", error);
+        let _ = app.notification().builder().title(title).body(body).show();
+    }
+}
+
+#[tauri::command]
+pub fn take_ocr_model_repair_request() -> bool {
+    MODEL_REPAIR_UI_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+#[tauri::command]
+pub fn debug_trigger_ocr_model_repair_notification(
+    app: AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+    if !cfg!(debug_assertions) {
+        return Err(
+            "OCR model repair notification testing is only available in debug builds".to_string(),
+        );
+    }
+    MODEL_REPAIR_NOTIFICATION_SHOWN.store(false, Ordering::SeqCst);
+    MODEL_REPAIR_UI_REQUESTED.store(false, Ordering::SeqCst);
+    show_ocr_model_repair_notification(&app);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn show_ocr_model_repair_notification(app: &AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+
+    if MODEL_REPAIR_NOTIFICATION_SHOWN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = app
+        .notification()
+        .builder()
+        .title(crate::i18n::t("en", "notifications.ocr_model_repair.title"))
+        .body(crate::i18n::t("en", "notifications.ocr_model_repair.body"))
+        .show();
+}
+
 fn expected_model_asset_size(filename: &str) -> Result<u64, String> {
     let sizes = MODEL_ASSET_SIZES.get_or_init(|| {
         let manifest: serde_json::Value =
@@ -873,14 +981,13 @@ pub async fn get_rust_ocr_model_status(app: AppHandle) -> Result<RustOcrModelSta
 pub async fn download_rust_ocr_model(
     app: AppHandle,
     window: tauri::Window,
-    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    state: tauri::State<'_, Arc<MlRuntimeState>>,
 ) -> Result<RustOcrModelStatus, String> {
     use futures::StreamExt;
     use rapidocr_core::config::PipelineConfig;
     use rapidocr_core::model::model_set_by_name;
 
     crate::commands::check_main_window(&window)?;
-    crate::commands::check_auth_required(&credential_state)?;
     invalidate_model_status_cache();
     if let Ok(status) = inspect_model_status(&app) {
         if status.installed {
@@ -1028,128 +1135,9 @@ pub async fn download_rust_ocr_model(
     }
     let status = inspect_model_status(&app)?;
     cache_model_status(status.clone());
+    state.stop();
+    MODEL_REPAIR_NOTIFICATION_SHOWN.store(false, Ordering::SeqCst);
     Ok(status)
-}
-
-#[tauri::command]
-pub async fn retry_failed_ocr(
-    app: AppHandle,
-    window: tauri::Window,
-    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
-    capture_state: tauri::State<'_, Arc<crate::capture::CaptureState>>,
-    limit: Option<i64>,
-) -> Result<serde_json::Value, String> {
-    crate::commands::check_main_window(&window)?;
-    crate::commands::check_auth_required(&credential_state)?;
-    let ml_state = app.state::<Arc<MlRuntimeState>>().inner().clone();
-    let _retry_guard = ml_state
-        .retry_lock
-        .try_lock()
-        .map_err(|_| "OCR retry is already in progress".to_string())?;
-    let ids = storage.list_failed_ocr_ids(limit.unwrap_or(10).clamp(1, 100))?;
-    let mut completed = 0usize;
-    let mut failed = 0usize;
-    for screenshot_id in &ids {
-        let record = match storage.get_screenshot_by_id(*screenshot_id) {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                failed += 1;
-                continue;
-            }
-            Err(error) => {
-                failed += 1;
-                let _ = storage.set_ocr_status(
-                    *screenshot_id,
-                    "failed",
-                    None,
-                    Some(MODEL_ID),
-                    None,
-                    Some(&error),
-                    None,
-                );
-                continue;
-            }
-        };
-        let bytes = match storage.read_image_bytes(&record.image_path) {
-            Ok((bytes, _)) => bytes,
-            Err(error) => {
-                failed += 1;
-                let _ = storage.set_ocr_status(
-                    *screenshot_id,
-                    "failed",
-                    None,
-                    Some(MODEL_ID),
-                    None,
-                    Some(&error),
-                    None,
-                );
-                continue;
-            }
-        };
-        capture_state
-            .in_flight_ocr_count
-            .fetch_add(1, Ordering::SeqCst);
-        {
-            let mut cache = capture_state
-                .ocr_image_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            cache.insert(*screenshot_id, bytes.clone());
-        }
-        let result = crate::capture::process_ocr_inner(
-            &app,
-            &storage,
-            *screenshot_id,
-            &bytes,
-            &record.image_hash,
-            record.window_title.as_deref().unwrap_or(""),
-            record.process_name.as_deref().unwrap_or(""),
-            record
-                .timestamp
-                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
-            crate::registry_config::get_u32("ocr_timeout_secs").unwrap_or(120),
-            crate::capture::OcrRouteConfig::from_registry(),
-        )
-        .await;
-        {
-            let mut cache = capture_state
-                .ocr_image_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            cache.remove(screenshot_id);
-        }
-        capture_state
-            .in_flight_ocr_count
-            .fetch_sub(1, Ordering::SeqCst);
-        match result {
-            Ok(()) => completed += 1,
-            Err(error) => {
-                failed += 1;
-                let _ = storage.set_ocr_status(
-                    *screenshot_id,
-                    "failed",
-                    Some(
-                        if crate::registry_config::get_bool("rust_ocr_enabled").unwrap_or(true) {
-                            "rust"
-                        } else {
-                            "python"
-                        },
-                    ),
-                    Some(MODEL_ID),
-                    None,
-                    Some(&error),
-                    None,
-                );
-            }
-        }
-    }
-    Ok(serde_json::json!({
-        "requested": ids.len(),
-        "completed": completed,
-        "failed": failed,
-        "remaining": storage.count_failed_ocr().unwrap_or(0),
-    }))
 }
 
 pub async fn run_postprocess_retry_loop(app: AppHandle) {
@@ -1224,7 +1212,7 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
                 .ocr_image_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            cache.insert(screenshot_id, image_bytes);
+            cache.insert(screenshot_id, Arc::from(image_bytes));
         }
         let enqueue_result = crate::capture::enqueue_python_ocr_postprocess(
             app,
@@ -1247,10 +1235,8 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
         }
         match enqueue_result {
             Ok(true) => storage.set_ocr_postprocess_status(screenshot_id, "queued", None)?,
-            Ok(false) => storage.record_ocr_postprocess_retry(
-                screenshot_id,
-                "Python OCR postprocess queue is full",
-            )?,
+            Ok(false) => storage
+                .record_ocr_postprocess_retry(screenshot_id, "Python postprocess queue is full")?,
             Err(error) => storage.record_ocr_postprocess_retry(screenshot_id, &error)?,
         }
     }

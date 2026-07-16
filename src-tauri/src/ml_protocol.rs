@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const ML_PROTOCOL_VERSION: u32 = 1;
+pub const ML_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_ML_HEADER_BYTES: usize = 1024 * 1024;
 pub const MAX_ML_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -26,6 +26,9 @@ pub enum MlRequest {
     Ocr {
         request_id: u64,
         timeout_ms: u64,
+        width: u32,
+        height: u32,
+        stride: usize,
         body_len: usize,
     },
     Shutdown {
@@ -52,7 +55,7 @@ pub struct MlOcrBlock {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MlOcrTimings {
-    pub image_decode_ms: f64,
+    pub image_prepare_ms: f64,
     pub model_total_ms: f64,
     pub request_total_ms: f64,
 }
@@ -90,12 +93,18 @@ pub fn read_request<R: Read>(reader: &mut R) -> Result<(MlRequest, Vec<u8>), Str
     let request: MlRequest = serde_json::from_slice(&header)
         .map_err(|error| format!("invalid ML request JSON: {error}"))?;
     let body_len = match &request {
-        MlRequest::Ocr { body_len, .. } => *body_len,
+        MlRequest::Ocr {
+            width,
+            height,
+            stride,
+            body_len,
+            ..
+        } => {
+            validate_rgb8_body(*width, *height, *stride, *body_len)?;
+            *body_len
+        }
         _ => 0,
     };
-    if body_len > MAX_ML_IMAGE_BYTES {
-        return Err(format!("ML image body exceeds limit: {body_len}"));
-    }
     let mut body = vec![0u8; body_len];
     reader
         .read_exact(&mut body)
@@ -108,8 +117,27 @@ pub fn write_request<W: Write>(
     request: &MlRequest,
     body: &[u8],
 ) -> Result<(), String> {
-    if body.len() > MAX_ML_IMAGE_BYTES {
-        return Err(format!("ML image body exceeds limit: {}", body.len()));
+    match request {
+        MlRequest::Ocr {
+            width,
+            height,
+            stride,
+            body_len,
+            ..
+        } => {
+            validate_rgb8_body(*width, *height, *stride, *body_len)?;
+            if body.len() != *body_len {
+                return Err(format!(
+                    "ML request body length mismatch: header={}, actual={}",
+                    body_len,
+                    body.len()
+                ));
+            }
+        }
+        _ if !body.is_empty() => {
+            return Err("non-OCR ML request must not include a body".to_string());
+        }
+        _ => {}
     }
     let header = serde_json::to_vec(request)
         .map_err(|error| format!("failed to encode ML request: {error}"))?;
@@ -118,6 +146,40 @@ pub fn write_request<W: Write>(
         .write_all(body)
         .and_then(|_| writer.flush())
         .map_err(|error| format!("failed to write ML request body: {error}"))
+}
+
+fn validate_rgb8_body(
+    width: u32,
+    height: u32,
+    stride: usize,
+    body_len: usize,
+) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err(format!("invalid ML RGB dimensions: {width}x{height}"));
+    }
+    let expected_stride = usize::try_from(width)
+        .map_err(|_| "ML RGB width does not fit usize".to_string())?
+        .checked_mul(3)
+        .ok_or_else(|| "ML RGB stride overflow".to_string())?;
+    if stride != expected_stride {
+        return Err(format!(
+            "ML RGB stride must be tightly packed: expected={expected_stride}, actual={stride}"
+        ));
+    }
+    let expected_len = stride
+        .checked_mul(
+            usize::try_from(height).map_err(|_| "ML RGB height does not fit usize".to_string())?,
+        )
+        .ok_or_else(|| "ML RGB body length overflow".to_string())?;
+    if body_len != expected_len {
+        return Err(format!(
+            "ML RGB body length mismatch: expected={expected_len}, actual={body_len}"
+        ));
+    }
+    if body_len > MAX_ML_IMAGE_BYTES {
+        return Err(format!("ML image body exceeds limit: {body_len}"));
+    }
+    Ok(())
 }
 
 pub fn read_response<R: Read>(reader: &mut R) -> Result<MlResponse, String> {
@@ -165,13 +227,16 @@ mod tests {
         let request = MlRequest::Ocr {
             request_id: 7,
             timeout_ms: 120_000,
-            body_len: 4,
+            width: 2,
+            height: 1,
+            stride: 6,
+            body_len: 6,
         };
         let mut bytes = Vec::new();
-        write_request(&mut bytes, &request, &[1, 2, 3, 4]).unwrap();
+        write_request(&mut bytes, &request, &[1, 2, 3, 4, 5, 6]).unwrap();
         let (decoded, body) = read_request(&mut bytes.as_slice()).unwrap();
         assert_eq!(decoded.request_id(), 7);
-        assert_eq!(body, [1, 2, 3, 4]);
+        assert_eq!(body, [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -193,7 +258,10 @@ mod tests {
         let request = MlRequest::Ocr {
             request_id: 9,
             timeout_ms: 1,
-            body_len: MAX_ML_IMAGE_BYTES + 1,
+            width: 4096,
+            height: 4096,
+            stride: 4096 * 3,
+            body_len: 4096 * 4096 * 3,
         };
         let header = serde_json::to_vec(&request).unwrap();
         let mut bytes = Vec::new();
@@ -201,5 +269,57 @@ mod tests {
         assert!(read_request(&mut bytes.as_slice())
             .unwrap_err()
             .contains("image body exceeds limit"));
+    }
+
+    #[test]
+    fn rejects_5k_rgb_body_before_writing_payload() {
+        let request = MlRequest::Ocr {
+            request_id: 12,
+            timeout_ms: 1,
+            width: 5120,
+            height: 2880,
+            stride: 5120 * 3,
+            body_len: 5120 * 2880 * 3,
+        };
+        let mut bytes = Vec::new();
+        let error = write_request(&mut bytes, &request, &[]).unwrap_err();
+        assert!(error.contains("image body exceeds limit"));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn rejects_non_tightly_packed_rgb_before_reading_body() {
+        let request = MlRequest::Ocr {
+            request_id: 10,
+            timeout_ms: 1,
+            width: 2,
+            height: 1,
+            stride: 8,
+            body_len: 8,
+        };
+        let header = serde_json::to_vec(&request).unwrap();
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &header).unwrap();
+        assert!(read_request(&mut bytes.as_slice())
+            .unwrap_err()
+            .contains("stride must be tightly packed"));
+    }
+
+    #[test]
+    fn rejects_rgb_body_length_mismatch() {
+        let request = MlRequest::Ocr {
+            request_id: 11,
+            timeout_ms: 1,
+            width: 2,
+            height: 2,
+            stride: 6,
+            body_len: 6,
+        };
+        let header = serde_json::to_vec(&request).unwrap();
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &header).unwrap();
+        assert!(read_request(&mut bytes.as_slice())
+            .unwrap_err()
+            .contains("body length mismatch"));
     }
 }

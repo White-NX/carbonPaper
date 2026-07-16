@@ -1,5 +1,5 @@
 import React from 'react';
-import { Github, User, CheckCircle2, Download, AlertCircle, RefreshCw, Bug, ShieldAlert } from 'lucide-react';
+import { Github, User, CheckCircle2, Download, AlertCircle, RefreshCw, Bug, ShieldAlert, BellRing } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
@@ -189,6 +189,13 @@ export default function AboutSection({
                 >
                   <ShieldAlert className="w-3.5 h-3.5" />
                   {t('aboutSection.debug.trigger_security_alert', 'Preview Security Alert Mask')}
+                </button>
+                <button
+                  onClick={() => withAuth(() => invoke('debug_trigger_ocr_model_repair_notification'), { autoPrompt: true }).catch(console.error)}
+                  className="flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
+                >
+                  <BellRing className="w-3.5 h-3.5" />
+                  {t('aboutSection.debug.trigger_ocr_model_repair_notification', 'Test OCR Model Repair Notification')}
                 </button>
                 <button
                   onClick={() => window.dispatchEvent(new CustomEvent('debug-update-modal', { detail: { critical: false } }))}

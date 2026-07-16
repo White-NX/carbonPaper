@@ -258,7 +258,6 @@ pub async fn mcp_get_status(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_some();
-    let rust_ocr_enabled = crate::registry_config::get_bool("rust_ocr_enabled").unwrap_or(true);
     let ml_status = ml_state.status(storage_state.count_failed_ocr().unwrap_or(0));
     let app_for_model_status = app.clone();
     let ocr_model_status = tokio::task::spawn_blocking(move || {
@@ -298,7 +297,7 @@ pub async fn mcp_get_status(
             "tool_schema_version": 1
         }
         ,"capabilities": {
-            "ocr_engine": if rust_ocr_enabled { "rust" } else { "python" },
+            "ocr_engine": "rust_raw_rgb",
             "rust_ml_state": ml_status.state,
             "ocr_model_id": ocr_model_status.as_ref().map(|status| status.model_id.as_str()),
             "ocr_model_revision": ocr_model_status.as_ref().map(|status| status.revision.as_str()),
@@ -306,7 +305,7 @@ pub async fn mcp_get_status(
             "ocr_model_verified": ocr_model_status.as_ref().map(|status| status.installed).unwrap_or(false),
             "search_ocr_text": true,
             "search_nl": python_running,
-            "search_nl_disabled_reason": if python_running { serde_json::Value::Null } else { serde_json::json!("legacy_python_monitor_not_running") }
+            "search_nl_disabled_reason": if python_running { serde_json::Value::Null } else { serde_json::json!("python_monitor_not_running") }
         }
     }))
 }

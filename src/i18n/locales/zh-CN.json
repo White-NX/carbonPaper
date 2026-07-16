@@ -1,4 +1,11 @@
 {
+  "notifications": {
+    "ocr_model_repair": {
+      "title": "CarbonPaper OCR 模型需要修复",
+      "body": "截图仍会保存，但在模型修复前不会生成 OCR 文本。点击此通知立即修复。",
+      "action": "修复模型"
+    }
+  },
   "settings": {
     "general": {
       "title": "通用选项",
@@ -219,7 +226,10 @@
         "changed_notice": "CPU 限制更改将在下次启动监控服务时生效"
       },
       "ocr": {
-        "title": "OCR 处理队列",
+        "title": "OCR 处理",
+        "single_flight": "固定单任务模式",
+        "single_flight_desc": "OCR 直接处理未经过 JPEG 的 RGB 捕获帧。为限制内存占用，OCR 运行期间不会排队新的完整 RGB 帧。",
+        "raw_info": "JPEG 仅用于加密存储和 Python 后处理，不会作为 OCR 输入，也不会用于 OCR 失败回退。",
         "pause_label": "OCR 队列有任务时暂停截图",
         "pause_desc": "开启后，当 OCR 队列中有未处理任务时将暂停截图，减少资源占用",
         "queue_limit_label": "限制 OCR 任务队列大小",
@@ -232,9 +242,11 @@
       },
       "rust_ocr": {
         "title": "OCR 引擎",
+        "raw_rgb": "Rust Raw RGB OCR",
+        "raw_rgb_desc": "隔离的 Rust ML 进程直接读取 RGB 捕获帧，不经过 JPEG，也不回退到 Python OCR。",
         "use_rust": "使用 Rust OCR",
-        "rust_desc": "使用隔离的 Rust ML 进程；失败时自动回退到 Python。",
-        "python_desc": "当前使用兼容的 Python OCR。",
+        "rust_desc": "使用隔离的 Rust ML 进程直接处理 RGB 捕获帧。",
+        "python_desc": "Python OCR 不再作为截图 OCR 回退路径。",
         "dml_beta": "DirectML Beta",
         "dml_beta_desc": "临时实验开关，默认关闭；未来会废弃并合并到统一的 DirectML 设置。",
         "model_ready": "PP-OCRv5 Mobile 已安装",
@@ -1256,7 +1268,8 @@
   },
   "aboutSection": {
     "debug": {
-      "trigger_security_alert": "预览安全告警蒙层"
+      "trigger_security_alert": "预览安全告警蒙层",
+      "trigger_ocr_model_repair_notification": "测试 OCR 模型修复通知"
     }
   },
   "securityAlert": {
@@ -1280,6 +1293,20 @@
     "switchToNormal": "切换到正常模式",
     "switchToXibao": "切换到喜报模式",
     "triggerTest": "触发测试错误窗口"
+  },
+  "ocrModelRepair": {
+    "title": "OCR 模型修复",
+    "ready": "OCR 模型已就绪",
+    "missing": "OCR 当前不可用",
+    "readyDescription": "新的截图将恢复生成 OCR 文本。",
+    "description": "CarbonPaper 仍会安全保存截图，但在模型修复前不会生成 OCR 文本，也不会回退到 JPEG 或 Python OCR。",
+    "noAuth": "修复不需要解锁。下载完成后会校验文件大小和 SHA-256，下一次 OCR 会自动载入新模型。",
+    "preparing": "正在准备下载…",
+    "checking": "正在检查模型状态…",
+    "later": "稍后处理",
+    "close": "关闭",
+    "repairing": "正在修复…",
+    "repair": "立即修复模型"
   },
   "timeline": {
     "month": "1月",

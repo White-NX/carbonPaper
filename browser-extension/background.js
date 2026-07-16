@@ -3,6 +3,12 @@
 // The main app's capture loop detects focused browser windows and sends capture
 // requests through NMH, which forwards them here.
 
+importScripts('image_transport.js');
+
+const {
+  fitPngPayload,
+} = globalThis.CarbonPaperImageTransport;
+
 const NM_HOST_NAME = 'com.carbonpaper.nmh';
 const MAX_RETRY = 30;
 
@@ -142,20 +148,19 @@ async function captureCurrentTab(retry = 0) {
 
     // Capture the visible tab
     const dataUrl = await chrome.tabs.captureVisibleTab(null, {
-      format: 'jpeg',
-      quality: 60
+      format: 'png'
     });
 
     if (!dataUrl) return;
 
-    // Extract base64 data (remove data:image/jpeg;base64, prefix)
+    // Extract base64 data (remove data:image/png;base64, prefix). OCR must receive
+    // lossless pixels; the desktop app performs its own JPEG encoding for storage.
     const base64Data = dataUrl.split(',')[1];
     if (!base64Data) return;
 
     // Compute a simple hash to avoid duplicate captures
     const hash = await computeHash(base64Data.substring(0, 1000)); // Hash first 1KB for speed
     if (hash === lastCaptureHash) return;
-    lastCaptureHash = hash;
 
     // Get page metadata from content script
     let pageData = {
@@ -189,14 +194,12 @@ async function captureCurrentTab(retry = 0) {
       faviconBase64 = faviconUrl;
     }
 
-    // Compute full image hash
-    const imageHash = await computeHash(base64Data);
-
-    // Send to NMH as a single message
-    nmPort.postMessage({
+    const payloadTemplate = (imageData) => ({
       type: 'save_screenshot',
-      image_data: base64Data,
-      image_hash: imageHash,
+      image_data: imageData,
+      // SHA-256 hex is always 64 ASCII bytes; use a fixed-size placeholder
+      // while selecting the image scale so the measured JSON size is exact.
+      image_hash: '0'.repeat(64),
       width: tab.width || 0,
       height: tab.height || 0,
       page_url: pageData.url,
@@ -205,6 +208,22 @@ async function captureCurrentTab(retry = 0) {
       visible_links: pageData.visibleLinks || [],
       browser_name: getBrowserName()
     });
+
+    const fitted = await fitPngPayload({
+      dataUrl,
+      buildPayload: payloadTemplate,
+    });
+    if (!fitted) {
+      console.warn('[CarbonPaper] Screenshot is too large to send over Native Messaging');
+      return;
+    }
+
+    const imageHash = await computeHash(fitted.base64);
+    fitted.payload.image_hash = imageHash;
+    nmPort.postMessage(fitted.payload);
+    // Only suppress duplicates after a message was actually handed to NMH;
+    // transport failures must remain retryable.
+    lastCaptureHash = hash;
 
   } catch (e) {
     // captureVisibleTab can fail if window is minimized, etc.

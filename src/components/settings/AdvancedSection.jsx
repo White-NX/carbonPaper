@@ -15,7 +15,6 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     config,
     loading,
     cpuDropdownOpen,
-    queueDropdownOpen,
     gpuDropdownOpen,
     clusteringDropdownOpen,
     cpuChanged,
@@ -31,7 +30,6 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     rustOcrModelStatus,
     rustOcrModelDownloading,
     setCpuDropdownOpen,
-    setQueueDropdownOpen,
     setGpuDropdownOpen,
     setClusteringDropdownOpen,
     clearCpuChanged,
@@ -39,7 +37,6 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     clearOnnxChanged,
     handleToggle,
     handleCpuPercentChange,
-    handleQueueSizeChange,
     handleOcrTimeoutDraftChange,
     handleOcrTimeoutChange,
     handleGpuChange,
@@ -47,7 +44,6 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     handleManualVacuum,
     handleRestartMlOcr,
     handleDownloadRustOcrModel,
-    handleRetryFailedOcr,
   } = useAdvancedSectionController({ monitorStatus, t });
 
   if (loading || !config) {
@@ -76,10 +72,6 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
 
       <OcrQueueCard
         config={config}
-        queueDropdownOpen={queueDropdownOpen}
-        onToggle={handleToggle}
-        onToggleQueueDropdown={() => setQueueDropdownOpen(!queueDropdownOpen)}
-        onQueueSizeChange={handleQueueSizeChange}
         onOcrTimeoutDraftChange={handleOcrTimeoutDraftChange}
         onOcrTimeoutChange={handleOcrTimeoutChange}
       />
@@ -93,7 +85,6 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         onToggle={handleToggle}
         onRestart={handleRestartMlOcr}
         onDownloadModel={handleDownloadRustOcrModel}
-        onRetryFailed={handleRetryFailedOcr}
       />
 
       <DmlAccelerationCard

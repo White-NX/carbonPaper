@@ -1,5 +1,5 @@
 import monitor.config as config
-from monitor.worker_process import OcrPostprocessQueue, _process_ocr
+from monitor.worker_process import OcrPostprocessQueue
 from ocr_service import OCRService, _parse_ocr_idle_unload_secs
 
 
@@ -64,24 +64,6 @@ class DummyOcrEngine:
         return []
 
 
-class DummyProcessOcrWorker:
-    enable_vector_store = False
-    vector_store = None
-
-    def __init__(self):
-        self.ocr_engine = DummyOcrEngine()
-        self.stats = {"processed_count": 0, "total_texts_found": 0}
-
-
-class CapturingPostprocessQueue:
-    def __init__(self):
-        self.jobs = []
-
-    def enqueue(self, job):
-        self.jobs.append(job)
-        return True
-
-
 def _png_bytes():
     from PIL import Image
     import io
@@ -118,32 +100,6 @@ def test_ocr_postprocess_updates_category_async_path(monkeypatch):
 
     assert classifier.calls == [("Editor", "async classification text", "code.exe")]
     assert storage.updates == [(42, "Development", 0.8765)]
-
-
-def test_process_ocr_enqueues_postprocess_even_when_ocr_text_is_empty(monkeypatch):
-    storage = DummyStorageClient()
-    postprocess = CapturingPostprocessQueue()
-
-    monkeypatch.setattr("storage_client.get_storage_client", lambda: storage)
-
-    result = _process_ocr(
-        {
-            "screenshot_id": 42,
-            "image_hash": "hash-42",
-            "window_title": "Editor",
-            "process_name": "code.exe",
-            "timestamp": 123,
-        },
-        DummyProcessOcrWorker(),
-        postprocess,
-    )
-
-    assert result["status"] == "success"
-    assert result["ocr_text"] == ""
-    assert result["postprocess_enqueued"] is True
-    assert len(postprocess.jobs) == 1
-    assert postprocess.jobs[0]["ocr_text"] == ""
-    assert postprocess.jobs[0]["window_title"] == "Editor"
 
 
 def test_ocr_service_loads_python_engine_only_on_first_inference(monkeypatch):

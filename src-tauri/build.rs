@@ -9,6 +9,35 @@ use walkdir::WalkDir;
 
 const UPDATE_PUBLIC_KEY_FILE: &str = "update-public-key.txt";
 
+fn generate_native_locales() {
+    let locales_dir = Path::new("../src/i18n/locales");
+    println!("cargo:rerun-if-changed={}", locales_dir.display());
+    let mut entries = fs::read_dir(locales_dir)
+        .unwrap_or_else(|error| panic!("Failed to read {}: {error}", locales_dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    let mut generated = String::from("pub const NATIVE_LOCALES: &[(&str, &str)] = &[\n");
+    for path in entries {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let locale = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("locale filename must be valid UTF-8");
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("Failed to read {}: {error}", path.display()));
+        generated.push_str(&format!("    ({locale:?}, {content:?}),\n"));
+    }
+    generated.push_str("];\n");
+
+    let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR must be set by Cargo");
+    fs::write(Path::new(&out_dir).join("native_locales.rs"), generated)
+        .expect("Failed to generate native locale catalog");
+}
+
 fn prune_monitor_staging(prebundle_dir: &Path) {
     if !prebundle_dir.starts_with(Path::new("pre-bundle")) || !prebundle_dir.exists() {
         return;
@@ -87,6 +116,7 @@ fn configure_update_public_key() {
 }
 
 fn main() {
+    generate_native_locales();
     configure_update_public_key();
     // --- 1. 定义路径 ---
     // 源文件夹

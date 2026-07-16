@@ -37,10 +37,8 @@ export function OcrEngineCard({
   onToggle,
   onRestart,
   onDownloadModel,
-  onRetryFailed,
 }) {
   const { t } = useTranslation();
-  const usingRust = config.rust_ocr_enabled !== false;
 
   return (
     <div className="space-y-3">
@@ -49,22 +47,19 @@ export function OcrEngineCard({
         {t('settings.advanced.rust_ocr.title', 'OCR 引擎')}
       </label>
       <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex-1 min-w-0">
-            <p className="text-sm text-ide-text font-medium">
-              {t('settings.advanced.rust_ocr.use_rust', '使用 Rust OCR')}
-            </p>
-            <p className="text-xs text-ide-muted mt-1">
-              {usingRust
-                ? t('settings.advanced.rust_ocr.rust_desc', '使用隔离的 Rust ML 进程；失败时自动回退到 Python。')
-                : t('settings.advanced.rust_ocr.python_desc', '当前使用兼容的 Python OCR。')}
-            </p>
-          </div>
-          <SettingsSwitch checked={usingRust} onChange={() => onToggle('rust_ocr_enabled')} />
+        <div className="rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3">
+          <p className="text-sm text-ide-text font-medium">
+            {t('settings.advanced.rust_ocr.raw_rgb', 'Rust Raw RGB OCR')}
+          </p>
+          <p className="text-xs text-ide-muted mt-1">
+            {t(
+              'settings.advanced.rust_ocr.raw_rgb_desc',
+              '隔离的 Rust ML 进程直接读取 RGB 捕获帧，不经过 JPEG，也不回退到 Python OCR。',
+            )}
+          </p>
         </div>
 
-        {usingRust && (
-          <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center justify-between gap-4">
             <div className="flex-1 min-w-0">
               <p className="text-sm text-ide-text font-medium">
                 {t('settings.advanced.rust_ocr.dml_beta', 'DirectML Beta')}
@@ -77,8 +72,7 @@ export function OcrEngineCard({
               checked={Boolean(config.rust_ocr_dml_beta)}
               onChange={() => onToggle('rust_ocr_dml_beta')}
             />
-          </div>
-        )}
+        </div>
 
         <div className="flex items-center justify-between gap-4 rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3">
           <div className="min-w-0 text-xs">
@@ -106,8 +100,7 @@ export function OcrEngineCard({
           )}
         </div>
 
-        {usingRust && (
-          <div className="flex items-center justify-between gap-4 rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3">
+        <div className="flex items-center justify-between gap-4 rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3">
             <div className="min-w-0 text-xs">
               <p className="text-ide-text font-medium">
                 {statusLoading
@@ -123,16 +116,6 @@ export function OcrEngineCard({
                   })}
                 </p>
               )}
-              {!statusLoading && (status?.failed_screenshots || 0) > 0 && (
-                <button
-                  onClick={onRetryFailed}
-                  className="text-ide-accent hover:underline mt-1"
-                >
-                  {t('settings.advanced.rust_ocr.retry_failed', '重试失败截图（{{count}}）', {
-                    count: status.failed_screenshots,
-                  })}
-                </button>
-              )}
             </div>
             <button
               onClick={onRestart}
@@ -141,8 +124,7 @@ export function OcrEngineCard({
             >
               <RefreshCw className="w-4 h-4" />
             </button>
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );

@@ -78,6 +78,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 
 [target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.7"
 windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_Security_Cryptography",

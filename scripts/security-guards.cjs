@@ -169,8 +169,9 @@ const COMMAND_TIERS = {
   'ml_runtime::get_ml_ocr_status': 'public',
   'ml_runtime::restart_ml_ocr_worker': 'session_required',
   'ml_runtime::get_rust_ocr_model_status': 'public',
-  'ml_runtime::download_rust_ocr_model': 'session_required',
-  'ml_runtime::retry_failed_ocr': 'session_required',
+  'ml_runtime::download_rust_ocr_model': 'bootstrap_policy',
+  'ml_runtime::take_ocr_model_repair_request': 'public',
+  'ml_runtime::debug_trigger_ocr_model_repair_notification': 'session_required',
 };
 
 function read(file) {
@@ -265,7 +266,7 @@ function checkCommandGuardImplementations() {
     'power::set_power_saving_enabled',
     'ml_runtime::restart_ml_ocr_worker',
     'ml_runtime::download_rust_ocr_model',
-    'ml_runtime::retry_failed_ocr',
+    'ml_runtime::debug_trigger_ocr_model_repair_notification',
     'monitor::start_monitor',
     'monitor::stop_monitor',
     'monitor::pause_monitor',
@@ -317,8 +318,13 @@ function checkRuntimeControlInvariants() {
   if (!foregroundSetter || dropIndex < 0 || invalidateIndex < 0 || dropIndex > invalidateIndex) {
     throw new Error('set_foreground_state must release app_in_foreground before invalidating the session');
   }
-  const invalidate = credentials.match(/pub fn invalidate_session[\s\S]*?\n    }/);
-  if (!invalidate || !invalidate[0].includes('不清除 master_key')) {
+  const invalidateStart = credentials.indexOf('pub fn invalidate_session');
+  const invalidateEnd = credentials.indexOf('pub fn clear_all_cached_keys', invalidateStart);
+  const invalidate = invalidateStart >= 0 && invalidateEnd > invalidateStart
+    ? credentials.slice(invalidateStart, invalidateEnd)
+    : '';
+  const executableInvalidate = invalidate.replace(/\/\/.*$/gm, '');
+  if (!invalidate.includes('Retain the master key') || /\bcached_master_key\b/.test(executableInvalidate)) {
     throw new Error('Session invalidation must preserve the background encryption key');
   }
 }
