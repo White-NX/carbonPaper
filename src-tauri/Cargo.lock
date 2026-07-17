@@ -4455,9 +4455,9 @@ dependencies = [
 
 [[package]]
 name = "rapidocr-core"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a144c985b0c3cd88a0bfb562c2796dfde88c1edc7a02cc8d2091658781a55a7e"
+checksum = "2afdaea55d9e8daf8f547a48a7fb45a43dbe076db3b9489c34386521cbdac294"
 dependencies = [
  "anyhow",
  "image",

@@ -71,7 +71,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 flate2 = "1"
 window-vibrancy = "0.5"
 open = "5"
-rapidocr-core = { version = "=0.2.1", default-features = false, features = ["tokio", "directml"] }
+rapidocr-core = { version = "=0.2.2", default-features = false, features = ["tokio", "directml"] }
 
 axum = "0.8"
 tower = "0.5"
