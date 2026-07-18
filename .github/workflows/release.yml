@@ -40,6 +40,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Run security guards
+        run: npm run test:security
+
       - name: Restore release asset cache
         uses: actions/cache@v4
         with:
@@ -97,6 +100,7 @@ jobs:
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
           CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION: ${{ vars.CARBONPAPER_UPDATE_SMOKE_MIN_PREVIOUS_VERSION }}
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
@@ -136,6 +140,8 @@ jobs:
 
       - name: Smoke test candidate forward portable update
         shell: pwsh
+        env:
+          CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
           $futureVersion = $env:CARBONPAPER_FORWARD_SMOKE_VERSION

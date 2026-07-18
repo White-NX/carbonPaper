@@ -16,6 +16,7 @@ const UPDATE_CHECK_URL: &str =
     "https://github.com/White-NX/carbonPaper/releases/latest/download/latest.json";
 const UPDATE_SMOKE_TEST_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_TEST";
 const UPDATE_SMOKE_MANIFEST_URL_ENV: &str = "CARBONPAPER_UPDATE_MANIFEST_URL";
+const UPDATE_SMOKE_PUBLIC_KEY_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_PUBLIC_KEY";
 const UPDATE_SMOKE_RESULT_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_RESULT";
 const UPDATE_SMOKE_EXPECTED_VERSION_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_EXPECTED_VERSION";
 const UPDATE_SMOKE_EXPECTED_MANIFEST_VERSION_ENV: &str =
@@ -49,13 +50,26 @@ fn manifest_signing_payload(manifest: &UpdateManifest) -> String {
     )
 }
 
-fn verify_update_manifest_signature(manifest: &UpdateManifest) -> Result<(), String> {
+/// Resolve the manifest verification key. Signature verification is always
+/// enforced; smoke-test mode may only substitute the verification key via an
+/// environment variable, and smoke mode itself restricts every manifest and
+/// download URL to loopback.
+fn update_signature_public_key_b64() -> Result<String, String> {
     if is_update_smoke_test_enabled() {
-        return Ok(());
+        if let Ok(key) = std::env::var(UPDATE_SMOKE_PUBLIC_KEY_ENV) {
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                return Ok(key);
+            }
+        }
     }
+    option_env!("CARBONPAPER_UPDATE_PUBLIC_KEY")
+        .map(str::to_string)
+        .ok_or_else(|| "Update signature public key is not configured".to_string())
+}
 
-    let public_key_b64 = option_env!("CARBONPAPER_UPDATE_PUBLIC_KEY")
-        .ok_or_else(|| "Update signature public key is not configured".to_string())?;
+fn verify_update_manifest_signature(manifest: &UpdateManifest) -> Result<(), String> {
+    let public_key_b64 = update_signature_public_key_b64()?;
     let public_key = base64::engine::general_purpose::STANDARD
         .decode(public_key_b64)
         .map_err(|e| format!("Invalid update public key encoding: {}", e))?;
@@ -97,6 +111,12 @@ fn safe_update_entry_path(name: &str) -> Result<PathBuf, String> {
         return Err(format!("Unsafe update archive path: {}", name));
     }
     Ok(path.to_path_buf())
+}
+
+/// Escape a value for interpolation inside a single-quoted PowerShell string
+/// literal, where `''` is the only escape sequence.
+fn ps_single_quote(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 /// Shared state for the update checker, caching the latest update manifest.
@@ -310,8 +330,8 @@ pub(crate) fn maybe_run_update_smoke_test(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        manifest_signing_payload, safe_update_entry_path, validate_loopback_update_url,
-        verify_update_manifest_with_key, UpdateManifest,
+        manifest_signing_payload, ps_single_quote, safe_update_entry_path,
+        validate_loopback_update_url, verify_update_manifest_with_key, UpdateManifest,
     };
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
@@ -365,6 +385,16 @@ mod tests {
         assert!(safe_update_entry_path("../outside.exe").is_err());
         assert!(safe_update_entry_path("/absolute.exe").is_err());
         assert!(safe_update_entry_path(r"C:\\Windows\\outside.exe").is_err());
+    }
+
+    #[test]
+    fn powershell_literals_escape_embedded_single_quotes() {
+        assert_eq!(ps_single_quote(r"C:\Apps\CarbonPaper"), r"C:\Apps\CarbonPaper");
+        assert_eq!(
+            ps_single_quote(r"C:\Users\O'Brien\AppData"),
+            r"C:\Users\O''Brien\AppData"
+        );
+        assert_eq!(ps_single_quote("a'b'c"), "a''b''c");
     }
 }
 
@@ -699,11 +729,11 @@ try {{
     exit 1
 }}
 "#,
-        exe_name_no_ext = exe_name.trim_end_matches(".exe"),
-        app_dir = app_dir_str,
-        extract_dir = extract_dir_str,
-        staging_dir = staging_dir_str,
-        exe_name = exe_name,
+        exe_name_no_ext = ps_single_quote(exe_name.trim_end_matches(".exe")),
+        app_dir = ps_single_quote(&app_dir_str),
+        extract_dir = ps_single_quote(&extract_dir_str),
+        staging_dir = ps_single_quote(&staging_dir_str),
+        exe_name = ps_single_quote(&exe_name),
     );
 
     // Write the PowerShell script

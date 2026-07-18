@@ -434,6 +434,7 @@ $succeeded = $false
 $envNames = @(
     "CARBONPAPER_UPDATE_SMOKE_TEST",
     "CARBONPAPER_UPDATE_MANIFEST_URL",
+    "CARBONPAPER_UPDATE_SMOKE_PUBLIC_KEY",
     "CARBONPAPER_UPDATE_SMOKE_RESULT",
     "CARBONPAPER_UPDATE_SMOKE_EXPECTED_VERSION",
     "CARBONPAPER_UPDATE_SMOKE_EXPECTED_MANIFEST_VERSION",
@@ -473,7 +474,14 @@ try {
     $port = Get-FreeTcpPort
     $candidateUrl = "http://127.0.0.1:$port/$candidateZipName"
     $manifestUrl = "http://127.0.0.1:$port/latest.json"
-    Write-SmokeManifest -LatestJson $latestJsonPath -OutPath (Join-Path $httpRoot "latest.json") -CandidateUrl $candidateUrl -ManifestVersion $ManifestVersion -CandidateSha256 $candidateSha256
+    $smokeManifestPath = Join-Path $httpRoot "latest.json"
+    Write-SmokeManifest -LatestJson $latestJsonPath -OutPath $smokeManifestPath -CandidateUrl $candidateUrl -ManifestVersion $ManifestVersion -CandidateSha256 $candidateSha256
+    $signScript = Join-Path $repoRoot "scripts\sign-update-manifest.mjs"
+    $smokePublicKey = [string](@(& node $signScript $smokeManifestPath) | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($smokePublicKey)) {
+        throw "Failed to sign update smoke manifest with $signScript"
+    }
+    $smokePublicKey = $smokePublicKey.Trim()
     Write-StaticServerScript -Path $serverScript
 
     Write-Host "Starting local update server: $manifestUrl"
@@ -487,6 +495,7 @@ try {
 
     $env:CARBONPAPER_UPDATE_SMOKE_TEST = "1"
     $env:CARBONPAPER_UPDATE_MANIFEST_URL = $manifestUrl
+    $env:CARBONPAPER_UPDATE_SMOKE_PUBLIC_KEY = $smokePublicKey
     $env:CARBONPAPER_UPDATE_SMOKE_RESULT = $resultFile
     $env:CARBONPAPER_UPDATE_SMOKE_EXPECTED_VERSION = $ExpectedAppVersion
     $env:CARBONPAPER_UPDATE_SMOKE_EXPECTED_MANIFEST_VERSION = $ManifestVersion
