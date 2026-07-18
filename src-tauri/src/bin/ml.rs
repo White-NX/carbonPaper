@@ -93,7 +93,7 @@ fn run() -> Result<(), String> {
         &MlResponse::Ready {
             protocol_version: ML_PROTOCOL_VERSION,
             worker_version: env!("CARGO_PKG_VERSION").to_string(),
-            rapidocr_core_version: "0.2.1".to_string(),
+            rapidocr_core_version: "0.2.2".to_string(),
             provider: provider.clone(),
             model_id: MODEL_ID.to_string(),
         },

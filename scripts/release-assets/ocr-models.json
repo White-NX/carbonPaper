@@ -4,7 +4,7 @@
   "revision": "r1",
   "directory": "ppocrv5-ch-mobile-r1",
   "bundle_path": "ocr-models/ppocrv5-ch-mobile-r1",
-  "rapidocr_core_version": "0.2.1",
+  "rapidocr_core_version": "0.2.2",
   "files": [
     {
       "name": "ch_PP-OCRv5_det_mobile.onnx",
