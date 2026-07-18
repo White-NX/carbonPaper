@@ -1,3 +1,8 @@
+//! CarbonPaper's Tauri backend composition root.
+//!
+//! This crate wires native capture, encrypted storage, monitor/ML processes, IPC,
+//! commands, tray behavior, and application lifecycle into the desktop runtime.
+
 mod analysis;
 mod autostart;
 mod capture;
@@ -5,10 +10,16 @@ pub mod commands;
 mod credential_manager;
 pub mod error;
 mod error_window;
+mod i18n;
 mod idle;
 mod logging;
 mod mcp_server;
 mod mcp_token;
+#[allow(dead_code)]
+mod ml_contracts;
+#[allow(dead_code)]
+mod ml_protocol;
+mod ml_runtime;
 mod model_management;
 mod monitor;
 mod monitor_ipc;
@@ -37,7 +48,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use storage::StorageState;
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
@@ -105,17 +116,13 @@ const TRAY_TEXTS_EN: TrayTexts = TrayTexts {
     auto_switched_lightweight: "Automatically switched to lightweight mode to save memory.",
 };
 
-fn normalize_app_language(language: &str) -> &'static str {
-    if language.to_ascii_lowercase().starts_with("en") {
-        "en"
-    } else {
-        "zh-CN"
-    }
+fn normalize_app_language(language: &str) -> String {
+    i18n::supported_locale(language)
 }
 
 fn tray_texts() -> &'static TrayTexts {
     let language = registry_config::get_string("language").unwrap_or_else(|| "zh-CN".to_string());
-    match normalize_app_language(&language) {
+    match normalize_app_language(&language).as_str() {
         "en" => &TRAY_TEXTS_EN,
         _ => &TRAY_TEXTS_ZH,
     }
@@ -130,7 +137,7 @@ fn tray_text_auto_lightweight_switched() -> &'static str {
 }
 
 pub(crate) fn set_app_language(app: &tauri::AppHandle, language: &str) -> Result<(), String> {
-    registry_config::set_string("language", normalize_app_language(language))?;
+    registry_config::set_string("language", &normalize_app_language(language))?;
     refresh_tray_menu(app);
     Ok(())
 }
@@ -285,72 +292,103 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
                 .map(|item| item.image_hash.clone())
                 .collect();
 
-            if !image_hashes.is_empty() {
-                let monitor_state = app_handle.state::<MonitorState>();
+            // Vector embeddings can only be removed while the Python monitor is
+            // reachable. Require its ack before destroying the image hashes the
+            // cleanup needs; otherwise leave the queue entries for a later cycle.
+            // The one exception is a monitor that is disabled by configuration and
+            // not running, where waiting would stall retention forever.
+            let monitor_state = app_handle.state::<MonitorState>();
+            let monitor_running = monitor_state
+                .process
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            let monitor_autostart =
+                registry_config::get_bool("autoStartMonitor").unwrap_or(true);
+
+            let vector_cleanup_done = if image_hashes.is_empty()
+                || vector_cleanup_can_be_skipped(monitor_running, monitor_autostart)
+            {
+                true
+            } else {
                 let payload = serde_json::json!({
                     "command": "delete_by_time_range",
                     "image_hashes": image_hashes,
                 });
-                if let Err(e) = monitor::forward_command_to_python(&monitor_state, payload).await {
-                    tracing::warn!("[DELETE_QUEUE] Vector cleanup failed: {}", e);
-                }
-            }
-
-            let data_dir = storage
-                .data_dir
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-
-            for item in &screenshot_candidates {
-                let path = std::path::Path::new(&item.image_path);
-                let abs_path = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    data_dir.join(path)
-                };
-
-                if let Err(e) = std::fs::remove_file(&abs_path) {
-                    let not_found = e.kind() == std::io::ErrorKind::NotFound;
-                    if !not_found {
-                        tracing::debug!(
-                            "[DELETE_QUEUE] Failed to remove image file {}: {}",
-                            abs_path.display(),
+                let result = monitor::forward_command_to_python(&monitor_state, payload).await;
+                let acked = vector_cleanup_acked(&result);
+                if !acked {
+                    match result {
+                        Ok(response) => tracing::warn!(
+                            "[DELETE_QUEUE] Vector cleanup rejected, deferring finalize: {}",
+                            response
+                        ),
+                        Err(e) => tracing::warn!(
+                            "[DELETE_QUEUE] Vector cleanup unavailable, deferring finalize: {}",
                             e
-                        );
+                        ),
                     }
                 }
-
-                let thumb_path = StorageState::thumbnail_path_for(&abs_path);
-                if let Err(e) = std::fs::remove_file(&thumb_path) {
-                    let not_found = e.kind() == std::io::ErrorKind::NotFound;
-                    if !not_found {
-                        tracing::debug!(
-                            "[DELETE_QUEUE] Failed to remove thumbnail {}: {}",
-                            thumb_path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-
-            let ids: Vec<i64> = screenshot_candidates.iter().map(|item| item.id).collect();
-            finalized_screenshots = match tokio::task::spawn_blocking({
-                let storage = storage.clone();
-                move || storage.finalize_screenshot_delete_batch(&ids)
-            })
-            .await
-            {
-                Ok(Ok(count)) => count,
-                Ok(Err(e)) => {
-                    tracing::warn!("[DELETE_QUEUE] Screenshot finalize failed: {}", e);
-                    0
-                }
-                Err(e) => {
-                    tracing::warn!("[DELETE_QUEUE] Screenshot finalize join error: {:?}", e);
-                    0
-                }
+                acked
             };
+
+            if vector_cleanup_done {
+                let data_dir = storage
+                    .data_dir
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+
+                for item in &screenshot_candidates {
+                    let path = std::path::Path::new(&item.image_path);
+                    let abs_path = if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        data_dir.join(path)
+                    };
+
+                    if let Err(e) = std::fs::remove_file(&abs_path) {
+                        let not_found = e.kind() == std::io::ErrorKind::NotFound;
+                        if !not_found {
+                            tracing::debug!(
+                                "[DELETE_QUEUE] Failed to remove image file {}: {}",
+                                abs_path.display(),
+                                e
+                            );
+                        }
+                    }
+
+                    let thumb_path = StorageState::thumbnail_path_for(&abs_path);
+                    if let Err(e) = std::fs::remove_file(&thumb_path) {
+                        let not_found = e.kind() == std::io::ErrorKind::NotFound;
+                        if !not_found {
+                            tracing::debug!(
+                                "[DELETE_QUEUE] Failed to remove thumbnail {}: {}",
+                                thumb_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+
+                let ids: Vec<i64> = screenshot_candidates.iter().map(|item| item.id).collect();
+                finalized_screenshots = match tokio::task::spawn_blocking({
+                    let storage = storage.clone();
+                    move || storage.finalize_screenshot_delete_batch(&ids)
+                })
+                .await
+                {
+                    Ok(Ok(count)) => count,
+                    Ok(Err(e)) => {
+                        tracing::warn!("[DELETE_QUEUE] Screenshot finalize failed: {}", e);
+                        0
+                    }
+                    Err(e) => {
+                        tracing::warn!("[DELETE_QUEUE] Screenshot finalize join error: {:?}", e);
+                        0
+                    }
+                };
+            }
         }
 
         let vacuum_ran = match tokio::task::spawn_blocking({
@@ -382,6 +420,81 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
     }
 }
 
+fn vector_cleanup_can_be_skipped(monitor_running: bool, monitor_autostart: bool) -> bool {
+    !monitor_running && !monitor_autostart
+}
+
+fn vector_cleanup_acked(result: &Result<serde_json::Value, String>) -> bool {
+    matches!(
+        result,
+        Ok(response) if response.get("status").and_then(|s| s.as_str()) == Some("success")
+    )
+}
+
+fn is_open_tray_click(button: MouseButton, button_state: MouseButtonState) -> bool {
+    matches!(
+        (button, button_state),
+        (MouseButton::Left, MouseButtonState::Up)
+    )
+}
+
+fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
+    cancel_auto_lightweight_timer(app);
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        if show_ocr_model_repair {
+            let _ = app.emit("show-ocr-model-repair", ());
+        }
+        if let Some(lightweight_state) = app.try_state::<Arc<LightweightModeState>>() {
+            *lightweight_state
+                .is_lightweight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = false;
+        }
+        refresh_tray_menu(app);
+        return;
+    }
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match create_main_window(&app_handle) {
+            Ok(()) => {
+                let lightweight_state = app_handle.state::<Arc<LightweightModeState>>();
+                *lightweight_state
+                    .is_lightweight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = false;
+                tracing::info!("Window recreated from lightweight mode");
+                refresh_tray_menu(&app_handle);
+                if show_ocr_model_repair {
+                    let _ = app_handle.emit("show-ocr-model-repair", ());
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to create main window: {}", e);
+                let texts = tray_texts();
+                let _ = app_handle
+                    .notification()
+                    .builder()
+                    .title("CarbonPaper")
+                    .body(&format!("{}: {}", texts.open_error, e))
+                    .show();
+            }
+        }
+    });
+}
+
+fn open_main_window_from_tray(app: &tauri::AppHandle) {
+    open_main_window(app, false);
+}
+
+pub(crate) fn open_main_window_for_ocr_model_repair(app: &tauri::AppHandle) {
+    open_main_window(app, true);
+}
+
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let app_handle = app.handle().clone();
     let texts = tray_texts();
@@ -406,51 +519,28 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .item(&quit_item)
         .build()?;
 
-    let mut tray_builder = TrayIconBuilder::new().menu(&menu);
+    let mut tray_builder = TrayIconBuilder::new()
+        .menu(&menu)
+        .show_menu_on_left_click(false);
     if let Some(icon) = app.default_window_icon().cloned() {
         tray_builder = tray_builder.icon(icon);
     }
     let tray = tray_builder
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button,
+                button_state,
+                ..
+            } = event
+            {
+                if is_open_tray_click(button, button_state) {
+                    open_main_window_from_tray(tray.app_handle());
+                }
+            }
+        })
         .on_menu_event(|app, event| match event.id.as_ref() {
             MENU_ID_OPEN => {
-                // 取消自动切换定时器
-                cancel_auto_lightweight_timer(app);
-
-                // 检查窗口是否存在
-                if let Some(window) = app.get_webview_window("main") {
-                    // 窗口存在，显示并聚焦
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                    if let Some(lightweight_state) = app.try_state::<Arc<LightweightModeState>>() {
-                        *lightweight_state.is_lightweight.lock().unwrap() = false;
-                    }
-                    refresh_tray_menu(app);
-                } else {
-                    // 窗口不存在（轻量模式），重建窗口
-                    let app_handle = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        match create_main_window(&app_handle) {
-                            Ok(()) => {
-                                // 更新轻量模式状态
-                                let lightweight_state =
-                                    app_handle.state::<Arc<LightweightModeState>>();
-                                *lightweight_state.is_lightweight.lock().unwrap() = false;
-                                tracing::info!("Window recreated from lightweight mode");
-                                refresh_tray_menu(&app_handle);
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to create main window: {}", e);
-                                let texts = tray_texts();
-                                let _ = app_handle
-                                    .notification()
-                                    .builder()
-                                    .title("CarbonPaper")
-                                    .body(&format!("{}: {}", texts.open_error, e))
-                                    .show();
-                            }
-                        }
-                    });
-                }
+                open_main_window_from_tray(app);
             }
             MENU_ID_TOGGLE_CAPTURE => {
                 let app_handle = app.clone();
@@ -655,6 +745,14 @@ fn start_auto_lightweight_timer(app: tauri::AppHandle) {
     *lightweight_state.auto_switch_timer.lock().unwrap() = Some(timer);
 }
 
+pub(crate) fn hide_main_window_to_tray(window: &tauri::Window) -> Result<(), String> {
+    window.hide().map_err(|e| e.to_string())?;
+    let app = window.app_handle();
+    let _ = app.emit("app-hidden", ());
+    start_auto_lightweight_timer(app.clone());
+    Ok(())
+}
+
 // 取消自动切换定时器
 fn cancel_auto_lightweight_timer(app: &tauri::AppHandle) {
     let lightweight_state = app.state::<Arc<LightweightModeState>>();
@@ -695,6 +793,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
+        .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(CaptureState::default()))
         .manage(AnalysisState::default())
         .manage(updater::UpdaterState::new())
@@ -713,11 +812,9 @@ pub fn run() {
                     }
                     if !IS_UPDATING.load(Ordering::Relaxed) {
                         api.prevent_close();
-                        let _ = window.hide();
-                        let _ = window.app_handle().emit("app-hidden", ());
-
-                        // 启动自动切换定时器
-                        start_auto_lightweight_timer(window.app_handle().clone());
+                        if let Err(e) = hide_main_window_to_tray(window) {
+                            tracing::error!("Failed to hide main window to tray: {}", e);
+                        }
                     }
                 }
             }
@@ -818,6 +915,18 @@ pub fn run() {
                     if let Err(e) = storage.initialize() {
                         tracing::error!("Failed to initialize storage: {}", e);
                     } else {
+                        match storage.discard_incomplete_ocr_postprocess() {
+                            Ok(discarded) if discarded > 0 => tracing::info!(
+                                "[ML:POSTPROCESS] discarded {} incomplete rows from the previous application process",
+                                discarded
+                            ),
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(
+                                "[ML:POSTPROCESS] failed to discard incomplete startup rows: {}",
+                                error
+                            ),
+                        }
+
                         let storage_clone = storage.inner().clone();
                         std::thread::spawn(move || {
                             StorageState::backfill_plaintext_process_names(storage_clone);
@@ -826,6 +935,10 @@ pub fn run() {
                         let app_handle_cleanup = app.handle().clone();
                         tauri::async_runtime::spawn(async move {
                             run_delete_queue_maintenance_loop(app_handle_cleanup).await;
+                        });
+                        let app_handle_postprocess = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            ml_runtime::run_postprocess_retry_loop(app_handle_postprocess).await;
                         });
                     }
                 } else {
@@ -846,6 +959,8 @@ pub fn run() {
                     Ok(false) => {}
                     Err(e) => tracing::warn!("Extension sync check failed: {}", e),
                 }
+
+                commands::utility::migrate_extension_enhancement_config();
 
                 {
                     let data_dir_clone = data_dir.clone();
@@ -920,6 +1035,8 @@ pub fn run() {
 
                 python::auto_install_spacy_models(app.handle().clone());
 
+                ml_runtime::schedule_ocr_model_health_notification(app.handle().clone());
+
                 // 轻量模式下自动启动监控
                 if start_hidden
                     && registry_config::get_bool("lightweight_auto_start_monitor").unwrap_or(true)
@@ -938,11 +1055,11 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::utility::greet,
             commands::utility::close_process,
-            commands::utility::set_updating_flag,
             commands::utility::set_app_language,
             monitor::start_monitor,
+            monitor::get_monitor_autostart,
+            monitor::set_monitor_autostart,
             monitor::stop_monitor,
             monitor::pause_monitor,
             monitor::resume_monitor,
@@ -951,7 +1068,6 @@ pub fn run() {
             monitor::monitor_update_filters,
             monitor::monitor_update_advanced_config,
             monitor::monitor_update_feature_config,
-            monitor::monitor_get_all_models,
             monitor::monitor_run_clustering,
             monitor::monitor_get_clustering_status,
             monitor::monitor_set_clustering_interval,
@@ -964,6 +1080,12 @@ pub fn run() {
             monitor::monitor_smart_cluster_calibrate_preview,
             monitor::monitor_presidio_set_language,
             monitor::monitor_classify_debug,
+            ml_runtime::get_ml_ocr_status,
+            ml_runtime::restart_ml_ocr_worker,
+            ml_runtime::get_rust_ocr_model_status,
+            ml_runtime::download_rust_ocr_model,
+            ml_runtime::take_ocr_model_repair_request,
+            ml_runtime::debug_trigger_ocr_model_repair_notification,
             monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）
             script_integrity::debug_trigger_security_alert,
@@ -1060,11 +1182,10 @@ pub fn run() {
             python::force_recheck_spacy_models,
             model_management::download_model,
             model_management::check_model_files,
+            model_management::get_model_inventory,
             // Updater commands
             updater::updater_check,
-            updater::updater_download,
-            updater::updater_extract,
-            updater::updater_apply,
+            updater::updater_install,
             // Native messaging commands
             native_messaging::get_nm_host_status,
             native_messaging::register_nm_host_chrome,
@@ -1079,6 +1200,7 @@ pub fn run() {
             commands::utility::mark_smart_cluster_setup_done,
             commands::utility::get_extension_enhancement_config,
             commands::utility::set_extension_enhancement,
+            commands::utility::get_nmh_sessions,
             // Smart Cluster commands
             commands::smart_cluster::smart_cluster_list,
             commands::smart_cluster::smart_cluster_get,
@@ -1104,6 +1226,7 @@ pub fn run() {
             commands::utility::restart_app,
             commands::utility::trigger_test_error,
             commands::utility::exit_app,
+            commands::utility::hide_to_tray,
             commands::utility::frontend_log,
             // 轻量模式命令
             commands::utility::switch_to_lightweight_mode,
@@ -1156,11 +1279,49 @@ pub fn run_silent_install() {
     python::run_silent_install();
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_left_button_release_opens_window_from_tray() {
+        assert!(is_open_tray_click(MouseButton::Left, MouseButtonState::Up));
+        assert!(!is_open_tray_click(
+            MouseButton::Left,
+            MouseButtonState::Down
+        ));
+        assert!(!is_open_tray_click(
+            MouseButton::Right,
+            MouseButtonState::Up
+        ));
+    }
+
+    #[test]
+    fn vector_cleanup_is_only_skipped_when_monitor_is_off_and_disabled() {
+        assert!(vector_cleanup_can_be_skipped(false, false));
+        assert!(!vector_cleanup_can_be_skipped(true, false));
+        assert!(!vector_cleanup_can_be_skipped(false, true));
+        assert!(!vector_cleanup_can_be_skipped(true, true));
+    }
+
+    #[test]
+    fn vector_cleanup_requires_explicit_success_ack() {
+        assert!(vector_cleanup_acked(&Ok(
+            serde_json::json!({ "status": "success", "vector_deleted": 3 })
+        )));
+        assert!(!vector_cleanup_acked(&Ok(
+            serde_json::json!({ "error": "vector store unavailable" })
+        )));
+        assert!(!vector_cleanup_acked(&Ok(serde_json::json!({}))));
+        assert!(!vector_cleanup_acked(&Err("Monitor not started".to_string())));
+    }
+}
+
 pub fn run_python_launcher(args: &[String]) -> i32 {
     python_launcher::run_python_launcher(args)
 }
 
-pub fn run_cng_unlock(key_file_path: &str) {
+pub fn run_cng_unlock(key_file_path: &str, owner_hwnd: Option<isize>) {
     use std::process::exit;
 
     let file_data = match std::fs::read(key_file_path) {
@@ -1179,7 +1340,7 @@ pub fn run_cng_unlock(key_file_path: &str) {
         }
     };
 
-    match credential_manager::decrypt_master_key_with_cng(&ciphertext) {
+    match credential_manager::decrypt_master_key_with_cng_for_window(&ciphertext, owner_hwnd) {
         Ok(master_key) => {
             print!("{}", hex::encode(&master_key));
             exit(0);

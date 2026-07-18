@@ -1,9 +1,9 @@
 // scripts/build-nmh.mjs
-// Builds the carbonpaper-nmh binary and copies it to pre-bundle/
-// Called before tauri build to ensure the NMH host is included in the bundle.
+// Builds the carbonpaper-nmh binary. Tauri bundles Cargo [[bin]] targets for
+// NSIS, while the portable packer reads the binary from target/<profile>.
 
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync } from 'node:fs';
+import { existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 
 const tauriDir = path.join(process.cwd(), 'src-tauri');
@@ -22,14 +22,11 @@ try {
 }
 
 const src = path.join(tauriDir, 'target', profile, 'carbonpaper-nmh.exe');
-const destDir = path.join(tauriDir, 'pre-bundle');
-const dest = path.join(destDir, 'carbonpaper-nmh.exe');
 
 if (!existsSync(src)) {
   console.error(`NMH binary not found at ${src}`);
   process.exit(1);
 }
 
-mkdirSync(destDir, { recursive: true });
-copyFileSync(src, dest);
-console.log(`Copied carbonpaper-nmh.exe to ${dest}`);
+rmSync(path.join(tauriDir, 'pre-bundle', 'carbonpaper-nmh.exe'), { force: true });
+console.log(`NMH binary ready at ${src}`);

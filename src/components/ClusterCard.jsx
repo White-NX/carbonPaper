@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 
 /**
- * Shared cluster card component used by TasksView and SmartClustersView.
+ * Shared cluster card component used by SmartClustersView.
  *
  * Visual treatment:
  *   - Gradient background (panel → bg) for depth vs the flat outlined look

@@ -40,7 +40,7 @@ export default defineConfig(async () => ({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/tests/setup.js"],
-    include: ["src/**/*.test.{js,jsx,ts,tsx}"],
+    include: ["src/**/*.test.{js,jsx,ts,tsx}", "browser-extension/**/*.test.{js,jsx,ts,tsx}"],
     exclude: ["node_modules", "dist", "src-tauri", "monitor"],
     coverage: {
       provider: "v8",

@@ -1,3 +1,9 @@
+//! Tauri commands for encrypted-storage maintenance, migration, and backup.
+//!
+//! Read-only startup probes run before login so the UI can decide which recovery
+//! dialog to show. Any operation that mutates, exports, imports, or reveals user data
+//! requires a valid authenticated session.
+
 use crate::capture::CaptureState;
 use crate::credential_manager::{get_cached_master_key, CredentialManagerState};
 use crate::monitor::{start_monitor_impl, stop_monitor_impl, MonitorState};
@@ -26,6 +32,11 @@ pub struct StartupVacuumStatus {
     pub in_progress: bool,
 }
 
+/// Reports whether HMAC records need migration and whether a migration is running.
+///
+/// Authentication: not required. Returns `{ "needs_migration": boolean,
+/// "is_running": boolean }`. Frontend: `hooks/useHmacMigrationStatus.js` and
+/// `components/HmacMigrationDialog.jsx`.
 #[tauri::command]
 pub async fn storage_check_hmac_migration_status(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -39,6 +50,10 @@ pub async fn storage_check_hmac_migration_status(
     })
 }
 
+/// Reports whether startup database compaction is needed or already running.
+///
+/// Authentication: not required. Returns `{ "needs_vacuum": boolean,
+/// "in_progress": boolean }`. Frontend: `components/StartupVacuumDialog.jsx`.
 #[tauri::command]
 pub async fn storage_get_startup_vacuum_status(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -60,6 +75,11 @@ pub async fn storage_get_startup_vacuum_status(
     })
 }
 
+/// Runs the one-time startup VACUUM when required.
+///
+/// Authentication: not required because it runs before the login flow and does not
+/// expose records. Returns `{ "ran", "already_done", "already_running" }` booleans.
+/// Frontend: `components/StartupVacuumDialog.jsx`.
 #[tauri::command]
 pub async fn storage_run_startup_vacuum_if_needed(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -83,6 +103,10 @@ pub async fn storage_run_startup_vacuum_if_needed(
     .map_err(|e| format!("VACUUM task panicked: {}", e))?
 }
 
+/// Runs an explicitly requested database VACUUM.
+///
+/// Authentication: required. Returns `{ "ok": boolean, "already_running": boolean }`.
+/// Frontend: `components/settings/useAdvancedSectionController.js`.
 #[tauri::command]
 pub async fn storage_run_manual_vacuum(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -107,6 +131,10 @@ pub async fn storage_run_manual_vacuum(
     .map_err(|e| format!("Manual VACUUM task panicked: {}", e))?
 }
 
+/// Starts HMAC migration and emits `hmac-migration-progress` events.
+///
+/// Authentication: required. Returns JSON `null` when complete and emits
+/// `hmac-migration-complete`. Frontend: `components/HmacMigrationDialog.jsx`.
 #[tauri::command]
 pub async fn storage_run_hmac_migration(
     app_handle: tauri::AppHandle,
@@ -143,6 +171,10 @@ pub async fn storage_run_hmac_migration(
     .map_err(|e| format!("Migration task panicked: {}", e))?
 }
 
+/// Requests cancellation of the active HMAC migration.
+///
+/// Authentication: required. Returns `{ "status": "cancel_requested" | "idle",
+/// "is_running": boolean }`.
 #[tauri::command]
 pub async fn storage_hmac_migration_cancel(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -157,6 +189,10 @@ pub async fn storage_hmac_migration_cancel(
     }))
 }
 
+/// Lists screenshot files that still exist as plaintext paths.
+///
+/// Authentication: required. Returns a JSON array of path strings.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_list_plaintext_files(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -167,6 +203,10 @@ pub async fn storage_list_plaintext_files(
     state.list_plaintext_screenshots()
 }
 
+/// Encrypts legacy plaintext screenshot files in place.
+///
+/// Authentication: required. Returns `{ "total_files", "migrated", "skipped",
+/// "errors" }`. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_migrate_plaintext(
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
@@ -187,6 +227,11 @@ pub async fn storage_migrate_plaintext(
     }))
 }
 
+/// Moves storage to `target`, optionally including screenshot data files.
+///
+/// Authentication: required. `migrate_data_files` controls whether only configuration
+/// or all data moves. Returns the migration result object and emits progress events.
+/// Frontend: `components/settings/storage/useStorageMigration.js`.
 #[tauri::command]
 pub async fn storage_migrate_data_dir(
     app_handle: tauri::AppHandle,
@@ -205,6 +250,10 @@ pub async fn storage_migrate_data_dir(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Requests cancellation of an active data-directory migration.
+///
+/// Authentication: required. Returns `{ "status": "cancel_requested" | "idle",
+/// "in_progress": boolean }`. Frontend: `components/settings/MigrationProgressDialog.jsx`.
 #[tauri::command]
 pub fn storage_migration_cancel(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -219,6 +268,10 @@ pub fn storage_migration_cancel(
     }))
 }
 
+/// Deletes legacy plaintext screenshot files after encrypted migration.
+///
+/// Authentication: required. Returns `{ "deleted": number }`.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_delete_plaintext(
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
@@ -234,6 +287,10 @@ pub async fn storage_delete_plaintext(
     Ok(serde_json::json!({ "deleted": count }))
 }
 
+/// Exports storage to a password-encrypted ZIP archive at `export_path`.
+///
+/// Authentication: required. `password` derives the backup key; returns JSON `null`
+/// and emits `backup-migration-progress`. Frontend: `components/BackupMigrationDialog.jsx`.
 #[tauri::command]
 pub async fn storage_export_backup(
     app_handle: tauri::AppHandle,
@@ -431,6 +488,11 @@ pub async fn storage_export_backup(
     result.and(init_result)
 }
 
+/// Imports a password-encrypted backup ZIP from `backup_zip_path`.
+///
+/// Authentication: required. The backup master key is re-wrapped for the local Windows
+/// credential before files are installed. Returns JSON `null` and emits progress events.
+/// Frontend: `components/BackupMigrationDialog.jsx`.
 #[tauri::command]
 pub async fn storage_import_backup(
     app_handle: tauri::AppHandle,

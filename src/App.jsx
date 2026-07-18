@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { invoke } from '@tauri-apps/api/core';
 import Timeline from './components/Timeline';
 import SettingsDialog from './components/settings/SettingsDialog';
 import Mask from './components/Mask';
@@ -15,6 +16,7 @@ import { NotificationToast, NotificationPanel } from './components/Notifications
 import ErrorWindow from './components/ErrorWindow';
 import HmacMigrationDialog from './components/HmacMigrationDialog';
 import StartupVacuumDialog from './components/StartupVacuumDialog';
+import OcrModelRepairCard from './components/OcrModelRepairCard';
 import { deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 import { UpdateModal } from './components/UpdateModal';
 import { useAppTheme } from './hooks/useAppTheme';
@@ -27,6 +29,7 @@ import { usePythonEnvironment } from './hooks/usePythonEnvironment';
 import { useSelectedSnapshot, normalizeTimestampToMs } from './hooks/useSelectedSnapshot';
 import { useStartupWizards } from './hooks/useStartupWizards';
 import { useUpdateManager } from './hooks/useUpdateManager';
+import { useTauriEventListener } from './hooks/useTauriEventListener';
 
 function App() {
   const { t } = useTranslation();
@@ -44,10 +47,27 @@ function App() {
   }, []);
 
   const [showSettings, setShowSettings] = useState(false);
+  const [showOcrModelRepair, setShowOcrModelRepair] = useState(false);
   const [activeTab, setActiveTab] = useState('preview');
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
   const [searchMode, setSearchMode] = useState('ocr');
   const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
+
+  const openOcrModelRepair = useCallback(() => {
+    setShowSettings(false);
+    setShowOcrModelRepair(true);
+    invoke('take_ocr_model_repair_request').catch(() => {});
+  }, []);
+
+  useTauriEventListener('show-ocr-model-repair', openOcrModelRepair, [openOcrModelRepair]);
+
+  useEffect(() => {
+    invoke('take_ocr_model_repair_request')
+      .then((requested) => {
+        if (requested) openOcrModelRepair();
+      })
+      .catch(() => {});
+  }, [openOcrModelRepair]);
 
   const { darkMode, setDarkMode } = useAppTheme();
   const { powerSavingMode, setPowerSavingMode, powerSavingSuppressed, windowFocused } = usePowerSavingState();
@@ -382,6 +402,11 @@ function App() {
         onSessionTimeoutChange={setSessionTimeout}
         isSessionValid={isAuthenticated}
         onLockSession={handleLockSession}
+      />
+
+      <OcrModelRepairCard
+        isOpen={showOcrModelRepair}
+        onClose={() => setShowOcrModelRepair(false)}
       />
     </div>
   );

@@ -1,14 +1,13 @@
-//! 凭证管理模块 - 使用 CNG (NCrypt) API 实现安全密钥管理
+//! Credential management backed by the Windows CNG (`NCrypt`) API.
 //!
-//! 安全模型：
-//! - 加密阶段（使用公钥）：无感，后台服务可随时执行
-//! - 解密阶段（使用私钥）：受 OS 强制 UI 保护，需用户 PIN 认证
+//! Security model:
+//! - Encryption uses an exported public key and can run unattended in background work.
+//! - Decryption uses the persisted private key, whose high-protection UI policy requires
+//!   OS-mediated user verification before sensitive data becomes available.
 //!
-//! 实现原理：
-//! 1. 使用 Microsoft Software Key Storage Provider 创建 RSA 密钥对
-//! 2. 设置 NCRYPT_UI_POLICY 强制高保护级别
-//! 3. 加密使用公钥（NCryptEncrypt 不触发 UI）
-//! 4. 解密使用私钥（NCryptDecrypt 触发系统级安全对话框）
+//! The Microsoft Software Key Storage Provider owns the RSA key pair. CarbonPaper sets
+//! `NCRYPT_UI_POLICY` to high protection, exports only the public blob for writes, and
+//! keeps decrypted master-key material in the bounded authenticated session cache.
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -20,57 +19,57 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use thiserror::Error;
 
-/// 凭证管理器错误类型
+/// Errors produced by credential and key-management operations.
 #[derive(Debug, Error)]
 #[allow(dead_code)]
 pub enum CredentialError {
-    /// Windows Hello 不可用
+    /// Windows Hello or the backing credential provider is unavailable.
     #[error("Windows Hello is not available")]
     WindowsHelloNotAvailable,
-    /// 用户取消了认证
+    /// The user cancelled OS authentication.
     #[error("User cancelled authentication")]
     UserCancelled,
-    /// 密钥不存在
+    /// The requested key does not exist.
     #[error("Credential key not found")]
     KeyNotFound,
-    /// 需要用户认证
+    /// An authenticated session is required.
     #[error("Authentication required")]
     AuthRequired,
-    /// 加密/解密失败
+    /// Encryption or decryption failed.
     #[error("Crypto error: {0}")]
     CryptoError(String),
-    /// 系统错误
+    /// A Windows or operating-system operation failed.
     #[error("System error: {0}")]
     SystemError(String),
-    /// 密钥已存在
+    /// The key already exists.
     #[error("Credential key already exists")]
     KeyAlreadyExists,
 }
 
-/// 默认认证会话超时时间（秒）
+/// Default authenticated-session timeout in seconds.
 const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 15 * 60; // 15 分钟
 const MASTER_KEY_FILE_NAME: &str = "credential_master_key.bin";
 const MASTER_KEY_LEN: usize = 32;
 const MASTER_KEY_FILE_MAGIC: &[u8; 5] = b"CPMK3"; // 版本升级
 const CNG_KEY_NAME: &str = "CarbonPaperMasterKeyV3";
-// 使用 Software KSP，它支持 RSA 加密和 UI Policy
+// The Software KSP supports RSA encryption and protected UI policy.
 const CNG_PROVIDER_NAME: &str = "Microsoft Software Key Storage Provider";
 
-/// 凭证管理器状态
+/// Shared credential-manager state.
 pub struct CredentialManagerState {
-    /// 缓存的加密密钥（用于 SQLCipher）
+    /// Cached SQLCipher database key, available only to an authenticated UI session.
     cached_db_key: Mutex<Option<Vec<u8>>>,
-    /// 缓存的公钥（用于加密新数据）
+    /// Cached public key used to encrypt new data without user interaction.
     cached_public_key: Mutex<Option<Vec<u8>>>,
-    /// 缓存的主密钥（用于数据加密）
+    /// Cached master key used by background data encryption.
     cached_master_key: Mutex<Option<Vec<u8>>>,
-    /// 数据目录路径
+    /// Data directory containing persisted key material.
     data_dir: Mutex<PathBuf>,
-    /// 上次认证成功的时间戳（用于会话超时）
+    /// Time of the last successful authentication, used for session expiry.
     last_auth_time: Mutex<Option<std::time::Instant>>,
-    /// 应用是否在前台（用于会话管理）
+    /// Whether the application UI is currently foregrounded.
     app_in_foreground: Mutex<bool>,
-    /// 会话超时时间（秒），-1 表示永不超时
+    /// Session timeout in seconds; `-1` disables time-based expiry.
     session_timeout_secs: Mutex<i64>,
 }
 
@@ -85,11 +84,11 @@ impl CredentialManagerState {
     }
 
     pub fn new(data_dir: PathBuf) -> Self {
-        // 默认值
+        // Start with secure defaults.
         let default = DEFAULT_SESSION_TIMEOUT_SECS as i64;
         let mut initial_timeout = default;
 
-        // 尝试从注册表读取持久化的超时（以秒为单位）
+        // Restore the persisted timeout, which is stored in seconds.
         if let Some(s) = crate::registry_config::get_string("session_timeout_secs") {
             if let Ok(parsed) = s.parse::<i64>() {
                 initial_timeout = parsed;
@@ -109,7 +108,7 @@ impl CredentialManagerState {
         }
     }
 
-    /// 设置会话超时时间（秒），-1 表示永不超时
+    /// Sets the session timeout in seconds; `-1` disables time-based expiry.
     #[allow(dead_code)]
     pub fn set_session_timeout(&self, timeout_secs: i64) {
         let mut timeout = self
@@ -119,7 +118,7 @@ impl CredentialManagerState {
         *timeout = timeout_secs;
     }
 
-    /// 获取当前会话超时时间设置
+    /// Returns the current session timeout setting.
     #[allow(dead_code)]
     pub fn get_session_timeout(&self) -> i64 {
         *self
@@ -128,7 +127,7 @@ impl CredentialManagerState {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 检查当前认证会话是否有效
+    /// Returns whether the authenticated UI session is still valid.
     pub fn is_session_valid(&self) -> bool {
         let last_auth = self
             .last_auth_time
@@ -145,22 +144,43 @@ impl CredentialManagerState {
 
         match *last_auth {
             Some(auth_time) => {
-                // 如果应用在后台，会话立即失效（除非设置为永不超时）
+                // Backgrounding invalidates the UI session unless expiry is disabled.
                 if !in_foreground && timeout_secs != -1 {
                     return false;
                 }
-                // 如果超时设置为 -1，永不超时
+                // A timeout of -1 keeps the foreground session valid indefinitely.
                 if timeout_secs == -1 {
                     return true;
                 }
-                // 检查是否超时
+                // Enforce elapsed-time expiry for foreground sessions.
                 auth_time.elapsed().as_secs() < timeout_secs as u64
             }
             None => false,
         }
     }
 
-    /// 更新认证时间戳
+    /// Returns whether the user authenticated within the specified window.
+    ///
+    /// Reserve this for exceptional operations that explicitly require a fresh
+    /// proof of user presence. Normal protected application actions should use
+    /// `is_session_valid` so an unlocked session remains sufficient.
+    pub fn is_recently_authenticated(&self, max_age_secs: u64) -> bool {
+        let in_foreground = *self
+            .app_in_foreground
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !in_foreground {
+            return false;
+        }
+
+        self.last_auth_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|auth_time| auth_time.elapsed().as_secs() < max_age_secs)
+            .unwrap_or(false)
+    }
+
+    /// Records a successful authentication time.
     pub fn update_auth_time(&self) {
         let mut last_auth = self
             .last_auth_time
@@ -169,8 +189,7 @@ impl CredentialManagerState {
         *last_auth = Some(std::time::Instant::now());
     }
 
-    /// 清除认证会话（锁定 UI 访问权限）
-    /// 注意：不清除 cached_master_key，以允许后台继续加密数据
+    /// Invalidates UI access while retaining the master key for background encryption.
     pub fn invalidate_session(&self) {
         let mut last_auth = self
             .last_auth_time
@@ -178,20 +197,20 @@ impl CredentialManagerState {
             .unwrap_or_else(|e| e.into_inner());
         *last_auth = None;
 
-        // 只清除 db_key 缓存（用于 UI 层的数据库访问）
-        // 保留 master_key 缓存，允许后台服务继续加密新数据
+        // Clear only the database key used for authenticated UI reads.
+        // Retain the master key so background services can continue encrypting new data.
         {
             let mut cached_db = self.cached_db_key.lock().unwrap_or_else(|e| e.into_inner());
             *cached_db = None;
         }
-        // 不清除 master_key - 后台加密需要它
+        // Do not clear the master key; background encryption depends on it.
         // {
         //     let mut cached_master = self.cached_master_key.lock().unwrap_or_else(|e| e.into_inner());
         //     *cached_master = None;
         // }
     }
 
-    /// 完全清除所有缓存（应用退出或重置时调用）
+    /// Clears every cached key during shutdown or credential reset.
     pub fn clear_all_cached_keys(&self) {
         {
             let mut cached_db = self.cached_db_key.lock().unwrap_or_else(|e| e.into_inner());
@@ -213,15 +232,19 @@ impl CredentialManagerState {
         }
     }
 
-    /// 设置应用前台/后台状态
+    /// Updates the foreground/background state used by session policy.
     pub fn set_foreground_state(&self, in_foreground: bool) {
         let mut state = self
             .app_in_foreground
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *state = in_foreground;
+        // Do not hold app_in_foreground while invalidating the session.
+        // is_session_valid acquires last_auth_time before app_in_foreground,
+        // so retaining this guard here would create an AB-BA lock inversion.
+        drop(state);
 
-        // 如果进入后台，立即使会话失效（除非设置为永不超时）
+        // Moving to the background immediately expires ordinary UI sessions.
         let timeout = *self
             .session_timeout_secs
             .lock()
@@ -278,8 +301,9 @@ impl CredentialManagerState {
     }
 }
 
-/// 使用主密钥加密数据（AES-GCM）
-/// 返回格式: nonce(12字节) + 密文 + tag(16字节)
+/// Encrypts data with the master key using AES-GCM.
+///
+/// The result is `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
 pub fn encrypt_with_master_key(
     master_key: &[u8],
     plaintext: &[u8],
@@ -287,16 +311,16 @@ pub fn encrypt_with_master_key(
     let cipher = Aes256Gcm::new_from_slice(master_key)
         .map_err(|e| CredentialError::CryptoError(format!("Failed to create cipher: {}", e)))?;
 
-    // 生成随机 nonce
+    // Generate a fresh nonce for every encryption.
     let nonce_bytes: [u8; 12] = rand::random();
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    // 加密数据
+    // Authenticate and encrypt the plaintext.
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
         .map_err(|e| CredentialError::CryptoError(format!("Encryption failed: {}", e)))?;
 
-    // 组合结果: nonce + ciphertext
+    // Prefix the nonce so decryption can reconstruct the AEAD input.
     let mut result = Vec::with_capacity(12 + ciphertext.len());
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&ciphertext);
@@ -304,7 +328,7 @@ pub fn encrypt_with_master_key(
     Ok(result)
 }
 
-/// 使用主密钥解密数据
+/// Decrypts and authenticates data encrypted with the master key.
 pub fn decrypt_with_master_key(
     master_key: &[u8],
     encrypted: &[u8],
@@ -318,17 +342,17 @@ pub fn decrypt_with_master_key(
     let cipher = Aes256Gcm::new_from_slice(master_key)
         .map_err(|e| CredentialError::CryptoError(format!("Failed to create cipher: {}", e)))?;
 
-    // 提取 nonce 和密文
+    // Split the nonce prefix from ciphertext and authentication tag.
     let nonce = Nonce::from_slice(&encrypted[..12]);
     let ciphertext = &encrypted[12..];
 
-    // 解密数据
+    // Reject modified data through AES-GCM authentication.
     cipher
         .decrypt(nonce, ciphertext)
         .map_err(|e| CredentialError::CryptoError(format!("Decryption failed: {}", e)))
 }
 
-/// 将加密数据编码为 Base64（用于存储在 ChromaDB 等文本字段）
+/// Encrypts data and encodes it as Base64 for text-only storage fields.
 #[allow(dead_code)]
 pub fn encrypt_to_base64_with_master_key(
     master_key: &[u8],
@@ -341,7 +365,7 @@ pub fn encrypt_to_base64_with_master_key(
     ))
 }
 
-/// 从 Base64 解密数据
+/// Decodes Base64 and decrypts data with the master key.
 #[allow(dead_code)]
 pub fn decrypt_from_base64_with_master_key(
     master_key: &[u8],
@@ -357,7 +381,7 @@ pub fn decrypt_from_base64_with_master_key(
         .map_err(|e| CredentialError::CryptoError(format!("Invalid UTF-8: {}", e)))
 }
 
-/// 生成用于 SQLCipher 的数据库密钥
+/// Derives the SQLCipher database key from the master key.
 #[allow(dead_code)]
 pub fn derive_db_key_from_master(master_key: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
@@ -366,7 +390,7 @@ pub fn derive_db_key_from_master(master_key: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// 生成用于搜索盲索引的高强度 HMAC 密钥
+/// Derives the high-entropy HMAC key used by the blind search index.
 pub fn derive_hmac_key_from_master(master_key: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(b"CarbonPaper-HMAC-v2-");
@@ -374,7 +398,7 @@ pub fn derive_hmac_key_from_master(master_key: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// 使用公钥派生弱数据库密钥（不需要用户认证）
+/// Derives the intentionally weak bootstrap database key from public material.
 pub fn derive_db_key_from_public_key(public_key: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(public_key);
@@ -382,7 +406,7 @@ pub fn derive_db_key_from_public_key(public_key: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// 将数据库密钥转换为 SQLCipher 可用的十六进制格式
+/// Formats a database key as a SQLCipher hexadecimal key literal.
 #[allow(dead_code)]
 pub fn db_key_to_hex(key: &[u8]) -> String {
     format!("x'{}'", hex::encode(key))
@@ -392,7 +416,7 @@ pub fn db_key_to_hex(key: &[u8]) -> String {
 mod windows_impl {
     use super::*;
 
-    /// 从 CNG RSA 密钥导出公钥（不触发任何 UI 弹窗）
+    /// Exports the CNG RSA public key without invoking protected private-key UI.
     pub fn export_cng_public_key() -> Result<Vec<u8>, CredentialError> {
         use windows::core::HSTRING;
         use windows::Win32::Security::Cryptography::{
@@ -404,8 +428,10 @@ mod windows_impl {
         let blob_type = HSTRING::from("RSAPUBLICBLOB");
         let blob_pcwstr = windows::core::PCWSTR::from_raw(blob_type.as_ptr());
 
-        // 第一次调用获取输出大小
+        // Query the output size before allocating the public-key blob.
         let mut out_len: u32 = 0;
+        // SAFETY: `key` is a live CNG key handle; the blob type string and output-length
+        // pointer remain valid for the synchronous size query, which has no output buffer.
         unsafe {
             NCryptExportKey(
                 key,
@@ -418,11 +444,14 @@ mod windows_impl {
             )
         }
         .map_err(|e| {
+            // SAFETY: `key` is still owned by this function and has not been freed.
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
             CredentialError::SystemError(format!("NCryptExportKey size failed: {}", e))
         })?;
 
         let mut output = vec![0u8; out_len as usize];
+        // SAFETY: the output slice owns at least the size reported by CNG and remains
+        // live and uniquely mutable for the synchronous export call.
         unsafe {
             NCryptExportKey(
                 key,
@@ -435,10 +464,12 @@ mod windows_impl {
             )
         }
         .map_err(|e| {
+            // SAFETY: `key` is still owned by this function and has not been freed.
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
             CredentialError::SystemError(format!("NCryptExportKey failed: {}", e))
         })?;
 
+        // SAFETY: this is the final use of the owned CNG key handle.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
         output.truncate(out_len as usize);
         Ok(output)
@@ -462,6 +493,8 @@ mod windows_impl {
 
         let mut provider = NCRYPT_PROV_HANDLE::default();
         let provider_name = HSTRING::from(CNG_PROVIDER_NAME);
+        // SAFETY: `provider_name` is a live NUL-terminated HSTRING and `provider` points
+        // to writable handle storage that CNG initializes synchronously.
         unsafe {
             NCryptOpenStorageProvider(&mut provider, PCWSTR::from_raw(provider_name.as_ptr()), 0)
         }
@@ -469,6 +502,8 @@ mod windows_impl {
 
         let blob_type = HSTRING::from("RSAPUBLICBLOB");
         let mut key = NCRYPT_KEY_HANDLE::default();
+        // SAFETY: provider is live, the blob type and public-key slice remain valid, and
+        // `key` points to writable storage for the imported handle.
         unsafe {
             NCryptImportKey(
                 provider,
@@ -481,11 +516,14 @@ mod windows_impl {
             )
         }
         .map_err(|e| {
+            // SAFETY: provider is owned here and import did not transfer that ownership.
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
             CredentialError::SystemError(format!("NCryptImportKey public key failed: {}", e))
         })?;
 
         let mut out_len: u32 = 0;
+        // SAFETY: key and plaintext are live for the call; a null output buffer requests
+        // only the required ciphertext length.
         unsafe {
             NCryptEncrypt(
                 key,
@@ -497,12 +535,16 @@ mod windows_impl {
             )
         }
         .map_err(|e| {
+            // SAFETY: both handles remain owned here and are freed once on this path.
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+            // SAFETY: provider remains live and owned after the key is released.
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
             CredentialError::SystemError(format!("NCryptEncrypt public size failed: {}", e))
         })?;
 
         let mut output = vec![0u8; out_len as usize];
+        // SAFETY: output is uniquely mutable and at least the size CNG reported; all
+        // input slices and handles remain live until the synchronous call returns.
         unsafe {
             NCryptEncrypt(
                 key,
@@ -514,22 +556,26 @@ mod windows_impl {
             )
         }
         .map_err(|e| {
+            // SAFETY: both handles remain owned here and are freed once on this path.
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+            // SAFETY: provider remains live and owned after the key is released.
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
             CredentialError::SystemError(format!("NCryptEncrypt public failed: {}", e))
         })?;
 
+        // SAFETY: these are the final uses of the owned imported key and provider handles.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+        // SAFETY: the provider is no longer needed after the imported key is released.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
         output.truncate(out_len as usize);
         Ok(output)
     }
 
-    /// 导出或获取缓存的公钥（同步，不触发任何 UI 弹窗）
+    /// Returns the cached exported public key without showing authentication UI.
     pub fn export_or_get_public_key(
         state: &CredentialManagerState,
     ) -> Result<Vec<u8>, CredentialError> {
-        // 首先检查是否有缓存的公钥
+        // Prefer the in-memory public key cache.
         {
             let cached = state
                 .cached_public_key
@@ -540,10 +586,10 @@ mod windows_impl {
             }
         }
 
-        // 从 CNG 导出公钥
+        // Export from CNG only on a cache miss.
         let public_key = export_cng_public_key()?;
 
-        // 缓存公钥
+        // Cache the immutable public blob for background encryption.
         {
             let mut cached = state
                 .cached_public_key
@@ -555,15 +601,15 @@ mod windows_impl {
         Ok(public_key)
     }
 
-    /// 强制验证用户身份并解锁主密钥
+    /// Forces user verification and unlocks the master key.
     ///
-    /// 策略：
-    /// - 冷启动（master key 未缓存）：主进程内直接 CNG 解密
-    ///   → 一次弹窗，且主进程 CNG PIN 缓存生效，后续 row key 解密无需再弹
-    /// - 锁定后解锁（master key 已缓存）：spawn 子进程执行 CNG 解密
-    ///   → 子进程无 PIN 缓存，强制弹窗；主进程 CNG 缓存仍在，row key 解密无额外弹窗
+    /// Cold start decrypts in the main process so one prompt establishes the CNG PIN
+    /// cache used by later row-key reads. Re-unlocking an already cached master key uses
+    /// a short-lived child process with no PIN cache, forcing fresh user verification
+    /// without disrupting the main process cache used for subsequent reads.
     pub fn force_verify_and_unlock_master_key(
         state: &CredentialManagerState,
+        owner_hwnd: Option<isize>,
     ) -> Result<Vec<u8>, CredentialError> {
         let key_file = state.master_key_file_path();
         if !key_file.exists() {
@@ -573,15 +619,15 @@ mod windows_impl {
         let already_cached = get_cached_master_key(state).is_some();
 
         let master_key = if already_cached {
-            // 锁定后解锁：主进程 CNG 已缓存不会弹窗，用子进程强制验证
-            verify_via_subprocess(&key_file)?
+            // A child process bypasses the main process's existing CNG PIN cache.
+            verify_via_subprocess(&key_file, owner_hwnd)?
         } else {
-            // 冷启动：主进程内直接解密，让 CNG PIN 缓存留在主进程中
+            // Cold start keeps the new CNG PIN cache in the main process.
             let file_data = std::fs::read(&key_file).map_err(|e| {
                 CredentialError::SystemError(format!("Failed to read master key file: {}", e))
             })?;
             let ciphertext = decode_master_key_file(&file_data)?;
-            decrypt_master_key_with_cng(&ciphertext)?
+            decrypt_master_key_with_cng_for_window(&ciphertext, owner_hwnd)?
         };
 
         {
@@ -595,15 +641,21 @@ mod windows_impl {
         Ok(master_key)
     }
 
-    /// 通过独立子进程执行 CNG 解密，绕过主进程的 PIN 缓存
-    fn verify_via_subprocess(key_file: &std::path::Path) -> Result<Vec<u8>, CredentialError> {
+    /// Runs CNG decryption in a child process to bypass the main process PIN cache.
+    fn verify_via_subprocess(
+        key_file: &std::path::Path,
+        owner_hwnd: Option<isize>,
+    ) -> Result<Vec<u8>, CredentialError> {
         let exe_path = std::env::current_exe().map_err(|e| {
             CredentialError::SystemError(format!("Failed to get current exe: {}", e))
         })?;
 
-        let output = std::process::Command::new(&exe_path)
-            .arg("--cng-unlock")
-            .arg(key_file)
+        let mut command = std::process::Command::new(&exe_path);
+        command.arg("--cng-unlock").arg(key_file);
+        if let Some(hwnd) = owner_hwnd {
+            command.arg(hwnd.to_string());
+        }
+        let output = command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -646,7 +698,7 @@ mod windows_impl {
         }
     }
 
-    /// 通过 Windows Hello 解锁并缓存主密钥
+    /// Unlocks and caches the master key through Windows Hello/CNG verification.
     #[allow(dead_code)]
     pub async fn unlock_master_key(
         state: &CredentialManagerState,
@@ -701,23 +753,24 @@ pub fn encrypt_with_exported_public_key(
     ))
 }
 
-/// 仅在首次使用时生成主密钥（不触发 Windows Hello）
-/// 如果主密钥已存在（缓存或文件），不做任何操作
-/// 用于 credential_initialize，避免冷启动时触发两次 Windows Hello
+/// Creates the master key on first use without invoking Windows Hello.
+///
+/// Existing cached or persisted keys are left untouched. This bootstrap path prevents
+/// `credential_initialize` from prompting twice during a cold start.
 #[cfg(windows)]
 pub fn ensure_master_key_created(state: &CredentialManagerState) -> Result<(), CredentialError> {
-    // 已缓存，无需操作
+    // An existing cached master key needs no bootstrap work.
     if get_cached_master_key(state).is_some() {
         return Ok(());
     }
 
     let key_file = state.master_key_file_path();
     if key_file.exists() {
-        // 主密钥文件已存在，稍后由 credential_verify_user 解锁
+        // A persisted key will be unlocked later by `credential_verify_user`.
         return Ok(());
     }
 
-    // 首次使用：生成新主密钥并用 CNG 公钥封装（不弹窗）
+    // First use: generate a master key and wrap it with the public key without UI.
     let mut master_key = vec![0u8; MASTER_KEY_LEN];
     rand::thread_rng().fill_bytes(&mut master_key);
 
@@ -759,7 +812,7 @@ pub async fn ensure_master_key_ready(
         return Ok(master_key);
     }
 
-    // 生成新主密钥并用 CNG/NCrypt 公钥封装（不弹窗）
+    // Generate a new master key and wrap it with the exported CNG public key.
     let mut master_key = vec![0u8; MASTER_KEY_LEN];
     rand::thread_rng().fill_bytes(&mut master_key);
 
@@ -786,7 +839,7 @@ pub async fn ensure_master_key_ready(
     Ok(master_key)
 }
 
-/// 检查是否需要认证
+/// Returns whether protected UI access requires authentication.
 #[allow(dead_code)]
 fn ensure_session_valid(state: &CredentialManagerState) -> Result<(), CredentialError> {
     if !state.is_session_valid() {
@@ -795,7 +848,7 @@ fn ensure_session_valid(state: &CredentialManagerState) -> Result<(), Credential
     Ok(())
 }
 
-/// 获取缓存的主密钥
+/// Returns a copy of the cached master key, if unlocked.
 pub fn get_cached_master_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
     state
         .cached_master_key
@@ -804,7 +857,7 @@ pub fn get_cached_master_key(state: &CredentialManagerState) -> Option<Vec<u8>> 
         .clone()
 }
 
-/// 获取缓存的数据库密钥
+/// Returns a copy of the cached database key, if authenticated.
 #[allow(dead_code)]
 pub fn get_cached_db_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
     state
@@ -814,7 +867,7 @@ pub fn get_cached_db_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
         .clone()
 }
 
-/// 获取缓存的公钥
+/// Returns a copy of the cached public key, if loaded.
 pub fn get_cached_public_key(state: &CredentialManagerState) -> Option<Vec<u8>> {
     state
         .cached_public_key
@@ -823,24 +876,24 @@ pub fn get_cached_public_key(state: &CredentialManagerState) -> Option<Vec<u8>> 
         .clone()
 }
 
-/// 获取或创建数据库密钥（同步版本，用于数据库初始化）
+/// Returns or derives the database key synchronously during storage initialization.
 #[allow(dead_code)]
 pub fn get_or_create_db_key_sync(
     state: &CredentialManagerState,
 ) -> Result<Vec<u8>, CredentialError> {
-    // 先检查缓存
+    // Prefer the authenticated database-key cache.
     if let Some(key) = get_cached_db_key(state) {
         return Ok(key);
     }
 
-    // 需要有效认证会话
+    // Deriving a read key requires a valid UI session.
     ensure_session_valid(state)?;
 
-    // 获取主密钥（必须已解锁缓存）
+    // The master key must already be unlocked and cached.
     let master_key = get_or_create_master_key_sync(state)?;
     let db_key = derive_db_key_from_master(&master_key);
 
-    // 更新缓存
+    // Cache the derived database key for the authenticated session.
     {
         let mut cached_db = state
             .cached_db_key
@@ -852,7 +905,7 @@ pub fn get_or_create_db_key_sync(
     Ok(db_key)
 }
 
-/// 获取或创建主密钥（同步版本）
+/// Returns the cached master key or reports that authentication is required.
 #[allow(dead_code)]
 pub fn get_or_create_master_key_sync(
     state: &CredentialManagerState,
@@ -861,7 +914,7 @@ pub fn get_or_create_master_key_sync(
         return Ok(key);
     }
 
-    // 未解锁，强制要求认证
+    // Refuse private-key access until the user explicitly unlocks the session.
     Err(CredentialError::AuthRequired)
 }
 
@@ -876,21 +929,25 @@ fn open_or_create_cng_key(
         NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG, NCRYPT_UI_POLICY,
     };
 
-    // 属性名称常量
+    // CNG property names.
     const LENGTH_PROP: &str = "Length";
     const UI_POLICY_PROP: &str = "UI Policy";
 
-    // 打开 Software KSP
+    // Open the Microsoft Software Key Storage Provider.
     let mut provider = NCRYPT_PROV_HANDLE::default();
     let provider_name = HSTRING::from(CNG_PROVIDER_NAME);
     let provider_pcwstr = PCWSTR::from_raw(provider_name.as_ptr());
+    // SAFETY: the provider name is a live NUL-terminated HSTRING and `provider` points
+    // to writable storage initialized synchronously by CNG.
     unsafe { NCryptOpenStorageProvider(&mut provider, provider_pcwstr, 0) }
         .map_err(|e| CredentialError::SystemError(format!("Failed to open CNG provider: {}", e)))?;
 
-    // 尝试打开已存在的密钥
+    // Reuse the persisted key when it already exists.
     let mut key = NCRYPT_KEY_HANDLE::default();
     let key_name = HSTRING::from(CNG_KEY_NAME);
     let key_pcwstr = PCWSTR::from_raw(key_name.as_ptr());
+    // SAFETY: provider and key-name storage remain live; `key` is valid writable output
+    // storage and CNG does not retain any Rust pointer.
     let open_result = unsafe {
         NCryptOpenKey(
             provider,
@@ -902,12 +959,16 @@ fn open_or_create_cng_key(
     };
 
     if open_result.is_ok() {
+        // SAFETY: the provider handle is owned here; the opened key remains independently
+        // valid after the provider reference is released.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
         return Ok(key);
     }
 
-    // 密钥不存在，创建新密钥
+    // Create a new persisted key when the lookup failed.
     let mut new_key = NCRYPT_KEY_HANDLE::default();
+    // SAFETY: provider and algorithm/key-name strings are live, and `new_key` is writable
+    // handle storage. Ownership of the returned key remains with this function.
     unsafe {
         NCryptCreatePersistedKey(
             provider,
@@ -919,14 +980,17 @@ fn open_or_create_cng_key(
         )
     }
     .map_err(|e| {
+        // SAFETY: provider is still owned here because key creation failed.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
         CredentialError::SystemError(format!("Failed to create CNG key: {}", e))
     })?;
 
-    // 设置 RSA 密钥长度为 2048 位
+    // Configure a 2048-bit RSA key before finalization.
     let key_length: u32 = 2048;
     let length_name = HSTRING::from(LENGTH_PROP);
     let length_pcwstr = PCWSTR::from_raw(length_name.as_ptr());
+    // SAFETY: `new_key` is an unfinalized live key, the property name is live, and the
+    // four-byte property value slice has the documented representation.
     unsafe {
         NCryptSetProperty(
             new_key,
@@ -936,13 +1000,14 @@ fn open_or_create_cng_key(
         )
     }
     .map_err(|e| {
+        // SAFETY: both handles remain owned here and are released once on this path.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(new_key.0)) };
+        // SAFETY: provider remains owned after releasing the failed key.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
         CredentialError::SystemError(format!("Failed to set key length: {}", e))
     })?;
 
-    // 设置 UI Policy - 强制高保护（解密时弹出系统级对话框）
-    // 注意：这是关键步骤，确保私钥操作需要用户确认
+    // Force high-protection UI so private-key operations require OS-mediated consent.
     let ui_policy = NCRYPT_UI_POLICY {
         dwVersion: 1,
         dwFlags: NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG,
@@ -953,6 +1018,8 @@ fn open_or_create_cng_key(
 
     let policy_name = HSTRING::from(UI_POLICY_PROP);
     let policy_pcwstr = PCWSTR::from_raw(policy_name.as_ptr());
+    // SAFETY: `ui_policy` is a fully initialized plain C-layout structure; the byte slice
+    // covers exactly that live value and is used only during the following synchronous call.
     let policy_bytes = unsafe {
         std::slice::from_raw_parts(
             &ui_policy as *const NCRYPT_UI_POLICY as *const u8,
@@ -960,21 +1027,29 @@ fn open_or_create_cng_key(
         )
     };
 
+    // SAFETY: the key, property name, and policy byte slice are valid and live for the
+    // synchronous property update.
     unsafe { NCryptSetProperty(new_key, policy_pcwstr, policy_bytes, NCRYPT_FLAGS(0)) }.map_err(
         |e| {
+            // SAFETY: both handles remain owned here and are released once on this path.
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(new_key.0)) };
+            // SAFETY: provider remains owned after releasing the failed key.
             let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
             CredentialError::SystemError(format!("Failed to set UI policy: {}", e))
         },
     )?;
 
-    // 最终确定密钥
+    // Finalize only after the length and UI policy are installed.
+    // SAFETY: `new_key` is a live unfinalized key configured by the calls above.
     unsafe { NCryptFinalizeKey(new_key, NCRYPT_FLAGS(0)) }.map_err(|e| {
+        // SAFETY: both handles remain owned here and are released once on this path.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(new_key.0)) };
+        // SAFETY: provider remains owned after releasing the failed key.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
         CredentialError::SystemError(format!("Failed to finalize CNG key: {}", e))
     })?;
 
+    // SAFETY: provider ownership ends here; the finalized persisted key handle remains valid.
     let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
     Ok(new_key)
 }
@@ -987,9 +1062,10 @@ fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialE
 
     let key = open_or_create_cng_key()?;
 
-    // 使用 PKCS1 padding（更广泛支持）
-    // 第一次调用获取输出大小
+    // Use PKCS#1 v1.5 padding for compatibility and query the output size first.
     let mut out_len: u32 = 0;
+    // SAFETY: key and master-key input are live; the null output buffer requests only
+    // the required ciphertext length.
     unsafe {
         NCryptEncrypt(
             key,
@@ -1001,11 +1077,14 @@ fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialE
         )
     }
     .map_err(|e| {
+        // SAFETY: key ownership remains local when encryption fails.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
         CredentialError::SystemError(format!("NCryptEncrypt size failed: {}", e))
     })?;
 
     let mut output = vec![0u8; out_len as usize];
+    // SAFETY: output is uniquely mutable and sized from CNG's query; key and input remain
+    // live for the synchronous encryption call.
     unsafe {
         NCryptEncrypt(
             key,
@@ -1017,10 +1096,12 @@ fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialE
         )
     }
     .map_err(|e| {
+        // SAFETY: key ownership remains local when encryption fails.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
         CredentialError::SystemError(format!("NCryptEncrypt failed: {}", e))
     })?;
 
+    // SAFETY: this is the final use of the owned key handle.
     let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
     output.truncate(out_len as usize);
     Ok(output)
@@ -1028,30 +1109,70 @@ fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialE
 
 #[cfg(windows)]
 pub fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    use windows::Win32::Security::Cryptography::{
-        NCryptDecrypt, NCryptFreeObject, NCRYPT_HANDLE, NCRYPT_PAD_PKCS1_FLAG,
-    };
+    decrypt_master_key_with_cng_for_window(ciphertext, None)
+}
+
+#[cfg(windows)]
+pub fn decrypt_master_key_with_cng_for_window(
+    ciphertext: &[u8],
+    owner_hwnd: Option<isize>,
+) -> Result<Vec<u8>, CredentialError> {
+    use windows::Win32::Security::Cryptography::NCRYPT_PAD_PKCS1_FLAG;
+
+    decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG, owner_hwnd)
+}
+
+#[cfg(windows)]
+fn decrypt_master_key_with_cng_flags(
+    ciphertext: &[u8],
+    flags: windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
+    owner_hwnd: Option<isize>,
+) -> Result<Vec<u8>, CredentialError> {
+    use windows::Win32::Foundation::NTE_SILENT_CONTEXT;
+    use windows::Win32::Security::Cryptography::{NCryptDecrypt, NCryptFreeObject, NCRYPT_HANDLE};
 
     let key = open_or_create_cng_key()?;
-
-    // 第一次调用获取输出大小
-    let mut out_len: u32 = 0;
-    unsafe {
-        NCryptDecrypt(
-            key,
-            Some(ciphertext),
-            None,
-            None,
-            &mut out_len,
-            NCRYPT_PAD_PKCS1_FLAG,
-        )
+    if let Some(hwnd) = owner_hwnd {
+        use windows::Win32::Security::Cryptography::{
+            NCryptSetProperty, NCRYPT_WINDOW_HANDLE_PROPERTY,
+        };
+        let hwnd_bytes = (hwnd as usize).to_ne_bytes();
+        // SAFETY: key is live and `hwnd_bytes` has the native pointer width expected by
+        // `NCRYPT_WINDOW_HANDLE_PROPERTY`; the slice is used synchronously.
+        unsafe {
+            NCryptSetProperty(
+                key,
+                NCRYPT_WINDOW_HANDLE_PROPERTY,
+                &hwnd_bytes,
+                windows::Win32::Security::Cryptography::NCRYPT_FLAGS(0),
+            )
+        }
+        .map_err(|e| {
+            // SAFETY: key ownership remains local when setting the property fails.
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+            CredentialError::SystemError(format!("Failed to set CNG owner window: {}", e))
+        })?;
     }
-    .map_err(|e| {
-        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-        CredentialError::SystemError(format!("NCryptDecrypt size failed: {}", e))
-    })?;
+
+    // Query plaintext size before allocating the output buffer.
+    let mut out_len: u32 = 0;
+    // SAFETY: key and ciphertext are live; the null output buffer requests only the
+    // plaintext length and `out_len` points to writable stack storage.
+    unsafe { NCryptDecrypt(key, Some(ciphertext), None, None, &mut out_len, flags) }.map_err(
+        |e| {
+            // SAFETY: key ownership remains local when decryption fails.
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+            if e.code() == NTE_SILENT_CONTEXT {
+                CredentialError::AuthRequired
+            } else {
+                CredentialError::SystemError(format!("NCryptDecrypt size failed: {}", e))
+            }
+        },
+    )?;
 
     let mut output = vec![0u8; out_len as usize];
+    // SAFETY: output is uniquely mutable and sized from CNG's query; all handles and
+    // input/output slices remain live until the synchronous call returns.
     unsafe {
         NCryptDecrypt(
             key,
@@ -1059,22 +1180,39 @@ pub fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, Credent
             None,
             Some(output.as_mut_slice()),
             &mut out_len,
-            NCRYPT_PAD_PKCS1_FLAG,
+            flags,
         )
     }
     .map_err(|e| {
+        // SAFETY: key ownership remains local when decryption fails.
         let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-        CredentialError::SystemError(format!("NCryptDecrypt failed: {}", e))
+        if e.code() == NTE_SILENT_CONTEXT {
+            CredentialError::AuthRequired
+        } else {
+            CredentialError::SystemError(format!("NCryptDecrypt failed: {}", e))
+        }
     })?;
 
+    // SAFETY: this is the final use of the owned key handle.
     let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
     output.truncate(out_len as usize);
     Ok(output)
 }
 
-/// 使用 CNG 私钥解封装行密钥（触发系统级 UI）
+/// Unwraps a row key with the protected CNG private key, allowing OS UI.
 pub fn decrypt_row_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
     decrypt_master_key_with_cng(ciphertext)
+}
+
+/// Silently unwraps a row key with CNG and never displays authentication UI.
+///
+/// Returns [`CredentialError::AuthRequired`] when user interaction would be needed so
+/// background callers can wait for an explicit unlock.
+#[cfg(windows)]
+pub fn decrypt_row_key_with_cng_silent(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+    use windows::Win32::Security::Cryptography::{NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG};
+
+    decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG, None)
 }
 
 fn encode_master_key_file(ciphertext: &[u8]) -> Vec<u8> {
@@ -1100,7 +1238,7 @@ pub fn decode_master_key_file(data: &[u8]) -> Result<Vec<u8>, CredentialError> {
     Ok(data[MASTER_KEY_FILE_MAGIC.len()..].to_vec())
 }
 
-/// 从文件加载公钥并缓存（无需用户交互）
+/// Loads and caches the public key file without user interaction.
 pub fn load_public_key_from_file(
     state: &CredentialManagerState,
 ) -> Result<Vec<u8>, CredentialError> {
@@ -1127,14 +1265,14 @@ pub fn load_public_key_from_file(
     Ok(public_key)
 }
 
-/// 保存公钥到文件（用于后续无需交互的访问）
+/// Persists the public key for future unattended encryption.
 pub fn save_public_key_to_file(
     state: &CredentialManagerState,
     public_key: &[u8],
 ) -> Result<(), CredentialError> {
     let key_file = state.file_path("credential_public_key.bin");
 
-    // 确保目录存在
+    // Create the parent directory before atomically writing the public key.
     if let Some(parent) = key_file.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             CredentialError::SystemError(format!("Failed to create directory: {}", e))
@@ -1154,9 +1292,35 @@ pub fn decrypt_row_key_with_cng(_ciphertext: &[u8]) -> Result<Vec<u8>, Credentia
     ))
 }
 
+#[cfg(not(windows))]
+pub fn decrypt_row_key_with_cng_silent(_ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+    Err(CredentialError::SystemError(
+        "CNG is only available on Windows".to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locking_ui_session_preserves_background_master_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = CredentialManagerState::new(temp.path().to_path_buf());
+        *state
+            .cached_master_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(vec![9u8; MASTER_KEY_LEN]);
+        state.update_auth_time();
+
+        state.invalidate_session();
+
+        assert!(!state.is_session_valid());
+        assert_eq!(
+            get_cached_master_key(&state),
+            Some(vec![9u8; MASTER_KEY_LEN])
+        );
+    }
 
     #[test]
     fn test_encrypt_decrypt() {

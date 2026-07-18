@@ -89,7 +89,7 @@ def test_supervisor_restarts_on_response_mismatch():
     proc = supervisor._proc
 
     with pytest.raises(WorkerProtocolError):
-        supervisor.request("process_ocr", timeout=1)
+        supervisor.request("enqueue_ocr_postprocess", timeout=1)
 
     assert proc.terminated
     snapshot = supervisor.status_snapshot()
@@ -103,11 +103,11 @@ def test_supervisor_logs_response_mismatch_keys(caplog):
 
     with caplog.at_level(logging.ERROR):
         with pytest.raises(WorkerProtocolError):
-            supervisor.request("process_ocr", timeout=1)
+            supervisor.request("enqueue_ocr_postprocess", timeout=1)
 
     text = caplog.text
     assert "protocol desync" in text
-    assert "expected_command=process_ocr" in text
+    assert "expected_command=enqueue_ocr_postprocess" in text
     assert "result_keys=['stats', 'status']" in text
 
 
@@ -191,7 +191,7 @@ def test_model_worker_status_snapshot_does_not_wait_for_busy_lock():
     worker._proc = FakeProc()
     worker._conn = EchoConn()
     worker._state = "busy"
-    worker._current_command = "process_ocr"
+    worker._current_command = "enqueue_ocr_postprocess"
 
     locked = threading.Event()
     release = threading.Event()
@@ -215,5 +215,5 @@ def test_model_worker_status_snapshot_does_not_wait_for_busy_lock():
     assert time.perf_counter() - started < 0.2
     assert stats["watchdog"]["name"] == "CarbonModelWorker"
     assert stats["watchdog"]["state"] == "busy"
-    assert stats["watchdog"]["current_command"] == "process_ocr"
+    assert stats["watchdog"]["current_command"] == "enqueue_ocr_postprocess"
     assert stats["watchdog"]["lock_contended"] is True

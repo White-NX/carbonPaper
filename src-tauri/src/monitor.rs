@@ -1,3 +1,8 @@
+//! Python monitor process orchestration and resource-control policy.
+//!
+//! This module owns monitor startup, authenticated named-pipe communication, Job Object
+//! limits, game-mode suppression, restart behavior, and frontend lifecycle events.
+
 use crate::capture::CaptureState;
 #[cfg(test)]
 use crate::monitor_ipc::parse_ipc_response;
@@ -141,16 +146,22 @@ impl Deref for JobHandle {
 
 impl Drop for JobHandle {
     fn drop(&mut self) {
+        // SAFETY: this wrapper exclusively owns the live Job Object handle and closes it
+        // exactly once after the monitor state releases the wrapper.
         unsafe {
             let _ = CloseHandle(self.0);
         }
     }
 }
 
+// SAFETY: Windows Job Object handles are opaque kernel references that may be moved
+// between threads; Rust ownership still guarantees a single close.
 unsafe impl Send for JobHandle {}
+// SAFETY: concurrent Job Object operations do not expose aliased Rust memory and are
+// supported by the Windows kernel handle model.
 unsafe impl Sync for JobHandle {}
 
-// 重试配置
+// Retry policy for monitor startup and named-pipe connection establishment.
 const MAX_RETRIES: u32 = 10;
 const RETRY_DELAY_MS: u64 = 100;
 const STARTUP_MAX_WAIT_MS: u64 = 15_000;
@@ -335,7 +346,6 @@ pub async fn send_ipc_request_reused(
         .and_then(|v| v.as_str())
         .unwrap_or("<unknown>")
         .to_string();
-    let is_process_ocr = command_name == "process_ocr";
     let requested_timeout_secs = req
         .get("timeout_secs")
         .and_then(|v| v.as_u64())
@@ -345,23 +355,13 @@ pub async fn send_ipc_request_reused(
         "status" | "pause" | "resume" | "continue" => 5,
         _ => 30,
     };
-    let min_timeout_secs = if is_process_ocr { 30 } else { 1 };
     let ipc_timeout_secs = requested_timeout_secs
         .unwrap_or(default_timeout_secs)
-        .clamp(min_timeout_secs, 605);
+        .clamp(1, 605);
     let ipc_started = std::time::Instant::now();
     let keepalive = command_name != "stop";
     if let Some(obj) = req.as_object_mut() {
         obj.insert("_ipc_keepalive".to_string(), Value::Bool(keepalive));
-    }
-
-    if is_process_ocr {
-        tracing::debug!(
-            "[DIAG:IPC] start reused command={} seq_no={} pipe={}",
-            command_name,
-            seq_no,
-            pipe_name
-        );
     }
 
     let mut persistent = {
@@ -384,21 +384,12 @@ pub async fn send_ipc_request_reused(
         }
     };
 
-    let result = send_ipc_request_on_client(
-        &mut persistent.client,
-        &req,
-        &command_name,
-        seq_no,
-        ipc_timeout_secs,
-        ipc_started,
-        is_process_ocr,
-    )
-    .await;
+    let result = send_ipc_request_on_client(&mut persistent.client, &req, ipc_timeout_secs).await;
 
     match &result {
         Ok(_) if keepalive => {
             persistent.requests = persistent.requests.saturating_add(1);
-            if is_process_ocr || persistent.requests % 100 == 0 {
+            if persistent.requests % 100 == 0 {
                 tracing::debug!(
                     "[DIAG:IPC] persistent request done command={} seq_no={} reused_count={} elapsed={}ms",
                     command_name,
@@ -442,8 +433,10 @@ pub async fn send_ipc_request_reused(
     result
 }
 
-/// 动态设置 Job Object 的 CPU 限制
+/// Updates the Job Object CPU cap at runtime.
 fn set_job_cpu_limit(handle: HANDLE, enabled: bool, percent: u32) -> Result<(), String> {
+    // SAFETY: `handle` is a live Job Object owned by monitor state; `cpu_info` has the
+    // exact layout and byte size required by `JobObjectCpuRateControlInformation`.
     unsafe {
         let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
         if enabled && percent > 0 {
@@ -463,11 +456,14 @@ fn set_job_cpu_limit(handle: HANDLE, enabled: bool, percent: u32) -> Result<(), 
     }
 }
 
-/// RAII guard：在 drop 时自动恢复 Job Object 的 CPU 限制
+/// RAII guard that restores the configured Job Object CPU cap on drop.
 struct CpuLimitGuard {
-    job_handle_raw: isize, // 存储原始值，避免 HANDLE (*mut c_void) 导致 !Send
+    // Store the value rather than HANDLE so the guard can cross async thread boundaries.
+    job_handle_raw: isize,
 }
 
+// SAFETY: the stored value names a Job Object kept alive by `MonitorState` for the
+// guard's lifetime; moving the integer between threads does not transfer ownership.
 unsafe impl Send for CpuLimitGuard {}
 
 impl Drop for CpuLimitGuard {
@@ -545,15 +541,6 @@ fn apply_monitor_side_effects(
             let Some(capture_state) = capture_state else {
                 return;
             };
-            // Update Rust-side backpressure config
-            let capture_on_ocr_busy = payload
-                .get("capture_on_ocr_busy")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let ocr_queue_max_size = payload
-                .get("ocr_queue_max_size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
             let ocr_timeout_secs = payload
                 .get("ocr_timeout_secs")
                 .and_then(|v| v.as_u64())
@@ -562,12 +549,6 @@ fn apply_monitor_side_effects(
                 })
                 .clamp(30, 600) as u32;
 
-            capture_state
-                .capture_on_ocr_busy
-                .store(capture_on_ocr_busy, Ordering::SeqCst);
-            capture_state
-                .ocr_queue_max_size
-                .store(ocr_queue_max_size, Ordering::SeqCst);
             capture_state
                 .ocr_timeout_secs
                 .store(ocr_timeout_secs, Ordering::SeqCst);
@@ -650,16 +631,12 @@ pub async fn monitor_update_advanced_config(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
-    capture_on_ocr_busy: bool,
-    ocr_queue_max_size: u32,
     ocr_timeout_secs: u32,
     clustering_allow_full_low_memory: bool,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let payload = serde_json::json!({
         "command": "update_advanced_config",
-        "capture_on_ocr_busy": capture_on_ocr_busy,
-        "ocr_queue_max_size": ocr_queue_max_size,
         "ocr_timeout_secs": ocr_timeout_secs,
         "clustering_allow_full_low_memory": clustering_allow_full_low_memory,
     });
@@ -681,19 +658,6 @@ pub async fn monitor_update_feature_config(
             "clustering_enabled": clustering_enabled,
             "classification_enabled": classification_enabled,
         }),
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn monitor_get_all_models(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
-) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({ "command": "get_all_models" }),
     )
     .await
 }
@@ -962,12 +926,15 @@ pub async fn forward_command_to_python(
 }
 
 fn create_job_object(cpu_limit_enabled: bool, cpu_limit_percent: u32) -> Result<JobHandle, String> {
+    // SAFETY: information structures match their Job Object information classes and
+    // remain alive for each call. The new handle is closed on all error paths or moved
+    // into `JobHandle`, which enforces single-close ownership.
     unsafe {
-        // 创建 Job Object
+        // Create the Job Object before applying resource and lifetime policies.
         let handle = CreateJobObjectW(None, None)
             .map_err(|e| format!("Failed to create job object: {:?}", e))?;
 
-        // 设置 CPU 限制（仅在启用时）
+        // Apply the CPU cap only when enabled.
         if cpu_limit_enabled && cpu_limit_percent > 0 {
             let mut cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
             cpu_info.ControlFlags =
@@ -980,12 +947,12 @@ fn create_job_object(cpu_limit_enabled: bool, cpu_limit_percent: u32) -> Result<
                 &cpu_info as *const _ as *const _,
                 std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
             ) {
-                let _ = CloseHandle(handle); // 确保清理资源
+                let _ = CloseHandle(handle);
                 return Err(format!("Failed to set CPU limit: {:?}", e));
             }
         }
 
-        // 设置"父进程退出则子进程自杀"
+        // Ensure children terminate when CarbonPaper closes the last Job handle.
         let mut limit_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limit_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
@@ -1409,6 +1376,22 @@ pub async fn start_monitor_impl(
             .env("CARBONPAPER_REVERSE_IPC_TOKEN", &reverse_ipc_auth_token)
             .env("PROFILING_ENABLED", "1");
 
+        match crate::ml_runtime::resolve_ocr_model_path(&app) {
+            Ok(path) => {
+                cmd_proc.env("CARBONPAPER_OCR_MODEL_DIR", path);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Bundled PP-OCRv5 Mobile model is unavailable; monitor will start with OCR degraded until the model is repaired: {}",
+                    error
+                );
+            }
+        }
+        cmd_proc.env(
+            "CARBONPAPER_REQUIRE_OCR_MODEL",
+            (!cfg!(debug_assertions)).to_string(),
+        );
+
         // Pass the current storage.data_dir to the child process to ensure that Python uses the correct data directory at startup.
         if let Some(storage_state) = app.try_state::<Arc<StorageState>>() {
             let dd = storage_state
@@ -1526,7 +1509,9 @@ pub async fn start_monitor_impl(
             .spawn()
             .map_err(|e| format!("Failed to start python: {}", e))?;
 
-        // 将子进程加入 Job 对象，以便随主进程退出时自动清理以及限制CPU使用
+        // Add the child to the Job Object for lifetime and CPU-limit enforcement.
+        // SAFETY: `child` owns a live process handle, `job` owns a live Job Object, and
+        // both remain valid for the synchronous assignment call.
         unsafe {
             let process_handle = HANDLE(child.as_raw_handle() as _);
             AssignProcessToJobObject(*job, process_handle)
@@ -1763,10 +1748,28 @@ pub async fn start_monitor_impl(
 
 #[tauri::command]
 pub async fn start_monitor(
+    window: tauri::Window,
     state: State<'_, MonitorState>,
     app: AppHandle,
 ) -> Result<String, String> {
+    crate::commands::check_main_window(&window)?;
     start_monitor_impl(state, app).await
+}
+
+#[tauri::command]
+pub fn get_monitor_autostart() -> bool {
+    crate::registry_config::get_bool("autoStartMonitor").unwrap_or(true)
+}
+
+#[tauri::command]
+pub fn set_monitor_autostart(
+    window: tauri::Window,
+    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+    crate::registry_config::set_bool("autoStartMonitor", enabled)
 }
 
 /// Spawn the Rust-side capture loop using CaptureState
@@ -1796,18 +1799,9 @@ fn spawn_capture_loop(app: &AppHandle) {
 
     // Load advanced config from registry
     {
-        let capture_on_ocr_busy =
-            crate::registry_config::get_bool("capture_on_ocr_busy").unwrap_or(false);
-        let ocr_queue_max_size = crate::registry_config::get_u32("ocr_queue_max_size").unwrap_or(1);
         let ocr_timeout_secs = crate::registry_config::get_u32("ocr_timeout_secs")
             .unwrap_or(120)
             .clamp(30, 600);
-        capture_state
-            .capture_on_ocr_busy
-            .store(capture_on_ocr_busy, Ordering::SeqCst);
-        capture_state
-            .ocr_queue_max_size
-            .store(ocr_queue_max_size, Ordering::SeqCst);
         capture_state
             .ocr_timeout_secs
             .store(ocr_timeout_secs, Ordering::SeqCst);
@@ -2005,12 +1999,12 @@ pub async fn stop_monitor_impl(
 
 #[tauri::command]
 pub async fn stop_monitor(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    window: tauri::Window,
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
     app: AppHandle,
 ) -> Result<String, String> {
-    crate::commands::check_auth_required(&credential_state)?;
+    crate::commands::check_main_window(&window)?;
     stop_monitor_impl(state, capture_state, app).await
 }
 
@@ -2031,12 +2025,12 @@ pub async fn pause_monitor_impl(
 /// Resumes screenshot capture after a pause.
 #[tauri::command]
 pub async fn pause_monitor(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    window: tauri::Window,
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
     app: AppHandle,
 ) -> Result<String, String> {
-    crate::commands::check_auth_required(&credential_state)?;
+    crate::commands::check_main_window(&window)?;
     pause_monitor_impl(state, capture_state, app).await
 }
 
@@ -2055,12 +2049,12 @@ pub async fn resume_monitor_impl(
 
 #[tauri::command]
 pub async fn resume_monitor(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    window: tauri::Window,
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
     app: AppHandle,
 ) -> Result<String, String> {
-    crate::commands::check_auth_required(&credential_state)?;
+    crate::commands::check_main_window(&window)?;
     resume_monitor_impl(state, capture_state, app).await
 }
 
@@ -2106,10 +2100,12 @@ pub async fn get_monitor_status(state: State<'_, MonitorState>) -> Result<String
     }
 }
 
-// ==================== GPU 枚举与游戏模式 ====================
+// GPU enumeration and game-mode resource suppression.
 
-/// 枚举系统中的 GPU 设备（排除软件渲染器）
+/// Enumerates hardware GPU adapters, excluding software renderers.
 pub fn enumerate_gpus_internal() -> Result<Vec<serde_json::Value>, String> {
+    // SAFETY: DXGI returns reference-counted COM interfaces whose lifetimes are managed
+    // by windows-rs; adapter indices are enumerated until Windows reports exhaustion.
     unsafe {
         let factory: IDXGIFactory1 =
             CreateDXGIFactory1().map_err(|e| format!("Failed to create DXGI factory: {:?}", e))?;
@@ -2120,7 +2116,7 @@ pub fn enumerate_gpus_internal() -> Result<Vec<serde_json::Value>, String> {
             let desc = adapter
                 .GetDesc1()
                 .map_err(|e| format!("Failed to get adapter desc: {:?}", e))?;
-            // 排除软件渲染器
+            // Exclude software renderers from user-selectable acceleration devices.
             if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0 {
                 let name = String::from_utf16_lossy(
                     &desc.Description[..desc
@@ -2145,8 +2141,11 @@ pub fn enumerate_gpus() -> Result<Vec<serde_json::Value>, String> {
     enumerate_gpus_internal()
 }
 
-/// 查询指定 GPU 的系统级显存占用率（使用 Windows Performance Counter，与任务管理器一致）
+/// Queries system-wide dedicated-memory use for one GPU via Windows PDH.
 fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
+    // SAFETY: DXGI COM interfaces are managed by windows-rs; the PDH path is
+    // NUL-terminated, output pointers reference correctly typed stack storage, and the
+    // query handle is closed on every path after it is opened.
     unsafe {
         let factory: IDXGIFactory1 =
             CreateDXGIFactory1().map_err(|e| format!("Failed to create DXGI factory: {:?}", e))?;
@@ -2164,7 +2163,7 @@ fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
             return Ok(0.0);
         }
 
-        // 使用 LUID 构造 Performance Counter 路径
+        // Build the PDH adapter instance name from the DXGI LUID.
         let luid = desc.AdapterLuid;
         let counter_path = format!(
             "\\GPU Adapter Memory(luid_0x{:08X}_0x{:08X}_phys_0)\\Dedicated Usage",
@@ -2175,7 +2174,7 @@ fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
             .chain(std::iter::once(0))
             .collect();
 
-        // PDH 查询
+        // Open and populate the PDH query.
         let mut query = 0isize;
         let status = PdhOpenQueryW(None, 0, &mut query);
         if status != 0 {
@@ -2197,7 +2196,7 @@ fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
             ));
         }
 
-        // 需要收集两次数据，第一次建立基线
+        // Collect once to establish the counter baseline before formatting the value.
         let status = PdhCollectQueryData(query);
         if status != 0 {
             PdhCloseQuery(query);
@@ -2262,8 +2261,11 @@ pub fn start_game_mode_monitor(app: AppHandle) {
 
                 let should_pause = match crate::capture::check_foreground_fullscreen() {
                     Some((process_name, _window_class, true)) if !process_name.is_empty() => {
-                        // Fullscreen detected with known process — pause only if it's NOT a browser
-                        !crate::capture::is_browser_process(&process_name)
+                        // Fullscreen detected with known process — pause only if it's NOT a
+                        // browser (hardcoded list or a live extension NMH session, which
+                        // covers Chromium forks the list doesn't know about)
+                        !(crate::capture::is_browser_process(&process_name)
+                            || crate::reverse_ipc::has_nmh_session_for_exe(&process_name))
                     }
                     Some((process_name, window_class, true)) if process_name.is_empty() => {
                         // Fullscreen but process name unavailable (likely elevated/protected).

@@ -33,6 +33,19 @@ pub struct ScreenshotRecord {
     pub category_confidence: Option<f64>,
 }
 
+/// Minimal decrypted screenshot metadata used by unattended clustering work.
+///
+/// Keeping this separate from `ScreenshotRecord` prevents background workers
+/// from decrypting unrelated fields such as page icons, links, or metadata.
+#[derive(Debug, Clone)]
+pub(crate) struct BackgroundScreenshotSummary {
+    pub(crate) id: i64,
+    pub(crate) window_title: Option<String>,
+    pub(crate) process_name: Option<String>,
+    pub(crate) timestamp: Option<i64>,
+    pub(crate) category: Option<String>,
+}
+
 /// OcrResult representing a row in the ocr_results table, with decrypted fields.
 /// Used for returning OCR data to the frontend and for search results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,7 +94,9 @@ pub struct SearchResult {
 /// The image data is expected to be Base64 encoded to allow passing through JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveScreenshotRequest {
-    pub image_data: String, // Base64 encoded image data
+    /// Base64-encoded image for external JSON/IPC callers. Internal byte-oriented
+    /// storage paths may leave this empty and call `save_screenshot_temp_bytes`.
+    pub image_data: String,
     pub image_hash: String,
     pub width: i32,
     pub height: i32,

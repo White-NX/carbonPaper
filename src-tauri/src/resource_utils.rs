@@ -1,3 +1,5 @@
+//! Safe resource and LocalAppData path discovery for packaged and development builds.
+
 use std::{env, path::PathBuf};
 use tauri::{AppHandle, Manager};
 

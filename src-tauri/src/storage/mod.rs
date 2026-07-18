@@ -27,9 +27,27 @@ use crate::credential_manager::{
     CredentialManagerState,
 };
 use rusqlite::{Connection, OpenFlags};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Error returned by background-only reads of encrypted screenshot content.
+/// `AuthRequired` is intentionally distinct so callers can defer work without
+/// treating a locked CNG key as a processing failure or displaying system UI.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BackgroundReadError {
+    #[error("authentication required")]
+    AuthRequired,
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for BackgroundReadError {
+    fn from(value: String) -> Self {
+        Self::Other(value)
+    }
+}
 
 /// StorageState manages the encrypted database connection, data directory paths, and migration state.
 /// It provides methods for initializing storage, saving/loading screenshots and OCR results,
@@ -60,6 +78,33 @@ pub struct StorageState {
     pub(crate) thumbnail_warmup_done: AtomicBool,
     /// Whether startup VACUUM is currently running
     startup_vacuum_in_progress: AtomicBool,
+}
+
+struct NamedConnectionGuard<'a> {
+    guard: std::sync::MutexGuard<'a, Option<Connection>>,
+    lock_holder: &'a Mutex<&'static str>,
+}
+
+impl Deref for NamedConnectionGuard<'_> {
+    type Target = Option<Connection>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for NamedConnectionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for NamedConnectionGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut holder) = self.lock_holder.lock() {
+            *holder = "";
+        }
+    }
 }
 
 impl StorageState {
@@ -152,7 +197,7 @@ impl StorageState {
     fn get_connection_named(
         &self,
         caller: &'static str,
-    ) -> Result<std::sync::MutexGuard<'_, Option<Connection>>, String> {
+    ) -> Result<NamedConnectionGuard<'_>, String> {
         let wait_start = std::time::Instant::now();
         let current_holder = self.lock_holder.lock().ok().map(|g| *g).unwrap_or("?");
         let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -172,7 +217,10 @@ impl StorageState {
         if guard.is_none() {
             return Err("Database not initialized".to_string());
         }
-        Ok(guard)
+        Ok(NamedConnectionGuard {
+            guard,
+            lock_holder: &self.lock_holder,
+        })
     }
 
     /// Open an independent SQLCipher read-only connection for read-heavy paths.

@@ -46,6 +46,9 @@ _clustering_ingest_thread = None
 _clustering_ingest_stop = threading.Event()
 _auth_token = None           # Auth token for IPC validation
 _last_seq_no = -1            # Last processed sequence number
+_seen_seq_nos = set()        # Accepted sequence numbers inside the replay window
+_seq_lock = threading.Lock()
+_SEQ_REPLAY_WINDOW = 4096
 _storage_pipe = None         # Storage service pipe name
 
 # Cache for dynamically extracted icons by process name
@@ -314,9 +317,24 @@ def _handle_command_impl(req: dict):
 
     # Replay-attack prevention
     if req_seq_no is not None:
-        if req_seq_no <= _last_seq_no:
-            return {'error': f'Authentication failed: Invalid sequence number (got {req_seq_no}, expected > {_last_seq_no})'}
-        _last_seq_no = req_seq_no
+        if not isinstance(req_seq_no, int) or isinstance(req_seq_no, bool) or req_seq_no < 0:
+            return {'error': 'Authentication failed: Invalid sequence number type'}
+        with _seq_lock:
+            minimum_retained = max(0, _last_seq_no - _SEQ_REPLAY_WINDOW + 1)
+            if req_seq_no in _seen_seq_nos or req_seq_no < minimum_retained:
+                return {
+                    'error': (
+                        'Authentication failed: Replayed or expired sequence number '
+                        f'(got {req_seq_no}, highest {_last_seq_no})'
+                    )
+                }
+            _seen_seq_nos.add(req_seq_no)
+            if req_seq_no > _last_seq_no:
+                _last_seq_no = req_seq_no
+                cutoff = max(0, _last_seq_no - _SEQ_REPLAY_WINDOW + 1)
+                _seen_seq_nos.difference_update(
+                    seq for seq in tuple(_seen_seq_nos) if seq < cutoff
+                )
 
     cmd = (req.get('command') or '').lower()
 
@@ -406,19 +424,15 @@ def _handle_command_impl(req: dict):
             return {'error': str(e)}
 
     if cmd == 'update_advanced_config':
-        capture_on_ocr_busy = bool(req.get('capture_on_ocr_busy', False))
-        ocr_queue_max_size = int(req.get('ocr_queue_max_size', 1))
         ocr_timeout_secs = int(req.get('ocr_timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
         allow_full_low_memory = bool(req.get(
             'clustering_allow_full_low_memory',
             getattr(config, 'CLUSTERING_ALLOW_FULL_LOW_MEMORY', False),
         ))
-        update_advanced_capture_config(capture_on_ocr_busy, ocr_queue_max_size, ocr_timeout_secs)
+        update_advanced_capture_config(ocr_timeout_secs)
         update_clustering_resource_config(allow_full_low_memory)
         return {
             'status': 'success',
-            'capture_on_ocr_busy': capture_on_ocr_busy,
-            'ocr_queue_max_size': ocr_queue_max_size,
             'ocr_timeout_secs': ocr_timeout_secs,
             'clustering_allow_full_low_memory': allow_full_low_memory,
         }
@@ -432,89 +446,6 @@ def _handle_command_impl(req: dict):
             'clustering_enabled': clustering_enabled,
             'classification_enabled': classification_enabled,
         }
-
-    if cmd == 'get_all_models':
-        logger.info('[DIAG:CMD-PY] Received get_all_models command')
-        local_appdata = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
-        
-        search_dirs = [
-            os.path.join(local_appdata, "carbonPaper", "models"),
-            os.path.join(local_appdata, "carbonPaper", "ppOCRmodel"),
-            os.path.join(os.path.expanduser('~'), ".rapidocr", "models"),
-            os.path.join(os.path.expanduser('~'), ".paddleocr"),
-        ]
-        
-        models_info = []
-        seen_paths = set()
-
-        for models_dir in search_dirs:
-            models_dir = os.path.normpath(models_dir)
-            if not os.path.exists(models_dir):
-                logger.info('[DIAG:CMD-PY] Models dir does not exist: %s', models_dir)
-                continue
-            
-            logger.info('[DIAG:CMD-PY] Scanning models dir: %s', models_dir)
-            
-            # For some dirs, we look at files directly (like .rapidocr/models contains .onnx files)
-            # For others, we look at subdirectories (like carbonPaper/models contains model folders)
-            items = os.listdir(models_dir)
-            for m in items:
-                m_path = os.path.join(models_dir, m)
-                if m_path in seen_paths:
-                    continue
-                
-                is_dir = os.path.isdir(m_path)
-                is_model_file = m.endswith('.onnx') or m.endswith('.pdmodel') or m.endswith('.bin')
-                
-                if is_dir or is_model_file:
-                    total_size = 0
-                    if is_dir:
-                        for dirpath, _, filenames in os.walk(m_path):
-                            for f in filenames:
-                                fp = os.path.join(dirpath, f)
-                                if not os.path.islink(fp):
-                                    try:
-                                        total_size += os.path.getsize(fp)
-                                    except Exception:
-                                        pass
-                    else:
-                        try:
-                            total_size = os.path.getsize(m_path)
-                        except Exception:
-                            pass
-                    
-                    if total_size == 0: continue
-
-                    # Determine purpose
-                    purpose = "未知"
-                    m_lower = m.lower()
-                    if "minilm" in m_lower:
-                        purpose = "任务聚类"
-                    elif "bge-small" in m_lower:
-                        purpose = "内容分类"
-                    elif "clip" in m_lower:
-                        purpose = "图像特征提取"
-                    elif "ocr" in m_lower or "det_infer" in m_lower or "rec_infer" in m_lower or "cls_infer" in m_lower or m_lower.startswith("ch_pp"):
-                        purpose = "文字识别 (OCR)"
-                    elif "zh_core_web" in m_lower or "en_core_web" in m_lower:
-                        purpose = "敏感信息识别"
-                        
-                    # Format size
-                    size_mb = total_size / (1024 * 1024)
-                    size_str = f"{size_mb:.1f} MB"
-                    if size_mb > 1024:
-                        size_str = f"{size_mb / 1024:.1f} GB"
-
-                    models_info.append({
-                        "name": m,
-                        "path": m_path,
-                        "size": size_str,
-                        "purpose": purpose
-                    })
-                    seen_paths.add(m_path)
-
-        logger.info('[DIAG:CMD-PY] Returning %d models', len(models_info))
-        return {'status': 'success', 'models': models_info}
 
     # ----- Vector search -----
     if cmd == 'search_nl':
@@ -582,64 +513,36 @@ def _handle_command_impl(req: dict):
             'vector_deleted': vector_info.get('deleted', 0),
         }
 
-    # ----- OCR processing (called by Rust capture loop) -----
-    if cmd == 'process_ocr':
+    if cmd == 'enqueue_ocr_postprocess':
         screenshot_id = req.get('screenshot_id')
         if screenshot_id is None:
             return {'error': 'screenshot_id is required'}
-        if not _ocr_worker:
-            return {'error': 'OCR service not initialised'}
-
-        logger.debug(
-            '[DIAG:process_ocr] start screenshot_id=%s image_hash=%s process=%s',
-            screenshot_id,
-            req.get('image_hash', ''),
-            req.get('process_name', ''),
-        )
-
-        if not hasattr(_ocr_worker, 'request'):
-            return {'error': 'OCR service requires RestartableModelWorker'}
-
+        if not _ocr_worker or not hasattr(_ocr_worker, 'request'):
+            return {'error': 'OCR postprocess service is not initialised'}
         timeout_secs = int(req.get('timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
         try:
             result = _ocr_worker.request(
-                'process_ocr',
+                'enqueue_ocr_postprocess',
                 {'request': req},
                 timeout=max(30, min(600, timeout_secs)),
             )
             if result.get('status') == 'success':
-                ocr_text = result.get('ocr_text', '')
-                ocr_results = result.get('ocr_results') or []
-                ocr_diag = result.get('ocr_diag') or {}
-                logger.info(
-                    '[DIAG:process_ocr] success screenshot_id=%s returned_blocks=%s text_len=%s postprocess_enqueued=%s elapsed=%.3fs worker_protocol=%s image_bytes=%s image_size=%s raw_blocks=%s filtered_blocks=%s ocr_elapsed=%.3fs',
-                    screenshot_id,
-                    len(ocr_results) if isinstance(ocr_results, list) else 0,
-                    len(ocr_text or ''),
-                    result.get('postprocess_enqueued'),
-                    float(result.get('elapsed') or 0.0),
-                    result.get('worker_protocol'),
-                    ocr_diag.get('image_bytes'),
-                    ocr_diag.get('image_size'),
-                    ocr_diag.get('raw_blocks'),
-                    ocr_diag.get('filtered_blocks'),
-                    float(ocr_diag.get('ocr_elapsed') or 0.0),
-                )
                 _enqueue_clustering_snapshot({
                     'screenshot_id': screenshot_id,
                     'process_name': req.get('process_name', ''),
                     'window_title': req.get('window_title', ''),
-                    'ocr_text': ocr_text,
+                    'ocr_text': req.get('ocr_text', ''),
                     'timestamp': req.get('timestamp', 0),
                     'category': '',
                 })
-                result.pop('ocr_text', None)
             return result
-        except TimeoutError as e:
-            logger.error('[DIAG:process_ocr] worker timeout screenshot_id=%s error=%s', screenshot_id, e)
-            return {'error': str(e)}
         except Exception as e:
-            logger.error('[DIAG:process_ocr] worker failed screenshot_id=%s error=%s', screenshot_id, e, exc_info=True)
+            logger.error(
+                '[DIAG:enqueue_ocr_postprocess] failed screenshot_id=%s error=%s',
+                screenshot_id,
+                e,
+                exc_info=True,
+            )
             return {'error': str(e)}
 
     # ----- Classification commands -----
@@ -849,7 +752,9 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     global _server, _ocr_worker, _classifier, _storage_pipe, _clustering_manager, _clustering_scheduler, _clustering_scheduler_active, _clustering_auth_monitor_thread, _auth_token, _last_seq_no, _last_clustering_auth_check, _last_clustering_session_valid
 
     _auth_token = auth_token
-    _last_seq_no = -1
+    with _seq_lock:
+        _last_seq_no = -1
+        _seen_seq_nos.clear()
     _storage_pipe = storage_pipe
     _clustering_scheduler_active = False
     _clustering_auth_monitor_thread = None
@@ -953,8 +858,8 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     except Exception as e:
         logger.warning('Smart Cluster worker failed to start (non-fatal): %s', e)
 
-    # NOTE: Screenshot capture loop is handled by Rust (capture.rs).
-    # Python only provides OCR via the 'process_ocr' IPC command.
+    # NOTE: Screenshot capture and OCR are handled by Rust. Python provides only
+    # classification, vector indexing, clustering, and related post-processing.
 
     return _server
 

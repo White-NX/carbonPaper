@@ -3,6 +3,7 @@ const path = require('path');
 
 const localesDir = path.join(__dirname, '..', 'src', 'i18n', 'locales');
 const sourceDir = path.join(__dirname, '..', 'src');
+const rustSourceDir = path.join(__dirname, '..', 'src-tauri', 'src');
 
 function collectKeys(obj, prefix = '') {
   const keys = [];
@@ -43,18 +44,30 @@ function hasKey(obj, key) {
   return true;
 }
 
-function findSourceFiles(dir, result = []) {
+function findSourceFiles(dir, extensions, result = []) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      findSourceFiles(fullPath, result);
+      findSourceFiles(fullPath, extensions, result);
       continue;
     }
-    if (!/\.(js|jsx|ts|tsx)$/.test(entry.name)) continue;
+    if (!extensions.test(entry.name)) continue;
     if (/\.(test|spec)\.(js|jsx|ts|tsx)$/.test(entry.name)) continue;
     result.push(fullPath);
   }
   return result;
+}
+
+function collectLiteralRustTranslationKeys(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const keys = [];
+  const regex = /(?:crate::)?i18n::t\(\s*[^,]+,\s*"([^"]+)"/g;
+  let match;
+  while ((match = regex.exec(raw)) !== null) {
+    const line = raw.slice(0, match.index).split(/\r?\n/).length;
+    keys.push({ key: match[1], line });
+  }
+  return keys;
 }
 
 function collectLiteralTranslationKeys(filePath) {
@@ -110,8 +123,18 @@ function main() {
 
   const baseData = localeData[filenames[0]];
   const missingSourceKeys = [];
-  for (const filePath of findSourceFiles(sourceDir)) {
+  for (const filePath of findSourceFiles(sourceDir, /\.(js|jsx|ts|tsx)$/)) {
     for (const { key, line } of collectLiteralTranslationKeys(filePath)) {
+      if (hasKey(baseData, key)) continue;
+      missingSourceKeys.push({
+        file: path.relative(path.join(__dirname, '..'), filePath),
+        line,
+        key,
+      });
+    }
+  }
+  for (const filePath of findSourceFiles(rustSourceDir, /\.rs$/)) {
+    for (const { key, line } of collectLiteralRustTranslationKeys(filePath)) {
       if (hasKey(baseData, key)) continue;
       missingSourceKeys.push({
         file: path.relative(path.join(__dirname, '..'), filePath),

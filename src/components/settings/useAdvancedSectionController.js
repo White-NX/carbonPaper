@@ -6,7 +6,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [config, setConfig] = useState(null);
   const [loading, setLoading] = useState(true);
   const [cpuDropdownOpen, setCpuDropdownOpen] = useState(false);
-  const [queueDropdownOpen, setQueueDropdownOpen] = useState(false);
   const [gpuDropdownOpen, setGpuDropdownOpen] = useState(false);
   const [clusteringDropdownOpen, setClusteringDropdownOpen] = useState(false);
   const [cpuChanged, setCpuChanged] = useState(false);
@@ -16,13 +15,21 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [gpuLoading, setGpuLoading] = useState(false);
   const [vacuumRunning, setVacuumRunning] = useState(false);
   const [vacuumMessage, setVacuumMessage] = useState('');
+  const [mlOcrStatus, setMlOcrStatus] = useState(null);
+  const [mlOcrStatusLoading, setMlOcrStatusLoading] = useState(false);
+  const [rustOcrModelStatus, setRustOcrModelStatus] = useState(null);
+  const [rustOcrModelDownloading, setRustOcrModelDownloading] = useState(false);
 
   const saveConfig = async (newConfig) => {
+    const previousConfig = config;
     setConfig(newConfig);
     try {
       await withAuth(() => invoke('set_advanced_config', { config: newConfig }), { autoPrompt: true });
+      return true;
     } catch (err) {
+      setConfig(previousConfig);
       console.error('Failed to save advanced config:', err);
+      return false;
     }
   };
 
@@ -30,10 +37,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     if (monitorStatus !== 'running') return;
     try {
       await withAuth(() => invoke('monitor_update_advanced_config', {
-        captureOnOcrBusy: newConfig.capture_on_ocr_busy,
-        ocrQueueMaxSize: newConfig.ocr_queue_limit_enabled
-          ? newConfig.ocr_queue_max_size
-          : 999999,
         ocrTimeoutSecs: newConfig.ocr_timeout_secs || 120,
         clusteringAllowFullLowMemory: Boolean(newConfig.clustering_allow_full_low_memory),
       }), { autoPrompt: true });
@@ -92,29 +95,93 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   useEffect(() => {
     const handler = () => {
       setCpuDropdownOpen(false);
-      setQueueDropdownOpen(false);
       setGpuDropdownOpen(false);
       setClusteringDropdownOpen(false);
     };
-    if (cpuDropdownOpen || queueDropdownOpen || gpuDropdownOpen || clusteringDropdownOpen) {
+    if (cpuDropdownOpen || gpuDropdownOpen || clusteringDropdownOpen) {
       document.addEventListener('click', handler);
       return () => document.removeEventListener('click', handler);
     }
     return undefined;
-  }, [cpuDropdownOpen, queueDropdownOpen, gpuDropdownOpen, clusteringDropdownOpen]);
+  }, [cpuDropdownOpen, gpuDropdownOpen, clusteringDropdownOpen]);
 
   useEffect(() => {
     refreshVacuumRunningStatus();
   }, []);
 
+  const refreshMlOcrStatus = async () => {
+    setMlOcrStatusLoading(true);
+    try {
+      setMlOcrStatus(await invoke('get_ml_ocr_status'));
+    } catch (err) {
+      console.warn('Failed to read Rust ML OCR status:', err);
+    } finally {
+      setMlOcrStatusLoading(false);
+    }
+  };
+
+  const refreshRustOcrModelStatus = async () => {
+    try {
+      setRustOcrModelStatus(await invoke('get_rust_ocr_model_status'));
+    } catch (err) {
+      console.warn('Failed to read Rust OCR model status:', err);
+    }
+  };
+
+  useEffect(() => {
+    refreshRustOcrModelStatus();
+  }, []);
+
+  useEffect(() => {
+    refreshMlOcrStatus();
+    const timer = window.setInterval(refreshMlOcrStatus, 5000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const handleDownloadRustOcrModel = async () => {
+    setRustOcrModelDownloading(true);
+    try {
+      const status = await invoke('download_rust_ocr_model');
+      setRustOcrModelStatus(status);
+      await refreshMlOcrStatus();
+    } catch (err) {
+      console.error('Failed to download Rust OCR model:', err);
+    } finally {
+      setRustOcrModelDownloading(false);
+    }
+  };
+
   const handleToggle = async (key) => {
     const newConfig = { ...config, [key]: !config[key] };
-    await saveConfig(newConfig);
+    const saved = await saveConfig(newConfig);
+    if (!saved) return;
     if (key === 'cpu_limit_enabled') setCpuChanged(true);
     if (key === 'use_dml') setDmlChanged(true);
     if (key === 'use_onnx') setOnnxChanged(true);
-    if (key === 'capture_on_ocr_busy' || key === 'ocr_queue_limit_enabled' || key === 'clustering_allow_full_low_memory') {
+    if (key === 'clustering_allow_full_low_memory') {
       await syncOcrConfigToMonitor(newConfig);
+    }
+    if (key === 'rust_ocr_dml_beta') {
+      try {
+        await withAuth(
+          () => invoke('restart_ml_ocr_worker'),
+          { autoPrompt: true },
+        );
+      } catch (err) {
+        console.warn('Failed to restart Rust ML OCR worker:', err);
+      }
+      await refreshMlOcrStatus();
+    }
+  };
+
+  const handleRestartMlOcr = async () => {
+    try {
+      await withAuth(
+        () => invoke('restart_ml_ocr_worker'),
+        { autoPrompt: true },
+      );
+    } finally {
+      await refreshMlOcrStatus();
     }
   };
 
@@ -122,13 +189,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     setCpuDropdownOpen(false);
     await saveConfig({ ...config, cpu_limit_percent: value });
     setCpuChanged(true);
-  };
-
-  const handleQueueSizeChange = async (value) => {
-    setQueueDropdownOpen(false);
-    const newConfig = { ...config, ocr_queue_max_size: value };
-    await saveConfig(newConfig);
-    await syncOcrConfigToMonitor(newConfig);
   };
 
   const handleOcrTimeoutDraftChange = (value) => {
@@ -184,7 +244,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     config,
     loading,
     cpuDropdownOpen,
-    queueDropdownOpen,
     gpuDropdownOpen,
     clusteringDropdownOpen,
     cpuChanged,
@@ -195,8 +254,11 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     vacuumRunning,
     vacuumMessage,
     selectedGpu,
+    mlOcrStatus,
+    mlOcrStatusLoading,
+    rustOcrModelStatus,
+    rustOcrModelDownloading,
     setCpuDropdownOpen,
-    setQueueDropdownOpen,
     setGpuDropdownOpen,
     setClusteringDropdownOpen,
     clearCpuChanged: () => setCpuChanged(false),
@@ -204,11 +266,12 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     clearOnnxChanged: () => setOnnxChanged(false),
     handleToggle,
     handleCpuPercentChange,
-    handleQueueSizeChange,
     handleOcrTimeoutDraftChange,
     handleOcrTimeoutChange,
     handleGpuChange,
     handleClusteringIntervalChange,
     handleManualVacuum,
+    handleRestartMlOcr,
+    handleDownloadRustOcrModel,
   };
 }

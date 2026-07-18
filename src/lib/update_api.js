@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { withAuth } from './auth_api';
 import { listen } from '@tauri-apps/api/event';
 
 /**
@@ -28,7 +29,7 @@ export async function downloadAndInstallUpdate(onProgress) {
   };
 
   // Listen for download progress events
-  const unlisten = onProgress
+  const unlistenProgress = onProgress
     ? await listen('updater-download-progress', (event) => {
         emitProgress({
           phase: 'downloading',
@@ -37,16 +38,21 @@ export async function downloadAndInstallUpdate(onProgress) {
         });
       })
     : null;
+  const unlistenPhase = onProgress
+    ? await listen('updater-phase', (event) => {
+        emitProgress({
+          phase: event.payload?.phase || 'downloading',
+          downloaded: 1,
+          contentLength: 1,
+        });
+      })
+    : null;
 
   try {
     emitProgress({ phase: 'downloading', downloaded: 0, contentLength: 0 });
-    await invoke('updater_download');
-
-    emitProgress({ phase: 'extracting', downloaded: 1, contentLength: 1 });
-    await invoke('updater_extract');
-    emitProgress({ phase: 'applying', downloaded: 1, contentLength: 1 });
-    await invoke('updater_apply');
+    await withAuth(() => invoke('updater_install'), { autoPrompt: true });
   } finally {
-    if (unlisten) unlisten();
+    if (unlistenProgress) unlistenProgress();
+    if (unlistenPhase) unlistenPhase();
   }
 }

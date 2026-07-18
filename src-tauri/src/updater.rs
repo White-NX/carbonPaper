@@ -1,3 +1,7 @@
+//! Signed-update discovery, download verification, and installer handoff.
+
+use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -12,6 +16,7 @@ const UPDATE_CHECK_URL: &str =
     "https://github.com/White-NX/carbonPaper/releases/latest/download/latest.json";
 const UPDATE_SMOKE_TEST_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_TEST";
 const UPDATE_SMOKE_MANIFEST_URL_ENV: &str = "CARBONPAPER_UPDATE_MANIFEST_URL";
+const UPDATE_SMOKE_PUBLIC_KEY_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_PUBLIC_KEY";
 const UPDATE_SMOKE_RESULT_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_RESULT";
 const UPDATE_SMOKE_EXPECTED_VERSION_ENV: &str = "CARBONPAPER_UPDATE_SMOKE_EXPECTED_VERSION";
 const UPDATE_SMOKE_EXPECTED_MANIFEST_VERSION_ENV: &str =
@@ -25,6 +30,7 @@ pub struct UpdateManifest {
     pub version: String,
     pub url: String,
     pub sha256: String,
+    pub signature: String,
     pub notes: Option<String>,
     pub pub_date: Option<String>,
     #[serde(default)]
@@ -33,15 +39,97 @@ pub struct UpdateManifest {
     pub min_version: Option<String>,
 }
 
+fn manifest_signing_payload(manifest: &UpdateManifest) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        manifest.version,
+        manifest.url,
+        manifest.sha256.to_ascii_lowercase(),
+        if manifest.critical { "1" } else { "0" },
+        manifest.min_version.as_deref().unwrap_or("")
+    )
+}
+
+/// Resolve the manifest verification key. Signature verification is always
+/// enforced; smoke-test mode may only substitute the verification key via an
+/// environment variable, and smoke mode itself restricts every manifest and
+/// download URL to loopback.
+fn update_signature_public_key_b64() -> Result<String, String> {
+    if is_update_smoke_test_enabled() {
+        if let Ok(key) = std::env::var(UPDATE_SMOKE_PUBLIC_KEY_ENV) {
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                return Ok(key);
+            }
+        }
+    }
+    option_env!("CARBONPAPER_UPDATE_PUBLIC_KEY")
+        .map(str::to_string)
+        .ok_or_else(|| "Update signature public key is not configured".to_string())
+}
+
+fn verify_update_manifest_signature(manifest: &UpdateManifest) -> Result<(), String> {
+    let public_key_b64 = update_signature_public_key_b64()?;
+    let public_key = base64::engine::general_purpose::STANDARD
+        .decode(public_key_b64)
+        .map_err(|e| format!("Invalid update public key encoding: {}", e))?;
+    let public_key: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| "Update public key must be 32 bytes".to_string())?;
+    verify_update_manifest_with_key(manifest, &public_key)
+}
+
+fn verify_update_manifest_with_key(
+    manifest: &UpdateManifest,
+    public_key: &[u8; 32],
+) -> Result<(), String> {
+    let verifying_key = VerifyingKey::from_bytes(public_key)
+        .map_err(|e| format!("Invalid update public key: {}", e))?;
+
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(&manifest.signature)
+        .map_err(|e| format!("Invalid update signature encoding: {}", e))?;
+    let signature = Signature::from_slice(&signature)
+        .map_err(|e| format!("Invalid update signature: {}", e))?;
+    verifying_key
+        .verify(manifest_signing_payload(manifest).as_bytes(), &signature)
+        .map_err(|_| "Update manifest signature verification failed".to_string())
+}
+
+fn safe_update_entry_path(name: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    let path = std::path::Path::new(name);
+    if path.as_os_str().is_empty()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!("Unsafe update archive path: {}", name));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Escape a value for interpolation inside a single-quoted PowerShell string
+/// literal, where `''` is the only escape sequence.
+fn ps_single_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 /// Shared state for the update checker, caching the latest update manifest.
 pub struct UpdaterState {
     manifest: Mutex<Option<UpdateManifest>>,
+    install_lock: tokio::sync::Mutex<()>,
 }
 
 impl UpdaterState {
     pub fn new() -> Self {
         Self {
             manifest: Mutex::new(None),
+            install_lock: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -198,7 +286,7 @@ pub(crate) fn maybe_run_update_smoke_test(app: AppHandle) {
                 check.version.as_deref(),
                 None,
             );
-            updater_download(app.clone(), app.state::<UpdaterState>()).await?;
+            updater_download_impl(app.clone(), &app.state::<UpdaterState>()).await?;
 
             write_update_smoke_status(
                 "running",
@@ -207,7 +295,7 @@ pub(crate) fn maybe_run_update_smoke_test(app: AppHandle) {
                 check.version.as_deref(),
                 None,
             );
-            updater_extract().await?;
+            updater_extract_impl().await?;
 
             write_update_smoke_status(
                 "running",
@@ -216,7 +304,7 @@ pub(crate) fn maybe_run_update_smoke_test(app: AppHandle) {
                 check.version.as_deref(),
                 None,
             );
-            updater_apply(
+            updater_apply_impl(
                 app.clone(),
                 app.state::<crate::monitor::MonitorState>(),
                 app.state::<std::sync::Arc<crate::capture::CaptureState>>(),
@@ -241,7 +329,12 @@ pub(crate) fn maybe_run_update_smoke_test(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_loopback_update_url;
+    use super::{
+        manifest_signing_payload, ps_single_quote, safe_update_entry_path,
+        validate_loopback_update_url, verify_update_manifest_with_key, UpdateManifest,
+    };
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
     fn update_smoke_url_allows_loopback_hosts() {
@@ -254,6 +347,54 @@ mod tests {
     fn update_smoke_url_rejects_non_loopback_hosts() {
         assert!(validate_loopback_update_url("https://example.com/latest.json").is_err());
         assert!(validate_loopback_update_url("file:///tmp/latest.json").is_err());
+    }
+
+    #[test]
+    fn signed_manifest_verification_rejects_tampering() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut manifest = UpdateManifest {
+            version: "1.2.3".into(),
+            url: "https://github.com/White-NX/carbonPaper/releases/download/v1.2.3/app.zip".into(),
+            sha256: "ab".repeat(32),
+            signature: String::new(),
+            notes: None,
+            pub_date: None,
+            critical: false,
+            min_version: None,
+        };
+        let signature = signing_key.sign(manifest_signing_payload(&manifest).as_bytes());
+        manifest.signature = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+
+        assert!(verify_update_manifest_with_key(
+            &manifest,
+            &signing_key.verifying_key().to_bytes()
+        )
+        .is_ok());
+
+        manifest.version = "1.2.4".into();
+        assert!(verify_update_manifest_with_key(
+            &manifest,
+            &signing_key.verifying_key().to_bytes()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn update_archive_paths_reject_escape_and_absolute_names() {
+        assert!(safe_update_entry_path("bin/carbonpaper.exe").is_ok());
+        assert!(safe_update_entry_path("../outside.exe").is_err());
+        assert!(safe_update_entry_path("/absolute.exe").is_err());
+        assert!(safe_update_entry_path(r"C:\\Windows\\outside.exe").is_err());
+    }
+
+    #[test]
+    fn powershell_literals_escape_embedded_single_quotes() {
+        assert_eq!(ps_single_quote(r"C:\Apps\CarbonPaper"), r"C:\Apps\CarbonPaper");
+        assert_eq!(
+            ps_single_quote(r"C:\Users\O'Brien\AppData"),
+            r"C:\Users\O''Brien\AppData"
+        );
+        assert_eq!(ps_single_quote("a'b'c"), "a''b''c");
     }
 }
 
@@ -316,6 +457,7 @@ pub async fn updater_check(
         .json()
         .await
         .map_err(|e| format!("Failed to parse update manifest: {}", e))?;
+    verify_update_manifest_signature(&manifest)?;
 
     let available = is_newer(&manifest.version, &current_version);
 
@@ -349,11 +491,7 @@ pub async fn updater_check(
     Ok(result)
 }
 
-#[tauri::command]
-pub async fn updater_download(
-    app: AppHandle,
-    state: tauri::State<'_, UpdaterState>,
-) -> Result<(), String> {
+async fn updater_download_impl(app: AppHandle, state: &UpdaterState) -> Result<(), String> {
     if !is_update_smoke_test_enabled()
         && !registry_config::get_bool("network_enabled").unwrap_or(true)
     {
@@ -378,6 +516,8 @@ pub async fn updater_download(
         .get(&manifest.url)
         .send()
         .await
+        .map_err(|e| format!("Download failed: {}", e))?
+        .error_for_status()
         .map_err(|e| format!("Download failed: {}", e))?;
 
     let content_length = response.content_length().unwrap_or(0);
@@ -422,8 +562,7 @@ pub async fn updater_download(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn updater_extract() -> Result<(), String> {
+async fn updater_extract_impl() -> Result<(), String> {
     let staging = staging_dir()?;
     let zip_path = staging.join("update.zip");
     let extract_dir = staging.join("extracted");
@@ -446,14 +585,23 @@ pub async fn updater_extract() -> Result<(), String> {
             .by_index(i)
             .map_err(|e| format!("Failed to read zip entry: {}", e))?;
 
-        let name = entry.name().to_string();
-
-        // Security: skip entries with path traversal
-        if name.contains("..") {
-            continue;
+        if entry
+            .unix_mode()
+            .map(|mode| mode & 0o170000 == 0o120000)
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "Update archive contains a symbolic link: {}",
+                entry.name()
+            ));
         }
 
-        let out_path = extract_dir.join(&name);
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("Unsafe update archive path: {}", entry.name()))?;
+        let enclosed = safe_update_entry_path(enclosed.to_string_lossy().as_ref())?;
+        let name = enclosed.to_string_lossy().to_string();
+        let out_path = extract_dir.join(enclosed);
 
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path)
@@ -474,8 +622,7 @@ pub async fn updater_extract() -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub async fn updater_apply(
+async fn updater_apply_impl(
     app: AppHandle,
     monitor_state: tauri::State<'_, crate::monitor::MonitorState>,
     capture_state: tauri::State<'_, std::sync::Arc<crate::capture::CaptureState>>,
@@ -582,11 +729,11 @@ try {{
     exit 1
 }}
 "#,
-        exe_name_no_ext = exe_name.trim_end_matches(".exe"),
-        app_dir = app_dir_str,
-        extract_dir = extract_dir_str,
-        staging_dir = staging_dir_str,
-        exe_name = exe_name,
+        exe_name_no_ext = ps_single_quote(exe_name.trim_end_matches(".exe")),
+        app_dir = ps_single_quote(&app_dir_str),
+        extract_dir = ps_single_quote(&extract_dir_str),
+        staging_dir = ps_single_quote(&staging_dir_str),
+        exe_name = ps_single_quote(&exe_name),
     );
 
     // Write the PowerShell script
@@ -617,4 +764,36 @@ try {{
     app.exit(0);
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn updater_install(
+    app: AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<
+        '_,
+        std::sync::Arc<crate::credential_manager::CredentialManagerState>,
+    >,
+    state: tauri::State<'_, UpdaterState>,
+    monitor_state: tauri::State<'_, crate::monitor::MonitorState>,
+    capture_state: tauri::State<'_, std::sync::Arc<crate::capture::CaptureState>>,
+) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+    let _install_guard = state
+        .install_lock
+        .try_lock()
+        .map_err(|_| "UPDATE_IN_PROGRESS".to_string())?;
+    let _ = app.emit(
+        "updater-phase",
+        serde_json::json!({ "phase": "downloading" }),
+    );
+    updater_download_impl(app.clone(), &state).await?;
+    let _ = app.emit(
+        "updater-phase",
+        serde_json::json!({ "phase": "extracting" }),
+    );
+    updater_extract_impl().await?;
+    let _ = app.emit("updater-phase", serde_json::json!({ "phase": "applying" }));
+    updater_apply_impl(app, monitor_state, capture_state).await
 }

@@ -21,6 +21,7 @@
   --ide-bg: #f7f9fc;
   --ide-panel: #ffffff;
   --ide-border: #d9dde7;
+  --ide-border-rgb: 217 221 231;
   --ide-text: #1f2430;
   --ide-muted: #6b7280;
   --ide-accent: #2563eb;
@@ -41,6 +42,7 @@
   --ide-bg: #1e1e1e;
   --ide-panel: #252526;
   --ide-border: #333333;
+  --ide-border-rgb: 51 51 51;
   --ide-text: #cccccc;
   --ide-muted: #858585;
   --ide-accent: #007acc;

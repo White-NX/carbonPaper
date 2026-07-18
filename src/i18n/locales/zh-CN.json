@@ -1,4 +1,11 @@
 {
+  "notifications": {
+    "ocr_model_repair": {
+      "title": "CarbonPaper OCR 模型需要修复",
+      "body": "截图仍会保存，但在模型修复前不会生成 OCR 文本。点击此通知立即修复。",
+      "action": "修复模型"
+    }
+  },
   "settings": {
     "general": {
       "title": "通用选项",
@@ -154,7 +161,11 @@
       "about": "关于",
       "extension": "浏览器扩展",
       "ai_embedding": "人工智能嵌入",
-      "features": "功能"
+      "features": "功能",
+      "capture": "记录与搜索",
+      "organize": "整理与智能",
+      "privacy": "隐私与访问",
+      "maintenance": "存储与维护"
     },
     "security": {
       "protection": {
@@ -215,7 +226,9 @@
         "changed_notice": "CPU 限制更改将在下次启动监控服务时生效"
       },
       "ocr": {
-        "title": "OCR 处理队列",
+        "title": "OCR 处理",
+        "single_flight": "固定单任务模式",
+        "single_flight_desc": "OCR 直接处理未经过 JPEG 的 RGB 捕获帧。为限制内存占用，OCR 运行期间不会排队新的完整 RGB 帧。",
         "pause_label": "OCR 队列有任务时暂停截图",
         "pause_desc": "开启后，当 OCR 队列中有未处理任务时将暂停截图，减少资源占用",
         "queue_limit_label": "限制 OCR 任务队列大小",
@@ -225,6 +238,29 @@
         "timeout_desc": "设定 OCR 任务的超时时间。冷启动固定允许 180 秒。",
         "seconds": "秒",
         "info": "OCR 队列设置会即时生效，无需重启监控服务"
+      },
+      "rust_ocr": {
+        "title": "OCR 引擎",
+        "raw_rgb": "Rust Raw RGB OCR",
+        "raw_rgb_desc": "隔离的 Rust ML 进程直接读取 RGB 捕获帧。",
+        "use_rust": "使用 Rust OCR",
+        "rust_desc": "使用隔离的 Rust ML 进程直接处理 RGB 捕获帧。",
+        "python_desc": "Python OCR 不再作为截图 OCR 回退路径。",
+        "dml_beta": "DirectML Beta",
+        "dml_beta_desc": "临时实验开关，默认关闭；未来会废弃并合并到统一的 DirectML 设置。",
+        "model_ready": "PP-OCRv5 Mobile 已安装",
+        "model_missing": "需要安装 PP-OCRv5 Mobile 模型",
+        "model_bundled": "PP-OCRv5 Mobile 随 CarbonPaper 安装",
+        "model_repaired": "PP-OCRv5 Mobile 已通过在线修复安装",
+        "model_damaged": "PP-OCRv5 Mobile 安装资源缺失或损坏",
+        "model_checking": "正在检查模型…",
+        "model_downloading": "下载中…",
+        "model_download": "下载模型",
+        "model_repair": "在线修复",
+        "status_loading": "正在读取状态…",
+        "status_counts": "成功 {{success}} · 失败 {{failure}} · 最近 {{elapsed}} ms",
+        "restart": "重启 Rust ML 进程",
+        "retry_failed": "重试失败截图（{{count}}）"
       },
       "dml": {
         "title": "OCR 推理加速",
@@ -441,12 +477,14 @@
       "title": "浏览器扩展",
       "description": "管理 CarbonPaper 浏览器扩展",
       "chrome": {
-        "label": "添加到 Chrome",
+        "name": "Chrome / Chromium 内核浏览器",
+        "label": "安装",
         "registered": "已注册",
         "registering": "注册中..."
       },
       "edge": {
-        "label": "添加到 Edge",
+        "name": "Microsoft Edge",
+        "label": "安装",
         "registered": "已注册",
         "registering": "注册中..."
       },
@@ -456,19 +494,23 @@
       },
       "enhance": {
         "label": "扩展增强",
-        "description": "启用后，浏览器扩展将接管该浏览器的截图捕获，提供更丰富的元数据（页面 URL、标题、网站图标、链接）。自带的截图循环将跳过该浏览器的 OCR 处理。",
-        "chrome": "启用 Chrome 扩展增强",
-        "edge": "启用 Edge 扩展增强"
+        "description": "启用后，已连接扩展的浏览器将由扩展接管截图捕获，提供更丰富的元数据（页面 URL、标题、网站图标、链接）。支持任意 Chromium 内核浏览器。",
+        "global": "启用扩展增强"
+      },
+      "sessions": {
+        "title": "已连接的浏览器",
+        "empty": "当前没有浏览器连接。",
+        "pid": "PID {{pid}}"
       },
       "success": "扩展安装成功。请在浏览器中启用该未打包扩展。",
       "error": "安装失败：{{error}}",
       "help": "点击按钮后，请在浏览器扩展管理页面中加载显示路径的未打包扩展。",
       "tutorial": {
         "title": "安装步骤",
-        "step1": "点击上方对应浏览器（Chrome 或 Edge）的安装按钮。",
+        "step1": "点击上方的安装按钮。「Chrome / Chromium 内核浏览器」同样适用于其他 Chromium 内核浏览器（360、百分、Brave 等）。",
         "step2": "打开浏览器扩展页面，启用「开发者模式」。",
         "step3": "点击「加载已解压的扩展程序」，选择安装后显示的扩展文件夹。",
-        "step4": "CarbonPaper 扩展图标将出现在浏览器工具栏中。"
+        "step4": "CarbonPaper 扩展图标将出现在浏览器工具栏中，且该浏览器会显示在「已连接的浏览器」列表里。"
       }
     },
     "ai_embedding": {
@@ -518,6 +560,7 @@
         "source": "来源",
         "endpoint": "端点",
         "copy": "复制配置提示词",
+        "copy_diagnostics": "复制诊断",
         "copied": "配置提示词已复制",
         "prompt": "请配置 CarbonPaper MCP 访问。\n\n1. 从 GitHub 仓库 {{repo}} 的 {{skillName}} 目录获取 Skill，并安装到你的 Agent/Skill 环境中。\n2. 使用该 Skill 处理 CarbonPaper 截图历史、OCR、任务聚类和智能聚类摘要相关请求。\n3. MCP endpoint：{{endpoint}}，使用 Streamable HTTP/HTTP POST。\n4. 认证头：Authorization: Bearer <CarbonPaper token>。不要让我把 token 写进长提示词；请让我在 CarbonPaper 中单独点击“复制令牌”，然后将其配置到你的 MCP 客户端。\n5. 如果工具返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 应用中完成 Windows Hello 解锁。\n6. 该 MCP 可能暴露本机截图历史、OCR 文本、窗口标题、URL、任务聚类和智能聚类数据；只在我明确要求时读取相关内容。"
       },
@@ -696,7 +739,15 @@
         "size": "大小",
         "location": "位置",
         "empty": "暂无模型数据",
-        "refresh": "刷新"
+        "refresh": "刷新",
+        "purposes": {
+          "image_embedding": "图像特征提取",
+          "content_classification": "内容分类",
+          "task_clustering": "任务聚类",
+          "smart_cluster_rerank": "智能聚类重排",
+          "ocr": "文字识别 (OCR)",
+          "legacy_ocr_cache": "旧版 OCR 缓存"
+        }
       }
     }
   },
@@ -906,13 +957,14 @@
     "subtitle": "捕获浏览器截图并附带丰富的元数据",
     "description": "CarbonPaper 浏览器扩展可以捕获浏览器视口截图，并附带页面元数据（URL、标题、可见链接）。选择你使用的浏览器来安装扩展。",
     "select_browser": "选择要安装的浏览器",
-    "chrome": "Google Chrome",
+    "chrome": "Google Chrome / 其他 Chromium 内核浏览器",
     "edge": "Microsoft Edge",
     "installing": "安装中...",
     "apply": "安装扩展",
     "skip": "跳过",
     "done": "完成",
     "success_message": "扩展安装成功。请在浏览器中启用开发者模式，然后从以下路径加载已解压的扩展。",
+    "connected": "已连接的浏览器：",
     "error_message": "安装失败"
   },
   "clusteringSetup": {
@@ -1223,7 +1275,8 @@
   },
   "aboutSection": {
     "debug": {
-      "trigger_security_alert": "预览安全告警蒙层"
+      "trigger_security_alert": "预览安全告警蒙层",
+      "trigger_ocr_model_repair_notification": "测试 OCR 模型修复通知"
     }
   },
   "securityAlert": {
@@ -1247,6 +1300,20 @@
     "switchToNormal": "切换到正常模式",
     "switchToXibao": "切换到喜报模式",
     "triggerTest": "触发测试错误窗口"
+  },
+  "ocrModelRepair": {
+    "title": "OCR 模型修复",
+    "ready": "OCR 模型已就绪",
+    "missing": "OCR 当前不可用",
+    "readyDescription": "新的截图将恢复生成 OCR 文本。",
+    "description": "CarbonPaper 仍会安全保存截图，但在模型修复前不会生成 OCR 文本，也不会回退到 JPEG 或 Python OCR。",
+    "noAuth": "修复不需要解锁。下载完成后会校验文件大小和 SHA-256，下一次 OCR 会自动载入新模型。",
+    "preparing": "正在准备下载…",
+    "checking": "正在检查模型状态…",
+    "later": "稍后处理",
+    "close": "关闭",
+    "repairing": "正在修复…",
+    "repair": "立即修复模型"
   },
   "timeline": {
     "month": "1月",

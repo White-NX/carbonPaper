@@ -156,6 +156,26 @@ impl StorageState {
                 FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
             );
 
+            -- OCR lifecycle is kept separate from screenshot metadata so
+            -- failed inference can remain retryable without changing the
+            -- durable screenshot record.
+            CREATE TABLE IF NOT EXISTS screenshot_ocr_status (
+                screenshot_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'pending',
+                engine TEXT,
+                model_id TEXT,
+                execution_provider TEXT,
+                error TEXT,
+                elapsed_ms REAL,
+                postprocess_status TEXT NOT NULL DEFAULT 'none',
+                postprocess_error TEXT,
+                postprocess_attempts INTEGER NOT NULL DEFAULT 0,
+                postprocess_next_retry_at TIMESTAMP,
+                attempted_at TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
+            );
+
             -- Deferred physical cleanup queues
             CREATE TABLE IF NOT EXISTS delete_queue_screenshots (
                 id INTEGER PRIMARY KEY
@@ -416,6 +436,53 @@ impl StorageState {
         // Classification columns
         Self::add_column_if_missing(conn, "screenshots", "category", "TEXT")?;
         Self::add_column_if_missing(conn, "screenshots", "category_confidence", "REAL")?;
+
+        Self::create_table_if_missing(
+            conn,
+            "screenshot_ocr_status",
+            r#"
+            CREATE TABLE IF NOT EXISTS screenshot_ocr_status (
+                screenshot_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'pending',
+                engine TEXT,
+                model_id TEXT,
+                execution_provider TEXT,
+                error TEXT,
+                elapsed_ms REAL,
+                postprocess_status TEXT NOT NULL DEFAULT 'none',
+                postprocess_error TEXT,
+                postprocess_attempts INTEGER NOT NULL DEFAULT 0,
+                postprocess_next_retry_at TIMESTAMP,
+                attempted_at TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
+            )
+            "#,
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "screenshot_ocr_status",
+            "postprocess_status",
+            "TEXT NOT NULL DEFAULT 'none'",
+        )?;
+        Self::add_column_if_missing(conn, "screenshot_ocr_status", "postprocess_error", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "screenshot_ocr_status",
+            "postprocess_attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "screenshot_ocr_status",
+            "postprocess_next_retry_at",
+            "TIMESTAMP",
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_screenshot_ocr_status_status ON screenshot_ocr_status(status);\
+             CREATE INDEX IF NOT EXISTS idx_screenshot_ocr_postprocess_retry ON screenshot_ocr_status(postprocess_status, postprocess_next_retry_at, updated_at);",
+        )
+        .map_err(|e| format!("Failed to create OCR lifecycle indexes: {}", e))?;
 
         // Task clustering tables
         Self::create_table_if_missing(

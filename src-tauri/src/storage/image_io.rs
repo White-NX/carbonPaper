@@ -1,11 +1,12 @@
 //! Image reading with decryption support.
 
 use crate::credential_manager::{
-    decrypt_row_key_with_cng, decrypt_with_master_key, encrypt_with_master_key,
+    decrypt_row_key_with_cng, decrypt_row_key_with_cng_silent, decrypt_with_master_key,
+    encrypt_with_master_key, CredentialError,
 };
 use std::path::{Path, PathBuf};
 
-use super::StorageState;
+use super::{BackgroundReadError, StorageState};
 
 impl StorageState {
     /// Read an encrypted image file and return Base64-encoded data.
@@ -70,10 +71,33 @@ impl StorageState {
 
     /// Read an encrypted image file and return raw image bytes.
     pub fn read_image_bytes(&self, path: &str) -> Result<(Vec<u8>, String), String> {
+        self.read_image_bytes_with_mode(path, false)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Read image bytes for unattended work without allowing CNG to display UI.
+    pub(crate) fn read_image_bytes_silent(
+        &self,
+        path: &str,
+    ) -> Result<(Vec<u8>, String), BackgroundReadError> {
+        self.read_image_bytes_with_mode(path, true)
+    }
+
+    fn read_image_bytes_with_mode(
+        &self,
+        path: &str,
+        silent: bool,
+    ) -> Result<(Vec<u8>, String), BackgroundReadError> {
         let diag_start = std::time::Instant::now();
 
         let (key_enc, abs_path) = {
-            let guard = self.get_connection_named("read_image_bytes")?;
+            let guard = self
+                .get_connection_named(if silent {
+                    "read_image_bytes_silent"
+                } else {
+                    "read_image_bytes"
+                })
+                .map_err(BackgroundReadError::Other)?;
             let conn = guard.as_ref().unwrap();
 
             if let Some(hash) = path.strip_prefix("memory://") {
@@ -86,7 +110,12 @@ impl StorageState {
                     .ok();
                 match result {
                     Some((key, real_path)) => (key, self.resolve_image_path(&real_path)),
-                    None => return Err(format!("No screenshot found for hash: {}", hash)),
+                    None => {
+                        return Err(BackgroundReadError::Other(format!(
+                            "No screenshot found for hash: {}",
+                            hash
+                        )))
+                    }
                 }
             } else {
                 let key: Option<Vec<u8>> = conn
@@ -103,13 +132,24 @@ impl StorageState {
         };
 
         let query_elapsed = diag_start.elapsed();
-        let mut row_key = key_enc
-            .as_ref()
-            .and_then(|enc| decrypt_row_key_with_cng(enc).ok())
-            .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
+        let encrypted_key = key_enc.as_ref().ok_or_else(|| {
+            BackgroundReadError::Other("Failed to unwrap image row key".to_string())
+        })?;
+        let mut row_key = if silent {
+            decrypt_row_key_with_cng_silent(encrypted_key)
+        } else {
+            decrypt_row_key_with_cng(encrypted_key)
+        }
+        .map_err(|error| match error {
+            CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
+            other => {
+                BackgroundReadError::Other(format!("Failed to unwrap image row key: {}", other))
+            }
+        })?;
 
         let abs_path_str = abs_path.to_string_lossy().to_string();
-        let result = read_encrypted_image_bytes(&abs_path_str, &row_key);
+        let result =
+            read_encrypted_image_bytes(&abs_path_str, &row_key).map_err(BackgroundReadError::Other);
         Self::zeroize_bytes(&mut row_key);
         if diag_start.elapsed().as_secs() >= 5 {
             tracing::warn!(

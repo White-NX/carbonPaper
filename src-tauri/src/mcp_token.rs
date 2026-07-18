@@ -1,3 +1,5 @@
+//! Generation, hashing, encryption, decryption, and legacy migration of MCP tokens.
+
 use crate::credential_manager::{
     self, decrypt_with_master_key, encrypt_with_master_key, CredentialManagerState,
 };

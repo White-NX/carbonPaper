@@ -12,13 +12,18 @@ use crate::monitor::MonitorState;
 use crate::reverse_ipc_protocol::{
     read_ipc_frame, write_ipc_binary_frame, write_ipc_frame, StorageResponse,
 };
-use crate::storage::{OcrResultInput, SaveScreenshotRequest, ScreenshotRecord, StorageState};
+#[cfg(test)]
+use crate::storage::ScreenshotRecord;
+use crate::storage::{
+    BackgroundReadError, BackgroundScreenshotSummary, OcrResultInput, SaveScreenshotRequest,
+    StorageState,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
 use tauri::Manager;
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer};
 use tokio::sync::{mpsc, Semaphore};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
@@ -75,10 +80,19 @@ pub enum StorageCommand {
     /// Check whether a screenshot with the given hash already exists.
     #[serde(rename = "screenshot_exists")]
     ScreenshotExists { image_hash: String },
+    #[serde(rename = "set_ocr_postprocess_status")]
+    SetOcrPostprocessStatus {
+        screenshot_id: i64,
+        status: String,
+        error: Option<String>,
+    },
+    #[serde(rename = "record_ocr_postprocess_retry")]
+    RecordOcrPostprocessRetry { screenshot_id: i64, error: String },
 }
 
 // Use OcrResultInput from crate::storage to keep a single canonical type
 
+#[cfg(test)]
 fn screenshot_record_with_ocr_json(
     rec: ScreenshotRecord,
     ocr_map: &std::collections::HashMap<i64, String>,
@@ -92,6 +106,28 @@ fn screenshot_record_with_ocr_json(
         "timestamp": rec.timestamp.unwrap_or(0) as f64,
         "category": rec.category.unwrap_or_default(),
     })
+}
+
+fn background_screenshot_with_ocr_json(
+    rec: BackgroundScreenshotSummary,
+    ocr_map: &std::collections::HashMap<i64, String>,
+) -> serde_json::Value {
+    let ocr_text = ocr_map.get(&rec.id).cloned().unwrap_or_default();
+    serde_json::json!({
+        "id": rec.id,
+        "process_name": rec.process_name.unwrap_or_default(),
+        "window_title": rec.window_title.unwrap_or_default(),
+        "ocr_text": ocr_text,
+        "timestamp": rec.timestamp.unwrap_or(0) as f64,
+        "category": rec.category.unwrap_or_default(),
+    })
+}
+
+fn background_read_error_response(error: BackgroundReadError) -> StorageResponse {
+    match error {
+        BackgroundReadError::AuthRequired => StorageResponse::error("AUTH_REQUIRED"),
+        BackgroundReadError::Other(message) => StorageResponse::error(&message),
+    }
 }
 
 use windows::Win32::Security::GetTokenInformation;
@@ -115,6 +151,8 @@ struct PipeSecurityContext {
 
 /// Create SECURITY_ATTRIBUTES that only allow the current user to access the pipe.
 fn get_security_context() -> Result<PipeSecurityContext, String> {
+    // SAFETY: `token_handle` is writable output storage; on success this function owns
+    // the process-token handle and closes it exactly once after the inner helper returns.
     unsafe {
         let mut token_handle = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
@@ -128,6 +166,9 @@ fn get_security_context() -> Result<PipeSecurityContext, String> {
 
 /// Inner helper so that `?` returns to `get_security_context` which always closes token_handle.
 fn get_security_context_inner(token_handle: HANDLE) -> Result<PipeSecurityContext, String> {
+    // SAFETY: `token_handle` is live for this call; queried buffer sizes determine every
+    // allocation, SID/ACL pointers refer into owned buffers retained by the returned
+    // context, and Windows does not retain temporary Rust pointers beyond each call.
     unsafe {
         let mut return_length = 0u32;
         let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut return_length);
@@ -207,6 +248,8 @@ fn is_pid_descendant_of(pid: u32, expected_ancestor_pid: u32) -> bool {
     }
 
     let mut parent_by_pid = std::collections::HashMap::<u32, u32>::new();
+    // SAFETY: the snapshot handle is checked before use, `PROCESSENTRY32.dwSize` is set as
+    // required, and the owned snapshot is closed after synchronous enumeration.
     unsafe {
         let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
             Ok(snapshot) => snapshot,
@@ -297,8 +340,10 @@ impl ReverseIpcServer {
                         }
                     };
 
-                    // 应用安全描述符和 PIPE_REJECT_REMOTE_CLIENTS。
+                    // Apply the current-user ACL and reject remote clients.
                     // Use byte-mode pipes for robust streaming of large JSON payloads.
+                    // SAFETY: the pipe name is NUL-terminated; `sec_ctx` retains the
+                    // security descriptor and ACL backing memory for the entire call.
                     let handle = unsafe {
                         windows::Win32::System::Pipes::CreateNamedPipeW(
                             windows::core::PCWSTR(wide_pipe_name.as_ptr()),
@@ -313,12 +358,16 @@ impl ReverseIpcServer {
                     };
 
                     if handle.is_invalid() {
+                        // SAFETY: `GetLastError` reads thread-local Win32 state and takes
+                        // no pointers or handles.
                         tracing::error!("Failed to create pipe via Win32 API: {:?}", unsafe { windows::Win32::Foundation::GetLastError() });
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue;
                     }
 
-                    // 将 Raw Handle 转换为 tokio NamedPipeServer
+                    // Transfer the raw pipe handle into Tokio's owning server wrapper.
+                    // SAFETY: `handle` is valid and uniquely owned. On success ownership
+                    // transfers to `NamedPipeServer`; on failure it is closed below.
                     let server = unsafe {
                         match NamedPipeServer::from_raw_handle(handle.0) {
                             Ok(s) => s,
@@ -330,7 +379,7 @@ impl ReverseIpcServer {
                         }
                     };
 
-                    // 等待客户端连接或关闭信号
+                    // Wait for either a client connection or the shutdown signal.
                     tokio::select! {
                         _ = shutdown_rx.recv() => {
                             tracing::info!("Reverse IPC server shutting down, goodbye");
@@ -385,7 +434,7 @@ impl ReverseIpcServer {
     }
 }
 
-/// 处理单个客户端连接
+/// Handles one authenticated reverse-IPC client connection.
 async fn handle_client(
     mut server: NamedPipeServer,
     storage: Arc<StorageState>,
@@ -393,7 +442,9 @@ async fn handle_client(
     app_handle: tauri::AppHandle,
     expected_auth_token: String,
 ) {
-    // 安全校验：验证客户端 PID
+    // Validate the client PID before reading any application request.
+    // SAFETY: Tokio owns a live pipe handle for the duration of the call and `pid` points
+    // to writable stack storage that Windows fills synchronously.
     let client_pid_raw = unsafe {
         let mut pid: u32 = 0;
         let handle = HANDLE(server.as_raw_handle() as *mut _);
@@ -636,6 +687,41 @@ fn process_request(
                 Err(e) => StorageResponse::error(&e),
             }
         }
+        "set_ocr_postprocess_status" => {
+            let screenshot_id = req
+                .get("screenshot_id")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(-1);
+            let status = req
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let error = req.get("error").and_then(|value| value.as_str());
+            if screenshot_id < 0 {
+                return StorageResponse::error("Invalid screenshot_id");
+            }
+            match storage.set_ocr_postprocess_status(screenshot_id, status, error) {
+                Ok(()) => StorageResponse::success(serde_json::json!({ "updated": true })),
+                Err(error) => StorageResponse::error(&error),
+            }
+        }
+        "record_ocr_postprocess_retry" => {
+            let screenshot_id = req
+                .get("screenshot_id")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(-1);
+            let error = req
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("OCR postprocess failed");
+            if screenshot_id < 0 {
+                return StorageResponse::error("Invalid screenshot_id");
+            }
+            match storage.record_ocr_postprocess_retry(screenshot_id, error) {
+                Ok(()) => StorageResponse::success(serde_json::json!({ "updated": true })),
+                Err(error) => StorageResponse::error(&error),
+            }
+        }
         "save_screenshot_temp" => {
             let request = match serde_json::from_value::<SaveScreenshotRequest>(req.clone()) {
                 Ok(r) => r,
@@ -782,6 +868,10 @@ fn process_request(
             }
         }
         "list_screenshots_for_clustering" => {
+            if !storage.is_session_valid() {
+                return StorageResponse::error("AUTH_REQUIRED");
+            }
+
             let start_ts = req.get("start_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let end_ts = req.get("end_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let offset = req.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -804,14 +894,15 @@ fn process_request(
                 Err(err) => return StorageResponse::error(&err),
             };
 
-            // Paged query with SQL LIMIT/OFFSET (only decrypt this page)
-            match storage.get_screenshots_by_time_range_paged(s, e, offset, limit) {
+            // Paged unattended query: decrypt only clustering metadata and
+            // force CNG silent mode so a state race can never display UI.
+            match storage.get_screenshot_summaries_by_time_range_paged_silent(s, e, offset, limit) {
                 Ok(records) => {
                     let ids: Vec<i64> = records.iter().map(|rec| rec.id).collect();
                     let ocr_batch_started = std::time::Instant::now();
-                    let ocr_map = match storage.get_ocr_results_by_screenshot_ids(&ids) {
+                    let ocr_map = match storage.get_ocr_results_by_screenshot_ids_silent(&ids) {
                         Ok(map) => map,
-                        Err(e) => return StorageResponse::error(&e),
+                        Err(error) => return background_read_error_response(error),
                     };
                     tracing::debug!(
                         "[DIAG:CLUSTERING] batch OCR fetch ids={} elapsed={}ms",
@@ -820,18 +911,22 @@ fn process_request(
                     );
                     let page: Vec<serde_json::Value> = records
                         .into_iter()
-                        .map(|rec| screenshot_record_with_ocr_json(rec, &ocr_map))
+                        .map(|rec| background_screenshot_with_ocr_json(rec, &ocr_map))
                         .collect();
                     StorageResponse::success(serde_json::json!({
                         "screenshots": page,
                         "total": total,
                     }))
                 }
-                Err(e) => StorageResponse::error(&e),
+                Err(error) => background_read_error_response(error),
             }
         }
 
         "get_screenshots_with_ocr_by_ids" => {
+            if !storage.is_session_valid() {
+                return StorageResponse::error("AUTH_REQUIRED");
+            }
+
             let ids: Vec<i64> = req
                 .get("ids")
                 .and_then(|v| v.as_array())
@@ -846,21 +941,22 @@ fn process_request(
             const MAX_BATCH: usize = 500;
             let ids: Vec<i64> = ids.into_iter().take(MAX_BATCH).collect();
 
-            // Fetch OCR results in batch first
-            let ocr_map = match storage.get_ocr_results_by_screenshot_ids(&ids) {
+            // Fetch OCR results in silent mode. Authentication loss aborts the
+            // entire batch instead of retrying CNG once per OCR row.
+            let ocr_map = match storage.get_ocr_results_by_screenshot_ids_silent(&ids) {
                 Ok(map) => map,
-                Err(e) => return StorageResponse::error(&e),
+                Err(error) => return background_read_error_response(error),
             };
 
-            match storage.get_screenshots_by_ids(&ids) {
+            match storage.get_screenshot_summaries_by_ids_silent(&ids) {
                 Ok(records) => {
                     let out: Vec<serde_json::Value> = records
                         .into_iter()
-                        .map(|rec| screenshot_record_with_ocr_json(rec, &ocr_map))
+                        .map(|rec| background_screenshot_with_ocr_json(rec, &ocr_map))
                         .collect();
                     StorageResponse::success(serde_json::json!({ "screenshots": out }))
                 }
-                Err(e) => StorageResponse::error(&e),
+                Err(error) => background_read_error_response(error),
             }
         }
 
@@ -1017,7 +1113,7 @@ fn get_temp_image_bytes(
     };
 
     if let Some(jpeg_bytes) = cached {
-        return Ok((jpeg_bytes, "image/jpeg".to_string()));
+        return Ok((jpeg_bytes.to_vec(), "image/jpeg".to_string()));
     }
 
     match storage.get_screenshot_by_id(screenshot_id) {
@@ -1109,6 +1205,9 @@ fn get_current_user_sid() -> Result<String, String> {
     use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+    // SAFETY: token and SID buffers are allocated from sizes returned by Windows; all
+    // handles and `LocalAlloc` strings are released once, and every output pointer refers
+    // to live writable storage for the duration of its synchronous call.
     unsafe {
         let mut token_handle = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle)
@@ -1204,16 +1303,65 @@ impl NmhPipeServer {
             };
 
             rt.block_on(async move {
+                let wide_pipe_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut first_pipe_instance = true;
+
                 loop {
-                    let server = match ServerOptions::new()
-                        .first_pipe_instance(false)
-                        .create(&pipe_name)
-                    {
-                        Ok(s) => s,
+                    // Apply the same current-user ACL as the storage pipe and
+                    // reject remote clients. Claim first-instance on the
+                    // initial create so a squatted pipe name fails loudly.
+                    let sec_ctx = match get_security_context() {
+                        Ok(ctx) => ctx,
                         Err(e) => {
-                            tracing::error!("Failed to create NMH pipe server: {}", e);
+                            tracing::error!("Failed to get NMH pipe security attributes: {}", e);
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                             continue;
+                        }
+                    };
+
+                    let open_mode = if first_pipe_instance {
+                        PIPE_ACCESS_DUPLEX
+                            | windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED
+                            | windows::Win32::Storage::FileSystem::FILE_FLAG_FIRST_PIPE_INSTANCE
+                    } else {
+                        PIPE_ACCESS_DUPLEX
+                            | windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED
+                    };
+
+                    // SAFETY: the pipe name is NUL-terminated; `sec_ctx` retains the
+                    // security descriptor and ACL backing memory for the entire call.
+                    let handle = unsafe {
+                        windows::Win32::System::Pipes::CreateNamedPipeW(
+                            windows::core::PCWSTR(wide_pipe_name.as_ptr()),
+                            open_mode,
+                            windows::Win32::System::Pipes::PIPE_TYPE_BYTE | windows::Win32::System::Pipes::PIPE_READMODE_BYTE | windows::Win32::System::Pipes::PIPE_WAIT | windows::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS,
+                            windows::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES,
+                            1024 * 1024,
+                            1024 * 1024,
+                            0,
+                            Some(&sec_ctx.sa),
+                        )
+                    };
+
+                    if handle.is_invalid() {
+                        // SAFETY: `GetLastError` reads thread-local Win32 state and takes
+                        // no pointers or handles.
+                        tracing::error!("Failed to create NMH pipe server: {:?}", unsafe { windows::Win32::Foundation::GetLastError() });
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    first_pipe_instance = false;
+
+                    // SAFETY: `handle` is valid and uniquely owned. On success ownership
+                    // transfers to `NamedPipeServer`; on failure it is closed below.
+                    let server = unsafe {
+                        match NamedPipeServer::from_raw_handle(handle.0) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("Failed to convert raw handle to NMH pipe server: {}", e);
+                                let _ = windows::Win32::Foundation::CloseHandle(handle);
+                                continue;
+                            }
                         }
                     };
 
@@ -1260,6 +1408,18 @@ async fn handle_nmh_client(
     app_handle: tauri::AppHandle,
     expected_token: String,
 ) {
+    // SAFETY: Tokio owns a live pipe handle for the duration of the call and `pid` points
+    // to writable stack storage that Windows fills synchronously.
+    let client_pid = unsafe {
+        let mut pid: u32 = 0;
+        let handle = HANDLE(server.as_raw_handle() as *mut _);
+        if GetNamedPipeClientProcessId(handle, &mut pid).is_ok() {
+            Some(pid)
+        } else {
+            None
+        }
+    };
+
     let buf = match read_ipc_frame(&mut server).await {
         Ok(result) => result,
         Err(e) => {
@@ -1279,12 +1439,13 @@ async fn handle_nmh_client(
         Ok(req) => {
             // Validate auth token
             let provided_token = req.get("auth_token").and_then(|t| t.as_str()).unwrap_or("");
-            if provided_token != expected_token {
+            if !constant_time_eq(provided_token, &expected_token) {
                 tracing::warn!("NMH auth token mismatch");
                 StorageResponse::error("Authentication failed")
             } else {
                 process_nmh_request(
                     &req,
+                    client_pid,
                     storage.clone(),
                     capture_state.clone(),
                     app_handle.clone(),
@@ -1304,6 +1465,7 @@ async fn handle_nmh_client(
 /// Process an NMH request (save_extension_screenshot)
 async fn process_nmh_request(
     req: &serde_json::Value,
+    client_pid: Option<u32>,
     storage: Arc<StorageState>,
     capture_state: Arc<CaptureState>,
     app_handle: tauri::AppHandle,
@@ -1311,7 +1473,93 @@ async fn process_nmh_request(
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
 
     match command {
+        "register_nmh" => {
+            let browser_pid = req.get("browser_pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let nmh_pid = req.get("nmh_pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let cmd_pipe_name = req
+                .get("cmd_pipe_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let browser_exe_path = req
+                .get("browser_exe_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let browser_exe_name = req
+                .get("browser_exe_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if browser_pid == 0 || nmh_pid == 0 || !cmd_pipe_name.starts_with(NMH_CMD_PIPE_PREFIX) {
+                return StorageResponse::error("Invalid register_nmh request");
+            }
+
+            // The NMH connects to this pipe itself and is spawned by the
+            // browser it claims (directly or via the cmd.exe NM launcher
+            // wrapper), so the caller must sit below the claimed browser PID.
+            let Some(client_pid) = client_pid else {
+                return StorageResponse::error("Cannot verify NMH client process");
+            };
+            if !is_pid_descendant_of(client_pid, browser_pid) {
+                tracing::warn!(
+                    "[SECURITY] register_nmh rejected: client PID {} is not a descendant of claimed browser PID {}",
+                    client_pid,
+                    browser_pid
+                );
+                return StorageResponse::error("Invalid register_nmh request");
+            }
+
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            {
+                let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+                upsert_session(
+                    &mut sessions,
+                    NmhSession {
+                        browser_pid,
+                        browser_exe_path,
+                        browser_exe_name: browser_exe_name.clone(),
+                        nmh_pid,
+                        cmd_pipe_name,
+                        registered_at_ms: now_ms,
+                        last_seen_ms: now_ms,
+                    },
+                );
+            }
+            tracing::info!(
+                "NMH session registered: browser={} pid={} nmh_pid={}",
+                browser_exe_name,
+                browser_pid,
+                nmh_pid
+            );
+            StorageResponse::success(serde_json::json!({"registered": true}))
+        }
+        "unregister_nmh" => {
+            let nmh_pid = req.get("nmh_pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let cmd_pipe_name = req
+                .get("cmd_pipe_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            {
+                let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+                remove_session(&mut sessions, nmh_pid, cmd_pipe_name);
+            }
+            tracing::info!("NMH session unregistered: nmh_pid={}", nmh_pid);
+            StorageResponse::success(serde_json::json!({"unregistered": true}))
+        }
         "save_extension_screenshot" => {
+            // Keep the sender's session fresh (liveness signal)
+            if let Some(nmh_pid) = req.get("nmh_pid").and_then(|v| v.as_u64()) {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+                for s in sessions.iter_mut() {
+                    if s.nmh_pid == nmh_pid as u32 {
+                        s.last_seen_ms = now_ms;
+                    }
+                }
+            }
+
             // Check if capture is paused
             if capture_state
                 .paused
@@ -1321,15 +1569,12 @@ async fn process_nmh_request(
             }
 
             let image_data = match req.get("image_data").and_then(|v| v.as_str()) {
-                Some(d) => d.to_string(),
+                Some(d) => d,
                 None => return StorageResponse::error("Missing image_data"),
             };
-            let image_hash = match req.get("image_hash").and_then(|v| v.as_str()) {
-                Some(h) => h.to_string(),
-                None => return StorageResponse::error("Missing image_hash"),
-            };
-            let width = req.get("width").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            let height = req.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            if req.get("image_hash").and_then(|v| v.as_str()).is_none() {
+                return StorageResponse::error("Missing image_hash");
+            }
             let page_url = req
                 .get("page_url")
                 .and_then(|v| v.as_str())
@@ -1358,22 +1603,60 @@ async fn process_nmh_request(
                 );
             }
 
-            // OCR queue backpressure check (same logic as capture loop)
-            let in_flight = capture_state
-                .in_flight_ocr_count
-                .load(std::sync::atomic::Ordering::SeqCst);
-            let capture_on_busy = capture_state
-                .capture_on_ocr_busy
-                .load(std::sync::atomic::Ordering::SeqCst);
-            let max_queue = capture_state
-                .ocr_queue_max_size
-                .load(std::sync::atomic::Ordering::SeqCst);
+            let Some(ocr_slot) = capture_state.try_reserve_ocr_slot() else {
+                return StorageResponse::error("OCR is busy (single-flight mode)");
+            };
 
-            if !capture_on_busy && in_flight > 0 {
-                return StorageResponse::error("OCR queue busy (conservative mode)");
-            } else if in_flight > max_queue {
-                return StorageResponse::error("OCR queue full");
+            let encoded_image = match base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                image_data,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return StorageResponse::error(&format!(
+                        "Invalid extension image base64: {error}"
+                    ));
+                }
+            };
+            match image::guess_format(&encoded_image) {
+                Ok(image::ImageFormat::Png) => {}
+                Ok(format) => {
+                    return StorageResponse::error(&format!(
+                        "Extension OCR requires lossless PNG input, received {format:?}"
+                    ));
+                }
+                Err(error) => {
+                    return StorageResponse::error(&format!(
+                        "Cannot determine extension image format: {error}"
+                    ));
+                }
             }
+            let decoded_rgb_image = match image::load_from_memory_with_format(
+                &encoded_image,
+                image::ImageFormat::Png,
+            ) {
+                Ok(image) => Arc::new(image.to_rgb8()),
+                Err(error) => {
+                    return StorageResponse::error(&format!(
+                        "Cannot decode extension PNG: {error}"
+                    ));
+                }
+            };
+            drop(encoded_image);
+            let ocr_rgb_image = resize_extension_ocr_image(decoded_rgb_image.clone());
+            let jpeg_quality = capture_state
+                .config
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .jpeg_quality;
+            let jpeg_bytes = match crate::capture::encode_rgb_jpeg(&decoded_rgb_image, jpeg_quality)
+            {
+                Ok(bytes) => Arc::<[u8]>::from(bytes),
+                Err(error) => return StorageResponse::error(&error),
+            };
+            let image_hash = crate::capture::md5_hash(&jpeg_bytes);
+            let width = decoded_rgb_image.width() as i32;
+            let height = decoded_rgb_image.height() as i32;
 
             // Build metadata with process_icon (same mechanism as capture loop)
             let metadata = Some(serde_json::json!({
@@ -1381,7 +1664,7 @@ async fn process_nmh_request(
             }));
 
             let request = SaveScreenshotRequest {
-                image_data: image_data.clone(),
+                image_data: String::new(),
                 image_hash: image_hash.clone(),
                 width,
                 height,
@@ -1395,7 +1678,7 @@ async fn process_nmh_request(
                 visible_links,
             };
 
-            match storage.save_screenshot_temp(&request) {
+            match storage.save_screenshot_temp_bytes(&request, &jpeg_bytes) {
                 Ok(result) => {
                     if result.status == "duplicate" {
                         return StorageResponse::success(serde_json::to_value(result).unwrap());
@@ -1403,76 +1686,66 @@ async fn process_nmh_request(
 
                     // Dispatch to OCR pipeline if we have a screenshot_id
                     if let Some(screenshot_id) = result.screenshot_id {
-                        // Decode image bytes for OCR cache
-                        if let Ok(jpeg_bytes) = base64::Engine::decode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &image_data,
-                        ) {
-                            // Store in OCR cache so Python can fetch via get_temp_image
-                            {
-                                let mut cache = capture_state
-                                    .ocr_image_cache
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                cache.insert(screenshot_id, jpeg_bytes);
-                            }
-
-                            // Spawn async OCR task
-                            let storage_arc = storage.clone();
-                            let capture_arc = capture_state.clone();
-                            let app_clone = app_handle.clone();
-                            let window_title = page_title.unwrap_or_default();
-                            let timestamp_ms = chrono::Utc::now().timestamp_millis();
-
-                            // Increment in-flight OCR counter
-                            capture_state
-                                .in_flight_ocr_count
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-                            tokio::spawn(async move {
-                                let monitor_state = app_clone.state::<MonitorState>();
-                                let result = process_extension_ocr(
-                                    &monitor_state,
-                                    &storage_arc,
-                                    screenshot_id,
-                                    &image_hash,
-                                    &window_title,
-                                    &browser_name,
-                                    timestamp_ms,
-                                )
-                                .await;
-
-                                // Remove from OCR cache
-                                {
-                                    let mut cache = capture_arc
-                                        .ocr_image_cache
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    cache.remove(&screenshot_id);
-                                }
-
-                                // Decrement in-flight OCR counter
-                                capture_arc
-                                    .in_flight_ocr_count
-                                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-
-                                if let Err(e) = result {
-                                    tracing::error!(
-                                        "Extension OCR failed for screenshot {}: {}",
-                                        screenshot_id,
-                                        e
-                                    );
-                                    if let Err(abort_err) =
-                                        storage_arc.abort_screenshot(screenshot_id, Some(&e))
-                                    {
-                                        tracing::error!(
-                                            "abort_screenshot also failed: {}",
-                                            abort_err
-                                        );
-                                    }
-                                }
-                            });
+                        // Store storage JPEG in cache for Python post-processing only.
+                        {
+                            let mut cache = capture_state
+                                .ocr_image_cache
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            cache.insert(screenshot_id, jpeg_bytes.clone());
                         }
+
+                        // Spawn async OCR task
+                        let storage_arc = storage.clone();
+                        let app_clone = app_handle.clone();
+                        let window_title = page_title.unwrap_or_default();
+                        let timestamp_ms = chrono::Utc::now().timestamp_millis();
+
+                        let ocr_guard = ocr_slot.into_task_guard(screenshot_id);
+                        tokio::spawn(async move {
+                            let _ocr_guard = ocr_guard;
+                            let route = crate::capture::OcrRouteConfig::from_registry();
+                            let result = process_extension_ocr(
+                                &app_clone,
+                                &storage_arc,
+                                screenshot_id,
+                                ocr_rgb_image,
+                                &image_hash,
+                                &window_title,
+                                &browser_name,
+                                timestamp_ms,
+                                route,
+                            )
+                            .await;
+
+                            if let Err(e) = result {
+                                crate::ml_runtime::schedule_ocr_model_health_notification(
+                                    app_clone.clone(),
+                                );
+                                tracing::error!(
+                                    "Extension OCR failed for screenshot {}: {}",
+                                    screenshot_id,
+                                    e
+                                );
+                                if let Err(commit_err) =
+                                    storage_arc.commit_screenshot(screenshot_id, None, None, None)
+                                {
+                                    tracing::error!(
+                                        "Failed to preserve extension screenshot: {}",
+                                        commit_err
+                                    );
+                                }
+                                let _ = storage_arc.set_ocr_status(
+                                    screenshot_id,
+                                    "failed",
+                                    Some("rust"),
+                                    Some("ppocrv5-ch-mobile"),
+                                    None,
+                                    Some(&e),
+                                    None,
+                                );
+                            }
+                        });
                     }
 
                     StorageResponse::success(serde_json::to_value(result).unwrap())
@@ -1484,52 +1757,206 @@ async fn process_nmh_request(
     }
 }
 
-/// Check if extension enhancement is enabled for a given browser process name.
-/// Reads from Windows registry settings.
-fn is_extension_enhanced_browser(browser_name: &str) -> bool {
-    let lower = browser_name.to_lowercase();
-    if lower.contains("chrome") {
-        crate::registry_config::get_bool("extension_enhanced_chrome").unwrap_or(false)
-    } else if lower.contains("edge") || lower.contains("msedge") {
-        crate::registry_config::get_bool("extension_enhanced_edge").unwrap_or(false)
-    } else {
-        false
+const EXTENSION_OCR_MAX_SIDE: u32 = 1600;
+
+fn resize_extension_ocr_image(image: Arc<image::RgbImage>) -> Arc<image::RgbImage> {
+    let max_dim = image.width().max(image.height());
+    if max_dim <= EXTENSION_OCR_MAX_SIDE {
+        return image;
+    }
+
+    let ratio = EXTENSION_OCR_MAX_SIDE as f64 / max_dim as f64;
+    let new_width = ((image.width() as f64 * ratio).round() as u32).max(1);
+    let new_height = ((image.height() as f64 * ratio).round() as u32).max(1);
+    Arc::new(image::imageops::resize(
+        image.as_ref(),
+        new_width,
+        new_height,
+        image::imageops::FilterType::Lanczos3,
+    ))
+}
+
+/// Check if extension enhancement is enabled (single global toggle).
+fn is_extension_enhanced_browser(_browser_name: &str) -> bool {
+    extension_enhancement_enabled()
+}
+
+/// The single global "browser extension enhancement" toggle.
+fn extension_enhancement_enabled() -> bool {
+    crate::registry_config::get_bool("extension_enhanced_global").unwrap_or(false)
+}
+
+// ==================== NMH session table ====================
+//
+// Each NMH instance registers itself at runtime with the browser main
+// process it belongs to (PID + exe path) and a random-suffix command pipe.
+// The capture loop routes capture requests by matching the foreground
+// window's PID against this table — no browser-name lists anywhere, so any
+// Chromium-based browser works without per-browser support code.
+
+/// A live NMH registration: one browser instance with the extension connected.
+#[derive(Debug, Clone, Serialize)]
+pub struct NmhSession {
+    pub browser_pid: u32,
+    pub browser_exe_path: String,
+    pub browser_exe_name: String,
+    pub nmh_pid: u32,
+    pub cmd_pipe_name: String,
+    pub registered_at_ms: i64,
+    pub last_seen_ms: i64,
+}
+
+static NMH_SESSIONS: once_cell::sync::Lazy<std::sync::Mutex<Vec<NmhSession>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Only accept command pipes created by our NMH (random-suffix namespace).
+const NMH_CMD_PIPE_PREFIX: &str = r"\\.\pipe\carbon_nmh_cmd_r_";
+
+/// Insert or replace a session, keyed by nmh_pid (an NMH re-registering —
+/// e.g. after an app restart rotated the token — replaces its old entry).
+fn upsert_session(sessions: &mut Vec<NmhSession>, session: NmhSession) {
+    sessions.retain(|s| s.nmh_pid != session.nmh_pid);
+    sessions.push(session);
+}
+
+/// Remove a session by nmh_pid + cmd_pipe_name.
+fn remove_session(sessions: &mut Vec<NmhSession>, nmh_pid: u32, cmd_pipe_name: &str) {
+    sessions.retain(|s| !(s.nmh_pid == nmh_pid && s.cmd_pipe_name == cmd_pipe_name));
+}
+
+/// Pick the session serving a foreground window: exact browser-PID match
+/// first; otherwise same exe path + ancestor check (covers windows owned by
+/// a child process of the browser main process). Ties (multi-profile: several
+/// NMHs on one browser process) go to the most recently seen session.
+fn select_session<'a>(
+    sessions: &'a [NmhSession],
+    window_pid: u32,
+    process_path: &str,
+    is_descendant: impl Fn(u32, u32) -> bool,
+) -> Option<&'a NmhSession> {
+    let exact = sessions
+        .iter()
+        .filter(|s| s.browser_pid == window_pid)
+        .max_by_key(|s| s.last_seen_ms);
+    if exact.is_some() {
+        return exact;
+    }
+    if process_path.is_empty() {
+        return None;
+    }
+    sessions
+        .iter()
+        .filter(|s| {
+            s.browser_exe_path.eq_ignore_ascii_case(process_path)
+                && is_descendant(window_pid, s.browser_pid)
+        })
+        .max_by_key(|s| s.last_seen_ms)
+}
+
+/// Query the full executable path of a process by PID (empty on failure).
+fn query_process_image_path(pid: u32) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: the process handle is checked and owned locally; the UTF-16 buffer and size
+    // pointer are valid for the query, and the handle is closed exactly once.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        if result.is_ok() && size > 0 {
+            Some(String::from_utf16_lossy(&buf[..size as usize]))
+        } else {
+            None
+        }
     }
 }
 
-/// Compute deterministic NMH command pipe name for a given browser type.
-/// Must match the formula in nmh.rs `compute_nmh_cmd_pipe_name`.
-pub fn compute_nmh_cmd_pipe_name(browser_type: &str) -> Result<String, String> {
-    let sid = get_current_user_sid()?;
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{}carbonpaper_nmh_cmd_salt_{}", sid, browser_type));
-    let hash = hasher.finalize();
-    let hex_hash = hex::encode(hash);
-    Ok(format!(r"\\.\pipe\carbon_nmh_cmd_{}", &hex_hash[..16]))
+/// Drop sessions whose browser process is gone, or whose PID now belongs to
+/// a different executable (PID-reuse guard).
+pub fn prune_dead_sessions() {
+    let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    sessions.retain(|s| match query_process_image_path(s.browser_pid) {
+        Some(path) => {
+            s.browser_exe_path.is_empty() || path.eq_ignore_ascii_case(&s.browser_exe_path)
+        }
+        None => false,
+    });
 }
 
-/// Request the browser extension to capture the current tab.
-/// Opens the NMH command pipe and sends a `request_capture` command.
-/// Fails silently (returns Err) if the NMH is not running — this is expected.
-pub async fn request_extension_capture(process_name: &str) -> Result<(), String> {
-    let browser_type = process_name_to_browser_type(process_name);
-    let pipe_name = compute_nmh_cmd_pipe_name(&browser_type)?;
+/// Snapshot of live sessions (pruned first) for the settings UI.
+pub fn nmh_sessions_snapshot() -> Vec<NmhSession> {
+    prune_dead_sessions();
+    NMH_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
-    tracing::info!(
-        "request_extension_capture: process={} browser_type={} pipe={}",
-        process_name,
-        browser_type,
+/// Find the NMH session that should capture for the given foreground window,
+/// if extension enhancement is enabled. Used by the capture loop.
+pub fn find_nmh_session_for_pid(window_pid: u32, process_path: &str) -> Option<NmhSession> {
+    if !extension_enhancement_enabled() {
+        return None;
+    }
+    {
+        let sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if sessions.is_empty() {
+            return None;
+        }
+    }
+    prune_dead_sessions();
+    let sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    select_session(&sessions, window_pid, process_path, is_pid_descendant_of).cloned()
+}
+
+/// Whether any registered NMH session belongs to a process with this
+/// executable name. The game-mode fullscreen exemption uses this so
+/// Chromium forks absent from the hardcoded browser list are still
+/// treated as browsers while an extension session is live. Deliberately
+/// a plain table lookup — no pruning, no per-call syscalls.
+pub fn has_nmh_session_for_exe(process_name: &str) -> bool {
+    if process_name.is_empty() {
+        return false;
+    }
+    let sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    sessions
+        .iter()
+        .any(|s| s.browser_exe_name.eq_ignore_ascii_case(process_name))
+}
+
+/// Request the browser extension behind `session` to capture its current tab.
+/// Opens the session's command pipe and sends a `request_capture` command.
+/// The whole round-trip is bounded by a timeout so a wedged NMH (e.g. its
+/// browser is suspended with a full Native Messaging pipe) cannot stall the
+/// capture loop. On failure the session is dropped from the table (dead pipe)
+/// so the capture loop falls back to normal screen capture immediately.
+pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(), String> {
+    const CMD_ROUNDTRIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    let pipe_name = session.cmd_pipe_name.clone();
+
+    tracing::debug!(
+        "request_extension_capture: browser={} pid={} pipe={}",
+        session.browser_exe_name,
+        session.browser_pid,
         pipe_name
     );
 
-    // Run blocking pipe I/O on a separate thread
-    tokio::task::spawn_blocking(move || {
-        use std::fs::OpenOptions;
-        use std::io::{Read, Write};
+    let round_trip = async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut pipe = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut pipe = ClientOptions::new()
             .open(&pipe_name)
             .map_err(|e| format!("Cannot open NMH cmd pipe: {}", e))?;
 
@@ -1538,123 +1965,85 @@ pub async fn request_extension_capture(process_name: &str) -> Result<(), String>
             serde_json::to_vec(&request).map_err(|e| format!("Serialization failed: {}", e))?;
 
         pipe.write_all(&data)
+            .await
             .map_err(|e| format!("Pipe write failed: {}", e))?;
-        pipe.flush()
-            .map_err(|e| format!("Pipe flush failed: {}", e))?;
 
-        // Read response (best-effort, don't care much about content)
+        // The NMH replies ok only after successfully forwarding the request
+        // to the extension over its Native Messaging port.
         let mut response_buf = vec![0u8; 1024];
-        let _ = pipe.read(&mut response_buf);
+        let n = pipe
+            .read(&mut response_buf)
+            .await
+            .map_err(|e| format!("Pipe read failed: {}", e))?;
+        let response: serde_json::Value = serde_json::from_slice(&response_buf[..n])
+            .map_err(|e| format!("Invalid NMH cmd response: {}", e))?;
+        if response.get("status").and_then(|s| s.as_str()) == Some("ok") {
+            Ok(())
+        } else {
+            Err(response
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("NMH reported failure")
+                .to_string())
+        }
+    };
 
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("Task join failed: {}", e))?
-}
+    let result: Result<(), String> = match tokio::time::timeout(CMD_ROUNDTRIP_TIMEOUT, round_trip)
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "NMH cmd pipe round-trip timed out after {:?}",
+            CMD_ROUNDTRIP_TIMEOUT
+        )),
+    };
 
-/// Map process name (e.g. "chrome.exe") to browser type string for pipe name computation.
-fn process_name_to_browser_type(process_name: &str) -> String {
-    let lower = process_name.to_lowercase();
-    if lower.contains("msedge") || lower.contains("edge") {
-        "edge".to_string()
-    } else {
-        "chrome".to_string()
+    if result.is_err() {
+        let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        remove_session(&mut sessions, session.nmh_pid, &session.cmd_pipe_name);
     }
+    result
 }
 
-/// Check if a process name belongs to a browser with extension enhancement enabled.
-/// Used by the capture loop to skip OCR for extension-enhanced browsers.
-pub fn is_process_extension_enhanced(process_name: &str) -> bool {
-    let lower = process_name.to_lowercase();
-    if lower == "chrome.exe" || lower == "chrome" {
-        crate::registry_config::get_bool("extension_enhanced_chrome").unwrap_or(false)
-    } else if lower == "msedge.exe" || lower == "msedge" {
-        crate::registry_config::get_bool("extension_enhanced_edge").unwrap_or(false)
-    } else {
-        false
-    }
-}
-
-/// Send extension screenshot to Python OCR pipeline and commit results
+/// Send losslessly decoded extension pixels to the Rust OCR pipeline and commit results.
 async fn process_extension_ocr(
-    monitor_state: &MonitorState,
+    app: &tauri::AppHandle,
     storage: &StorageState,
     screenshot_id: i64,
+    rgb_image: Arc<image::RgbImage>,
     image_hash: &str,
     window_title: &str,
     process_name: &str,
     timestamp_ms: i64,
+    route: crate::capture::OcrRouteConfig,
 ) -> Result<(), String> {
-    let pipe_name = {
-        let guard = monitor_state
-            .pipe_name
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard
-            .clone()
-            .ok_or_else(|| "Monitor pipe not available".to_string())?
+    let provider = if route.use_directml_beta {
+        "directml_beta"
+    } else {
+        "cpu"
     };
-
-    let req = serde_json::json!({
-        "command": "process_ocr",
-        "screenshot_id": screenshot_id,
-        "image_hash": image_hash,
-        "window_title": window_title,
-        "process_name": process_name,
-        "timestamp": timestamp_ms,
-    });
-
-    let (auth_token, seq_no) = {
-        let token = monitor_state
-            .auth_token
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .ok_or_else(|| "Auth token not available".to_string())?;
-        let seq = monitor_state
-            .request_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        (token, seq)
-    };
-
-    let response = crate::monitor::send_ipc_request_reused(
-        monitor_state,
-        &pipe_name,
-        &auth_token,
-        seq_no,
-        req,
-    )
-    .await?;
-
-    if let Some(error) = response.get("error").and_then(|v| v.as_str()) {
-        return Err(format!("Python OCR error: {}", error));
-    }
-
-    let ocr_results: Option<Vec<OcrResultInput>> = response
-        .get("ocr_results")
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-    // Extract category from Python response
-    let category = response
-        .get("category")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let category_confidence = response.get("category_confidence").and_then(|v| v.as_f64());
-
-    storage.commit_screenshot(
+    storage.set_ocr_status(
         screenshot_id,
-        ocr_results.as_ref(),
-        category.as_deref(),
-        category_confidence,
+        "running",
+        Some("rust"),
+        Some("ppocrv5-ch-mobile"),
+        Some(provider),
+        None,
+        None,
     )?;
-
-    tracing::info!(
-        "Extension screenshot {} committed with {} OCR results",
+    crate::capture::process_ocr_inner(
+        app,
+        storage,
         screenshot_id,
-        ocr_results.as_ref().map(|r| r.len()).unwrap_or(0)
-    );
-
-    Ok(())
+        rgb_image,
+        image_hash,
+        window_title,
+        process_name,
+        timestamp_ms,
+        crate::registry_config::get_u32("ocr_timeout_secs").unwrap_or(120),
+        route,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1700,19 +2089,101 @@ mod tests {
     }
 
     #[test]
-    fn test_process_name_to_browser_type_chrome() {
-        assert_eq!(process_name_to_browser_type("chrome.exe"), "chrome");
+    fn background_auth_error_uses_stable_auth_required_code() {
+        let response = background_read_error_response(BackgroundReadError::AuthRequired);
+        assert_eq!(response.status, "error");
+        assert_eq!(response.error.as_deref(), Some("AUTH_REQUIRED"));
+        assert!(response.data.is_none());
+    }
+
+    fn make_session(browser_pid: u32, nmh_pid: u32, last_seen_ms: i64) -> NmhSession {
+        NmhSession {
+            browser_pid,
+            browser_exe_path: format!(r"C:\browsers\b{}.exe", browser_pid),
+            browser_exe_name: format!("b{}.exe", browser_pid),
+            nmh_pid,
+            cmd_pipe_name: format!(r"\\.\pipe\carbon_nmh_cmd_r_{:032x}", nmh_pid),
+            registered_at_ms: last_seen_ms,
+            last_seen_ms,
+        }
     }
 
     #[test]
-    fn test_process_name_to_browser_type_edge() {
-        assert_eq!(process_name_to_browser_type("msedge.exe"), "edge");
+    fn test_upsert_session_replaces_same_nmh_pid() {
+        let mut sessions = vec![make_session(100, 1, 1000)];
+        upsert_session(&mut sessions, make_session(200, 1, 2000));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].browser_pid, 200);
+        assert_eq!(sessions[0].last_seen_ms, 2000);
     }
 
     #[test]
-    fn test_process_name_to_browser_type_unknown() {
-        // Unknown browsers default to "chrome"
-        assert_eq!(process_name_to_browser_type("firefox.exe"), "chrome");
+    fn test_upsert_session_keeps_other_sessions() {
+        let mut sessions = vec![make_session(100, 1, 1000)];
+        upsert_session(&mut sessions, make_session(200, 2, 2000));
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_session_matches_both_keys() {
+        let mut sessions = vec![make_session(100, 1, 1000), make_session(200, 2, 2000)];
+        let pipe = sessions[0].cmd_pipe_name.clone();
+        remove_session(&mut sessions, 1, &pipe);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].nmh_pid, 2);
+        // Wrong pipe name doesn't remove
+        remove_session(&mut sessions, 2, r"\\.\pipe\other");
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_select_session_exact_pid_match() {
+        let sessions = vec![make_session(100, 1, 1000), make_session(200, 2, 2000)];
+        let s = select_session(&sessions, 200, "", |_, _| false).unwrap();
+        assert_eq!(s.nmh_pid, 2);
+    }
+
+    #[test]
+    fn test_select_session_no_match() {
+        let sessions = vec![make_session(100, 1, 1000)];
+        assert!(select_session(&sessions, 999, "", |_, _| false).is_none());
+    }
+
+    #[test]
+    fn test_select_session_same_pid_picks_most_recent() {
+        // Multi-profile: two NMHs registered against the same browser process
+        let sessions = vec![make_session(100, 1, 1000), {
+            let mut s = make_session(100, 2, 5000);
+            s.browser_exe_path = sessions_path_of(100);
+            s
+        }];
+        let s = select_session(&sessions, 100, "", |_, _| false).unwrap();
+        assert_eq!(s.nmh_pid, 2);
+    }
+
+    fn sessions_path_of(pid: u32) -> String {
+        format!(r"C:\browsers\b{}.exe", pid)
+    }
+
+    #[test]
+    fn test_select_session_descendant_fallback() {
+        let sessions = vec![make_session(100, 1, 1000)];
+        // Window owned by a child process (pid 555) of the browser (pid 100),
+        // same exe path (case-insensitive)
+        let path = r"c:\BROWSERS\B100.EXE";
+        let s = select_session(&sessions, 555, path, |pid, ancestor| {
+            pid == 555 && ancestor == 100
+        });
+        assert!(s.is_some());
+        // Different exe path → no fallback even if descendant
+        let s2 = select_session(&sessions, 555, r"C:\other\b.exe", |_, _| true);
+        assert!(s2.is_none());
+    }
+
+    #[test]
+    fn test_select_session_empty_path_no_fallback() {
+        let sessions = vec![make_session(100, 1, 1000)];
+        assert!(select_session(&sessions, 555, "", |_, _| true).is_none());
     }
 
     #[test]
@@ -1788,6 +2259,29 @@ mod tests {
             validate_reverse_ipc_request(&req, "secret", &mut last).unwrap();
         }
         assert_eq!(last, Some(2));
+    }
+
+    #[test]
+    fn extension_ocr_image_is_scaled_to_maximum_side() {
+        let image = Arc::new(image::RgbImage::from_pixel(
+            5120,
+            2880,
+            image::Rgb([0, 0, 0]),
+        ));
+        let resized = resize_extension_ocr_image(image);
+        assert_eq!(resized.dimensions(), (1600, 900));
+        assert!(resized.as_raw().len() <= 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn extension_ocr_image_keeps_small_input_dimensions() {
+        let image = Arc::new(image::RgbImage::from_pixel(
+            1200,
+            800,
+            image::Rgb([0, 0, 0]),
+        ));
+        let resized = resize_extension_ocr_image(image);
+        assert_eq!(resized.dimensions(), (1200, 800));
     }
 
     #[test]

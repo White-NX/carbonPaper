@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Loader2, Globe, Check } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { withAuth } from '../lib/auth_api';
 
 export default function ExtensionSetupWizard({ isVisible, onComplete }) {
   const { t } = useTranslation();
@@ -10,6 +11,22 @@ export default function ExtensionSetupWizard({ isVisible, onComplete }) {
   const [done, setDone] = useState(false);
   const [extensionPath, setExtensionPath] = useState('');
   const [error, setError] = useState('');
+  const [sessions, setSessions] = useState([]);
+
+  // After install, poll for live NMH sessions so the user gets real
+  // confirmation that the extension connected (not just registry state).
+  useEffect(() => {
+    if (!done) return undefined;
+    const load = async () => {
+      try {
+        const result = await invoke('get_nmh_sessions');
+        setSessions(Array.isArray(result) ? result : []);
+      } catch {}
+    };
+    load();
+    const timer = setInterval(load, 3000);
+    return () => clearInterval(timer);
+  }, [done]);
 
   const toggleBrowser = (browser) => {
     setSelectedBrowsers((prev) => ({ ...prev, [browser]: !prev[browser] }));
@@ -31,7 +48,10 @@ export default function ExtensionSetupWizard({ isVisible, onComplete }) {
     try {
       let lastPath = '';
       for (const browser of browsers) {
-        const result = await invoke('install_browser_extension', { browser });
+        const result = await withAuth(
+          () => invoke('install_browser_extension', { browser }),
+          { autoPrompt: true },
+        );
         if (result?.extension_path) lastPath = result.extension_path;
       }
       setExtensionPath(lastPath);
@@ -80,6 +100,19 @@ export default function ExtensionSetupWizard({ isVisible, onComplete }) {
                 <p className="text-xs text-green-400/70 break-all ml-6">{extensionPath}</p>
               )}
             </div>
+            {sessions.length > 0 && (
+              <div className="mt-3 text-xs text-ide-muted space-y-1">
+                <p>{t('extensionSetup.connected')}</p>
+                <ul className="space-y-0.5">
+                  {sessions.map((s) => (
+                    <li key={`${s.nmh_pid}-${s.cmd_pipe_name}`} className="flex items-center gap-2 ml-1">
+                      <span className="w-1.5 h-1.5 rounded-full bg-green-400 shrink-0" />
+                      <span>{s.browser_exe_name || s.browser_exe_path}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <div className="mt-5 flex justify-end">
               <button
                 onClick={handleDone}

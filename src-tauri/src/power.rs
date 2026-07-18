@@ -1,8 +1,11 @@
+//! AC-power monitoring and automatic power-saving state transitions.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
+use crate::credential_manager::CredentialManagerState;
 use crate::registry_config;
 use windows::Win32::System::Power::GetSystemPowerStatus;
 
@@ -29,6 +32,8 @@ impl PowerState {
 
 /// Check if AC power is connected (not on battery)
 fn is_ac_power_connected() -> bool {
+    // SAFETY: `status` is initialized writable storage of the exact Win32 structure
+    // type, and `GetSystemPowerStatus` does not retain its pointer.
     unsafe {
         let mut status = windows::Win32::System::Power::SYSTEM_POWER_STATUS::default();
         if GetSystemPowerStatus(&mut status).is_ok() {
@@ -184,10 +189,15 @@ pub fn get_power_saving_status(
 
 #[tauri::command]
 pub fn set_power_saving_enabled(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     power_state: tauri::State<'_, Arc<PowerState>>,
     app: AppHandle,
     enabled: bool,
 ) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+
     registry_config::set_bool("power_saving_mode_enabled", enabled)?;
     power_state.enabled.store(enabled, Ordering::SeqCst);
 

@@ -523,8 +523,8 @@ class TextEmbedder:
                     from logging_config import log_model_loading
                     log_model_loading("BGE-small-zh-v1.5 (ONNX)")
                     logger.info("Loading BGE-small-zh-v1.5 from ONNX: %s ...", onnx_file)
-                    from transformers import AutoTokenizer
-                    self._tokenizer = AutoTokenizer.from_pretrained(model_path)
+                    from numpy_tokenizer import NumpyTokenizer
+                    self._tokenizer = NumpyTokenizer(model_path)
                     self._model = create_onnx_session(onnx_file)
                     self._is_onnx = True
                     logger.info("BGE-small-zh-v1.5 loaded successfully via ONNX")

@@ -1,8 +1,19 @@
+//! Credential and authenticated-session commands.
+//!
+//! These commands form the frontend boundary for Windows Hello-backed key setup and
+//! session lifetime management. Initialization and verification intentionally remain
+//! callable before a session exists; changing session policy requires authentication.
+
 use crate::credential_manager::{self, CredentialManagerState};
 use crate::mcp_server;
 use crate::storage::StorageState;
 use std::sync::Arc;
 
+/// Initializes the CNG key pair, cached public key, master key, and encrypted storage.
+///
+/// Authentication: not required because this command bootstraps authentication.
+/// Returns a success message string; rejects non-Windows platforms.
+/// Frontend: `components/AuthMask.jsx` and `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn credential_initialize(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -37,16 +48,25 @@ pub async fn credential_initialize(
     }
 }
 
+/// Shows the OS credential UI, unlocks the master key, and restores protected services.
+///
+/// Authentication: this command performs authentication and therefore needs no session.
+/// Returns `true` after verification succeeds; errors include OS verification failures.
+/// Frontend: `components/AuthMask.jsx`.
 #[tauri::command]
 pub async fn credential_verify_user(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: tauri::State<'_, Arc<CredentialManagerState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
     mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
 ) -> Result<bool, String> {
     #[cfg(windows)]
     {
-        credential_manager::force_verify_and_unlock_master_key(&state)
+        let owner_hwnd = window
+            .hwnd()
+            .map_err(|e| format!("Failed to get main window handle: {}", e))?;
+        credential_manager::force_verify_and_unlock_master_key(&state, Some(owner_hwnd.0 as isize))
             .map_err(|e| format!("Verification failed: {}", e))?;
 
         state.update_auth_time();
@@ -64,6 +84,7 @@ pub async fn credential_verify_user(
     #[cfg(not(windows))]
     {
         let _ = &app;
+        let _ = &window;
         let _ = &state;
         let _ = &storage_state;
         let _ = &mcp_state;
@@ -71,6 +92,10 @@ pub async fn credential_verify_user(
     }
 }
 
+/// Reports whether the current in-memory authenticated session is still valid.
+///
+/// Authentication: not required. Returns a JSON boolean.
+/// Frontend: `hooks/useAuthSession.js`.
 #[tauri::command]
 pub async fn credential_check_session(
     state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -78,6 +103,9 @@ pub async fn credential_check_session(
     Ok(state.is_session_valid())
 }
 
+/// Invalidates the current authenticated session immediately.
+///
+/// Authentication: not required. Returns JSON `null` on success.
 #[tauri::command]
 pub async fn credential_lock_session(
     state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -86,6 +114,10 @@ pub async fn credential_lock_session(
     Ok(())
 }
 
+/// Records whether the main UI is foregrounded for session-expiry policy.
+///
+/// Authentication: not required. `in_foreground` is the current UI visibility state;
+/// returns JSON `null` on success.
 #[tauri::command]
 pub async fn credential_set_foreground(
     state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -95,6 +127,10 @@ pub async fn credential_set_foreground(
     Ok(())
 }
 
+/// Changes and persists the authenticated-session timeout in seconds.
+///
+/// Authentication: required. `timeout` is an integer number of seconds; returns JSON
+/// `null`. Frontend: `hooks/useAuthSession.js`.
 #[tauri::command]
 pub async fn credential_set_session_timeout(
     state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -110,6 +146,10 @@ pub async fn credential_set_session_timeout(
     Ok(())
 }
 
+/// Returns the configured authenticated-session timeout in seconds.
+///
+/// Authentication: not required so the login UI can display policy. Returns a JSON
+/// integer. Frontend: `hooks/useAuthSession.js`.
 #[tauri::command]
 pub async fn credential_get_session_timeout(
     state: tauri::State<'_, Arc<CredentialManagerState>>,

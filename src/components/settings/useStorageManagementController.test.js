@@ -1,5 +1,6 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { invoke } from '@tauri-apps/api/core';
 
 import {
   fetchThumbnailBatch,
@@ -37,6 +38,7 @@ const t = (_key, fallback) => fallback || _key;
 describe('useStorageManagementController', () => {
   beforeEach(() => {
     localStorage.clear();
+    invoke.mockReset();
     fetchThumbnailBatch.mockClear();
     getIndexHealth.mockClear();
     getProcessStorageStats.mockClear();
@@ -84,5 +86,63 @@ describe('useStorageManagementController', () => {
 
     await waitFor(() => expect(getIndexHealth).toHaveBeenCalledWith({ refreshVector: false }));
     expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not push cached storage policy to the backend on mount', async () => {
+    localStorage.setItem('snapshotRetentionPeriod', '1month');
+    localStorage.setItem('snapshotStorageLimit', '10');
+
+    renderHook(() => useStorageManagementController({
+      storage: { root_path: 'C:/CarbonPaper' },
+      onRefresh: vi.fn(),
+      t,
+      monitorStatus: 'stopped',
+    }));
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('storage_get_policy'));
+    expect(invoke).not.toHaveBeenCalledWith('storage_set_policy', expect.anything());
+  });
+
+  it('lets the backend policy override stale cached values, treating missing as disabled', async () => {
+    localStorage.setItem('snapshotRetentionPeriod', '1month');
+    localStorage.setItem('snapshotStorageLimit', '10');
+    invoke.mockImplementation(async (cmd) => {
+      if (cmd === 'storage_get_policy') return { storage_limit: '50' };
+      return undefined;
+    });
+
+    const { result } = renderHook(() => useStorageManagementController({
+      storage: { root_path: 'C:/CarbonPaper' },
+      onRefresh: vi.fn(),
+      t,
+      monitorStatus: 'stopped',
+    }));
+
+    await waitFor(() => expect(result.current.storageLimit).toBe('50'));
+    expect(result.current.retentionPeriod).toBe('permanent');
+    expect(localStorage.getItem('snapshotStorageLimit')).toBe('50');
+    expect(localStorage.getItem('snapshotRetentionPeriod')).toBe('permanent');
+    expect(invoke).not.toHaveBeenCalledWith('storage_set_policy', expect.anything());
+  });
+
+  it('persists the policy only on an explicit user change', async () => {
+    const { result } = renderHook(() => useStorageManagementController({
+      storage: { root_path: 'C:/CarbonPaper' },
+      onRefresh: vi.fn(),
+      t,
+      monitorStatus: 'stopped',
+    }));
+
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('storage_get_policy'));
+
+    await act(async () => {
+      await result.current.setRetentionPeriod('6months');
+    });
+
+    expect(result.current.retentionPeriod).toBe('6months');
+    expect(localStorage.getItem('snapshotRetentionPeriod')).toBe('6months');
+    expect(invoke).toHaveBeenCalledWith('storage_set_policy', {
+      policy: { storage_limit: 'unlimited', retention_period: '6months' },
+    });
   });
 });

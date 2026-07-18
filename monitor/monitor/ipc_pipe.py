@@ -243,16 +243,7 @@ class _NamedPipeServer(threading.Thread):
 
                 keep_alive = bool(req.get('_ipc_keepalive', False))
                 command = req.get('command')
-                is_process_ocr = command == 'process_ocr'
                 requests_handled += 1
-                if is_process_ocr:
-                    logger.debug(
-                        '[DIAG:PIPE] request received command=%s bytes=%s from_pid=%s keepalive=%s',
-                        command,
-                        len(payload),
-                        client_pid,
-                        keep_alive,
-                    )
 
                 # 3. Execute Command
                 exec_started = _time.perf_counter()
@@ -261,12 +252,6 @@ class _NamedPipeServer(threading.Thread):
                 if handler_elapsed >= 3.0:
                     logger.warning(
                         '[DIAG:PIPE] slow handler command=%s exec=%.3fs',
-                        command,
-                        handler_elapsed,
-                    )
-                elif is_process_ocr:
-                    logger.debug(
-                        '[DIAG:PIPE] handler finished command=%s in %.3fs',
                         command,
                         handler_elapsed,
                     )
@@ -291,16 +276,6 @@ class _NamedPipeServer(threading.Thread):
                         )
                         return
                     raise
-                if is_process_ocr:
-                    logger.debug(
-                        '[DIAG:PIPE] response sent command=%s write=%.3fs request_total=%.3fs connection_total=%.3fs requests=%s resp_bytes=%s',
-                        command,
-                        _time.perf_counter() - write_started,
-                        _time.perf_counter() - request_started,
-                        _time.perf_counter() - handler_started,
-                        requests_handled,
-                        len(resp_str),
-                    )
 
         except Exception as e:
             logger.error(f"Error handling IPC client: {e}", exc_info=True)

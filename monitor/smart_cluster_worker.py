@@ -169,6 +169,12 @@ class SmartClusterWorker:
         if not self._storage_client:
             return False
 
+        # This worker is unattended: never ask Rust to decrypt protected data
+        # until the user has explicitly unlocked the credential session.
+        if not self._storage_client.is_session_valid():
+            logger.debug("[smart_cluster_worker] skipping tick — credential session locked")
+            return False
+
         # Quick exits.
         pending = self._storage_client.smart_cluster_count_pending()
         if pending <= 0:

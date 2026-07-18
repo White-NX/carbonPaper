@@ -1,6 +1,6 @@
 [package]
 name = "carbonpaper"
-version = "0.8.2"
+version = "0.8.3"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -19,10 +19,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "carbonpaper-nmh"
 path = "src/bin/nmh.rs"
 
+[[bin]]
+name = "carbonpaper-ml"
+path = "src/bin/ml.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 walkdir = "2.5.0"
 sha2 = "0.10"
+base64 = "0.22"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
@@ -55,6 +60,7 @@ sha2 = "0.10"
 md-5 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+ed25519-dalek = "2"
 image = "0.25"
 dirs = "5"
 jieba-rs = "0.7"
@@ -65,12 +71,14 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 flate2 = "1"
 window-vibrancy = "0.5"
 open = "5"
+rapidocr-core = { version = "=0.2.2", default-features = false, features = ["tokio", "directml"] }
 
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 
 [target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.7"
 windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_Security_Cryptography",
@@ -109,3 +117,6 @@ tauri-plugin-single-instance = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

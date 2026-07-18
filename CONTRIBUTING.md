@@ -20,6 +20,21 @@ Running this command before developing
 npm install
 ```
 
-## Apologies for the multilingual annotations
+## Documentation and Comment Language
 
-Due to oversights in early development, the program currently contains mixed Chinese and English comments, and lacks comprehensive API documentation. This issue will likely be addressed in future versions.
+Use English for new or substantially edited source comments and Rust documentation so
+contributors and security reviewers can read the same invariants. User-facing strings
+remain localized through the existing i18n system and are not covered by this rule.
+
+When touching a module that contains older Chinese comments, translate nearby comments
+that still explain useful intent. Remove comments that merely restate the next line.
+Prefer documenting why a constraint exists, which state transition is expected, and what
+must remain true across an API or FFI boundary.
+
+Every Tauri command must document its purpose, authentication requirement, parameters,
+serialized return shape, and the frontend wrapper or component that calls it. Every new
+`unsafe` block or `unsafe impl` must have an adjacent `// SAFETY:` comment explaining the
+caller guarantees, pointer/handle validity, ownership, lifetime, and thread-safety
+invariants that make the operation sound. CI treats undocumented unsafe blocks as a
+Clippy warning; contributors should run `cargo clippy --manifest-path src-tauri/Cargo.toml
+--all-targets` before submitting Rust changes.

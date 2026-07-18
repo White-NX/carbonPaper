@@ -1,5 +1,5 @@
 import { readFile, writeFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { createHash, createPrivateKey, createPublicKey, sign } from 'node:crypto';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { execSync } from 'node:child_process';
@@ -30,6 +30,11 @@ const zipPath = path.join(bundleOutDir, zipFileName);
 // Compute SHA256
 const zipData = await readFile(zipPath);
 const sha256 = createHash('sha256').update(zipData).digest('hex');
+
+const signingKeyBase64 = process.env.CARBONPAPER_UPDATE_SIGNING_KEY;
+if (!signingKeyBase64) {
+  throw new Error('CARBONPAPER_UPDATE_SIGNING_KEY is required to sign latest.json');
+}
 
 // Parse release body if provided
 let notes = `Release ${tag}`;
@@ -88,6 +93,26 @@ const latestJson = {
 if (min_version) {
   latestJson.min_version = min_version;
 }
+
+const signingPayload = [
+  latestJson.version,
+  latestJson.url,
+  latestJson.sha256.toLowerCase(),
+  latestJson.critical ? '1' : '0',
+  latestJson.min_version || '',
+].join('\n');
+const signingKey = createPrivateKey({
+  key: Buffer.from(signingKeyBase64, 'base64'),
+  format: 'pem',
+});
+const publicKeyFile = process.env.CARBONPAPER_UPDATE_PUBLIC_KEY_FILE || 'src-tauri/update-public-key.txt';
+const configuredPublicKey = (await readFile(path.join(cwd, publicKeyFile), 'utf8')).trim();
+const publicKeyDer = createPublicKey(signingKey).export({ format: 'der', type: 'spki' });
+const derivedPublicKey = publicKeyDer.subarray(publicKeyDer.length - 32).toString('base64');
+if (derivedPublicKey !== configuredPublicKey) {
+  throw new Error('CARBONPAPER_UPDATE_SIGNING_KEY does not match CARBONPAPER_UPDATE_PUBLIC_KEY');
+}
+latestJson.signature = sign(null, Buffer.from(signingPayload, 'utf8'), signingKey).toString('base64');
 
 const outPath = path.join(bundleOutDir, 'latest.json');
 await writeFile(outPath, JSON.stringify(latestJson, null, 2) + '\n');

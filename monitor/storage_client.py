@@ -85,6 +85,8 @@ READ_RETRY_COMMANDS = {
 
 IDEMPOTENT_RETRY_COMMANDS = {
     'update_screenshot_category',
+    'set_ocr_postprocess_status',
+    'record_ocr_postprocess_retry',
     'smart_cluster_enqueue_pending',
     'smart_cluster_delete_pending',
     'smart_cluster_record_assignment',
@@ -975,6 +977,28 @@ class StorageClient:
             'status': 'error',
             'error': response.get('error', 'Unknown error')
         }
+
+    def set_ocr_postprocess_status(
+        self,
+        screenshot_id: int,
+        status: str,
+        error: Optional[str] = None,
+    ) -> bool:
+        response = self._send_request({
+            'command': 'set_ocr_postprocess_status',
+            'screenshot_id': int(screenshot_id),
+            'status': status,
+            'error': error,
+        })
+        return response.get('status') == 'success'
+
+    def record_ocr_postprocess_retry(self, screenshot_id: int, error: str) -> bool:
+        response = self._send_request({
+            'command': 'record_ocr_postprocess_retry',
+            'screenshot_id': int(screenshot_id),
+            'error': str(error or 'OCR postprocess failed'),
+        })
+        return response.get('status') == 'success'
 
     def abort_screenshot(self, screenshot_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
         """

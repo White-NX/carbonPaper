@@ -1,3 +1,5 @@
+//! Python 3.12 discovery, installation, virtual-environment setup, and progress logging.
+
 use std::path::{Path, PathBuf};
 use winreg::enums::*;
 use winreg::RegKey;
@@ -104,6 +106,19 @@ fn probe_python_command(cmd: &str, args: &[&str]) -> Option<(String, String)> {
     Some((version, executable))
 }
 
+fn find_required_python_executable() -> Option<String> {
+    for cmd in ["python3", "python", "py"] {
+        let args = if cmd == "py" { vec!["-3.12"] } else { vec![] };
+        if let Some((version, executable)) = probe_python_command(cmd, &args) {
+            if version == REQUIRED_PYTHON_VERSION && PathBuf::from(&executable).is_file() {
+                return Some(executable);
+            }
+        }
+    }
+
+    find_python_3_12_from_registry().ok()
+}
+
 fn probe_python_executable(python_exe_path: &Path) -> Option<String> {
     let mut cmd_proc = std::process::Command::new(normalize_path_for_command(python_exe_path));
     cmd_proc
@@ -183,26 +198,7 @@ fn find_python_3_12_from_registry() -> Result<String, FindPythonError> {
 /// - `Err(String)`: 如果未找到，返回错误信息
 #[tauri::command]
 pub fn check_python_status() -> Result<String, String> {
-    let possible_commands = ["python3", "python", "py"];
-
-    // Iterate through possible commands to find a usable Python interpreter
-    for cmd in possible_commands {
-        let args = if cmd == "py" { vec!["-3.12"] } else { vec![] };
-        if let Some((version, executable)) = probe_python_command(cmd, &args) {
-            if version == REQUIRED_PYTHON_VERSION {
-                let exe_path = PathBuf::from(&executable);
-                if exe_path.is_file() {
-                    return Ok(executable);
-                }
-            }
-        }
-    }
-
-    // 尝试从注册表中查找 Python 3.12.x
-    match find_python_3_12_from_registry() {
-        Ok(path) => Ok(path),
-        Err(_e) => Ok("".to_string()),
-    }
+    Ok(find_required_python_executable().unwrap_or_default())
 }
 
 #[tauri::command]
@@ -295,7 +291,17 @@ fn run_elevated_hidden_cmd(file: &str, args: &[String]) -> io::Result<std::proce
 /// # Returns
 /// - `Ok(String)`: 如果安装成功，返回成功信息
 /// - `Err(String)`: 如果安装失败，返回错误信息
-pub async fn request_install_python(app: AppHandle) -> Result<String, String> {
+pub async fn request_install_python(
+    app: AppHandle,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+) -> Result<String, String> {
+    if !bootstrap_install_allowed(
+        credential_state.is_session_valid(),
+        venv_python_exists(&app),
+    ) {
+        return Err("AUTH_REQUIRED".to_string());
+    }
+
     let log_path = get_log_path();
 
     let _ = fs::remove_file(&log_path);
@@ -363,8 +369,32 @@ pub async fn request_install_python(app: AppHandle) -> Result<String, String> {
 /// - `Err(String)`: 如果安装失败，返回错误信息
 pub async fn install_python_venv(
     app: AppHandle,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     python_path: Option<String>,
 ) -> Result<String, String> {
+    let session_valid = credential_state.is_session_valid();
+    let venv_exists = venv_python_exists(&app);
+    if !bootstrap_install_allowed(session_valid, venv_exists) {
+        return Err("AUTH_REQUIRED".to_string());
+    }
+
+    let trusted_python = match (session_valid, python_path) {
+        (true, Some(path)) => {
+            let executable = PathBuf::from(&path);
+            if !executable.is_file() || probe_python_executable(&executable).is_none() {
+                return Err(format!(
+                    "Selected Python executable must be version {}",
+                    REQUIRED_PYTHON_VERSION
+                ));
+            }
+            Some(path)
+        }
+        _ => Some(
+            find_required_python_executable()
+                .ok_or_else(|| "Required Python 3.12.10 executable was not found".to_string())?,
+        ),
+    };
+
     let log_path = get_log_path();
 
     let _ = fs::remove_file(&log_path);
@@ -373,7 +403,7 @@ pub async fn install_python_venv(
         File::create(&log_path).map_err(|e| e.to_string())?,
     ));
 
-    match perform_install_python_venv(log_file, &app, python_path.as_deref()) {
+    match perform_install_python_venv(log_file, &app, trusted_python.as_deref()) {
         Ok(_) => Ok("Python virtual environment and dependencies installed successfully.".into()),
         Err(e) => {
             let log_content = fs::read_to_string(&log_path)
@@ -1126,7 +1156,30 @@ pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
 /// Install a spaCy model package (e.g. `zh_core_web_sm`, `en_core_web_sm`)
 /// using pip from the existing venv.  Streams progress via `install-log` events.
 #[tauri::command]
-pub async fn install_spacy_model(app: AppHandle, model_name: String) -> Result<String, String> {
+pub async fn install_spacy_model(
+    app: AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    model_name: String,
+) -> Result<String, String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+
+    install_spacy_model_impl(app, model_name).await
+}
+
+fn venv_python_exists(app: &AppHandle) -> bool {
+    get_venv_dir(app)
+        .join("Scripts")
+        .join("python.exe")
+        .is_file()
+}
+
+fn bootstrap_install_allowed(session_valid: bool, venv_exists: bool) -> bool {
+    session_valid || !venv_exists
+}
+
+async fn install_spacy_model_impl(app: AppHandle, model_name: String) -> Result<String, String> {
     // Validate model name to prevent injection
     let allowed = ["zh_core_web_sm", "en_core_web_sm"];
     if !allowed.contains(&model_name.as_str()) {
@@ -1716,7 +1769,7 @@ pub fn auto_install_spacy_models(app: AppHandle) {
                 .enable_all()
                 .build();
             let result = match rt {
-                Ok(rt) => rt.block_on(install_spacy_model(app_clone, model_name.clone())),
+                Ok(rt) => rt.block_on(install_spacy_model_impl(app_clone, model_name.clone())),
                 Err(e) => Err(format!("Failed to create runtime: {}", e)),
             };
 
@@ -1750,4 +1803,17 @@ pub fn auto_install_spacy_models(app: AppHandle) {
         }
         tracing::info!("auto_install_spacy_models: finished");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bootstrap_install_allowed;
+
+    #[test]
+    fn bootstrap_install_only_bypasses_auth_while_venv_is_missing() {
+        assert!(bootstrap_install_allowed(false, false));
+        assert!(!bootstrap_install_allowed(false, true));
+        assert!(bootstrap_install_allowed(true, false));
+        assert!(bootstrap_install_allowed(true, true));
+    }
 }

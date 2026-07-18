@@ -1,7 +1,7 @@
 {
   "name": "carbonpaper",
   "private": true,
-  "version": "0.8.2",
+  "version": "0.8.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -18,18 +18,24 @@
     "test:security": "node scripts/security-guards.cjs",
     "test:backend:fast": "npm run test:security && npm run test:python:regression && npm run test:rust && npm run test:python:prebundle-sync",
     "tauri": "tauri",
-    "debug": "tauri dev",
+    "debug": "npm run prepare:ocr-assets && node scripts/build-ml.mjs && tauri dev",
     "i18n:extract": "i18next-scanner --config i18next-scanner.config.cjs 'src/**/*.{js,jsx,ts,tsx}'",
     "i18n:check": "node scripts/i18n-check.cjs",
     "codemod:i18n": "jscodeshift -t scripts/transforms/i18n-jscodeshift.cjs src/components --extensions=js,jsx,ts,tsx",
     "bump:version": "node scripts/bump-version.mjs",
     "build:nmh": "node scripts/build-nmh.mjs",
     "build:nmh:release": "node scripts/build-nmh.mjs --release",
+    "build:ml": "node scripts/build-ml.mjs",
+    "build:ml:release": "node scripts/build-ml.mjs --release",
+    "verify:ml-runtime": "src-tauri\\target\\release\\carbonpaper-ml.exe --verify-models --model-dir src-tauri\\pre-bundle\\ocr-models\\ppocrv5-ch-mobile-r1",
     "prepare:release-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1",
+    "prepare:ocr-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1 -OcrOnly",
     "verify:release-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1 -VerifyOnly",
     "test:release-assets": "node scripts/verify-release-assets.mjs",
+    "verify:release-bundles": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release-bundles.ps1",
     "pack:portable": "node scripts/pack-portable.mjs",
-    "tauri:build": "npm run prepare:release-assets && node scripts/build-nmh.mjs --release && tauri build && node scripts/pack-portable.mjs"
+    "generate:update-signing-key": "node scripts/generate-update-signing-key.mjs",
+    "tauri:build": "npm run prepare:release-assets && node scripts/build-nmh.mjs --release && npm run build:ml:release && npm run verify:ml-runtime && tauri build && node scripts/pack-portable.mjs && npm run verify:release-bundles"
   },
   "dependencies": {
     "@tauri-apps/api": "~2.9.0",

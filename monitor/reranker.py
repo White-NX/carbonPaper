@@ -174,15 +174,12 @@ class Reranker:
             model_dir = _resolve_model_path()
             onnx_path = _resolve_onnx_path(model_dir, variant)
 
-            # Tokenizer reused from transformers (already a dependency for
-            # MiniLM / classifier). Fast tokenizer reads tokenizer.json
-            # directly, no sentencepiece file needed. Loaded once per process.
+            # Use the low-level Rust tokenizer directly. AutoTokenizer imports
+            # Torch in the pinned dependency set even for NumPy/ONNX output.
             if self._tokenizer is None:
-                from transformers import AutoTokenizer
+                from numpy_tokenizer import NumpyTokenizer
                 logger.info("Loading reranker tokenizer from %s ...", model_dir)
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    model_dir, local_files_only=True, use_fast=True
-                )
+                self._tokenizer = NumpyTokenizer(model_dir)
 
             # Prefer DirectML for GPU acceleration on Windows; fall back to CPU.
             import onnxruntime as ort

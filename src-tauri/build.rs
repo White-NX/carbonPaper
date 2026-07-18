@@ -1,12 +1,123 @@
 // src-tauri/build.rs
 
+use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use walkdir::WalkDir;
 
+const UPDATE_PUBLIC_KEY_FILE: &str = "update-public-key.txt";
+
+fn generate_native_locales() {
+    let locales_dir = Path::new("../src/i18n/locales");
+    println!("cargo:rerun-if-changed={}", locales_dir.display());
+    let mut entries = fs::read_dir(locales_dir)
+        .unwrap_or_else(|error| panic!("Failed to read {}: {error}", locales_dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    let mut generated = String::from("pub const NATIVE_LOCALES: &[(&str, &str)] = &[\n");
+    for path in entries {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let locale = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("locale filename must be valid UTF-8");
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("Failed to read {}: {error}", path.display()));
+        generated.push_str(&format!("    ({locale:?}, {content:?}),\n"));
+    }
+    generated.push_str("];\n");
+
+    let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR must be set by Cargo");
+    fs::write(Path::new(&out_dir).join("native_locales.rs"), generated)
+        .expect("Failed to generate native locale catalog");
+}
+
+fn prune_monitor_staging(prebundle_dir: &Path) {
+    if !prebundle_dir.starts_with(Path::new("pre-bundle")) || !prebundle_dir.exists() {
+        return;
+    }
+    let mut stale = WalkDir::new(prebundle_dir)
+        .contents_first(true)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path == prebundle_dir {
+                return None;
+            }
+            let name = path.file_name()?.to_string_lossy();
+            let remove_dir = path.is_dir()
+                && (name == "tests"
+                    || name == "tests_tmp"
+                    || name == "__pycache__"
+                    || name == ".pytest_cache"
+                    || name == ".tmp_pytest"
+                    || name.starts_with(".pytest"));
+            let remove_file = path.is_file()
+                && (name.ends_with(".pyc")
+                    || name == "test.py"
+                    || name.starts_with("test_")
+                    || name.ends_with("_test.py")
+                    || name.contains("_test_"));
+            (remove_dir || remove_file).then(|| path.to_path_buf())
+        })
+        .collect::<Vec<_>>();
+    stale.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in stale {
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn configure_update_public_key() {
+    let path = Path::new(UPDATE_PUBLIC_KEY_FILE);
+    println!("cargo:rerun-if-changed={}", UPDATE_PUBLIC_KEY_FILE);
+
+    let public_key = fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "Build failed: cannot read checked-in update public key {}: {}",
+            path.display(),
+            e
+        )
+    });
+    let public_key = public_key.trim();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(public_key)
+        .unwrap_or_else(|e| panic!("Build failed: update public key is not valid base64: {}", e));
+    if decoded.len() != 32 {
+        panic!(
+            "Build failed: update public key must decode to 32 bytes, got {}",
+            decoded.len()
+        );
+    }
+
+    if let Ok(configured) = std::env::var("CARBONPAPER_UPDATE_PUBLIC_KEY") {
+        if configured.trim() != public_key {
+            panic!(
+                "Build failed: CARBONPAPER_UPDATE_PUBLIC_KEY does not match {}",
+                UPDATE_PUBLIC_KEY_FILE
+            );
+        }
+    }
+
+    println!(
+        "cargo:rustc-env=CARBONPAPER_UPDATE_PUBLIC_KEY={}",
+        public_key
+    );
+}
+
 fn main() {
+    generate_native_locales();
+    configure_update_public_key();
     // --- 1. 定义路径 ---
     // 源文件夹
     let source_dir = Path::new("../monitor");
@@ -15,6 +126,7 @@ fn main() {
 
     // --- 2. 确保临时目录存在（避免每次清空导致热重载循环） ---
     fs::create_dir_all(prebundle_dir).expect("Failed to create pre-bundle directory");
+    prune_monitor_staging(prebundle_dir);
 
     // 只在内容变更时复制，避免无谓的文件时间戳抖动触发重建
     fn copy_file_if_needed(src: &Path, dst: &Path) {
@@ -51,10 +163,14 @@ fn main() {
         // 检查是否是需要被完全排除的文件夹
         if path.is_dir() {
             let file_name = path.file_name().unwrap_or_default();
+            let file_name = file_name.to_string_lossy();
             if file_name == ".venv"
                 || file_name == ".pytest_cache"
                 || file_name == "__pycache__"
                 || file_name == "tests"
+                || file_name == "tests_tmp"
+                || file_name == ".tmp_pytest"
+                || file_name.starts_with(".pytest")
             {
                 // 如果是，返回 false，`walkdir` 将不会进入这个目录
                 // 排除 tests/ 是为了不把测试代码打进生产 monitor.pyz
@@ -102,6 +218,16 @@ fn main() {
             // 规则 3: 排除 `chroma_db` 文件夹内的所有文件
             if src_path.starts_with(source_dir.join("chroma_db")) {
                 should_copy = false;
+            }
+
+            if let Some(file_name) = src_path.file_name().and_then(|name| name.to_str()) {
+                if file_name == "test.py"
+                    || file_name.starts_with("test_")
+                    || file_name.ends_with("_test.py")
+                    || file_name.contains("_test_")
+                {
+                    should_copy = false;
+                }
             }
 
             // 如果满足复制条件，就执行复制

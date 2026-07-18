@@ -1,3 +1,10 @@
+//! Authenticated Tauri API for screenshot storage, search, policy, and task data.
+//!
+//! Unless explicitly stated otherwise, commands in this module require a valid
+//! credential session and serialize storage-layer DTOs directly to the frontend.
+//! Screenshot and search wrappers live in `src/lib/monitor_api.js`; task and cluster
+//! wrappers live in `src/lib/task_api.js`.
+
 use super::check_auth_required;
 use crate::credential_manager::CredentialManagerState;
 use crate::monitor::{self, MonitorState};
@@ -253,6 +260,10 @@ mod tests {
     }
 }
 
+/// Returns timeline records between millisecond timestamps `start_time` and `end_time`.
+///
+/// Authentication: required. `max_records` caps the result; returns an array of
+/// `ScreenshotRecord` objects. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_timeline(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -282,6 +293,10 @@ pub async fn storage_get_timeline(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Aggregates screenshot counts into `bucket_ms` timeline buckets.
+///
+/// Authentication: required. Returns an array of `DensityBucket` objects for the
+/// requested millisecond range. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_timeline_density(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -313,6 +328,10 @@ pub async fn storage_get_timeline_density(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Searches OCR records with pagination, fuzzy matching, process, time, and category filters.
+///
+/// Authentication: required. Returns an array of `SearchResult` objects; optional
+/// filters are omitted as JSON `null`. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_search(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -348,6 +367,10 @@ pub async fn storage_search(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Loads and decrypts a full screenshot selected by `id` or legacy `path`.
+///
+/// Authentication: required. Exactly one selector should be supplied. Returns a status
+/// object containing image data and metadata. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_image(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -382,6 +405,10 @@ pub async fn storage_get_image(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Loads or creates a thumbnail selected by `id` or legacy `path`.
+///
+/// Authentication: required. Returns a status object containing the encoded thumbnail.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_thumbnail(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -416,6 +443,10 @@ pub async fn storage_get_thumbnail(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Loads thumbnails for multiple screenshot `ids` in one IPC call.
+///
+/// Authentication: required. Returns an object keyed by screenshot ID with per-item
+/// thumbnail results. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_batch_get_thumbnails(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -450,6 +481,10 @@ pub async fn storage_batch_get_thumbnails(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Starts background generation of missing thumbnails.
+///
+/// Authentication: required. Returns `{ "started", "running", "progress" }`; repeated
+/// calls report the active or completed state. Frontend: `hooks/useStartupWizards.js`.
 #[tauri::command]
 pub async fn storage_warmup_thumbnails(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -599,6 +634,10 @@ pub async fn storage_warmup_thumbnails(
     }))
 }
 
+/// Returns the current thumbnail warmup progress object.
+///
+/// Authentication: required. The object includes running, totals, processed counts,
+/// failures, and cancellation state.
 #[tauri::command]
 pub async fn storage_get_thumbnail_warmup_status(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -607,6 +646,9 @@ pub async fn storage_get_thumbnail_warmup_status(
     Ok(thumbnail_warmup_progress_json())
 }
 
+/// Requests cancellation of thumbnail warmup and returns its updated progress object.
+///
+/// Authentication: required. Cancellation is cooperative.
 #[tauri::command]
 pub fn storage_cancel_thumbnail_warmup(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -623,6 +665,10 @@ pub fn storage_cancel_thumbnail_warmup(
     Ok(thumbnail_warmup_progress_json())
 }
 
+/// Returns a screenshot record and all associated OCR rows selected by `id` or `path`.
+///
+/// Authentication: required. Returns `{ "status": "success" | "not_found",
+/// "record", "ocr_results" }`. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_screenshot_details(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -662,6 +708,11 @@ pub async fn storage_get_screenshot_details(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Permanently deletes one screenshot and asks the vector index to remove its embedding.
+///
+/// Authentication: required. `screenshot_id` identifies the record. Returns
+/// `{ "status": "success", "deleted": boolean, "vector_deleted": number | null }`.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_delete_screenshot(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -703,6 +754,10 @@ pub async fn storage_delete_screenshot(
     }))
 }
 
+/// Permanently deletes screenshots in the requested millisecond time range.
+///
+/// Authentication: required. Returns `{ "status": "success", "deleted_count": number,
+/// "vector_deleted": number | null }`. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_delete_by_time_range(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -753,6 +808,10 @@ pub async fn storage_delete_by_time_range(
     }))
 }
 
+/// Lists distinct process names and their screenshot counts.
+///
+/// Authentication: required. Returns `[{ "process_name": string, "count": number }]`.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_list_processes(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -772,6 +831,10 @@ pub async fn storage_list_processes(
         .collect())
 }
 
+/// Returns per-process storage usage statistics.
+///
+/// Authentication: required. Returns an array of `ProcessStorageStat` objects.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_process_stats(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -785,6 +848,10 @@ pub async fn storage_get_process_stats(
         .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Returns a paginated month/thumbnail summary for `process_name`.
+///
+/// Authentication: required. `page` defaults to 0 and `page_size` to 60; returns a
+/// `ProcessMonthlyThumbnailPage`. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_process_monthly_thumbnails(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -807,6 +874,9 @@ pub async fn storage_get_process_monthly_thumbnails(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Queues soft deletion for all records from a process and optional `month`.
+///
+/// Authentication: required. Returns `SoftDeleteResult`. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_soft_delete(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -824,6 +894,10 @@ pub async fn storage_soft_delete(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Queues soft deletion for the supplied screenshot IDs.
+///
+/// Authentication: required. Returns `SoftDeleteScreenshotsResult`.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_soft_delete_screenshots(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -838,6 +912,10 @@ pub async fn storage_soft_delete_screenshots(
         .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Returns pending and completed soft-delete queue counts.
+///
+/// Authentication: required. Returns `DeleteQueueStatus`.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_delete_queue_status(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -851,6 +929,10 @@ pub async fn storage_get_delete_queue_status(
         .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Combines encrypted-storage index statistics with Python vector-index health.
+///
+/// Authentication: required. `refresh_vector` requests a live vector recount. Returns a
+/// JSON health object for both stores. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_index_health(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -878,6 +960,10 @@ pub async fn storage_get_index_health(
     Ok(compose_index_health_response(storage_stats, monitor_health))
 }
 
+/// Retries failed vector indexing through the monitor service.
+///
+/// Authentication: required. `limit` defaults to 32 and is clamped to 1..=256; returns
+/// the monitor's retry result object. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_retry_vector_indexing(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -896,6 +982,10 @@ pub async fn storage_retry_vector_indexing(
     .await
 }
 
+/// Persists a screenshot and its metadata from a trusted native producer.
+///
+/// Authentication: required. `request` is `SaveScreenshotRequest`; returns
+/// `SaveScreenshotResponse`. This command is registered for internal/native callers.
 #[tauri::command]
 pub async fn storage_save_screenshot(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -907,6 +997,10 @@ pub async fn storage_save_screenshot(
     state.save_screenshot(&request)
 }
 
+/// Scores visible links using aggregate storage statistics.
+///
+/// Authentication: not required; input contains link features rather than stored user
+/// records. Returns an array of `ScoredLink` objects for the browser integration.
 #[tauri::command]
 pub async fn storage_compute_link_scores(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -915,6 +1009,10 @@ pub async fn storage_compute_link_scores(
     state.compute_link_scores(&links)
 }
 
+/// Returns the storage encryption public key as standard Base64.
+///
+/// Authentication: not required because the public key cannot decrypt data. Returns a
+/// JSON string for trusted native/browser producers.
 #[tauri::command]
 pub async fn storage_get_public_key(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -926,6 +1024,10 @@ pub async fn storage_get_public_key(
     ))
 }
 
+/// Merges and persists a partial storage policy update.
+///
+/// Authentication: required. `policy` must be a JSON object. Returns the merged policy
+/// with encrypted secrets redacted. Frontend: settings controllers using `invoke`.
 #[tauri::command]
 pub async fn storage_set_policy(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -947,6 +1049,9 @@ pub async fn storage_set_policy(
     Ok(response)
 }
 
+/// Returns the current storage policy with encrypted secrets redacted.
+///
+/// Authentication: required. Returns a JSON object consumed by frontend settings.
 #[tauri::command]
 pub async fn storage_get_policy(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -961,6 +1066,10 @@ pub async fn storage_get_policy(
     Ok(policy)
 }
 
+/// Encrypts plaintext for the legacy ChromaDB bridge.
+///
+/// Authentication: not required because only the public-key encryption path is used.
+/// Returns an encoded ciphertext string for the monitor process.
 #[tauri::command]
 pub async fn storage_encrypt_for_chromadb(
     state: tauri::State<'_, Arc<StorageState>>,
@@ -969,6 +1078,10 @@ pub async fn storage_encrypt_for_chromadb(
     state.encrypt_for_chromadb(&plaintext)
 }
 
+/// Decrypts a legacy ChromaDB ciphertext.
+///
+/// Authentication: required because this uses private key material. Returns the
+/// plaintext string to the trusted caller.
 #[tauri::command]
 pub async fn storage_decrypt_from_chromadb(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -980,6 +1093,10 @@ pub async fn storage_decrypt_from_chromadb(
     state.decrypt_from_chromadb(&encrypted)
 }
 
+/// Updates a screenshot category and forwards a learning anchor to the monitor.
+///
+/// Authentication: required. Returns `{ "status": "success", "updated": boolean }`.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_update_category(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1034,6 +1151,10 @@ pub async fn storage_update_category(
     }))
 }
 
+/// Returns monitor-defined category metadata.
+///
+/// Authentication: required. Returns the monitor's `get_categories` JSON object.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_categories(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1047,6 +1168,10 @@ pub async fn storage_get_categories(
     monitor::forward_command_to_python(&monitor_state, payload).await
 }
 
+/// Lists distinct categories currently stored in SQLite.
+///
+/// Authentication: required. Returns an array of strings.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_categories_from_db(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1057,6 +1182,10 @@ pub async fn storage_get_categories_from_db(
     state.get_categories_from_db()
 }
 
+/// Looks up categories for multiple image hashes.
+///
+/// Authentication: required. Returns a JSON object mapping each hash to a category or
+/// `null`. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_batch_get_categories(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1068,6 +1197,10 @@ pub async fn storage_batch_get_categories(
     state.batch_get_categories_by_hash(&image_hashes)
 }
 
+/// Lists task clusters with optional layer, time, and visibility filters.
+///
+/// Authentication: required. Returns an array of `TaskRecord` objects.
+/// Frontend: `lib/task_api.js`.
 #[tauri::command]
 pub async fn storage_get_tasks(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1091,6 +1224,10 @@ pub async fn storage_get_tasks(
     )
 }
 
+/// Finds screenshots related to `screenshot_id` by task/link evidence.
+///
+/// Authentication: required. `limit` defaults to 8; returns `RelatedScreenshotsResult`.
+/// Frontend: `lib/task_api.js`.
 #[tauri::command]
 pub async fn storage_get_related_screenshots(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1103,6 +1240,10 @@ pub async fn storage_get_related_screenshots(
     state.get_related_screenshots(screenshot_id, limit.unwrap_or(8))
 }
 
+/// Returns a page of screenshot stubs assigned to `task_id`.
+///
+/// Authentication: required. `page` defaults to 0 and `page_size` to 50; returns an
+/// array of `TaskScreenshotStub`. Frontend: `lib/task_api.js`.
 #[tauri::command]
 pub async fn storage_get_task_screenshots(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1116,6 +1257,9 @@ pub async fn storage_get_task_screenshots(
     state.get_task_screenshots(task_id, page.unwrap_or(0), page_size.unwrap_or(50))
 }
 
+/// Replaces the user-visible label for `task_id`.
+///
+/// Authentication: required. Returns JSON `null`. Frontend: `lib/task_api.js`.
 #[tauri::command]
 pub async fn storage_update_task_label(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1128,6 +1272,9 @@ pub async fn storage_update_task_label(
     state.update_task_label(task_id, &label)
 }
 
+/// Deletes a task and its assignments.
+///
+/// Authentication: required. Returns JSON `null`. Frontend: `lib/task_api.js`.
 #[tauri::command]
 pub async fn storage_delete_task(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1139,6 +1286,10 @@ pub async fn storage_delete_task(
     state.delete_task(task_id)
 }
 
+/// Removes one screenshot assignment from a task.
+///
+/// Authentication: required. Returns the remaining assignment count as a JSON integer.
+/// Frontend: `lib/task_api.js`.
 #[tauri::command]
 pub async fn storage_remove_task_screenshot(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1151,6 +1302,10 @@ pub async fn storage_remove_task_screenshot(
     state.remove_task_screenshot(task_id, screenshot_id)
 }
 
+/// Merges `task_ids` and returns the surviving task ID.
+///
+/// Authentication: required. At least two valid IDs are expected.
+/// Frontend: `lib/task_api.js`.
 #[tauri::command]
 pub async fn storage_merge_tasks(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -1162,6 +1317,10 @@ pub async fn storage_merge_tasks(
     state.merge_tasks(&task_ids)
 }
 
+/// Persists clustering output supplied by the monitor pipeline.
+///
+/// Authentication: required. `tasks` contains `SaveTaskRequest` objects; returns the
+/// saved task IDs. Frontend: `lib/task_api.js`.
 #[tauri::command]
 pub async fn storage_save_clustering_results(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,

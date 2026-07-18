@@ -1,6 +1,18 @@
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Settings as SettingsIcon, Shield, Info, Activity, Image as ImageIcon, Database, HardDrive, Wrench, Languages, Globe, Plug, Sparkles } from 'lucide-react';
+import {
+  Settings as SettingsIcon,
+  Shield,
+  Activity,
+  Image as ImageIcon,
+  Database,
+  HardDrive,
+  Wrench,
+  Search,
+  Sparkles,
+  SlidersHorizontal,
+  Info,
+} from 'lucide-react';
 import { Dialog } from '../Dialog';
 import MonitorServiceSection from './MonitorServiceSection';
 import GeneralOptionsSection from './GeneralOptionsSection';
@@ -101,13 +113,11 @@ function SettingsDialog({
 
   const tabs = [
     { id: 'general', label: t('settings.tabs.general'), icon: SettingsIcon },
-    { id: 'language', label: t('settings.tabs.language'), icon: Languages },
-    { id: 'security', label: t('settings.tabs.security'), icon: Shield },
-    { id: 'features', label: t('settings.tabs.features'), icon: Sparkles },
-    { id: 'advanced', label: t('settings.tabs.advanced'), icon: Wrench },
-    { id: 'extension', label: t('settings.tabs.extension'), icon: Globe },
-    { id: 'ai_embedding', label: t('settings.tabs.ai_embedding'), icon: Plug },
-    { id: 'analysis', label: t('settings.tabs.analysis'), icon: HardDrive },
+    { id: 'capture', label: t('settings.tabs.capture'), icon: Search },
+    { id: 'organize', label: t('settings.tabs.organize'), icon: Sparkles },
+    { id: 'privacy', label: t('settings.tabs.privacy'), icon: Shield },
+    { id: 'maintenance', label: t('settings.tabs.maintenance'), icon: Wrench },
+    { id: 'advanced', label: t('settings.tabs.advanced'), icon: SlidersHorizontal },
     { id: 'about', label: t('settings.tabs.about'), icon: Info },
   ];
 
@@ -130,15 +140,17 @@ function SettingsDialog({
                 activeTab === tab.id ? 'bg-ide-accent text-white font-medium' : 'text-ide-text hover:bg-ide-hover'
               }`}
             >
-              <tab.icon className="w-4 h-4" />
-              {tab.label}
+              <tab.icon className="w-4 h-4 shrink-0" />
+              <span className="min-w-0 leading-tight">{tab.label}</span>
             </button>
           ))}
         </div>
 
         <div className="flex-1 overflow-y-auto p-6 scrollbar-thin">
           {activeTab === 'general' && (
-            <div className="space-y-6">
+            <div className="space-y-8">
+              <LanguageSection />
+
               <MonitorServiceSection
                 monitorStatus={monitorStatus}
                 onStart={handleStartMonitor}
@@ -166,19 +178,8 @@ function SettingsDialog({
             </div>
           )}
 
-          {activeTab === 'language' && (
-            <LanguageSection />
-          )}
-
-          {activeTab === 'security' && (
+          {activeTab === 'capture' && (
             <div className="space-y-8">
-              <SecuritySection
-                sessionTimeout={sessionTimeout}
-                onSessionTimeoutChange={onSessionTimeoutChange}
-                isSessionValid={isSessionValid}
-                onLockSession={onLockSession}
-              />
-
               <CaptureFiltersSection
                 filterSettings={filterSettings}
                 processInput={processInput}
@@ -201,46 +202,61 @@ function SettingsDialog({
             </div>
           )}
 
-          {activeTab === 'features' && (
+          {activeTab === 'organize' && (
             <FeaturesSection monitorStatus={monitorStatus} />
           )}
 
-          {activeTab === 'advanced' && (
-            <AdvancedSection monitorStatus={monitorStatus} onRestartMonitor={handleRestartMonitor} />
+          {activeTab === 'privacy' && (
+            <div className="space-y-8">
+              <SecuritySection
+                sessionTimeout={sessionTimeout}
+                onSessionTimeoutChange={onSessionTimeoutChange}
+                isSessionValid={isSessionValid}
+                onLockSession={onLockSession}
+              />
+
+              <BrowserExtensionSection />
+            </div>
           )}
 
-          {activeTab === 'extension' && (
-            <BrowserExtensionSection />
-          )}
-
-          <div className={activeTab !== 'ai_embedding' ? 'hidden' : ''}>
+          <div className={activeTab === 'privacy' ? 'mt-8' : 'hidden'}>
             <AiEmbeddingSection />
           </div>
 
-          {activeTab === 'analysis' && (
-            <StorageManagementSection
-              storageSegments={storageSegments}
-              totalStorage={totalStorage}
-              storage={storage}
-              loading={analysisLoading}
-              refreshing={analysisRefreshing}
-              error={analysisError}
-              onRefresh={handleRefreshAnalysis}
-              monitorStatus={monitorStatus}
-            />
+          {activeTab === 'maintenance' && (
+            <div className="space-y-8">
+              <StorageManagementSection
+                storageSegments={storageSegments}
+                totalStorage={totalStorage}
+                storage={storage}
+                loading={analysisLoading}
+                refreshing={analysisRefreshing}
+                error={analysisError}
+                onRefresh={handleRefreshAnalysis}
+                monitorStatus={monitorStatus}
+              />
+            </div>
+          )}
+
+          {activeTab === 'advanced' && (
+            <div className="space-y-8">
+              <AdvancedSection monitorStatus={monitorStatus} onRestartMonitor={handleRestartMonitor} />
+            </div>
           )}
 
           {activeTab === 'about' && (
-            <AboutSection
-              checking={checkingUpdate}
-              upToDate={upToDate}
-              onCheckUpdate={handleCheckUpdate}
-              updateInfo={updateInfo}
-              updateError={updateError}
-              downloading={downloading}
-              downloadProgress={downloadProgress}
-              onDownloadUpdate={handleDownloadUpdate}
-            />
+            <div className="space-y-8">
+              <AboutSection
+                checking={checkingUpdate}
+                upToDate={upToDate}
+                onCheckUpdate={handleCheckUpdate}
+                updateInfo={updateInfo}
+                updateError={updateError}
+                downloading={downloading}
+                downloadProgress={downloadProgress}
+                onDownloadUpdate={handleDownloadUpdate}
+              />
+            </div>
           )}
         </div>
       </div>

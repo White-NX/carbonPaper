@@ -32,6 +32,51 @@ function Read-ProjectVersion {
     return [string]$tauriConf.version
 }
 
+function Assert-UpdatedRustOcrRuntime {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string]$InstallDir
+    )
+
+    $worker = Join-Path $InstallDir "carbonpaper-ml.exe"
+    if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) {
+        throw "Updated installation is missing carbonpaper-ml.exe: $worker"
+    }
+
+    $manifestPath = Join-Path $RepoRoot "scripts\release-assets\ocr-models.json"
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $bundleDir = Join-Path $InstallDir ([string]$manifest.bundle_path).Replace('/', '\')
+    foreach ($asset in $manifest.files) {
+        $path = Join-Path $bundleDir ([string]$asset.name)
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Updated installation is missing Rust OCR model asset: $path"
+        }
+        $size = (Get-Item -LiteralPath $path).Length
+        if ($size -ne [long]$asset.size) {
+            throw "Updated Rust OCR model asset has wrong size: $path expected=$($asset.size) actual=$size"
+        }
+        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+        if ($hash -ne ([string]$asset.sha256).ToLowerInvariant()) {
+            throw "Updated Rust OCR model asset checksum mismatch: $path expected=$($asset.sha256) actual=$hash"
+        }
+    }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $verifyOutput = & $worker --verify-models --model-dir $bundleDir 2>&1
+        $workerExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($workerExitCode -ne 0) {
+        throw "Updated Rust OCR runtime failed model verification (exit $workerExitCode): $($verifyOutput -join "`n")"
+    }
+    if (($verifyOutput -join "`n") -notmatch '"model_id":"ppocrv5-ch-mobile"') {
+        throw "Updated Rust OCR runtime returned an unexpected verification result: $($verifyOutput -join "`n")"
+    }
+}
+
 function Compare-SemVerCore {
     param(
         [Parameter(Mandatory = $true)][string]$Left,
@@ -389,6 +434,7 @@ $succeeded = $false
 $envNames = @(
     "CARBONPAPER_UPDATE_SMOKE_TEST",
     "CARBONPAPER_UPDATE_MANIFEST_URL",
+    "CARBONPAPER_UPDATE_SMOKE_PUBLIC_KEY",
     "CARBONPAPER_UPDATE_SMOKE_RESULT",
     "CARBONPAPER_UPDATE_SMOKE_EXPECTED_VERSION",
     "CARBONPAPER_UPDATE_SMOKE_EXPECTED_MANIFEST_VERSION",
@@ -428,7 +474,14 @@ try {
     $port = Get-FreeTcpPort
     $candidateUrl = "http://127.0.0.1:$port/$candidateZipName"
     $manifestUrl = "http://127.0.0.1:$port/latest.json"
-    Write-SmokeManifest -LatestJson $latestJsonPath -OutPath (Join-Path $httpRoot "latest.json") -CandidateUrl $candidateUrl -ManifestVersion $ManifestVersion -CandidateSha256 $candidateSha256
+    $smokeManifestPath = Join-Path $httpRoot "latest.json"
+    Write-SmokeManifest -LatestJson $latestJsonPath -OutPath $smokeManifestPath -CandidateUrl $candidateUrl -ManifestVersion $ManifestVersion -CandidateSha256 $candidateSha256
+    $signScript = Join-Path $repoRoot "scripts\sign-update-manifest.mjs"
+    $smokePublicKey = [string](@(& node $signScript $smokeManifestPath) | Select-Object -Last 1)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($smokePublicKey)) {
+        throw "Failed to sign update smoke manifest with $signScript"
+    }
+    $smokePublicKey = $smokePublicKey.Trim()
     Write-StaticServerScript -Path $serverScript
 
     Write-Host "Starting local update server: $manifestUrl"
@@ -442,6 +495,7 @@ try {
 
     $env:CARBONPAPER_UPDATE_SMOKE_TEST = "1"
     $env:CARBONPAPER_UPDATE_MANIFEST_URL = $manifestUrl
+    $env:CARBONPAPER_UPDATE_SMOKE_PUBLIC_KEY = $smokePublicKey
     $env:CARBONPAPER_UPDATE_SMOKE_RESULT = $resultFile
     $env:CARBONPAPER_UPDATE_SMOKE_EXPECTED_VERSION = $ExpectedAppVersion
     $env:CARBONPAPER_UPDATE_SMOKE_EXPECTED_MANIFEST_VERSION = $ManifestVersion
@@ -493,6 +547,7 @@ try {
                 if ($result.current_version -ne $ExpectedAppVersion) {
                     throw "Updated app reported version $($result.current_version), expected $ExpectedAppVersion."
                 }
+                Assert-UpdatedRustOcrRuntime -RepoRoot $repoRoot -InstallDir (Split-Path -Parent $oldExe)
                 if (Test-Path -LiteralPath $updateErrorLog) {
                     $updateError = Get-Content -LiteralPath $updateErrorLog -Raw
                     throw "Update script wrote update_error.log: $updateError"

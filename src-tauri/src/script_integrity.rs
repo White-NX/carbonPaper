@@ -130,7 +130,16 @@ pub fn log_security_event(_app: &AppHandle, event: &str, detail: &str) {
 /// Also writes a `event=debug_trigger` to security.log to verify the log path is correct.
 /// This command itself has no side effects, the security alert payload is simulated.
 #[tauri::command]
-pub fn debug_trigger_security_alert(app: AppHandle) -> Result<(), String> {
+pub fn debug_trigger_security_alert(
+    app: AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<
+        '_,
+        std::sync::Arc<crate::credential_manager::CredentialManagerState>,
+    >,
+) -> Result<(), String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
     log_security_event(&app, "debug_trigger", "manually triggered from settings");
     app.emit(
         "security-alert",
