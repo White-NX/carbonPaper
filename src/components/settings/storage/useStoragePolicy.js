@@ -1,50 +1,55 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../../../lib/auth_api';
 
 export function useStoragePolicy({ t }) {
-  const [storageLimit, setStorageLimit] = useState(() => {
+  const [storageLimit, setStorageLimitState] = useState(() => {
     return localStorage.getItem('snapshotStorageLimit') || 'unlimited';
   });
-  const [retentionPeriod, setRetentionPeriod] = useState(() => {
+  const [retentionPeriod, setRetentionPeriodState] = useState(() => {
     return localStorage.getItem('snapshotRetentionPeriod') || 'permanent';
   });
+  const policyRef = useRef({ storageLimit, retentionPeriod });
+  const userEditedRef = useRef(false);
 
   useEffect(() => {
-    localStorage.setItem('snapshotStorageLimit', storageLimit);
-    (async () => {
-      try {
-        await withAuth(() => invoke('storage_set_policy', { policy: { storage_limit: storageLimit, retention_period: retentionPeriod } }));
-      } catch {
-        // Backend may be unavailable in dev; localStorage remains the fallback.
-      }
-    })();
-  }, [storageLimit]);
-
-  useEffect(() => {
-    localStorage.setItem('snapshotRetentionPeriod', retentionPeriod);
-    (async () => {
-      try {
-        await withAuth(() => invoke('storage_set_policy', { policy: { storage_limit: storageLimit, retention_period: retentionPeriod } }));
-      } catch {
-        // Ignore backend sync failures here; the settings remain locally persisted.
-      }
-    })();
-  }, [retentionPeriod]);
+    policyRef.current = { storageLimit, retentionPeriod };
+  }, [storageLimit, retentionPeriod]);
 
   useEffect(() => {
     (async () => {
       try {
         const resp = await withAuth(() => invoke('storage_get_policy'));
-        if (resp && typeof resp === 'object') {
-          if (resp.storage_limit) setStorageLimit(String(resp.storage_limit));
-          if (resp.retention_period) setRetentionPeriod(String(resp.retention_period));
-        }
+        if (userEditedRef.current || !resp || typeof resp !== 'object') return;
+        // The backend policy is authoritative; a missing value means the
+        // corresponding limit is disabled, so never push the cached value up.
+        const backendLimit = resp.storage_limit ? String(resp.storage_limit) : 'unlimited';
+        const backendRetention = resp.retention_period ? String(resp.retention_period) : 'permanent';
+        setStorageLimitState(backendLimit);
+        setRetentionPeriodState(backendRetention);
+        localStorage.setItem('snapshotStorageLimit', backendLimit);
+        localStorage.setItem('snapshotRetentionPeriod', backendRetention);
       } catch {
-        // Keep localStorage values when the backend is unavailable.
+        // Keep localStorage values for display when the backend is unavailable.
       }
     })();
   }, []);
+
+  const persistPolicy = async (nextLimit, nextRetention) => {
+    userEditedRef.current = true;
+    setStorageLimitState(nextLimit);
+    setRetentionPeriodState(nextRetention);
+    localStorage.setItem('snapshotStorageLimit', nextLimit);
+    localStorage.setItem('snapshotRetentionPeriod', nextRetention);
+    try {
+      await withAuth(() => invoke('storage_set_policy', { policy: { storage_limit: nextLimit, retention_period: nextRetention } }));
+    } catch {
+      // Backend may be unavailable in dev; localStorage remains the fallback.
+    }
+  };
+
+  const setStorageLimit = (value) => persistPolicy(value, policyRef.current.retentionPeriod);
+  const setRetentionPeriod = (value) => persistPolicy(policyRef.current.storageLimit, value);
 
   const storageLimitOptions = [
     { value: '10', label: t('settings.storageManagement.storageLimit.options.10') },
