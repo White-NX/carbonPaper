@@ -519,11 +519,12 @@ def _handle_command_impl(req: dict):
             return {'error': 'screenshot_id is required'}
         if not _ocr_worker or not hasattr(_ocr_worker, 'request'):
             return {'error': 'OCR postprocess service is not initialised'}
+        timeout_secs = int(req.get('timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
         try:
             result = _ocr_worker.request(
                 'enqueue_ocr_postprocess',
                 {'request': req},
-                timeout=30,
+                timeout=max(30, min(600, timeout_secs)),
             )
             if result.get('status') == 'success':
                 _enqueue_clustering_snapshot({

@@ -553,7 +553,9 @@ class RestartableModelWorker(WorkerSupervisor):
         except Exception:
             self._stats["failed_count"] += 1
             raise
-        if result.get("error"):
+        if command == "enqueue_ocr_postprocess" and result.get("status") == "success":
+            self._stats["processed_count"] += 1
+        elif result.get("error"):
             self._stats["failed_count"] += 1
         return result
 
