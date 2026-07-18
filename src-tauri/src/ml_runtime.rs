@@ -1153,6 +1153,26 @@ pub async fn run_postprocess_retry_loop(app: AppHandle) {
     }
 }
 
+/// Whether an enqueue error means the Python monitor never accepted the
+/// request (monitor stopped, pipe unreachable, transport read/write failure
+/// or timeout). Matches the error strings emitted by `monitor.rs` /
+/// `monitor_ipc.rs` before a response is parsed; anything else is treated as
+/// a real processing failure so a poisoned row still exhausts its budget.
+fn is_monitor_unavailable_error(error: &str) -> bool {
+    const TRANSPORT_ERROR_PREFIXES: &[&str] = &[
+        "Monitor not started",
+        "Failed to connect to pipe:",
+        "Write frame length error:",
+        "Write frame body error:",
+        "Read frame length error:",
+        "Read frame body error:",
+        "IPC response timed out after",
+    ];
+    TRANSPORT_ERROR_PREFIXES
+        .iter()
+        .any(|prefix| error.starts_with(prefix))
+}
+
 async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
     let storage = app
         .state::<Arc<crate::storage::StorageState>>()
@@ -1237,6 +1257,16 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
             Ok(true) => storage.set_ocr_postprocess_status(screenshot_id, "queued", None)?,
             Ok(false) => storage
                 .record_ocr_postprocess_retry(screenshot_id, "Python postprocess queue is full")?,
+            Err(error) if is_monitor_unavailable_error(&error) => {
+                // Keep the row pending with its retry budget intact; the next
+                // pass retries once the monitor is reachable again.
+                tracing::debug!(
+                    "[ML:POSTPROCESS] monitor unavailable, deferring screenshot {}: {}",
+                    screenshot_id,
+                    error
+                );
+                return Ok(());
+            }
             Err(error) => storage.record_ocr_postprocess_retry(screenshot_id, &error)?,
         }
     }
@@ -1290,5 +1320,28 @@ mod tests {
         let (missing, corrupt) = inspect_model_directory(directory.path()).expect("inspection");
         assert!(missing.is_empty());
         assert_eq!(corrupt.len(), 3);
+    }
+
+    #[test]
+    fn postprocess_retry_budget_is_only_consumed_for_real_failures() {
+        // Transport-level outages keep the row pending without touching the budget.
+        assert!(is_monitor_unavailable_error("Monitor not started"));
+        assert!(is_monitor_unavailable_error(
+            "Failed to connect to pipe: os error 2. Is monitor running?"
+        ));
+        assert!(is_monitor_unavailable_error(
+            "Write frame body error: broken pipe"
+        ));
+        assert!(is_monitor_unavailable_error(
+            "Read frame length error: connection reset"
+        ));
+        assert!(is_monitor_unavailable_error("IPC response timed out after 30s"));
+
+        // Failures reported by Python (or unknown errors) consume the budget.
+        assert!(!is_monitor_unavailable_error("postprocess worker crashed"));
+        assert!(!is_monitor_unavailable_error(
+            "Invalid JSON response: expected value. Data: garbage"
+        ));
+        assert!(!is_monitor_unavailable_error(""));
     }
 }
