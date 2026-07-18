@@ -663,19 +663,6 @@ pub async fn monitor_update_feature_config(
 }
 
 #[tauri::command]
-pub async fn monitor_get_all_models(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
-) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({ "command": "get_all_models" }),
-    )
-    .await
-}
-
-#[tauri::command]
 pub async fn monitor_run_clustering(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, MonitorState>,

@@ -123,7 +123,6 @@ export default function FeaturesSection({ monitorStatus }) {
       <ModelInventoryTable
         models={models}
         modelsLoading={modelsLoading}
-        monitorStatus={monitorStatus}
         onRefresh={loadModels}
         onOpenLocation={handleOpenLocation}
         formatSize={formatSize}

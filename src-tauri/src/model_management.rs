@@ -848,21 +848,329 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
         &models_dir.join("bge-reranker-v2-m3"),
         None,
         false,
-        |base| {
-            missing_files(
-                base,
-                &[
-                    "config.json",
-                    "tokenizer.json",
-                    "tokenizer_config.json",
-                    "special_tokens_map.json",
-                    "onnx/model_uint8.onnx",
-                ],
-            )
-        },
+        reranker_missing,
     );
 
     Ok(serde_json::Value::Object(result))
+}
+
+fn reranker_missing(base: &Path) -> Vec<String> {
+    missing_files(
+        base,
+        &[
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "onnx/model_uint8.onnx",
+        ],
+    )
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelVariantStatus {
+    pub runtime: &'static str,
+    pub path: String,
+    pub installed: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelInventoryEntry {
+    pub id: String,
+    pub display_name: String,
+    /// Stable purpose key translated by the frontend (i18n), never display text.
+    pub purpose: &'static str,
+    pub installed: bool,
+    pub active_runtime: Option<&'static str>,
+    /// Total size in bytes across this logical model's on-disk variants.
+    pub size: u64,
+    pub path: String,
+    pub variants: Vec<ModelVariantStatus>,
+}
+
+struct RequiredModelDef {
+    id: &'static str,
+    display_name: &'static str,
+    purpose: &'static str,
+    subdir: Option<&'static str>,
+    onnx_missing: fn(&Path) -> Vec<String>,
+    pytorch_missing: fn(&Path) -> Vec<String>,
+}
+
+const REQUIRED_MODEL_DEFS: &[RequiredModelDef] = &[
+    RequiredModelDef {
+        id: "chinese-clip",
+        display_name: "Chinese-CLIP ViT-B/16",
+        purpose: "image_embedding",
+        subdir: None,
+        onnx_missing: chinese_clip_onnx_missing,
+        pytorch_missing: chinese_clip_pytorch_missing,
+    },
+    RequiredModelDef {
+        id: "bge-small-zh",
+        display_name: "BGE-small-zh v1.5",
+        purpose: "content_classification",
+        subdir: Some("bge-small-zh-v1.5"),
+        onnx_missing: bge_onnx_missing,
+        pytorch_missing: bge_pytorch_missing,
+    },
+    RequiredModelDef {
+        id: "minilm-l12",
+        display_name: "MiniLM-L12 multilingual",
+        purpose: "task_clustering",
+        subdir: Some("paraphrase-multilingual-MiniLM-L12-v2"),
+        onnx_missing: minilm_onnx_missing,
+        pytorch_missing: minilm_pytorch_missing,
+    },
+];
+
+/// Chinese-CLIP lives at the root of `models` / `models-onnx`, next to the
+/// subdirectories of other models, so its size must be measured from an
+/// explicit file set instead of walking the shared root.
+const CLIP_ROOT_MEASURE_FILES: &[&str] = &[
+    "vocab.txt",
+    "config.json",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "pytorch_model.bin",
+];
+
+fn dir_size_recursive(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            total += dir_size_recursive(&entry.path());
+        } else if let Ok(metadata) = entry.metadata() {
+            total += metadata.len();
+        }
+    }
+    total
+}
+
+fn file_set_size(base: &Path, files: &[&str]) -> u64 {
+    files
+        .iter()
+        .filter_map(|file| std::fs::metadata(base.join(file)).ok().map(|m| m.len()))
+        .sum()
+}
+
+fn clip_root_size(root: &Path) -> u64 {
+    file_set_size(root, CLIP_ROOT_MEASURE_FILES) + dir_size_recursive(&root.join("onnx"))
+}
+
+fn variant_dir(root: &Path, subdir: Option<&str>) -> PathBuf {
+    match subdir {
+        Some(sub) => root.join(sub),
+        None => root.to_path_buf(),
+    }
+}
+
+fn required_model_entries(
+    models_dir: &Path,
+    onnx_models_dir: &Path,
+    prefer_onnx: bool,
+) -> Vec<ModelInventoryEntry> {
+    let onnx_ok = required_onnx_complete_with_fallback(onnx_models_dir, models_dir);
+    let pytorch_ok = required_pytorch_complete(models_dir);
+    // Mirrors resolve_required_model_runtime: ONNX is only active when the
+    // configured ONNX set is complete, while PyTorch may take over only when
+    // its complete set is available.
+    let global_runtime = if prefer_onnx && onnx_ok {
+        Some(RequiredModelRuntime::Onnx)
+    } else if pytorch_ok {
+        Some(RequiredModelRuntime::Pytorch)
+    } else {
+        None
+    };
+
+    let mut entries = Vec::new();
+    for def in REQUIRED_MODEL_DEFS {
+        let onnx_primary = variant_dir(onnx_models_dir, def.subdir);
+        let onnx_legacy = variant_dir(models_dir, def.subdir);
+        let onnx_primary_ok = (def.onnx_missing)(&onnx_primary).is_empty();
+        let onnx_legacy_ok = (def.onnx_missing)(&onnx_legacy).is_empty();
+        let onnx_installed = onnx_primary_ok || onnx_legacy_ok;
+        let onnx_path = if onnx_primary_ok || !onnx_legacy_ok {
+            onnx_primary.clone()
+        } else {
+            onnx_legacy
+        };
+
+        let pytorch_base = variant_dir(models_dir, def.subdir);
+        let pytorch_installed = (def.pytorch_missing)(&pytorch_base).is_empty();
+
+        let (onnx_primary_size, legacy_shared_size) = if def.subdir.is_some() {
+            // The legacy ONNX location and the PyTorch location share
+            // models/<subdir>, so walking the two distinct dirs is exact.
+            (
+                dir_size_recursive(&onnx_primary),
+                dir_size_recursive(&pytorch_base),
+            )
+        } else {
+            (clip_root_size(onnx_models_dir), clip_root_size(models_dir))
+        };
+        let size = onnx_primary_size + legacy_shared_size;
+
+        let active_runtime = match global_runtime {
+            Some(RequiredModelRuntime::Onnx) if onnx_installed => Some("onnx"),
+            Some(RequiredModelRuntime::Pytorch) if pytorch_installed => Some("pytorch"),
+            _ => None,
+        };
+
+        let path = match active_runtime {
+            Some("pytorch") => pytorch_base.clone(),
+            Some("onnx") => onnx_path.clone(),
+            None if prefer_onnx && onnx_primary_size > 0 => onnx_primary.clone(),
+            None if legacy_shared_size > 0 => pytorch_base.clone(),
+            None if onnx_primary_size > 0 => onnx_primary.clone(),
+            None if prefer_onnx => onnx_path.clone(),
+            None => pytorch_base.clone(),
+            Some(_) => unreachable!("unsupported model runtime"),
+        };
+
+        entries.push(ModelInventoryEntry {
+            id: def.id.to_string(),
+            display_name: def.display_name.to_string(),
+            purpose: def.purpose,
+            installed: onnx_installed || pytorch_installed,
+            active_runtime,
+            size,
+            path: path.to_string_lossy().to_string(),
+            variants: vec![
+                ModelVariantStatus {
+                    runtime: "onnx",
+                    path: onnx_path.to_string_lossy().to_string(),
+                    installed: onnx_installed,
+                },
+                ModelVariantStatus {
+                    runtime: "pytorch",
+                    path: pytorch_base.to_string_lossy().to_string(),
+                    installed: pytorch_installed,
+                },
+            ],
+        });
+    }
+    entries
+}
+
+fn reranker_entry(models_dir: &Path) -> ModelInventoryEntry {
+    let base = models_dir.join("bge-reranker-v2-m3");
+    let installed = reranker_missing(&base).is_empty();
+    ModelInventoryEntry {
+        id: "bge-reranker-v2-m3".to_string(),
+        display_name: "BGE Reranker v2-M3".to_string(),
+        purpose: "smart_cluster_rerank",
+        installed,
+        active_runtime: installed.then_some("onnx"),
+        size: dir_size_recursive(&base),
+        path: base.to_string_lossy().to_string(),
+        variants: vec![ModelVariantStatus {
+            runtime: "onnx",
+            path: base.to_string_lossy().to_string(),
+            installed,
+        }],
+    }
+}
+
+/// Obsolete PaddleOCR-era caches that earlier releases left behind. Surfaced
+/// so users can locate them, never treated as usable models.
+fn legacy_cache_entry(id: &str, display_name: &str, dir: &Path) -> Option<ModelInventoryEntry> {
+    let size = dir_size_recursive(dir);
+    if size == 0 {
+        return None;
+    }
+    Some(ModelInventoryEntry {
+        id: id.to_string(),
+        display_name: display_name.to_string(),
+        purpose: "legacy_ocr_cache",
+        installed: true,
+        active_runtime: None,
+        size,
+        path: dir.to_string_lossy().to_string(),
+        variants: Vec::new(),
+    })
+}
+
+fn collect_model_inventory(
+    ocr_status: Option<crate::ml_runtime::RustOcrModelStatus>,
+) -> Result<Vec<ModelInventoryEntry>, String> {
+    let appdata_dir = file_in_local_appdata()
+        .ok_or_else(|| "Could not determine local appdata directory.".to_string())?;
+    let models_dir = appdata_dir.join("models");
+    let onnx_models_dir = appdata_dir.join("models-onnx");
+    let prefer_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
+
+    let mut entries = required_model_entries(&models_dir, &onnx_models_dir, prefer_onnx);
+    entries.push(reranker_entry(&models_dir));
+
+    if let Some(status) = ocr_status {
+        let model_dir = PathBuf::from(&status.path);
+        entries.push(ModelInventoryEntry {
+            id: status.model_id.clone(),
+            display_name: "PP-OCRv5 Mobile".to_string(),
+            purpose: "ocr",
+            installed: status.installed,
+            active_runtime: status.installed.then_some("onnx"),
+            size: dir_size_recursive(&model_dir),
+            path: status.path.clone(),
+            variants: vec![ModelVariantStatus {
+                runtime: "onnx",
+                path: status.path,
+                installed: status.installed,
+            }],
+        });
+    }
+
+    if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        entries.extend(legacy_cache_entry(
+            "legacy-paddleocr-cache",
+            "PaddleOCR cache",
+            &home.join(".paddleocr"),
+        ));
+        entries.extend(legacy_cache_entry(
+            "legacy-rapidocr-cache",
+            "RapidOCR cache",
+            &home.join(".rapidocr"),
+        ));
+    }
+    entries.extend(legacy_cache_entry(
+        "legacy-ppocrmodel",
+        "ppOCRmodel",
+        &appdata_dir.join("ppOCRmodel"),
+    ));
+
+    entries.retain(|entry| entry.installed || entry.size > 0);
+    Ok(entries)
+}
+
+#[tauri::command]
+/// Structured inventory of logical models (embedding, rerank, OCR, legacy
+/// caches) for the settings page. Replaces the Python-side directory scan.
+pub async fn get_model_inventory(
+    app: AppHandle,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+) -> Result<serde_json::Value, String> {
+    crate::commands::check_auth_required(&credential_state)?;
+
+    let models = tauri::async_runtime::spawn_blocking(move || {
+        let ocr_status = crate::ml_runtime::ocr_model_status(&app).ok();
+        collect_model_inventory(ocr_status)
+    })
+    .await
+    .map_err(|e| format!("model inventory task failed: {e}"))??;
+
+    Ok(json!({ "status": "success", "models": models }))
 }
 
 #[cfg(test)]
@@ -1009,5 +1317,130 @@ mod tests {
 
         std::fs::write(base.join("b.bin"), b"ready").expect("rewrite b");
         assert!(model_files_complete(base, &["a.bin", "b.bin"]));
+    }
+
+    #[test]
+    fn inventory_reports_logical_models_instead_of_directory_names() {
+        // Reproduces the layout that used to render as pseudo-rows named
+        // "onnx", "pytorch_model.bin", and unknown "bge-reranker-v2-m3".
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let models_dir = tmp.path().join("models");
+        let onnx_models_dir = tmp.path().join("models-onnx");
+        write_complete_pytorch_models(&models_dir);
+        touch(&models_dir, "onnx/model_q4.onnx");
+        touch(&models_dir, "tokenizer.json");
+        for rel in [
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "onnx/model_uint8.onnx",
+        ] {
+            touch(&models_dir.join("bge-reranker-v2-m3"), rel);
+        }
+
+        let mut entries = required_model_entries(&models_dir, &onnx_models_dir, true);
+        entries.push(reranker_entry(&models_dir));
+
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "chinese-clip",
+                "bge-small-zh",
+                "minilm-l12",
+                "bge-reranker-v2-m3"
+            ]
+        );
+        assert!(entries.iter().all(|e| e.installed));
+        assert!(entries.iter().all(|e| e.size > 0));
+
+        let clip = &entries[0];
+        assert_eq!(clip.purpose, "image_embedding");
+        // ONNX text models are incomplete, so the runtime falls back to
+        // PyTorch even though the CLIP ONNX weights exist at the legacy root.
+        assert_eq!(clip.active_runtime, Some("pytorch"));
+        assert!(clip
+            .variants
+            .iter()
+            .any(|v| v.runtime == "onnx" && v.installed));
+
+        let reranker = entries.last().unwrap();
+        assert_eq!(reranker.purpose, "smart_cluster_rerank");
+        assert_eq!(reranker.active_runtime, Some("onnx"));
+    }
+
+    #[test]
+    fn clip_size_excludes_sibling_model_directories() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let models_dir = tmp.path().join("models");
+        let onnx_models_dir = tmp.path().join("models-onnx");
+        touch(&models_dir, "pytorch_model.bin");
+        touch(&models_dir, "onnx/model_q4.onnx");
+        touch(&models_dir, "bge-small-zh-v1.5/pytorch_model.bin");
+        touch(&models_dir, "bge-reranker-v2-m3/onnx/model_uint8.onnx");
+        touch(&models_dir, "ocr/ppocrv5-ch-mobile/det.onnx");
+
+        // Each touched file is 1 byte; only the two CLIP files may count.
+        assert_eq!(clip_root_size(&models_dir), 2);
+        assert_eq!(clip_root_size(&onnx_models_dir), 0);
+    }
+
+    #[test]
+    fn fresh_install_yields_uninstalled_zero_size_entries() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let models_dir = tmp.path().join("models");
+        let onnx_models_dir = tmp.path().join("models-onnx");
+
+        let mut entries = required_model_entries(&models_dir, &onnx_models_dir, true);
+        entries.push(reranker_entry(&models_dir));
+        assert!(entries.iter().all(|e| !e.installed && e.size == 0));
+    }
+
+    #[test]
+    fn configured_pytorch_does_not_report_onnx_as_active() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let models_dir = tmp.path().join("models");
+        let onnx_models_dir = tmp.path().join("models-onnx");
+        write_complete_clip_onnx(&onnx_models_dir);
+        write_complete_text_onnx(&onnx_models_dir.join("bge-small-zh-v1.5"));
+        write_complete_text_onnx(&onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"));
+
+        let entries = required_model_entries(&models_dir, &onnx_models_dir, false);
+        assert!(entries.iter().all(|entry| entry.installed));
+        assert!(entries.iter().all(|entry| entry.active_runtime.is_none()));
+    }
+
+    #[test]
+    fn incomplete_legacy_model_uses_existing_location() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let models_dir = tmp.path().join("models");
+        let onnx_models_dir = tmp.path().join("models-onnx");
+        let partial_bge = models_dir.join("bge-small-zh-v1.5");
+        touch(&partial_bge, "config.json");
+
+        let entries = required_model_entries(&models_dir, &onnx_models_dir, true);
+        let bge = entries
+            .iter()
+            .find(|entry| entry.id == "bge-small-zh")
+            .expect("bge inventory entry");
+
+        assert!(!bge.installed);
+        assert_eq!(bge.active_runtime, None);
+        assert_eq!(PathBuf::from(&bge.path), partial_bge);
+        assert!(Path::new(&bge.path).exists());
+    }
+
+    #[test]
+    fn legacy_cache_entry_requires_content() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        assert!(legacy_cache_entry("x", "X", &tmp.path().join("missing")).is_none());
+
+        let cache = tmp.path().join(".paddleocr");
+        touch(&cache, "whl/det/inference.pdmodel");
+        let entry = legacy_cache_entry("legacy-paddleocr-cache", "PaddleOCR cache", &cache)
+            .expect("cache entry");
+        assert_eq!(entry.purpose, "legacy_ocr_cache");
+        assert!(entry.size > 0);
     }
 }

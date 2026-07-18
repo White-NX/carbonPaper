@@ -229,7 +229,6 @@
         "title": "OCR 处理",
         "single_flight": "固定单任务模式",
         "single_flight_desc": "OCR 直接处理未经过 JPEG 的 RGB 捕获帧。为限制内存占用，OCR 运行期间不会排队新的完整 RGB 帧。",
-        "raw_info": "JPEG 仅用于加密存储和 Python 后处理，不会作为 OCR 输入，也不会用于 OCR 失败回退。",
         "pause_label": "OCR 队列有任务时暂停截图",
         "pause_desc": "开启后，当 OCR 队列中有未处理任务时将暂停截图，减少资源占用",
         "queue_limit_label": "限制 OCR 任务队列大小",
@@ -243,7 +242,7 @@
       "rust_ocr": {
         "title": "OCR 引擎",
         "raw_rgb": "Rust Raw RGB OCR",
-        "raw_rgb_desc": "隔离的 Rust ML 进程直接读取 RGB 捕获帧，不经过 JPEG，也不回退到 Python OCR。",
+        "raw_rgb_desc": "隔离的 Rust ML 进程直接读取 RGB 捕获帧。",
         "use_rust": "使用 Rust OCR",
         "rust_desc": "使用隔离的 Rust ML 进程直接处理 RGB 捕获帧。",
         "python_desc": "Python OCR 不再作为截图 OCR 回退路径。",
@@ -740,7 +739,15 @@
         "size": "大小",
         "location": "位置",
         "empty": "暂无模型数据",
-        "refresh": "刷新"
+        "refresh": "刷新",
+        "purposes": {
+          "image_embedding": "图像特征提取",
+          "content_classification": "内容分类",
+          "task_clustering": "任务聚类",
+          "smart_cluster_rerank": "智能聚类重排",
+          "ocr": "文字识别 (OCR)",
+          "legacy_ocr_cache": "旧版 OCR 缓存"
+        }
       }
     }
   },

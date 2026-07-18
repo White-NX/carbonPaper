@@ -229,7 +229,6 @@
         "title": "OCR processing",
         "single_flight": "Fixed single-task mode",
         "single_flight_desc": "OCR processes RGB capture frames before JPEG encoding. To cap memory use, full RGB frames are not queued while OCR is running.",
-        "raw_info": "JPEG is used only for encrypted storage and Python post-processing. It is never OCR input or an OCR failure fallback.",
         "pause_label": "Pause captures when OCR queue has work",
         "pause_desc": "When enabled, pauses captures while there are unprocessed OCR tasks to reduce resource usage",
         "queue_limit_label": "Limit OCR task queue size",
@@ -243,7 +242,7 @@
       "rust_ocr": {
         "title": "OCR engine",
         "raw_rgb": "Rust Raw RGB OCR",
-        "raw_rgb_desc": "The isolated Rust ML process reads RGB capture frames directly, without JPEG encoding or Python OCR fallback.",
+        "raw_rgb_desc": "The isolated Rust ML process reads RGB capture frames directly.",
         "use_rust": "Use Rust OCR",
         "rust_desc": "Runs OCR directly on RGB capture frames in an isolated Rust ML process.",
         "python_desc": "Python OCR is no longer used as the screenshot OCR fallback.",
@@ -740,7 +739,15 @@
         "size": "Size",
         "location": "Location",
         "empty": "No model data available",
-        "refresh": "Refresh"
+        "refresh": "Refresh",
+        "purposes": {
+          "image_embedding": "Image feature extraction",
+          "content_classification": "Content classification",
+          "task_clustering": "Task clustering",
+          "smart_cluster_rerank": "Smart cluster reranking",
+          "ocr": "Text recognition (OCR)",
+          "legacy_ocr_cache": "Legacy OCR cache"
+        }
       }
     }
   },

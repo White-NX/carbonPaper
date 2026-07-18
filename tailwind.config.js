@@ -10,7 +10,7 @@ export default {
       colors: {
         'ide-bg': 'var(--ide-bg)',
         'ide-panel': 'var(--ide-panel)',
-        'ide-border': 'var(--ide-border)',
+        'ide-border': 'rgb(var(--ide-border-rgb) / <alpha-value>)',
         'ide-text': 'var(--ide-text)',
         'ide-muted': 'var(--ide-muted)',
         'ide-accent': 'var(--ide-accent)',

@@ -1026,7 +1026,6 @@ pub fn run() {
             monitor::monitor_update_filters,
             monitor::monitor_update_advanced_config,
             monitor::monitor_update_feature_config,
-            monitor::monitor_get_all_models,
             monitor::monitor_run_clustering,
             monitor::monitor_get_clustering_status,
             monitor::monitor_set_clustering_interval,
@@ -1141,6 +1140,7 @@ pub fn run() {
             python::force_recheck_spacy_models,
             model_management::download_model,
             model_management::check_model_files,
+            model_management::get_model_inventory,
             // Updater commands
             updater::updater_check,
             updater::updater_install,

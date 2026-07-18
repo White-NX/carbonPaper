@@ -56,16 +56,6 @@ export default function OcrQueueCard({
             <span className="text-xs text-ide-muted">{t('settings.advanced.ocr.seconds', '秒')}</span>
           </div>
         </div>
-
-        <div className="flex items-start gap-2 p-2.5 bg-ide-panel/50 border border-ide-border/30 rounded-lg">
-          <Info className="w-4 h-4 text-ide-muted shrink-0 mt-0.5" />
-          <p className="text-xs text-ide-muted leading-relaxed">
-            {t(
-              'settings.advanced.ocr.raw_info',
-              'JPEG 仅用于加密存储和 Python 后处理，不会作为 OCR 输入，也不会用于 OCR 失败回退。',
-            )}
-          </p>
-        </div>
       </div>
     </div>
   );

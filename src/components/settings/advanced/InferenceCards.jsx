@@ -54,7 +54,7 @@ export function OcrEngineCard({
           <p className="text-xs text-ide-muted mt-1">
             {t(
               'settings.advanced.rust_ocr.raw_rgb_desc',
-              '隔离的 Rust ML 进程直接读取 RGB 捕获帧，不经过 JPEG，也不回退到 Python OCR。',
+              '隔离的 Rust ML 进程直接读取 RGB 捕获帧。',
             )}
           </p>
         </div>

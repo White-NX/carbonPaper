@@ -22,7 +22,7 @@ export function useFeaturesController({
   const [rangeStart, setRangeStart] = useState('');
   const [rangeEnd, setRangeEnd] = useState('');
   const [customControlsOpen, setCustomControlsOpen] = useState(false);
-  const modelInventory = useModelInventory({ monitorStatus });
+  const modelInventory = useModelInventory();
   const smartCluster = useSmartClusterControls();
   const { scModelAvailable } = smartCluster;
 

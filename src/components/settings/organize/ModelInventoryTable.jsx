@@ -5,7 +5,6 @@ import { Database, ExternalLink, RefreshCw } from 'lucide-react';
 export default function ModelInventoryTable({
   models,
   modelsLoading,
-  monitorStatus,
   onRefresh,
   onOpenLocation,
   formatSize,
@@ -21,7 +20,7 @@ export default function ModelInventoryTable({
         </label>
         <button
           onClick={onRefresh}
-          disabled={modelsLoading || monitorStatus !== 'running'}
+          disabled={modelsLoading}
           className="p-1 text-ide-muted hover:text-ide-text hover:bg-ide-hover rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           title={t('settings.features.models.refresh', '刷新')}
         >
@@ -42,9 +41,18 @@ export default function ModelInventoryTable({
           <tbody>
             {models.length > 0 ? (
               models.map((model) => (
-                <tr key={model.name} className="border-t border-ide-border hover:bg-ide-hover transition-colors">
-                  <td className="px-3 py-1.5 font-medium">{model.name}</td>
-                  <td className="px-3 py-1.5 text-ide-muted whitespace-nowrap">{model.purpose}</td>
+                <tr key={model.id} className="border-t border-ide-border hover:bg-ide-hover transition-colors">
+                  <td className="px-3 py-1.5 font-medium">
+                    {model.display_name}
+                    {model.active_runtime && (
+                      <span className="ml-1.5 px-1 py-0.5 text-[10px] uppercase rounded bg-ide-panel text-ide-muted border border-ide-border">
+                        {model.active_runtime}
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-3 py-1.5 text-ide-muted whitespace-nowrap">
+                    {t(`settings.features.models.purposes.${model.purpose}`, model.purpose)}
+                  </td>
                   <td className="px-3 py-1.5 text-ide-muted whitespace-nowrap">{formatSize(model.size)}</td>
                   <td className="px-3 py-1.5 text-ide-muted">
                     <button
