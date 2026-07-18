@@ -292,72 +292,103 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
                 .map(|item| item.image_hash.clone())
                 .collect();
 
-            if !image_hashes.is_empty() {
-                let monitor_state = app_handle.state::<MonitorState>();
+            // Vector embeddings can only be removed while the Python monitor is
+            // reachable. Require its ack before destroying the image hashes the
+            // cleanup needs; otherwise leave the queue entries for a later cycle.
+            // The one exception is a monitor that is disabled by configuration and
+            // not running, where waiting would stall retention forever.
+            let monitor_state = app_handle.state::<MonitorState>();
+            let monitor_running = monitor_state
+                .process
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            let monitor_autostart =
+                registry_config::get_bool("autoStartMonitor").unwrap_or(true);
+
+            let vector_cleanup_done = if image_hashes.is_empty()
+                || vector_cleanup_can_be_skipped(monitor_running, monitor_autostart)
+            {
+                true
+            } else {
                 let payload = serde_json::json!({
                     "command": "delete_by_time_range",
                     "image_hashes": image_hashes,
                 });
-                if let Err(e) = monitor::forward_command_to_python(&monitor_state, payload).await {
-                    tracing::warn!("[DELETE_QUEUE] Vector cleanup failed: {}", e);
-                }
-            }
-
-            let data_dir = storage
-                .data_dir
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-
-            for item in &screenshot_candidates {
-                let path = std::path::Path::new(&item.image_path);
-                let abs_path = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    data_dir.join(path)
-                };
-
-                if let Err(e) = std::fs::remove_file(&abs_path) {
-                    let not_found = e.kind() == std::io::ErrorKind::NotFound;
-                    if !not_found {
-                        tracing::debug!(
-                            "[DELETE_QUEUE] Failed to remove image file {}: {}",
-                            abs_path.display(),
+                let result = monitor::forward_command_to_python(&monitor_state, payload).await;
+                let acked = vector_cleanup_acked(&result);
+                if !acked {
+                    match result {
+                        Ok(response) => tracing::warn!(
+                            "[DELETE_QUEUE] Vector cleanup rejected, deferring finalize: {}",
+                            response
+                        ),
+                        Err(e) => tracing::warn!(
+                            "[DELETE_QUEUE] Vector cleanup unavailable, deferring finalize: {}",
                             e
-                        );
+                        ),
                     }
                 }
-
-                let thumb_path = StorageState::thumbnail_path_for(&abs_path);
-                if let Err(e) = std::fs::remove_file(&thumb_path) {
-                    let not_found = e.kind() == std::io::ErrorKind::NotFound;
-                    if !not_found {
-                        tracing::debug!(
-                            "[DELETE_QUEUE] Failed to remove thumbnail {}: {}",
-                            thumb_path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-
-            let ids: Vec<i64> = screenshot_candidates.iter().map(|item| item.id).collect();
-            finalized_screenshots = match tokio::task::spawn_blocking({
-                let storage = storage.clone();
-                move || storage.finalize_screenshot_delete_batch(&ids)
-            })
-            .await
-            {
-                Ok(Ok(count)) => count,
-                Ok(Err(e)) => {
-                    tracing::warn!("[DELETE_QUEUE] Screenshot finalize failed: {}", e);
-                    0
-                }
-                Err(e) => {
-                    tracing::warn!("[DELETE_QUEUE] Screenshot finalize join error: {:?}", e);
-                    0
-                }
+                acked
             };
+
+            if vector_cleanup_done {
+                let data_dir = storage
+                    .data_dir
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+
+                for item in &screenshot_candidates {
+                    let path = std::path::Path::new(&item.image_path);
+                    let abs_path = if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        data_dir.join(path)
+                    };
+
+                    if let Err(e) = std::fs::remove_file(&abs_path) {
+                        let not_found = e.kind() == std::io::ErrorKind::NotFound;
+                        if !not_found {
+                            tracing::debug!(
+                                "[DELETE_QUEUE] Failed to remove image file {}: {}",
+                                abs_path.display(),
+                                e
+                            );
+                        }
+                    }
+
+                    let thumb_path = StorageState::thumbnail_path_for(&abs_path);
+                    if let Err(e) = std::fs::remove_file(&thumb_path) {
+                        let not_found = e.kind() == std::io::ErrorKind::NotFound;
+                        if !not_found {
+                            tracing::debug!(
+                                "[DELETE_QUEUE] Failed to remove thumbnail {}: {}",
+                                thumb_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+
+                let ids: Vec<i64> = screenshot_candidates.iter().map(|item| item.id).collect();
+                finalized_screenshots = match tokio::task::spawn_blocking({
+                    let storage = storage.clone();
+                    move || storage.finalize_screenshot_delete_batch(&ids)
+                })
+                .await
+                {
+                    Ok(Ok(count)) => count,
+                    Ok(Err(e)) => {
+                        tracing::warn!("[DELETE_QUEUE] Screenshot finalize failed: {}", e);
+                        0
+                    }
+                    Err(e) => {
+                        tracing::warn!("[DELETE_QUEUE] Screenshot finalize join error: {:?}", e);
+                        0
+                    }
+                };
+            }
         }
 
         let vacuum_ran = match tokio::task::spawn_blocking({
@@ -387,6 +418,17 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
             );
         }
     }
+}
+
+fn vector_cleanup_can_be_skipped(monitor_running: bool, monitor_autostart: bool) -> bool {
+    !monitor_running && !monitor_autostart
+}
+
+fn vector_cleanup_acked(result: &Result<serde_json::Value, String>) -> bool {
+    matches!(
+        result,
+        Ok(response) if response.get("status").and_then(|s| s.as_str()) == Some("success")
+    )
 }
 
 fn is_open_tray_click(button: MouseButton, button_state: MouseButtonState) -> bool {
@@ -1252,6 +1294,26 @@ mod tests {
             MouseButton::Right,
             MouseButtonState::Up
         ));
+    }
+
+    #[test]
+    fn vector_cleanup_is_only_skipped_when_monitor_is_off_and_disabled() {
+        assert!(vector_cleanup_can_be_skipped(false, false));
+        assert!(!vector_cleanup_can_be_skipped(true, false));
+        assert!(!vector_cleanup_can_be_skipped(false, true));
+        assert!(!vector_cleanup_can_be_skipped(true, true));
+    }
+
+    #[test]
+    fn vector_cleanup_requires_explicit_success_ack() {
+        assert!(vector_cleanup_acked(&Ok(
+            serde_json::json!({ "status": "success", "vector_deleted": 3 })
+        )));
+        assert!(!vector_cleanup_acked(&Ok(
+            serde_json::json!({ "error": "vector store unavailable" })
+        )));
+        assert!(!vector_cleanup_acked(&Ok(serde_json::json!({}))));
+        assert!(!vector_cleanup_acked(&Err("Monitor not started".to_string())));
     }
 }
 
