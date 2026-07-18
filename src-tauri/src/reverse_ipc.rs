@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
 use tauri::Manager;
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer};
 use tokio::sync::{mpsc, Semaphore};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
@@ -1303,16 +1303,65 @@ impl NmhPipeServer {
             };
 
             rt.block_on(async move {
+                let wide_pipe_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut first_pipe_instance = true;
+
                 loop {
-                    let server = match ServerOptions::new()
-                        .first_pipe_instance(false)
-                        .create(&pipe_name)
-                    {
-                        Ok(s) => s,
+                    // Apply the same current-user ACL as the storage pipe and
+                    // reject remote clients. Claim first-instance on the
+                    // initial create so a squatted pipe name fails loudly.
+                    let sec_ctx = match get_security_context() {
+                        Ok(ctx) => ctx,
                         Err(e) => {
-                            tracing::error!("Failed to create NMH pipe server: {}", e);
+                            tracing::error!("Failed to get NMH pipe security attributes: {}", e);
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                             continue;
+                        }
+                    };
+
+                    let open_mode = if first_pipe_instance {
+                        PIPE_ACCESS_DUPLEX
+                            | windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED
+                            | windows::Win32::Storage::FileSystem::FILE_FLAG_FIRST_PIPE_INSTANCE
+                    } else {
+                        PIPE_ACCESS_DUPLEX
+                            | windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED
+                    };
+
+                    // SAFETY: the pipe name is NUL-terminated; `sec_ctx` retains the
+                    // security descriptor and ACL backing memory for the entire call.
+                    let handle = unsafe {
+                        windows::Win32::System::Pipes::CreateNamedPipeW(
+                            windows::core::PCWSTR(wide_pipe_name.as_ptr()),
+                            open_mode,
+                            windows::Win32::System::Pipes::PIPE_TYPE_BYTE | windows::Win32::System::Pipes::PIPE_READMODE_BYTE | windows::Win32::System::Pipes::PIPE_WAIT | windows::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS,
+                            windows::Win32::System::Pipes::PIPE_UNLIMITED_INSTANCES,
+                            1024 * 1024,
+                            1024 * 1024,
+                            0,
+                            Some(&sec_ctx.sa),
+                        )
+                    };
+
+                    if handle.is_invalid() {
+                        // SAFETY: `GetLastError` reads thread-local Win32 state and takes
+                        // no pointers or handles.
+                        tracing::error!("Failed to create NMH pipe server: {:?}", unsafe { windows::Win32::Foundation::GetLastError() });
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    first_pipe_instance = false;
+
+                    // SAFETY: `handle` is valid and uniquely owned. On success ownership
+                    // transfers to `NamedPipeServer`; on failure it is closed below.
+                    let server = unsafe {
+                        match NamedPipeServer::from_raw_handle(handle.0) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("Failed to convert raw handle to NMH pipe server: {}", e);
+                                let _ = windows::Win32::Foundation::CloseHandle(handle);
+                                continue;
+                            }
                         }
                     };
 
@@ -1359,6 +1408,18 @@ async fn handle_nmh_client(
     app_handle: tauri::AppHandle,
     expected_token: String,
 ) {
+    // SAFETY: Tokio owns a live pipe handle for the duration of the call and `pid` points
+    // to writable stack storage that Windows fills synchronously.
+    let client_pid = unsafe {
+        let mut pid: u32 = 0;
+        let handle = HANDLE(server.as_raw_handle() as *mut _);
+        if GetNamedPipeClientProcessId(handle, &mut pid).is_ok() {
+            Some(pid)
+        } else {
+            None
+        }
+    };
+
     let buf = match read_ipc_frame(&mut server).await {
         Ok(result) => result,
         Err(e) => {
@@ -1378,12 +1439,13 @@ async fn handle_nmh_client(
         Ok(req) => {
             // Validate auth token
             let provided_token = req.get("auth_token").and_then(|t| t.as_str()).unwrap_or("");
-            if provided_token != expected_token {
+            if !constant_time_eq(provided_token, &expected_token) {
                 tracing::warn!("NMH auth token mismatch");
                 StorageResponse::error("Authentication failed")
             } else {
                 process_nmh_request(
                     &req,
+                    client_pid,
                     storage.clone(),
                     capture_state.clone(),
                     app_handle.clone(),
@@ -1403,6 +1465,7 @@ async fn handle_nmh_client(
 /// Process an NMH request (save_extension_screenshot)
 async fn process_nmh_request(
     req: &serde_json::Value,
+    client_pid: Option<u32>,
     storage: Arc<StorageState>,
     capture_state: Arc<CaptureState>,
     app_handle: tauri::AppHandle,
@@ -1430,6 +1493,21 @@ async fn process_nmh_request(
                 .to_string();
 
             if browser_pid == 0 || nmh_pid == 0 || !cmd_pipe_name.starts_with(NMH_CMD_PIPE_PREFIX) {
+                return StorageResponse::error("Invalid register_nmh request");
+            }
+
+            // The NMH connects to this pipe itself and is spawned by the
+            // browser it claims (directly or via the cmd.exe NM launcher
+            // wrapper), so the caller must sit below the claimed browser PID.
+            let Some(client_pid) = client_pid else {
+                return StorageResponse::error("Cannot verify NMH client process");
+            };
+            if !is_pid_descendant_of(client_pid, browser_pid) {
+                tracing::warn!(
+                    "[SECURITY] register_nmh rejected: client PID {} is not a descendant of claimed browser PID {}",
+                    client_pid,
+                    browser_pid
+                );
                 return StorageResponse::error("Invalid register_nmh request");
             }
 
@@ -1842,11 +1920,30 @@ pub fn find_nmh_session_for_pid(window_pid: u32, process_path: &str) -> Option<N
     select_session(&sessions, window_pid, process_path, is_pid_descendant_of).cloned()
 }
 
+/// Whether any registered NMH session belongs to a process with this
+/// executable name. The game-mode fullscreen exemption uses this so
+/// Chromium forks absent from the hardcoded browser list are still
+/// treated as browsers while an extension session is live. Deliberately
+/// a plain table lookup — no pruning, no per-call syscalls.
+pub fn has_nmh_session_for_exe(process_name: &str) -> bool {
+    if process_name.is_empty() {
+        return false;
+    }
+    let sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    sessions
+        .iter()
+        .any(|s| s.browser_exe_name.eq_ignore_ascii_case(process_name))
+}
+
 /// Request the browser extension behind `session` to capture its current tab.
 /// Opens the session's command pipe and sends a `request_capture` command.
-/// On failure the session is dropped from the table (dead pipe) so the
-/// capture loop falls back to normal screen capture immediately.
+/// The whole round-trip is bounded by a timeout so a wedged NMH (e.g. its
+/// browser is suspended with a full Native Messaging pipe) cannot stall the
+/// capture loop. On failure the session is dropped from the table (dead pipe)
+/// so the capture loop falls back to normal screen capture immediately.
 pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(), String> {
+    const CMD_ROUNDTRIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
     let pipe_name = session.cmd_pipe_name.clone();
 
     tracing::debug!(
@@ -1856,14 +1953,10 @@ pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(
         pipe_name
     );
 
-    // Run blocking pipe I/O on a separate thread
-    let result: Result<(), String> = tokio::task::spawn_blocking(move || {
-        use std::fs::OpenOptions;
-        use std::io::{Read, Write};
+    let round_trip = async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut pipe = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut pipe = ClientOptions::new()
             .open(&pipe_name)
             .map_err(|e| format!("Cannot open NMH cmd pipe: {}", e))?;
 
@@ -1872,15 +1965,15 @@ pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(
             serde_json::to_vec(&request).map_err(|e| format!("Serialization failed: {}", e))?;
 
         pipe.write_all(&data)
+            .await
             .map_err(|e| format!("Pipe write failed: {}", e))?;
-        pipe.flush()
-            .map_err(|e| format!("Pipe flush failed: {}", e))?;
 
         // The NMH replies ok only after successfully forwarding the request
         // to the extension over its Native Messaging port.
         let mut response_buf = vec![0u8; 1024];
         let n = pipe
             .read(&mut response_buf)
+            .await
             .map_err(|e| format!("Pipe read failed: {}", e))?;
         let response: serde_json::Value = serde_json::from_slice(&response_buf[..n])
             .map_err(|e| format!("Invalid NMH cmd response: {}", e))?;
@@ -1893,9 +1986,17 @@ pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(
                 .unwrap_or("NMH reported failure")
                 .to_string())
         }
-    })
-    .await
-    .map_err(|e| format!("Task join failed: {}", e))?;
+    };
+
+    let result: Result<(), String> = match tokio::time::timeout(CMD_ROUNDTRIP_TIMEOUT, round_trip)
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "NMH cmd pipe round-trip timed out after {:?}",
+            CMD_ROUNDTRIP_TIMEOUT
+        )),
+    };
 
     if result.is_err() {
         let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());

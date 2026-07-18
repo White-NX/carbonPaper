@@ -158,8 +158,9 @@ async function captureCurrentTab(retry = 0) {
     const base64Data = dataUrl.split(',')[1];
     if (!base64Data) return;
 
-    // Compute a simple hash to avoid duplicate captures
-    const hash = await computeHash(base64Data.substring(0, 1000)); // Hash first 1KB for speed
+    // Hash the full payload to avoid duplicate captures; a prefix hash would
+    // miss changes below a static page header.
+    const hash = await computeHash(base64Data);
     if (hash === lastCaptureHash) return;
 
     // Get page metadata from content script

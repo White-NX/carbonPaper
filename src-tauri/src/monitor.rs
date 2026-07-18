@@ -2261,8 +2261,11 @@ pub fn start_game_mode_monitor(app: AppHandle) {
 
                 let should_pause = match crate::capture::check_foreground_fullscreen() {
                     Some((process_name, _window_class, true)) if !process_name.is_empty() => {
-                        // Fullscreen detected with known process — pause only if it's NOT a browser
-                        !crate::capture::is_browser_process(&process_name)
+                        // Fullscreen detected with known process — pause only if it's NOT a
+                        // browser (hardcoded list or a live extension NMH session, which
+                        // covers Chromium forks the list doesn't know about)
+                        !(crate::capture::is_browser_process(&process_name)
+                            || crate::reverse_ipc::has_nmh_session_for_exe(&process_name))
                     }
                     Some((process_name, window_class, true)) if process_name.is_empty() => {
                         // Fullscreen but process name unavailable (likely elevated/protected).

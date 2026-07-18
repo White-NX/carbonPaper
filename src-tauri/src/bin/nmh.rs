@@ -708,6 +708,45 @@ fn start_command_pipe_thread(stdout_mutex: Arc<Mutex<io::Stdout>>, cmd_pipe_name
     });
 }
 
+/// Upper bound for a single command-pipe read or write. The pipe has one
+/// instance, so a client that connects but never completes its I/O would
+/// otherwise block every future capture request.
+#[cfg(windows)]
+const CMD_PIPE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run a blocking command-pipe I/O operation, cancelling the pending I/O via
+/// `CancelIoEx` if it does not complete within `timeout`.
+///
+/// The caller must keep the pipe handle open until this function returns (the
+/// watchdog thread is joined before returning, so the handle stays valid for
+/// the cancel call). Cancelling when no I/O is pending is a harmless no-op.
+#[cfg(windows)]
+fn with_pipe_io_timeout<T>(
+    pipe: *mut std::ffi::c_void,
+    timeout: std::time::Duration,
+    op: impl FnOnce() -> T,
+) -> T {
+    extern "system" {
+        fn CancelIoEx(file: *mut std::ffi::c_void, overlapped: *const std::ffi::c_void) -> i32;
+    }
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let pipe_addr = pipe as usize;
+    let watchdog = std::thread::spawn(move || {
+        if done_rx.recv_timeout(timeout).is_err() {
+            // SAFETY: the pipe handle outlives this thread (joined below) and
+            // a null OVERLAPPED cancels all pending I/O on the handle.
+            unsafe {
+                CancelIoEx(pipe_addr as *mut std::ffi::c_void, std::ptr::null());
+            }
+        }
+    });
+    let result = op();
+    let _ = done_tx.send(());
+    let _ = watchdog.join();
+    result
+}
+
 /// Run the synchronous command pipe server loop using Win32 API.
 #[cfg(windows)]
 fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>>) {
@@ -814,12 +853,13 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
             }
         }
 
-        // Read request from the command pipe
+        // Read request from the command pipe, bounded so a client that
+        // connects but never writes cannot wedge the single-instance pipe.
         let mut buf = vec![0u8; 4096];
         let mut bytes_read: u32 = 0;
         // SAFETY: `pipe` is connected and live; `buf` is uniquely writable for its full
         // advertised length and `bytes_read` is valid output storage.
-        let read_ok = unsafe {
+        let read_ok = with_pipe_io_timeout(pipe, CMD_PIPE_IO_TIMEOUT, || unsafe {
             ReadFile(
                 pipe,
                 buf.as_mut_ptr(),
@@ -827,7 +867,7 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
                 &mut bytes_read,
                 ptr::null(),
             )
-        };
+        });
 
         if read_ok != 0 && bytes_read > 0 {
             let request_str = String::from_utf8_lossy(&buf[..bytes_read as usize]);
@@ -863,8 +903,10 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
                     let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
                     let mut written: u32 = 0;
                     // SAFETY: the pipe is connected; the response slice is live for the
-                    // synchronous write and `written` is valid output storage.
-                    unsafe {
+                    // synchronous write and `written` is valid output storage. The flush
+                    // blocks until the client reads the response, so it shares the same
+                    // watchdog bound as the write.
+                    with_pipe_io_timeout(pipe, CMD_PIPE_IO_TIMEOUT, || unsafe {
                         WriteFile(
                             pipe,
                             response_bytes.as_ptr(),
@@ -873,7 +915,7 @@ fn run_command_pipe_server(pipe_name: &str, stdout_mutex: &Arc<Mutex<io::Stdout>
                             ptr::null(),
                         );
                         FlushFileBuffers(pipe);
-                    }
+                    });
                 }
             }
         }
