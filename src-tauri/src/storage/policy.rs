@@ -1,5 +1,6 @@
 //! Storage policy save/load operations.
 
+use chrono::{Duration, Utc};
 use serde_json::Value as JsonValue;
 use std::path::Path;
 use sysinfo::Disks;
@@ -42,6 +43,30 @@ fn parse_storage_limit_bytes(policy: &JsonValue) -> Option<u64> {
     }
 
     Some(gb.saturating_mul(GIB))
+}
+
+/// Resolve `retention_period` to a UTC cutoff datetime string
+/// (`%Y-%m-%d %H:%M:%S`, matching the `created_at` column). Snapshots created
+/// strictly before this value are considered expired. Returns `None` for
+/// `permanent`, empty, or unrecognized values (retention disabled).
+fn parse_retention_cutoff(policy: &JsonValue) -> Option<String> {
+    let key = match policy.get("retention_period")? {
+        JsonValue::String(v) => v.trim().to_ascii_lowercase(),
+        _ => return None,
+    };
+
+    // Fixed-length day approximations; a retention policy does not need
+    // calendar-exact month boundaries.
+    let days = match key.as_str() {
+        "1month" => 30,
+        "6months" => 180,
+        "1year" => 365,
+        "2years" => 730,
+        _ => return None,
+    };
+
+    let cutoff = Utc::now() - Duration::days(days);
+    Some(cutoff.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
 fn disk_totals_for_path(path: &Path) -> Option<(u64, u64)> {
@@ -116,8 +141,10 @@ impl StorageState {
     /// Enforce snapshot storage policy once.
     ///
     /// Policy includes:
-    /// 1) User snapshot cap (`storage_limit` in GB): prune oldest snapshots beyond cap.
-    /// 2) Disk pressure fallback: if free space gets too low, prune to a safe free-space value.
+    /// 1) Retention (`retention_period`): prune snapshots older than the
+    ///    configured age (1 month / 6 months / 1 year / 2 years).
+    /// 2) User snapshot cap (`storage_limit` in GB): prune oldest snapshots beyond cap.
+    /// 3) Disk pressure fallback: if free space gets too low, prune to a safe free-space value.
     ///
     /// Returns a summary string when pruning is enqueued, otherwise `None`.
     pub fn enforce_snapshot_storage_policy_once(&self) -> Result<Option<String>, String> {
@@ -134,22 +161,48 @@ impl StorageState {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
+        let mut reasons: Vec<String> = Vec::new();
+        let mut total_marked = 0i64;
+
+        // 1) Age-based retention. Snapshots older than the cutoff are pruned
+        //    regardless of how much space they occupy.
+        let mut retention_freed_bytes = 0u64;
+        if let Some(cutoff_dt) = parse_retention_cutoff(&policy) {
+            let (candidate_ids, freed_bytes) = self
+                .select_screenshots_created_before(&cutoff_dt, MAX_POLICY_DELETE_CANDIDATES_PER_RUN)?;
+            if !candidate_ids.is_empty() {
+                let result = self.soft_delete_screenshots(&candidate_ids)?;
+                if result.screenshots_marked > 0 {
+                    total_marked += result.screenshots_marked;
+                    retention_freed_bytes = freed_bytes;
+                    reasons.push(format!(
+                        "retention_expired(cutoff={}, queued={}, freed~={} bytes)",
+                        cutoff_dt, result.screenshots_marked, freed_bytes
+                    ));
+                }
+            }
+        }
+
+        // 2) + 3) Size-based reclaim (user cap and disk-pressure fallback).
         let current_images_bytes = if screenshot_dir.exists() {
             directory_size(&screenshot_dir)
         } else {
             0
         };
+        // Retention deletions above are queued but not yet unlinked, so their
+        // bytes still count in `directory_size`. Discount them so the cap pass
+        // does not double-count space that is already being reclaimed.
+        let effective_images_bytes = current_images_bytes.saturating_sub(retention_freed_bytes);
 
         let mut required_reclaim_bytes = 0u64;
-        let mut reasons: Vec<String> = Vec::new();
 
         if let Some(limit_bytes) = parse_storage_limit_bytes(&policy) {
-            if current_images_bytes > limit_bytes {
-                let exceed = current_images_bytes.saturating_sub(limit_bytes);
+            if effective_images_bytes > limit_bytes {
+                let exceed = effective_images_bytes.saturating_sub(limit_bytes);
                 required_reclaim_bytes = required_reclaim_bytes.max(exceed);
                 reasons.push(format!(
                     "policy_cap_exceeded(current={}, cap={}, exceed={})",
-                    current_images_bytes, limit_bytes, exceed
+                    effective_images_bytes, limit_bytes, exceed
                 ));
             }
         }
@@ -178,30 +231,95 @@ impl StorageState {
             }
         }
 
-        if required_reclaim_bytes == 0 {
-            return Ok(None);
+        if required_reclaim_bytes > 0 {
+            let (candidate_ids, estimated_reclaim_bytes) = self
+                .select_oldest_screenshots_for_reclaim(
+                    required_reclaim_bytes,
+                    MAX_POLICY_DELETE_CANDIDATES_PER_RUN,
+                )?;
+            if !candidate_ids.is_empty() {
+                let result = self.soft_delete_screenshots(&candidate_ids)?;
+                if result.screenshots_marked > 0 {
+                    total_marked += result.screenshots_marked;
+                    reasons.push(format!(
+                        "cap_reclaim(queued={}, estimated_reclaim={} bytes, target_reclaim={} bytes)",
+                        result.screenshots_marked, estimated_reclaim_bytes, required_reclaim_bytes
+                    ));
+                }
+            }
         }
 
-        let (candidate_ids, estimated_reclaim_bytes) = self.select_oldest_screenshots_for_reclaim(
-            required_reclaim_bytes,
-            MAX_POLICY_DELETE_CANDIDATES_PER_RUN,
-        )?;
-
-        if candidate_ids.is_empty() {
-            return Ok(None);
-        }
-
-        let result = self.soft_delete_screenshots(&candidate_ids)?;
-        if result.screenshots_marked <= 0 {
+        if total_marked == 0 {
             return Ok(None);
         }
 
         Ok(Some(format!(
-            "queued {} screenshots (estimated_reclaim={} bytes, target_reclaim={} bytes, reasons={})",
-            result.screenshots_marked,
-            estimated_reclaim_bytes,
-            required_reclaim_bytes,
+            "queued {} screenshots ({})",
+            total_marked,
             reasons.join("; ")
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_retention_cutoff;
+    use chrono::{Duration, NaiveDateTime, Utc};
+    use serde_json::json;
+
+    const FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+    fn cutoff_for(period: &str) -> String {
+        parse_retention_cutoff(&json!({ "retention_period": period }))
+            .unwrap_or_else(|| panic!("expected a cutoff for {period}"))
+    }
+
+    #[test]
+    fn permanent_and_unknown_disable_retention() {
+        assert!(parse_retention_cutoff(&json!({ "retention_period": "permanent" })).is_none());
+        assert!(parse_retention_cutoff(&json!({ "retention_period": "" })).is_none());
+        assert!(parse_retention_cutoff(&json!({ "retention_period": "forever" })).is_none());
+        // Non-string values and a missing key both mean "no retention".
+        assert!(parse_retention_cutoff(&json!({ "retention_period": 30 })).is_none());
+        assert!(parse_retention_cutoff(&json!({})).is_none());
+    }
+
+    #[test]
+    fn known_periods_produce_parseable_cutoffs() {
+        for period in ["1month", "6months", "1year", "2years"] {
+            let cutoff = cutoff_for(period);
+            assert_eq!(cutoff.len(), 19, "unexpected format for {period}: {cutoff}");
+            NaiveDateTime::parse_from_str(&cutoff, FORMAT)
+                .unwrap_or_else(|e| panic!("cutoff for {period} not in `{FORMAT}`: {e}"));
+        }
+    }
+
+    #[test]
+    fn period_key_is_trimmed_and_case_insensitive() {
+        assert!(parse_retention_cutoff(&json!({ "retention_period": "1Month" })).is_some());
+        assert!(parse_retention_cutoff(&json!({ "retention_period": " 1YEAR " })).is_some());
+    }
+
+    #[test]
+    fn longer_retention_yields_earlier_cutoff() {
+        // The datetime string sorts lexicographically, so a longer retention
+        // window must produce a smaller (earlier) cutoff string.
+        let one_month = cutoff_for("1month");
+        let six_months = cutoff_for("6months");
+        let one_year = cutoff_for("1year");
+        let two_years = cutoff_for("2years");
+        assert!(two_years < one_year);
+        assert!(one_year < six_months);
+        assert!(six_months < one_month);
+    }
+
+    #[test]
+    fn cutoff_matches_expected_day_offset() {
+        for (period, days) in [("1month", 30), ("6months", 180), ("1year", 365), ("2years", 730)] {
+            let cutoff = NaiveDateTime::parse_from_str(&cutoff_for(period), FORMAT).unwrap();
+            let expected = (Utc::now() - Duration::days(days)).naive_utc();
+            let skew = (expected - cutoff).num_seconds().abs();
+            assert!(skew <= 5, "{period}: cutoff off by {skew}s");
+        }
     }
 }

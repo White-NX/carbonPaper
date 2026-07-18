@@ -2452,6 +2452,67 @@ impl StorageState {
         Ok((selected_ids, estimated_reclaim_bytes))
     }
 
+    /// Select up to `max_candidates` non-deleted screenshots created strictly
+    /// before `cutoff_dt` (UTC `%Y-%m-%d %H:%M:%S`, matching `created_at`),
+    /// oldest first, for age-based retention pruning.
+    ///
+    /// Returns `(ids, estimated_freed_bytes)`. Unlike the reclaim selector this
+    /// has no byte target — every row older than the cutoff is a candidate — and
+    /// rows whose files are already gone are still returned so their database
+    /// entries get cleared.
+    pub fn select_screenshots_created_before(
+        &self,
+        cutoff_dt: &str,
+        max_candidates: i64,
+    ) -> Result<(Vec<i64>, u64), String> {
+        if max_candidates <= 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let safe_limit = max_candidates.clamp(1, 20_000);
+
+        let rows: Vec<(i64, String)> = {
+            let guard = self.get_connection_named("select_screenshots_created_before")?;
+            let conn = guard.as_ref().unwrap();
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, image_path
+                     FROM screenshots
+                     WHERE is_deleted = 0 AND created_at < ?1
+                     ORDER BY created_at ASC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("Failed to prepare retention candidate query: {}", e))?;
+
+            let rows: Vec<(i64, String)> = stmt
+                .query_map(params![cutoff_dt, safe_limit], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|e| format!("Failed to load retention candidates: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            rows
+        };
+
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut estimated_freed_bytes = 0u64;
+
+        for (id, image_path) in rows {
+            let abs_path = self.resolve_image_path(&image_path);
+            let image_bytes = std::fs::metadata(&abs_path).map(|m| m.len()).unwrap_or(0);
+            let thumb_path = Self::thumbnail_path_for(&abs_path);
+            let thumb_bytes = std::fs::metadata(&thumb_path).map(|m| m.len()).unwrap_or(0);
+            estimated_freed_bytes = estimated_freed_bytes
+                .saturating_add(image_bytes)
+                .saturating_add(thumb_bytes);
+            ids.push(id);
+        }
+
+        Ok((ids, estimated_freed_bytes))
+    }
+
     /// Fetch pending counts in delete queues.
     pub fn get_delete_queue_status(&self) -> Result<DeleteQueueStatus, String> {
         let guard = self.get_connection_named("get_delete_queue_status")?;
