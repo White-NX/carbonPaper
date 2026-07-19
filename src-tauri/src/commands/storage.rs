@@ -103,7 +103,7 @@ fn compose_index_health_response(
         .as_ref()
         .and_then(|value| value.get("worker_storage_ipc"))
         .cloned();
-    let vector_rows_count = vector_stats
+    let actual_clip_image_rows = vector_stats
         .as_ref()
         .and_then(|stats| value_as_i64(stats.get("count")));
     let pending_retry_queue_count = postprocess
@@ -130,11 +130,40 @@ fn compose_index_health_response(
         })
         .unwrap_or(serde_json::Value::Null);
 
+    // Count-level CLIP image-index check (Milestone 1): compares the
+    // SQLite-derived eligibility estimate against the live Python Chroma
+    // `screenshots` collection count. This is not a per-row or vector-quality
+    // check; equal counts can still hide missing/orphan swaps.
+    let clip_image_index = match actual_clip_image_rows {
+        Some(actual) => {
+            let expected = storage_stats.expected_clip_image_rows;
+            let missing = (expected - actual).max(0);
+            let orphaned = (actual - expected).max(0);
+            serde_json::json!({
+                "expected_eligible_images": expected,
+                "actual_rows": actual,
+                "missing_lower_bound": missing,
+                "orphaned_lower_bound": orphaned,
+                "assessment": if missing == 0 && orphaned == 0 { "count_match" } else { "count_mismatch" },
+                "eligibility": "active screenshot with active OCR row",
+                "eligibility_is_proxy": true,
+            })
+        }
+        None => serde_json::json!({
+            "expected_eligible_images": storage_stats.expected_clip_image_rows,
+            "actual_rows": serde_json::Value::Null,
+            "assessment": "unknown",
+            "eligibility": "active screenshot with active OCR row",
+            "eligibility_is_proxy": true,
+        }),
+    };
+
     serde_json::json!({
         "status": "success",
         "screenshots_count": storage_stats.screenshots_count,
         "ocr_rows_count": storage_stats.ocr_rows_count,
-        "vector_rows_count": vector_rows_count,
+        "vector_rows_count": actual_clip_image_rows,
+        "clip_image_index": clip_image_index,
         "pending_retry_queue_count": pending_retry_queue_count,
         "smart_cluster_pending_count": storage_stats.smart_cluster_pending_count,
         "delete_queue": storage_stats.delete_queue,
@@ -209,6 +238,7 @@ mod tests {
         let storage_stats = IndexStorageStats {
             screenshots_count: 10,
             ocr_rows_count: 12,
+            expected_clip_image_rows: 9,
             smart_cluster_pending_count: 3,
             delete_queue: DeleteQueueStatus {
                 pending_screenshots: 1,
@@ -232,9 +262,42 @@ mod tests {
         assert_eq!(response["screenshots_count"], 10);
         assert_eq!(response["ocr_rows_count"], 12);
         assert_eq!(response["vector_rows_count"], 9);
+        assert_eq!(response["clip_image_index"]["actual_rows"], 9);
+        assert_eq!(response["clip_image_index"]["expected_eligible_images"], 9);
+        assert_eq!(response["clip_image_index"]["assessment"], "count_match");
+        assert_eq!(response["clip_image_index"]["missing_lower_bound"], 0);
         assert_eq!(response["pending_retry_queue_count"], 4);
         assert_eq!(response["monitor_available"], true);
         assert_eq!(response["last_indexing_error"], "chroma down");
+    }
+
+    #[test]
+    fn compose_index_health_response_reports_clip_image_count_mismatch() {
+        let storage_stats = IndexStorageStats {
+            screenshots_count: 20,
+            ocr_rows_count: 40,
+            expected_clip_image_rows: 15,
+            smart_cluster_pending_count: 0,
+            delete_queue: DeleteQueueStatus {
+                pending_screenshots: 0,
+                pending_ocr: 0,
+                running: false,
+            },
+        };
+        let monitor_health = Ok(json!({
+            "status": "success",
+            "worker_started": true,
+            "stats": { "vector_stats": { "count": 9 } },
+            "postprocess": {}
+        }));
+
+        let response = compose_index_health_response(storage_stats, monitor_health);
+
+        assert_eq!(response["clip_image_index"]["assessment"], "count_mismatch");
+        assert_eq!(response["clip_image_index"]["expected_eligible_images"], 15);
+        assert_eq!(response["clip_image_index"]["actual_rows"], 9);
+        assert_eq!(response["clip_image_index"]["missing_lower_bound"], 6);
+        assert_eq!(response["clip_image_index"]["orphaned_lower_bound"], 0);
     }
 
     #[test]
@@ -242,6 +305,7 @@ mod tests {
         let storage_stats = IndexStorageStats {
             screenshots_count: 10,
             ocr_rows_count: 12,
+            expected_clip_image_rows: 9,
             smart_cluster_pending_count: 3,
             delete_queue: DeleteQueueStatus {
                 pending_screenshots: 1,
@@ -255,6 +319,12 @@ mod tests {
 
         assert_eq!(response["screenshots_count"], 10);
         assert_eq!(response["vector_rows_count"], serde_json::Value::Null);
+        assert_eq!(response["clip_image_index"]["assessment"], "unknown");
+        assert_eq!(response["clip_image_index"]["expected_eligible_images"], 9);
+        assert_eq!(
+            response["clip_image_index"]["actual_rows"],
+            serde_json::Value::Null
+        );
         assert_eq!(response["monitor_available"], false);
         assert_eq!(response["monitor_error"], "Monitor not started");
     }

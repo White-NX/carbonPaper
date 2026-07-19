@@ -1261,10 +1261,37 @@ impl StorageState {
         .map_err(|e| format!("Failed to count active OCR rows: {}", e))
     }
 
+    /// Estimated expected row count for the derived CLIP image index.
+    ///
+    /// Semantics (Milestone 1): a vector row is expected for every DISTINCT
+    /// `image_hash` among non-deleted screenshots that have at least one
+    /// active OCR row. Distinct-hash because the vector collection is keyed by
+    /// image hash, so duplicate captures share one row. OCR-row existence is a
+    /// stable migration-baseline proxy; Milestone 2 replaces it with a
+    /// first-party per-row ledger.
+    pub fn count_expected_clip_image_rows(&self) -> Result<i64, String> {
+        let guard = self.get_connection_named("count_expected_clip_image_rows")?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
+        conn.query_row(
+            "SELECT COUNT(DISTINCT s.image_hash) FROM screenshots s
+             WHERE s.is_deleted = 0
+               AND EXISTS (
+                   SELECT 1 FROM ocr_results o
+                    WHERE o.screenshot_id = s.id AND o.is_deleted = 0
+               )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("Failed to count expected CLIP image rows: {}", e))
+    }
+
     pub fn get_index_storage_stats(&self) -> Result<IndexStorageStats, String> {
         Ok(IndexStorageStats {
             screenshots_count: self.count_active_screenshots()?,
             ocr_rows_count: self.count_active_ocr_rows()?,
+            expected_clip_image_rows: self.count_expected_clip_image_rows()?,
             smart_cluster_pending_count: self.count_smart_cluster_pending()?,
             delete_queue: self.get_delete_queue_status()?,
         })
@@ -2957,6 +2984,42 @@ mod ocr_lifecycle_tests {
         assert_eq!(ocr_postprocess_retry_decision(3), ("pending", Some(300), 4));
         assert_eq!(ocr_postprocess_retry_decision(4), ("failed", None, 5));
         assert_eq!(ocr_postprocess_retry_decision(99), ("failed", None, 100));
+    }
+
+    #[test]
+    fn expected_clip_images_are_not_counted_per_ocr_row() {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE screenshots (
+                    id INTEGER PRIMARY KEY,
+                    image_hash TEXT NOT NULL,
+                    is_deleted INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE ocr_results (
+                    screenshot_id INTEGER NOT NULL,
+                    is_deleted INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO screenshots (id, image_hash, is_deleted) VALUES
+                    (1, 'h1', 0),
+                    (2, 'h1', 0),
+                    (3, 'h2', 0),
+                    (4, 'h3', 0),
+                    (5, 'h4', 1),
+                    (6, 'h5', 0);
+                 INSERT INTO ocr_results (screenshot_id, is_deleted) VALUES
+                    (1, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0);
+                 ",
+            )
+            .expect("CLIP eligibility fixture");
+        *storage.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection);
+
+        // h1 is one image vector despite three OCR rows; h2/h3 each contribute
+        // one; h4 is deleted; h5 has no OCR row.
+        assert_eq!(storage.count_expected_clip_image_rows().unwrap(), 3);
     }
 
     #[test]
