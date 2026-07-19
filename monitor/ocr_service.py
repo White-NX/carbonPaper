@@ -35,7 +35,7 @@ def _parse_ocr_idle_unload_secs(raw_value: Optional[str]) -> float:
     return max(30.0, value)
 
 from ocr_engine import OCREngine, get_ocr_engine
-from vector_store import VectorStore
+from vector_store import DEFAULT_CLIP_MIN_SIMILARITY, VectorStore
 from storage_client import StorageClient, get_storage_client, init_storage_client
 
 
@@ -177,7 +177,11 @@ class OCRService:
         fetch_count = max(target_count * buffer_multiplier, target_count + 20)
 
         _t0 = _time.perf_counter()
-        raw_results = self.vector_store.search_by_text(query, n_results=fetch_count)
+        raw_results = self.vector_store.search_by_text(
+            query,
+            n_results=fetch_count,
+            min_similarity=DEFAULT_CLIP_MIN_SIMILARITY,
+        )
         _t_vector_search = _time.perf_counter() - _t0
 
         filtered: List[Dict[str, Any]] = []

@@ -14,6 +14,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CLIP_MIN_SIMILARITY = 0.32
+
 # Lazy import to avoid slow startup
 _clip_instance = None
 
@@ -1108,7 +1110,7 @@ class VectorStore:
         self,
         query: str,
         n_results: int = 10,
-        min_similarity: float = 0.32
+        min_similarity: float = DEFAULT_CLIP_MIN_SIMILARITY
     ) -> List[Dict[str, Any]]:
         """
         Search images using natural language.

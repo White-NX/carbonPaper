@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "target_release": "v0.8.4-beta",
+  "clip": {
+    "preprocessor": {
+      "image_size": 224,
+      "image_mean": [0.48145466, 0.4578275, 0.40821073],
+      "image_std": [0.26862954, 0.26130258, 0.27577711],
+      "rescale_factor": 0.00392156862745098,
+      "resize": "square_bicubic",
+      "convert": "rgb"
+    },
+    "texts": [
+      {"id": "visual_zh", "text": "海边日落与蓝色天空"},
+      {"id": "visual_mixed", "text": "VS Code 中的 Rust 编译错误"}
+    ],
+    "images": [
+      {"id": "rgb_gradient", "kind": "rgb_gradient", "width": 37, "height": 23},
+      {"id": "checkerboard", "kind": "checkerboard", "width": 29, "height": 41, "cell": 5}
+    ]
+  },
+  "minilm": {
+    "max_length": 256,
+    "pooling": "attention_mask_mean",
+    "normalization": "l2",
+    "cases": [
+      {
+        "id": "editor_build",
+        "process_name": "Code.exe",
+        "window_title": "carbonPaper — storage.rs",
+        "ocr_text": "Compiling carbonpaper 0.8.4 beta finished with one warning."
+      },
+      {
+        "id": "browser_research",
+        "process_name": "chrome.exe",
+        "window_title": "向量索引迁移方案",
+        "ocr_text": "比较 Python 与 Rust 的语义搜索排序，确保旧截图和新截图均可检索。"
+      },
+      {
+        "id": "ocr_truncation",
+        "process_name": "notes.exe",
+        "window_title": "OCR 截断契约",
+        "ocr_text": "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ这是用于验证 OCR 文本只取前两百个字符的非敏感固定样本。重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容重复内容TAIL_MARKER_SHOULD_NOT_APPEAR"
+      }
+    ]
+  },
+  "bge": {
+    "max_length": 512,
+    "pooling": "cls",
+    "normalization": "l2",
+    "texts": [
+      {"id": "classification_work", "text": "代码编辑器正在编译 Rust 项目"},
+      {"id": "classification_media", "text": "视频播放器正在播放自然纪录片"}
+    ]
+  },
+  "reranker": {
+    "variant": "uint8",
+    "max_length": 512,
+    "score": "raw_logit",
+    "query": "修复 Rust 向量索引迁移错误",
+    "documents": [
+      {"id": "relevant", "text": "Code.exe | storage.rs | Rust migration failed while writing the derived vector index"},
+      {"id": "partial", "text": "浏览器中打开了一篇介绍向量数据库的文章"},
+      {"id": "irrelevant", "text": "视频播放器正在播放海边日落"}
+    ]
+  },
+  "search_contract": {
+    "clip_vector_search": {
+      "query": "海边风景",
+      "n_results": 3,
+      "min_similarity": 0.32,
+      "rows": [
+        {
+          "id": "above-threshold",
+          "distance": 0.67,
+          "document": "visible result",
+          "metadata": {"image_path": "memory://hash-a", "process_name": "photos.exe"}
+        },
+        {
+          "id": "below-threshold",
+          "distance": 0.69,
+          "document": "filtered result",
+          "metadata": {"image_path": "memory://hash-b", "process_name": "photos.exe"}
+        }
+      ]
+    },
+    "cases": [
+      {
+        "id": "process_filter_and_pagination",
+        "query": "开发工作",
+        "n_results": 2,
+        "offset": 1,
+        "process_names": ["chrome.exe"],
+        "start_time": null,
+        "end_time": null,
+        "raw_results": [
+          {
+            "id": "row-a",
+            "metadata": {"process_name": "chrome.exe", "created_at": "2026-07-19 09:00:00"},
+            "ocr_text": "first",
+            "distance": 0.05,
+            "similarity": 0.95
+          },
+          {
+            "id": "row-b",
+            "metadata": {"process_name": "code.exe", "created_at": "2026-07-19 09:01:00"},
+            "ocr_text": "filtered process",
+            "distance": 0.10,
+            "similarity": 0.90
+          },
+          {
+            "id": "row-c",
+            "metadata": {"process_name": "chrome.exe", "screenshot_created_at": "2026-07-19 09:02:00"},
+            "ocr_text": "second chrome",
+            "distance": 0.15,
+            "similarity": 0.85
+          },
+          {
+            "id": "row-d",
+            "metadata": {"process_name": "chrome.exe"},
+            "ocr_text": "third chrome without timestamp",
+            "distance": 0.20,
+            "similarity": 0.80
+          }
+        ]
+      },
+      {
+        "id": "time_filter_keeps_unknown_timestamp",
+        "query": "时间过滤",
+        "n_results": 10,
+        "offset": 0,
+        "process_names": null,
+        "start_time": 4102444800,
+        "end_time": null,
+        "raw_results": [
+          {
+            "id": "dated-old",
+            "metadata": {"process_name": "code.exe", "created_at": "2026-07-19 09:00:00"},
+            "ocr_text": "parsed timestamp is filtered",
+            "distance": 0.10,
+            "similarity": 0.90
+          },
+          {
+            "id": "undated",
+            "metadata": {"process_name": "notes.exe"},
+            "ocr_text": "unknown timestamp currently passes the filter",
+            "distance": 0.20,
+            "similarity": 0.80
+          }
+        ]
+      }
+    ]
+  }
+}
