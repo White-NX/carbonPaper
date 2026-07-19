@@ -8,7 +8,9 @@ onnxruntime-directml==1.24.2
 
 transformers>=4.30.0
 torch
-chromadb>=0.4.0
+# Pinned: ChromaDB on-disk format is not stable across major versions and the
+# vector store is treated as a rebuildable cache keyed to this exact version.
+chromadb==1.5.1
 
 numpy<2.0.0
 

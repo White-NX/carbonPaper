@@ -379,6 +379,10 @@ pub struct DeleteQueueStatus {
 pub struct IndexStorageStats {
     pub screenshots_count: i64,
     pub ocr_rows_count: i64,
+    /// Distinct image hashes estimated to be eligible for one CLIP image row
+    /// (non-deleted screenshots with at least one active OCR row). This is a
+    /// stable migration proxy, not an OCR-row count or a per-row health proof.
+    pub expected_clip_image_rows: i64,
     pub smart_cluster_pending_count: i64,
     pub delete_queue: DeleteQueueStatus,
 }
