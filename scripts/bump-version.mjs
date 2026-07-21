@@ -23,6 +23,8 @@ const filePaths = {
   packageLock: path.join(cwd, 'package-lock.json'),
   tauriConfig: path.join(cwd, 'src-tauri', 'tauri.conf.json'),
   cargoToml: path.join(cwd, 'src-tauri', 'Cargo.toml'),
+  // 独立 crate：worker 通过 CARGO_PKG_VERSION 上报版本，漏掉会导致运行时版本漂移
+  semanticWorkerCargoToml: path.join(cwd, 'src-tauri', 'semantic-worker', 'Cargo.toml'),
   appVersionJs: path.join(cwd, 'src', 'lib', 'version.js')
 };
 
@@ -62,7 +64,7 @@ await updateJsonFile(filePaths.tauriConfig, (data) => {
   return data;
 });
 
-await updateTextFile(filePaths.cargoToml, (raw) => {
+const updateCargoPackageVersion = (raw, filePath) => {
   const lines = raw.split(/\r?\n/);
   let inPackage = false;
   let updated = false;
@@ -82,11 +84,18 @@ await updateTextFile(filePaths.cargoToml, (raw) => {
   });
 
   if (!updated) {
-    throw new Error('未在 Cargo.toml 的 [package] 中找到 version 字段');
+    throw new Error(`未在 ${path.relative(cwd, filePath)} 的 [package] 中找到 version 字段`);
   }
 
   return nextLines.join('\n');
-});
+};
+
+await updateTextFile(filePaths.cargoToml, (raw) => updateCargoPackageVersion(raw, filePaths.cargoToml));
+
+await updateTextFile(
+  filePaths.semanticWorkerCargoToml,
+  (raw) => updateCargoPackageVersion(raw, filePaths.semanticWorkerCargoToml)
+);
 
 await updateTextFile(filePaths.appVersionJs, (raw) => {
   const next = raw.replace(/export const APP_VERSION = ['"][^'"]+['"];?/, `export const APP_VERSION = '${appVersion}';`);

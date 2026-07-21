@@ -1,0 +1,38 @@
+{
+  "version": "1.24.2",
+  "bundle_path": "onnxruntime/1.24.2",
+  "packages": [
+    {
+      "name": "Microsoft.ML.OnnxRuntime.DirectML 1.24.2",
+      "url": "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.24.2",
+      "archive_sha256": "c9b8adb96dfb5578097bea42a7d9b7ff8f300fb3c3a6f3052fe5b702628ab681",
+      "files": [
+        {
+          "source": "runtimes/win-x64/native/onnxruntime.dll",
+          "name": "onnxruntime.dll",
+          "size": 17270304,
+          "sha256": "a2323bc49544645b911743052f1edce594e17df1e3423b71468c7386bc902f80"
+        },
+        {
+          "source": "runtimes/win-x64/native/onnxruntime_providers_shared.dll",
+          "name": "onnxruntime_providers_shared.dll",
+          "size": 22048,
+          "sha256": "8b33b30ac866c938aa3d946d4f92fc2ba70fff06ef45d5ce22e483f19ba2c896"
+        }
+      ]
+    },
+    {
+      "name": "Microsoft.AI.DirectML 1.15.4",
+      "url": "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.15.4",
+      "archive_sha256": "4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9",
+      "files": [
+        {
+          "source": "bin/x64-win/DirectML.dll",
+          "name": "DirectML.dll",
+          "size": 18527776,
+          "sha256": "9c9e6d822561c6c41b90e6994b3e8857cf1d66dbfb1e0c4c799c7c89b4e92da1"
+        }
+      ]
+    }
+  ]
+}

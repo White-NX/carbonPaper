@@ -60,6 +60,10 @@ if (existsSync(preBundleDir)) {
 const requiredPortableEntries = [
   'carbonpaper-ml.exe',
   'carbonpaper-nmh.exe',
+  'carbonpaper-semantic-worker.exe',
+  'onnxruntime/1.24.2/onnxruntime.dll',
+  'onnxruntime/1.24.2/onnxruntime_providers_shared.dll',
+  'onnxruntime/1.24.2/DirectML.dll',
   'ocr-models/ppocrv5-ch-mobile-r1/ch_PP-OCRv5_det_mobile.onnx',
   'ocr-models/ppocrv5-ch-mobile-r1/ch_PP-OCRv5_rec_mobile.onnx',
   'ocr-models/ppocrv5-ch-mobile-r1/ppocrv5_dict.txt',
