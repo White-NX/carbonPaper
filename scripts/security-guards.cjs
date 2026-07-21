@@ -172,6 +172,8 @@ const COMMAND_TIERS = {
   'ml_runtime::download_rust_ocr_model': 'bootstrap_policy',
   'ml_runtime::take_ocr_model_repair_request': 'public',
   'ml_runtime::debug_trigger_ocr_model_repair_notification': 'session_required',
+  'semantic_runtime::get_ml_semantic_status': 'public',
+  'semantic_runtime::restart_ml_semantic_worker': 'runtime_public',
 };
 
 function read(file) {
@@ -292,6 +294,7 @@ function checkRuntimeControlInvariants() {
     'monitor::stop_monitor',
     'monitor::pause_monitor',
     'monitor::resume_monitor',
+    'semantic_runtime::restart_ml_semantic_worker',
   ];
   for (const command of runtimeCommands) {
     const body = commandFunctionBody(command);
@@ -305,10 +308,10 @@ function checkRuntimeControlInvariants() {
 
   const interactiveAuthRuntimeCalls = walk(path.join(ROOT, 'src'))
     .filter((file) => /\.(js|jsx|ts|tsx)$/.test(file))
-    .filter((file) => /withAuth\s*\(\s*\(\)\s*=>\s*invoke\(['"](?:start_monitor|stop_monitor|pause_monitor|resume_monitor)['"]/.test(fs.readFileSync(file, 'utf8')))
+    .filter((file) => /withAuth\s*\(\s*\(\)\s*=>\s*invoke\(['"](?:start_monitor|stop_monitor|pause_monitor|resume_monitor|restart_ml_semantic_worker)['"]/.test(fs.readFileSync(file, 'utf8')))
     .map((file) => path.relative(ROOT, file));
   if (interactiveAuthRuntimeCalls.length) {
-    throw new Error(`Monitor runtime controls must not request interactive authentication:\n${interactiveAuthRuntimeCalls.join('\n')}`);
+    throw new Error(`Runtime controls must not request interactive authentication:\n${interactiveAuthRuntimeCalls.join('\n')}`);
   }
 
   const credentials = read('src-tauri/src/credential_manager.rs');

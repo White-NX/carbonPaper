@@ -94,7 +94,7 @@ fn run() -> Result<(), String> {
             protocol_version: ML_PROTOCOL_VERSION,
             worker_version: env!("CARGO_PKG_VERSION").to_string(),
             rapidocr_core_version: "0.2.2".to_string(),
-            provider: provider.clone(),
+            provider,
             model_id: MODEL_ID.to_string(),
         },
     )?;
@@ -199,6 +199,16 @@ fn run() -> Result<(), String> {
                         )?;
                     }
                 }
+            }
+            other => {
+                write_response(
+                    &mut writer,
+                    &MlResponse::Error {
+                        request_id: other.request_id(),
+                        kind: "invalid_request".to_string(),
+                        message: "semantic request was sent to the OCR worker".to_string(),
+                    },
+                )?;
             }
         }
     }

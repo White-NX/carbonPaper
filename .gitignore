@@ -47,6 +47,7 @@ tools/disk-wear-runs/
 /aria2c.exe
 /python-3.12.10-amd64.exe
 /.release-assets/
+/src-tauri/semantic-worker/target/
 
 # Artificial Intelligence
 CLAUDE.md

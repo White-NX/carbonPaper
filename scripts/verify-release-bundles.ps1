@@ -18,6 +18,7 @@ $bundleDir = Join-Path $RootDir "src-tauri\target\release\bundle\nsis"
 $portableZip = Join-Path $bundleDir "carbonpaper_${version}_x64_portable.zip"
 $installer = Join-Path $bundleDir "carbonpaper_${version}_x64-setup.exe"
 $manifest = Get-Content -LiteralPath (Join-Path $RootDir "scripts\release-assets\ocr-models.json") -Raw | ConvertFrom-Json
+$semanticManifest = Get-Content -LiteralPath (Join-Path $RootDir "scripts\release-assets\onnxruntime-directml.json") -Raw | ConvertFrom-Json
 
 function Get-StreamSha256 {
     param([Parameter(Mandatory = $true)][System.IO.Stream]$Stream)
@@ -48,7 +49,7 @@ try {
     if ($duplicates) {
         throw "Portable bundle contains duplicate entries: $($duplicates.Name -join ', ')"
     }
-    foreach ($required in @("carbonpaper.exe", "carbonpaper-ml.exe", "carbonpaper-nmh.exe")) {
+    foreach ($required in @("carbonpaper.exe", "carbonpaper-ml.exe", "carbonpaper-nmh.exe", "carbonpaper-semantic-worker.exe")) {
         if (-not $archive.GetEntry($required)) {
             throw "Portable bundle is missing $required"
         }
@@ -72,6 +73,27 @@ try {
             throw "Portable bundle asset checksum mismatch for $entryName"
         }
     }
+    foreach ($package in $semanticManifest.packages) {
+        foreach ($asset in $package.files) {
+            $entryName = (([string]$semanticManifest.bundle_path).TrimEnd('/') + '/' + [string]$asset.name)
+            $entry = $archive.GetEntry($entryName)
+            if (-not $entry) {
+                throw "Portable bundle is missing $entryName"
+            }
+            if ($entry.Length -ne [long]$asset.size) {
+                throw "Portable semantic runtime size mismatch for $entryName"
+            }
+            $stream = $entry.Open()
+            try {
+                $hash = Get-StreamSha256 -Stream $stream
+            } finally {
+                $stream.Dispose()
+            }
+            if ($hash -ne ([string]$asset.sha256).ToLowerInvariant()) {
+                throw "Portable semantic runtime checksum mismatch for $entryName"
+            }
+        }
+    }
 } finally {
     $archive.Dispose()
 }
@@ -88,7 +110,7 @@ if (-not $sevenZip) {
 }
 
 $listing = @(& $sevenZip.Source l $installer)
-foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-nmh.exe")) {
+foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-nmh.exe", "carbonpaper-semantic-worker.exe")) {
     $count = @($listing | Where-Object { $_ -match ("\s" + [regex]::Escape($required) + "$") }).Count
     if ($count -ne 1) {
         throw "NSIS installer must contain exactly one $required entry; found $count"
@@ -97,6 +119,13 @@ foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-nmh.exe")) {
 foreach ($asset in $manifest.files) {
     if (-not ($listing -match [regex]::Escape([string]$asset.name))) {
         throw "NSIS installer is missing $($asset.name)"
+    }
+}
+foreach ($package in $semanticManifest.packages) {
+    foreach ($asset in $package.files) {
+        if (-not ($listing -match [regex]::Escape([string]$asset.name))) {
+            throw "NSIS installer is missing semantic runtime $($asset.name)"
+        }
     }
 }
 
@@ -119,6 +148,19 @@ try {
             throw "Extracted NSIS model checksum mismatch for $path"
         }
     }
+    $semanticRuntimeDir = Join-Path $extractDir ([string]$semanticManifest.bundle_path).Replace('/', '\')
+    foreach ($package in $semanticManifest.packages) {
+        foreach ($asset in $package.files) {
+            $path = Join-Path $semanticRuntimeDir ([string]$asset.name)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "Extracted NSIS installer is missing $path"
+            }
+            $hash = Get-PathSha256 -Path $path
+            if ($hash -ne ([string]$asset.sha256).ToLowerInvariant()) {
+                throw "Extracted NSIS semantic runtime checksum mismatch for $path"
+            }
+        }
+    }
     $worker = Join-Path $extractDir "carbonpaper-ml.exe"
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -138,4 +180,4 @@ try {
     }
 }
 
-Write-Host "Portable and NSIS Rust OCR runtime bundles verified."
+Write-Host "Portable and NSIS Rust OCR/semantic runtime bundles verified."

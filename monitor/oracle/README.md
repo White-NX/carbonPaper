@@ -22,6 +22,23 @@ Validate the current Python implementation against the committed oracle:
   tools\migration_oracle.py validate
 ```
 
+Build the isolated Rust semantic worker, then validate its CPU output against
+the same committed oracle:
+
+```powershell
+npm run build:semantic-ml
+& "$env:LOCALAPPDATA\carbonpaper\.venv\Scripts\python.exe" `
+  tools\validate_rust_semantic.py --provider cpu
+```
+
+Use `--provider directml` for the explicit DirectML gate. Chinese-CLIP and BGE
+pass that gate. MiniLM and the uint8 reranker currently exceed the reviewed
+DirectML numeric tolerance, so the worker does not advertise them for that
+provider and the desktop supervisor retries them on CPU. The validator uses
+only installed model files and the pinned ONNX Runtime DLL, disables network
+model access and telemetry, and prints exact-token or numeric metrics for each
+model contract.
+
 `golden-v1.json` records exact token tensors, preprocessing tensors, normalized
 embeddings, raw reranker logits, search filtering/pagination output, model file
 fingerprints, and the tolerances that future Rust parity tests must enforce.

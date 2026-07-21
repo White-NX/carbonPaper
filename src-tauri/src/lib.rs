@@ -32,6 +32,10 @@ mod resource_utils;
 mod reverse_ipc;
 mod reverse_ipc_protocol;
 mod script_integrity;
+#[allow(dead_code)]
+mod semantic_models;
+#[allow(dead_code)]
+mod semantic_runtime;
 mod sensitive_filter;
 mod storage;
 mod updater;
@@ -303,8 +307,7 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some();
-            let monitor_autostart =
-                registry_config::get_bool("autoStartMonitor").unwrap_or(true);
+            let monitor_autostart = registry_config::get_bool("autoStartMonitor").unwrap_or(true);
 
             let vector_cleanup_done = if image_hashes.is_empty()
                 || vector_cleanup_can_be_skipped(monitor_running, monitor_autostart)
@@ -794,6 +797,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
+        .manage(Arc::new(semantic_runtime::SemanticRuntimeState::new()))
         .manage(Arc::new(CaptureState::default()))
         .manage(AnalysisState::default())
         .manage(updater::UpdaterState::new())
@@ -1086,6 +1090,8 @@ pub fn run() {
             ml_runtime::download_rust_ocr_model,
             ml_runtime::take_ocr_model_repair_request,
             ml_runtime::debug_trigger_ocr_model_repair_notification,
+            semantic_runtime::get_ml_semantic_status,
+            semantic_runtime::restart_ml_semantic_worker,
             monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）
             script_integrity::debug_trigger_security_alert,
@@ -1313,7 +1319,9 @@ mod tests {
             serde_json::json!({ "error": "vector store unavailable" })
         )));
         assert!(!vector_cleanup_acked(&Ok(serde_json::json!({}))));
-        assert!(!vector_cleanup_acked(&Err("Monitor not started".to_string())));
+        assert!(!vector_cleanup_acked(&Err(
+            "Monitor not started".to_string()
+        )));
     }
 }
 

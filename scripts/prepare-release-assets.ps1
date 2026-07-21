@@ -3,6 +3,7 @@ param(
     [switch]$Force,
     [switch]$VerifyOnly,
     [switch]$OcrOnly,
+    [switch]$DevelopmentOnly,
     [string]$RootDir
 )
 
@@ -15,6 +16,13 @@ if ([string]::IsNullOrWhiteSpace($RootDir)) {
 } else {
     $RootDir = (Resolve-Path $RootDir).Path
 }
+
+if ($OcrOnly -and $DevelopmentOnly) {
+    throw "-OcrOnly and -DevelopmentOnly cannot be used together."
+}
+
+$includeReleaseTools = -not $OcrOnly -and -not $DevelopmentOnly
+$includeSemanticRuntime = -not $OcrOnly
 
 $pythonAsset = @{
     Name = "Python 3.12.10 installer"
@@ -268,8 +276,92 @@ function Stage-OcrModelAssets {
     }
 }
 
-Write-Host "Preparing CarbonPaper release assets in $RootDir"
-if (-not $OcrOnly) {
+function Ensure-SemanticRuntimePackage {
+    param(
+        [Parameter(Mandatory = $true)]$Package,
+        [Parameter(Mandatory = $true)][string]$CacheDir
+    )
+
+    $allValid = $true
+    foreach ($file in $Package.files) {
+        $cached = Join-Path $CacheDir ([string]$file.name)
+        try {
+            Assert-FileSize -Path $cached -Expected ([long]$file.size) -Label "Semantic runtime $($file.name)"
+            Assert-Sha256 -Path $cached -Expected ([string]$file.sha256) -Label "Semantic runtime $($file.name)"
+        } catch {
+            $allValid = $false
+            if ($VerifyOnly) {
+                throw
+            }
+            break
+        }
+    }
+    if ($allValid -and -not $Force) {
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("carbonpaper-semantic-runtime-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    try {
+        $archive = Join-Path $tmp "package.zip"
+        $extract = Join-Path $tmp "extract"
+        Invoke-Download -Url ([string]$Package.url) -OutFile $archive
+        Assert-Sha256 -Path $archive -Expected ([string]$Package.archive_sha256) -Label "$($Package.name) archive"
+        Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+        foreach ($file in $Package.files) {
+            $relative = ([string]$file.source).Replace('/', '\')
+            $source = Join-Path $extract $relative
+            $label = "Semantic runtime $($file.name)"
+            Assert-FileSize -Path $source -Expected ([long]$file.size) -Label $label
+            Assert-Sha256 -Path $source -Expected ([string]$file.sha256) -Label $label
+            Copy-Item -LiteralPath $source -Destination (Join-Path $CacheDir ([string]$file.name)) -Force
+        }
+    } finally {
+        if ((Test-Path -LiteralPath $tmp) -and $tmp.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force
+        }
+    }
+}
+
+function Stage-SemanticRuntimeAssets {
+    param(
+        [Parameter(Mandatory = $true)]$Manifest,
+        [Parameter(Mandatory = $true)][string]$CacheDir,
+        [Parameter(Mandatory = $true)][string]$BundleDir
+    )
+
+    $managedRoot = [System.IO.Path]::GetFullPath((Join-Path $RootDir "src-tauri\pre-bundle\onnxruntime"))
+    $resolvedBundleDir = [System.IO.Path]::GetFullPath($BundleDir)
+    $managedPrefix = $managedRoot.TrimEnd('\') + '\'
+    if (-not $resolvedBundleDir.StartsWith($managedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to manage semantic runtime directory outside $managedRoot`: $resolvedBundleDir"
+    }
+
+    if (-not $VerifyOnly) {
+        if (Test-Path -LiteralPath $resolvedBundleDir) {
+            Remove-Item -LiteralPath $resolvedBundleDir -Recurse -Force
+        }
+        New-Item -ItemType Directory -Force -Path $resolvedBundleDir | Out-Null
+        foreach ($package in $Manifest.packages) {
+            foreach ($file in $package.files) {
+                Copy-Item -LiteralPath (Join-Path $CacheDir ([string]$file.name)) -Destination (Join-Path $resolvedBundleDir ([string]$file.name)) -Force
+            }
+        }
+    }
+
+    foreach ($package in $Manifest.packages) {
+        foreach ($file in $package.files) {
+            $staged = Join-Path $resolvedBundleDir ([string]$file.name)
+            $label = "Staged semantic runtime $($file.name)"
+            Assert-FileSize -Path $staged -Expected ([long]$file.size) -Label $label
+            Assert-Sha256 -Path $staged -Expected ([string]$file.sha256) -Label $label
+        }
+    }
+}
+
+Write-Host "Preparing CarbonPaper assets in $RootDir"
+if ($includeReleaseTools) {
     Ensure-DownloadedFile -Asset $pythonAsset
     Ensure-Aria2 -Asset $aria2Asset
 }
@@ -281,4 +373,14 @@ foreach ($asset in $ocrManifest.files) {
     Ensure-OcrModelAsset -Asset $asset -CacheDir $ocrCacheDir
 }
 Stage-OcrModelAssets -Manifest $ocrManifest -CacheDir $ocrCacheDir -BundleDir $ocrBundleDir
-Write-Host "Release assets are ready."
+if ($includeSemanticRuntime) {
+    $semanticManifestPath = Join-Path $RootDir "scripts\release-assets\onnxruntime-directml.json"
+    $semanticManifest = Get-Content -LiteralPath $semanticManifestPath -Raw | ConvertFrom-Json
+    $semanticCacheDir = Join-Path $RootDir (".release-assets\onnxruntime\" + [string]$semanticManifest.version)
+    $semanticBundleDir = Join-Path $RootDir ("src-tauri\pre-bundle\" + ([string]$semanticManifest.bundle_path).Replace('/', '\'))
+    foreach ($package in $semanticManifest.packages) {
+        Ensure-SemanticRuntimePackage -Package $package -CacheDir $semanticCacheDir
+    }
+    Stage-SemanticRuntimeAssets -Manifest $semanticManifest -CacheDir $semanticCacheDir -BundleDir $semanticBundleDir
+}
+Write-Host "Requested assets are ready."
