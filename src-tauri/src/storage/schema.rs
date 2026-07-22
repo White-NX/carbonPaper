@@ -65,6 +65,7 @@ impl StorageState {
         // Initialize table schema
         let t3 = std::time::Instant::now();
         self.init_tables(&conn)?;
+        self.cleanup_derived_index_sidecars_at_startup(&conn, &data_dir)?;
         Self::set_auto_vacuum_incremental(&conn)?;
         let tables_dur = t3.elapsed();
 
@@ -115,7 +116,7 @@ impl StorageState {
     }
 
     /// Initialize database tables.
-    fn init_tables(&self, conn: &Connection) -> Result<(), String> {
+    pub(super) fn init_tables(&self, conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
             r#"
             -- Screenshot records
@@ -175,6 +176,270 @@ impl StorageState {
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
             );
+
+            -- Rust-owned derived semantic vectors. SQLite is the durable cache;
+            -- any ANN sidecar remains rebuildable from these rows.
+            CREATE TABLE IF NOT EXISTS derived_embeddings (
+                index_kind TEXT NOT NULL,
+                subject_key TEXT NOT NULL,
+                dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+                vector_f32 BLOB NOT NULL,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                embedding_version INTEGER NOT NULL CHECK (embedding_version > 0),
+                source_fingerprint TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (index_kind, subject_key)
+            );
+
+            -- Per-subject migration/rebuild ledger. A vector is query-visible
+            -- only while this row is completed and its version fields match.
+            CREATE TABLE IF NOT EXISTS derived_index_jobs (
+                index_kind TEXT NOT NULL,
+                subject_key TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error_code TEXT,
+                error TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                next_retry_at TIMESTAMP,
+                lease_token TEXT,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                embedding_version INTEGER NOT NULL CHECK (embedding_version > 0),
+                source_fingerprint TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (index_kind, subject_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_derived_embeddings_model
+                ON derived_embeddings(index_kind, model_id, model_revision, embedding_version);
+            CREATE INDEX IF NOT EXISTS idx_derived_index_jobs_status
+                ON derived_index_jobs(index_kind, status, next_retry_at, updated_at);
+
+            -- Monotonic query-visible content epoch for each derived index.
+            -- Only mutations that can change the completed embedding join advance
+            -- this value, allowing sidecar publication to ignore ledger-only churn.
+            CREATE TABLE IF NOT EXISTS derived_index_state (
+                index_kind TEXT PRIMARY KEY,
+                data_epoch INTEGER NOT NULL DEFAULT 0 CHECK (data_epoch >= 0),
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS derived_index_generations (
+                index_kind TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL CHECK (generation > 0),
+                data_epoch INTEGER NOT NULL DEFAULT 0 CHECK (data_epoch >= 0),
+                file_name TEXT NOT NULL,
+                checksum_sha256 TEXT NOT NULL,
+                row_count INTEGER NOT NULL CHECK (row_count >= 0),
+                dimensions INTEGER,
+                model_id TEXT,
+                model_revision TEXT,
+                embedding_version INTEGER CHECK (embedding_version > 0),
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            DROP TRIGGER IF EXISTS derived_embeddings_epoch_after_insert;
+            CREATE TRIGGER derived_embeddings_epoch_after_insert
+            AFTER INSERT ON derived_embeddings
+            WHEN EXISTS (
+                SELECT 1 FROM derived_index_jobs j
+                 WHERE j.index_kind = NEW.index_kind
+                   AND j.subject_key = NEW.subject_key
+                   AND j.status = 'completed'
+                   AND j.model_id = NEW.model_id
+                   AND j.model_revision = NEW.model_revision
+                   AND j.embedding_version = NEW.embedding_version
+                   AND j.source_fingerprint = NEW.source_fingerprint
+            )
+            BEGIN
+                INSERT INTO derived_index_state (index_kind, data_epoch, updated_at)
+                VALUES (NEW.index_kind, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(index_kind) DO UPDATE SET
+                    data_epoch = data_epoch + 1,
+                    updated_at = CURRENT_TIMESTAMP;
+                DELETE FROM derived_index_generations WHERE index_kind = NEW.index_kind;
+            END;
+
+            DROP TRIGGER IF EXISTS derived_embeddings_epoch_after_update;
+            CREATE TRIGGER derived_embeddings_epoch_after_update
+            AFTER UPDATE ON derived_embeddings
+            WHEN EXISTS (
+                SELECT 1 FROM derived_index_jobs j
+                 WHERE j.index_kind = OLD.index_kind
+                   AND j.subject_key = OLD.subject_key
+                   AND j.status = 'completed'
+                   AND j.model_id = OLD.model_id
+                   AND j.model_revision = OLD.model_revision
+                   AND j.embedding_version = OLD.embedding_version
+                   AND j.source_fingerprint = OLD.source_fingerprint
+            ) OR EXISTS (
+                SELECT 1 FROM derived_index_jobs j
+                 WHERE j.index_kind = NEW.index_kind
+                   AND j.subject_key = NEW.subject_key
+                   AND j.status = 'completed'
+                   AND j.model_id = NEW.model_id
+                   AND j.model_revision = NEW.model_revision
+                   AND j.embedding_version = NEW.embedding_version
+                   AND j.source_fingerprint = NEW.source_fingerprint
+            )
+            BEGIN
+                INSERT INTO derived_index_state (index_kind, data_epoch, updated_at)
+                VALUES (NEW.index_kind, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(index_kind) DO UPDATE SET
+                    data_epoch = data_epoch + 1,
+                    updated_at = CURRENT_TIMESTAMP;
+                DELETE FROM derived_index_generations WHERE index_kind = NEW.index_kind;
+            END;
+
+            DROP TRIGGER IF EXISTS derived_embeddings_epoch_after_delete;
+            CREATE TRIGGER derived_embeddings_epoch_after_delete
+            AFTER DELETE ON derived_embeddings
+            WHEN EXISTS (
+                SELECT 1 FROM derived_index_jobs j
+                 WHERE j.index_kind = OLD.index_kind
+                   AND j.subject_key = OLD.subject_key
+                   AND j.status = 'completed'
+                   AND j.model_id = OLD.model_id
+                   AND j.model_revision = OLD.model_revision
+                   AND j.embedding_version = OLD.embedding_version
+                   AND j.source_fingerprint = OLD.source_fingerprint
+            )
+            BEGIN
+                INSERT INTO derived_index_state (index_kind, data_epoch, updated_at)
+                VALUES (OLD.index_kind, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(index_kind) DO UPDATE SET
+                    data_epoch = data_epoch + 1,
+                    updated_at = CURRENT_TIMESTAMP;
+                DELETE FROM derived_index_generations WHERE index_kind = OLD.index_kind;
+            END;
+
+            DROP TRIGGER IF EXISTS derived_index_jobs_epoch_after_insert;
+            CREATE TRIGGER derived_index_jobs_epoch_after_insert
+            AFTER INSERT ON derived_index_jobs
+            WHEN NEW.status = 'completed' AND EXISTS (
+                SELECT 1 FROM derived_embeddings e
+                 WHERE e.index_kind = NEW.index_kind
+                   AND e.subject_key = NEW.subject_key
+                   AND e.model_id = NEW.model_id
+                   AND e.model_revision = NEW.model_revision
+                   AND e.embedding_version = NEW.embedding_version
+                   AND e.source_fingerprint = NEW.source_fingerprint
+            )
+            BEGIN
+                INSERT INTO derived_index_state (index_kind, data_epoch, updated_at)
+                VALUES (NEW.index_kind, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(index_kind) DO UPDATE SET
+                    data_epoch = data_epoch + 1,
+                    updated_at = CURRENT_TIMESTAMP;
+                DELETE FROM derived_index_generations WHERE index_kind = NEW.index_kind;
+            END;
+
+            DROP TRIGGER IF EXISTS derived_index_jobs_epoch_after_update;
+            CREATE TRIGGER derived_index_jobs_epoch_after_update
+            AFTER UPDATE ON derived_index_jobs
+            WHEN (OLD.status = 'completed' AND EXISTS (
+                SELECT 1 FROM derived_embeddings e
+                 WHERE e.index_kind = OLD.index_kind
+                   AND e.subject_key = OLD.subject_key
+                   AND e.model_id = OLD.model_id
+                   AND e.model_revision = OLD.model_revision
+                   AND e.embedding_version = OLD.embedding_version
+                   AND e.source_fingerprint = OLD.source_fingerprint
+            )) OR (NEW.status = 'completed' AND EXISTS (
+                SELECT 1 FROM derived_embeddings e
+                 WHERE e.index_kind = NEW.index_kind
+                   AND e.subject_key = NEW.subject_key
+                   AND e.model_id = NEW.model_id
+                   AND e.model_revision = NEW.model_revision
+                   AND e.embedding_version = NEW.embedding_version
+                   AND e.source_fingerprint = NEW.source_fingerprint
+            ))
+            BEGIN
+                INSERT INTO derived_index_state (index_kind, data_epoch, updated_at)
+                VALUES (NEW.index_kind, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(index_kind) DO UPDATE SET
+                    data_epoch = data_epoch + 1,
+                    updated_at = CURRENT_TIMESTAMP;
+                DELETE FROM derived_index_generations WHERE index_kind = NEW.index_kind;
+            END;
+
+            DROP TRIGGER IF EXISTS derived_index_jobs_epoch_after_delete;
+            CREATE TRIGGER derived_index_jobs_epoch_after_delete
+            AFTER DELETE ON derived_index_jobs
+            WHEN OLD.status = 'completed' AND EXISTS (
+                SELECT 1 FROM derived_embeddings e
+                 WHERE e.index_kind = OLD.index_kind
+                   AND e.subject_key = OLD.subject_key
+                   AND e.model_id = OLD.model_id
+                   AND e.model_revision = OLD.model_revision
+                   AND e.embedding_version = OLD.embedding_version
+                   AND e.source_fingerprint = OLD.source_fingerprint
+            )
+            BEGIN
+                INSERT INTO derived_index_state (index_kind, data_epoch, updated_at)
+                VALUES (OLD.index_kind, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(index_kind) DO UPDATE SET
+                    data_epoch = data_epoch + 1,
+                    updated_at = CURRENT_TIMESTAMP;
+                DELETE FROM derived_index_generations WHERE index_kind = OLD.index_kind;
+            END;
+
+            -- Derived rows follow screenshot lifecycle changes transactionally.
+            -- Text vectors use the screenshot id; image vectors use image_hash.
+            DROP TRIGGER IF EXISTS cleanup_derived_index_on_screenshot_soft_delete;
+            CREATE TRIGGER cleanup_derived_index_on_screenshot_soft_delete
+            AFTER UPDATE OF is_deleted ON screenshots
+            WHEN OLD.is_deleted = 0 AND NEW.is_deleted != 0
+            BEGIN
+                DELETE FROM derived_embeddings
+                 WHERE index_kind = 'semantic_text'
+                   AND subject_key = CAST(NEW.id AS TEXT);
+                DELETE FROM derived_index_jobs
+                 WHERE index_kind = 'semantic_text'
+                   AND subject_key = CAST(NEW.id AS TEXT);
+                DELETE FROM derived_embeddings
+                 WHERE index_kind = 'clip_image'
+                   AND subject_key = NEW.image_hash
+                   AND NOT EXISTS (
+                       SELECT 1 FROM screenshots
+                        WHERE image_hash = NEW.image_hash AND is_deleted = 0
+                   );
+                DELETE FROM derived_index_jobs
+                 WHERE index_kind = 'clip_image'
+                   AND subject_key = NEW.image_hash
+                   AND NOT EXISTS (
+                       SELECT 1 FROM screenshots
+                        WHERE image_hash = NEW.image_hash AND is_deleted = 0
+                   );
+            END;
+
+            DROP TRIGGER IF EXISTS cleanup_derived_index_on_screenshot_delete;
+            CREATE TRIGGER cleanup_derived_index_on_screenshot_delete
+            AFTER DELETE ON screenshots
+            BEGIN
+                DELETE FROM derived_embeddings
+                 WHERE index_kind = 'semantic_text'
+                   AND subject_key = CAST(OLD.id AS TEXT);
+                DELETE FROM derived_index_jobs
+                 WHERE index_kind = 'semantic_text'
+                   AND subject_key = CAST(OLD.id AS TEXT);
+                DELETE FROM derived_embeddings
+                 WHERE index_kind = 'clip_image'
+                   AND subject_key = OLD.image_hash
+                   AND NOT EXISTS (
+                       SELECT 1 FROM screenshots
+                        WHERE image_hash = OLD.image_hash AND is_deleted = 0
+                   );
+                DELETE FROM derived_index_jobs
+                 WHERE index_kind = 'clip_image'
+                   AND subject_key = OLD.image_hash
+                   AND NOT EXISTS (
+                       SELECT 1 FROM screenshots
+                        WHERE image_hash = OLD.image_hash AND is_deleted = 0
+                   );
+            END;
 
             -- Deferred physical cleanup queues
             CREATE TABLE IF NOT EXISTS delete_queue_screenshots (
@@ -244,6 +509,7 @@ impl StorageState {
         }
 
         self.ensure_schema(conn)?;
+        self.recover_interrupted_derived_index_jobs_at_startup(conn)?;
 
         Ok(())
     }
@@ -436,6 +702,22 @@ impl StorageState {
         // Classification columns
         Self::add_column_if_missing(conn, "screenshots", "category", "TEXT")?;
         Self::add_column_if_missing(conn, "screenshots", "category_confidence", "REAL")?;
+
+        Self::add_column_if_missing(conn, "derived_index_generations", "model_id", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "derived_index_generations",
+            "data_epoch",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::add_column_if_missing(conn, "derived_index_generations", "model_revision", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "derived_index_generations",
+            "embedding_version",
+            "INTEGER",
+        )?;
+        Self::add_column_if_missing(conn, "derived_index_jobs", "lease_token", "TEXT")?;
 
         Self::create_table_if_missing(
             conn,

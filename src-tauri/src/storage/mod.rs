@@ -5,6 +5,7 @@
 //! 2. Screenshot metadata and OCR results
 //! 3. OCR data storage and search
 
+mod derived_index;
 mod encryption;
 mod image_io;
 mod link_scoring;
@@ -18,6 +19,8 @@ pub mod smart_cluster;
 pub mod task;
 mod types;
 
+#[allow(unused_imports)]
+pub use derived_index::*;
 #[allow(unused_imports)]
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
 pub use types::*;
@@ -78,6 +81,9 @@ pub struct StorageState {
     pub(crate) thumbnail_warmup_done: AtomicBool,
     /// Whether startup VACUUM is currently running
     startup_vacuum_in_progress: AtomicBool,
+    /// Serializes derived-index sidecar publication without participating in
+    /// the data-directory/database lock ordering.
+    derived_generation_publish_lock: Mutex<()>,
 }
 
 struct NamedConnectionGuard<'a> {
@@ -128,6 +134,7 @@ impl StorageState {
             bitmap_index_migrated: AtomicBool::new(false),
             thumbnail_warmup_done: AtomicBool::new(false),
             startup_vacuum_in_progress: AtomicBool::new(false),
+            derived_generation_publish_lock: Mutex::new(()),
         }
     }
 

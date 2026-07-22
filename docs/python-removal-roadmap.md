@@ -151,7 +151,32 @@ Current reality:
 - Idle-gate only background capture indexing, rebuild, and maintenance model loads. A user-initiated search/calibration request is foreground/manual work: it remains deadline-bound but must not silently fail merely because the system is not idle.
 - Match the existing ONNX Runtime safety settings or justify/test any change in graph optimization, allocator, file-vs-buffer loading, thread counts, CPU fallback, and DirectML device selection.
 
-#### M2.3 — Rust-owned derived embedding storage and ledger
+#### M2.3 — Rust-owned derived embedding storage and ledger — DONE 2026-07-21
+
+Implementation status: `m2/derived-vector-store` adds the first-party SQLite
+`derived_embeddings` cache, the `(index_kind, subject_key)`
+`derived_index_jobs` ledger, and generation metadata. Vector + completed-ledger
+writes and vector + ledger deletion are transactional. Query-visible reads join
+both tables and require exact model revision, embedding version, and source
+fingerprint agreement, so pending, failed, discarded, invalidated, or partial
+rows cannot leak into search. The generalized keys are `screenshot_id` strings
+for `semantic_text` and `image_hash` for `clip_image`.
+
+Workers claim queued subjects with random execution leases; completion, failure,
+and discard are compare-and-set transitions against the active lease, and commits
+also require the referenced screenshot or image hash to remain active. This
+prevents late workers from resurrecting deleted/discarded work or hiding a
+newer completion. Startup requeues any `processing` lease left behind by an
+interrupted process so rebuilds remain resumable after crashes.
+
+The branch also publishes immutable, checksummed `.cpdvec` generations through
+temporary-file fsync and atomic rename. The initial payload is a flat exact-scan
+snapshot; SQLite remains authoritative, and the payload can be replaced by an
+ANN layout when the M2.5 query path needs it without changing persistence or
+generation semantics. Runtime publication never deletes finalized sidecars;
+unreferenced generations are cleaned during the next startup, before readers
+are exposed. M2.4 owns paged rebuild/migration orchestration; M2.5 owns
+dual-write and production query cutover.
 
 - Prefer a two-layer derived design:
   1. a SQLite `derived_embeddings` cache holding the migrated/generated float32 vector plus `index_kind`, `subject_key`, dimensions, model id/revision, embedding version, source fingerprint, and timestamps;
@@ -362,6 +387,6 @@ Do not delete a Python component until its Rust replacement has shipped as defau
 
 ## Immediate Next Step
 
-Continue from PR #139 with the stacked branch `m2/python-oracle-contracts`: version this roadmap at `docs/python-removal-roadmap.md`; add synthetic fixtures plus a local CPU golden generator/validator for Chinese-CLIP, MiniLM, BGE, bge-reranker, and `search_nl`; record exact token tensors, preprocessing, pooling/normalization, raw logits, result shape/filter/pagination behavior, model fingerprints, and Rust parity tolerances. Ordinary CI validates the model-free contract and golden structure without downloading models; installed-model validation remains an explicit local/release-gate command.
+Continue from `m2/derived-vector-store` with M2.4, preferably beginning in `m2/minilm-dual-write-migration`: add an explicit, idempotent, paged, resumable MiniLM rebuild/migration command backed by `derived_index_jobs`; rehydrate process/title/category/OCR inputs from SQLite; dual-write new MiniLM vectors to Chroma and the Rust store; expose progress, cancellation, force-run, and unmappable/error diagnostics. Python/Chroma remains authoritative until the later shadow-query gate passes.
 
 No Rust backend becomes authoritative until its Python behavior contract, dual-write/migration, shadow-query, lifecycle, performance, and rollback gates pass. The first recommended cutover is MiniLM semantic retrieval; CLIP follows only after both legacy-vector migration and new-capture Rust image indexing work. Chroma remains for Milestone 4 task clustering, and Python BGE remains for Milestone 5 classification. Until subject-level Rust ledgers exist, the internal count-level CLIP comparison is only a migration baseline, not a product health judgment.

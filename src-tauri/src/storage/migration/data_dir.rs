@@ -84,6 +84,13 @@ impl StorageState {
             &self.migration_in_progress,
             &self.migration_cancel_requested,
         );
+        // Wait for an in-flight sidecar publication to finish before closing,
+        // copying, or removing the current data directory. New publishers see
+        // migration_in_progress and fail before entering this boundary.
+        let _derived_publish_guard = self
+            .derived_generation_publish_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
 
         let src = self
             .data_dir
