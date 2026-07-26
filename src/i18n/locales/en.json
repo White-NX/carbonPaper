@@ -1279,6 +1279,29 @@
       "trigger_ocr_model_repair_notification": "Test OCR Model Repair Notification"
     }
   },
+  "minilmMigration": {
+    "title": "Data migration in progress",
+    "subtitle": "Task vectors are being migrated to the local Rust index. The app is in maintenance mode while this runs.",
+    "eta": "Estimated time remaining: {{eta}} ",
+    "safeWrite": "Writing to disk. Please do not force-quit the app.",
+    "waitingForAuth": "Your session has expired. Complete Windows Hello authentication and the migration will continue automatically.",
+    "reauth": "Authenticate",
+    "errorCount": "{{count}} records could not be migrated. Details were written to the migration diagnostics.",
+    "blockedHint": "Other operations are unavailable during migration. If the app exits, migration resumes after the next launch and unlock.",
+    "phases": {
+      "starting": "Preparing…",
+      "preflight": "Checking disk space…",
+      "snapshotting_chroma": "Creating the vector snapshot…",
+      "copying_chroma": "Copying existing vectors…",
+      "reconciling": "Removing out-of-scope local vectors…",
+      "publishing_write": "Writing the index file…",
+      "publishing_sync": "Publishing the index…",
+      "publishing_verify": "Verifying the index file…",
+      "publishing_commit": "Committing the index…",
+      "waiting_for_auth": "Waiting for authentication…",
+      "working": "Working…"
+    }
+  },
   "securityAlert": {
     "title": "Monitor integrity compromised",
     "debug_title": "Security alert — debug trigger",

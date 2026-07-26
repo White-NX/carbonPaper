@@ -20,6 +20,9 @@ import {
   removeTaskScreenshot,
   runClustering,
   setClusteringInterval,
+  getMinilmRebuildStatus,
+  listMinilmRebuildErrors,
+  getMaintenanceStatus,
 } from './task_api';
 
 describe('task_api', () => {
@@ -102,6 +105,22 @@ describe('task_api', () => {
     expect(invoke).toHaveBeenNthCalledWith(2, 'monitor_set_clustering_interval', { interval: '1w' });
     expectWithAuth(1, { autoPrompt: false });
     expectWithAuth(2, { autoPrompt: true });
+  });
+
+  it('exposes read-only MiniLM migration status commands', async () => {
+    invoke.mockResolvedValue({ running: true });
+
+    await getMinilmRebuildStatus();
+    await listMinilmRebuildErrors(5, 25);
+    await getMaintenanceStatus();
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'get_minilm_rebuild_status');
+    expect(invoke).toHaveBeenNthCalledWith(2, 'list_minilm_rebuild_errors', {
+      offset: 5,
+      limit: 25,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, 'get_maintenance_status');
+    expectWithAuth(1);
   });
 
   it('calls smart cluster summary commands with expected payloads', async () => {

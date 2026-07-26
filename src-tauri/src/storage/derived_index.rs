@@ -19,10 +19,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SIDECAR_MAGIC: &[u8; 8] = b"CPDVEC01";
 const SIDECAR_FORMAT_VERSION: u32 = 3;
 const MAX_SUBJECT_KEY_BYTES: usize = 1024;
-const MAX_METADATA_BYTES: usize = 4096;
+pub(super) const MAX_METADATA_BYTES: usize = 4096;
 const MAX_VECTOR_DIMENSIONS: usize = 65_536;
 const SIDECAR_PAGE_SIZE: u32 = 512;
 const LEASE_TOKEN_BYTES: usize = 16;
+pub const DERIVED_GENERATION_CANCELLED: &str = "DERIVED_GENERATION_CANCELLED";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +112,15 @@ pub struct DerivedIndexJobRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnsureDerivedIndexJobResult {
+    Queued,
+    Requeued,
+    AlreadyCurrent,
+    AlreadyProcessing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DerivedIndexGeneration {
     pub index_kind: DerivedIndexKind,
@@ -149,6 +159,130 @@ struct DerivedWorkerJobUpdate<'a> {
 }
 
 impl StorageState {
+    /// Ensure one subject has a ledger entry without reviving a current result.
+    /// A changed model/source contract queues fresh work; a matching completed
+    /// result is always reused so migration cannot accidentally recompute it.
+    pub fn ensure_derived_index_job(
+        &self,
+        spec: &DerivedIndexJobSpec,
+    ) -> Result<EnsureDerivedIndexJobResult, String> {
+        validate_job_spec(spec)?;
+        let mut guard = self.get_connection_named("ensure_derived_index_job")?;
+        let conn = guard.as_mut().ok_or("Database not initialized")?;
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Failed to start derived job transaction: {error}"))?;
+        if !derived_subject_is_active(&tx, spec.index_kind, &spec.subject_key)? {
+            return Err("Cannot queue a derived index job for an inactive subject".to_string());
+        }
+
+        let existing = tx
+            .query_row(
+                r#"
+                SELECT status, model_id, model_revision, embedding_version,
+                       source_fingerprint
+                FROM derived_index_jobs
+                WHERE index_kind = ?1 AND subject_key = ?2
+                "#,
+                params![spec.index_kind.as_str(), spec.subject_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect derived index job: {error}"))?;
+
+        let result = match existing {
+            None => {
+                tx.execute(
+                    r#"
+                    INSERT INTO derived_index_jobs (
+                        index_kind, subject_key, status, attempts, model_id,
+                        model_revision, embedding_version, source_fingerprint, updated_at
+                    ) VALUES (?1, ?2, 'pending', 0, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+                    "#,
+                    params![
+                        spec.index_kind.as_str(),
+                        spec.subject_key,
+                        spec.model_id,
+                        spec.model_revision,
+                        spec.embedding_version,
+                        spec.source_fingerprint,
+                    ],
+                )
+                .map_err(|error| format!("Failed to create derived index job: {error}"))?;
+                EnsureDerivedIndexJobResult::Queued
+            }
+            Some((status, model_id, model_revision, embedding_version, source_fingerprint)) => {
+                let contract_matches = model_id == spec.model_id
+                    && model_revision == spec.model_revision
+                    && embedding_version == i64::from(spec.embedding_version)
+                    && source_fingerprint == spec.source_fingerprint;
+                if contract_matches {
+                    match DerivedIndexJobStatus::from_db(&status)? {
+                        DerivedIndexJobStatus::Completed => {
+                            EnsureDerivedIndexJobResult::AlreadyCurrent
+                        }
+                        DerivedIndexJobStatus::Processing => {
+                            EnsureDerivedIndexJobResult::AlreadyProcessing
+                        }
+                        DerivedIndexJobStatus::Pending => EnsureDerivedIndexJobResult::Queued,
+                        DerivedIndexJobStatus::Failed
+                        | DerivedIndexJobStatus::WaitingForAuth
+                        | DerivedIndexJobStatus::Discarded => {
+                            tx.execute(
+                                r#"
+                                UPDATE derived_index_jobs
+                                SET status = 'pending', error_code = NULL, error = NULL,
+                                    next_retry_at = NULL, lease_token = NULL,
+                                    updated_at = CURRENT_TIMESTAMP
+                                WHERE index_kind = ?1 AND subject_key = ?2
+                                "#,
+                                params![spec.index_kind.as_str(), spec.subject_key],
+                            )
+                            .map_err(|error| {
+                                format!("Failed to resume derived index job: {error}")
+                            })?;
+                            EnsureDerivedIndexJobResult::Requeued
+                        }
+                    }
+                } else {
+                    tx.execute(
+                        r#"
+                        UPDATE derived_index_jobs
+                        SET status = 'pending', error_code = NULL, error = NULL,
+                            attempts = 0,
+                            next_retry_at = NULL, lease_token = NULL,
+                            model_id = ?3, model_revision = ?4,
+                            embedding_version = ?5, source_fingerprint = ?6,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE index_kind = ?1 AND subject_key = ?2
+                        "#,
+                        params![
+                            spec.index_kind.as_str(),
+                            spec.subject_key,
+                            spec.model_id,
+                            spec.model_revision,
+                            spec.embedding_version,
+                            spec.source_fingerprint,
+                        ],
+                    )
+                    .map_err(|error| format!("Failed to requeue derived index job: {error}"))?;
+                    EnsureDerivedIndexJobResult::Requeued
+                }
+            }
+        };
+        tx.commit()
+            .map_err(|error| format!("Failed to commit derived job transaction: {error}"))?;
+        Ok(result)
+    }
+
     /// Queue or re-queue one derived subject. A changed source/model contract
     /// resets its retry budget and immediately hides any stale vector.
     pub fn upsert_derived_index_job(&self, spec: &DerivedIndexJobSpec) -> Result<(), String> {
@@ -253,6 +387,28 @@ impl StorageState {
                 status: DerivedIndexJobStatus::WaitingForAuth,
                 error_code: Some("authentication_required"),
                 error,
+                next_retry_at: None,
+                increment_attempts: false,
+            },
+        )
+    }
+
+    /// Release a processing lease without charging the retry budget. This is
+    /// used by explicit cancellation so the next run resumes.
+    pub fn requeue_derived_index_job(
+        &self,
+        spec: &DerivedIndexJobSpec,
+        lease_token: &str,
+        reason_code: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        self.set_derived_worker_job_state(
+            spec,
+            lease_token,
+            DerivedWorkerJobUpdate {
+                status: DerivedIndexJobStatus::Pending,
+                error_code: Some(reason_code),
+                error: Some(reason),
                 next_retry_at: None,
                 increment_attempts: false,
             },
@@ -781,6 +937,26 @@ impl StorageState {
         &self,
         index_kind: DerivedIndexKind,
     ) -> Result<DerivedIndexGeneration, String> {
+        self.publish_derived_index_generation_with_progress(
+            index_kind,
+            |_phase, _current, _total| {},
+            || false,
+        )
+    }
+
+    /// Publish a generation on a blocking worker with cooperative cancellation
+    /// and bounded progress callbacks. `sync_all` itself cannot be interrupted;
+    /// callers should present that phase as a short safe-write interval.
+    pub fn publish_derived_index_generation_with_progress<P, C>(
+        &self,
+        index_kind: DerivedIndexKind,
+        mut progress: P,
+        cancelled: C,
+    ) -> Result<DerivedIndexGeneration, String>
+    where
+        P: FnMut(&str, u64, u64),
+        C: Fn() -> bool,
+    {
         if self.is_migration_in_progress() {
             return Err("Cannot publish a derived index during data migration".to_string());
         }
@@ -808,22 +984,50 @@ impl StorageState {
         let file_name = format!("{}-{generation}.cpdvec", index_kind.as_str());
         let final_path = sidecar_dir.join(&file_name);
         let temp_path = sidecar_dir.join(format!(".{file_name}.tmp"));
-        let checksum_sha256 =
-            match self.write_sidecar_streaming(&temp_path, index_kind, generation, &snapshot) {
+        if cancelled() {
+            return Err(DERIVED_GENERATION_CANCELLED.to_string());
+        }
+        let checksum_sha256 = match self.write_sidecar_streaming(
+            &temp_path,
+            index_kind,
+            generation,
+            &snapshot,
+            &mut progress,
+            &cancelled,
+        ) {
                 Ok(checksum) => checksum,
                 Err(error) => {
                     let _ = fs::remove_file(&temp_path);
                     return Err(error);
                 }
             };
-        if let Err(error) = verify_sidecar(&temp_path, &checksum_sha256) {
+        if cancelled() {
+            let _ = fs::remove_file(&temp_path);
+            return Err(DERIVED_GENERATION_CANCELLED.to_string());
+        }
+        if let Err(error) = verify_sidecar_with_progress(
+            &temp_path,
+            &checksum_sha256,
+            &mut progress,
+            &cancelled,
+        ) {
             let _ = fs::remove_file(&temp_path);
             return Err(error);
         }
+        if cancelled() {
+            let _ = fs::remove_file(&temp_path);
+            return Err(DERIVED_GENERATION_CANCELLED.to_string());
+        }
+        progress("publishing_commit", 0, 1);
         fs::rename(&temp_path, &final_path).map_err(|error| {
             let _ = fs::remove_file(&temp_path);
             format!("Failed to publish derived index generation: {error}")
         })?;
+
+        if cancelled() {
+            let _ = fs::remove_file(&final_path);
+            return Err(DERIVED_GENERATION_CANCELLED.to_string());
+        }
 
         let record = DerivedIndexGeneration {
             index_kind,
@@ -850,6 +1054,7 @@ impl StorageState {
             let _ = fs::remove_file(&final_path);
             return Err(error);
         }
+        progress("publishing_commit", 1, 1);
         Ok(record)
     }
 
@@ -1080,6 +1285,8 @@ impl StorageState {
         index_kind: DerivedIndexKind,
         generation: u64,
         snapshot: &DerivedIndexSnapshotMetadata,
+        progress: &mut impl FnMut(&str, u64, u64),
+        cancelled: &impl Fn() -> bool,
     ) -> Result<String, String> {
         let file = OpenOptions::new()
             .write(true)
@@ -1089,10 +1296,14 @@ impl StorageState {
         let mut writer = BufWriter::new(file);
         let mut hasher = Sha256::new();
         write_sidecar_header(&mut writer, &mut hasher, index_kind, generation, snapshot)?;
+        progress("publishing_write", 0, snapshot.row_count);
 
         let mut after_subject_key: Option<String> = None;
         let mut written_rows = 0u64;
         loop {
+            if cancelled() {
+                return Err(DERIVED_GENERATION_CANCELLED.to_string());
+            }
             let page = self.list_query_visible_embedding_page(
                 index_kind,
                 after_subject_key.as_deref(),
@@ -1108,6 +1319,7 @@ impl StorageState {
                 .checked_add(page.len() as u64)
                 .ok_or_else(|| "Derived generation row count overflow".to_string())?;
             after_subject_key = page.last().map(|row| row.job.subject_key.clone());
+            progress("publishing_write", written_rows, snapshot.row_count);
         }
         if written_rows != snapshot.row_count {
             return Err(format!(
@@ -1116,13 +1328,20 @@ impl StorageState {
             ));
         }
 
+        if cancelled() {
+            return Err(DERIVED_GENERATION_CANCELLED.to_string());
+        }
         writer
             .flush()
             .map_err(|error| format!("Failed to flush derived index temp file: {error}"))?;
+        progress("publishing_sync", 0, 0);
         writer
             .get_ref()
             .sync_all()
             .map_err(|error| format!("Failed to sync derived index temp file: {error}"))?;
+        if cancelled() {
+            return Err(DERIVED_GENERATION_CANCELLED.to_string());
+        }
         Ok(hex::encode(hasher.finalize()))
     }
 }
@@ -1140,7 +1359,7 @@ type RawSnapshotMetadata = (
     Option<i64>,
 );
 
-fn derived_subject_is_active(
+pub(super) fn derived_subject_is_active(
     conn: &rusqlite::Connection,
     index_kind: DerivedIndexKind,
     subject_key: &str,
@@ -1311,7 +1530,7 @@ fn decode_embedding_row(
     })
 }
 
-fn validate_job_spec(spec: &DerivedIndexJobSpec) -> Result<(), String> {
+pub(super) fn validate_job_spec(spec: &DerivedIndexJobSpec) -> Result<(), String> {
     validate_required_text("subject_key", &spec.subject_key, MAX_SUBJECT_KEY_BYTES)?;
     validate_required_text("model_id", &spec.model_id, MAX_METADATA_BYTES)?;
     validate_required_text("model_revision", &spec.model_revision, MAX_METADATA_BYTES)?;
@@ -1377,7 +1596,7 @@ fn normalize_retry_timestamp(value: Option<&str>) -> Result<Option<String>, Stri
         .map_err(|_| "next_retry_at must be RFC3339 or UTC YYYY-MM-DD HH:MM:SS".to_string())
 }
 
-fn encode_vector(vector: &[f32]) -> Result<Vec<u8>, String> {
+pub(super) fn encode_vector(vector: &[f32]) -> Result<Vec<u8>, String> {
     if vector.is_empty() {
         return Err("Derived embedding vector must not be empty".to_string());
     }
@@ -1389,6 +1608,9 @@ fn encode_vector(vector: &[f32]) -> Result<Vec<u8>, String> {
     }
     if vector.iter().any(|value| !value.is_finite()) {
         return Err("Derived embedding vector contains a non-finite value".to_string());
+    }
+    if vector.iter().all(|value| value.abs() <= f32::EPSILON) {
+        return Err("Derived embedding vector must not be a zero vector".to_string());
     }
     let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
     for value in vector {
@@ -1497,8 +1719,26 @@ fn write_hashed(writer: &mut impl Write, hasher: &mut Sha256, bytes: &[u8]) -> R
 }
 
 fn verify_sidecar(path: &Path, expected_checksum: &str) -> Result<(), String> {
+    verify_sidecar_with_progress(
+        path,
+        expected_checksum,
+        &mut |_phase, _current, _total| {},
+        &|| false,
+    )
+}
+
+fn verify_sidecar_with_progress(
+    path: &Path,
+    expected_checksum: &str,
+    progress: &mut impl FnMut(&str, u64, u64),
+    cancelled: &impl Fn() -> bool,
+) -> Result<(), String> {
     let file = std::fs::File::open(path)
         .map_err(|error| format!("Failed to open derived index sidecar: {error}"))?;
+    let total = file
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let mut reader = BufReader::new(file);
     let mut header = [0u8; SIDECAR_MAGIC.len()];
     reader
@@ -1509,8 +1749,14 @@ fn verify_sidecar(path: &Path, expected_checksum: &str) -> Result<(), String> {
     }
     let mut hasher = Sha256::new();
     hasher.update(header);
-    let mut buffer = [0u8; 64 * 1024];
+    let mut verified = header.len() as u64;
+    let mut last_reported = 0_u64;
+    progress("publishing_verify", verified, total);
+    let mut buffer = [0u8; 1024 * 1024];
     loop {
+        if cancelled() {
+            return Err(DERIVED_GENERATION_CANCELLED.to_string());
+        }
         let read = reader
             .read(&mut buffer)
             .map_err(|error| format!("Failed to read derived index sidecar: {error}"))?;
@@ -1518,6 +1764,11 @@ fn verify_sidecar(path: &Path, expected_checksum: &str) -> Result<(), String> {
             break;
         }
         hasher.update(&buffer[..read]);
+        verified = verified.saturating_add(read as u64);
+        if verified.saturating_sub(last_reported) >= 8 * 1024 * 1024 || verified >= total {
+            progress("publishing_verify", verified, total);
+            last_reported = verified;
+        }
     }
     let checksum = hex::encode(hasher.finalize());
     if checksum != expected_checksum {
@@ -1604,6 +1855,96 @@ mod tests {
         vector: Vec<f32>,
     ) -> Result<(), String> {
         storage.commit_derived_embedding(&claimed_write(storage, spec, vector))
+    }
+
+    #[test]
+    fn ensure_job_is_idempotent_until_source_change() {
+        let (_temp, storage) = test_storage();
+        let spec = job(DerivedIndexKind::SemanticText, "41");
+        ensure_active_subject(&storage, &spec);
+        assert_eq!(
+            storage.ensure_derived_index_job(&spec).unwrap(),
+            EnsureDerivedIndexJobResult::Queued
+        );
+        let lease = storage.mark_derived_index_job_processing(&spec).unwrap();
+        storage
+            .commit_derived_embedding(&DerivedEmbeddingWrite {
+                job: spec.clone(),
+                lease_token: lease,
+                vector: vec![0.5, 0.25],
+            })
+            .unwrap();
+        assert_eq!(
+            storage.ensure_derived_index_job(&spec).unwrap(),
+            EnsureDerivedIndexJobResult::AlreadyCurrent
+        );
+        assert_eq!(
+            storage
+                .get_derived_index_job(DerivedIndexKind::SemanticText, "41")
+                .unwrap()
+                .unwrap()
+                .status,
+            DerivedIndexJobStatus::Completed
+        );
+
+        let mut changed = spec.clone();
+        changed.source_fingerprint = "new-source".to_string();
+        assert_eq!(
+            storage.ensure_derived_index_job(&changed).unwrap(),
+            EnsureDerivedIndexJobResult::Requeued
+        );
+    }
+
+    #[test]
+    fn cancellation_requeue_preserves_retry_budget() {
+        let (_temp, storage) = test_storage();
+        let spec = job(DerivedIndexKind::SemanticText, "43");
+        ensure_active_subject(&storage, &spec);
+        storage.ensure_derived_index_job(&spec).unwrap();
+        let lease = storage.mark_derived_index_job_processing(&spec).unwrap();
+        storage
+            .requeue_derived_index_job(&spec, &lease, "cancelled", "cancelled by user")
+            .unwrap();
+        let record = storage
+            .get_derived_index_job(DerivedIndexKind::SemanticText, "43")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, DerivedIndexJobStatus::Pending);
+        assert_eq!(record.attempts, 0);
+        assert_eq!(record.error_code.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn explicit_ensure_resumes_terminal_and_delayed_jobs() {
+        let (_temp, storage) = test_storage();
+        let discarded = job(DerivedIndexKind::SemanticText, "44");
+        let lease = queue_and_claim(&storage, &discarded);
+        storage
+            .mark_derived_index_job_discarded(&discarded, &lease, "empty_model_input", "empty")
+            .unwrap();
+        assert_eq!(
+            storage.ensure_derived_index_job(&discarded).unwrap(),
+            EnsureDerivedIndexJobResult::Requeued
+        );
+
+        let failed = job(DerivedIndexKind::SemanticText, "45");
+        let lease = queue_and_claim(&storage, &failed);
+        storage
+            .mark_derived_index_job_failed(
+                &failed,
+                &lease,
+                "temporary",
+                "temporary",
+                Some("2100-01-01 00:00:00"),
+            )
+            .unwrap();
+        assert_eq!(
+            storage.ensure_derived_index_job(&failed).unwrap(),
+            EnsureDerivedIndexJobResult::Requeued
+        );
+        storage
+            .mark_derived_index_job_processing(&failed)
+            .expect("explicit ensure clears delayed retry timestamp");
     }
 
     #[test]

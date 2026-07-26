@@ -240,6 +240,66 @@ impl StorageState {
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- Durable orchestration state for the foreground MiniLM migration.
+            -- The vector cache and sidecar remain rebuildable; these rows only
+            -- make a long-running upgrade resumable and diagnosable.
+            CREATE TABLE IF NOT EXISTS minilm_migration_runs (
+                run_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                vector_space_revision TEXT NOT NULL,
+                status TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                export_id TEXT,
+                export_cursor INTEGER NOT NULL DEFAULT 0 CHECK (export_cursor >= 0),
+                chroma_total INTEGER NOT NULL DEFAULT 0 CHECK (chroma_total >= 0),
+                chroma_processed INTEGER NOT NULL DEFAULT 0 CHECK (chroma_processed >= 0),
+                migrated INTEGER NOT NULL DEFAULT 0 CHECK (migrated >= 0),
+                legacy_unverified INTEGER NOT NULL DEFAULT 0 CHECK (legacy_unverified >= 0),
+                already_current INTEGER NOT NULL DEFAULT 0 CHECK (already_current >= 0),
+                failed INTEGER NOT NULL DEFAULT 0 CHECK (failed >= 0),
+                discarded INTEGER NOT NULL DEFAULT 0 CHECK (discarded >= 0),
+                unmappable INTEGER NOT NULL DEFAULT 0 CHECK (unmappable >= 0),
+                removed_extra INTEGER NOT NULL DEFAULT 0 CHECK (removed_extra >= 0),
+                publish_current INTEGER NOT NULL DEFAULT 0 CHECK (publish_current >= 0),
+                publish_total INTEGER NOT NULL DEFAULT 0 CHECK (publish_total >= 0),
+                required_free_bytes INTEGER NOT NULL DEFAULT 0 CHECK (required_free_bytes >= 0),
+                available_free_bytes INTEGER NOT NULL DEFAULT 0 CHECK (available_free_bytes >= 0),
+                monitor_was_running INTEGER NOT NULL DEFAULT 0,
+                monitor_was_paused INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                heartbeat_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finished_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_minilm_migration_runs_updated
+                ON minilm_migration_runs(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS minilm_migration_subjects (
+                run_id TEXT NOT NULL,
+                subject_key TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (run_id, subject_key),
+                FOREIGN KEY (run_id) REFERENCES minilm_migration_runs(run_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS minilm_migration_run_errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                subject_key TEXT,
+                phase TEXT NOT NULL,
+                code TEXT NOT NULL,
+                error TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (run_id) REFERENCES minilm_migration_runs(run_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_minilm_migration_errors_run
+                ON minilm_migration_run_errors(run_id, id);
+
             DROP TRIGGER IF EXISTS derived_embeddings_epoch_after_insert;
             CREATE TRIGGER derived_embeddings_epoch_after_insert
             AFTER INSERT ON derived_embeddings

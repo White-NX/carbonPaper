@@ -63,11 +63,23 @@ impl StorageState {
         encrypted_data: &[u8],
         encrypted_key: &[u8],
     ) -> Result<Vec<u8>, BackgroundReadError> {
-        let mut row_key =
-            decrypt_row_key_with_cng_silent(encrypted_key).map_err(|error| match error {
-                CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
-                other => BackgroundReadError::Other(format!("Failed to unwrap row key: {}", other)),
-            })?;
+        Self::decrypt_payload_with_unwrap(encrypted_data, encrypted_key, &|ciphertext| {
+            decrypt_row_key_with_cng_silent(ciphertext)
+        })
+    }
+
+    /// Row-payload decryption with an injected row-key unwrap, so batch
+    /// callers can reuse one `CngKeySession` handle instead of paying a CNG
+    /// open/free round-trip for every row.
+    pub(crate) fn decrypt_payload_with_unwrap(
+        encrypted_data: &[u8],
+        encrypted_key: &[u8],
+        unwrap_row_key: &dyn Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
+    ) -> Result<Vec<u8>, BackgroundReadError> {
+        let mut row_key = unwrap_row_key(encrypted_key).map_err(|error| match error {
+            CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
+            other => BackgroundReadError::Other(format!("Failed to unwrap row key: {}", other)),
+        })?;
 
         let decrypted = decrypt_with_master_key(&row_key, encrypted_data)
             .map_err(|e| BackgroundReadError::Other(format!("Failed to decrypt payload: {}", e)));

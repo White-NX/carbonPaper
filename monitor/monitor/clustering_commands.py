@@ -18,6 +18,11 @@ HANDLED_CLUSTERING_COMMANDS = {
     "smart_cluster_stop_drain",
     "smart_cluster_worker_status",
     "smart_cluster_calibrate_preview",
+    "start_task_vectors_export",
+    "get_task_vectors_export_status",
+    "export_task_vectors_page",
+    "finish_task_vectors_export",
+    "upsert_task_vectors",
 }
 
 
@@ -167,6 +172,78 @@ def handle_clustering_command(
                 "model_path": _resolve_model_path(),
             }
         except Exception as e:
+            return {"error": str(e)}
+
+    if cmd == "start_task_vectors_export":
+        service_error = _requires_service(manager=manager)
+        if service_error:
+            return service_error
+        auth_error = _requires_auth(auth_gate)
+        if auth_error:
+            return auth_error
+        try:
+            result = manager.start_task_vectors_export(
+                export_id=req.get("export_id", ""),
+            )
+            return {"status": "success", **result}
+        except Exception as e:
+            logger.exception("start_task_vectors_export failed")
+            return {"error": str(e)}
+
+    if cmd == "get_task_vectors_export_status":
+        service_error = _requires_service(manager=manager)
+        if service_error:
+            return service_error
+        auth_error = _requires_auth(auth_gate)
+        if auth_error:
+            return auth_error
+        try:
+            result = manager.get_task_vectors_export_status(req.get("export_id", ""))
+            return {"status": "success", **result}
+        except Exception as e:
+            logger.exception("get_task_vectors_export_status failed")
+            return {"error": str(e)}
+
+    if cmd == "export_task_vectors_page":
+        service_error = _requires_service(manager=manager)
+        if service_error:
+            return service_error
+        auth_error = _requires_auth(auth_gate)
+        if auth_error:
+            return auth_error
+        try:
+            result = manager.export_task_vectors_page(
+                export_id=req.get("export_id", ""),
+                cursor=req.get("cursor", 0),
+                limit=req.get("limit", 128),
+            )
+            return {"status": "success", **result}
+        except Exception as e:
+            logger.exception("export_task_vectors_page failed")
+            return {"error": str(e)}
+
+    if cmd == "finish_task_vectors_export":
+        service_error = _requires_service(manager=manager)
+        if service_error:
+            return service_error
+        auth_error = _requires_auth(auth_gate)
+        if auth_error:
+            return auth_error
+        released = manager.finish_task_vectors_export(req.get("export_id", ""))
+        return {"status": "success", "released": released}
+
+    if cmd == "upsert_task_vectors":
+        service_error = _requires_service(manager=manager)
+        if service_error:
+            return service_error
+        auth_error = _requires_auth(auth_gate)
+        if auth_error:
+            return auth_error
+        try:
+            count = manager.upsert_task_vectors(req.get("records", []))
+            return {"status": "success", "upserted": count}
+        except Exception as e:
+            logger.exception("upsert_task_vectors failed")
             return {"error": str(e)}
 
     if cmd == "smart_cluster_drain_now":

@@ -85,6 +85,8 @@ READ_RETRY_COMMANDS = {
 
 IDEMPOTENT_RETRY_COMMANDS = {
     'update_screenshot_category',
+    'upsert_minilm_derived_embeddings',
+    'delete_minilm_derived_embeddings',
     'set_ocr_postprocess_status',
     'record_ocr_postprocess_retry',
     'smart_cluster_enqueue_pending',
@@ -725,6 +727,33 @@ class StorageClient:
         if response.get('status') == 'success':
             return response.get('data', {'screenshots': []})
         raise RuntimeError(response.get('error', 'Unknown error during IPC get_screenshots_with_ocr_by_ids'))
+
+    def upsert_minilm_derived_embeddings(self, records: List[Dict[str, Any]]) -> bool:
+        """Best-effort batch dual-write of Python-produced MiniLM vectors to Rust."""
+        if not records:
+            return True
+        if len(records) > 128:
+            raise ValueError('MiniLM dual-write batch exceeds 128 records')
+        response = self._send_request({
+            'command': 'upsert_minilm_derived_embeddings',
+            'records': records,
+        })
+        if response.get('status') != 'success':
+            return False
+        errors = response.get('data', {}).get('errors', [])
+        return not errors
+
+    def delete_minilm_derived_embeddings(self, screenshot_ids: List[int]) -> bool:
+        """Mirror hot-layer expiry into the Rust-derived semantic cache."""
+        if not screenshot_ids:
+            return True
+        if len(screenshot_ids) > 128:
+            raise ValueError('MiniLM delete batch exceeds 128 records')
+        response = self._send_request({
+            'command': 'delete_minilm_derived_embeddings',
+            'screenshot_ids': [int(value) for value in screenshot_ids],
+        })
+        return response.get('status') == 'success'
 
     def update_screenshot_category(
         self,

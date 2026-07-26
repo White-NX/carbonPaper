@@ -450,6 +450,14 @@ async fn handle_tools_call(
         None => return JsonRpcResponse::error(id, -32602, "Missing params".into()),
     };
 
+    if crate::maintenance::is_active() {
+        return JsonRpcResponse::error(
+            id,
+            -32000,
+            crate::maintenance::MAINTENANCE_IN_PROGRESS.into(),
+        );
+    }
+
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params
         .get("arguments")

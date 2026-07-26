@@ -602,6 +602,11 @@ fn process_request(
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
     let diag_start = std::time::Instant::now();
 
+    if crate::maintenance::is_active() && !crate::maintenance::reverse_ipc_command_allowed(command)
+    {
+        return StorageResponse::error(crate::maintenance::MAINTENANCE_IN_PROGRESS);
+    }
+
     let response = match command {
         "save_screenshot" => {
             // 解析保存截图请求
@@ -957,6 +962,106 @@ fn process_request(
                     StorageResponse::success(serde_json::json!({ "screenshots": out }))
                 }
                 Err(error) => background_read_error_response(error),
+            }
+        }
+
+        "upsert_minilm_derived_embeddings" => {
+            if !storage.is_session_valid() {
+                return StorageResponse::error("AUTH_REQUIRED");
+            }
+            let Some(records) = req.get("records").and_then(|value| value.as_array()) else {
+                return StorageResponse::error("records must be an array");
+            };
+            if records.len() > 128 {
+                return StorageResponse::error("MiniLM dual-write batch exceeds 128 records");
+            }
+            let mut completed = 0_u64;
+            let mut already_current = 0_u64;
+            let mut errors = Vec::new();
+            for record in records {
+                let screenshot_id = record
+                    .get("screenshot_id")
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(0);
+                let vector: Vec<f32> =
+                    match record.get("embedding").cloned().map(serde_json::from_value) {
+                        Some(Ok(vector)) => vector,
+                        Some(Err(error)) => {
+                            errors.push(serde_json::json!({
+                                "screenshot_id": screenshot_id,
+                                "error": format!("invalid embedding: {error}"),
+                            }));
+                            continue;
+                        }
+                        None => {
+                            errors.push(serde_json::json!({
+                                "screenshot_id": screenshot_id,
+                                "error": "embedding is required",
+                            }));
+                            continue;
+                        }
+                    };
+                match crate::minilm_migration::import_minilm_vector_from_python(
+                    storage,
+                    screenshot_id,
+                    vector,
+                ) {
+                    Ok(crate::storage::EnsureDerivedIndexJobResult::Queued)
+                    | Ok(crate::storage::EnsureDerivedIndexJobResult::Requeued) => completed += 1,
+                    Ok(_) => already_current += 1,
+                    Err(error) => errors.push(serde_json::json!({
+                        "screenshot_id": screenshot_id,
+                        "error": error,
+                    })),
+                }
+            }
+            StorageResponse::success(serde_json::json!({
+                "completed": completed,
+                "already_current": already_current,
+                "errors": errors,
+            }))
+        }
+
+        "delete_minilm_derived_embeddings" => {
+            if !storage.is_session_valid() {
+                return StorageResponse::error("AUTH_REQUIRED");
+            }
+            let Some(ids) = req.get("screenshot_ids").and_then(|value| value.as_array()) else {
+                return StorageResponse::error("screenshot_ids must be an array");
+            };
+            if ids.len() > 128 {
+                return StorageResponse::error("MiniLM delete batch exceeds 128 records");
+            }
+            let mut deleted = 0_u64;
+            let mut errors = Vec::new();
+            for value in ids {
+                let screenshot_id = value.as_i64().unwrap_or(0);
+                if screenshot_id <= 0 {
+                    errors.push(serde_json::json!({
+                        "screenshot_id": screenshot_id,
+                        "error": "screenshot_id must be positive",
+                    }));
+                    continue;
+                }
+                match storage.delete_derived_index_subject(
+                    crate::storage::DerivedIndexKind::SemanticText,
+                    &screenshot_id.to_string(),
+                ) {
+                    Ok(true) => deleted += 1,
+                    Ok(false) => {}
+                    Err(error) => errors.push(serde_json::json!({
+                        "screenshot_id": screenshot_id,
+                        "error": error,
+                    })),
+                }
+            }
+            if errors.is_empty() {
+                StorageResponse::success(serde_json::json!({ "deleted": deleted }))
+            } else {
+                StorageResponse::error(&format!(
+                    "Failed to delete {} MiniLM rows",
+                    errors.len()
+                ))
             }
         }
 
@@ -1471,6 +1576,11 @@ async fn process_nmh_request(
     app_handle: tauri::AppHandle,
 ) -> StorageResponse {
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
+
+    if crate::maintenance::is_active() && !crate::maintenance::reverse_ipc_command_allowed(command)
+    {
+        return StorageResponse::error(crate::maintenance::MAINTENANCE_IN_PROGRESS);
+    }
 
     match command {
         "register_nmh" => {

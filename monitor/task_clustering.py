@@ -17,10 +17,14 @@ import gc
 import sys
 import json
 import time
+import base64
 import logging
+import secrets
+import shutil
 import threading
 import hashlib
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Tuple
 
 from clustering_resources import (
@@ -43,6 +47,12 @@ class ModelNotAvailableError(Exception):
 # Constants
 # ---------------------------------------------------------------------------
 EMBEDDING_DIM = 384
+RUST_DUAL_WRITE_BATCH_SIZE = 32
+MAX_TASK_VECTOR_EXPORTS = 4
+TASK_VECTOR_EXPORT_LOGICAL_TIMEOUT_SECS = 10 * 60
+TASK_VECTOR_EXPORT_IDLE_TTL_SECS = 24 * 60 * 60
+TASK_VECTOR_EXPORT_HARD_TTL_SECS = 7 * 24 * 60 * 60
+TASK_VECTOR_EXPORT_TMP_TTL_SECS = 60 * 60
 HOT_LAYER_DAYS = 30
 CENTROID_MATCH_THRESHOLD = 0.55   # cosine similarity threshold for assigning to existing cluster
 MIN_CLUSTER_SIZE = 5
@@ -489,9 +499,17 @@ class HotColdManager:
         self._storage_client = storage_client
         self._embedder = TaskEmbedder()
         self._engine = ClusteringEngine()
+        self._task_vector_exports = {}
+        self._task_vector_export_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="task-vector-export",
+        )
+        self._pending_rust_deletes = set()
         # run_clustering calls helpers/properties that also acquire this lock.
         # Use RLock to avoid self-deadlock on nested acquisitions.
         self._lock = threading.RLock()
+
+        self._load_pending_rust_deletes()
 
         logger.info("[task_clustering] HotColdManager ready (lazy loading collections)")
 
@@ -558,6 +576,468 @@ class HotColdManager:
 
     # ---- Hot layer operations --------------------------------------------
 
+    @staticmethod
+    def _task_vector_sort_key(doc_id: str):
+        try:
+            parsed = int(doc_id)
+            if parsed > 0 and str(parsed) == doc_id:
+                return (0, parsed)
+        except (TypeError, ValueError):
+            pass
+        return (1, doc_id)
+
+    @staticmethod
+    def _migration_artifact_root() -> str:
+        data_dir = os.environ.get("CARBONPAPER_DATA_DIR")
+        if not data_dir:
+            local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+            data_dir = os.path.join(local_appdata, "CarbonPaper", "data")
+        return os.path.join(data_dir, "migrations", "minilm")
+
+    @classmethod
+    def _task_vector_export_dir(cls, export_id: str) -> str:
+        return os.path.join(cls._migration_artifact_root(), export_id)
+
+    @classmethod
+    def _rust_delete_retry_path(cls) -> str:
+        return os.path.join(cls._migration_artifact_root(), "rust-delete-retry.json")
+
+    @staticmethod
+    def _validate_export_id(export_id: str) -> str:
+        export_id = str(export_id or "")
+        if not (16 <= len(export_id) <= 128) or any(
+            not (ch.isalnum() or ch in "-_") for ch in export_id
+        ):
+            raise ValueError("invalid task vector export id")
+        return export_id
+
+    def _cleanup_task_vector_exports(self) -> None:
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        root = self._migration_artifact_root()
+        try:
+            os.makedirs(root, exist_ok=True)
+            for name in os.listdir(root):
+                path = os.path.join(root, name)
+                if not os.path.isdir(path):
+                    continue
+                try:
+                    age = now_wall - os.path.getmtime(path)
+                    ttl = (
+                        TASK_VECTOR_EXPORT_TMP_TTL_SECS
+                        if name.endswith(".tmp")
+                        else TASK_VECTOR_EXPORT_HARD_TTL_SECS
+                    )
+                    if age > ttl:
+                        shutil.rmtree(path, ignore_errors=True)
+                except OSError:
+                    pass
+        except OSError:
+            logger.debug("[task_clustering] failed to clean export artifacts", exc_info=True)
+
+        with self._lock:
+            expired = [
+                export_id
+                for export_id, state in self._task_vector_exports.items()
+                if state.get("status") != "preparing"
+                and now_mono - state.get("last_access", now_mono)
+                > TASK_VECTOR_EXPORT_IDLE_TTL_SECS
+            ]
+            for export_id in expired:
+                self._task_vector_exports.pop(export_id, None)
+
+    def _build_task_vectors_export(
+        self,
+        export_id: str,
+        stop_event: threading.Event,
+    ) -> None:
+        final_dir = self._task_vector_export_dir(export_id)
+        temp_dir = final_dir + ".tmp"
+        try:
+            results = self.hot_collection.get(include=[])
+            ids = [str(doc_id) for doc_id in (results.get("ids") or [])]
+            ids.sort(key=self._task_vector_sort_key)
+
+            with self._lock:
+                state = self._task_vector_exports.get(export_id)
+                if (
+                    state is None
+                    or state.get("status") != "preparing"
+                    or stop_event.is_set()
+                ):
+                    return
+
+            os.makedirs(self._migration_artifact_root(), exist_ok=True)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            os.makedirs(temp_dir, exist_ok=False)
+            ids_path = os.path.join(temp_dir, "ids.json")
+            with open(ids_path + ".tmp", "w", encoding="utf-8") as stream:
+                json.dump(ids, stream, ensure_ascii=False, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(ids_path + ".tmp", ids_path)
+            manifest = {
+                "export_id": export_id,
+                "total": len(ids),
+                "created_at": time.time(),
+            }
+            manifest_path = os.path.join(temp_dir, "manifest.json")
+            with open(manifest_path + ".tmp", "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream, separators=(",", ":"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(manifest_path + ".tmp", manifest_path)
+
+            with self._lock:
+                state = self._task_vector_exports.get(export_id)
+                if (
+                    state is None
+                    or state.get("status") != "preparing"
+                    or stop_event.is_set()
+                ):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    return
+                if os.path.isdir(final_dir):
+                    shutil.rmtree(final_dir, ignore_errors=True)
+                os.replace(temp_dir, final_dir)
+                state.update({
+                    "status": "ready",
+                    "total": len(ids),
+                    "ids": tuple(ids),
+                    "last_access": time.monotonic(),
+                    "finished_at": time.time(),
+                })
+        except Exception as exc:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            with self._lock:
+                state = self._task_vector_exports.get(export_id)
+                if state is not None and state.get("status") == "preparing":
+                    state.update({
+                        "status": "failed",
+                        "error": str(exc),
+                        "last_access": time.monotonic(),
+                    })
+            logger.exception("task_vectors export snapshot failed")
+
+    def start_task_vectors_export(
+        self,
+        export_id: str,
+    ) -> Dict[str, Any]:
+        """Start a persistent ID snapshot without blocking the IPC worker."""
+        self._cleanup_task_vector_exports()
+        export_id = self._validate_export_id(export_id or secrets.token_hex(16))
+        now_mono = time.monotonic()
+        with self._lock:
+            existing = self._task_vector_exports.get(export_id)
+            if existing is not None:
+                return self.get_task_vectors_export_status(export_id)
+            if len(self._task_vector_exports) >= MAX_TASK_VECTOR_EXPORTS:
+                oldest = min(
+                    self._task_vector_exports,
+                    key=lambda key: self._task_vector_exports[key].get("created_mono", now_mono),
+                )
+                self._task_vector_exports.pop(oldest, None)
+            stop_event = threading.Event()
+            self._task_vector_exports[export_id] = {
+                "status": "preparing",
+                "total": 0,
+                "ids": None,
+                "error": None,
+                "created_mono": now_mono,
+                "created_at": time.time(),
+                "last_access": now_mono,
+                "stop_event": stop_event,
+            }
+        self._task_vector_export_executor.submit(
+            self._build_task_vectors_export,
+            export_id,
+            stop_event,
+        )
+        return {"export_id": export_id, "state": "preparing", "total": 0}
+
+    def _restore_task_vector_export(self, export_id: str) -> Optional[Dict[str, Any]]:
+        export_dir = self._task_vector_export_dir(export_id)
+        manifest_path = os.path.join(export_dir, "manifest.json")
+        ids_path = os.path.join(export_dir, "ids.json")
+        if not (os.path.isfile(manifest_path) and os.path.isfile(ids_path)):
+            return None
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            with open(ids_path, "r", encoding="utf-8") as stream:
+                ids = tuple(str(value) for value in json.load(stream))
+            if manifest.get("export_id") != export_id or int(manifest.get("total", -1)) != len(ids):
+                raise ValueError("task vector export manifest does not match ids")
+            return {
+                "status": "ready",
+                "total": len(ids),
+                "ids": ids,
+                "error": None,
+                "created_mono": time.monotonic(),
+                "created_at": float(manifest.get("created_at", time.time())),
+                "last_access": time.monotonic(),
+                "stop_event": threading.Event(),
+                "finished_at": os.path.getmtime(manifest_path),
+            }
+        except Exception:
+            logger.exception("failed to restore task_vectors export %s", export_id)
+            return None
+
+    def get_task_vectors_export_status(self, export_id: str) -> Dict[str, Any]:
+        export_id = self._validate_export_id(export_id)
+        self._cleanup_task_vector_exports()
+        with self._lock:
+            state = self._task_vector_exports.get(export_id)
+        if state is None:
+            restored = self._restore_task_vector_export(export_id)
+            if restored is not None:
+                with self._lock:
+                    self._task_vector_exports[export_id] = restored
+                    state = restored
+        if state is None:
+            return {"export_id": export_id, "state": "missing", "total": 0}
+
+        with self._lock:
+            state = self._task_vector_exports[export_id]
+            elapsed = time.monotonic() - state.get("created_mono", time.monotonic())
+            if (
+                state.get("status") == "preparing"
+                and elapsed > TASK_VECTOR_EXPORT_LOGICAL_TIMEOUT_SECS
+            ):
+                state["status"] = "timed_out"
+                state["error"] = "task vector ID snapshot exceeded its 10 minute deadline"
+                state["stop_event"].set()
+            state["last_access"] = time.monotonic()
+            return {
+                "export_id": export_id,
+                "state": state.get("status", "missing"),
+                "total": int(state.get("total", 0) or 0),
+                "error": state.get("error"),
+                "created_at": state.get("created_at"),
+                "finished_at": state.get("finished_at"),
+            }
+
+    def export_task_vectors_page(
+        self,
+        export_id: str,
+        cursor: int = 0,
+        limit: int = 128,
+    ) -> Dict[str, Any]:
+        """Export one page from a stable id snapshot, preserving snapshot order.
+
+        Vectors travel as one little-endian float32 blob wrapped in Base64
+        instead of tens of thousands of JSON floats, keeping a 128-row page
+        around 256 KB of pipe traffic.
+        """
+        export_id = self._validate_export_id(export_id)
+        cursor = max(0, int(cursor))
+        limit = max(1, min(500, int(limit)))
+        with self._lock:
+            snapshot = self._task_vector_exports.get(export_id)
+        if snapshot is None:
+            snapshot = self._restore_task_vector_export(export_id)
+            if snapshot is not None:
+                with self._lock:
+                    self._task_vector_exports[export_id] = snapshot
+        if snapshot is None:
+            raise ValueError("unknown or expired task vector export")
+        with self._lock:
+            snapshot = self._task_vector_exports[export_id]
+            if snapshot.get("status") != "ready":
+                raise ValueError(f"task vector export is {snapshot.get('status')}")
+            snapshot["last_access"] = time.monotonic()
+            snapshot_ids = snapshot["ids"]
+            page_ids = list(snapshot_ids[cursor:cursor + limit])
+            total = len(snapshot_ids)
+
+        if not page_ids:
+            return {
+                "ids": [],
+                "dimensions": EMBEDDING_DIM,
+                "embeddings_f32_le_b64": "",
+                "missing_ids": [],
+                "errors": [],
+                "next_cursor": cursor,
+                "done": True,
+                "total": total,
+            }
+
+        results = self.hot_collection.get(ids=page_ids, include=["embeddings"])
+        returned_ids = [str(doc_id) for doc_id in (results.get("ids") or [])]
+        embeddings = results.get("embeddings")
+        if embeddings is None:
+            embeddings = []
+        vectors_by_id = {}
+        errors = []
+        for doc_id, vector in zip(returned_ids, embeddings):
+            try:
+                row = np.asarray(vector, dtype="<f4").reshape(-1)
+                if row.shape[0] != EMBEDDING_DIM:
+                    raise ValueError(
+                        f"expected {EMBEDDING_DIM} dimensions, got {row.shape[0]}"
+                    )
+                vectors_by_id[doc_id] = row
+            except Exception as exc:
+                errors.append({"id": doc_id, "error": str(exc)})
+
+        ordered_ids = [doc_id for doc_id in page_ids if doc_id in vectors_by_id]
+        if ordered_ids:
+            payload = np.concatenate([vectors_by_id[doc_id] for doc_id in ordered_ids])
+            embeddings_b64 = base64.b64encode(payload.tobytes()).decode("ascii")
+        else:
+            embeddings_b64 = ""
+        missing_ids = [
+            doc_id
+            for doc_id in page_ids
+            if doc_id not in vectors_by_id
+            and not any(entry["id"] == doc_id for entry in errors)
+        ]
+        next_cursor = cursor + len(page_ids)
+        return {
+            "ids": ordered_ids,
+            "dimensions": EMBEDDING_DIM,
+            "embeddings_f32_le_b64": embeddings_b64,
+            "missing_ids": missing_ids,
+            "errors": errors,
+            "next_cursor": next_cursor,
+            "done": next_cursor >= total,
+            "total": total,
+        }
+
+    def finish_task_vectors_export(self, export_id: str) -> bool:
+        """Release memory and persistent artifacts after a completed migration."""
+        export_id = self._validate_export_id(export_id)
+        with self._lock:
+            state = self._task_vector_exports.pop(export_id, None)
+            if state is not None:
+                state["stop_event"].set()
+        shutil.rmtree(self._task_vector_export_dir(export_id), ignore_errors=True)
+        shutil.rmtree(self._task_vector_export_dir(export_id) + ".tmp", ignore_errors=True)
+        return state is not None
+
+    def _load_pending_rust_deletes(self) -> None:
+        path = self._rust_delete_retry_path()
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                values = json.load(stream)
+            self._pending_rust_deletes = {
+                str(value) for value in values if str(value).isdigit() and int(value) > 0
+            }
+        except FileNotFoundError:
+            self._pending_rust_deletes = set()
+        except Exception:
+            logger.exception("failed to load pending Rust MiniLM deletions")
+            self._pending_rust_deletes = set()
+
+    def _persist_pending_rust_deletes(self) -> None:
+        path = self._rust_delete_retry_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            temp_path = path + ".tmp"
+            # The whole snapshot-write-replace sequence stays under the lock:
+            # concurrent writers would otherwise race on the same .tmp file
+            # (os.replace fails on Windows while the file is open).
+            with self._lock:
+                snapshot = sorted(self._pending_rust_deletes, key=int)
+                with open(temp_path, "w", encoding="utf-8") as stream:
+                    json.dump(snapshot, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temp_path, path)
+        except Exception:
+            logger.exception("failed to persist pending Rust MiniLM deletions")
+
+    def _flush_pending_rust_deletes(self) -> None:
+        if not self._storage_client:
+            return
+        with self._lock:
+            pending = sorted(self._pending_rust_deletes, key=int)
+        if not pending:
+            return
+        for offset in range(0, len(pending), 128):
+            batch = pending[offset:offset + 128]
+            try:
+                # IPC happens outside the lock; the manager lock also guards
+                # Chroma operations and must not wait on pipe round-trips.
+                if not self._storage_client.delete_minilm_derived_embeddings(
+                    [int(value) for value in batch]
+                ):
+                    break
+                with self._lock:
+                    self._pending_rust_deletes.difference_update(batch)
+            except Exception:
+                logger.debug("Rust MiniLM delete retry failed", exc_info=True)
+                break
+        self._persist_pending_rust_deletes()
+
+    def _queue_rust_deletes(self, ids: List[str]) -> None:
+        with self._lock:
+            self._pending_rust_deletes.update(str(value) for value in ids)
+        self._persist_pending_rust_deletes()
+        self._flush_pending_rust_deletes()
+
+    def upsert_task_vectors(self, records: List[Dict[str, Any]]) -> int:
+        """Write Rust-generated MiniLM vectors to the authoritative hot layer."""
+        if not isinstance(records, list) or not records:
+            return 0
+        if len(records) > 128:
+            raise ValueError("task vector upsert batch exceeds 128 records")
+
+        ids, embeddings, metadatas, documents = [], [], [], []
+        for record in records:
+            doc_id = str(record.get("id", ""))
+            if not doc_id.isdigit() or int(doc_id) <= 0 or str(int(doc_id)) != doc_id:
+                raise ValueError(f"invalid task vector id: {doc_id!r}")
+            vector = np.asarray(record.get("embedding", []), dtype=np.float32)
+            if vector.shape != (EMBEDDING_DIM,) or not np.isfinite(vector).all():
+                raise ValueError(f"invalid task vector for id {doc_id}")
+            timestamp = float(record.get("timestamp", 0) or 0)
+            if timestamp > 1e12:
+                timestamp /= 1000.0
+            process_name = str(record.get("process_name", "") or "")
+            window_title = str(record.get("window_title", "") or "")
+            category = str(record.get("category", "") or "")
+            document = str(record.get("document", "") or "")
+            ids.append(doc_id)
+            embeddings.append(vector.tolist())
+            metadatas.append({
+                "screenshot_id": int(doc_id),
+                "timestamp": timestamp,
+                "process_name": self._encrypt(process_name) if process_name else "",
+                "window_title": self._encrypt(window_title) if window_title else "",
+                "category": category,
+                "layer": "hot",
+            })
+            documents.append(self._encrypt(document))
+
+        self.hot_collection.upsert(
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            documents=documents,
+        )
+        return len(ids)
+
+    def _dual_write_rust(self, ids: List[str], vectors) -> None:
+        """Best-effort reverse-IPC copy; Chroma success remains authoritative."""
+        if not self._storage_client or not ids:
+            return
+        try:
+            for offset in range(0, len(ids), RUST_DUAL_WRITE_BATCH_SIZE):
+                batch_ids = ids[offset:offset + RUST_DUAL_WRITE_BATCH_SIZE]
+                batch_vectors = vectors[offset:offset + RUST_DUAL_WRITE_BATCH_SIZE]
+                records = [
+                    {
+                        "screenshot_id": int(doc_id),
+                        "embedding": np.asarray(vector, dtype=np.float32).tolist(),
+                    }
+                    for doc_id, vector in zip(batch_ids, batch_vectors)
+                ]
+                if not self._storage_client.upsert_minilm_derived_embeddings(records):
+                    logger.debug("[task_clustering] Rust MiniLM dual-write returned row errors")
+        except Exception as e:
+            logger.debug("[task_clustering] Rust MiniLM dual-write failed (non-fatal): %s", e)
+
     def add_snapshot(
         self,
         screenshot_id: int,
@@ -609,6 +1089,8 @@ class HotColdManager:
             metadatas=[metadata],
             documents=[self._encrypt(combined)],
         )
+        self._dual_write_rust([doc_id], [vector])
+        self._flush_pending_rust_deletes()
 
         # Enqueue for smart cluster evaluation. Best-effort and O(1) — the
         # actual scoring happens in a separate idle-aware worker so this stays
@@ -759,6 +1241,7 @@ class HotColdManager:
             )
             if expired["ids"]:
                 self.hot_collection.delete(ids=expired["ids"])
+                self._queue_rust_deletes(expired["ids"])
                 logger.info("Removed %d expired vectors from hot layer", len(expired["ids"]))
         except Exception as e:
             logger.warning("Failed to clean expired hot vectors: %s", e)
@@ -898,6 +1381,7 @@ class HotColdManager:
                         embeddings=vectors.tolist(),
                         metadatas=batch_metas,
                     )
+                    self._dual_write_rust(batch_ids, vectors)
                     added += len(batch_ids)
                     logger.info("Backfilled %d/%d (page offset %d)", added, total, offset)
                 except Exception as e:
