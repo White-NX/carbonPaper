@@ -1128,8 +1128,7 @@ fn decrypt_master_key_with_cng_flags(
     flags: windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
     owner_hwnd: Option<isize>,
 ) -> Result<Vec<u8>, CredentialError> {
-    use windows::Win32::Foundation::NTE_SILENT_CONTEXT;
-    use windows::Win32::Security::Cryptography::{NCryptDecrypt, NCryptFreeObject, NCRYPT_HANDLE};
+    use windows::Win32::Security::Cryptography::{NCryptFreeObject, NCRYPT_HANDLE};
 
     let key = open_or_create_cng_key()?;
     if let Some(hwnd) = owner_hwnd {
@@ -1154,21 +1153,38 @@ fn decrypt_master_key_with_cng_flags(
         })?;
     }
 
+    let result = ncrypt_decrypt_with_key(key, ciphertext, flags);
+    // SAFETY: this is the final use of the owned key handle.
+    let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
+    result
+}
+
+/// Runs the size-query + decrypt `NCryptDecrypt` pair against a borrowed key
+/// handle. The caller keeps ownership of the handle and frees it, which lets
+/// [`CngKeySession`] reuse one handle across a whole batch.
+#[cfg(windows)]
+fn ncrypt_decrypt_with_key(
+    key: windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE,
+    ciphertext: &[u8],
+    flags: windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
+) -> Result<Vec<u8>, CredentialError> {
+    use windows::Win32::Foundation::NTE_SILENT_CONTEXT;
+    use windows::Win32::Security::Cryptography::NCryptDecrypt;
+
+    let map_error = |stage: &str, e: windows::core::Error| {
+        if e.code() == NTE_SILENT_CONTEXT {
+            CredentialError::AuthRequired
+        } else {
+            CredentialError::SystemError(format!("{stage}: {e}"))
+        }
+    };
+
     // Query plaintext size before allocating the output buffer.
     let mut out_len: u32 = 0;
     // SAFETY: key and ciphertext are live; the null output buffer requests only the
     // plaintext length and `out_len` points to writable stack storage.
-    unsafe { NCryptDecrypt(key, Some(ciphertext), None, None, &mut out_len, flags) }.map_err(
-        |e| {
-            // SAFETY: key ownership remains local when decryption fails.
-            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-            if e.code() == NTE_SILENT_CONTEXT {
-                CredentialError::AuthRequired
-            } else {
-                CredentialError::SystemError(format!("NCryptDecrypt size failed: {}", e))
-            }
-        },
-    )?;
+    unsafe { NCryptDecrypt(key, Some(ciphertext), None, None, &mut out_len, flags) }
+        .map_err(|e| map_error("NCryptDecrypt size failed", e))?;
 
     let mut output = vec![0u8; out_len as usize];
     // SAFETY: output is uniquely mutable and sized from CNG's query; all handles and
@@ -1183,18 +1199,8 @@ fn decrypt_master_key_with_cng_flags(
             flags,
         )
     }
-    .map_err(|e| {
-        // SAFETY: key ownership remains local when decryption fails.
-        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-        if e.code() == NTE_SILENT_CONTEXT {
-            CredentialError::AuthRequired
-        } else {
-            CredentialError::SystemError(format!("NCryptDecrypt failed: {}", e))
-        }
-    })?;
+    .map_err(|e| map_error("NCryptDecrypt failed", e))?;
 
-    // SAFETY: this is the final use of the owned key handle.
-    let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
     output.truncate(out_len as usize);
     Ok(output)
 }
@@ -1213,6 +1219,68 @@ pub fn decrypt_row_key_with_cng_silent(ciphertext: &[u8]) -> Result<Vec<u8>, Cre
     use windows::Win32::Security::Cryptography::{NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG};
 
     decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG, None)
+}
+
+/// Reusable CNG unwrap session that keeps the private-key handle open for a
+/// whole batch.
+///
+/// Every one-shot [`decrypt_row_key_with_cng_silent`] call pays a
+/// provider-open + key-open + free RPC round-trip to the key-isolation
+/// service before the actual RSA decrypt. Batch readers (the MiniLM
+/// migration fingerprints tens of thousands of OCR boxes) amortize that
+/// fixed cost by opening the handle once. Handles are not tied to a thread,
+/// but each worker thread must open its own session so no handle receives
+/// concurrent `NCryptDecrypt` calls.
+#[cfg(windows)]
+pub struct CngKeySession {
+    key: windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE,
+}
+
+#[cfg(windows)]
+impl CngKeySession {
+    /// Opens the persisted key for silent batch unwrapping. Background use
+    /// only: a locked session surfaces as `AuthRequired` on decrypt instead
+    /// of popping system UI.
+    pub fn open_silent() -> Result<Self, CredentialError> {
+        Ok(Self {
+            key: open_or_create_cng_key()?,
+        })
+    }
+
+    /// Silently unwraps one row key with the cached handle.
+    pub fn unwrap_row_key(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+        use windows::Win32::Security::Cryptography::{NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG};
+
+        ncrypt_decrypt_with_key(self.key, ciphertext, NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CngKeySession {
+    fn drop(&mut self) {
+        use windows::Win32::Security::Cryptography::{NCryptFreeObject, NCRYPT_HANDLE};
+
+        // SAFETY: the session exclusively owns the handle; this is its final use.
+        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(self.key.0)) };
+    }
+}
+
+#[cfg(not(windows))]
+pub struct CngKeySession;
+
+#[cfg(not(windows))]
+impl CngKeySession {
+    pub fn open_silent() -> Result<Self, CredentialError> {
+        Err(CredentialError::SystemError(
+            "CNG is only available on Windows".to_string(),
+        ))
+    }
+
+    pub fn unwrap_row_key(&self, _ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+        Err(CredentialError::SystemError(
+            "CNG is only available on Windows".to_string(),
+        ))
+    }
 }
 
 fn encode_master_key_file(ciphertext: &[u8]) -> Vec<u8> {

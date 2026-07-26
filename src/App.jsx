@@ -16,6 +16,7 @@ import { NotificationToast, NotificationPanel } from './components/Notifications
 import ErrorWindow from './components/ErrorWindow';
 import HmacMigrationDialog from './components/HmacMigrationDialog';
 import StartupVacuumDialog from './components/StartupVacuumDialog';
+import MinilmMigrationOverlay from './components/MinilmMigrationOverlay';
 import OcrModelRepairCard from './components/OcrModelRepairCard';
 import { deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 import { UpdateModal } from './components/UpdateModal';
@@ -281,6 +282,10 @@ function App() {
         />
 
         <StartupVacuumDialog />
+
+        {/* Top-level, non-dismissable maintenance overlay: covers the whole
+            window (TopBar included) while the MiniLM migration runs. */}
+        <MinilmMigrationOverlay />
 
         {isAuthenticated && <HmacMigrationDialog />}
 

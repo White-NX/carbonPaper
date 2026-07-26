@@ -572,7 +572,7 @@ async fn dispatch_typed_monitor_command(
     forward_command_to_python(&state, payload).await
 }
 
-async fn authenticated_monitor_command(
+pub(crate) async fn authenticated_monitor_command(
     credential_state: &crate::credential_manager::CredentialManagerState,
     state: &MonitorState,
     payload: Value,
@@ -1753,6 +1753,7 @@ pub async fn start_monitor(
     app: AppHandle,
 ) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
+    crate::maintenance::guard()?;
     start_monitor_impl(state, app).await
 }
 
@@ -2005,6 +2006,7 @@ pub async fn stop_monitor(
     app: AppHandle,
 ) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
+    crate::maintenance::guard()?;
     stop_monitor_impl(state, capture_state, app).await
 }
 
@@ -2031,6 +2033,7 @@ pub async fn pause_monitor(
     app: AppHandle,
 ) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
+    crate::maintenance::guard()?;
     pause_monitor_impl(state, capture_state, app).await
 }
 
@@ -2055,6 +2058,7 @@ pub async fn resume_monitor(
     app: AppHandle,
 ) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
+    crate::maintenance::guard()?;
     resume_monitor_impl(state, capture_state, app).await
 }
 

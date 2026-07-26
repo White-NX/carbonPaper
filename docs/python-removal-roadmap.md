@@ -175,8 +175,9 @@ snapshot; SQLite remains authoritative, and the payload can be replaced by an
 ANN layout when the M2.5 query path needs it without changing persistence or
 generation semantics. Runtime publication never deletes finalized sidecars;
 unreferenced generations are cleaned during the next startup, before readers
-are exposed. M2.4 owns paged rebuild/migration orchestration; M2.5 owns
-dual-write and production query cutover.
+are exposed. M2.4 owns the paged MiniLM migration and the temporary
+Chroma/Rust index dual-write; M2.5 owns shadow queries, production query
+cutover, and the later CLIP overlap.
 
 - Prefer a two-layer derived design:
   1. a SQLite `derived_embeddings` cache holding the migrated/generated float32 vector plus `index_kind`, `subject_key`, dimensions, model id/revision, embedding version, source fingerprint, and timestamps;
@@ -189,19 +190,90 @@ dual-write and production query cutover.
 - New vectors become query-visible only after the embedding row and completed ledger state commit. ANN generation lag must be safe: queries use the last complete generation plus a bounded exact-scan delta, or wait for an atomic generation swap.
 - Deletion, model-version invalidation, duplicate image hashes, session lock/unlock, and interrupted writes need first-party tests.
 
-#### M2.4 — Explicit rebuild and Chroma migration
+#### M2.4 — Sentinel-triggered MiniLM migration — DONE 2026-07-24
 
-- Add one explicit, idempotent, paged rebuild/migration command per index kind. It is resumable from the ledger, idle-gated by default, manually forceable, cancellable, and never an automatic unbounded background loop.
-- Migrate `task_vectors` by `screenshot_id`; rehydrate process/title/category/OCR metadata from SQLite rather than trusting Chroma metadata as user truth.
-- Migrate `screenshots` vectors as float arrays, never by routine image re-encoding. Export id/embedding/metadata while the Python/Chroma fallback still exists; decrypt `image_path`, require `memory://<image_hash>`, verify the legacy `md5("memory://" + image_hash)` id, and map to an active SQLite screenshot. Rows that cannot be mapped remain on the legacy backend and block cutover; they are not silently dropped or automatically re-encoded.
-- Keep `task_centroids` and any Chroma operations needed by Python HDBSCAN/PaCMAP until Milestone 4. During the overlap, either continue Python ownership of those collections or dual-write the `task_vectors` inputs it needs. Do not delete `chromadb` from default dependencies in Milestone 2 merely because Rust search has cut over.
+The Chroma `task_vectors` collection is a ~30-day hot layer whose expired
+vectors are compressed into `task_centroids`, so "every SQLite screenshot has
+a MiniLM vector" is **not** a migration completion condition, and the Rust
+coverage denominator for the later cutover gate is the set of valid, mappable
+vectors in the Chroma snapshot — not all screenshots.
+
+The mandatory copy is entirely sentinel-triggered. For each vector-space
+revision, the absence of
+`app_metadata.minilm_auto_migration_done_<revision>` starts one full-scope,
+idempotent copy at startup. The worker waits for Windows Hello unlock before
+reading encrypted OCR inputs. A crash, process exit, or transient worker
+failure leaves the sentinel unset; the next launch/unlock resumes from the
+durable cursor and snapshot. Legacy manual/time-bounded run records are never
+resumed or allowed to settle the sentinel; the automatic mode starts a fresh
+full copy instead.
+Terminally quarantined invalid/orphan rows may finish as
+`completed_with_errors` and still settle the sentinel; transient orchestration
+failures remain unfinished and retry automatically.
+
+The whole run executes under global maintenance mode: a non-dismissable
+full-window overlay, `MAINTENANCE_IN_PROGRESS` rejection at MCP and reverse
+IPC boundaries (with a small session/crypto/status/dual-write allowlist),
+gated monitor start/stop/pause/resume commands, and a paused
+retention/delete-queue loop. Capture is paused for the duration; the previous
+monitor running/paused state is recorded and restored exactly. The migration
+cannot be started from settings and cannot be cancelled; closing the app is
+the only interruption.
+
+The full hot-layer ID snapshot is built asynchronously by an internal Python
+protocol (`start_task_vectors_export` → status polling → exact-id pages →
+`finish_task_vectors_export`), persisted with an atomically renamed manifest
+under `data/migrations/minilm/<export_id>/`, and bounded by a 10-minute logical
+build deadline plus 24 h idle / 7 d hard / 1 h `.tmp` TTLs. It has no
+user-facing time range or cancellation option.
+Pages carry vectors as one little-endian float32 blob in Base64
+(`embeddings_f32_le_b64`, ~256 KB per 128-row page) instead of tens of
+thousands of JSON floats. Run state is durable in
+`minilm_migration_runs` / `minilm_migration_subjects` /
+`minilm_migration_run_errors`: each page commits ledger rows, embeddings,
+counters, and the export cursor in one transaction, so a crash either retries
+an uncommitted page or continues after it, and an interrupted run resumes by
+re-attaching to the persisted snapshot (a snapshot Python can no longer
+restore forces a cursor reset rather than a silently reordered page walk).
+Rust accepts only canonical positive screenshot ids and finite, non-zero
+384-dimensional vectors (zero vectors are quarantined, never imported), maps
+them to active SQLite screenshots, and rehydrates process/title/category/OCR
+from SQLite. A valid legacy vector whose current SQLite text is empty is still
+copied but marked `legacy_chroma_unverified` instead of being recomputed.
+Orphan Chroma ids, corrupt vectors, and rows that disappear after the snapshot
+remain persisted diagnostics and yield `completed_with_errors`. After the
+copy, a full-scope run deletes Rust `semantic_text` rows outside the snapshot
+scope (`reconcile`), and Python's hot-layer expiry now mirrors deletions to
+Rust through reverse IPC with a persisted retry queue, so the Rust collection
+tracks — rather than outgrows — the Chroma hot layer. A disk preflight
+(`estimated peak × 1.25 + 1 GiB`, with a 64 MiB transient allowance) rejects
+the run before any vector write; generation publication runs on a blocking
+worker with progress phases `publishing_sync` / `publishing_verify` /
+`publishing_commit`. The migration never requests cancellation; the final
+`sync_all` window is surfaced to the user as an uninterruptible safe write.
+
+The MiniLM source contract remains exactly `process | title | OCR[:200]`; its
+versioned fingerprint excludes category and is computed from the final
+Rust-rehydrated model input. Legacy Chroma rows do not record their producing
+runtime, so imported and newly generated vectors share the reviewed
+compatibility contract `minilm-l12-vector-space-v1`. Python capture paths
+best-effort dual-write their vectors to Rust through authenticated reverse IPC;
+Rust ignores Python metadata and recomputes the fingerprint. The migration
+never runs inference to manufacture a missing vector.
+Chroma/Python remains the authoritative query backend in this phase: there is
+no shadow-query or production-query switch in M2.4.
+
+`task_centroids` and all Chroma operations needed by Python HDBSCAN/PaCMAP stay
+unchanged until Milestone 4. The separate CLIP `screenshots` float-copy
+migration remains step 6 of M2.5, immediately before CLIP new-capture
+dual-write and shadow query. `chromadb` therefore remains a default dependency.
 
 #### M2.5 — Dual-write, shadow-query, then cut over by capability
 
 Recommended sequence:
 
 1. MiniLM Rust inference parity.
-2. MiniLM derived-cache/index dual-write and migration.
+2. MiniLM derived-cache/index dual-write and migration. **Done in M2.4.**
 3. Rust semantic shadow queries compared locally with Chroma; Python remains authoritative.
 4. Cut over semantic-text retrieval and Smart Cluster calibration prefilter; keep rollback.
 5. Reranker parity and shadow scoring; cut over calibration only after score/order gates pass. The Python Smart Cluster worker may temporarily call the Rust reranker, but its Python fallback remains until Milestone 3.
@@ -387,6 +459,6 @@ Do not delete a Python component until its Rust replacement has shipped as defau
 
 ## Immediate Next Step
 
-Continue from `m2/derived-vector-store` with M2.4, preferably beginning in `m2/minilm-dual-write-migration`: add an explicit, idempotent, paged, resumable MiniLM rebuild/migration command backed by `derived_index_jobs`; rehydrate process/title/category/OCR inputs from SQLite; dual-write new MiniLM vectors to Chroma and the Rust store; expose progress, cancellation, force-run, and unmappable/error diagnostics. Python/Chroma remains authoritative until the later shadow-query gate passes.
+Continue with M2.5 MiniLM shadow queries: compare Rust semantic retrieval locally against Chroma using the migrated generation and bounded delta path, record score/order parity and latency, and keep Python/Chroma authoritative until the release gate and rollback checks pass. The coverage denominator for that gate is the set of valid, mappable vectors in the Chroma hot-layer snapshot, not all SQLite screenshots. Then cut over MiniLM semantic retrieval independently before beginning the separate CLIP vector migration/cutover sequence.
 
 No Rust backend becomes authoritative until its Python behavior contract, dual-write/migration, shadow-query, lifecycle, performance, and rollback gates pass. The first recommended cutover is MiniLM semantic retrieval; CLIP follows only after both legacy-vector migration and new-capture Rust image indexing work. Chroma remains for Milestone 4 task clustering, and Python BGE remains for Milestone 5 classification. Until subject-level Rust ledgers exist, the internal count-level CLIP comparison is only a migration baseline, not a product health judgment.

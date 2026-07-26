@@ -1,8 +1,7 @@
 //! Screenshot CRUD operations (save, get, delete, commit, abort).
 
 use crate::credential_manager::{
-    decrypt_row_key_with_cng_silent, decrypt_with_master_key, encrypt_with_master_key,
-    CredentialError,
+    decrypt_with_master_key, encrypt_with_master_key, CngKeySession, CredentialError,
 };
 use chrono::{DateTime, Utc};
 use rand::RngCore;
@@ -57,6 +56,137 @@ impl EncryptedScreenshotSummaryRow {
             category: row.get(7)?,
         })
     }
+}
+
+/// Upper bound for CNG unwrap worker threads. The RSA work runs inside the
+/// key-isolation service, which stops scaling beyond a few concurrent
+/// callers, and background reads must not saturate every core.
+const CNG_UNWRAP_MAX_THREADS: usize = 8;
+
+fn open_cng_session() -> Result<CngKeySession, BackgroundReadError> {
+    CngKeySession::open_silent().map_err(|error| match error {
+        CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
+        other => BackgroundReadError::Other(format!("Failed to open CNG session: {other}")),
+    })
+}
+
+/// Runs RPC-bound row-key unwrapping in parallel. Items are split into
+/// contiguous chunks; every worker thread opens its own [`CngKeySession`], so
+/// a batch pays the provider/key-open round-trip once per thread instead of
+/// once per row and no NCrypt handle receives concurrent calls. Input order
+/// is preserved. Any `AuthRequired` fails the whole batch with `AuthRequired`
+/// so callers keep their wait-for-unlock semantics.
+fn unwrap_batch_parallel<T, R, F>(items: Vec<T>, process: F) -> Result<Vec<R>, BackgroundReadError>
+where
+    T: Send,
+    R: Send,
+    F: Fn(&CngKeySession, T) -> Result<R, BackgroundReadError> + Sync,
+{
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .min(CNG_UNWRAP_MAX_THREADS)
+        .min(items.len())
+        .max(1);
+    if threads == 1 {
+        let session = open_cng_session()?;
+        return items
+            .into_iter()
+            .map(|item| process(&session, item))
+            .collect();
+    }
+
+    let chunk_size = items.len().div_ceil(threads);
+    let mut chunks: Vec<Vec<T>> = Vec::with_capacity(threads);
+    let mut remaining = items.into_iter();
+    loop {
+        let chunk: Vec<T> = remaining.by_ref().take(chunk_size).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        chunks.push(chunk);
+    }
+
+    let results: Vec<Result<Vec<R>, BackgroundReadError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(|| {
+                    let session = open_cng_session()?;
+                    chunk
+                        .into_iter()
+                        .map(|item| process(&session, item))
+                        .collect()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(BackgroundReadError::Other(
+                        "CNG unwrap worker panicked".to_string(),
+                    ))
+                })
+            })
+            .collect()
+    });
+
+    let mut merged = Vec::new();
+    let mut first_error: Option<BackgroundReadError> = None;
+    for result in results {
+        match result {
+            Ok(mut part) => merged.append(&mut part),
+            Err(BackgroundReadError::AuthRequired) => return Err(BackgroundReadError::AuthRequired),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(merged),
+    }
+}
+
+/// Joins decrypted OCR box texts with single spaces per screenshot, skipping
+/// empty boxes, and stops decrypting a screenshot's remaining boxes once
+/// `min_chars` joined characters are collected. Rows of one screenshot must
+/// arrive contiguously in reading order; the produced string is then a join
+/// prefix of the full join, so its first `min_chars` characters match the
+/// full text exactly (the MiniLM source contract only consumes that prefix).
+fn assemble_ocr_text_prefixes<E>(
+    rows: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)>,
+    min_chars: usize,
+    mut decrypt: impl FnMut(&[u8], &[u8]) -> Result<String, E>,
+) -> Result<std::collections::HashMap<i64, String>, E> {
+    let mut texts: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    let mut joined_chars: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for (screenshot_id, text_enc, key_enc) in rows {
+        if joined_chars
+            .get(&screenshot_id)
+            .is_some_and(|&count| count >= min_chars)
+        {
+            continue;
+        }
+        let (Some(data), Some(key)) = (text_enc.as_deref(), key_enc.as_deref()) else {
+            continue;
+        };
+        let text = decrypt(data, key)?;
+        if text.is_empty() {
+            continue;
+        }
+        let list = texts.entry(screenshot_id).or_default();
+        let count = joined_chars.entry(screenshot_id).or_insert(0);
+        *count += text.chars().count() + usize::from(!list.is_empty());
+        list.push(text);
+    }
+    Ok(texts
+        .into_iter()
+        .map(|(id, list)| (id, list.join(" ")))
+        .collect())
 }
 
 fn ocr_postprocess_retry_decision(current_attempts: i64) -> (&'static str, Option<i64>, i64) {
@@ -1469,9 +1599,12 @@ impl StorageState {
         Ok(raw_rows.into_iter().map(|raw| raw.into_record()).collect())
     }
 
-    fn decrypt_screenshot_summary_silent(
-        &self,
+    /// Decrypts one summary row with an injected row-key unwrap so batch
+    /// callers reuse a per-thread [`CngKeySession`] instead of paying a CNG
+    /// open/free round-trip per row.
+    fn decrypt_screenshot_summary_with_unwrap(
         row: EncryptedScreenshotSummaryRow,
+        unwrap_row_key: &dyn Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
     ) -> Result<BackgroundScreenshotSummary, BackgroundReadError> {
         let needs_row_key = row.window_title_enc.is_some() || row.process_name_enc.is_some();
         let mut row_key = if needs_row_key {
@@ -1481,15 +1614,13 @@ impl StorageState {
                     row.id
                 ))
             })?;
-            Some(
-                decrypt_row_key_with_cng_silent(encrypted_key).map_err(|error| match error {
-                    CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
-                    other => BackgroundReadError::Other(format!(
-                        "Failed to unwrap screenshot summary key id={}: {}",
-                        row.id, other
-                    )),
-                })?,
-            )
+            Some(unwrap_row_key(encrypted_key).map_err(|error| match error {
+                CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
+                other => BackgroundReadError::Other(format!(
+                    "Failed to unwrap screenshot summary key id={}: {}",
+                    row.id, other
+                )),
+            })?)
         } else {
             None
         };
@@ -1543,6 +1674,18 @@ impl StorageState {
             process_name: process_name_result?,
             timestamp: row.timestamp,
             category: row.category,
+        })
+    }
+
+    /// Decrypts summary rows in parallel with one CNG session per worker
+    /// thread, preserving input order.
+    fn decrypt_summaries_parallel(
+        raw_rows: Vec<EncryptedScreenshotSummaryRow>,
+    ) -> Result<Vec<BackgroundScreenshotSummary>, BackgroundReadError> {
+        unwrap_batch_parallel(raw_rows, |session, row| {
+            Self::decrypt_screenshot_summary_with_unwrap(row, &|ciphertext| {
+                session.unwrap_row_key(ciphertext)
+            })
         })
     }
 
@@ -1602,10 +1745,7 @@ impl StorageState {
             rows
         };
 
-        raw_rows
-            .into_iter()
-            .map(|row| self.decrypt_screenshot_summary_silent(row))
-            .collect()
+        Self::decrypt_summaries_parallel(raw_rows)
     }
 
     pub(crate) fn get_screenshot_summaries_by_time_range_paged_silent(
@@ -1667,10 +1807,7 @@ impl StorageState {
             rows
         };
 
-        raw_rows
-            .into_iter()
-            .map(|row| self.decrypt_screenshot_summary_silent(row))
-            .collect()
+        Self::decrypt_summaries_parallel(raw_rows)
     }
 
     pub fn get_screenshot_by_id(&self, id: i64) -> Result<Option<ScreenshotRecord>, String> {
@@ -1947,6 +2084,113 @@ impl StorageState {
             return Err(BackgroundReadError::AuthRequired);
         }
         self.get_ocr_results_by_screenshot_ids_with_mode(screenshot_ids, true)
+    }
+
+    /// Batch OCR text for MiniLM source fingerprints. Per screenshot only the
+    /// first `min_chars` joined characters are guaranteed — the MiniLM source
+    /// contract truncates OCR input to a fixed prefix — which lets the
+    /// decrypt loop skip the long tail of boxes: most screenshots reach the
+    /// budget within a few boxes instead of paying one RSA unwrap per box.
+    /// Screenshots are decrypted in parallel with per-thread CNG sessions.
+    /// Every requested id is present in the result (empty string when the
+    /// screenshot has no decryptable text), matching
+    /// [`Self::get_ocr_results_by_screenshot_ids_silent`].
+    pub(crate) fn get_ocr_text_prefixes_by_screenshot_ids_silent(
+        &self,
+        screenshot_ids: &[i64],
+        min_chars: usize,
+    ) -> Result<std::collections::HashMap<i64, String>, BackgroundReadError> {
+        if screenshot_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        if !self.is_session_valid() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
+
+        // Phase 1: fetch the raw encrypted rows with a read-only connection.
+        let raw_rows = {
+            let conn = self
+                .open_read_connection_named("get_ocr_text_prefixes_by_screenshot_ids_silent")
+                .map_err(BackgroundReadError::Other)?;
+
+            let mut raw_rows: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> = Vec::new();
+
+            // Process in chunks to avoid SQLite parameter limit (usually 999)
+            for chunk in screenshot_ids.chunks(500) {
+                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+                let sql = format!(
+                    "SELECT screenshot_id, text_enc, text_key_encrypted
+                     FROM ocr_results
+                     WHERE is_deleted = 0 AND screenshot_id IN ({})
+                     ORDER BY screenshot_id, box_y1, box_x1",
+                    placeholders.join(",")
+                );
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+                let mut stmt = conn.prepare(&sql).map_err(|e| {
+                    BackgroundReadError::Other(format!(
+                        "Failed to prepare OCR prefix query: {}",
+                        e
+                    ))
+                })?;
+
+                let rows = stmt
+                    .query_map(params.as_slice(), |row| {
+                        let screenshot_id: i64 = row.get(0)?;
+                        let text_enc: Option<Vec<u8>> = row.get(1)?;
+                        let text_key_enc: Option<Vec<u8>> = row.get(2)?;
+                        Ok((screenshot_id, text_enc, text_key_enc))
+                    })
+                    .map_err(|e| {
+                        BackgroundReadError::Other(format!(
+                            "Failed to execute OCR prefix query: {}",
+                            e
+                        ))
+                    })?;
+
+                for row in rows.filter_map(|r| r.ok()) {
+                    raw_rows.push(row);
+                }
+            }
+            raw_rows
+        };
+
+        // Phase 2: group boxes per screenshot. Each id lives in exactly one
+        // IN chunk and every chunk is ordered by screenshot_id, so the rows
+        // of one screenshot are contiguous and in reading order.
+        let mut groups: Vec<Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)>> = Vec::new();
+        for row in raw_rows {
+            match groups.last_mut() {
+                Some(group) if group.last().map(|(id, _, _)| *id) == Some(row.0) => {
+                    group.push(row)
+                }
+                _ => groups.push(vec![row]),
+            }
+        }
+
+        // Phase 3: decrypt each screenshot's prefix in parallel.
+        let maps = unwrap_batch_parallel(groups, |session, group| {
+            assemble_ocr_text_prefixes(group, min_chars, |data, key| {
+                let bytes = Self::decrypt_payload_with_unwrap(data, key, &|ciphertext| {
+                    session.unwrap_row_key(ciphertext)
+                })?;
+                String::from_utf8(bytes).map_err(|error| {
+                    BackgroundReadError::Other(format!("Invalid OCR text encoding: {}", error))
+                })
+            })
+        })?;
+
+        let mut result: std::collections::HashMap<i64, String> = screenshot_ids
+            .iter()
+            .map(|&id| (id, String::new()))
+            .collect();
+        for map in maps {
+            for (id, text) in map {
+                result.insert(id, text);
+            }
+        }
+        Ok(result)
     }
 
     fn get_ocr_results_by_screenshot_ids_with_mode(
@@ -3033,6 +3277,10 @@ mod ocr_lifecycle_tests {
             Err(BackgroundReadError::AuthRequired)
         ));
         assert!(matches!(
+            storage.get_ocr_text_prefixes_by_screenshot_ids_silent(&[1], 200),
+            Err(BackgroundReadError::AuthRequired)
+        ));
+        assert!(matches!(
             storage.get_screenshot_summaries_by_ids_silent(&[1]),
             Err(BackgroundReadError::AuthRequired)
         ));
@@ -3045,6 +3293,57 @@ mod ocr_lifecycle_tests {
             ),
             Err(BackgroundReadError::AuthRequired)
         ));
+    }
+
+    #[test]
+    fn ocr_prefix_assembly_matches_full_join_and_skips_tail_boxes() {
+        let box_row = |id: i64, text: &str| (id, Some(text.as_bytes().to_vec()), Some(vec![0u8]));
+        let rows = vec![
+            box_row(1, "0123456789"),
+            (1, None, None), // legacy row without payload is skipped for free
+            box_row(1, ""),  // empty box costs one decrypt but adds no text
+            box_row(1, "abcdefghij"), // joined length reaches the 20-char budget here
+            box_row(1, "tail-never-needed"),
+            box_row(1, "tail-never-needed-2"),
+            box_row(2, "短文本"),
+            box_row(3, "这是一段刚好超过二十个字符预算的中文文本内容"),
+            box_row(3, "尾部"),
+            box_row(4, ""), // only-empty screenshot yields no map entry
+        ];
+        let full_join = |wanted: i64| -> String {
+            rows.iter()
+                .filter(|(id, data, _)| *id == wanted && data.is_some())
+                .filter_map(|(_, data, _)| String::from_utf8(data.clone().unwrap()).ok())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        let mut decrypts = 0usize;
+        let result = assemble_ocr_text_prefixes(rows.clone(), 20, |data, _key| {
+            decrypts += 1;
+            Ok::<String, BackgroundReadError>(String::from_utf8(data.to_vec()).unwrap())
+        })
+        .unwrap();
+
+        // The assembled text must agree with the full join on the consumed
+        // prefix — that is the exact fingerprint-equivalence contract.
+        for id in [1i64, 2, 3] {
+            let expected: String = full_join(id).chars().take(20).collect();
+            let got: String = result
+                .get(&id)
+                .cloned()
+                .unwrap_or_default()
+                .chars()
+                .take(20)
+                .collect();
+            assert_eq!(got, expected, "prefix mismatch for screenshot {id}");
+        }
+        // Screenshot 4 produced no text; the caller pre-fills empty strings.
+        assert!(!result.contains_key(&4));
+        // 9 decryptable boxes exist, but the two tails of screenshot 1 and
+        // the tail of screenshot 3 must be skipped once the budget is met.
+        assert_eq!(decrypts, 6);
     }
 
     #[test]

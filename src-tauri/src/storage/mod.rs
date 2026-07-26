@@ -9,6 +9,7 @@ mod derived_index;
 mod encryption;
 mod image_io;
 mod link_scoring;
+mod minilm_migration;
 pub mod migration;
 mod policy;
 mod process;
@@ -23,6 +24,8 @@ mod types;
 pub use derived_index::*;
 #[allow(unused_imports)]
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
+#[allow(unused_imports)]
+pub use minilm_migration::*;
 pub use types::*;
 
 use crate::credential_manager::{

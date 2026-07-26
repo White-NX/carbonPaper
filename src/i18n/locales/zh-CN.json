@@ -1279,6 +1279,29 @@
       "trigger_ocr_model_repair_notification": "测试 OCR 模型修复通知"
     }
   },
+  "minilmMigration": {
+    "title": "语义索引迁移中",
+    "subtitle": "正在进行数据库迁移。迁移期间应用处于维护模式。",
+    "eta": "预计剩余时间：{{eta}}",
+    "safeWrite": "正在写入磁盘，请勿强制关闭应用。",
+    "waitingForAuth": "会话已过期。请完成 Windows Hello 认证，迁移随后会自动继续。",
+    "reauth": "重新认证",
+    "errorCount": "有 {{count}} 条记录无法迁移，详情已写入迁移诊断。",
+    "blockedHint": "迁移期间其它操作暂不可用；若应用退出，将在下次启动并解锁后自动继续。",
+    "phases": {
+      "starting": "正在准备…",
+      "preflight": "正在检查磁盘空间…",
+      "snapshotting_chroma": "正在创建向量快照…",
+      "copying_chroma": "正在复制现有向量…",
+      "reconciling": "正在清理超出范围的本地向量…",
+      "publishing_write": "正在写入索引文件…",
+      "publishing_sync": "正在发布索引…",
+      "publishing_verify": "正在校验索引文件…",
+      "publishing_commit": "正在提交索引…",
+      "waiting_for_auth": "等待身份认证…",
+      "working": "正在处理…"
+    }
+  },
   "securityAlert": {
     "title": "监控完整性已被破坏",
     "debug_title": "安全告警 — 调试触发",

@@ -69,8 +69,23 @@ fn parse_retention_cutoff(policy: &JsonValue) -> Option<String> {
     Some(cutoff.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
-fn disk_totals_for_path(path: &Path) -> Option<(u64, u64)> {
+/// On Windows `fs::canonicalize` returns `\\?\`-prefixed verbatim paths whose
+/// `Prefix` component never equals the plain `C:\` mount points sysinfo
+/// reports, so `starts_with` would match no disk at all. Strip the prefix.
+fn strip_windows_verbatim(path: std::path::PathBuf) -> std::path::PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+        return std::path::PathBuf::from(format!(r"\\{stripped}"));
+    }
+    if let Some(stripped) = text.strip_prefix(r"\\?\") {
+        return std::path::PathBuf::from(stripped.to_string());
+    }
+    path
+}
+
+pub(super) fn disk_totals_for_path(path: &Path) -> Option<(u64, u64)> {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = strip_windows_verbatim(canonical);
     let disks = Disks::new_with_refreshed_list();
 
     let mut matched: Option<(usize, u64, u64)> = None;
@@ -263,11 +278,46 @@ impl StorageState {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_retention_cutoff;
+    use super::{disk_totals_for_path, parse_retention_cutoff};
     use chrono::{Duration, NaiveDateTime, Utc};
     use serde_json::json;
+    use std::path::Path;
 
     const FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+    #[test]
+    fn verbatim_prefixes_are_stripped_to_plain_forms() {
+        use super::strip_windows_verbatim;
+        use std::path::PathBuf;
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"\\?\D:\projects\app")),
+            PathBuf::from(r"D:\projects\app")
+        );
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"\\?\UNC\server\share\dir")),
+            PathBuf::from(r"\\server\share\dir")
+        );
+        assert_eq!(
+            strip_windows_verbatim(PathBuf::from(r"D:\already\plain")),
+            PathBuf::from(r"D:\already\plain")
+        );
+    }
+
+    #[test]
+    fn disk_totals_resolve_for_plain_and_verbatim_paths() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            disk_totals_for_path(manifest_dir).is_some(),
+            "plain existing path must resolve to its disk"
+        );
+        // On Windows fs::canonicalize yields a \\?\-prefixed verbatim path;
+        // it must still match the plain mount points sysinfo reports.
+        let verbatim = std::fs::canonicalize(manifest_dir).expect("canonicalize manifest dir");
+        assert!(
+            disk_totals_for_path(&verbatim).is_some(),
+            "verbatim path {verbatim:?} must resolve to its disk"
+        );
+    }
 
     fn cutoff_for(period: &str) -> String {
         parse_retention_cutoff(&json!({ "retention_period": period }))

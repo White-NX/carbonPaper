@@ -174,6 +174,9 @@ const COMMAND_TIERS = {
   'ml_runtime::debug_trigger_ocr_model_repair_notification': 'session_required',
   'semantic_runtime::get_ml_semantic_status': 'public',
   'semantic_runtime::restart_ml_semantic_worker': 'runtime_public',
+  'minilm_migration::get_minilm_rebuild_status': 'public',
+  'minilm_migration::list_minilm_rebuild_errors': 'session_required',
+  'maintenance::get_maintenance_status': 'public',
 };
 
 function read(file) {

@@ -137,6 +137,26 @@ export async function getClusteringStatus() {
 }
 
 /**
+ * Read progress for the active or most recently persisted MiniLM migration
+ * run. The migration itself is sentinel-triggered at startup and cannot be
+ * started or cancelled from the frontend; an interrupted run resumes on the
+ * next launch/unlock.
+ */
+export async function getMinilmRebuildStatus() {
+  return invoke('get_minilm_rebuild_status');
+}
+
+/** List in-memory + persisted diagnostics and failed/discarded ledger jobs. */
+export async function listMinilmRebuildErrors(offset = 0, limit = 100) {
+  return withAuth(() => invoke('list_minilm_rebuild_errors', { offset, limit }));
+}
+
+/** Whether the app is in global maintenance mode (blocking overlay shown). */
+export async function getMaintenanceStatus() {
+  return invoke('get_maintenance_status');
+}
+
+/**
  * Set the automatic clustering interval.
  * @param {'1d'|'1w'|'1m'|'6m'} interval
  */

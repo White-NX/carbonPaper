@@ -13,8 +13,10 @@ mod error_window;
 mod i18n;
 mod idle;
 mod logging;
+mod maintenance;
 mod mcp_server;
 mod mcp_token;
+mod minilm_migration;
 #[allow(dead_code)]
 mod ml_contracts;
 #[allow(dead_code)]
@@ -224,6 +226,12 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        // Retention and delete-queue work would race the MiniLM migration's
+        // Chroma snapshot; stand still while maintenance mode is active.
+        if maintenance::is_active() {
+            continue;
+        }
 
         let storage = app_handle.state::<Arc<StorageState>>().inner().clone();
 
@@ -798,6 +806,7 @@ pub fn run() {
         .manage(MonitorState::new())
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(semantic_runtime::SemanticRuntimeState::new()))
+        .manage(Arc::new(minilm_migration::MinilmMigrationState::new()))
         .manage(Arc::new(CaptureState::default()))
         .manage(AnalysisState::default())
         .manage(updater::UpdaterState::new())
@@ -935,6 +944,10 @@ pub fn run() {
                         std::thread::spawn(move || {
                             StorageState::backfill_plaintext_process_names(storage_clone);
                         });
+
+                        // Sentinel-gated one-time M2.4a Chroma copy; waits for
+                        // unlock internally before starting.
+                        minilm_migration::spawn_minilm_auto_migration(app.handle().clone());
 
                         let app_handle_cleanup = app.handle().clone();
                         tauri::async_runtime::spawn(async move {
@@ -1092,6 +1105,9 @@ pub fn run() {
             ml_runtime::debug_trigger_ocr_model_repair_notification,
             semantic_runtime::get_ml_semantic_status,
             semantic_runtime::restart_ml_semantic_worker,
+            minilm_migration::get_minilm_rebuild_status,
+            minilm_migration::list_minilm_rebuild_errors,
+            maintenance::get_maintenance_status,
             monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）
             script_integrity::debug_trigger_security_alert,
