@@ -1263,6 +1263,34 @@ pub(crate) fn import_minilm_vector_from_python(
     Ok(ensured)
 }
 
+/// Reconstruct the MiniLM task text and its fingerprint for a batch of
+/// screenshot ids, using the exact migration/dual-write contract
+/// (`build_minilm_task_text` + `minilm_source_fingerprint`). Ids that map to no
+/// active screenshot are simply absent from the returned map. Used by the M2.5
+/// document-encoder shadow probe to re-encode migrated documents with the Rust
+/// runtime and compare against the stored Python doc vectors.
+pub(crate) fn minilm_sources_for_ids(
+    storage: &StorageState,
+    ids: &[i64],
+) -> Result<HashMap<i64, (String, String)>, String> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let summaries = storage
+        .get_screenshot_summaries_by_ids_silent(ids)
+        .map_err(background_error)?;
+    let ocr = storage
+        .get_ocr_text_prefixes_by_screenshot_ids_silent(ids, MINILM_OCR_SNIPPET_CHARS)
+        .map_err(background_error)?;
+    let mut out = HashMap::with_capacity(summaries.len());
+    for row in source_rows(summaries, &ocr) {
+        if let Ok(id) = row.spec.subject_key.parse::<i64>() {
+            out.insert(id, (row.text, row.spec.source_fingerprint));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

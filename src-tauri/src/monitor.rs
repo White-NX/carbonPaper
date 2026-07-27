@@ -727,6 +727,7 @@ pub async fn monitor_get_task_clusters(
 
 #[tauri::command]
 pub async fn monitor_nl_cluster_query(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, MonitorState>,
     query: String,
@@ -734,18 +735,34 @@ pub async fn monitor_nl_cluster_query(
     enable_rerank: Option<bool>,
     rerank_variant: Option<String>,
 ) -> Result<Value, String> {
-    authenticated_monitor_command(
+    let enable_rerank = enable_rerank.unwrap_or(false);
+    let started = std::time::Instant::now();
+    let response = authenticated_monitor_command(
         &credential_state,
         &state,
         serde_json::json!({
             "command": "nl_cluster_query",
-            "query": query,
+            "query": query.clone(),
             "n_results": n_results.unwrap_or(30).min(200),
-            "enable_rerank": enable_rerank.unwrap_or(false),
+            "enable_rerank": enable_rerank,
             "rerank_variant": rerank_variant.unwrap_or_else(|| "q4f16".to_string()),
         }),
     )
-    .await
+    .await?;
+    let python_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    // Passive M2.5 shadow comparison. Runs only when semantic_runtime is
+    // rust_shadow; never alters the authoritative Python/Chroma response.
+    if response.get("status").and_then(|value| value.as_str()) == Some("success") {
+        crate::semantic_shadow::spawn_shadow_sample(
+            app,
+            query,
+            enable_rerank,
+            response.clone(),
+            python_ms,
+        );
+    }
+    Ok(response)
 }
 
 #[tauri::command]

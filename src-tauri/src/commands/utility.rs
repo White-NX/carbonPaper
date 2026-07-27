@@ -144,6 +144,10 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         registry_config::get_bool("clustering_allow_full_low_memory").unwrap_or(false);
     let network_enabled = registry_config::get_bool("network_enabled").unwrap_or(true);
     let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
+    // M2.5 per-capability backend selection. Enums, not booleans, because
+    // inference runtime and index ownership cut over at different times.
+    let semantic_runtime = crate::semantic_shadow::semantic_runtime_backend();
+    let semantic_index = crate::semantic_shadow::semantic_index_backend();
 
     Ok(serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
@@ -160,6 +164,8 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "clustering_allow_full_low_memory": clustering_allow_full_low_memory,
         "network_enabled": network_enabled,
         "use_onnx": use_onnx,
+        "semantic_runtime": semantic_runtime,
+        "semantic_index": semantic_index,
     }))
 }
 
@@ -227,6 +233,18 @@ pub fn set_advanced_config(
     }
     if let Some(v) = config.get("use_onnx").and_then(|v| v.as_bool()) {
         registry_config::set_bool("use_onnx", v)?;
+    }
+    // M2.5 backend selection. Unknown enum values are ignored so the runtime
+    // keeps observably falling back to the previous default.
+    if let Some(v) = config.get("semantic_runtime").and_then(|v| v.as_str()) {
+        if ["python", "rust_shadow", "rust"].contains(&v) {
+            registry_config::set_string("semantic_runtime", v)?;
+        }
+    }
+    if let Some(v) = config.get("semantic_index").and_then(|v| v.as_str()) {
+        if ["chroma", "dual", "rust"].contains(&v) {
+            registry_config::set_string("semantic_index", v)?;
+        }
     }
     Ok(())
 }

@@ -18,6 +18,9 @@ impl StorageState {
         if *initialized {
             return Ok(());
         }
+        // Belt-and-braces against a stale resident matrix from a previous
+        // connection; `shutdown` already clears it on the normal path.
+        self.reset_semantic_vector_cache();
 
         // Create directories
         let data_dir = self
@@ -103,6 +106,10 @@ impl StorageState {
     /// Shut down storage: close database connection.
     pub fn shutdown(&self) -> Result<(), String> {
         self.lazy_indexer_shutdown.store(true, Ordering::SeqCst);
+        // The resident semantic matrix belongs to the connection being closed.
+        // Its freshness epoch is per-database, so carrying it into whatever
+        // connection comes next can silently score against the old file.
+        self.reset_semantic_vector_cache();
         let mut db_guard = self.db.lock().map_err(|e| format!("lock error: {}", e))?;
         if db_guard.is_some() {
             *db_guard = None;
@@ -542,6 +549,62 @@ impl StorageState {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- M2.5 shadow-query diagnostics: local, telemetry-free parity and
+            -- latency samples comparing Rust semantic retrieval against the
+            -- authoritative Chroma/Python nl_cluster_query. Only a query hash is
+            -- stored, never the query text. Bounded retention is enforced on insert.
+            CREATE TABLE IF NOT EXISTS semantic_shadow_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                query_hash TEXT NOT NULL,
+                k INTEGER NOT NULL,
+                python_count INTEGER NOT NULL,
+                rust_count INTEGER NOT NULL,
+                shared INTEGER NOT NULL,
+                top1_agreement INTEGER NOT NULL,
+                overlap_k REAL NOT NULL,
+                max_abs_err REAL,
+                mean_abs_err REAL,
+                embed_ms REAL NOT NULL,
+                scan_ms REAL NOT NULL,
+                python_ms REAL NOT NULL,
+                rust_visible INTEGER NOT NULL,
+                chroma_scope INTEGER,
+                only_in_chroma INTEGER NOT NULL DEFAULT 0,
+                in_both_diff_rank INTEGER NOT NULL DEFAULT 0,
+                only_in_rust INTEGER NOT NULL DEFAULT 0,
+                note TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_semantic_shadow_samples_created
+                ON semantic_shadow_samples(id DESC);
+
+            -- M2.5 doc-encoder parity: one summary row per Rust-vs-Python
+            -- document-encoder probe run. Complements the per-query samples
+            -- above by measuring the OTHER half of the chain: Rust re-encoding
+            -- the migrated documents (build_minilm_task_text + Rust MiniLM) vs
+            -- the stored Python doc vectors. Only aggregate cosine/latency
+            -- stats are stored, never document text. Bounded retention on insert.
+            CREATE TABLE IF NOT EXISTS semantic_doc_encoder_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                doc_sample_count INTEGER NOT NULL,
+                requested INTEGER NOT NULL,
+                source_changed INTEGER NOT NULL DEFAULT 0,
+                missing_text INTEGER NOT NULL DEFAULT 0,
+                cos_min REAL,
+                cos_p05 REAL,
+                cos_p50 REAL,
+                cos_mean REAL,
+                cos_max REAL,
+                cold_start_ms REAL,
+                steady_ms_per_doc REAL,
+                note TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_semantic_doc_encoder_runs_created
+                ON semantic_doc_encoder_runs(id DESC);
+
             -- Enable foreign key constraints
             PRAGMA foreign_keys = ON;
 
@@ -778,6 +841,36 @@ impl StorageState {
             "INTEGER",
         )?;
         Self::add_column_if_missing(conn, "derived_index_jobs", "lease_token", "TEXT")?;
+
+        // M2.5 shadow-query non-overlap classification (added after the table
+        // first shipped, so upgrade existing diagnostic tables in place).
+        Self::add_column_if_missing(
+            conn,
+            "semantic_shadow_samples",
+            "only_in_chroma",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "semantic_shadow_samples",
+            "in_both_diff_rank",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "semantic_shadow_samples",
+            "only_in_rust",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // Cold-start marker: the first probe sample bears the ONNX session
+        // init cost, so steady-state latency percentiles exclude it and it is
+        // reported separately (added after the table first shipped).
+        Self::add_column_if_missing(
+            conn,
+            "semantic_shadow_samples",
+            "cold_start",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         Self::create_table_if_missing(
             conn,

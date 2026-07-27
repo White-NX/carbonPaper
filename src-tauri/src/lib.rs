@@ -38,6 +38,7 @@ mod script_integrity;
 mod semantic_models;
 #[allow(dead_code)]
 mod semantic_runtime;
+mod semantic_shadow;
 mod sensitive_filter;
 mod storage;
 mod updater;
@@ -957,6 +958,22 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             ml_runtime::run_postprocess_retry_loop(app_handle_postprocess).await;
                         });
+
+                        // The resident MiniLM matrix only earns its ~14 MiB
+                        // while the user is running NL cluster queries; release
+                        // it once they stop. The frontend does not report when
+                        // the view closes, so this polls instead of subscribing.
+                        let storage_cache = storage.inner().clone();
+                        tauri::async_runtime::spawn(async move {
+                            let mut ticker =
+                                tokio::time::interval(std::time::Duration::from_secs(60));
+                            loop {
+                                ticker.tick().await;
+                                storage_cache.evict_semantic_vector_cache_if_idle(
+                                    storage::SEMANTIC_CACHE_IDLE_TTL,
+                                );
+                            }
+                        });
                     }
                 } else {
                     tracing::error!("Storage initialization deferred: public key unavailable");
@@ -1107,6 +1124,9 @@ pub fn run() {
             semantic_runtime::restart_ml_semantic_worker,
             minilm_migration::get_minilm_rebuild_status,
             minilm_migration::list_minilm_rebuild_errors,
+            semantic_shadow::get_semantic_shadow_report,
+            semantic_shadow::run_semantic_shadow_probe,
+            semantic_shadow::run_semantic_doc_encoder_probe,
             maintenance::get_maintenance_status,
             monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）

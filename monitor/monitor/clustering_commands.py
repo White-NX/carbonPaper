@@ -23,6 +23,7 @@ HANDLED_CLUSTERING_COMMANDS = {
     "export_task_vectors_page",
     "finish_task_vectors_export",
     "upsert_task_vectors",
+    "get_task_vectors_count",
 }
 
 
@@ -92,6 +93,17 @@ def handle_clustering_command(
                 if k != "clusters"
             } if last else None,
         }
+
+    if cmd == "get_task_vectors_count":
+        service_error = _requires_service(manager=manager)
+        if service_error:
+            return service_error
+        try:
+            count = int(manager.hot_collection.count())
+            return {"status": "success", "count": count}
+        except Exception as e:
+            logger.warning("get_task_vectors_count failed: %s", e)
+            return {"error": str(e)}
 
     if cmd == "set_clustering_interval":
         service_error = _requires_service(scheduler=scheduler)
