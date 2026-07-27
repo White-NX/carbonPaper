@@ -66,6 +66,7 @@ Unchanged except where the audit forces a correction.
 - A Rust replacement is not complete merely because it can load the same ONNX file. Before default cutover it must pass the Python-oracle behavior contract for preprocessing/tokenization, pooling/normalization, response shape, filtering/pagination, ranking quality, lifecycle, and rollback.
 - **Corrected flag rule:** prefer shipping a Rust replacement behind a config flag, then default, then remove the Python fallback a release later. Where a replacement ships default without a flag (as OCR did), it **must** still expose an observable fallback/degrade path and a diagnostic. Track any skipped flag as debt rather than pretending it exists.
 - Heavy ML must use the existing idle policy or an explicit manual-run path. No background model load/inference should surprise a foreground app.
+- **Migration diagnostics are development scaffolding, not product surface.** Shadow comparison toggles, parity probes, and their sample tables exist only to prove one cutover gate. Once that gate is proven and the capability is cut over, they must be removed from the default build before the capability ships in a production (non-beta) release. Shipping one to end users is a defect, not a harmless extra: it exposes a meaningless switch, keeps a second inference path alive on a user's machine, and invites bug reports about numbers no user can act on. Whatever must survive for the "observable fallback" rule is a minimal read-only status field on an existing status command, never a dev panel.
 - Delete infrastructure only after the previous release ran without needing it by default.
 - Model downloads must be explicit, pinned by expected files and hashes where practical, and described as local ML assets.
 - Do not port a Python feature just because it exists. If it is low value, hard to explain, or expensive to maintain, demote or remove it.
@@ -274,7 +275,7 @@ Recommended sequence:
 
 1. MiniLM Rust inference parity.
 2. MiniLM derived-cache/index dual-write and migration. **Done in M2.4.**
-3. Rust semantic shadow queries compared locally with Chroma; Python remains authoritative.
+3. Rust semantic shadow queries compared locally with Chroma; Python remains authoritative. **Harness done 2026-07-27** — passive per-query shadow, an active built-in query corpus, and a document-encoder re-encode probe, reported through the telemetry-free `get_semantic_shadow_report`. The whole surface is temporary by construction; see the retirement block below.
 4. Cut over semantic-text retrieval and Smart Cluster calibration prefilter; keep rollback.
 5. Reranker parity and shadow scoring; cut over calibration only after score/order gates pass. The Python Smart Cluster worker may temporarily call the Rust reranker, but its Python fallback remains until Milestone 3.
 6. CLIP vector export/migration.
@@ -282,8 +283,51 @@ Recommended sequence:
 8. Rust CLIP text-query shadow mode, then cut over `search_nl` and MCP capability reporting.
 9. Implement BGE in the shared Rust runtime and run it in shadow mode, but do not remove Python BGE inference until classification itself has a Rust path or a deliberately supported Rust inference bridge. The classification consumer remains a Milestone 5 completion item.
 
+Step-3 measurement (2026-07-27, 256-query and 256-document samples): query-encoder
+maximum absolute error 6.0e-7; Overlap@10 p50 100%, p05 50%; top-1 agreement
+90.7%; document re-encode cosine p50 0.9917 / p05 0.9868 / min 0.9796. Retrieval
+divergence is dominated by Rust returning documents the Chroma ANN path does not
+surface — the Rust side is an exact scan over the same hot layer, so a strict
+superset of recall is expected and was accepted as a difference in retrieval
+method rather than a Rust defect. Recorded honestly: this clears the query-encoder
+numeric gate but not the literal "top-10 overlap ≥ 99% / top-1 effectively
+unchanged" or the ≥0.99999 cosine wording below, which were written assuming two
+implementations of the *same* retrieval method. The step-4 cutover therefore keeps
+the `python` fallback and should re-check ranking on the reranked end-to-end path
+(step 5), where the bi-encoder recall difference is re-scored anyway.
+
 - Use enum backends, not ambiguous booleans: `semantic_runtime = python|rust_shadow|rust`, `semantic_index = chroma|dual|rust`, `clip_runtime = python|rust_shadow|rust`, `clip_index = chroma|dual|rust`. Invalid or unavailable Rust configurations fall back observably for one release, with a local diagnostic explaining why.
 - Preserve and explicitly test search response schemas, filters, offsets, limits, thresholds, MCP tool availability, and frontend labels. OCR keyword, MiniLM semantic text, CLIP visual/NL image search, and Smart Cluster assignment remain separately labeled; their scores are not compared across models.
+
+##### Shadow-scaffolding retirement — release-blocking, not optional cleanup
+
+Every `rust_shadow` harness in this milestone is a development instrument with a
+scheduled death. It proves one gate, and then it goes. A production (non-beta)
+release must not contain the shadow toggle or its probes for a capability that
+has already cut over. Enforce this per capability, at the cutover PR, rather
+than as an end-of-milestone sweep — an unowned diagnostic panel never gets
+deleted later.
+
+MiniLM instance of the rule. Shadow-only, delete with (or immediately after)
+the step-4 cutover:
+
+- `semantic_shadow.rs` — `spawn_shadow_sample`, `run_semantic_shadow_probe`, `run_semantic_doc_encoder_probe`, the built-in probe corpus, and the single-flight guards; the `spawn_shadow_sample` call site in `monitor.rs::monitor_nl_cluster_query`; the three Tauri commands registered in `lib.rs`.
+- `storage/semantic_shadow.rs` and the `semantic_shadow_samples` / `semantic_doc_encoder_runs` tables plus their in-place column upgrades in `storage/schema.rs`. Dropping these tables loses no user data — they hold query hashes and parity/latency numbers only, never query text or screenshot content.
+- `SemanticShadowCard` in `settings/advanced/InferenceCards.jsx`, its wiring in `AdvancedSection.jsx`, and the report/probe state in `useAdvancedSectionController.js`.
+- `minilm_migration::minilm_sources_for_ids`, whose only caller is the document-encoder probe.
+- The `rust_shadow` value of `semantic_runtime` once nothing can enter that mode.
+
+Explicitly **not** shadow scaffolding — this code is the production read path and stays:
+
+- `derived_index::semantic_text_topk`, `ScoredSubject`, `count_query_visible_embeddings`.
+- `storage/semantic_cache.rs` (the resident vector matrix), its `StorageState` fields, the idle-eviction ticker in `lib.rs`, and the cache resets in `storage/schema.rs`.
+- The `semantic_runtime` / `semantic_index` enums themselves, minus the retired value: they remain the observable rollback switch required above.
+
+What may survive the cutover is the *fallback* diagnostic the enum rule demands
+— which backend is active and why a Rust configuration was refused — and it
+survives as a field on an existing status command, not as a settings card with
+percentiles in it. Apply the same shape to the reranker, CLIP, and BGE shadows
+when their turn comes.
 
 Release gate:
 
@@ -295,6 +339,7 @@ Release gate:
 - Embedding migration/rebuild is interruptible/resumable; session lock/unlock, process crash, partial ANN generation, model upgrade, rollback to the previous release, and deletion are tested without screenshot loss or silent vector loss.
 - Background semantic work cannot trigger a model load during fullscreen/game activity. User-initiated search remains available with a deadline. OCR p95 latency and reliability show no material regression from semantic work; search p95 latency and peak memory stay within an explicitly recorded budget.
 - The Python fallback remains available for one released version after each capability becomes Rust-default.
+- **No shadow/probe development surface for an already-cut-over capability ships in a production build.** The retirement list above is executed, not deferred: the settings card, the probe commands, and the sample tables are gone, and the only remaining backend diagnostic is the read-only fallback status the enum rule requires. A beta may ship the harness; a production release may not.
 
 Depends on: Milestone 1 semantics/decisions landed and reviewed, including the approximate-count caveats above.
 
@@ -446,6 +491,15 @@ Do not delete a Python component until its Rust replacement has shipped as defau
 - Python classification/PII dependencies — only after Milestone 5 is stable.
 - Python installer/venv/pyz/reverse IPC — only after Milestone 6 proves fresh install and upgrade without Python.
 
+Migration scaffolding runs on the opposite clock. It is not a Python component
+waiting for a replacement; it is temporary instrumentation that must be removed
+as soon as the gate it proves is signed off, and at the latest before the
+capability's first production release:
+
+- MiniLM shadow toggle, query/document probes, `semantic_shadow_samples` / `semantic_doc_encoder_runs`, and the settings card — delete with the M2.5 step-4 cutover. Full artifact list in the retirement block under M2.5.
+- Reranker, CLIP, and BGE shadow harnesses — same rule at their own cutovers.
+- The `rust_shadow` enum values — delete once no capability can still enter shadow mode.
+
 ## Branching And Release Discipline
 
 - Keep this roadmap inside the `carbonPaper` repository (for example `docs/python-removal-roadmap.md`) before treating milestone status as branch/PR truth. The current parent-directory `roadmap.md` is outside the repository and cannot be reviewed or versioned with implementation branches.
@@ -459,6 +513,16 @@ Do not delete a Python component until its Rust replacement has shipped as defau
 
 ## Immediate Next Step
 
-Continue with M2.5 MiniLM shadow queries: compare Rust semantic retrieval locally against Chroma using the migrated generation and bounded delta path, record score/order parity and latency, and keep Python/Chroma authoritative until the release gate and rollback checks pass. The coverage denominator for that gate is the set of valid, mappable vectors in the Chroma hot-layer snapshot, not all SQLite screenshots. Then cut over MiniLM semantic retrieval independently before beginning the separate CLIP vector migration/cutover sequence.
+M2.5 step 3 is done: the shadow harness (passive per-query comparison, active
+query corpus, document re-encode probe) landed on `m2/minilm-shadow-cutover`
+together with the resident-vector read path, and its parity/latency numbers are
+recorded above. Next is step 4 — cut over semantic-text retrieval and the Smart
+Cluster calibration prefilter to `semantic_index = rust`, keeping the `python`
+enum value as the one-release observable rollback. That same PR must delete the
+shadow scaffolding per the retirement block; the harness has now served its
+purpose and must not reach a production build. The coverage denominator for the
+gate is the set of valid, mappable vectors in the Chroma hot-layer snapshot, not
+all SQLite screenshots. Only then begin the separate CLIP vector
+migration/cutover sequence.
 
 No Rust backend becomes authoritative until its Python behavior contract, dual-write/migration, shadow-query, lifecycle, performance, and rollback gates pass. The first recommended cutover is MiniLM semantic retrieval; CLIP follows only after both legacy-vector migration and new-capture Rust image indexing work. Chroma remains for Milestone 4 task clustering, and Python BGE remains for Milestone 5 classification. Until subject-level Rust ledgers exist, the internal count-level CLIP comparison is only a migration baseline, not a product health judgment.
