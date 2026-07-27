@@ -101,6 +101,14 @@ pub struct DerivedEmbeddingRecord {
     pub updated_at: String,
 }
 
+/// One scored subject from an exact-scan semantic retrieval. `score` is cosine
+/// similarity (dot product of L2-normalized vectors).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScoredSubject {
+    pub subject_key: String,
+    pub score: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DerivedIndexJobRecord {
     pub spec: DerivedIndexJobSpec,
@@ -569,6 +577,13 @@ impl StorageState {
             .map_err(|_| "Derived embedding dimensions exceed SQLite range".to_string())?;
         let mut guard = self.get_connection_named("commit_derived_embedding")?;
         let conn = guard.as_mut().ok_or("Database not initialized")?;
+        // Sampled before the write so the resident cache can tell "I was
+        // current and this is my delta" from "I already missed something".
+        let epoch_before = if write.job.index_kind == DerivedIndexKind::SemanticText {
+            Some(read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?)
+        } else {
+            None
+        };
         let tx = conn
             .transaction()
             .map_err(|error| format!("Failed to start derived embedding transaction: {error}"))?;
@@ -633,6 +648,19 @@ impl StorageState {
         .map_err(|error| format!("Failed to write derived embedding: {error}"))?;
         tx.commit()
             .map_err(|error| format!("Failed to commit derived embedding: {error}"))?;
+        if let Some(epoch_before) = epoch_before {
+            // The triggers in this transaction advanced the epoch. Read it back
+            // on the connection already held and fold the row into the resident
+            // matrix, so continuous dual-write capture does not invalidate the
+            // whole cache every few seconds.
+            let epoch_after = read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?;
+            self.note_semantic_cache_write(
+                &write.job.subject_key,
+                &write.vector,
+                epoch_before,
+                epoch_after,
+            );
+        }
         Ok(())
     }
 
@@ -679,6 +707,49 @@ impl StorageState {
                 .and_then(|row| decode_embedding_row(index_kind, row))
         })
         .collect()
+    }
+
+    /// Count query-visible embeddings for one index kind. Used as the Rust
+    /// coverage numerator for the M2.5 shadow-query diagnostics.
+    pub fn count_query_visible_embeddings(
+        &self,
+        index_kind: DerivedIndexKind,
+    ) -> Result<u64, String> {
+        let guard = self.get_connection_named("count_query_visible_embeddings")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let count: i64 = conn
+            .query_row(
+                &visible_embedding_aggregate_sql(),
+                [index_kind.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to count query-visible embeddings: {error}"))?;
+        u64::try_from(count).map_err(|_| "Invalid query-visible embedding count".to_string())
+    }
+
+    /// Exact-scan cosine top-K over the query-visible `semantic_text`
+    /// embeddings. Stored and query vectors are both L2-normalized, so cosine
+    /// similarity equals the dot product. This is the M2.5 shadow-query read
+    /// path: SQLite remains authoritative and the `.cpdvec` ANN sidecar is not
+    /// consulted until a performance gate requires it. The scan is bounded by
+    /// the ~30-day MiniLM hot layer that M2.4 migrated.
+    ///
+    /// Scoring runs against the resident matrix rather than re-reading the
+    /// store per query — see `semantic_cache` for the freshness and lifetime
+    /// rules. The result is identical to a fresh SQL scan; only the summation
+    /// order of the dot product differs, which can reorder exact ties.
+    pub fn semantic_text_topk(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<ScoredSubject>, String> {
+        if query.is_empty() {
+            return Err("Semantic query vector must not be empty".to_string());
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        self.semantic_topk_resident(query, k)
     }
 
     pub fn get_derived_index_job(
@@ -843,6 +914,11 @@ impl StorageState {
         validate_required_text("subject_key", subject_key, MAX_SUBJECT_KEY_BYTES)?;
         let mut guard = self.get_connection_named("delete_derived_index_subject")?;
         let conn = guard.as_mut().ok_or("Database not initialized")?;
+        let epoch_before = if index_kind == DerivedIndexKind::SemanticText {
+            Some(read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?)
+        } else {
+            None
+        };
         let tx = conn
             .transaction()
             .map_err(|error| format!("Failed to start derived deletion transaction: {error}"))?;
@@ -860,6 +936,10 @@ impl StorageState {
             .map_err(|error| format!("Failed to delete derived index job: {error}"))?;
         tx.commit()
             .map_err(|error| format!("Failed to commit derived deletion: {error}"))?;
+        if let Some(epoch_before) = epoch_before {
+            let epoch_after = read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?;
+            self.note_semantic_cache_removal(subject_key, epoch_before, epoch_after);
+        }
         Ok(vectors > 0 || jobs > 0)
     }
 
@@ -1384,41 +1464,69 @@ pub(super) fn derived_subject_is_active(
     .map_err(|error| format!("Failed to validate derived index subject: {error}"))
 }
 
+/// The query-visible content epoch. The `derived_index_state` triggers advance
+/// it on every mutation that can change the visible join, which makes it the
+/// authority the resident vector cache checks itself against.
+pub(super) fn read_derived_data_epoch(
+    conn: &rusqlite::Connection,
+    index_kind: DerivedIndexKind,
+) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COALESCE((SELECT data_epoch FROM derived_index_state WHERE index_kind = ?1), 0)",
+        [index_kind.as_str()],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("Failed to read derived index epoch: {error}"))
+}
+
+/// Single definition of "query-visible": a completed ledger row whose model
+/// contract and fingerprint still match the stored vector. Every projection
+/// below shares it so the resident cache cannot drift from the SQL readers.
+const VISIBLE_EMBEDDING_SOURCE: &str = r#"
+        FROM derived_embeddings e
+        INNER JOIN derived_index_jobs j
+          ON j.index_kind = e.index_kind AND j.subject_key = e.subject_key
+        WHERE e.index_kind = ?1 AND j.status = 'completed'
+          AND j.model_id = e.model_id
+          AND j.model_revision = e.model_revision
+          AND j.embedding_version = e.embedding_version
+          AND j.source_fingerprint = e.source_fingerprint
+"#;
+
 fn visible_embedding_sql(predicate: &str, suffix: &str) -> String {
     format!(
         r#"
         SELECT e.subject_key, e.dimensions, e.vector_f32, e.model_id,
                e.model_revision, e.embedding_version, e.source_fingerprint,
                e.updated_at
-        FROM derived_embeddings e
-        INNER JOIN derived_index_jobs j
-          ON j.index_kind = e.index_kind AND j.subject_key = e.subject_key
-        WHERE e.index_kind = ?1 AND j.status = 'completed'
-          AND j.model_id = e.model_id
-          AND j.model_revision = e.model_revision
-          AND j.embedding_version = e.embedding_version
-          AND j.source_fingerprint = e.source_fingerprint
+        {VISIBLE_EMBEDDING_SOURCE}
           {predicate} {suffix}
         "#
     )
 }
 
+/// Column-minimal projection for the resident cache load. The scan needs only
+/// an identity and the vector; the four text columns the full projection
+/// carries are decoded and thrown away once per row.
+pub(super) fn visible_embedding_scan_sql() -> String {
+    format!(
+        r#"
+        SELECT e.subject_key, e.dimensions, e.vector_f32
+        {VISIBLE_EMBEDDING_SOURCE}
+        "#
+    )
+}
+
 fn visible_embedding_aggregate_sql() -> String {
-    r#"
+    format!(
+        r#"
         SELECT COUNT(*), MIN(e.dimensions), MAX(e.dimensions),
                MIN(e.model_id), MAX(e.model_id),
                MIN(e.model_revision), MAX(e.model_revision),
                MIN(e.embedding_version), MAX(e.embedding_version)
-        FROM derived_embeddings e
-        INNER JOIN derived_index_jobs j
-          ON j.index_kind = e.index_kind AND j.subject_key = e.subject_key
-        WHERE e.index_kind = ?1 AND j.status = 'completed'
-          AND j.model_id = e.model_id
-          AND j.model_revision = e.model_revision
-          AND j.embedding_version = e.embedding_version
-          AND j.source_fingerprint = e.source_fingerprint
-    "#
-    .to_string()
+        {VISIBLE_EMBEDDING_SOURCE}
+        "#
+    )
 }
 
 fn decode_snapshot_metadata(
@@ -1619,7 +1727,7 @@ pub(super) fn encode_vector(vector: &[f32]) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn decode_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>, String> {
+pub(super) fn decode_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>, String> {
     let expected = dimensions
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| "Stored embedding byte length overflow".to_string())?;
@@ -2765,5 +2873,166 @@ mod tests {
         assert!(storage
             .publish_derived_index_generation(DerivedIndexKind::SemanticText)
             .is_err());
+    }
+
+    #[test]
+    fn semantic_text_topk_ranks_visible_rows_by_cosine() {
+        let (_temp, storage) = test_storage();
+        // Three L2-normalized 2-D vectors at increasing angle from the query.
+        commit_vector(&storage, job(DerivedIndexKind::SemanticText, "1"), vec![1.0, 0.0])
+            .unwrap();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "2"),
+            vec![0.8, 0.6],
+        )
+        .unwrap();
+        commit_vector(&storage, job(DerivedIndexKind::SemanticText, "3"), vec![0.0, 1.0])
+            .unwrap();
+
+        // A pending rebuild must hide its row from retrieval.
+        let hidden = job(DerivedIndexKind::SemanticText, "4");
+        ensure_active_subject(&storage, &hidden);
+        storage.upsert_derived_index_job(&hidden).unwrap();
+
+        let query = vec![1.0f32, 0.0];
+        let ranked = storage.semantic_text_topk(&query, 2).unwrap();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].subject_key, "1");
+        assert_eq!(ranked[1].subject_key, "2");
+        assert!((ranked[0].score - 1.0).abs() < 1e-6);
+        assert!(ranked[0].score >= ranked[1].score);
+
+        // The pending subject (id 4) never appears; only completed rows scan.
+        assert_eq!(storage.semantic_text_topk(&query, 10).unwrap().len(), 3);
+        assert_eq!(
+            storage
+                .count_query_visible_embeddings(DerivedIndexKind::SemanticText)
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn semantic_text_topk_rejects_empty_query_and_zero_k() {
+        let (_temp, storage) = test_storage();
+        assert!(storage.semantic_text_topk(&[], 5).is_err());
+        assert!(storage.semantic_text_topk(&[1.0, 0.0], 0).unwrap().is_empty());
+    }
+
+    fn data_epoch(storage: &StorageState) -> i64 {
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        read_derived_data_epoch(guard.as_ref().unwrap(), DerivedIndexKind::SemanticText).unwrap()
+    }
+
+    const VECTOR_BYTES: usize = std::mem::size_of::<f32>();
+
+    #[test]
+    fn resident_cache_absorbs_write_path_updates() {
+        let (_temp, storage) = test_storage();
+        commit_vector(&storage, job(DerivedIndexKind::SemanticText, "1"), vec![1.0, 0.0]).unwrap();
+        let query = vec![1.0f32, 0.0];
+        // The first query loads the matrix; nothing is resident before it.
+        assert_eq!(storage.semantic_vector_cache_bytes(), 0);
+        assert_eq!(storage.semantic_text_topk(&query, 5).unwrap().len(), 1);
+        assert_eq!(storage.semantic_vector_cache_bytes(), 2 * VECTOR_BYTES);
+
+        // A dual-write landing while the cache is resident must be visible to
+        // the next query without a reload.
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "2"),
+            vec![0.8, 0.6],
+        )
+        .unwrap();
+        let ranked = storage.semantic_text_topk(&query, 5).unwrap();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].subject_key, "1");
+        assert_eq!(ranked[1].subject_key, "2");
+        assert_eq!(storage.semantic_vector_cache_bytes(), 4 * VECTOR_BYTES);
+
+        // Re-encoding an existing subject replaces its row in place.
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "2"),
+            vec![0.0, 1.0],
+        )
+        .unwrap();
+        let ranked = storage.semantic_text_topk(&[0.0, 1.0], 1).unwrap();
+        assert_eq!(ranked[0].subject_key, "2");
+        assert!((ranked[0].score - 1.0).abs() < 1e-6);
+        assert_eq!(storage.semantic_vector_cache_bytes(), 4 * VECTOR_BYTES);
+    }
+
+    #[test]
+    fn resident_cache_does_not_survive_a_trigger_driven_delete() {
+        let (_temp, storage) = test_storage();
+        for (key, vector) in [("1", vec![1.0, 0.0]), ("2", vec![0.9, 0.1])] {
+            commit_vector(&storage, job(DerivedIndexKind::SemanticText, key), vector).unwrap();
+        }
+        let query = vec![1.0f32, 0.0];
+        assert_eq!(storage.semantic_text_topk(&query, 5).unwrap().len(), 2);
+
+        // Soft-deleting the screenshot removes the embedding from inside
+        // SQLite, which the write-path hooks cannot observe.
+        let before = data_epoch(&storage);
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .as_ref()
+                .unwrap()
+                .execute("UPDATE screenshots SET is_deleted = 1 WHERE id = 1", [])
+                .unwrap();
+        }
+        // The nested epoch trigger is what makes the resident matrix notice.
+        // If this ever stops holding, the visibility re-check below is the only
+        // thing standing between the cache and a deleted screenshot.
+        assert!(data_epoch(&storage) > before);
+
+        let ranked = storage.semantic_text_topk(&query, 5).unwrap();
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].subject_key, "2");
+        assert_eq!(storage.semantic_vector_cache_bytes(), 2 * VECTOR_BYTES);
+    }
+
+    #[test]
+    fn resident_cache_drops_a_subject_deleted_through_the_api() {
+        let (_temp, storage) = test_storage();
+        for (key, vector) in [("1", vec![1.0, 0.0]), ("2", vec![0.9, 0.1])] {
+            commit_vector(&storage, job(DerivedIndexKind::SemanticText, key), vector).unwrap();
+        }
+        let query = vec![1.0f32, 0.0];
+        assert_eq!(storage.semantic_text_topk(&query, 5).unwrap().len(), 2);
+
+        assert!(storage
+            .delete_derived_index_subject(DerivedIndexKind::SemanticText, "1")
+            .unwrap());
+        let ranked = storage.semantic_text_topk(&query, 5).unwrap();
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].subject_key, "2");
+        assert_eq!(storage.semantic_vector_cache_bytes(), 2 * VECTOR_BYTES);
+    }
+
+    #[test]
+    fn idle_eviction_releases_the_resident_matrix() {
+        let (_temp, storage) = test_storage();
+        commit_vector(&storage, job(DerivedIndexKind::SemanticText, "1"), vec![1.0, 0.0]).unwrap();
+        // Nothing resident yet, so there is nothing to evict.
+        assert!(!storage.evict_semantic_vector_cache_if_idle(std::time::Duration::ZERO));
+
+        assert_eq!(storage.semantic_text_topk(&[1.0, 0.0], 1).unwrap().len(), 1);
+        assert!(storage.semantic_vector_cache_bytes() > 0);
+        // A live TTL keeps a just-used cache.
+        assert!(!storage
+            .evict_semantic_vector_cache_if_idle(super::super::SEMANTIC_CACHE_IDLE_TTL));
+        assert!(storage.semantic_vector_cache_bytes() > 0);
+
+        assert!(storage.evict_semantic_vector_cache_if_idle(std::time::Duration::ZERO));
+        assert_eq!(storage.semantic_vector_cache_bytes(), 0);
+        assert!(!storage.evict_semantic_vector_cache_if_idle(std::time::Duration::ZERO));
+
+        // The next query reloads transparently.
+        assert_eq!(storage.semantic_text_topk(&[1.0, 0.0], 1).unwrap().len(), 1);
+        assert!(storage.semantic_vector_cache_bytes() > 0);
     }
 }

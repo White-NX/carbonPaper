@@ -151,10 +151,28 @@ where
     }
 }
 
+/// Builds the batched OCR prefix query for `placeholder_count` screenshot ids.
+/// `ORDER BY screenshot_id, id` is load-bearing: `id` is the insertion rowid,
+/// and the boxes of one screenshot are inserted in a single transaction in the
+/// exact order the OCR engine emitted them — the same order their texts were
+/// joined into the MiniLM source string. Ordering by geometry instead would
+/// reshuffle boxes that share a visual line (`box_y1` jitters by a few pixels)
+/// and rebuild text that no longer matches the stored vector.
+fn ocr_text_prefix_query(placeholder_count: usize) -> String {
+    let placeholders = vec!["?"; placeholder_count].join(",");
+    format!(
+        "SELECT screenshot_id, text_enc, text_key_encrypted
+         FROM ocr_results
+         WHERE is_deleted = 0 AND screenshot_id IN ({})
+         ORDER BY screenshot_id, id",
+        placeholders
+    )
+}
+
 /// Joins decrypted OCR box texts with single spaces per screenshot, skipping
 /// empty boxes, and stops decrypting a screenshot's remaining boxes once
 /// `min_chars` joined characters are collected. Rows of one screenshot must
-/// arrive contiguously in reading order; the produced string is then a join
+/// arrive contiguously in insertion order; the produced string is then a join
 /// prefix of the full join, so its first `min_chars` characters match the
 /// full text exactly (the MiniLM source contract only consumes that prefix).
 fn assemble_ocr_text_prefixes<E>(
@@ -2092,6 +2110,8 @@ impl StorageState {
     /// decrypt loop skip the long tail of boxes: most screenshots reach the
     /// budget within a few boxes instead of paying one RSA unwrap per box.
     /// Screenshots are decrypted in parallel with per-thread CNG sessions.
+    /// The prefix replays the boxes in insertion order so it reproduces the
+    /// text that was actually embedded; see [`ocr_text_prefix_query`].
     /// Every requested id is present in the result (empty string when the
     /// screenshot has no decryptable text), matching
     /// [`Self::get_ocr_results_by_screenshot_ids_silent`].
@@ -2117,14 +2137,7 @@ impl StorageState {
 
             // Process in chunks to avoid SQLite parameter limit (usually 999)
             for chunk in screenshot_ids.chunks(500) {
-                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
-                let sql = format!(
-                    "SELECT screenshot_id, text_enc, text_key_encrypted
-                     FROM ocr_results
-                     WHERE is_deleted = 0 AND screenshot_id IN ({})
-                     ORDER BY screenshot_id, box_y1, box_x1",
-                    placeholders.join(",")
-                );
+                let sql = ocr_text_prefix_query(chunk.len());
                 let params: Vec<&dyn rusqlite::ToSql> =
                     chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
 
@@ -2158,7 +2171,9 @@ impl StorageState {
 
         // Phase 2: group boxes per screenshot. Each id lives in exactly one
         // IN chunk and every chunk is ordered by screenshot_id, so the rows
-        // of one screenshot are contiguous and in reading order.
+        // of one screenshot are contiguous and in insertion order — the exact
+        // order the OCR engine emitted the boxes, which is the order their
+        // texts were joined into the embedded MiniLM source string.
         let mut groups: Vec<Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)>> = Vec::new();
         for row in raw_rows {
             match groups.last_mut() {
@@ -3293,6 +3308,52 @@ mod ocr_lifecycle_tests {
             ),
             Err(BackgroundReadError::AuthRequired)
         ));
+    }
+
+    #[test]
+    fn ocr_text_prefix_query_replays_insertion_order() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE ocr_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    screenshot_id INTEGER NOT NULL,
+                    text_enc BLOB,
+                    text_key_encrypted BLOB,
+                    box_x1 REAL, box_y1 REAL,
+                    is_deleted INTEGER NOT NULL DEFAULT 0
+                 );
+                 -- Rows are listed in OCR engine order, which is the order the
+                 -- boxes were embedded. Geometry disagrees on purpose: the last
+                 -- box of screenshot 7 sits highest on screen, and the first two
+                 -- share a visual line whose box_y1 jitters by one pixel.
+                 INSERT INTO ocr_results
+                    (screenshot_id, text_enc, text_key_encrypted, box_x1, box_y1, is_deleted)
+                 VALUES
+                    (7, X'01', X'00', 900.0, 41.0, 0),
+                    (7, X'02', X'00', 120.0, 40.0, 0),
+                    (7, X'03', X'00', 300.0, 10.0, 0),
+                    (7, X'04', X'00',  10.0,  9.0, 1),
+                    (8, X'05', X'00',  50.0, 99.0, 0);",
+            )
+            .expect("OCR ordering fixture");
+
+        let sql = ocr_text_prefix_query(2);
+        let mut stmt = connection.prepare(&sql).expect("prefix query");
+        let rows: Vec<(i64, u8)> = stmt
+            .query_map(params![7i64, 8i64], |row| {
+                let screenshot_id: i64 = row.get(0)?;
+                let text_enc: Vec<u8> = row.get(1)?;
+                Ok((screenshot_id, text_enc[0]))
+            })
+            .expect("execute prefix query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read prefix rows");
+
+        // Insertion order — ordering by `box_y1, box_x1` would hand back 3, 2, 1
+        // for screenshot 7 and rebuild text the vector was never encoded from.
+        // The soft-deleted box 4 stays out regardless of order.
+        assert_eq!(rows, vec![(7, 1u8), (7, 2u8), (7, 3u8), (8, 5u8)]);
     }
 
     #[test]

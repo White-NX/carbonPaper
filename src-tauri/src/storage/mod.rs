@@ -16,6 +16,8 @@ mod process;
 mod schema;
 mod screenshot;
 mod search;
+mod semantic_cache;
+mod semantic_shadow;
 pub mod smart_cluster;
 pub mod task;
 mod types;
@@ -26,6 +28,9 @@ pub use derived_index::*;
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
 #[allow(unused_imports)]
 pub use minilm_migration::*;
+#[allow(unused_imports)]
+pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
+pub use semantic_shadow::*;
 pub use types::*;
 
 use crate::credential_manager::{
@@ -36,7 +41,7 @@ use rusqlite::{Connection, OpenFlags};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Error returned by background-only reads of encrypted screenshot content.
 /// `AuthRequired` is intentionally distinct so callers can defer work without
@@ -87,6 +92,12 @@ pub struct StorageState {
     /// Serializes derived-index sidecar publication without participating in
     /// the data-directory/database lock ordering.
     derived_generation_publish_lock: Mutex<()>,
+    /// Resident `semantic_text` vectors for the exact-scan read path. Loaded on
+    /// first query, kept current by the write path, released when idle.
+    /// Lock order: always acquired after the database mutex, never before.
+    semantic_vector_cache: RwLock<Option<semantic_cache::SemanticVectorCache>>,
+    /// Unix millis of the last resident-cache use; 0 when nothing is cached.
+    semantic_cache_used_at: AtomicU64,
 }
 
 struct NamedConnectionGuard<'a> {
@@ -138,6 +149,8 @@ impl StorageState {
             thumbnail_warmup_done: AtomicBool::new(false),
             startup_vacuum_in_progress: AtomicBool::new(false),
             derived_generation_publish_lock: Mutex::new(()),
+            semantic_vector_cache: RwLock::new(None),
+            semantic_cache_used_at: AtomicU64::new(0),
         }
     }
 
