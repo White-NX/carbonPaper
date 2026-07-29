@@ -736,33 +736,47 @@ pub async fn monitor_nl_cluster_query(
     rerank_variant: Option<String>,
 ) -> Result<Value, String> {
     let enable_rerank = enable_rerank.unwrap_or(false);
-    let started = std::time::Instant::now();
+    let n_results = n_results.unwrap_or(30).min(200);
+    // Checked here rather than only inside `authenticated_monitor_command` so
+    // the Rust branch cannot serve a query the Python branch would have refused.
+    crate::commands::check_auth_required(&credential_state)?;
+
+    // M2.5 step 4: the Rust semantic index serves bi-encoder retrieval only.
+    // Reranked queries — every Smart Cluster calibration query — stay on Python
+    // until step 6, because `query_by_text` fuses retrieval and reranking and
+    // the ML protocol exposes no standalone rerank operation.
+    if !enable_rerank {
+        match crate::semantic_query::try_rust_nl_query(&app, &query, n_results).await {
+            crate::semantic_query::RustQueryOutcome::Served(response) => return Ok(response),
+            crate::semantic_query::RustQueryOutcome::NotSelected => {}
+            crate::semantic_query::RustQueryOutcome::FellBack(reason) => {
+                tracing::warn!(
+                    "[SEMANTIC] rust retrieval unavailable, serving from python: {reason}"
+                );
+            }
+        }
+    }
+
     let response = authenticated_monitor_command(
         &credential_state,
         &state,
         serde_json::json!({
             "command": "nl_cluster_query",
-            "query": query.clone(),
-            "n_results": n_results.unwrap_or(30).min(200),
+            "query": query,
+            "n_results": n_results,
             "enable_rerank": enable_rerank,
             "rerank_variant": rerank_variant.unwrap_or_else(|| "q4f16".to_string()),
         }),
     )
     .await?;
-    let python_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-    // Passive M2.5 shadow comparison. Runs only when semantic_runtime is
-    // rust_shadow; never alters the authoritative Python/Chroma response.
-    if response.get("status").and_then(|value| value.as_str()) == Some("success") {
-        crate::semantic_shadow::spawn_shadow_sample(
-            app,
-            query,
-            enable_rerank,
-            response.clone(),
-            python_ms,
-        );
+    if !enable_rerank {
+        // Recorded here, not at the point the Rust path stood down: the
+        // diagnostic answers "who served the last query", and Python has only
+        // now answered. A reranked query never had a Rust path to choose
+        // between, so it leaves the diagnostic alone.
+        crate::semantic_query::observe_python_served();
     }
-    Ok(response)
+    Ok(crate::semantic_query::tag_python_response(response))
 }
 
 #[tauri::command]

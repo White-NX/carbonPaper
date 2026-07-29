@@ -709,8 +709,9 @@ impl StorageState {
         .collect()
     }
 
-    /// Count query-visible embeddings for one index kind. Used as the Rust
-    /// coverage numerator for the M2.5 shadow-query diagnostics.
+    /// Count query-visible embeddings for one index kind. Reported for
+    /// `semantic_text` in the Settings → Advanced backend diagnostic, where it
+    /// is the local half of "how much of the corpus can Rust actually rank".
     pub fn count_query_visible_embeddings(
         &self,
         index_kind: DerivedIndexKind,
@@ -729,10 +730,11 @@ impl StorageState {
 
     /// Exact-scan cosine top-K over the query-visible `semantic_text`
     /// embeddings. Stored and query vectors are both L2-normalized, so cosine
-    /// similarity equals the dot product. This is the M2.5 shadow-query read
-    /// path: SQLite remains authoritative and the `.cpdvec` ANN sidecar is not
-    /// consulted until a performance gate requires it. The scan is bounded by
-    /// the ~30-day MiniLM hot layer that M2.4 migrated.
+    /// similarity equals the dot product. This is the production semantic read
+    /// path (`semantic_query.rs`): SQLite remains authoritative and the
+    /// `.cpdvec` ANN sidecar is not consulted until a performance gate requires
+    /// it. The scan is bounded by the ~30-day MiniLM hot layer that M2.4
+    /// migrated.
     ///
     /// Scoring runs against the resident matrix rather than re-reading the
     /// store per query — see `semantic_cache` for the freshness and lifetime

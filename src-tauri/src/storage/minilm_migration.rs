@@ -926,4 +926,47 @@ mod tests {
             .unwrap();
         assert!(storage.is_minilm_auto_migration_done("revision-1").unwrap());
     }
+
+    // The two tests below cover `crate::minilm_migration`'s dual-write entry
+    // point rather than this module's. They live here because that is where the
+    // `StorageState` test fixture is: the type's connection field is private to
+    // the storage module, and a permanently-vs-transiently rejected mirror is
+    // exactly a storage-level distinction.
+
+    #[test]
+    fn a_malformed_dual_write_row_is_rejected_permanently_not_queued_forever() {
+        // Python queues every failed mirror durably, and the Rust read path
+        // stands down while that queue is non-empty. A row whose payload can
+        // never become valid must therefore be reported as permanent, or it
+        // would hold semantic retrieval on Python for the life of the queue.
+        use crate::minilm_migration::{import_minilm_vector_from_python, MINILM_DIMENSIONS};
+        let storage = test_storage();
+
+        let rejection = import_minilm_vector_from_python(&storage, 0, vec![0.25; MINILM_DIMENSIONS])
+            .err()
+            .expect("a non-positive screenshot id is rejected");
+        assert!(rejection.permanent, "{}", rejection.message);
+
+        let rejection = import_minilm_vector_from_python(&storage, 5, vec![0.25; 10])
+            .err()
+            .expect("a wrong-width vector is rejected");
+        assert!(rejection.permanent, "{}", rejection.message);
+    }
+
+    #[test]
+    fn a_locked_session_is_transient_so_the_mirror_is_retried_after_unlock() {
+        // The opposite mistake: treating a locked vault as permanent would make
+        // Python drop vectors it will never write again, leaving the index
+        // silently short with nothing recording the loss.
+        use crate::minilm_migration::{import_minilm_vector_from_python, MINILM_DIMENSIONS};
+        let storage = test_storage();
+        assert!(!storage.is_session_valid());
+
+        let rejection =
+            import_minilm_vector_from_python(&storage, 5, vec![0.25; MINILM_DIMENSIONS])
+                .err()
+                .expect("a locked session cannot read the source row");
+        assert!(!rejection.permanent, "{}", rejection.message);
+        assert_eq!(rejection.message, "AUTH_REQUIRED");
+    }
 }

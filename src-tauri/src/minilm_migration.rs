@@ -1214,6 +1214,39 @@ pub fn list_minilm_rebuild_errors(
     }))
 }
 
+/// Why one Python dual-write row could not be mirrored, and — the part the
+/// caller actually acts on — whether retrying it could ever succeed.
+///
+/// Python keeps a durable retry queue for failed mirrors, and the Rust read
+/// path stands down while that queue is non-empty. A row Rust will reject
+/// forever (its screenshot was deleted, its vector is malformed) would
+/// therefore stall the queue and disable Rust retrieval permanently, so the
+/// two kinds of failure have to be distinguishable over the wire.
+pub(crate) struct ImportRejection {
+    /// True when no amount of retrying changes the outcome, so the caller
+    /// should drop the row rather than queue it.
+    pub permanent: bool,
+    pub message: String,
+}
+
+impl ImportRejection {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            permanent: true,
+            message: message.into(),
+        }
+    }
+
+    /// The store, the session or the source read failed. The same row may well
+    /// succeed once the session is valid again or the writer stops contending.
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            permanent: false,
+            message: message.into(),
+        }
+    }
+}
+
 /// Best-effort Python→Rust dual-write for newly produced MiniLM vectors. The
 /// caller-provided metadata is deliberately ignored; source text and its
 /// fingerprint are rehydrated from SQLite.
@@ -1221,30 +1254,43 @@ pub(crate) fn import_minilm_vector_from_python(
     storage: &StorageState,
     screenshot_id: i64,
     vector: Vec<f32>,
-) -> Result<EnsureDerivedIndexJobResult, String> {
+) -> Result<EnsureDerivedIndexJobResult, ImportRejection> {
     if screenshot_id <= 0 {
-        return Err("screenshot_id must be positive".to_string());
+        return Err(ImportRejection::permanent("screenshot_id must be positive"));
     }
-    validate_vector(&vector)?;
+    // A vector of the wrong width, or one carrying non-finite values, is a
+    // property of the payload rather than of the moment it arrived.
+    validate_vector(&vector).map_err(ImportRejection::permanent)?;
     let summaries = storage
         .get_screenshot_summaries_by_ids_silent(&[screenshot_id])
-        .map_err(background_error)?;
+        .map_err(|error| ImportRejection::transient(background_error(error)))?;
     let ocr = storage
         .get_ocr_text_prefixes_by_screenshot_ids_silent(&[screenshot_id], MINILM_OCR_SNIPPET_CHARS)
-        .map_err(background_error)?;
+        .map_err(|error| ImportRejection::transient(background_error(error)))?;
     let mut sources = source_rows(summaries, &ocr);
+    // Chroma keeps documents for screenshots the user has already deleted —
+    // Python only prunes the hot layer on age — so this is the expected fate of
+    // any queued id that gets deleted before its mirror lands, not an anomaly.
     let source = sources
         .pop()
-        .ok_or_else(|| "No active SQLite screenshot maps to screenshot_id".to_string())?;
+        .ok_or_else(|| {
+            ImportRejection::permanent("No active SQLite screenshot maps to screenshot_id")
+        })?;
     if source.text.is_empty() {
-        return Err("SQLite source produces an empty MiniLM input".to_string());
+        return Err(ImportRejection::permanent(
+            "SQLite source produces an empty MiniLM input",
+        ));
     }
-    let ensured = storage.ensure_derived_index_job(&source.spec)?;
+    let ensured = storage
+        .ensure_derived_index_job(&source.spec)
+        .map_err(ImportRejection::transient)?;
     if matches!(
         ensured,
         EnsureDerivedIndexJobResult::Queued | EnsureDerivedIndexJobResult::Requeued
     ) {
-        let lease = storage.mark_derived_index_job_processing(&source.spec)?;
+        let lease = storage
+            .mark_derived_index_job_processing(&source.spec)
+            .map_err(ImportRejection::transient)?;
         if let Err(error) = storage.commit_derived_embedding(&DerivedEmbeddingWrite {
             job: source.spec.clone(),
             lease_token: lease.clone(),
@@ -1257,38 +1303,10 @@ pub(crate) fn import_minilm_vector_from_python(
                 &error,
                 None,
             );
-            return Err(error);
+            return Err(ImportRejection::transient(error));
         }
     }
     Ok(ensured)
-}
-
-/// Reconstruct the MiniLM task text and its fingerprint for a batch of
-/// screenshot ids, using the exact migration/dual-write contract
-/// (`build_minilm_task_text` + `minilm_source_fingerprint`). Ids that map to no
-/// active screenshot are simply absent from the returned map. Used by the M2.5
-/// document-encoder shadow probe to re-encode migrated documents with the Rust
-/// runtime and compare against the stored Python doc vectors.
-pub(crate) fn minilm_sources_for_ids(
-    storage: &StorageState,
-    ids: &[i64],
-) -> Result<HashMap<i64, (String, String)>, String> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let summaries = storage
-        .get_screenshot_summaries_by_ids_silent(ids)
-        .map_err(background_error)?;
-    let ocr = storage
-        .get_ocr_text_prefixes_by_screenshot_ids_silent(ids, MINILM_OCR_SNIPPET_CHARS)
-        .map_err(background_error)?;
-    let mut out = HashMap::with_capacity(summaries.len());
-    for row in source_rows(summaries, &ocr) {
-        if let Ok(id) = row.spec.subject_key.parse::<i64>() {
-            out.insert(id, (row.text, row.spec.source_fingerprint));
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

@@ -19,11 +19,8 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [mlOcrStatusLoading, setMlOcrStatusLoading] = useState(false);
   const [rustOcrModelStatus, setRustOcrModelStatus] = useState(null);
   const [rustOcrModelDownloading, setRustOcrModelDownloading] = useState(false);
-  const [semanticShadowReport, setSemanticShadowReport] = useState(null);
-  const [semanticShadowLoading, setSemanticShadowLoading] = useState(false);
-  const [semanticProbeRunning, setSemanticProbeRunning] = useState(false);
-  const [semanticProbeSummary, setSemanticProbeSummary] = useState(null);
-  const [docProbeRunning, setDocProbeRunning] = useState(false);
+  const [semanticStatus, setSemanticStatus] = useState(null);
+  const [semanticStatusLoading, setSemanticStatusLoading] = useState(false);
 
   const saveConfig = async (newConfig) => {
     const previousConfig = config;
@@ -137,6 +134,33 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     refreshRustOcrModelStatus();
   }, []);
 
+  const refreshSemanticStatus = async () => {
+    setSemanticStatusLoading(true);
+    try {
+      setSemanticStatus(await invoke('get_ml_semantic_status'));
+    } catch (err) {
+      console.warn('Failed to read semantic backend status:', err);
+    } finally {
+      setSemanticStatusLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshSemanticStatus();
+  }, []);
+
+  /**
+   * The one-release rollback lever. `chroma` hands natural-language retrieval
+   * back to Python; the vectors stay where they are, so it is reversible at
+   * any time. `semantic_runtime` stays a separate registry-only switch because
+   * it rolls back Rust inference itself, which is a developer concern.
+   */
+  const handleToggleRustSemanticIndex = async (enabled) => {
+    const newConfig = { ...config, semantic_index: enabled ? 'rust' : 'chroma' };
+    const saved = await saveConfig(newConfig);
+    if (saved) await refreshSemanticStatus();
+  };
+
   useEffect(() => {
     refreshMlOcrStatus();
     const timer = window.setInterval(refreshMlOcrStatus, 5000);
@@ -176,75 +200,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
         console.warn('Failed to restart Rust ML OCR worker:', err);
       }
       await refreshMlOcrStatus();
-    }
-  };
-
-  const refreshSemanticShadowReport = async () => {
-    setSemanticShadowLoading(true);
-    try {
-      setSemanticShadowReport(await invoke('get_semantic_shadow_report', { window: 500 }));
-    } catch (err) {
-      console.warn('Failed to read semantic shadow report:', err);
-    } finally {
-      setSemanticShadowLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (config?.semantic_runtime === 'rust_shadow') {
-      refreshSemanticShadowReport();
-    }
-  }, [config?.semantic_runtime]);
-
-  useEffect(() => {
-    // The report/probe surface is always visible, so load the diagnostic once
-    // on mount regardless of whether the passive shadow toggle is on.
-    refreshSemanticShadowReport();
-  }, []);
-
-  const handleSemanticShadowToggle = async (enabled) => {
-    const newConfig = { ...config, semantic_runtime: enabled ? 'rust_shadow' : 'python' };
-    const saved = await saveConfig(newConfig);
-    if (saved && enabled) {
-      await refreshSemanticShadowReport();
-    }
-  };
-
-  const handleRunSemanticProbe = async () => {
-    setSemanticProbeRunning(true);
-    try {
-      const summary = await withAuth(() => invoke('run_semantic_shadow_probe', {}), { autoPrompt: true });
-      setSemanticProbeSummary(summary);
-      if (summary?.report) {
-        setSemanticShadowReport(summary.report);
-      } else {
-        await refreshSemanticShadowReport();
-      }
-    } catch (err) {
-      console.error('Failed to run semantic shadow probe:', err);
-    } finally {
-      setSemanticProbeRunning(false);
-    }
-  };
-
-  const handleRunDocEncoderProbe = async () => {
-    setDocProbeRunning(true);
-    try {
-      const summary = await withAuth(
-        () => invoke('run_semantic_doc_encoder_probe', {}),
-        { autoPrompt: true },
-      );
-      // The command returns the full report (with the doc-encoder section
-      // attached), so update the shared report directly when present.
-      if (summary?.report) {
-        setSemanticShadowReport(summary.report);
-      } else {
-        await refreshSemanticShadowReport();
-      }
-    } catch (err) {
-      console.error('Failed to run document-encoder probe:', err);
-    } finally {
-      setDocProbeRunning(false);
     }
   };
 
@@ -332,11 +287,8 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     mlOcrStatusLoading,
     rustOcrModelStatus,
     rustOcrModelDownloading,
-    semanticShadowReport,
-    semanticShadowLoading,
-    semanticProbeRunning,
-    semanticProbeSummary,
-    docProbeRunning,
+    semanticStatus,
+    semanticStatusLoading,
     setCpuDropdownOpen,
     setGpuDropdownOpen,
     setClusteringDropdownOpen,
@@ -352,9 +304,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     handleManualVacuum,
     handleRestartMlOcr,
     handleDownloadRustOcrModel,
-    handleSemanticShadowToggle,
-    refreshSemanticShadowReport,
-    handleRunSemanticProbe,
-    handleRunDocEncoderProbe,
+    handleToggleRustSemanticIndex,
+    refreshSemanticStatus,
   };
 }

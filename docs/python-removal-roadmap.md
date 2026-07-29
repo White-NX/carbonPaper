@@ -6,6 +6,7 @@ Supersedes the 0.8.1-baseline plan (kept for reference in `roadmap.0.8.1-origina
 2026-07-19 correction: the earlier Milestone 1 "demote Chinese-CLIP / one NL text path" decision is **reversed**. It rested on a dead-code rationale (`search_by_image` / `search_by_ocr_text`) that missed the *live* CLIP consumer — `search_by_text`, the text→image backend actually serving `search_nl` from two frontend surfaces and the MCP. Text→image visual search ("search 'sea', get sea-looking screenshots") is a distinct cross-modal capability that neither the shipped Rust keyword search (`storage/search.rs::search_text`) nor a future MiniLM-over-OCR semantic search can reproduce. CLIP is now **retained as a first-class search surface**; see the Milestone 1 decisions and Milestone 2 below.
 2026-07-19 implementation review: Milestone 2 is revised around **behavioral equivalence**, not merely moving an ONNX call site. Rust cutover must preserve feature availability, data coverage, filters, response contracts, ranking quality, foreground isolation, upgrade/rollback, and the still-live Python consumers. ChromaDB cannot be removed in Milestone 2 while `task_vectors` / `task_centroids` still serve Milestone 4 task clustering, and Python BGE inference cannot be removed before the classification consumer has a Rust path or an explicit Rust inference bridge.
 2026-07-19 delivery decision: **Milestone 2 is the committed scope for v0.8.4 Beta**, delivered as short stacked PRs with disabled/shadow infrastructure allowed to land before individual capability cutovers. This accelerates implementation without weakening the parity, migration, rollback, foreground-isolation, or one-release fallback gates. v0.8.4 Beta completing M2 does not mean that ChromaDB or the Python distribution can be removed in the same release.
+2026-07-28 cutover-scope correction (three changes, all forced by reading the shipped code rather than the plan). First, the old step 4 bundled two things the code cannot separate the way the plan assumed: Smart Cluster calibration is hard-wired to `enable_rerank = true` (`NlClusterView.jsx:95`) and Python's `query_by_text` fuses retrieval and reranking into one call with no standalone rerank command, so "cut over the calibration prefilter" would require a throwaway Rust→Python rerank bridge. Calibration moves to the reranker step instead, and step 4 cuts over the non-reranked path only. Second, the M2.5 release gate's "top-10 overlap ≥ 99%" wording was written assuming two implementations of the *same* retrieval method; the shipped Rust path is an exact scan and Chroma is ANN, so the measured divergence is a recall superset, not a defect. The gate is rewritten to say so rather than shipping against a gate known to fail on its literal text. Third, the numbered steps never contained a Rust capture-side MiniLM indexing step — new screenshots are still encoded and enqueued only by Python, which the M2.5 "with Python stopped" gate silently requires. It is now an explicit step between the query cutover and the reranker.
 
 Goal (unchanged): gradually remove the Python monitor stack from CarbonPaper while keeping user data safe, keeping OCR/search usable, and avoiding foreground ML interference.
 
@@ -266,7 +267,7 @@ no shadow-query or production-query switch in M2.4.
 
 `task_centroids` and all Chroma operations needed by Python HDBSCAN/PaCMAP stay
 unchanged until Milestone 4. The separate CLIP `screenshots` float-copy
-migration remains step 6 of M2.5, immediately before CLIP new-capture
+migration remains step 7 of M2.5, immediately before CLIP new-capture
 dual-write and shadow query. `chromadb` therefore remains a default dependency.
 
 #### M2.5 — Dual-write, shadow-query, then cut over by capability
@@ -276,12 +277,103 @@ Recommended sequence:
 1. MiniLM Rust inference parity.
 2. MiniLM derived-cache/index dual-write and migration. **Done in M2.4.**
 3. Rust semantic shadow queries compared locally with Chroma; Python remains authoritative. **Harness done 2026-07-27** — passive per-query shadow, an active built-in query corpus, and a document-encoder re-encode probe, reported through the telemetry-free `get_semantic_shadow_report`. The whole surface is temporary by construction; see the retirement block below.
-4. Cut over semantic-text retrieval and Smart Cluster calibration prefilter; keep rollback.
-5. Reranker parity and shadow scoring; cut over calibration only after score/order gates pass. The Python Smart Cluster worker may temporarily call the Rust reranker, but its Python fallback remains until Milestone 3.
-6. CLIP vector export/migration.
-7. Rust CLIP image encoder dual-write for new captures. **Do not cut over visual search while new screenshots still depend solely on Python image encoding.**
-8. Rust CLIP text-query shadow mode, then cut over `search_nl` and MCP capability reporting.
-9. Implement BGE in the shared Rust runtime and run it in shadow mode, but do not remove Python BGE inference until classification itself has a Rust path or a deliberately supported Rust inference bridge. The classification consumer remains a Milestone 5 completion item.
+4. Cut over the **non-reranked** semantic-text retrieval path to `semantic_index = rust`; keep rollback. Calibration is deliberately *not* included — see the scope note below.
+5. Rust capture-side MiniLM indexing and retention ownership: new screenshots are encoded and enqueued by Rust, and hot-layer expiry is decided by Rust rather than mirrored from Python. Without this, `semantic_index = rust` means "Rust reads, Python writes".
+6. Reranker parity and shadow scoring; then cut over Smart Cluster calibration, which moves as one unit with the reranker. The Python Smart Cluster worker may temporarily call the Rust reranker, but its Python fallback remains until Milestone 3.
+7. CLIP vector export/migration.
+8. Rust CLIP image encoder dual-write for new captures. **Do not cut over visual search while new screenshots still depend solely on Python image encoding.**
+9. Rust CLIP text-query shadow mode, then cut over `search_nl` and MCP capability reporting.
+10. Implement BGE in the shared Rust runtime and run it in shadow mode, but do not remove Python BGE inference until classification itself has a Rust path or a deliberately supported Rust inference bridge. The classification consumer remains a Milestone 5 completion item.
+
+Step-4 scope: retrieval only, not calibration (recorded 2026-07-28). The earlier
+plan said step 4 cuts over "semantic-text retrieval and Smart Cluster
+calibration prefilter". In the shipped code those are not separable at this
+step. Calibration mode forces `enableRerank = true` because it needs
+`rerank_score` to derive a per-cluster threshold (`NlClusterView.jsx:94-95`),
+and Python's `query_by_text` performs retrieval and reranking in one call
+(`task_clustering.py:1657-1701`) with no standalone rerank command on the
+protocol. Cutting over the calibration prefilter alone would therefore mean
+adding a Rust-retrieve → Python-rerank bridge that exists for exactly one
+release and is deleted at step 6 — more new surface than it saves, on the one
+path where a ranking mistake silently corrupts a saved threshold. So step 4
+cuts over `enable_rerank = false` only; `enable_rerank = true` continues to run
+entirely on Python and moves at step 6, where the end-to-end reranked ordering
+is re-measured anyway.
+
+Step-4 defaults and rollback levers. The cutover flips the *defaults* of both
+enums to `rust`, not merely the set of legal values — a "cutover" that left
+`semantic_index` defaulting to `chroma` would ship a switch nobody flips. This
+is safe on a machine whose M2.4 migration has not run, because an empty Rust
+index is treated as a fallback condition and the query is served from Python.
+Two independent levers restore the previous behavior for the one required
+release: `semantic_index = chroma` (Python owns retrieval) and
+`semantic_runtime = python` (no Rust MiniLM inference). The second is honored as
+a refusal rather than silently overridden, because serving from the Rust store
+necessarily encodes the query with the Rust runtime. Every refusal is recorded
+with its reason and read back through `get_ml_semantic_status.backend`, which
+the Settings → Advanced "semantic retrieval backend" card renders together with
+the `semantic_index` switch, so both the diagnostic and the rollback are
+reachable without a registry editor.
+
+Step-4 coverage rule (recorded 2026-07-28, extended 2026-07-29 after review).
+An empty Rust index falls back, but a *partially* filled one would not, and that
+is the failure this step actually has to defend against: ranking an incomplete
+corpus returns a plausible page with screenshots silently missing from it, which
+no user can detect and no after-the-fact instrument can reconstruct. Three
+things can leave the index short, and each has its own refusal.
+
+*The migration may not have finished.* The M2.4 copy commits page by page
+against a persisted cursor, and a migrated row becomes query-visible the moment
+its job row reaches `completed` — there is no generation gate in front of the
+read path. A run that fails mid-session drops the maintenance guard and does not
+retry until the next launch, so the rest of that session would otherwise serve a
+prefix of the corpus. The once-per-revision sentinel therefore gates retrieval
+too (`last_fallback_reason = migration_incomplete`), cached in-process because it
+is a one-way transition.
+
+*A mirror may have been lost.* The Python dual-write is durable — a mirror that
+fails is queued to `migrations/minilm/rust-import-retry.json` and retried from
+Chroma on the next capture or clustering pass, the same treatment hot-layer
+deletions already had. The size of that queue travels with every dual-write, so
+the Rust read path knows when its copy is behind and refuses to serve until the
+backlog is paid (`last_fallback_reason = index_incomplete`). Because the Rust
+counter is process-global and starts at zero, Python also reports the queue it
+loads off disk at monitor startup, and again after every retry pass including
+the ones that wrote nothing — otherwise a backlog that survived an app restart
+would be invisible to Rust until the next capture happened to write, which with
+the monitor paused is never.
+
+*The debt must stay payable.* Only mirrors that can still arrive count. Chroma
+keeps documents for screenshots the user deleted until they age out (Python
+prunes the hot layer on age alone), so a queued id can become one Rust rejects
+every time it is offered. Rust therefore classifies each rejected row as
+permanent or transient, Python drops the permanent ones instead of queueing
+them, and a retry pass no longer stops at the first failing batch. Without this
+a single deleted screenshot would hold the debt above zero — and Rust retrieval
+switched off — for as long as the queue survived.
+
+This is what replaces the deleted shadow harness's `only_in_chroma` metric as a
+*runtime* guard; the release gate below still expects the offline measurement
+before the step is called done. One residual window remains, recorded honestly:
+while the reverse-IPC pipe itself is down, Python cannot report the debt it is
+accumulating, so the Rust index can be behind without knowing it until the pipe
+recovers. Step 5 removes the reporting problem altogether by making Rust the
+writer.
+
+Step-5 scope: why an extra step exists (recorded 2026-07-28). The numbered
+sequence had no Rust capture-side MiniLM indexing step, even though the M2.5
+release gate requires that "with Python stopped … new-capture Rust CLIP/MiniLM
+indexing continue to work". CLIP got such a step (now step 8); MiniLM was
+skipped. In the shipped code the only writers of `semantic_text` rows are the
+M2.4 migration and the Python dual-write over reverse IPC
+(`reverse_ipc.rs`), and the only reaper is Python's hot-layer expiry mirroring
+its deletions to Rust. Rust can already embed (`semantic_runtime::embed_text`),
+but nothing calls it for a new screenshot. So step 4 delivers `semantic_index =
+rust` in the honest sense of "Rust owns the read path", not "Rust owns the
+index". Step 5 closes that: an idle-gated Rust enqueue/drain worker on the
+capture path plus Rust-owned retention, after which the "Python stopped" gate
+can genuinely be evaluated. Until then the capability is advertised as
+Rust-read / Python-written, per the honest-advertisement rule.
 
 Step-3 measurement (2026-07-27, 256-query and 256-document samples): query-encoder
 maximum absolute error 6.0e-7; Overlap@10 p50 100%, p05 50%; top-1 agreement
@@ -290,11 +382,12 @@ divergence is dominated by Rust returning documents the Chroma ANN path does not
 surface — the Rust side is an exact scan over the same hot layer, so a strict
 superset of recall is expected and was accepted as a difference in retrieval
 method rather than a Rust defect. Recorded honestly: this clears the query-encoder
-numeric gate but not the literal "top-10 overlap ≥ 99% / top-1 effectively
-unchanged" or the ≥0.99999 cosine wording below, which were written assuming two
-implementations of the *same* retrieval method. The step-4 cutover therefore keeps
-the `python` fallback and should re-check ranking on the reranked end-to-end path
-(step 5), where the bi-encoder recall difference is re-scored anyway.
+numeric gate but not the *original literal* "top-10 overlap ≥ 99% / top-1
+effectively unchanged" wording, which assumed two implementations of the same
+retrieval method; that wording is superseded below rather than waived. The
+step-4 cutover therefore keeps the `python` fallback and should re-check ranking
+on the reranked end-to-end path (step 6), where the bi-encoder recall difference
+is re-scored anyway.
 
 - Use enum backends, not ambiguous booleans: `semantic_runtime = python|rust_shadow|rust`, `semantic_index = chroma|dual|rust`, `clip_runtime = python|rust_shadow|rust`, `clip_index = chroma|dual|rust`. Invalid or unavailable Rust configurations fall back observably for one release, with a local diagnostic explaining why.
 - Preserve and explicitly test search response schemas, filters, offsets, limits, thresholds, MCP tool availability, and frontend labels. OCR keyword, MiniLM semantic text, CLIP visual/NL image search, and Smart Cluster assignment remain separately labeled; their scores are not compared across models.
@@ -332,9 +425,14 @@ when their turn comes.
 Release gate:
 
 - Token IDs match exactly for the golden corpus. CPU embedding cosine is at least 0.99999 with maximum absolute error 0.0001; DirectML embedding cosine is at least 0.999 with maximum absolute error 0.001 unless a model-specific, reviewed tolerance is documented. Raw reranker logits use the same CPU/DirectML absolute-error profiles.
-- On a representative migrated corpus, Rust-vs-Python top-10 overlap is at least 99%, top-1 is effectively unchanged, threshold decisions are stable, and filter/pagination/JSON contracts match 100%. Any intentional behavior correction is isolated and documented as a bug fix.
+- **Retrieval equivalence, stated as a recall-superset gate (rewritten 2026-07-28).** The original wording — "top-10 overlap at least 99%, top-1 effectively unchanged" — assumed the Rust and Python paths were two implementations of the *same* retrieval method. They are not: Chroma is approximate (HNSW), the Rust path is an exact cosine scan over the same hot layer. An exact scan that agreed with an ANN index 99% of the time at k=10 would be evidence that one of them is wrong, not that both are right. The gate is therefore:
+  - **Recall superset.** For each query, every Python top-K result that is present in the Rust store must be reachable by the Rust scan at a score no worse than Python assigns it. A Python-top result that is *absent* from the Rust store is a real coverage defect and blocks the cutover; a Python-top result that is present but ranked differently is the expected ANN-vs-exact difference. The shipped shadow harness reports these separately as `only_in_chroma` (blocking) and `in_both_diff_rank` (accepted) precisely so the two cannot be confused. Since the harness is deleted at step 4, this remains an offline gate measured before the cutover lands; what enforces it afterwards is the runtime coverage rule above (durable dual-write plus a debt-gated read path), not a metric nobody can read anymore.
+  - **Query-encoder numerics.** Cosine agreement between the Rust query encoder and the Python one, measured against the same stored document vectors, must meet the CPU tolerance above. This is the part that would catch a genuine Rust inference bug, and it is the part the 2026-07-27 measurement passed at 6.0e-7 maximum absolute error.
+  - **Contracts.** Filter, offset, limit, threshold, and JSON response contracts still match 100%. This is unchanged and is not softened by the above.
+  - Overlap@10 and top-1 agreement remain **recorded** as descriptive numbers, not pass/fail thresholds, for the bi-encoder retrieval step. They return to being a pass/fail gate at step 6, where reranked end-to-end ordering — which is what the user actually sees on the calibration path — is compared.
 - Migrated subject-key sets match exactly per index kind; unmappable/corrupt rows are listable and keep the legacy backend active. Existing CLIP vectors are byte-copied/float-copied rather than re-encoded during normal migration.
-- With Python stopped, Rust-owned semantic-text search, migrated CLIP visual search, and new-capture Rust CLIP/MiniLM indexing continue to work for capabilities marked `rust`. Capabilities still marked Python-backed remain advertised honestly and usable through fallback.
+- With Python stopped, Rust-owned semantic-text search, migrated CLIP visual search, and new-capture Rust CLIP/MiniLM indexing continue to work for capabilities marked `rust`. Capabilities still marked Python-backed remain advertised honestly and usable through fallback. **MiniLM reaches this gate at step 5, not step 4** — see the step-5 scope note. Step 4 may ship with the capability advertised as Rust-read / Python-written.
+
 - Existing automatic classification and task clustering do not regress: Python BGE remains until its consumer migrates, and `task_vectors` / `task_centroids` remain available to the Milestone 4 path.
 - Embedding migration/rebuild is interruptible/resumable; session lock/unlock, process crash, partial ANN generation, model upgrade, rollback to the previous release, and deletion are tested without screenshot loss or silent vector loss.
 - Background semantic work cannot trigger a model load during fullscreen/game activity. User-initiated search remains available with a deadline. OCR p95 latency and reliability show no material regression from semantic work; search p95 latency and peak memory stay within an explicitly recorded budget.
@@ -504,7 +602,7 @@ capability's first production release:
 
 - Keep this roadmap inside the `carbonPaper` repository (for example `docs/python-removal-roadmap.md`) before treating milestone status as branch/PR truth. The current parent-directory `roadmap.md` is outside the repository and cannot be reviewed or versioned with implementation branches.
 - `m2/contracts-and-baseline` / PR #139 contains the Mini Milestone 1 collection semantics/tests, internal CLIP count diagnostics, and Chroma version pin. Keep the Python oracle in the next stacked PR so the already-small baseline PR remains reviewable. Do not include unrelated release-workflow edits or user-facing warnings.
-- Build the v0.8.4 Beta Milestone 2 as short, stacked branches/PRs rather than a big-bang branch: `m2/contracts-and-baseline`, `m2/python-oracle-contracts`, `m2/rust-onnx-runtime`, `m2/derived-vector-store`, `m2/minilm-dual-write-migration`, `m2/minilm-shadow-cutover`, `m2/reranker-shadow-cutover`, `m2/clip-vector-migration`, `m2/clip-cutover`, `m2/search-ui-capabilities`, and `m2/bge-shadow`. Infrastructure may merge to `main` while disabled; each consumer cutover has its own gate and rollback.
+- Build the v0.8.4 Beta Milestone 2 as short, stacked branches/PRs rather than a big-bang branch: `m2/contracts-and-baseline`, `m2/python-oracle-contracts`, `m2/rust-onnx-runtime`, `m2/derived-vector-store`, `m2/minilm-dual-write-migration`, `m2/minilm-shadow-cutover`, `m2/minilm-query-cutover`, `m2/minilm-capture-indexing`, `m2/reranker-shadow-cutover`, `m2/clip-vector-migration`, `m2/clip-cutover`, `m2/search-ui-capabilities`, and `m2/bge-shadow`. Infrastructure may merge to `main` while disabled; each consumer cutover has its own gate and rollback. (`m2/minilm-query-cutover` and `m2/minilm-capture-indexing` were added on 2026-07-28 for M2.5 steps 4 and 5; calibration is no longer part of the query-cutover PR and rides with `m2/reranker-shadow-cutover`.)
 - Do not open a release branch until the intended capabilities have passed shadow mode on `main`. Release branches are stabilization-only; avoid accumulating new migration architecture there.
 - Intended backend selection is explicit per capability. Prefer enums (`python|rust_shadow|rust`, `chroma|dual|rust`) over one Boolean per replacement because inference and index ownership cut over at different times. **Reality:** only `rust_ocr_dml_beta` (a DirectML accelerator toggle) exists; OCR shipped default without a `rust_ocr` flag. Milestones 2-5 must not repeat that unobservable big-bang cutover.
 - Each flag/replacement should have a telemetry-free local diagnostic command that reports status and last error (the OCR runtime and `mcp_get_status` are the model to follow).
@@ -516,13 +614,22 @@ capability's first production release:
 M2.5 step 3 is done: the shadow harness (passive per-query comparison, active
 query corpus, document re-encode probe) landed on `m2/minilm-shadow-cutover`
 together with the resident-vector read path, and its parity/latency numbers are
-recorded above. Next is step 4 — cut over semantic-text retrieval and the Smart
-Cluster calibration prefilter to `semantic_index = rust`, keeping the `python`
-enum value as the one-release observable rollback. That same PR must delete the
-shadow scaffolding per the retirement block; the harness has now served its
-purpose and must not reach a production build. The coverage denominator for the
-gate is the set of valid, mappable vectors in the Chroma hot-layer snapshot, not
-all SQLite screenshots. Only then begin the separate CLIP vector
-migration/cutover sequence.
+recorded above. In progress is step 4 on `m2/minilm-query-cutover` — route the
+**non-reranked** NL semantic-text query through `semantic_index = rust`, keeping
+the `python` enum value as the one-release observable rollback. Reranked queries
+(which is every calibration query) stay on Python until step 6; see the step-4
+scope note for why splitting them there is cheaper than a one-release rerank
+bridge. That same PR must delete the shadow scaffolding per the retirement
+block; the harness has now served its purpose and must not reach a production
+build. The coverage denominator for the gate is the set of valid, mappable
+vectors in the Chroma hot-layer snapshot, not all SQLite screenshots.
+
+Step 5 (`m2/minilm-capture-indexing`) follows immediately and is not optional
+bookkeeping: until Rust encodes and enqueues new captures and owns retention,
+`semantic_index = rust` means Rust reads an index Python still writes, and the
+"with Python stopped" release gate cannot be evaluated for MiniLM at all. Only
+after that does the reranker step (6) run, which is also where Smart Cluster
+calibration moves. The separate CLIP vector migration/cutover sequence begins
+after those.
 
 No Rust backend becomes authoritative until its Python behavior contract, dual-write/migration, shadow-query, lifecycle, performance, and rollback gates pass. The first recommended cutover is MiniLM semantic retrieval; CLIP follows only after both legacy-vector migration and new-capture Rust image indexing work. Chroma remains for Milestone 4 task clustering, and Python BGE remains for Milestone 5 classification. Until subject-level Rust ledgers exist, the internal count-level CLIP comparison is only a migration baseline, not a product health judgment.
