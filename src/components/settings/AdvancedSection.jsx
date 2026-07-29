@@ -4,7 +4,7 @@ import AdvancedWarning from './advanced/AdvancedWarning';
 import ClusteringTechnicalCard from './advanced/ClusteringTechnicalCard';
 import CpuLimitCard from './advanced/CpuLimitCard';
 import DatabaseMaintenanceCard from './advanced/DatabaseMaintenanceCard';
-import { DmlAccelerationCard, OcrEngineCard, OnnxRuntimeCard, SemanticShadowCard } from './advanced/InferenceCards';
+import { DmlAccelerationCard, OcrEngineCard, OnnxRuntimeCard, SemanticBackendCard } from './advanced/InferenceCards';
 import NetworkAccessCard from './advanced/NetworkAccessCard';
 import OcrQueueCard from './advanced/OcrQueueCard';
 import { useAdvancedSectionController } from './useAdvancedSectionController';
@@ -44,15 +44,10 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     handleManualVacuum,
     handleRestartMlOcr,
     handleDownloadRustOcrModel,
-    semanticShadowReport,
-    semanticShadowLoading,
-    handleSemanticShadowToggle,
-    refreshSemanticShadowReport,
-    semanticProbeRunning,
-    semanticProbeSummary,
-    handleRunSemanticProbe,
-    docProbeRunning,
-    handleRunDocEncoderProbe,
+    semanticStatus,
+    semanticStatusLoading,
+    handleToggleRustSemanticIndex,
+    refreshSemanticStatus,
   } = useAdvancedSectionController({ monitorStatus, t });
 
   if (loading || !config) {
@@ -120,17 +115,12 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         onClearChanged={clearOnnxChanged}
       />
 
-      <SemanticShadowCard
+      <SemanticBackendCard
         config={config}
-        report={semanticShadowReport}
-        reportLoading={semanticShadowLoading}
-        onToggleShadow={handleSemanticShadowToggle}
-        onRefresh={refreshSemanticShadowReport}
-        onRunProbe={handleRunSemanticProbe}
-        probeRunning={semanticProbeRunning}
-        probeSummary={semanticProbeSummary}
-        onRunDocProbe={handleRunDocEncoderProbe}
-        docProbeRunning={docProbeRunning}
+        status={semanticStatus}
+        statusLoading={semanticStatusLoading}
+        onToggleRustIndex={handleToggleRustSemanticIndex}
+        onRefresh={refreshSemanticStatus}
       />
 
       <ClusteringTechnicalCard

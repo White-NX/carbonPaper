@@ -146,8 +146,8 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
     // M2.5 per-capability backend selection. Enums, not booleans, because
     // inference runtime and index ownership cut over at different times.
-    let semantic_runtime = crate::semantic_shadow::semantic_runtime_backend();
-    let semantic_index = crate::semantic_shadow::semantic_index_backend();
+    let semantic_runtime = crate::semantic_query::semantic_runtime_backend();
+    let semantic_index = crate::semantic_query::semantic_index_backend();
 
     Ok(serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
@@ -235,9 +235,10 @@ pub fn set_advanced_config(
         registry_config::set_bool("use_onnx", v)?;
     }
     // M2.5 backend selection. Unknown enum values are ignored so the runtime
-    // keeps observably falling back to the previous default.
+    // keeps observably falling back to the previous default. `rust_shadow` was
+    // retired with the step-4 cutover and is no longer accepted.
     if let Some(v) = config.get("semantic_runtime").and_then(|v| v.as_str()) {
-        if ["python", "rust_shadow", "rust"].contains(&v) {
+        if ["python", "rust"].contains(&v) {
             registry_config::set_string("semantic_runtime", v)?;
         }
     }

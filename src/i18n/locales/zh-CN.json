@@ -291,6 +291,22 @@
         "label": "启用网络功能",
         "description": "关闭后将禁用程序的所有外部网络请求，包括检查更新、下载模型等。"
       },
+      "semantic_backend": {
+        "title": "语义检索后端",
+        "label": "使用 Rust 语义检索",
+        "description": "关闭后，自然语言检索交回 Python 与 ChromaDB 处理。向量数据保持不变，可以随时切换回来。",
+        "diagnostic": "本地诊断",
+        "refresh": "刷新诊断",
+        "last_query": "上次检索由谁完成",
+        "served_rust": "Rust",
+        "served_python": "Python",
+        "served_unknown": "本次启动后尚未检索",
+        "indexed": "本地已索引向量",
+        "pending": "待补写向量",
+        "fallbacks": "回退次数",
+        "last_reason": "上次回退原因",
+        "pending_hint": "有向量尚未从 Python 同步到本地索引，在补齐之前检索会交给 Python 完成，以免结果里静默地漏掉截图。"
+      },
       "onnx": {
         "title": "ONNX 推理 (测试性)",
         "label": "使用 ONNX 模型推理",

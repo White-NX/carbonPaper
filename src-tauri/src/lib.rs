@@ -36,9 +36,9 @@ mod reverse_ipc_protocol;
 mod script_integrity;
 #[allow(dead_code)]
 mod semantic_models;
+mod semantic_query;
 #[allow(dead_code)]
 mod semantic_runtime;
-mod semantic_shadow;
 mod sensitive_filter;
 mod storage;
 mod updater;
@@ -1124,9 +1124,6 @@ pub fn run() {
             semantic_runtime::restart_ml_semantic_worker,
             minilm_migration::get_minilm_rebuild_status,
             minilm_migration::list_minilm_rebuild_errors,
-            semantic_shadow::get_semantic_shadow_report,
-            semantic_shadow::run_semantic_shadow_probe,
-            semantic_shadow::run_semantic_doc_encoder_probe,
             maintenance::get_maintenance_status,
             monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）

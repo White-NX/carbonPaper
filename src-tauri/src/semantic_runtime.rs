@@ -49,6 +49,12 @@ pub struct SemanticRuntimeStatus {
     pub last_error: Option<String>,
     pub last_elapsed_ms: Option<f64>,
     pub directml_disabled_for_session: bool,
+    /// M2.5 observable-fallback diagnostic: which semantic backend is selected,
+    /// which one actually served the last NL query, why a Rust configuration
+    /// was refused, and how far the local index is known to be behind. This
+    /// read-only field is what survives of the retired shadow settings card —
+    /// the enum rule requires a local diagnostic, not a dev panel.
+    pub backend: crate::semantic_query::SemanticBackendStatus,
 }
 
 #[derive(Debug)]
@@ -534,6 +540,7 @@ impl SemanticRuntimeState {
             last_error: inner.last_error.clone(),
             last_elapsed_ms: inner.last_elapsed_ms,
             directml_disabled_for_session: inner.directml_disabled_for_session,
+            backend: crate::semantic_query::backend_status(None),
         }
     }
 
@@ -1071,10 +1078,25 @@ fn assign_kill_on_close_job(child: &Child) -> Result<SemanticJobHandle, String> 
 }
 
 #[tauri::command]
-pub fn get_ml_semantic_status(
+pub async fn get_ml_semantic_status(
     state: tauri::State<'_, Arc<SemanticRuntimeState>>,
-) -> SemanticRuntimeStatus {
-    state.status()
+    storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
+) -> Result<SemanticRuntimeStatus, String> {
+    let mut status = state.status();
+    // Filled here rather than in `status()` because the local index count needs
+    // the database, and the internal callers of `status()` are on paths that
+    // must not touch it. `async` plus `spawn_blocking` is deliberate: the count
+    // takes the process-wide, non-reentrant database mutex, and every other
+    // command in this codebase that touches storage keeps that wait off the
+    // thread dispatching IPC. A synchronous command here would freeze the UI
+    // for as long as a vacuum or a migration page holds the lock.
+    let storage = storage.inner().clone();
+    status.backend = tokio::task::spawn_blocking(move || {
+        crate::semantic_query::backend_status(Some(storage.as_ref()))
+    })
+    .await
+    .map_err(|error| format!("Failed to read semantic backend status: {error}"))?;
+    Ok(status)
 }
 
 #[tauri::command]

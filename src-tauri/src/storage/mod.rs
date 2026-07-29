@@ -9,15 +9,14 @@ mod derived_index;
 mod encryption;
 mod image_io;
 mod link_scoring;
-mod minilm_migration;
 pub mod migration;
+mod minilm_migration;
 mod policy;
 mod process;
 mod schema;
 mod screenshot;
 mod search;
 mod semantic_cache;
-mod semantic_shadow;
 pub mod smart_cluster;
 pub mod task;
 mod types;
@@ -30,7 +29,6 @@ pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
 pub use minilm_migration::*;
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
-pub use semantic_shadow::*;
 pub use types::*;
 
 use crate::credential_manager::{

@@ -176,9 +176,6 @@ const COMMAND_TIERS = {
   'semantic_runtime::restart_ml_semantic_worker': 'runtime_public',
   'minilm_migration::get_minilm_rebuild_status': 'public',
   'minilm_migration::list_minilm_rebuild_errors': 'session_required',
-  'semantic_shadow::get_semantic_shadow_report': 'public',
-  'semantic_shadow::run_semantic_shadow_probe': 'session_required',
-  'semantic_shadow::run_semantic_doc_encoder_probe': 'session_required',
   'maintenance::get_maintenance_status': 'public',
 };
 

@@ -99,6 +99,10 @@ impl SemanticVectorCache {
         self.subjects.len()
     }
 
+    pub(super) fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+
     pub(super) fn resident_bytes(&self) -> usize {
         self.matrix.len() * std::mem::size_of::<f32>()
     }
@@ -190,6 +194,25 @@ impl SemanticVectorCache {
     }
 }
 
+/// Rejects a query whose width does not match the stored vectors.
+///
+/// `top_candidates` answers "nothing scored" for a foreign dimension, which is
+/// the right thing for a scoring routine but the wrong thing for a caller
+/// deciding *why* it got nothing: the read path would report an empty index and
+/// send someone looking for a missing migration when the real cause is a model
+/// whose vectors no longer fit the store. An empty store keeps the old
+/// behavior, because there is no contract to violate yet.
+fn check_query_dimensions(query: &[f32], cache: &SemanticVectorCache) -> Result<(), String> {
+    if cache.rows() == 0 || query.len() == cache.dimensions() {
+        return Ok(());
+    }
+    Err(format!(
+        "dimension_mismatch: query has {} dimension(s), the stored index has {}",
+        query.len(),
+        cache.dimensions()
+    ))
+}
+
 impl StorageState {
     /// Cosine top-K over the resident matrix, loading it on first use.
     pub(super) fn semantic_topk_resident(
@@ -212,7 +235,10 @@ impl StorageState {
                 .read()
                 .unwrap_or_else(|error| error.into_inner());
             match guard.as_ref() {
-                Some(cache) if cache.epoch == current_epoch => Some(cache.top_candidates(query, want)),
+                Some(cache) if cache.epoch == current_epoch => {
+                    check_query_dimensions(query, cache)?;
+                    Some(cache.top_candidates(query, want))
+                }
                 _ => None,
             }
         };
@@ -220,6 +246,7 @@ impl StorageState {
         let reloaded = candidates.is_none();
         if candidates.is_none() {
             let loaded = self.load_semantic_vector_cache()?;
+            check_query_dimensions(query, &loaded)?;
             let top = loaded.top_candidates(query, want);
             let mut guard = self
                 .semantic_vector_cache
@@ -495,6 +522,18 @@ mod tests {
     fn top_candidates_reject_a_foreign_query_dimension() {
         let cache = cache_of(&[("1", vec![1.0, 0.0])]);
         assert!(cache.top_candidates(&[1.0, 0.0, 0.0], 5).is_empty());
+    }
+
+    #[test]
+    fn a_foreign_query_dimension_is_reported_rather_than_read_as_an_empty_index() {
+        let cache = cache_of(&[("1", vec![1.0, 0.0])]);
+        let error = check_query_dimensions(&[1.0, 0.0, 0.0], &cache).unwrap_err();
+        assert!(error.starts_with("dimension_mismatch:"), "{error}");
+        assert!(check_query_dimensions(&[1.0, 0.0], &cache).is_ok());
+        // Nothing stored yet: an empty index is the honest answer, not a
+        // dimension complaint about a contract that does not exist.
+        let empty = SemanticVectorCache::new(1);
+        assert!(check_query_dimensions(&[1.0, 0.0, 0.0], &empty).is_ok());
     }
 
     #[test]

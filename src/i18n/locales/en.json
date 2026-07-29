@@ -291,6 +291,22 @@
         "label": "Enable Network Features",
         "description": "When disabled, all external network requests will be blocked, including update checks and model downloads."
       },
+      "semantic_backend": {
+        "title": "Semantic retrieval backend",
+        "label": "Use Rust semantic retrieval",
+        "description": "When off, natural-language retrieval is handed back to Python and ChromaDB. Vector data is unaffected, so you can switch back at any time.",
+        "diagnostic": "Local diagnostic",
+        "refresh": "Refresh diagnostic",
+        "last_query": "Last query served by",
+        "served_rust": "Rust",
+        "served_python": "Python",
+        "served_unknown": "No query since startup",
+        "indexed": "Vectors indexed locally",
+        "pending": "Vectors awaiting mirror",
+        "fallbacks": "Fallbacks",
+        "last_reason": "Last fallback reason",
+        "pending_hint": "Some vectors have not reached the local index yet. Until they do, retrieval is served by Python so that results cannot silently omit screenshots."
+      },
       "onnx": {
         "title": "ONNX Inference (Experimental)",
         "label": "Use ONNX model inference",
