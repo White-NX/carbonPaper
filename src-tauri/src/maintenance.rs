@@ -75,9 +75,11 @@ pub fn get_maintenance_status() -> MaintenanceStatus {
 }
 
 /// Reverse-IPC commands that remain usable during maintenance: session/crypto
-/// helpers the migration itself depends on, read-only status, MiniLM
-/// dual-write mirroring, and NMH session bookkeeping. Everything that writes
-/// screenshots, OCR, or clustering state is rejected.
+/// helpers the migration itself depends on, read-only status, and NMH session
+/// bookkeeping. Everything that writes screenshots, OCR, or clustering state is
+/// rejected. The MiniLM mirror commands used to be allowed here because Python
+/// wrote vectors Rust had to accept even mid-migration; M2.5 step 5 removed
+/// them along with the Python-side writer.
 pub fn reverse_ipc_command_allowed(command: &str) -> bool {
     matches!(
         command,
@@ -89,8 +91,6 @@ pub fn reverse_ipc_command_allowed(command: &str) -> bool {
             | "decrypt_many_from_chromadb"
             | "screenshot_exists"
             | "get_screenshots_with_ocr_by_ids"
-            | "upsert_minilm_derived_embeddings"
-            | "delete_minilm_derived_embeddings"
             | "register_nmh"
             | "unregister_nmh"
     )
@@ -113,15 +113,21 @@ mod tests {
 
     #[test]
     fn reverse_ipc_allowlist_rejects_mutations() {
-        assert!(reverse_ipc_command_allowed(
-            "upsert_minilm_derived_embeddings"
-        ));
+        assert!(reverse_ipc_command_allowed("get_screenshots_with_ocr_by_ids"));
         assert!(reverse_ipc_command_allowed("get_auth_status"));
         assert!(!reverse_ipc_command_allowed("save_screenshot"));
         assert!(!reverse_ipc_command_allowed("save_extension_screenshot"));
         assert!(!reverse_ipc_command_allowed("commit_screenshot"));
         assert!(!reverse_ipc_command_allowed(
             "smart_cluster_record_assignment"
+        ));
+        // Retired with the Python-side mirror. Still named here so that
+        // re-adding either one is a deliberate edit rather than a revival.
+        assert!(!reverse_ipc_command_allowed(
+            "upsert_minilm_derived_embeddings"
+        ));
+        assert!(!reverse_ipc_command_allowed(
+            "delete_minilm_derived_embeddings"
         ));
     }
 }

@@ -302,10 +302,12 @@
         "served_python": "Python",
         "served_unknown": "本次启动后尚未检索",
         "indexed": "本地已索引向量",
-        "pending": "待补写向量",
+        "backlog": "等待索引的截图",
+        "stalled": "索引失败的截图",
         "fallbacks": "回退次数",
         "last_reason": "上次回退原因",
-        "pending_hint": "有向量尚未从 Python 同步到本地索引，在补齐之前检索会交给 Python 完成，以免结果里静默地漏掉截图。"
+        "backlog_hint": "语义索引只在电脑空闲时进行，因此使用期间截取的画面要等到下一个空闲时段才能被自然语言检索到。",
+        "stalled_hint": "这些截图已经用完索引重试次数，不会再被自动处理，在重建索引之前它们不会出现在自然语言检索结果里。"
       },
       "onnx": {
         "title": "ONNX 推理 (测试性)",

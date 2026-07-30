@@ -47,17 +47,6 @@ class ModelNotAvailableError(Exception):
 # Constants
 # ---------------------------------------------------------------------------
 EMBEDDING_DIM = 384
-RUST_DUAL_WRITE_BATCH_SIZE = 32
-# Upper bound on the durable import-retry queue. The queue is normally bounded
-# by the hot layer itself, because entries Chroma no longer holds are pruned on
-# every flush; this cap only matters if the mirror stays unreachable for months.
-MAX_PENDING_RUST_IMPORTS = 100_000
-# The import-retry queue is journalled by appending. Re-queueing the same id
-# writes another line, so the file is compacted once it grows to several times
-# the live queue — the floor keeps small, healthy queues from compacting on
-# every pass.
-RUST_IMPORT_JOURNAL_COMPACT_FACTOR = 4
-RUST_IMPORT_JOURNAL_COMPACT_FLOOR = 512
 MAX_TASK_VECTOR_EXPORTS = 4
 TASK_VECTOR_EXPORT_LOGICAL_TIMEOUT_SECS = 10 * 60
 TASK_VECTOR_EXPORT_IDLE_TTL_SECS = 24 * 60 * 60
@@ -514,23 +503,9 @@ class HotColdManager:
             max_workers=1,
             thread_name_prefix="task-vector-export",
         )
-        self._pending_rust_deletes = set()
-        self._pending_rust_imports = set()
-        self._rust_import_journal_lines = 0
         # run_clustering calls helpers/properties that also acquire this lock.
         # Use RLock to avoid self-deadlock on nested acquisitions.
         self._lock = threading.RLock()
-
-        self._load_pending_rust_deletes()
-        self._load_pending_rust_imports()
-        if self._pending_rust_imports:
-            # Rust's debt counter lives in its process, not on disk, so a
-            # backlog that survived a restart is invisible to it until someone
-            # says so. Until it hears this, it would rank a knowably incomplete
-            # index and return results that quietly omit screenshots. Reported
-            # here rather than waiting for the next capture, which may be
-            # minutes away or, with the monitor paused, may never come.
-            self._report_import_debt()
 
         logger.info("[task_clustering] HotColdManager ready (lazy loading collections)")
 
@@ -618,14 +593,6 @@ class HotColdManager:
     @classmethod
     def _task_vector_export_dir(cls, export_id: str) -> str:
         return os.path.join(cls._migration_artifact_root(), export_id)
-
-    @classmethod
-    def _rust_delete_retry_path(cls) -> str:
-        return os.path.join(cls._migration_artifact_root(), "rust-delete-retry.json")
-
-    @classmethod
-    def _rust_import_retry_path(cls) -> str:
-        return os.path.join(cls._migration_artifact_root(), "rust-import-retry.json")
 
     @staticmethod
     def _validate_export_id(export_id: str) -> str:
@@ -940,329 +907,6 @@ class HotColdManager:
         shutil.rmtree(self._task_vector_export_dir(export_id) + ".tmp", ignore_errors=True)
         return state is not None
 
-    def _load_pending_rust_deletes(self) -> None:
-        path = self._rust_delete_retry_path()
-        try:
-            with open(path, "r", encoding="utf-8") as stream:
-                values = json.load(stream)
-            self._pending_rust_deletes = {
-                str(value) for value in values if str(value).isdigit() and int(value) > 0
-            }
-        except FileNotFoundError:
-            self._pending_rust_deletes = set()
-        except Exception:
-            logger.exception("failed to load pending Rust MiniLM deletions")
-            self._pending_rust_deletes = set()
-
-    def _persist_pending_rust_deletes(self) -> None:
-        path = self._rust_delete_retry_path()
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            temp_path = path + ".tmp"
-            # The whole snapshot-write-replace sequence stays under the lock:
-            # concurrent writers would otherwise race on the same .tmp file
-            # (os.replace fails on Windows while the file is open).
-            with self._lock:
-                snapshot = sorted(self._pending_rust_deletes, key=int)
-                with open(temp_path, "w", encoding="utf-8") as stream:
-                    json.dump(snapshot, stream)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temp_path, path)
-        except Exception:
-            logger.exception("failed to persist pending Rust MiniLM deletions")
-
-    def _flush_pending_rust_deletes(self) -> None:
-        if not self._storage_client:
-            return
-        with self._lock:
-            pending = sorted(self._pending_rust_deletes, key=int)
-        if not pending:
-            return
-        for offset in range(0, len(pending), 128):
-            batch = pending[offset:offset + 128]
-            try:
-                # IPC happens outside the lock; the manager lock also guards
-                # Chroma operations and must not wait on pipe round-trips.
-                if not self._storage_client.delete_minilm_derived_embeddings(
-                    [int(value) for value in batch]
-                ):
-                    break
-                with self._lock:
-                    self._pending_rust_deletes.difference_update(batch)
-            except Exception:
-                logger.debug("Rust MiniLM delete retry failed", exc_info=True)
-                break
-        self._persist_pending_rust_deletes()
-
-    def _queue_rust_deletes(self, ids: List[str]) -> None:
-        with self._lock:
-            self._pending_rust_deletes.update(str(value) for value in ids)
-        self._persist_pending_rust_deletes()
-        self._flush_pending_rust_deletes()
-
-    # ---- Rust MiniLM import retry ----------------------------------------
-    #
-    # The mirror of the deletion queue above, and it exists for the same kind
-    # of reason. Deletions were made durable so Rust could never surface a
-    # screenshot the user removed. Insertions need durability now that Rust
-    # *serves* semantic retrieval: a mirror that is dropped and forgotten
-    # leaves a screenshot permanently unfindable, with nothing on either side
-    # recording that it went missing. Only ids are queued; the vector is read
-    # back from Chroma, which stays authoritative, so a retry can never write
-    # a vector that disagrees with the hot layer.
-    #
-    # The queue is stored as an append-only journal of ids, one per line,
-    # rather than as a rewritten JSON array. Queueing happens on the capture
-    # path, and the queue is large exactly when the mirror has been failing for
-    # a long time, so rewriting the whole file per screenshot would make the
-    # capture path slowest in the situation that already went wrong. Appending
-    # costs one small write regardless of how much is queued. Removals cannot
-    # be expressed by appending, so they compact the file instead — and that
-    # only happens when the queue actually shrank, which is progress.
-
-    def _load_pending_rust_imports(self) -> None:
-        path = self._rust_import_retry_path()
-        try:
-            with open(path, "r", encoding="utf-8") as stream:
-                raw = stream.read()
-            queued, lines = self._parse_rust_import_journal(raw)
-            self._pending_rust_imports = queued
-            self._rust_import_journal_lines = lines
-        except FileNotFoundError:
-            self._pending_rust_imports = set()
-            self._rust_import_journal_lines = 0
-        except Exception:
-            logger.exception("failed to load pending Rust MiniLM imports")
-            self._pending_rust_imports = set()
-            self._rust_import_journal_lines = 0
-
-    @staticmethod
-    def _parse_rust_import_journal(raw: str) -> Tuple[set, int]:
-        """Read the id journal, accepting the JSON array earlier builds wrote.
-
-        Returns the live queue and how many entries the file spent on it — the
-        two differ once an id has been appended more than once, which is what
-        the compaction threshold watches.
-        """
-        text = raw.strip()
-        if not text:
-            return set(), 0
-        values = json.loads(text) if text.startswith("[") else text.splitlines()
-        entries = [
-            str(value).strip()
-            for value in values
-            if str(value).strip().isdigit() and int(str(value).strip()) > 0
-        ]
-        return set(entries), len(entries)
-
-    def _append_pending_rust_imports(self, ids: List[str]) -> None:
-        """Record newly queued ids without rewriting what is already on disk."""
-        if not ids:
-            return
-        path = self._rust_import_retry_path()
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with self._lock:
-                with open(path, "a", encoding="utf-8") as stream:
-                    stream.write("".join(f"{value}\n" for value in ids))
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                self._rust_import_journal_lines += len(ids)
-        except Exception:
-            logger.exception("failed to append pending Rust MiniLM imports")
-
-    def _compact_pending_rust_imports(self) -> None:
-        """Rewrite the journal so it holds exactly the live queue."""
-        path = self._rust_import_retry_path()
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            temp_path = path + ".tmp"
-            # Same locking rule as the deletion queue: the snapshot, write and
-            # replace stay together, because os.replace fails on Windows while
-            # another writer still holds the same .tmp file open.
-            with self._lock:
-                snapshot = sorted(self._pending_rust_imports, key=int)
-                with open(temp_path, "w", encoding="utf-8") as stream:
-                    stream.write("".join(f"{value}\n" for value in snapshot))
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temp_path, path)
-                self._rust_import_journal_lines = len(snapshot)
-        except Exception:
-            logger.exception("failed to compact pending Rust MiniLM imports")
-
-    def _pending_import_debt(self, excluding: Optional[List[str]] = None) -> int:
-        """Queued mirrors Rust does not have yet, ignoring a batch in flight."""
-        with self._lock:
-            if not excluding:
-                return len(self._pending_rust_imports)
-            return len(self._pending_rust_imports.difference(str(v) for v in excluding))
-
-    def _report_import_debt(self) -> None:
-        """Tell Rust how far behind its copy of the index is.
-
-        Rust's counter is process-global and starts at zero, so it cannot see a
-        queue that was loaded from disk at monitor startup, nor one that only
-        changed because rows were dropped rather than written. Left unreported,
-        it would rank against an index it wrongly believed complete — results
-        that look normal while quietly missing screenshots.
-        """
-        if not self._storage_client:
-            return
-        try:
-            self._storage_client.report_minilm_import_debt(self._pending_import_debt())
-        except Exception:
-            logger.debug("could not report the Rust MiniLM import debt", exc_info=True)
-
-    def _queue_rust_imports(self, ids: List[str]) -> None:
-        values = [str(value) for value in ids]
-        with self._lock:
-            was_empty = not self._pending_rust_imports
-            added = [value for value in values if value not in self._pending_rust_imports]
-            self._pending_rust_imports.update(added)
-            overflow = len(self._pending_rust_imports) - MAX_PENDING_RUST_IMPORTS
-            if overflow > 0:
-                # Screenshot ids are monotonic, so the newest entries are the
-                # largest. Reaching this cap means the mirror has been
-                # unreachable for a very long time; the queue stays non-empty
-                # either way, which is what keeps Rust retrieval standing down
-                # until the backlog is paid.
-                ordered = sorted(self._pending_rust_imports, key=int)
-                self._pending_rust_imports = set(ordered[overflow:])
-                logger.warning(
-                    "Rust MiniLM import queue exceeded %d entries; dropped %d oldest",
-                    MAX_PENDING_RUST_IMPORTS,
-                    overflow,
-                )
-        if was_empty:
-            # First loss after a healthy stretch. Worth a warning: from here on
-            # semantic retrieval is served by Python until the queue drains.
-            logger.warning(
-                "Rust MiniLM mirror failed for %d vector(s); queued for retry", len(values)
-            )
-        if overflow > 0:
-            # The queue shrank as well as grew, which appending cannot express.
-            self._compact_pending_rust_imports()
-        else:
-            self._append_pending_rust_imports(added)
-
-    def _settle_rust_imports(self, settled: set) -> None:
-        """Drop ids that no longer need mirroring and compact the journal."""
-        if not settled:
-            self._maybe_compact_rust_import_journal()
-            return
-        with self._lock:
-            self._pending_rust_imports.difference_update(settled)
-        self._compact_pending_rust_imports()
-
-    def _maybe_compact_rust_import_journal(self) -> None:
-        """Collapse a journal that repeated re-queueing has left mostly stale.
-
-        Appending the same id twice is harmless for correctness — the loader
-        deduplicates — but a queue that keeps failing the same rows would grow
-        the file without bound. Compacting once it is several times the live
-        set keeps the file proportional to the queue.
-        """
-        with self._lock:
-            live = len(self._pending_rust_imports)
-            lines = self._rust_import_journal_lines
-        if lines <= RUST_IMPORT_JOURNAL_COMPACT_FLOOR:
-            return
-        if lines < live * RUST_IMPORT_JOURNAL_COMPACT_FACTOR:
-            return
-        self._compact_pending_rust_imports()
-
-    def _flush_pending_rust_imports(self) -> None:
-        """Re-send queued mirrors, reading each vector back from Chroma."""
-        if not self._storage_client:
-            return
-        with self._lock:
-            pending = sorted(self._pending_rust_imports, key=int)
-        if not pending:
-            return
-
-        settled = set()
-        try:
-            collection = self.hot_collection
-            if collection is None:
-                return
-
-            for offset in range(0, len(pending), RUST_DUAL_WRITE_BATCH_SIZE):
-                batch = pending[offset:offset + RUST_DUAL_WRITE_BATCH_SIZE]
-                try:
-                    stored = collection.get(ids=batch, include=["embeddings"])
-                except Exception:
-                    logger.debug("Rust MiniLM import retry could not read Chroma", exc_info=True)
-                    break
-
-                found_ids = list(stored.get("ids") or [])
-                embeddings = stored.get("embeddings")
-                embeddings = [] if embeddings is None else list(embeddings)
-                records = [
-                    {
-                        "screenshot_id": int(doc_id),
-                        "embedding": np.asarray(vector, dtype=np.float32).tolist(),
-                    }
-                    for doc_id, vector in zip(found_ids, embeddings)
-                ]
-                # Ids Chroma no longer holds expired or were deleted while the
-                # queue waited. Rust has nothing to mirror for them, and the
-                # deletion queue owns removing anything it already has.
-                found = set(found_ids)
-                settled.update(value for value in batch if value not in found)
-
-                if not records:
-                    continue
-                try:
-                    outcome = self._storage_client.upsert_minilm_derived_embeddings(
-                        records,
-                        # Neither the batch in flight nor anything earlier
-                        # batches already settled is still owed. Counting them
-                        # would keep Rust standing down over a debt that is
-                        # being paid as this loop runs.
-                        pending_imports=self._pending_import_debt(
-                            excluding=batch + sorted(settled)
-                        ),
-                    )
-                except Exception:
-                    logger.debug("Rust MiniLM import retry failed", exc_info=True)
-                    break
-                if outcome.retry_ids is None:
-                    # The batch failed as a whole — a closed pipe, a locked
-                    # vault — so nothing is known about individual rows and
-                    # nothing settles. Later batches would fail the same way.
-                    logger.debug("Rust MiniLM import retry was rejected wholesale")
-                    break
-
-                sent = {str(record["screenshot_id"]) for record in records}
-                settled.update(sent.difference(outcome.retry_ids))
-                if outcome.dropped_ids:
-                    # Rust will never accept these: their screenshots are gone
-                    # from SQLite, or their vectors are malformed. Chroma keeps
-                    # documents for deleted screenshots until they age out, so
-                    # this is the expected fate of a queued id the user deletes.
-                    # Keeping them queued would hold Rust retrieval down for as
-                    # long as the queue lives, which is to say forever.
-                    logger.info(
-                        "Rust MiniLM mirror permanently rejected %d queued vector(s); dropping",
-                        len(outcome.dropped_ids),
-                    )
-                if len(outcome.retry_ids) == len(records):
-                    # Nothing in this batch got through. That reads as a
-                    # condition affecting every row rather than a bad row, so
-                    # stop instead of walking the rest of the backlog into it.
-                    break
-        finally:
-            self._settle_rust_imports(settled)
-            # Reported on every pass, including the ones that wrote nothing:
-            # rows that were dropped or found missing change the debt without
-            # any dual-write having carried the new number to Rust.
-            self._report_import_debt()
-
-        if not self._pending_import_debt():
-            logger.info("Rust MiniLM import queue drained")
-
     def upsert_task_vectors(self, records: List[Dict[str, Any]]) -> int:
         """Write Rust-generated MiniLM vectors to the authoritative hot layer."""
         if not isinstance(records, list) or not records:
@@ -1305,121 +949,16 @@ class HotColdManager:
         )
         return len(ids)
 
-    def _dual_write_rust(self, ids: List[str], vectors) -> None:
-        """Mirror to the Rust derived store; Chroma success remains authoritative.
-
-        A failure here is no longer allowed to vanish. Rust serves non-reranked
-        semantic retrieval from this store, so a vector that never arrives is a
-        screenshot that can never be found again by natural-language search.
-        Failed ids go to the durable retry queue, and the queue length travels
-        with every write so the Rust side can stand down until it is paid.
-
-        Only the rows that actually failed are queued, and only the ones that
-        could still succeed. A row Rust accepted does not need retrying, and a
-        row it rejected permanently never will — queueing either would inflate
-        the debt that keeps retrieval on Python.
-        """
-        if not self._storage_client or not ids:
-            return
-        for offset in range(0, len(ids), RUST_DUAL_WRITE_BATCH_SIZE):
-            batch_ids = ids[offset:offset + RUST_DUAL_WRITE_BATCH_SIZE]
-            batch_vectors = vectors[offset:offset + RUST_DUAL_WRITE_BATCH_SIZE]
-            records = [
-                {
-                    "screenshot_id": int(doc_id),
-                    "embedding": np.asarray(vector, dtype=np.float32).tolist(),
-                }
-                for doc_id, vector in zip(batch_ids, batch_vectors)
-            ]
-            try:
-                outcome = self._storage_client.upsert_minilm_derived_embeddings(
-                    records,
-                    pending_imports=self._pending_import_debt(excluding=batch_ids),
-                )
-            except Exception as e:
-                logger.debug("[task_clustering] Rust MiniLM dual-write failed: %s", e)
-                # No response at all: same standing as a wholesale rejection —
-                # nothing is known per row, so every id is assumed still owed.
-                outcome = None
-            if outcome is not None and outcome.delivered:
-                continue
-            dropped = outcome.dropped_ids if outcome is not None else []
-            if dropped:
-                logger.info(
-                    "[task_clustering] Rust MiniLM mirror permanently rejected %d vector(s)",
-                    len(dropped),
-                )
-            retry = (
-                [str(value) for value in batch_ids]
-                if outcome is None or outcome.retry_ids is None
-                else outcome.retry_ids
-            )
-            if retry:
-                self._queue_rust_imports(retry)
-
-    def add_snapshot(
-        self,
-        screenshot_id: int,
-        process_name: str,
-        window_title: str,
-        ocr_text: str,
-        timestamp: float,
-        category: str = "",
-    ):
-        """Encode and store a single snapshot in the hot layer.
-
-        Silently skips if the MiniLM model is not yet downloaded.
-        The timestamp is normalised to seconds (Unix epoch).
-        """
-        if not TaskEmbedder.is_model_available():
-            return  # model not downloaded yet, skip silently
-
-        combined = build_task_text(process_name, window_title, ocr_text)
-        if not combined.strip():
-            return
-
-        # Normalise timestamp to seconds — callers may pass milliseconds
-        if timestamp > 1e12:
-            timestamp = timestamp / 1000.0
-
-        doc_id = str(screenshot_id)
-        # Check for duplicate
-        try:
-            existing = self.hot_collection.get(ids=[doc_id])
-            if existing and existing["ids"]:
-                return
-        except Exception:
-            pass
-
-        vector = self._embedder.encode_single(combined)
-
-        metadata = {
-            "screenshot_id": screenshot_id,
-            "timestamp": timestamp,
-            "process_name": self._encrypt(process_name) if process_name else "",
-            "window_title": self._encrypt(window_title) if window_title else "",
-            "category": category or "",
-            "layer": "hot",
-        }
-
-        self.hot_collection.add(
-            ids=[doc_id],
-            embeddings=[vector.tolist()],
-            metadatas=[metadata],
-            documents=[self._encrypt(combined)],
-        )
-        self._dual_write_rust([doc_id], [vector])
-        self._flush_pending_rust_deletes()
-        self._flush_pending_rust_imports()
-
-        # Enqueue for smart cluster evaluation. Best-effort and O(1) — the
-        # actual scoring happens in a separate idle-aware worker so this stays
-        # off the OCR critical path.
-        if self._storage_client:
-            try:
-                self._storage_client.smart_cluster_enqueue_pending(screenshot_id)
-            except Exception as e:
-                logger.debug("[task_clustering] smart cluster enqueue failed (non-fatal): %s", e)
+    # M2.5 step 5 removed `_dual_write_rust` and `add_snapshot` from this class.
+    # Python no longer runs MiniLM on the capture path: Rust encodes each new
+    # screenshot on its idle-gated worker, commits the vector to its own store,
+    # and hands the finished row back through `upsert_task_vectors` above. The
+    # Smart Cluster pending enqueue moved with the encoder for the same reason —
+    # it belongs next to whoever wrote the vector the prefilter reads.
+    #
+    # What is left here is the hot layer as a *consumer*: clustering reads it,
+    # `compress_to_cold` ages it, and `_backfill_from_screenshots` still rebuilds
+    # it from SQLite when it is found empty.
 
     def get_hot_vectors(self, days: int = HOT_LAYER_DAYS) -> Tuple[np.ndarray, List[str], List[Dict]]:
         """Retrieve hot-layer vectors within the time window.
@@ -1554,14 +1093,16 @@ class HotColdManager:
                 except Exception as e:
                     logger.warning("Failed to archive cluster %s to cold: %s", cid, e)
 
-        # Remove expired hot vectors
+        # Remove expired hot vectors. Only this collection's own rows: since
+        # M2.5 step 5 the Rust semantic store keeps its own 30-day window
+        # against SQLite timestamps, so the deletions no longer have to be
+        # mirrored across. The two stores stop tracking each other.
         try:
             expired = self.hot_collection.get(
                 where={"timestamp": {"$lt": cutoff}},
             )
             if expired["ids"]:
                 self.hot_collection.delete(ids=expired["ids"])
-                self._queue_rust_deletes(expired["ids"])
                 logger.info("Removed %d expired vectors from hot layer", len(expired["ids"]))
         except Exception as e:
             logger.warning("Failed to clean expired hot vectors: %s", e)
@@ -1701,7 +1242,6 @@ class HotColdManager:
                         embeddings=vectors.tolist(),
                         metadatas=batch_metas,
                     )
-                    self._dual_write_rust(batch_ids, vectors)
                     added += len(batch_ids)
                     logger.info("Backfilled %d/%d (page offset %d)", added, total, offset)
                 except Exception as e:
@@ -1739,12 +1279,6 @@ class HotColdManager:
 
         Returns clustering results dict.
         """
-        # Periodic retry for the Rust mirror, deliberately outside the manager
-        # lock (it does pipe round-trips) and outside the capture path. Without
-        # it, a backlog left by an unreachable mirror would wait for the next
-        # screenshot; a paused monitor would never clear it at all.
-        self._flush_pending_rust_imports()
-
         with self._lock:
             logger.info("Starting clustering run (range=%s–%s) …",
                         start_time or "auto", end_time or "auto")

@@ -302,10 +302,12 @@
         "served_python": "Python",
         "served_unknown": "No query since startup",
         "indexed": "Vectors indexed locally",
-        "pending": "Vectors awaiting mirror",
+        "backlog": "Screenshots awaiting indexing",
+        "stalled": "Screenshots that failed indexing",
         "fallbacks": "Fallbacks",
         "last_reason": "Last fallback reason",
-        "pending_hint": "Some vectors have not reached the local index yet. Until they do, retrieval is served by Python so that results cannot silently omit screenshots."
+        "backlog_hint": "Semantic indexing runs only while the computer is idle, so screenshots captured during active use become searchable by natural language after the next idle period.",
+        "stalled_hint": "These screenshots exhausted their indexing retries and will not be picked up again on their own. They stay out of natural-language search until indexing is rebuilt."
       },
       "onnx": {
         "title": "ONNX Inference (Experimental)",

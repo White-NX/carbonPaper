@@ -1,635 +1,1344 @@
-# CarbonPaper v0.8.4 Beta M2 / 0.8.x Python Removal Roadmap
+# Python Removal Roadmap (CarbonPaper 0.8.x)
 
-Baseline: CarbonPaper `0.8.3`, revised on 2026-07-18 from a direct source-code audit of the shipped tree.
-Supersedes the 0.8.1-baseline plan (kept for reference in `roadmap.0.8.1-original.md`).
-2026-07-19 update: Milestone 1 was reduced to an **internal migration baseline**: collection semantics, scope decisions, a stable count-level CLIP baseline, and the Chroma version pin. It is not a user-facing health feature and does not need a separate release; its per-row ledger, rebuild executor, and actionable maintenance UI belong to Milestone 2.
-2026-07-19 correction: the earlier Milestone 1 "demote Chinese-CLIP / one NL text path" decision is **reversed**. It rested on a dead-code rationale (`search_by_image` / `search_by_ocr_text`) that missed the *live* CLIP consumer — `search_by_text`, the text→image backend actually serving `search_nl` from two frontend surfaces and the MCP. Text→image visual search ("search 'sea', get sea-looking screenshots") is a distinct cross-modal capability that neither the shipped Rust keyword search (`storage/search.rs::search_text`) nor a future MiniLM-over-OCR semantic search can reproduce. CLIP is now **retained as a first-class search surface**; see the Milestone 1 decisions and Milestone 2 below.
-2026-07-19 implementation review: Milestone 2 is revised around **behavioral equivalence**, not merely moving an ONNX call site. Rust cutover must preserve feature availability, data coverage, filters, response contracts, ranking quality, foreground isolation, upgrade/rollback, and the still-live Python consumers. ChromaDB cannot be removed in Milestone 2 while `task_vectors` / `task_centroids` still serve Milestone 4 task clustering, and Python BGE inference cannot be removed before the classification consumer has a Rust path or an explicit Rust inference bridge.
-2026-07-19 delivery decision: **Milestone 2 is the committed scope for v0.8.4 Beta**, delivered as short stacked PRs with disabled/shadow infrastructure allowed to land before individual capability cutovers. This accelerates implementation without weakening the parity, migration, rollback, foreground-isolation, or one-release fallback gates. v0.8.4 Beta completing M2 does not mean that ChromaDB or the Python distribution can be removed in the same release.
-2026-07-28 cutover-scope correction (three changes, all forced by reading the shipped code rather than the plan). First, the old step 4 bundled two things the code cannot separate the way the plan assumed: Smart Cluster calibration is hard-wired to `enable_rerank = true` (`NlClusterView.jsx:95`) and Python's `query_by_text` fuses retrieval and reranking into one call with no standalone rerank command, so "cut over the calibration prefilter" would require a throwaway Rust→Python rerank bridge. Calibration moves to the reranker step instead, and step 4 cuts over the non-reranked path only. Second, the M2.5 release gate's "top-10 overlap ≥ 99%" wording was written assuming two implementations of the *same* retrieval method; the shipped Rust path is an exact scan and Chroma is ANN, so the measured divergence is a recall superset, not a defect. The gate is rewritten to say so rather than shipping against a gate known to fail on its literal text. Third, the numbered steps never contained a Rust capture-side MiniLM indexing step — new screenshots are still encoded and enqueued only by Python, which the M2.5 "with Python stopped" gate silently requires. It is now an explicit step between the query cutover and the reranker.
+**Goal.** Remove the Python monitor stack from CarbonPaper without losing user
+data, without breaking OCR or search, and without letting background machine
+learning interfere with whatever the user has in the foreground.
 
-Goal (unchanged): gradually remove the Python monitor stack from CarbonPaper while keeping user data safe, keeping OCR/search usable, and avoiding foreground ML interference.
+**Current milestone.** Milestone 2, targeted at v0.8.4 Beta. Steps 1-5 of the
+M2.5 cutover sequence are done; step 6 is next.
 
-## Why This Revision
+---
 
-The original plan assigned one milestone per `0.8.x` version and assumed a **direct Python-to-Rust hop, one feature at a time**. The audit shows the codebase diverged from that plan in three important ways, so version numbers no longer describe reality:
+## 1. How to read this document
 
-1. **OCR is already Rust-default** (the original 0.8.5 target) even though the shipped version is `0.8.3`. It was implemented not via the in-process `OcrEngine` trait but as a standalone `carbonpaper-ml.exe` worker built on the pinned crate `rapidocr-core = "=0.2.2"`. The Python-default beta phase (original 0.8.4) and its dual-run diagnostics were **skipped entirely**.
-2. **A "two-hop" migration is actually in progress** (see below). The team first unified all ML onto ONNX inside Python and lifted model-asset management into Rust, rather than porting each feature straight to Rust.
-3. **The Agent/MCP parallel track ran ahead** of the Python-removal track, reaching the original 0.8.3 target.
+The document is organized by **milestone**, not by version. Milestones are
+ordered commitments; version numbers next to them are estimates. Only Milestone
+2 is tied to a specific release (v0.8.4 Beta). Do not infer a milestone's status
+from the app's version number — section 3 explains why the two drifted apart.
 
-Consequence for this document: Milestone 2 is explicitly targeted at **v0.8.4 Beta**. Later milestones remain ordered commitments rather than promises tied to a specific patch number. Do not infer later milestone status from the version number.
+Each milestone has the same five parts:
 
-## The Two-Hop Migration Reality
+| Part | Answers |
+| --- | --- |
+| **Goal** | Why this milestone exists |
+| **Where the code is** | What is already true, in the shipped or in-flight tree |
+| **Work** | What has to be built, and what is already built |
+| **Release gate** | What must be provably true before the milestone is called done |
+| **Depends on** | Which earlier milestone has to land first |
 
-The real path is not `Python(PyTorch) -> Rust`. It is:
+Status words are used strictly:
 
-- **Hop 1 — ONNX unification + Rust asset ownership (mostly done).** All ML models (OCR PP-OCRv5, CLIP, BGE, MiniLM, bge-reranker) are ONNX; `use_onnx` defaults to `true` (`model_management.rs:390`) and `torch`/`sentence-transformers` are fallback-only (`monitor/main.py:12-18` ONNX sentinel skips the torch import). Model registration, install status, sizing, and OCR **inference** are Rust-owned. Python is compressed into a thin layer: `onnxruntime-directml` inference + ChromaDB + post-process orchestration.
-- **Hop 2 — move ONNX inference from Python to Rust (only OCR done).** Everything except OCR still runs its ONNX inference inside the Python `onnxruntime`.
+- **DONE** — merged and gate-checked.
+- **IN PROGRESS** — partially merged; the milestone body says which parts.
+- **IMPLEMENTED, SOAKING** — code is written and on a branch, awaiting an
+  on-machine run before it counts as done.
+- **PLANNED** — not started.
 
-This matters for planning: because embedding, reranking, and classification already share one Python ONNX runtime, they are cheaper to move **together** (swap the inference layer once) than one feature per release. The milestone plan is reorganized around that.
+Code references (`file.rs:123`) are pointers, not contracts. Line numbers drift
+with every commit; the file and symbol names are the durable part. Where a
+reference matters for a decision, the symbol name is given so it can be found
+again.
 
-## What Actually Shipped (audited 2026-07-18)
+---
 
-Line references are as of the audit and will drift.
+## 2. Status at a glance
 
-**Reliability & migration baseline (original 0.8.2) — DONE**
-- Frontend image/detail queue deadlines with `deadline_exceeded` (`src/lib/monitor_api.js:15-122`).
-- Python `StorageClient` reverse-IPC watchdog with per-phase deadlines and status reporting (`monitor/storage_client.py:105-113,344-497`).
-- Monitor crash recovery via `MonitorRecoveryState` — chose the "recoverable state + restart" option, `policy = manual_restart`, crash counter, `monitor-recovery` events (`src-tauri/src/monitor.rs:44-74`).
-- Non-silent OCR/index failure: screenshot preserved on OCR failure, `screenshot_ocr_status` carries `status` + `postprocess_status/attempts/next_retry` (`storage/schema.rs:162-173`; `capture.rs:1734-1749`); retry command `storage_retry_vector_indexing`.
-- Index health panel wired to UI (`components/settings/storage/IndexHealthCard.jsx` + `storage_get_index_health`).
-- Scheduled HDBSCAN is idle-gated (`monitor/task_clustering.py:1347-1354`).
-- Repo hygiene clean: `git ls-files` shows no tracked db/key/pyz/venv/installer.
+| Milestone | Target | Status | What it is waiting on |
+| --- | --- | --- | --- |
+| M1 — Vector semantics and migration baseline | folded into M2 | **DONE** | — |
+| M2 — Rust ONNX inference and per-kind index ownership | v0.8.4 Beta | **IN PROGRESS** — 5 of 10 cutover steps done | reranker + Smart Cluster scoring (step 6), then CLIP (steps 7-9), then BGE shadow (step 10) |
+| M3 — Smart Cluster worker in Rust | post-v0.8.4 Beta | **PLANNED** (scope reduced) | M2 step 6 |
+| M4 — Task clustering decision | post-M3 | **PLANNED** | M2 (embedding similarity) |
+| M5 — Classification and PII resolution | post-M4 | **PLANNED** | M2-M4 |
+| M6 — Python-free default build | later 0.8.x | **PLANNED** | M1-M5 default and stable for a release |
+| M7 — Infrastructure deletion and simplification | final 0.8.x | **PLANNED** | M6 |
+| Parallel track — Agent skill and MCP | ongoing | **MOSTLY DONE** | settings-page MCP smoke test; per-agent setup variants |
 
-**OCR = Rust default (original 0.8.4 + 0.8.5) — DONE / exceeded**
-- Capture hot path calls Rust OCR directly; status recorded as `engine="rust"` (`capture.rs:1785-1855`). Engine is `rapidocr-core "=0.2.2"` with `directml` feature (`src-tauri/Cargo.toml:74`).
-- Rust OCR runtime has a watchdog timeout that kills a stuck worker (`ml_runtime.rs:216-295`) and a post-process retry loop with a real-failure-only retry budget (`ml_runtime.rs:1143-1270`).
-- Online model repair + status UI (`components/OcrModelRepairCard.jsx`, `settings/advanced/InferenceCards.jsx`).
-- Divergence from the original plan, recorded as debt: there is **no `ocr_engine` config flag and no registry-level Python OCR fallback**; Python OCR recognition is disabled by a runtime handshake (`monitor/ocr_service.py:129`, `_rust_ocr_provider_active`). Dual-run diagnostics were never built.
+---
 
-**ONNX unification + Rust model asset registry (not in original plan) — DONE**
-- `ModelInventoryEntry` reports id / purpose / installed / `active_runtime` (`onnx`|`pytorch`) / size / per-runtime variants; exposed via `get_model_inventory` (`model_management.rs:878-1063,1160`; UI `settings/organize/ModelInventoryTable.jsx`).
-- This over-delivers the original 0.8.3 "ModelRegistry" but only covers assets — there is **no `rust-native` runtime** for anything but OCR.
+## 3. Where the code actually is
 
-**Rust ML contracts (original 0.8.3) — PARTIAL / different shape**
-- `ml_contracts.rs` defines `OcrEngine`/`TextEmbedder`/`Reranker`/`VectorIndex`/`ModelRegistry`, but the four non-OCR traits are deliberate placeholders with no method surface and **no `impl` anywhere** (`ml_contracts.rs:1-4,25-39`). Real OCR bypasses the trait via the worker process + `ml_protocol` IPC.
-- The "bounded job runner" exists only as an OCR-specific narrow implementation (watchdog + post-process retry). There is **no general named-queue runner and no idle gating** in Rust.
+### The migration is two hops, not one
 
-**Agent/MCP track — reached original 0.8.3** (see the parallel-track section).
+The original plan assumed a direct `Python (PyTorch) -> Rust` port, one feature
+per release. What the team actually built is two hops:
 
-## Non-Negotiable Direction
+**Hop 1 — unify everything on ONNX, move model assets to Rust. Done.** All five
+models (OCR PP-OCRv5, Chinese-CLIP, BGE, MiniLM, bge-reranker) are ONNX.
+`use_onnx` defaults to `true` (`commands/utility.rs:146`, `monitor.rs:1440`), and
+when the `CARBONPAPER_USE_ONNX` sentinel is set the Python entry point skips the
+`torch` import entirely (`monitor/main.py:6-20`), which saves roughly 250-400 MB
+of DLL working set. Model registration, install status, sizing, and OCR
+*inference* are Rust-owned. Python is compressed to a thin layer:
+`onnxruntime-directml` inference, ChromaDB, and post-process orchestration.
 
-Unchanged except where the audit forces a correction.
+**Hop 2 — move ONNX inference from Python into Rust. OCR and MiniLM retrieval
+done.** Everything else still runs its ONNX session inside the Python
+`onnxruntime`.
 
-- SQLite-owned screenshots, OCR, and metadata remain the source of truth. Embeddings and ANN indexes are derived caches: they may be persisted and migrated to avoid expensive recomputation, but they must remain versioned, diagnosable, and rebuildable from SQLite-owned inputs. ChromaDB is currently the operational vector store, not an owner of unrecoverable user data.
-- Every cross-thread, IPC, model, and UI request path must have a deadline, cancellation behavior, and user-visible failure state.
-- A Rust replacement is not complete merely because it can load the same ONNX file. Before default cutover it must pass the Python-oracle behavior contract for preprocessing/tokenization, pooling/normalization, response shape, filtering/pagination, ranking quality, lifecycle, and rollback.
-- **Corrected flag rule:** prefer shipping a Rust replacement behind a config flag, then default, then remove the Python fallback a release later. Where a replacement ships default without a flag (as OCR did), it **must** still expose an observable fallback/degrade path and a diagnostic. Track any skipped flag as debt rather than pretending it exists.
-- Heavy ML must use the existing idle policy or an explicit manual-run path. No background model load/inference should surprise a foreground app.
-- **Migration diagnostics are development scaffolding, not product surface.** Shadow comparison toggles, parity probes, and their sample tables exist only to prove one cutover gate. Once that gate is proven and the capability is cut over, they must be removed from the default build before the capability ships in a production (non-beta) release. Shipping one to end users is a defect, not a harmless extra: it exposes a meaningless switch, keeps a second inference path alive on a user's machine, and invites bug reports about numbers no user can act on. Whatever must survive for the "observable fallback" rule is a minimal read-only status field on an existing status command, never a dev panel.
-- Delete infrastructure only after the previous release ran without needing it by default.
-- Model downloads must be explicit, pinned by expected files and hashes where practical, and described as local ML assets.
-- Do not port a Python feature just because it exists. If it is low value, hard to explain, or expensive to maintain, demote or remove it.
+This is why Milestone 2 is organized around a shared runtime rather than one
+feature per release: embedding, reranking, and classification already sit on one
+Python ONNX runtime, so they are cheaper to move by swapping the inference layer
+once than by porting each consumer separately.
 
-## Target End State
+### What Rust owns today
 
-By the end of the `0.8.x` line:
+Capture, OCR, OCR storage, keyword search, thumbnails, the model asset registry,
+task and Smart Cluster persistence, MCP, app lifecycle — and, as of Milestone 2,
+MiniLM semantic-text inference, the derived embedding store, non-reranked
+semantic retrieval, capture-side semantic indexing, and semantic retention.
 
-- Rust owns capture, OCR, OCR storage, keyword search, thumbnails, model registry, task/smart-cluster persistence, MCP, and app lifecycle. *(Already true today except for the ML inference and vector-store layers.)*
+Specifics worth knowing before touching this area:
+
+- **OCR** runs in a standalone `carbonpaper-ml.exe` worker built on the pinned
+  crate `rapidocr-core = "=0.2.2"` with the `directml` feature
+  (`src-tauri/Cargo.toml`). The capture hot path calls it directly and records
+  `engine="rust"` (`capture.rs`). The runtime has a watchdog that kills a stuck
+  worker and a post-process retry loop with a real-failure-only budget
+  (`ml_runtime.rs`).
+- **Semantic inference** runs in a second worker process, reached over a
+  versioned protocol (`ml_protocol.rs`, `semantic_engine.rs`) that exposes
+  `embed_text`, `embed_image`, `rerank`, status, and unload. It deliberately does
+  not share the OCR queue or failure domain.
+- **The trait layer in `ml_contracts.rs` is documentation, not the seam.** The
+  traits (`TextEmbedder`, `ImageEmbedder`, `Reranker`, `VectorIndex`,
+  `ModelRegistry`, `OcrEngine`) now carry real method surfaces, but there is no
+  `impl` of any of them anywhere in the tree — the module is declared
+  `#[allow(dead_code)]` in `lib.rs`. Both OCR and semantic inference bypass the
+  traits via the worker process plus IPC. Treat `ml_contracts.rs` as a written
+  record of the intended boundaries; do not expect to find behavior behind it.
+- **There is still no general named-queue job runner in Rust.** There are three
+  purpose-built ones instead: the OCR watchdog and retry loop, the idle-gated
+  MiniLM index worker (`minilm_index.rs`), and the migration orchestrator
+  (`minilm_migration.rs`). Idle gating exists (`idle.rs`, `IdleState`), but each
+  consumer wires it up for itself.
+
+### What Python still owns today
+
+- **Chinese-CLIP** image and text inference, and the Chroma `screenshots`
+  collection. `search_nl` still forwards to Python (`monitor.rs:600`), and the
+  MCP tool list drops `search_nl` when the Python monitor is not running
+  (`mcp_server.rs:435`, `commands/mcp.rs`).
+- **bge-reranker** inference (`monitor/reranker.py`), which serves both Smart
+  Cluster calibration and the Smart Cluster scoring worker.
+- **BGE classification** (`monitor/classifier.py`), invoked from OCR
+  post-process (`monitor/monitor/worker_process.py`).
+- **HDBSCAN / PaCMAP task clustering** (`monitor/task_clustering.py`), including
+  the `task_vectors` hot layer and the `task_centroids` cold layer.
+- **MiniLM inference in three places that are not the capture path**: the
+  reranked NL query encode (`task_clustering.py:1486`), the hot-layer rebuild
+  (`_backfill_from_screenshots`, `task_clustering.py:1237`), and the Smart
+  Cluster worker's own encode and live-encode fallback
+  (`smart_cluster_worker.py:296,479`).
+- **Presidio NER** as tier 2 of the MCP output PII filter, default-on
+  (`sensitive_filter.rs:73` sets `presidio_enabled: true`; the call site is
+  `mcp_server.rs:825-865`).
+
+### Why the version numbers stopped tracking the plan
+
+Three divergences, all confirmed by reading the shipped tree:
+
+1. **OCR became Rust-default early.** That was the original 0.8.5 target, and it
+   shipped while the app was still on 0.8.3. The planned Python-default beta
+   phase (original 0.8.4) and its dual-run diagnostics were skipped entirely.
+2. **The two-hop reality above** replaced the one-feature-per-release plan.
+3. **The Agent/MCP parallel track ran ahead** and reached the original 0.8.3
+   target on its own schedule.
+
+One consequence is recorded as debt rather than smoothed over: OCR shipped
+default with **no `ocr_engine` config flag and no registry-level Python OCR
+fallback**. Python OCR recognition is switched off by a runtime handshake
+(`monitor/ocr_service.py:129`, `_rust_ocr_provider_active`), which is not a user-
+or operator-reachable rollback. Dual-run diagnostics were never built. Milestones
+2-5 must not repeat that pattern; see the flag rule in section 4.
+
+---
+
+## 4. Rules that bind every milestone
+
+**SQLite is the source of truth.** Screenshots, OCR, and metadata live in
+SQLite. Embeddings and ANN indexes are derived caches: they may be persisted and
+migrated to avoid expensive recomputation, but they must stay versioned,
+diagnosable, and rebuildable from SQLite-owned inputs. ChromaDB is the current
+operational vector store, never an owner of unrecoverable user data.
+
+**Every path has a deadline.** Every cross-thread, IPC, model, and UI request
+path needs a deadline, a defined cancellation behavior, and a user-visible
+failure state.
+
+**Loading the same ONNX file is not parity.** Before a Rust replacement becomes
+the default it must pass the Python-oracle behavior contract for preprocessing
+and tokenization, pooling and normalization, response shape, filtering and
+pagination, ranking quality, lifecycle, and rollback.
+
+**The flag rule.** Ship a Rust replacement behind a config flag, then make it
+the default, then remove the Python fallback one release later. If a replacement
+ships default without a flag — as OCR did — it must still expose an observable
+fallback or degrade path and a diagnostic. A skipped flag is tracked as debt, not
+pretended into existence.
+
+**Heavy machine learning waits for idle, or for the user to ask.** Background
+model loads and inference use the idle policy or an explicit manual-run path. No
+background work should surprise a foreground application. This is a hard
+requirement, not a preference: a foreground game stutter caused by background
+inference is a release blocker.
+
+**Migration diagnostics are scaffolding, not product.** Shadow comparison
+toggles, parity probes, and their sample tables exist to prove one cutover gate.
+Once the gate is proven and the capability is cut over, they are removed from the
+default build before that capability ships in a production (non-beta) release.
+Shipping one to end users is a defect: it exposes a meaningless switch, keeps a
+second inference path alive on the user's machine, and invites bug reports about
+numbers nobody can act on. Whatever must survive for the observable-fallback rule
+is a read-only status field on an existing status command, never a settings panel.
+
+**Delete late.** Remove infrastructure only after the previous release ran
+without needing it by default.
+
+**Model downloads are explicit,** pinned by expected files and hashes where
+practical, and described to the user as local machine-learning assets.
+
+**Do not port a feature just because it exists.** If a Python feature is low
+value, hard to explain, or expensive to maintain, demote or remove it instead —
+but decide that against the *live* consumers, not against what the code looks
+like. The reversed CLIP decision in Milestone 1 is the standing warning here.
+
+---
+
+## 5. Target end state
+
+By the end of the 0.8.x line:
+
+- Rust owns capture, OCR, OCR storage, keyword search, thumbnails, the model
+  registry, task and Smart Cluster persistence, MCP, and app lifecycle. *(Already
+  true, except for the remaining machine-learning inference and vector-store
+  layers.)*
 - Python is not installed by default.
-- `monitor.pyz`, `requirements.txt`, bundled Python installer, pip sync UI, Python venv checks, Python named-pipe server, reverse storage IPC, and Python worker supervision are removed from the default build.
-- Optional legacy/experimental ML features, if kept, are external add-ons rather than part of the core capture pipeline.
+- `monitor.pyz`, `requirements.txt`, the bundled Python installer, the pip sync
+  UI, Python venv checks, the Python named-pipe server, reverse storage IPC, and
+  Python worker supervision are gone from the default build.
+- Any surviving legacy or experimental machine-learning feature is an external
+  add-on, not part of the core capture pipeline.
 
-## Milestone Plan (Revised)
+---
 
-Milestones are ordered. Version hints are estimates. Each keeps the original Purpose / Recommended changes / Release gate shape and adds **Current reality** and **Depends on** so the plan stays honest.
+## 6. Milestones
 
-### Milestone 1 — Vector Semantics & Internal Migration Baseline — MINI, FOLDED INTO M2 PREPARATION
+### Milestone 1 — Vector semantics and migration baseline — DONE
 
-Slimmed on 2026-07-19 after a direct source audit. Key correction to the original framing: ChromaDB holds **no unrecoverable data** — every vector, document, and metadata field is derived from SQLite-owned sources (images + OCR text + window metadata), so "make vector state safe" was already true by construction. What was actually missing was *verifiability* and *scope decisions*. The per-row status ledger and the rebuild executor originally planned here are deliberately **moved to Milestone 2**: a ledger is only trustworthy when the index writer maintains it first-party, and the writer becomes Rust in Milestone 2 — building a Python-driven ledger/rebuilder first would be throwaway scaffolding.
+**Goal.** Decide what the vector collections mean and what is in scope, and
+establish a stable pre/post-migration baseline. This is an internal engineering
+baseline, not a user-facing health feature, so it needed no release of its own
+and landed as the first Milestone 2 preparation branch.
 
-Audit facts this rests on (2026-07-19):
+**Where the code is.** ChromaDB held **no unrecoverable data** — every vector,
+document, and metadata field is derived from SQLite-owned sources (images, OCR
+text, window metadata). "Make vector state safe" was therefore already true by
+construction. What was actually missing was *verifiability* and *scope
+decisions*. The per-row status ledger and the rebuild executor originally planned
+here moved to Milestone 2, because a ledger is only trustworthy when the index
+writer maintains it first-party, and the writer becomes Rust in Milestone 2.
 
-- Three collections, two key schemes: `screenshots` (CLIP image vectors, keyed `md5("memory://" + image_hash)`), `task_vectors` (MiniLM text vectors, keyed `str(screenshot_id)`), `task_centroids` (cold centroids).
-- **Important scope of the Milestone 1 health check:** `actual_clip_image_rows` is only the live row count of the Python Chroma `screenshots` collection — normalized Chinese-CLIP **image embeddings** used by `search_nl` text→image search. It is not the Rust OCR/keyword index, not the MiniLM `task_vectors` collection, not the `task_centroids` collection, and not a check of vector quality or search ranking.
-- `postprocess_status = 'completed'` never meant "vector exists": text-less screenshots skip vector indexing but still complete.
-- `task_vectors` ingest is fire-and-forget with no status anywhere (model-missing / session-locked / queue-full drops are silent); screenshot deletion does not clean it — the 30-day hot-layer expiry is the only reaper.
-- Restart marks unfinished postprocess `discarded` terminally, and the retry button only drains a ≤32-entry in-memory backlog. Both are **confirmed intentional design** (bounded failure, no unbounded retry/IO). Consequence: any rebuild must be explicit, budgeted, and idempotent — delivered in Milestone 2, never as automatic resurrection.
+Audit facts the milestone rests on:
 
-Internal implementation candidate in the current working tree:
+- Three collections, two key schemes: `screenshots` (Chinese-CLIP image vectors,
+  keyed `md5("memory://" + image_hash)`), `task_vectors` (MiniLM text vectors,
+  keyed `str(screenshot_id)`), and `task_centroids` (cold centroids).
+- `postprocess_status = 'completed'` never meant "a vector exists" — text-less
+  screenshots skip vector indexing and still complete.
+- `task_vectors` ingest was fire-and-forget with no status anywhere. Drops from a
+  missing model, a locked session, or a full queue were silent, and screenshot
+  deletion did not clean the collection. The 30-day hot-layer expiry was the only
+  reaper.
+- Restart marks unfinished post-process work `discarded` terminally, and the
+  retry button only drains an in-memory backlog of at most 32 entries. **Both are
+  confirmed intentional** — bounded failure, no unbounded retry or IO storm. The
+  consequence for this plan is that any rebuild must be explicit, budgeted, and
+  idempotent, never automatic resurrection.
 
-- Expected CLIP-image baseline owned by Rust: `count_expected_clip_image_rows` = distinct `image_hash` among non-deleted screenshots with an active OCR row (`storage/screenshot.rs`). This deliberately keeps the same stable proxy for all pre/post migration comparisons; it does not add a temporary schema field that Milestone 2's ledger would immediately replace.
-- Count-level CLIP diagnostic in `storage_get_index_health`: `clip_image_index {expected_eligible_images, actual_rows, missing_lower_bound, orphaned_lower_bound, assessment}`. It is retained only as internal JSON/log/copy-diagnostics input for M2 migration comparisons. The existing user UI is unchanged and does not display the gap or terminal postprocess counts.
-- The purpose is coverage observability for one rebuildable derived cache: detect that CLIP visual search may have fewer eligible image rows than SQLite suggests, or may retain rows for deleted/non-eligible inputs. It does not prove that the vectors are numerically correct, that nearest-neighbor ranking is good, or that the other semantic/task indexes are healthy.
-- `chromadb==1.5.1` pinned (was `>=0.4.0` while 1.5.1 was actually deployed; on-disk format is not stable across majors and the cache is keyed to this version until Milestone 2 replaces it).
+**Work — delivered.**
 
-Decisions recorded (binding for later milestones):
+- `count_expected_clip_image_rows` (`storage/screenshot.rs`) — distinct
+  `image_hash` among non-deleted screenshots that have an active OCR row. A
+  stable proxy usable for pre- and post-migration comparison, deliberately
+  avoiding a temporary schema field that Milestone 2's ledger would replace
+  immediately.
+- A count-level CLIP diagnostic inside `storage_get_index_health`:
+  `clip_image_index { expected_eligible_images, actual_rows, missing_lower_bound,
+  orphaned_lower_bound, assessment }`. Internal only — it feeds JSON, logs, and
+  copy-diagnostics, and the ordinary settings UI does not display the gap.
+- `chromadb==1.5.1` pinned. It was declared `>=0.4.0` while 1.5.1 was actually
+  deployed; the on-disk format is not stable across majors and the cache is keyed
+  to this version until Milestone 2 replaces it.
+- A storage-backed test proving that multiple OCR rows and duplicate image hashes
+  do not inflate the expected CLIP row count.
 
-- **Chinese-CLIP text→image search is retained as a distinct surface — reversal of the earlier demotion.** `search_nl`'s live backend is `search_by_text` (CLIP text encoder → `screenshots` image-vector collection), reachable from two frontend surfaces (`AdvancedSearch.jsx`, `SearchBox.jsx`) and the MCP `search_nl` tool. It is cross-modal — a text query matching a screenshot's *visual* content — which neither the shipped Rust keyword search (`storage/search.rs::search_text`, a blind bigram index over OCR text) nor a future MiniLM-over-OCR semantic search can reproduce. The withdrawn "demote, no Rust port" decision evaluated the two genuinely dead functions (`search_by_image`, `search_by_ocr_text`) and missed the live one. Its valid parts survive as *scoping*, not deletion: CLIP indexing is gated on `ocr_text.strip()` (`worker_process.py:166`), so the retained capability is exactly "text→image over text-bearing screenshots"; and the expensive image re-encode is avoided by **keeping the already-populated collection** — deletion, not retention, is what would force the costly rebuild.
-- **Three labeled search surfaces, not one collapsed NL path.** OCR keyword (Rust, shipped) · semantic text over OCR (MiniLM, → Rust in Milestone 2) · visual/NL image search (CLIP text→image, retained). Different modalities, non-comparable scores; the "two NL surfaces confuse users" problem is solved by clear labeling (Milestone 2 UI copy), not by folding text→image into text→OCR.
-- **This retention makes the internal baseline coherent.** `count_expected_clip_image_rows` counts `DISTINCT image_hash` with an active OCR row (`storage/screenshot.rs`) versus the live `screenshots` count (`get_collection_stats`). Deleting that collection later would have voided the migration baseline.
-- `task_vectors` (MiniLM, keyed `screenshot_id`) and `screenshots` (CLIP, keyed `image_hash`) are **independent collections serving different surfaces** — Milestone 2 re-homes each on its own terms; neither replaces the other. `task_vectors` deletion-orphan rows stay accepted debt (30-day self-expiry) until its Milestone 2 ledger.
-- Discard-on-restart and memory-only retry stay exactly as designed; the Milestone 2 rebuild is the explicit, user-triggered complement that makes discarding lossless.
+What this diagnostic does **not** prove: that the vectors are numerically
+correct, that nearest-neighbor ranking is good, or that the MiniLM and centroid
+indexes are healthy. It detects only that CLIP visual search may cover fewer
+eligible images than SQLite implies, or may retain rows for inputs that are gone.
 
-Internal preparation gate:
+**Binding decisions.** These carry into every later milestone.
 
-- Internal diagnostics can record the same estimated-vs-actual CLIP count before and after migration without changing the ordinary settings UI.
-- The scope decisions above are written down here and reflected in the Milestone 2 plan.
-- A storage-backed test proves multiple OCR rows and duplicate image hashes do not inflate the expected CLIP row count.
-- Keep the unrelated `.github/workflows/release.yml` change out of the migration branch/PR.
+1. **Chinese-CLIP text-to-image search is retained as a distinct surface.** This
+   reverses an earlier decision to demote it. `search_nl`'s live backend is
+   `search_by_text` — the CLIP text encoder scoring against the `screenshots`
+   image-vector collection — reachable from `AdvancedSearch.jsx`, `SearchBox.jsx`,
+   and the MCP `search_nl` tool. It is cross-modal: a text query matching a
+   screenshot's *visual* content. Neither the shipped Rust keyword search
+   (`storage/search.rs::search_text`, a blind bigram bitmap index over OCR text)
+   nor a future MiniLM-over-OCR semantic search can reproduce it. The withdrawn
+   demotion had evaluated two genuinely dead functions (`search_by_image`,
+   `search_by_ocr_text`) and missed the live one.
+   Its valid parts survive as *scoping* rather than deletion: CLIP indexing is
+   gated on `ocr_text.strip()` (`monitor/monitor/worker_process.py:166`), so the
+   retained capability is precisely "text-to-image over text-bearing
+   screenshots"; and the expensive image re-encode is avoided by keeping the
+   already-populated collection, since deletion — not retention — is what would
+   force a costly rebuild.
+2. **Three labeled search surfaces, not one collapsed natural-language path.**
+   OCR keyword (Rust, shipped) · semantic text over OCR (MiniLM, Rust as of
+   Milestone 2) · visual and natural-language image search (CLIP text-to-image,
+   retained). Different modalities with non-comparable scores. The "two
+   natural-language surfaces confuse users" problem is solved by clear labeling,
+   not by folding text-to-image into text-over-OCR.
+3. **`task_vectors` and `screenshots` are independent collections serving
+   different surfaces.** Milestone 2 re-homes each on its own terms; neither
+   replaces the other. `task_vectors` deletion-orphan rows stay accepted debt
+   until the Milestone 2 ledger covers them.
+4. **Discard-on-restart and memory-only retry stay exactly as designed.** The
+   Milestone 2 rebuild is the explicit, user-triggered complement that makes
+   discarding lossless.
 
-Depends on: nothing. This preparation may land as the first `m2/contracts-and-baseline` PR rather than as a separately released milestone.
+**Depends on.** Nothing.
 
-### Milestone 2 — Behavior-Equivalent Rust ONNX + Per-Kind Index Ownership (target: v0.8.4 Beta)
+---
 
-Purpose: complete "hop 2" without changing product capability. Introduce Rust ONNX inference and Rust-owned derived indexes, but cut over **one capability at a time** only after Python-oracle parity, dual-write, shadow query, data migration, foreground-isolation, and rollback gates pass. CLIP text→image, MiniLM semantic-text retrieval, reranking, classification, and unsupervised task clustering are separate consumers even when they share ONNX Runtime; shared runtime code does not justify a big-bang consumer switch.
+### Milestone 2 — Behavior-equivalent Rust ONNX and per-kind index ownership — IN PROGRESS
 
-v0.8.4 Beta delivery shape: the complete M2 implementation is developed in this version, but still lands incrementally. Infrastructure may merge while disabled; MiniLM, reranker, and CLIP each move through `python/chroma -> rust_shadow/dual -> rust with Python fallback`. A capability is part of the v0.8.4 Beta completion claim only after its own release gate passes. BGE classification and `task_centroids` remain explicitly outside the production cutover even though the shared Rust runtime may exercise BGE in shadow mode.
+**Target: v0.8.4 Beta.**
 
-Current reality:
+**Goal.** Complete hop 2 without changing product capability. Introduce Rust
+ONNX inference and Rust-owned derived indexes, and cut over **one capability at a
+time**, each only after its own parity, dual-write, shadow-query, migration,
+foreground-isolation, and rollback gates pass. CLIP text-to-image, MiniLM
+semantic-text retrieval, reranking, classification, and unsupervised task
+clustering are separate consumers even though they share one ONNX Runtime. A
+shared runtime does not justify a big-bang consumer switch.
 
-- `TextEmbedder`/`Reranker` are empty traits; `ml_protocol` only exposes OCR; `search_nl` still forwards to Python (`monitor.rs:600`).
-- Python owns CLIP image/text inference and the `screenshots` collection; MiniLM and the `task_vectors` / `task_centroids` collections still support semantic retrieval and Milestone 4 task clustering; BGE still feeds Python classification; the reranker feeds both calibration and the Python Smart Cluster worker.
-- Therefore "remove Python ONNX + Chroma in Milestone 2" would be a functional regression. Chroma remains available for the still-live task-clustering collections until Milestone 4, and Python BGE remains available until classification has a Rust consumer (Milestone 5) or an explicit Python→Rust inference bridge.
-- Milestone 1's worktree implementation provides only count-level CLIP observability. Milestone 2 upgrades each migrated index kind to subject-level status.
+**Delivery shape.** The complete implementation is developed inside this version
+but lands incrementally as short stacked branches. Infrastructure may merge while
+disabled. Each of MiniLM, the reranker, and CLIP moves through
+`python/chroma -> rust_shadow/dual -> rust with Python fallback`. A capability
+counts toward the v0.8.4 Beta completion claim only after its own gate passes.
 
-#### M2.1 — Freeze the Python behavior contract
+**Explicitly out of scope for this milestone's production cutover:** BGE
+classification and `task_centroids`, even though the shared Rust runtime may
+exercise BGE in shadow mode.
 
-- Build a local, telemetry-free Python oracle/golden harness using non-sensitive fixture text/images. Record and test the exact contracts already shipped:
-  - Chinese-CLIP: RGB conversion; direct square BICUBIC resize; `preprocessor_config.json` rescale/mean/std; tokenizer padding with no truncation; explicit text/image output selection; L2 normalization.
-  - MiniLM: tokenizer max length 256; attention-mask mean pooling; L2 normalization; combined text format `process | title | OCR[:200]`.
-  - BGE: tokenizer max length 512; CLS pooling; L2 normalization.
-  - bge-reranker: pair tokenization; max length 512; raw logits, not sigmoid; variant-specific model file and output.
-  - CLIP search: cosine distance, minimum similarity 0.32, current over-fetch/filter/pagination order, and the existing JSON response fields.
-- Rust token IDs must match exactly. CPU vectors should match to a very tight cosine/absolute-error tolerance; DirectML may use a slightly wider numeric tolerance, but ranking and threshold decisions must remain within the release gate below.
-- Treat known current bugs separately from migration parity. For example, changing NL time/category filtering behavior is an explicit bug fix with tests and release notes, not an accidental consequence of the backend switch.
+**What Milestone 2 cannot do.** Removing Python ONNX and Chroma here would be a
+functional regression. Chroma stays available for the still-live task-clustering
+collections until Milestone 4, and Python BGE stays available until
+classification has a Rust consumer (Milestone 5) or a deliberately supported
+Rust inference bridge.
 
-#### M2.2 — Add a separate Rust semantic runtime
+#### Sub-milestone status
 
-- Implement batch-capable Rust interfaces with real method surfaces: text embedding, image embedding, and reranking. Reuse the pinned model assets and tokenizer JSON files; make input/output tensor names and pooling/preprocessing explicit model descriptors rather than output-name heuristics.
-- Extend the versioned ML protocol with bounded `embed_text`, `embed_image`, `rerank`, status, and unload operations, including maximum batch/token/body limits, deadlines, cancellation behavior, provider/model/version diagnostics, and stable error kinds.
-- Keep OCR on a dedicated high-priority worker/process. Semantic inference must not serialize behind or hold memory inside the OCR critical worker. A separate semantic worker may share executable/runtime code, but not the OCR queue or failure domain.
-- Idle-gate only background capture indexing, rebuild, and maintenance model loads. A user-initiated search/calibration request is foreground/manual work: it remains deadline-bound but must not silently fail merely because the system is not idle.
-- Match the existing ONNX Runtime safety settings or justify/test any change in graph optimization, allocator, file-vs-buffer loading, thread counts, CPU fallback, and DirectML device selection.
+| | Sub-milestone | Status |
+| --- | --- | --- |
+| M2.1 | Freeze the Python behavior contract | **DONE** |
+| M2.2 | Separate Rust semantic runtime | **DONE** |
+| M2.3 | Rust-owned derived embedding storage and ledger | **DONE** 2026-07-21 |
+| M2.4 | Sentinel-triggered MiniLM migration | **DONE** 2026-07-24 |
+| M2.5 | Dual-write, shadow-query, then cut over by capability | **IN PROGRESS** — 5 of 10 steps |
+
+#### M2.1 — Freeze the Python behavior contract — DONE
+
+A local, telemetry-free Python oracle and golden harness over non-sensitive
+fixture text and images (`monitor/oracle/golden-v1.json`), recording and testing
+the contracts already shipped:
+
+- **Chinese-CLIP** — RGB conversion; direct square BICUBIC resize;
+  `preprocessor_config.json` rescale/mean/std; tokenizer padding with no
+  truncation; explicit text/image output selection; L2 normalization.
+- **MiniLM** — tokenizer max length 256; attention-mask mean pooling; L2
+  normalization; combined text format `process | title | OCR[:200]`.
+- **BGE** — tokenizer max length 512; CLS pooling; L2 normalization.
+- **bge-reranker** — pair tokenization; max length 512; **raw logits, not
+  sigmoid**; variant-specific model file and output.
+- **CLIP search** — cosine distance; minimum similarity 0.32; the current
+  over-fetch, filter, and pagination order; the existing JSON response fields.
+
+Rust token IDs must match exactly. CPU vectors must match to a very tight
+cosine and absolute-error tolerance. DirectML may use a slightly wider numeric
+tolerance, but ranking and threshold decisions still have to satisfy the M2.5
+release gate.
+
+Known current bugs are tracked separately from migration parity. Changing
+natural-language time or category filtering, for instance, is an explicit bug fix
+with its own tests and release note — not an accidental consequence of switching
+backends.
+
+#### M2.2 — Add a separate Rust semantic runtime — DONE
+
+- Batch-capable Rust interfaces for text embedding, image embedding, and
+  reranking, reusing the pinned model assets and tokenizer JSON. Input and output
+  tensor names, pooling, and preprocessing are explicit model descriptors
+  (`semantic_models.rs`) rather than output-name heuristics.
+- The versioned ML protocol (`ml_protocol.rs`) carries bounded `embed_text`,
+  `embed_image`, `rerank`, status, and unload operations, with maximum batch,
+  token, and body limits, deadlines, cancellation behavior, provider/model/version
+  diagnostics, and stable error kinds.
+- **OCR keeps its own high-priority worker.** Semantic inference does not
+  serialize behind the OCR critical worker and does not hold memory inside it. The
+  two may share executable and runtime code, never the queue or the failure
+  domain.
+- **Idle gating applies to background work only** — capture indexing, rebuild,
+  and maintenance model loads. A user-initiated search or calibration request is
+  foreground work: deadline-bound, but never refused merely because the machine
+  is in use.
+- ONNX Runtime safety settings match the existing Python ones, or a change to
+  graph optimization, allocator, file-versus-buffer loading, thread counts, CPU
+  fallback, or DirectML device selection is justified and tested.
+
+**Provider constraint recorded here because it shapes later steps.**
+`semantic_engine.rs::provider_supports_model` refuses any non-CPU provider for
+MiniLM and for bge-reranker-v2-m3, following the 2026-07-20 audit that rejected
+DirectML parity for both. The Rust engine also holds **one** model resident
+(`semantic_engine.rs`, `loaded: Option<LoadedModel>`), where the Python reranker
+path keeps two.
 
 #### M2.3 — Rust-owned derived embedding storage and ledger — DONE 2026-07-21
 
-Implementation status: `m2/derived-vector-store` adds the first-party SQLite
-`derived_embeddings` cache, the `(index_kind, subject_key)`
-`derived_index_jobs` ledger, and generation metadata. Vector + completed-ledger
-writes and vector + ledger deletion are transactional. Query-visible reads join
-both tables and require exact model revision, embedding version, and source
-fingerprint agreement, so pending, failed, discarded, invalidated, or partial
-rows cannot leak into search. The generalized keys are `screenshot_id` strings
-for `semantic_text` and `image_hash` for `clip_image`.
+Landed on `m2/derived-vector-store`. Two layers, by design:
 
-Workers claim queued subjects with random execution leases; completion, failure,
-and discard are compare-and-set transitions against the active lease, and commits
-also require the referenced screenshot or image hash to remain active. This
-prevents late workers from resurrecting deleted/discarded work or hiding a
-newer completion. Startup requeues any `processing` lease left behind by an
-interrupted process so rebuilds remain resumable after crashes.
+1. **A SQLite `derived_embeddings` cache** holding the migrated or generated
+   float32 vector plus `index_kind`, `subject_key`, dimensions, model id and
+   revision, embedding version, source fingerprint, and timestamps.
+2. **A generation-versioned ANN sidecar** used purely as a rebuildable
+   acceleration layer, written via temporary file, fsync, and atomic replace, and
+   validated by header and checksum. It is never authoritative.
 
-The branch also publishes immutable, checksummed `.cpdvec` generations through
-temporary-file fsync and atomic rename. The initial payload is a flat exact-scan
-snapshot; SQLite remains authoritative, and the payload can be replaced by an
-ANN layout when the M2.5 query path needs it without changing persistence or
-generation semantics. Runtime publication never deletes finalized sidecars;
-unreferenced generations are cleaned during the next startup, before readers
-are exposed. M2.4 owns the paged MiniLM migration and the temporary
-Chroma/Rust index dual-write; M2.5 owns shadow queries, production query
-cutover, and the later CLIP overlap.
+Persisting derived vectors is what avoids an expensive CLIP re-encode during
+migration, and it gives ledger and vector writes one transactional boundary.
 
-- Prefer a two-layer derived design:
-  1. a SQLite `derived_embeddings` cache holding the migrated/generated float32 vector plus `index_kind`, `subject_key`, dimensions, model id/revision, embedding version, source fingerprint, and timestamps;
-  2. a generation-versioned ANN sidecar used only as a rebuildable acceleration layer, written via temporary file + fsync + atomic replace and validated by header/checksum.
-  SQLite screenshots/OCR/metadata remain the source inputs. Persisting derived vectors avoids expensive CLIP re-encoding during migration and gives ledger/vector writes one transactional boundary; the ANN file is never authoritative.
-- Use a generalized subject key rather than `(screenshot_id, index_kind)`:
-  - `text_embedding` → `subject_key = screenshot_id`;
-  - `image_embedding` → `subject_key = image_hash`.
-- Ledger sketch: `derived_index_jobs(index_kind, subject_key, status, error_code, error, attempts, next_retry_at, model_id, model_revision, embedding_version, source_fingerprint, updated_at)`, PK `(index_kind, subject_key)`. `discarded` remains legal and visible; rebuild is explicit, never automatic resurrection.
-- New vectors become query-visible only after the embedding row and completed ledger state commit. ANN generation lag must be safe: queries use the last complete generation plus a bounded exact-scan delta, or wait for an atomic generation swap.
-- Deletion, model-version invalidation, duplicate image hashes, session lock/unlock, and interrupted writes need first-party tests.
+**Generalized subject keys** rather than `(screenshot_id, index_kind)`:
+`semantic_text` uses the `screenshot_id` as a string, `clip_image` uses the
+`image_hash`.
+
+**The ledger** is `derived_index_jobs(index_kind, subject_key, status,
+error_code, error, attempts, next_retry_at, model_id, model_revision,
+embedding_version, source_fingerprint, updated_at)` with primary key
+`(index_kind, subject_key)`. `discarded` is a legal, visible state; rebuild is
+explicit and never automatic resurrection.
+
+**Visibility and safety properties, all first-party tested:**
+
+- Vector plus completed-ledger writes, and vector plus ledger deletion, are
+  transactional. Query-visible reads join both tables and require exact
+  agreement on model revision, embedding version, and source fingerprint, so
+  pending, failed, discarded, invalidated, or partial rows cannot leak into
+  search results.
+- Workers claim queued subjects with random execution leases. Completion,
+  failure, and discard are compare-and-set transitions against the active lease,
+  and a commit additionally requires the referenced screenshot or image hash to
+  still be active. A late worker therefore cannot resurrect deleted or discarded
+  work, nor hide a newer completion.
+- Startup requeues any `processing` lease left behind by an interrupted process,
+  so a rebuild stays resumable across crashes.
+- Runtime publication of a `.cpdvec` generation never deletes a finalized
+  sidecar. Unreferenced generations are cleaned during the next startup, before
+  readers are exposed.
+- Deletion, model-version invalidation, duplicate image hashes, session lock and
+  unlock, and interrupted writes each have tests.
+
+The initial sidecar payload is a flat exact-scan snapshot. SQLite remains
+authoritative, so the payload can be replaced by an ANN layout later without
+changing persistence or generation semantics.
 
 #### M2.4 — Sentinel-triggered MiniLM migration — DONE 2026-07-24
 
-The Chroma `task_vectors` collection is a ~30-day hot layer whose expired
-vectors are compressed into `task_centroids`, so "every SQLite screenshot has
-a MiniLM vector" is **not** a migration completion condition, and the Rust
-coverage denominator for the later cutover gate is the set of valid, mappable
-vectors in the Chroma snapshot — not all screenshots.
+**What the migration is copying.** The Chroma `task_vectors` collection is a
+roughly 30-day hot layer whose expired vectors are compressed into
+`task_centroids`. So "every SQLite screenshot has a MiniLM vector" is **not** a
+completion condition, and the coverage denominator for the later cutover gate is
+the set of valid, mappable vectors in the Chroma snapshot — not the set of all
+screenshots.
 
-The mandatory copy is entirely sentinel-triggered. For each vector-space
-revision, the absence of
-`app_metadata.minilm_auto_migration_done_<revision>` starts one full-scope,
-idempotent copy at startup. The worker waits for Windows Hello unlock before
-reading encrypted OCR inputs. A crash, process exit, or transient worker
-failure leaves the sentinel unset; the next launch/unlock resumes from the
-durable cursor and snapshot. Legacy manual/time-bounded run records are never
-resumed or allowed to settle the sentinel; the automatic mode starts a fresh
-full copy instead.
-Terminally quarantined invalid/orphan rows may finish as
-`completed_with_errors` and still settle the sentinel; transient orchestration
-failures remain unfinished and retry automatically.
+**Triggering.** Entirely sentinel-driven. For each vector-space revision, the
+absence of `app_metadata.minilm_auto_migration_done_<revision>` starts one
+full-scope, idempotent copy at startup. The worker waits for Windows Hello unlock
+before reading encrypted OCR inputs. A crash, process exit, or transient worker
+failure leaves the sentinel unset, and the next launch or unlock resumes from the
+durable cursor and snapshot. Legacy manual or time-bounded run records are never
+resumed and never allowed to settle the sentinel; the automatic mode starts a
+fresh full copy instead. Terminally quarantined invalid or orphan rows may finish
+as `completed_with_errors` and still settle the sentinel, whereas transient
+orchestration failures stay unfinished and retry automatically.
 
-The whole run executes under global maintenance mode: a non-dismissable
-full-window overlay, `MAINTENANCE_IN_PROGRESS` rejection at MCP and reverse
-IPC boundaries (with a small session/crypto/status/dual-write allowlist),
-gated monitor start/stop/pause/resume commands, and a paused
-retention/delete-queue loop. Capture is paused for the duration; the previous
-monitor running/paused state is recorded and restored exactly. The migration
-cannot be started from settings and cannot be cancelled; closing the app is
-the only interruption.
+**Maintenance mode, and its cost.** The whole run executes under global
+maintenance mode: a non-dismissable full-window overlay,
+`MAINTENANCE_IN_PROGRESS` rejection at the MCP and reverse-IPC boundaries (with a
+small session, crypto, and status allowlist in
+`maintenance.rs::reverse_ipc_command_allowed`), gated monitor
+start/stop/pause/resume commands, and a paused retention and delete-queue loop.
+The migration cannot be started from settings and cannot be cancelled; closing
+the app is the only interruption.
 
-The full hot-layer ID snapshot is built asynchronously by an internal Python
-protocol (`start_task_vectors_export` → status polling → exact-id pages →
-`finish_task_vectors_export`), persisted with an atomically renamed manifest
-under `data/migrations/minilm/<export_id>/`, and bounded by a 10-minute logical
-build deadline plus 24 h idle / 7 d hard / 1 h `.tmp` TTLs. It has no
-user-facing time range or cancellation option.
+**Capture is paused for the duration.** The previous monitor running or paused
+state is recorded and restored exactly, but screenshots that would have been
+taken during the run are not taken. This is the first maintenance operation in
+the app that stops capture, and it is accepted deliberately: the alternative is
+letting new captures race a rewrite of the store they are being written into.
+Keeping the run short is therefore a correctness-adjacent concern, not just a
+polish one.
+
+**The snapshot.** The full hot-layer ID snapshot is built asynchronously by an
+internal Python protocol (`start_task_vectors_export` -> status polling -> exact
+ID pages -> `finish_task_vectors_export`), persisted with an atomically renamed
+manifest under `data/migrations/minilm/<export_id>/`, and bounded by a 10-minute
+logical build deadline plus 24-hour idle, 7-day hard, and 1-hour `.tmp` TTLs.
+There is no user-facing time range and no cancellation.
+
 Pages carry vectors as one little-endian float32 blob in Base64
-(`embeddings_f32_le_b64`, ~256 KB per 128-row page) instead of tens of
-thousands of JSON floats. Run state is durable in
-`minilm_migration_runs` / `minilm_migration_subjects` /
-`minilm_migration_run_errors`: each page commits ledger rows, embeddings,
-counters, and the export cursor in one transaction, so a crash either retries
-an uncommitted page or continues after it, and an interrupted run resumes by
-re-attaching to the persisted snapshot (a snapshot Python can no longer
-restore forces a cursor reset rather than a silently reordered page walk).
-Rust accepts only canonical positive screenshot ids and finite, non-zero
-384-dimensional vectors (zero vectors are quarantined, never imported), maps
-them to active SQLite screenshots, and rehydrates process/title/category/OCR
-from SQLite. A valid legacy vector whose current SQLite text is empty is still
-copied but marked `legacy_chroma_unverified` instead of being recomputed.
-Orphan Chroma ids, corrupt vectors, and rows that disappear after the snapshot
-remain persisted diagnostics and yield `completed_with_errors`. After the
-copy, a full-scope run deletes Rust `semantic_text` rows outside the snapshot
-scope (`reconcile`), and Python's hot-layer expiry now mirrors deletions to
-Rust through reverse IPC with a persisted retry queue, so the Rust collection
-tracks — rather than outgrows — the Chroma hot layer. A disk preflight
-(`estimated peak × 1.25 + 1 GiB`, with a 64 MiB transient allowance) rejects
-the run before any vector write; generation publication runs on a blocking
-worker with progress phases `publishing_sync` / `publishing_verify` /
-`publishing_commit`. The migration never requests cancellation; the final
-`sync_all` window is surfaced to the user as an uninterruptible safe write.
+(`embeddings_f32_le_b64`, roughly 256 KB per 128-row page) rather than as tens of
+thousands of JSON floats.
 
-The MiniLM source contract remains exactly `process | title | OCR[:200]`; its
-versioned fingerprint excludes category and is computed from the final
-Rust-rehydrated model input. Legacy Chroma rows do not record their producing
-runtime, so imported and newly generated vectors share the reviewed
-compatibility contract `minilm-l12-vector-space-v1`. Python capture paths
-best-effort dual-write their vectors to Rust through authenticated reverse IPC;
-Rust ignores Python metadata and recomputes the fingerprint. The migration
-never runs inference to manufacture a missing vector.
-Chroma/Python remains the authoritative query backend in this phase: there is
-no shadow-query or production-query switch in M2.4.
+**Durability.** Run state lives in `minilm_migration_runs`,
+`minilm_migration_subjects`, and `minilm_migration_run_errors`. Each page commits
+ledger rows, embeddings, counters, and the export cursor in one transaction, so a
+crash either retries an uncommitted page or continues past it, and an interrupted
+run resumes by re-attaching to the persisted snapshot. A snapshot Python can no
+longer restore forces a cursor reset rather than a silently reordered page walk.
 
-`task_centroids` and all Chroma operations needed by Python HDBSCAN/PaCMAP stay
-unchanged until Milestone 4. The separate CLIP `screenshots` float-copy
-migration remains step 7 of M2.5, immediately before CLIP new-capture
-dual-write and shadow query. `chromadb` therefore remains a default dependency.
+**Validation and mapping.** Rust accepts only canonical positive screenshot IDs
+and finite, non-zero 384-dimensional vectors — zero vectors are quarantined,
+never imported. It maps them to active SQLite screenshots and rehydrates
+process, title, category, and OCR from SQLite. A valid legacy vector whose
+current SQLite text is empty is still copied, marked
+`legacy_chroma_unverified` rather than recomputed. Orphan Chroma IDs, corrupt
+vectors, and rows that disappear after the snapshot remain persisted diagnostics
+and yield `completed_with_errors`. **The migration never runs inference to
+manufacture a missing vector.**
 
-#### M2.5 — Dual-write, shadow-query, then cut over by capability
+**Reconciliation.** After the copy, a full-scope run deletes Rust
+`semantic_text` rows outside the snapshot scope. During this phase Python's
+hot-layer expiry mirrors its deletions to Rust through reverse IPC with a
+persisted retry queue, so the Rust collection tracks rather than outgrows the
+Chroma hot layer. *(Step 5 later reverses the direction of ownership and removes
+this mirror.)*
 
-Recommended sequence:
+**Operational bounds.** A disk preflight (estimated peak × 1.25 + 1 GiB, with a
+64 MiB transient allowance) rejects the run before any vector write. Generation
+publication runs on a blocking worker with progress phases `publishing_sync`,
+`publishing_verify`, and `publishing_commit`. The final `sync_all` window is
+surfaced to the user as an uninterruptible safe write.
 
-1. MiniLM Rust inference parity.
-2. MiniLM derived-cache/index dual-write and migration. **Done in M2.4.**
-3. Rust semantic shadow queries compared locally with Chroma; Python remains authoritative. **Harness done 2026-07-27** — passive per-query shadow, an active built-in query corpus, and a document-encoder re-encode probe, reported through the telemetry-free `get_semantic_shadow_report`. The whole surface is temporary by construction; see the retirement block below.
-4. Cut over the **non-reranked** semantic-text retrieval path to `semantic_index = rust`; keep rollback. Calibration is deliberately *not* included — see the scope note below.
-5. Rust capture-side MiniLM indexing and retention ownership: new screenshots are encoded and enqueued by Rust, and hot-layer expiry is decided by Rust rather than mirrored from Python. Without this, `semantic_index = rust` means "Rust reads, Python writes".
-6. Reranker parity and shadow scoring; then cut over Smart Cluster calibration, which moves as one unit with the reranker. The Python Smart Cluster worker may temporarily call the Rust reranker, but its Python fallback remains until Milestone 3.
-7. CLIP vector export/migration.
-8. Rust CLIP image encoder dual-write for new captures. **Do not cut over visual search while new screenshots still depend solely on Python image encoding.**
-9. Rust CLIP text-query shadow mode, then cut over `search_nl` and MCP capability reporting.
-10. Implement BGE in the shared Rust runtime and run it in shadow mode, but do not remove Python BGE inference until classification itself has a Rust path or a deliberately supported Rust inference bridge. The classification consumer remains a Milestone 5 completion item.
+**Contract.** The MiniLM source contract stays exactly `process | title |
+OCR[:200]`. Its versioned fingerprint excludes category and is computed from the
+final Rust-rehydrated model input. Legacy Chroma rows do not record which runtime
+produced them, so imported and newly generated vectors share the reviewed
+compatibility contract `minilm-l12-vector-space-v1`.
 
-Step-4 scope: retrieval only, not calibration (recorded 2026-07-28). The earlier
-plan said step 4 cuts over "semantic-text retrieval and Smart Cluster
-calibration prefilter". In the shipped code those are not separable at this
-step. Calibration mode forces `enableRerank = true` because it needs
-`rerank_score` to derive a per-cluster threshold (`NlClusterView.jsx:94-95`),
-and Python's `query_by_text` performs retrieval and reranking in one call
-(`task_clustering.py:1657-1701`) with no standalone rerank command on the
-protocol. Cutting over the calibration prefilter alone would therefore mean
-adding a Rust-retrieve → Python-rerank bridge that exists for exactly one
-release and is deleted at step 6 — more new surface than it saves, on the one
-path where a ranking mistake silently corrupts a saved threshold. So step 4
-cuts over `enable_rerank = false` only; `enable_rerank = true` continues to run
-entirely on Python and moves at step 6, where the end-to-end reranked ordering
-is re-measured anyway.
+**What M2.4 does not do.** Chroma and Python remain the authoritative query
+backend throughout this phase — there is no shadow-query or production-query
+switch here. `task_centroids` and all Chroma operations needed by Python HDBSCAN
+and PaCMAP stay unchanged until Milestone 4, so `chromadb` remains a default
+dependency.
 
-Step-4 defaults and rollback levers. The cutover flips the *defaults* of both
-enums to `rust`, not merely the set of legal values — a "cutover" that left
-`semantic_index` defaulting to `chroma` would ship a switch nobody flips. This
-is safe on a machine whose M2.4 migration has not run, because an empty Rust
-index is treated as a fallback condition and the query is served from Python.
+#### M2.5 — Dual-write, shadow-query, then cut over by capability — IN PROGRESS
+
+The cutover sequence, with status:
+
+| Step | Work | Status |
+| --- | --- | --- |
+| 1 | MiniLM Rust inference parity | **DONE** |
+| 2 | MiniLM derived-cache dual-write and migration | **DONE** (M2.4) |
+| 3 | Rust semantic shadow queries against Chroma, Python authoritative | **DONE** 2026-07-27, harness since retired |
+| 4 | Cut over the **non-reranked** semantic-text retrieval path | **DONE**, merged |
+| 5 | Rust capture-side MiniLM indexing and retention ownership | **IMPLEMENTED, SOAKING** on `m2/minilm-capture-indexing` |
+| 6 | Reranker parity and shadow scoring, then cut over Smart Cluster calibration **and the scoring worker together** | **NEXT** — `m2/reranker-shadow-cutover` |
+| 7 | CLIP vector export and migration | PLANNED |
+| 8 | Rust CLIP image-encoder dual-write for new captures | PLANNED |
+| 9 | Rust CLIP text-query shadow mode, then cut over `search_nl` and MCP capability reporting | PLANNED |
+| 10 | BGE in the shared Rust runtime, shadow mode only | PLANNED |
+
+Two ordering constraints are load-bearing. **Step 8 precedes step 9:** do not cut
+over visual search while new screenshots still depend solely on Python image
+encoding, or old data will be searchable while new captures silently stop being
+indexed. **Step 10 does not remove Python BGE:** the classification consumer is a
+Milestone 5 item, and Python BGE inference stays until classification has a Rust
+path or a deliberately supported Rust inference bridge.
+
+##### Step 3 — measured result (2026-07-27)
+
+Over 256-query and 256-document samples: query-encoder maximum absolute error
+6.0e-7; Overlap@10 p50 100%, p05 50%; top-1 agreement 90.7%; document re-encode
+cosine p50 0.9917, p05 0.9868, min 0.9796.
+
+Retrieval divergence is dominated by Rust returning documents the Chroma
+approximate-nearest-neighbor path does not surface. The Rust side is an exact
+scan over the same hot layer, so a strict superset of recall is the expected
+outcome, and it was accepted as a difference in retrieval *method* rather than a
+Rust defect.
+
+Recorded honestly: this clears the query-encoder numeric gate but not the
+*original literal* wording of "top-10 overlap at least 99%, top-1 effectively
+unchanged", which assumed two implementations of the same retrieval method. That
+wording is superseded in the release gate below rather than waived.
+
+The 0.83 document-encoder figure seen in an earlier report was a measurement
+artifact, not a divergence: the probe read OCR blocks in geometric order
+(`ORDER BY box_y1`) while the write path encoded them in engine order. The fix
+was to match engine order on the rebuild side. Production clustering vectors were
+never affected.
+
+##### Step 4 — non-reranked retrieval cutover — DONE
+
+`semantic_query.rs` serves the non-reranked natural-language query from a Rust
+MiniLM query encode plus an exact cosine scan over the migrated derived store,
+rehydrating response metadata from SQLite.
+
+**Scope: retrieval only, not calibration.** An earlier version of this plan had
+step 4 cutting over "semantic-text retrieval and Smart Cluster calibration
+prefilter". In the shipped code those are not separable here. Calibration always
+reranks — `NlClusterView.jsx` initializes `enableRerank` from `isCalibrate` and
+renders the toggle only in the non-calibrate branch, so a calibration session has
+no way to turn it off — because it needs `rerank_score` to derive a per-cluster
+threshold. And Python's `query_by_text` (`task_clustering.py:1433`) performs
+retrieval and reranking in one call, with no standalone rerank operation on the
+protocol. Cutting over the calibration prefilter alone would mean building a
+Rust-retrieve-then-Python-rerank bridge that exists for exactly one release and
+is deleted at step 6 — more new surface than it saves, on the one path where a
+ranking mistake silently corrupts a saved threshold. So step 4 cuts over
+`enable_rerank = false` only. `enable_rerank = true` continues to run entirely on
+Python and moves at step 6, where the end-to-end reranked ordering is re-measured
+anyway.
+
+**Defaults and rollback levers.** The cutover flips the *defaults* of both enums
+to `rust`, not merely the set of legal values — a cutover that left
+`semantic_index` defaulting to `chroma` would ship a switch nobody flips. This is
+safe on a machine whose M2.4 migration has not run, because an empty Rust index
+is a fallback condition and the query is served from Python.
+
 Two independent levers restore the previous behavior for the one required
-release: `semantic_index = chroma` (Python owns retrieval) and
-`semantic_runtime = python` (no Rust MiniLM inference). The second is honored as
-a refusal rather than silently overridden, because serving from the Rust store
-necessarily encodes the query with the Rust runtime. Every refusal is recorded
-with its reason and read back through `get_ml_semantic_status.backend`, which
-the Settings → Advanced "semantic retrieval backend" card renders together with
-the `semantic_index` switch, so both the diagnostic and the rollback are
-reachable without a registry editor.
+release:
 
-Step-4 coverage rule (recorded 2026-07-28, extended 2026-07-29 after review).
-An empty Rust index falls back, but a *partially* filled one would not, and that
-is the failure this step actually has to defend against: ranking an incomplete
-corpus returns a plausible page with screenshots silently missing from it, which
-no user can detect and no after-the-fact instrument can reconstruct. Three
-things can leave the index short, and each has its own refusal.
+- `semantic_index = chroma` — Python owns retrieval.
+- `semantic_runtime = python` — no Rust MiniLM inference at all. This is honored
+  as a *refusal* rather than silently overridden, because serving from the Rust
+  store necessarily encodes the query with the Rust runtime.
 
-*The migration may not have finished.* The M2.4 copy commits page by page
-against a persisted cursor, and a migrated row becomes query-visible the moment
-its job row reaches `completed` — there is no generation gate in front of the
-read path. A run that fails mid-session drops the maintenance guard and does not
-retry until the next launch, so the rest of that session would otherwise serve a
-prefix of the corpus. The once-per-revision sentinel therefore gates retrieval
-too (`last_fallback_reason = migration_incomplete`), cached in-process because it
-is a one-way transition.
+Every refusal is recorded with its reason and read back through
+`get_ml_semantic_status.backend`, which the Settings → Advanced "semantic
+retrieval backend" card renders alongside the `semantic_index` switch. Both the
+diagnostic and the rollback are reachable without a registry editor.
 
-*A mirror may have been lost.* The Python dual-write is durable — a mirror that
-fails is queued to `migrations/minilm/rust-import-retry.json` and retried from
-Chroma on the next capture or clustering pass, the same treatment hot-layer
-deletions already had. The size of that queue travels with every dual-write, so
-the Rust read path knows when its copy is behind and refuses to serve until the
-backlog is paid (`last_fallback_reason = index_incomplete`). Because the Rust
-counter is process-global and starts at zero, Python also reports the queue it
-loads off disk at monitor startup, and again after every retry pass including
-the ones that wrote nothing — otherwise a backlog that survived an app restart
-would be invisible to Rust until the next capture happened to write, which with
-the monitor paused is never.
+**Coverage is the failure mode this step defends against.** An empty Rust index
+falls back, but a *partially* filled one would not, and ranking an incomplete
+corpus returns a plausible page with screenshots silently missing from it —
+something no user can detect and no after-the-fact instrument can reconstruct.
+Two conditions can leave the local store a prefix of a corpus somebody else holds
+in full, and each keeps its refusal:
 
-*The debt must stay payable.* Only mirrors that can still arrive count. Chroma
-keeps documents for screenshots the user deleted until they age out (Python
-prunes the hot layer on age alone), so a queued id can become one Rust rejects
-every time it is offered. Rust therefore classifies each rejected row as
-permanent or transient, Python drops the permanent ones instead of queueing
-them, and a retry pass no longer stops at the first failing batch. Without this
-a single deleted screenshot would hold the debt above zero — and Rust retrieval
-switched off — for as long as the queue survived.
+- **`migration_incomplete`** — the M2.4 copy has not finished. It commits page by
+  page and a migrated row becomes query-visible the moment its job row reaches
+  `completed`; there is no generation gate in front of the read path. A run that
+  fails mid-session drops the maintenance guard and does not retry until the next
+  launch, so the rest of that session would otherwise serve a prefix. The
+  once-per-revision sentinel gates retrieval too, cached in-process because it is
+  a one-way transition.
+- **`rust_index_empty`** — the store is empty outright, which is the unmigrated
+  machine.
 
-This is what replaces the deleted shadow harness's `only_in_chroma` metric as a
-*runtime* guard; the release gate below still expects the offline measurement
-before the step is called done. One residual window remains, recorded honestly:
-while the reverse-IPC pipe itself is down, Python cannot report the debt it is
-accumulating, so the Rust index can be behind without knowing it until the pipe
-recovers. Step 5 removes the reporting problem altogether by making Rust the
-writer.
+A third refusal, `index_incomplete`, existed in step 4 and was removed by step 5;
+the reasoning is in the step-5 section.
 
-Step-5 scope: why an extra step exists (recorded 2026-07-28). The numbered
-sequence had no Rust capture-side MiniLM indexing step, even though the M2.5
-release gate requires that "with Python stopped … new-capture Rust CLIP/MiniLM
-indexing continue to work". CLIP got such a step (now step 8); MiniLM was
-skipped. In the shipped code the only writers of `semantic_text` rows are the
-M2.4 migration and the Python dual-write over reverse IPC
-(`reverse_ipc.rs`), and the only reaper is Python's hot-layer expiry mirroring
-its deletions to Rust. Rust can already embed (`semantic_runtime::embed_text`),
-but nothing calls it for a new screenshot. So step 4 delivers `semantic_index =
-rust` in the honest sense of "Rust owns the read path", not "Rust owns the
-index". Step 5 closes that: an idle-gated Rust enqueue/drain worker on the
-capture path plus Rust-owned retention, after which the "Python stopped" gate
-can genuinely be evaluated. Until then the capability is advertised as
-Rust-read / Python-written, per the honest-advertisement rule.
+**Behavior difference, recorded as a bug fix.** Python reads process, title,
+timestamp, and category out of Chroma metadata, so a screenshot deleted after
+indexing is still rendered from a stale copy. Rust reads them from SQLite and
+drops rows that no longer map to an active screenshot, which means a Rust
+response can be shorter than `n_results` where the Python one was not. This
+belongs in the release notes.
 
-Step-3 measurement (2026-07-27, 256-query and 256-document samples): query-encoder
-maximum absolute error 6.0e-7; Overlap@10 p50 100%, p05 50%; top-1 agreement
-90.7%; document re-encode cosine p50 0.9917 / p05 0.9868 / min 0.9796. Retrieval
-divergence is dominated by Rust returning documents the Chroma ANN path does not
-surface — the Rust side is an exact scan over the same hot layer, so a strict
-superset of recall is expected and was accepted as a difference in retrieval
-method rather than a Rust defect. Recorded honestly: this clears the query-encoder
-numeric gate but not the *original literal* "top-10 overlap ≥ 99% / top-1
-effectively unchanged" wording, which assumed two implementations of the same
-retrieval method; that wording is superseded below rather than waived. The
-step-4 cutover therefore keeps the `python` fallback and should re-check ranking
-on the reranked end-to-end path (step 6), where the bi-encoder recall difference
-is re-scored anyway.
+**Shadow scaffolding was retired with this step, as the rule requires.** Deleted:
+`semantic_shadow.rs` and `storage/semantic_shadow.rs`; the
+`semantic_shadow_samples` and `semantic_doc_encoder_runs` tables, now dropped in
+`storage/schema.rs`; `SemanticShadowCard` and its wiring in `AdvancedSection.jsx`
+and `useAdvancedSectionController.js`; the three shadow Tauri commands; the
+`rust_shadow` value of `semantic_runtime`, which now normalizes to the shipped
+default like any unrecognized string.
 
-- Use enum backends, not ambiguous booleans: `semantic_runtime = python|rust_shadow|rust`, `semantic_index = chroma|dual|rust`, `clip_runtime = python|rust_shadow|rust`, `clip_index = chroma|dual|rust`. Invalid or unavailable Rust configurations fall back observably for one release, with a local diagnostic explaining why.
-- Preserve and explicitly test search response schemas, filters, offsets, limits, thresholds, MCP tool availability, and frontend labels. OCR keyword, MiniLM semantic text, CLIP visual/NL image search, and Smart Cluster assignment remain separately labeled; their scores are not compared across models.
+Explicitly **not** scaffolding — this is the production read path and stays:
+`derived_index::semantic_text_topk`, `ScoredSubject`,
+`count_query_visible_embeddings`; `storage/semantic_cache.rs` (the resident
+vector matrix), its `StorageState` fields, the idle-eviction ticker in `lib.rs`,
+and the cache resets in `storage/schema.rs`; the `semantic_runtime` and
+`semantic_index` enums themselves, minus the retired value, since they are the
+observable rollback switch. `minilm_index::minilm_sources` was the
+document-encoder probe's source builder and is now the capture worker's — it is
+production code.
 
-##### Shadow-scaffolding retirement — release-blocking, not optional cleanup
+##### Step 5 — Rust capture-side indexing and retention — IMPLEMENTED, SOAKING
 
-Every `rust_shadow` harness in this milestone is a development instrument with a
-scheduled death. It proves one gate, and then it goes. A production (non-beta)
-release must not contain the shadow toggle or its probes for a capability that
-has already cut over. Enforce this per capability, at the cutover PR, rather
-than as an end-of-milestone sweep — an unowned diagnostic panel never gets
-deleted later.
+**Why this step exists.** The numbered sequence originally had no Rust
+capture-side MiniLM indexing step, even though the M2.5 release gate requires
+that "with Python stopped, new-capture Rust CLIP and MiniLM indexing continue to
+work". CLIP got such a step (now step 8); MiniLM was skipped. Before this step,
+the only writers of `semantic_text` rows were the M2.4 migration and the Python
+dual-write over reverse IPC, and the only reaper was Python's hot-layer expiry
+mirroring its deletions across. Rust could already embed, but nothing called it
+for a new screenshot. So step 4 delivered `semantic_index = rust` in the honest
+sense of "Rust owns the read path", not "Rust owns the index". Step 5 closes
+that, after which the "Python stopped" gate can genuinely be evaluated.
 
-MiniLM instance of the rule. Shadow-only, delete with (or immediately after)
-the step-4 cutover:
+**What landed.**
 
-- `semantic_shadow.rs` — `spawn_shadow_sample`, `run_semantic_shadow_probe`, `run_semantic_doc_encoder_probe`, the built-in probe corpus, and the single-flight guards; the `spawn_shadow_sample` call site in `monitor.rs::monitor_nl_cluster_query`; the three Tauri commands registered in `lib.rs`.
-- `storage/semantic_shadow.rs` and the `semantic_shadow_samples` / `semantic_doc_encoder_runs` tables plus their in-place column upgrades in `storage/schema.rs`. Dropping these tables loses no user data — they hold query hashes and parity/latency numbers only, never query text or screenshot content.
-- `SemanticShadowCard` in `settings/advanced/InferenceCards.jsx`, its wiring in `AdvancedSection.jsx`, and the report/probe state in `useAdvancedSectionController.js`.
-- `minilm_migration::minilm_sources_for_ids`, whose only caller is the document-encoder probe.
-- The `rust_shadow` value of `semantic_runtime` once nothing can enter that mode.
+- `minilm_index.rs` — the capture path enqueues a `semantic_text` ledger job on
+  the OCR commit. An idle-gated worker claims, encodes, and commits vector and
+  ledger in one transaction, queues the Smart Cluster pending entry, and mirrors
+  the finished row into Chroma through the existing `upsert_task_vectors`
+  command. The same worker ages rows out at 30 days and re-queues screenshots
+  whose enqueue never ran.
+- `semantic_query.rs` — the `index_incomplete` refusal is gone. The ledger depth,
+  the count of jobs whose retry budget is spent, and the age of the oldest
+  waiting screenshot are reported instead, and Settings → Advanced shows them.
+  `migration_incomplete` and `rust_index_empty` stay.
+- Python — `add_snapshot`, the dual-write, the durable import-retry journal, the
+  delete mirror, and the capture-path clustering ingest queue are removed, along
+  with the three reverse-IPC handlers that served them. `HotColdManager` keeps
+  the hot layer as a *consumer*: clustering reads it, `compress_to_cold` ages it,
+  and `_backfill_from_screenshots` rebuilds it when it is found empty.
 
-Explicitly **not** shadow scaffolding — this code is the production read path and stays:
+**Decision 1 — Rust becomes the only MiniLM encoder on the capture path, and the
+mirror reverses direction.** The obvious reading of "Rust encodes new captures"
+would add a second encoder beside the Python one, embedding every screenshot
+twice. Dropping the hot layer instead is not available: Milestone 4 task
+clustering still reads `task_vectors`, and `compress_to_cold` still derives
+`task_centroids` from it. So Rust takes over the inference and hands the finished
+vector to Python for the Chroma write — the M2.4 dual-write with its direction
+reversed. The failure modes reverse with it, in the direction that matters: a
+lost mirror now degrades unsupervised clustering rather than making a screenshot
+unfindable by natural-language search.
 
-- `derived_index::semantic_text_topk`, `ScoredSubject`, `count_query_visible_embeddings`.
-- `storage/semantic_cache.rs` (the resident vector matrix), its `StorageState` fields, the idle-eviction ticker in `lib.rs`, and the cache resets in `storage/schema.rs`.
-- The `semantic_runtime` / `semantic_index` enums themselves, minus the retired value: they remain the observable rollback switch required above.
+Note the precise scope. Python still runs MiniLM for the reranked query encode,
+for `_backfill_from_screenshots`, and inside the Smart Cluster worker. Those
+consumers move at step 6 and Milestones 3 and 4.
 
-What may survive the cutover is the *fallback* diagnostic the enum rule demands
-— which backend is active and why a Rust configuration was refused — and it
-survives as a field on an existing status command, not as a settings card with
-percentiles in it. Apply the same shape to the reranker, CLIP, and BGE shadows
-when their turn comes.
+**Decision 2 — indexing is strictly idle-gated, and the coverage rule changes
+shape rather than tightening.** MiniLM is a 118 MB model
+(`semantic_models.rs`, 118,308,126 bytes), over the line at which background
+inference waits for an idle window, so the drain worker is gated on the existing
+idle policy instead of running inline on the post-process path the way Python
+did.
 
-Release gate:
+Three consequences, all deliberate and all recorded rather than smoothed over:
 
-- Token IDs match exactly for the golden corpus. CPU embedding cosine is at least 0.99999 with maximum absolute error 0.0001; DirectML embedding cosine is at least 0.999 with maximum absolute error 0.001 unless a model-specific, reviewed tolerance is documented. Raw reranker logits use the same CPU/DirectML absolute-error profiles.
-- **Retrieval equivalence, stated as a recall-superset gate (rewritten 2026-07-28).** The original wording — "top-10 overlap at least 99%, top-1 effectively unchanged" — assumed the Rust and Python paths were two implementations of the *same* retrieval method. They are not: Chroma is approximate (HNSW), the Rust path is an exact cosine scan over the same hot layer. An exact scan that agreed with an ANN index 99% of the time at k=10 would be evidence that one of them is wrong, not that both are right. The gate is therefore:
-  - **Recall superset.** For each query, every Python top-K result that is present in the Rust store must be reachable by the Rust scan at a score no worse than Python assigns it. A Python-top result that is *absent* from the Rust store is a real coverage defect and blocks the cutover; a Python-top result that is present but ranked differently is the expected ANN-vs-exact difference. The shipped shadow harness reports these separately as `only_in_chroma` (blocking) and `in_both_diff_rank` (accepted) precisely so the two cannot be confused. Since the harness is deleted at step 4, this remains an offline gate measured before the cutover lands; what enforces it afterwards is the runtime coverage rule above (durable dual-write plus a debt-gated read path), not a metric nobody can read anymore.
-  - **Query-encoder numerics.** Cosine agreement between the Rust query encoder and the Python one, measured against the same stored document vectors, must meet the CPU tolerance above. This is the part that would catch a genuine Rust inference bug, and it is the part the 2026-07-27 measurement passed at 6.0e-7 maximum absolute error.
-  - **Contracts.** Filter, offset, limit, threshold, and JSON response contracts still match 100%. This is unchanged and is not softened by the above.
-  - Overlap@10 and top-1 agreement remain **recorded** as descriptive numbers, not pass/fail thresholds, for the bi-encoder retrieval step. They return to being a pass/fail gate at step 6, where reranked end-to-end ordering — which is what the user actually sees on the calibration path — is compared.
-- Migrated subject-key sets match exactly per index kind; unmappable/corrupt rows are listable and keep the legacy backend active. Existing CLIP vectors are byte-copied/float-copied rather than re-encoded during normal migration.
-- With Python stopped, Rust-owned semantic-text search, migrated CLIP visual search, and new-capture Rust CLIP/MiniLM indexing continue to work for capabilities marked `rust`. Capabilities still marked Python-backed remain advertised honestly and usable through fallback. **MiniLM reaches this gate at step 5, not step 4** — see the step-5 scope note. Step 4 may ship with the capability advertised as Rust-read / Python-written.
+1. **Search freshness regresses.** A screenshot captured during active use is not
+   semantically searchable until the next idle window, where previously it was
+   searchable within seconds. The backlog depth and the age of the oldest waiting
+   screenshot are reported in the backend diagnostic so the cost is visible
+   rather than merely felt.
+2. **There is no manual-run path yet.** Section 4 permits heavy machine learning
+   to gate on idle *or* on an explicit manual run; this worker has only the
+   former. Adding a bounded "index now" action belongs with this step's soak
+   follow-up.
+3. **Idle requires AC power.** `idle.rs` computes `is_idle` as
+   `idle_secs >= IDLE_THRESHOLD_SECS && !fullscreen && ac_connected`, and
+   `power_saving_mode_enabled` defaults to true. On a laptop running on battery
+   the worker therefore never runs, so neither the Rust semantic index nor — since
+   Rust is now the capture-path encoder — the Chroma hot layer gains new rows for
+   as long as that lasts. The backlog is bounded only by how long the machine
+   stays unplugged. This needs a decision before the milestone is called done: a
+   manual run, a battery-time allowance, or an explicit statement that
+   battery-only machines index on the next AC session.
 
-- Existing automatic classification and task clustering do not regress: Python BGE remains until its consumer migrates, and `task_vectors` / `task_centroids` remain available to the Milestone 4 path.
-- Embedding migration/rebuild is interruptible/resumable; session lock/unlock, process crash, partial ANN generation, model upgrade, rollback to the previous release, and deletion are tested without screenshot loss or silent vector loss.
-- Background semantic work cannot trigger a model load during fullscreen/game activity. User-initiated search remains available with a deadline. OCR p95 latency and reliability show no material regression from semantic work; search p95 latency and peak memory stay within an explicitly recorded budget.
-- The Python fallback remains available for one released version after each capability becomes Rust-default.
-- **No shadow/probe development surface for an already-cut-over capability ships in a production build.** The retirement list above is executed, not deferred: the settings card, the probe commands, and the sample tables are gone, and the only remaining backend diagnostic is the read-only fallback status the enum rule requires. A beta may ship the harness; a production release may not.
+**Why the `index_incomplete` refusal did not survive.** Not because idle gating
+would trip it nightly. That refusal assumed Python held a complete corpus to fall
+back *to*, which was true while Python was the encoder. Once Rust encodes and
+Chroma receives its rows from the Rust mirror, both stores are behind by
+essentially the same screenshots, so handing the query to Python buys the user
+nothing while costing them the faster path. The backlog therefore stops being a
+reason to refuse and becomes a reported number.
 
-Depends on: Milestone 1 semantics/decisions landed and reviewed, including the approximate-count caveats above.
+One caveat on "essentially": `_backfill_from_screenshots` can still write Chroma
+rows that never reach Rust, since it encodes from SQLite with Python's own
+embedder and there is no longer a reverse dual-write. It only fires when the hot
+layer is found entirely empty, so this is an edge case rather than a routine
+divergence — but the two stores are not identical by construction, and a future
+step that depends on their being identical must not assume it.
 
-### Milestone 3 — Smart Cluster Worker in Rust (target: post-v0.8.4 Beta)
+**Decision 3 — retention becomes first-party; deletion already was.** The
+pre-implementation audit recorded that a user-deleted screenshot leaves its
+derived row behind as an unbounded storage leak. That was wrong, and it is
+corrected here rather than quietly dropped: the schema has carried
+`cleanup_derived_index_on_screenshot_soft_delete` and its hard-delete twin since
+the derived layer was introduced, and both remove the embedding and the ledger
+row inside the deleting transaction. What was genuinely mirrored from Python was
+*expiry on age* — the only deleter of aged Rust `semantic_text` rows was Python's
+hot-layer expiry sending its own deletions back over reverse IPC. Step 5 gives
+Rust its own 30-day rule against SQLite `created_at` and removes that mirror;
+Python keeps expiring its own Chroma hot layer for the clustering path. The two
+stores stop tracking each other, which is what ownership means here. The reaper
+also sweeps subjects with no live screenshot, which after the triggers is a
+safety net for rows written before they existed rather than a live path.
 
-Purpose: move Smart Cluster scoring entirely into Rust. Note Smart Cluster (user-controllable, NL-anchored, already Rust-persisted in `storage/smart_cluster.rs`) is a **different system** from unsupervised task clustering — do not conflate them.
+**Decision 4 — the Chroma mirror is best-effort, and the residual gap is named.**
+Rust holds the authoritative copy, so a mirror lost while the monitor is down or
+clustering is disabled costs that screenshot its place in unsupervised task
+clustering, not its findability by search. It is not re-sent:
+`_backfill_from_screenshots` rebuilds the hot layer only when it is found
+*entirely* empty, so a partial gap stays open until the row ages out. The Smart
+Cluster prefilter is unaffected, since it already falls back to a live encode for
+any ID the collection lacks. Closing the clustering gap belongs with Milestone 4,
+which is where `task_vectors` is actually consumed and where a Rust-to-Python
+vector read would have a second user.
 
-Current reality: persistence and schema are Rust; the scoring worker `monitor/smart_cluster_worker.py` and `monitor/reranker.py` are still Python (`monitor_smart_cluster_worker_status` forwards to Python).
+**The Smart Cluster pending enqueue moved with the encoder.** Python's
+`add_snapshot` called `smart_cluster_enqueue_pending` right after it wrote the
+vector, so the Rust writer makes that call in the same position — which also puts
+the queue entry point in Rust before step 6 needs it.
 
-Recommended changes:
+##### Step 6 — reranker and Smart Cluster scoring — NEXT
 
-- Move pending-queue drain into Rust using the Milestone 2 reranker.
-- Preserve the current good behavior: idle gate before load, idle re-check during batches, manual force-run, reranker unload after idle, per-cluster threshold assignment.
-- Remove `monitor/smart_cluster_worker.py` from the default runtime path; keep the SQLite schema unless a migration is clearly needed.
-- Add cheap assignment explainability if practical: prefilter score, rerank score, threshold, model id/version.
+**Scope: the scoring worker moves with the reranker.** An earlier version of this
+plan allowed the Python Smart Cluster worker to keep scoring while calibration
+moved to Rust, with a temporary reverse-IPC rerank bridge as an option. A source
+audit rules that arrangement out.
 
-Release gate:
+`monitor/reranker.py` builds its own provider list and prefers DirectML
+(`reranker.py:186-187`), so today both the calibration scores and the worker's
+assignment scores come from a GPU session, while the Rust engine refuses
+DirectML for this model outright. Calibration writes its result into
+`smart_clusters.threshold` and leaves it there, and the worker compares its own
+logits against that stored number. Moving calibration alone would leave a
+persisted threshold produced by one scorer being applied by another —
+assignments that quietly over- or under-fire, against a number the user never
+sees and cannot correct.
 
-- Creation, calibration preview, pending drain, assignment, rescan, and summary storage all work without Python.
+So step 6 cuts over calibration and the scoring worker as one unit, pulling the
+Milestone 3 scoring path forward. Milestone 3 keeps the rest of that worker's
+surface.
+
+**Three implementation consequences.**
+
+1. **Batching and a foreground latency budget.** The Rust cross-encoder is
+   CPU-only while Python's is not, and the calibration path over-fetches
+   `n_results * rerank_overfetch` — 120 documents at the defaults
+   (`task_clustering.py:1433`, `n_results = 30`, `rerank_overfetch = 4`) —
+   against a protocol cap of `MAX_RERANK_DOCUMENTS = 64`
+   (`ml_protocol.rs:18`). The step needs request batching and a *measured*
+   foreground latency budget before it can claim its gate. The shipped Python
+   path also keeps two models resident, where the Rust engine holds one and
+   re-verifies a 570 MB file (`semantic_models.rs`, 570,727,094 bytes) on every
+   swap.
+2. **Thresholds already on disk were produced by the retired scorer.** Each
+   cluster has to record the scorer that produced its threshold — model,
+   revision, variant, provider — so that a threshold from a scorer that no longer
+   exists is recognizable rather than silently reused.
+3. **The `rerank_variant` selector is a loose end to resolve, not carry across.**
+   Rust pins `model_uint8.onnx`, which is also the only variant
+   `model_management.rs` installs, so the multi-variant dropdown already offers no
+   real choice. There is a live inconsistency to clean up at the same time:
+   `NlClusterView.jsx` and `query_by_text` default to `uint8`, while
+   `task_api.js` and `monitor.rs` default to `q4f16` — a variant that is never
+   installed. Do not carry the dropdown across the cutover as a live switch.
+
+##### Configuration surface
+
+Enum backends, not ambiguous booleans, because inference and index ownership cut
+over at different times:
+
+| Setting | Values | Default today |
+| --- | --- | --- |
+| `semantic_runtime` | `python` \| `rust` | `rust` |
+| `semantic_index` | `chroma` \| `dual` \| `rust` | `rust` |
+| `clip_runtime` | `python` \| `rust_shadow` \| `rust` | not yet introduced |
+| `clip_index` | `chroma` \| `dual` \| `rust` | not yet introduced |
+
+Invalid or unavailable Rust configurations fall back observably for one release,
+with a local diagnostic explaining why. `rust_shadow` is retired from
+`semantic_runtime` now that nothing can enter shadow mode for MiniLM; CLIP will
+introduce and then retire its own.
+
+Search response schemas, filters, offsets, limits, thresholds, MCP tool
+availability, and frontend labels are preserved and explicitly tested. OCR
+keyword, MiniLM semantic text, CLIP visual and natural-language image search, and
+Smart Cluster assignment stay separately labeled, and their scores are never
+compared across models.
+
+##### Milestone 2 release gate
+
+**Numeric parity.** Token IDs match exactly for the golden corpus. CPU embedding
+cosine is at least 0.99999 with maximum absolute error 0.0001. DirectML embedding
+cosine is at least 0.999 with maximum absolute error 0.001, unless a
+model-specific reviewed tolerance is documented. Raw reranker logits use the same
+CPU and DirectML absolute-error profiles.
+
+**Retrieval equivalence, stated as a recall-superset gate.** The original wording
+— "top-10 overlap at least 99%, top-1 effectively unchanged" — assumed the Rust
+and Python paths were two implementations of the *same* retrieval method. They
+are not: Chroma is approximate (HNSW), the Rust path is an exact cosine scan over
+the same hot layer. An exact scan that agreed with an approximate index 99% of
+the time at k=10 would be evidence that one of them is wrong, not that both are
+right. So:
+
+- **Recall superset.** For each query, every Python top-K result that is present
+  in the Rust store must be reachable by the Rust scan at a score no worse than
+  Python assigns it. A Python-top result that is *absent* from the Rust store is
+  a real coverage defect and blocks the cutover. A Python-top result that is
+  present but ranked differently is the expected approximate-versus-exact
+  difference. The retired shadow harness reported these separately as
+  `only_in_chroma` (blocking) and `in_both_diff_rank` (accepted) precisely so the
+  two could not be confused. Since the harness was deleted at step 4, this is an
+  **offline gate measured before a cutover lands**; what enforces coverage
+  afterwards is the runtime refusal set, not a metric nobody can read anymore.
+- **Query-encoder numerics.** Cosine agreement between the Rust and Python query
+  encoders, measured against the same stored document vectors, must meet the CPU
+  tolerance above. This is the part that catches a genuine Rust inference bug,
+  and the part the 2026-07-27 measurement passed at 6.0e-7.
+- **Contracts.** Filter, offset, limit, threshold, and JSON response contracts
+  still match 100%. Not softened by anything above.
+- Overlap@10 and top-1 agreement stay **recorded** as descriptive numbers for the
+  bi-encoder step, not pass/fail thresholds. They return to being a pass/fail
+  gate at step 6, where reranked end-to-end ordering — what the user actually
+  sees on the calibration path — is compared.
+
+**Migration.** Migrated subject-key sets match exactly per index kind.
+Unmappable and corrupt rows are listable and keep the legacy backend active.
+Existing CLIP vectors are float-copied, not re-encoded, during normal migration.
+
+**Python stopped.** With Python stopped, Rust-owned semantic-text search,
+migrated CLIP visual search, and new-capture Rust CLIP and MiniLM indexing
+continue to work for every capability marked `rust`. Capabilities still marked
+Python-backed are advertised honestly and remain usable through fallback.
+**MiniLM reaches this gate at step 5, not step 4** — step 4 may ship with the
+capability advertised as Rust-read and Python-written.
+
+**No regressions elsewhere.** Existing automatic classification and task
+clustering do not regress: Python BGE remains until its consumer migrates, and
+`task_vectors` and `task_centroids` remain available to the Milestone 4 path.
+
+**Lifecycle.** Embedding migration and rebuild are interruptible and resumable.
+Session lock and unlock, process crash, partial ANN generation, model upgrade,
+rollback to the previous release, and deletion are all tested without screenshot
+loss or silent vector loss.
+
+**Foreground isolation.** Background semantic work cannot trigger a model load
+during fullscreen or game activity. User-initiated search stays available with a
+deadline. OCR p95 latency and reliability show no material regression from
+semantic work. Search p95 latency and peak memory stay inside an explicitly
+recorded budget.
+
+**Rollback.** The Python fallback remains available for one released version
+after each capability becomes Rust-default.
+
+**Scaffolding is gone.** No shadow or probe development surface for an
+already-cut-over capability ships in a production build. The settings card, the
+probe commands, and the sample tables are deleted, and the only remaining backend
+diagnostic is the read-only fallback status the flag rule requires. A beta may
+ship a harness; a production release may not.
+
+**Depends on.** Milestone 1's semantics and decisions, landed and reviewed,
+including the count-level caveats.
+
+---
+
+### Milestone 3 — Smart Cluster worker in Rust — PLANNED
+
+**Target: post-v0.8.4 Beta.**
+
+**Goal.** Move the remainder of Smart Cluster scoring into Rust.
+
+Smart Cluster — user-controllable, natural-language-anchored, already
+Rust-persisted in `storage/smart_cluster.rs` — is a **different system** from
+unsupervised task clustering. Do not conflate the two.
+
+**Where the code is.** Persistence and schema are Rust. The scoring worker
+`monitor/smart_cluster_worker.py` and `monitor/reranker.py` are still Python, and
+`monitor_smart_cluster_worker_status` (`monitor.rs:796`) forwards to Python.
+
+**Scope reduced 2026-07-29.** The pending-queue drain and the reranker scoring
+move earlier, in M2.5 step 6, because the calibration threshold and the
+assignment score have to come from the same scorer and calibration cuts over
+there. What remains here is the surface around that scorer.
+
+**Work.**
+
+- Keep the current good behavior intact: idle gate before load, idle re-check
+  during batches, manual force-run, reranker unload after idle, per-cluster
+  threshold assignment.
+- Port the status command, force-run, and queue plumbing.
+- Add cheap assignment explainability if practical: prefilter score, rerank
+  score, threshold, model id and version.
+- Remove `monitor/smart_cluster_worker.py` from the default runtime path once the
+  Rust drain has run for a release. Keep the SQLite schema unless a migration is
+  clearly needed.
+
+**Release gate.**
+
+- Creation, calibration preview, pending drain, assignment, rescan, and summary
+  storage all work without Python.
 - Old pending entries are processed or left retryable, never silently dropped.
 
-Depends on: Milestone 2 (Rust reranker).
+**Depends on.** Milestone 2 step 6 (Rust reranker and scoring).
 
-### Milestone 4 — Task Clustering Decision (target: post-Milestone 3)
+---
 
-Purpose: decide whether HDBSCAN/PaCMAP task clustering deserves to survive Python removal. Default stance: it does not.
+### Milestone 4 — Task clustering decision — PLANNED
 
-Current reality: `monitor/task_clustering.py` (PaCMAP + sklearn HDBSCAN) with a periodic auto-scheduler is fully Python; the scheduler is idle-gated but there is no Rust replacement.
+**Target: post-Milestone 3.**
 
-Recommended direction:
+**Goal.** Decide whether HDBSCAN and PaCMAP task clustering deserves to survive
+Python removal. **Default stance: it does not.**
 
-- Do not port HDBSCAN/PaCMAP unless user value is proven. Prefer simpler Rust-owned grouping: session windows, process/title/URL continuity, Rust embedding similarity, Smart Cluster assignments, user corrections.
-- If unsupervised clustering is still wanted, make it manual/idle-only, cancellable, rebuildable, and off the capture/OCR hot path.
+**Where the code is.** `monitor/task_clustering.py` (PaCMAP plus scikit-learn
+HDBSCAN) with a periodic auto-scheduler, fully Python. The scheduler is
+idle-gated (`task_clustering.py:1696`), but there is no Rust replacement.
+
+**Work.**
+
+- Do not port HDBSCAN and PaCMAP unless user value is proven. Prefer simpler
+  Rust-owned grouping: session windows, process/title/URL continuity, Rust
+  embedding similarity, Smart Cluster assignments, user corrections.
+- If unsupervised clustering is still wanted, make it manual or idle-only,
+  cancellable, rebuildable, and off the capture and OCR hot path.
 - Remove or hide the periodic automatic Python HDBSCAN scheduler.
-- Keep existing saved tasks in SQLite with migration/compat display.
+- Keep existing saved tasks in SQLite with migration and compatibility display.
+- Decide the fate of the `task_vectors` hot layer, which after M2.5 step 5 is fed
+  only by a best-effort Rust mirror and is not repaired when partially behind.
+  This is where a Rust-to-Python vector read would get its second user, and where
+  the clustering coverage gap opened by step 5 is closed or accepted.
 
-Release gate:
+**Release gate.**
 
-- No dependency on Python HDBSCAN/PaCMAP for capture, OCR, search, or Smart Cluster.
-- Task view stays useful; any expensive clustering run is explicitly idle-gated or manual.
+- No dependency on Python HDBSCAN or PaCMAP for capture, OCR, search, or Smart
+  Cluster.
+- The task view stays useful, and any expensive clustering run is explicitly
+  idle-gated or manual.
 
-Depends on: Milestone 2 (embedding similarity), if the simpler grouping uses it.
+**Depends on.** Milestone 2, if the simpler grouping uses embedding similarity.
 
-### Milestone 5 — Classification & PII Resolution (target: post-Milestone 4)
+---
 
-Purpose: remove the remaining Python-only ML features or make them optional add-ons.
+### Milestone 5 — Classification and PII resolution — PLANNED
 
-Current reality: classification `monitor/classifier.py` (BGE, ONNX + torch fallback) runs in OCR post-process (`monitor/monitor/worker_process.py`). PII is a **two-tier MCP-output filter**: Rust aho-corasick dictionary masking (tier 1, `sensitive_filter.rs:264`) + Python Presidio NER (tier 2, default-on `presidio_enabled:true`, `mcp_server.rs:503-558`). The Rust rule layer is already the first line, but only on the MCP read path — capture-time PII is untouched. `torch`/`spacy`/`presidio-*` remain in `requirements.txt`.
+**Target: post-Milestone 4.**
 
-Recommended changes:
+**Goal.** Remove the remaining Python-only machine-learning features, or make
+them optional add-ons.
 
-- Replace Python BGE classification with Rust embedding-based scoring (Milestone 2 engine), simple process/title rules, user-defined Smart Clusters, or remove automatic classification from the default experience.
-- PII: keep and extend the Rust deterministic rules; decide Presidio/spaCy's fate — add ONNX NER only for a concrete workflow, otherwise make advanced PII optional and not part of the default install. Clarify whether PII also applies at capture-write time, not only MCP read.
-- Remove `torch`, `sentence-transformers`, `hdbscan`, `pacmap`, `spacy`, `presidio-*` from default dependencies once no default feature needs them.
-- Audit UI for now-backendless controls; demote experimental panels; simplify wizards.
+**Where the code is.** Classification (`monitor/classifier.py`, BGE via ONNX with
+a torch fallback) runs inside OCR post-process
+(`monitor/monitor/worker_process.py`). PII is a **two-tier MCP-output filter**:
+tier 1 is Rust aho-corasick dictionary masking (`sensitive_filter.rs`), tier 2 is
+Python Presidio NER, default-on (`presidio_enabled: true` at
+`sensitive_filter.rs:73`, applied at `mcp_server.rs:825-865`). The Rust rule
+layer is already the first line, but only on the MCP read path — capture-time PII
+is untouched. `torch`, `spacy`, and `presidio-*` remain in `requirements.txt`.
 
-Release gate:
+**Work.**
 
-- Default install needs no Python packages for classification, PII, OCR, semantic search, or Smart Cluster.
-- Advanced toggles reflect what is installed; no UI path starts Python implicitly.
+- Replace Python BGE classification with Rust embedding-based scoring using the
+  Milestone 2 engine, or with simple process and title rules, or with
+  user-defined Smart Clusters — or remove automatic classification from the
+  default experience.
+- PII: keep and extend the Rust deterministic rules. Decide Presidio and spaCy's
+  fate — add ONNX NER only for a concrete workflow, otherwise make advanced PII
+  optional and not part of the default install. Clarify whether PII also applies
+  at capture-write time, not only on the MCP read path.
+- Remove `torch`, `sentence-transformers`, `hdbscan`, `pacmap`, `spacy`, and
+  `presidio-*` from default dependencies once no default feature needs them.
+- Audit the UI for now-backendless controls, demote experimental panels, simplify
+  wizards.
 
-Depends on: Milestones 2-4.
+**Release gate.**
 
-### Milestone 6 — Python-Free Default Build (target: later 0.8.x)
+- A default install needs no Python packages for classification, PII, OCR,
+  semantic search, or Smart Cluster.
+- Advanced toggles reflect what is actually installed, and no UI path starts
+  Python implicitly.
 
-Purpose: ship the first default build that does not install or start Python.
+**Depends on.** Milestones 2-4.
 
-Current reality: unchanged from the original plan — all of it is still present. `python.rs` provides `request_install_python` / `install_python_venv` / `install_spacy_model` / dep sync; `build.rs` packages and integrity-checks `monitor.pyz`; the release still bundles the Python installer.
+---
 
-Recommended changes:
+### Milestone 6 — Python-free default build — PLANNED
 
-- Remove Python auto-install from first-run.
-- Stop bundling/copying `python-3.12.10-amd64.exe`, `monitor.pyz`, `requirements.txt`, venv freshness checks, pip sync UI, spaCy install UI.
-- Keep a temporary `python_legacy_monitor` build flag only if needed, off by default, out of release packaging.
-- Update docs/README: core is Rust-native; downloads are ONNX assets; no Python required. (Also fix stale `CLAUDE.md` OCR wording.)
-- Upgrade cleanup: detect old venv, offer deletion after successful Rust-native operation, never delete user data.
+**Target: later 0.8.x.**
 
-Release gate:
+**Goal.** Ship the first default build that neither installs nor starts Python.
 
-- Fresh install and upgrade both work without Python; legacy Python files are not required for capture, OCR, search, Smart Cluster, settings, MCP, or extension capture.
+**Where the code is.** Unchanged from the original plan — all of it is still
+present. `python.rs` provides `request_install_python`, `install_python_venv`,
+`install_spacy_model`, and dependency sync. `build.rs` packages and
+integrity-checks `monitor.pyz`. The release still bundles the Python installer.
 
-Depends on: Milestones 1-5 all default and stable for at least one release.
+**Work.**
 
-### Milestone 7 — Infrastructure Deletion & Product Simplification (target: final 0.8.x cleanup)
+- Remove Python auto-install from first run.
+- Stop bundling and copying `python-3.12.10-amd64.exe`, `monitor.pyz`,
+  `requirements.txt`, venv freshness checks, the pip sync UI, and the spaCy
+  install UI.
+- Keep a temporary `python_legacy_monitor` build flag only if needed — off by
+  default, out of release packaging.
+- Update docs and README: the core is Rust-native, downloads are ONNX assets, no
+  Python required. This includes fixing `CLAUDE.md`, which still describes OCR as
+  PaddleOCR and still requires a `torch`-before-cv2 import order that the ONNX
+  sentinel path no longer performs.
+- Upgrade cleanup: detect an old venv, offer deletion after successful
+  Rust-native operation, never delete user data.
 
-Purpose: delete the now-unused integration layers and simplify the product surface.
+**Release gate.**
 
-Recommended changes:
+- Fresh install and upgrade both work without Python. Legacy Python files are not
+  required for capture, OCR, search, Smart Cluster, settings, MCP, or extension
+  capture.
 
-- Remove default-build code for the Python launcher, installer/venv manager, monitor named-pipe server, reverse storage IPC, Python worker supervisor, and Python ChromaDB ownership.
-- Remove stale docs/naming: no "Python service handles capture/OCR"; no "demo" labels on production Smart Cluster paths; no obsolete PaddleOCR naming (the runtime is RapidOCR/ONNX).
-- Collapse setup into: app auth/storage, model assets, optional browser extension. Simplify settings into General / Privacy & Security / Search & Models / Storage / Extension / Advanced. Keep advanced diagnostics but off the main path.
+**Depends on.** Milestones 1-5, all default and stable for at least one release.
 
-Release gate:
+---
 
-- Removing Python files removes no user data; tests and packaging no longer reference Python monitor files in default mode.
-- The product reads as one Rust-native local memory app, not a stack of optional subsystems.
+### Milestone 7 — Infrastructure deletion and product simplification — PLANNED
 
-Depends on: Milestone 6.
+**Target: final 0.8.x cleanup.**
 
-## Parallel Track: AI Agent Skill And MCP Onboarding
+**Goal.** Delete the now-unused integration layers and simplify the product
+surface.
 
-Status: reached the original 0.8.3 target. The standalone package `carbonpaper-memory` (repo `carbonPaperSkill`) is now the committed distribution shape (`components/settings/agent-access/agentAccessConstants.js:1-2`).
+**Work.**
 
-**Done:**
-- Full Agent-setup area: endpoint + connection state, one-click copy of the setup prompt, separate token copy, "copy diagnostics" (`components/settings/agent-access/`).
-- `mcp_get_status` returns `server_version`, `skill.tool_schema_version`, and `capabilities` including `search_nl` availability and the `python_monitor_not_running` disabled reason (`commands/mcp.rs:239-308`).
-- 12 MCP tools exposed; `search_nl` is dropped from the tool list when its backend is unavailable (`mcp_server.rs:435`) — capability awareness already works.
+- Remove default-build code for the Python launcher, the installer and venv
+  manager, the monitor named-pipe server, reverse storage IPC, the Python worker
+  supervisor, and Python ChromaDB ownership.
+- Remove stale docs and naming: no "Python service handles capture/OCR"; no
+  "demo" labels on production Smart Cluster paths (`task_clustering.py` still
+  labels the natural-language retrieval section "demo"); no obsolete PaddleOCR
+  naming, since the runtime is RapidOCR on ONNX.
+- Collapse setup into three things: app auth and storage, model assets, and the
+  optional browser extension. Simplify settings into General, Privacy & Security,
+  Search & Models, Storage, Extension, and Advanced. Keep advanced diagnostics,
+  but off the main path.
 
-**Remaining:**
-- Original 0.8.4 items are the gap: a **settings-page MCP smoke test** (authenticated ping, list tools, harmless metadata query, separate auth/port/privacy-filter failure reporting) and per-Agent guided setup variants.
-- Capability-drift control: when Milestone 2/3 move embedding/reranker/Smart Cluster to Rust, update the Skill's capability flags and the `search_nl` wording to track its backend (CLIP text→image, moving Python→Rust in Milestone 2) so it never advertises a Python-only path as stable — while keeping it advertised, since the capability is retained, not removed. Prefer generating/validating the Skill's tool table from the Rust MCP command definitions.
+**Release gate.**
 
-Do not defer this track to Milestones 6-7. The Agent story is already stable; those milestones should only remove obsolete Python wording.
+- Removing Python files removes no user data. Tests and packaging no longer
+  reference Python monitor files in default mode.
+- The product reads as one Rust-native local memory application, not a stack of
+  optional subsystems.
 
-## Feature-Specific Migration Notes
+**Depends on.** Milestone 6.
 
-### OCR — DONE
+---
 
-Shipped via `rapidocr-core` (pinned crate, not the originally planned local `rapidocr-rs` path), as a standalone worker with thin CarbonPaper integration (RGB bytes in, blocks + timings out). Retain the original gate list as regression fixtures: empty/black, mixed CN/EN browser, code/editor, dense document, tiny edge text, transparent/alpha, EXIF-oriented, and fullscreen/game (no foreground stutter).
+## 7. Parallel track: AI agent skill and MCP onboarding
 
-### Semantic Search
+**Status.** Reached the original 0.8.3 target. The standalone package
+`carbonpaper-memory` (repo `carbonPaperSkill`) is the committed distribution
+shape (`components/settings/agent-access/agentAccessConstants.js`).
 
-Keep OCR keyword search as the dependable baseline (Rust `search_text`, shipped). Make semantic text search Rust-owned and rebuildable in Milestone 2. There are **three distinct surfaces, kept separate and clearly labeled**: OCR keyword, semantic text (MiniLM over OCR), and visual/NL image search (Chinese-CLIP text→image). Chinese-CLIP is **retained (2026-07-19 reversal of the earlier demotion)** — it is `search_nl`'s live backend and the only text→image path. Milestone 2 migrates its existing vectors, dual-writes new image embeddings, and cuts over text queries only after parity; it never creates a window where visual search works for old data but new captures stop being indexed. "Prefer one path" applies *within* the text modality (do not ship several redundant text-NL surfaces), not to folding text→image into text→OCR.
+**Done.**
+
+- A full agent-setup area: endpoint and connection state, one-click copy of the
+  setup prompt, separate token copy, and copy-diagnostics
+  (`components/settings/agent-access/`).
+- `mcp_get_status` returns `server_version`, `skill.tool_schema_version`, and
+  `capabilities`, including `search_nl` availability and the
+  `python_monitor_not_running` disabled reason (`commands/mcp.rs`).
+- 12 MCP tools exposed. `search_nl` is dropped from the tool list when its
+  backend is unavailable (`mcp_server.rs:435`), so capability awareness already
+  works.
+
+**Remaining.**
+
+- The original 0.8.4 items: a **settings-page MCP smoke test** (authenticated
+  ping, list tools, harmless metadata query, with auth, port, and privacy-filter
+  failures reported separately) and per-agent guided setup variants. No such
+  command exists today.
+- Capability-drift control. As Milestones 2 and 3 move embedding, reranker, and
+  Smart Cluster work to Rust, update the skill's capability flags and the
+  `search_nl` wording to track its backend — CLIP text-to-image, moving from
+  Python to Rust at M2.5 steps 7-9 — so it never advertises a Python-only path as
+  stable, while keeping it advertised, since the capability is retained rather
+  than removed. Prefer generating and validating the skill's tool table from the
+  Rust MCP command definitions.
+
+Do not defer this track to Milestones 6-7. The agent story is already stable;
+those milestones should only remove obsolete Python wording.
+
+---
+
+## 8. Per-feature notes
+
+### OCR — done
+
+Shipped via `rapidocr-core` (a pinned crate, not the originally planned local
+`rapidocr-rs` path), as a standalone worker with thin CarbonPaper integration:
+RGB bytes in, blocks plus timings out.
+
+Retain the original gate list as regression fixtures: empty and black frames,
+mixed Chinese/English browser content, code and editor windows, dense documents,
+tiny edge text, transparent and alpha content, EXIF-oriented images, and
+fullscreen or game capture with no foreground stutter.
+
+### Semantic search
+
+Keep OCR keyword search as the dependable baseline (Rust `search_text`, shipped).
+Semantic text search is Rust-owned and rebuildable as of Milestone 2.
+
+There are **three distinct surfaces, kept separate and clearly labeled**: OCR
+keyword; semantic text (MiniLM over OCR); and visual or natural-language image
+search (Chinese-CLIP text-to-image).
+
+Chinese-CLIP is **retained** — it is `search_nl`'s live backend and the only
+text-to-image path. Milestone 2 migrates its existing vectors, dual-writes new
+image embeddings, and cuts over text queries only after parity. It must never
+create a window where visual search works for old data while new captures stop
+being indexed.
+
+"Prefer one path" applies *within* the text modality — do not ship several
+redundant text-based natural-language surfaces — not to folding text-to-image
+into text-over-OCR.
 
 ### Smart Cluster
 
-Preserve the current product model; it is more user-controllable than unsupervised task clustering. Rust already owns persistence; Milestone 3 moves the queue/prefilter/reranker/assignment/idle-gate. Add explanation fields before adding more algorithms.
+Preserve the current product model; it is more user-controllable than
+unsupervised task clustering. Rust already owns persistence. M2.5 step 6 moves
+the reranker and scoring; Milestone 3 moves the surrounding surface. Add
+explanation fields before adding more algorithms.
 
-### Task Clustering
+### Task clustering
 
-Treat HDBSCAN/PaCMAP as an experiment that may not survive Python removal (Milestone 4). Prefer simpler grouping; if kept, manual/idle-only and derived from SQLite/embedding data, never a capture dependency.
+Treat HDBSCAN and PaCMAP as an experiment that may not survive Python removal
+(Milestone 4). Prefer simpler grouping. If kept, make it manual or idle-only and
+derive it from SQLite and embedding data, never as a capture dependency.
 
-### PII / Presidio
+### PII and Presidio
 
-The Rust deterministic rule layer already exists and runs first on the MCP path. Extend it; add ONNX NER only for a concrete workflow; avoid shipping spaCy transformer models by default; decide whether PII also belongs at capture-write time (Milestone 5).
+The Rust deterministic rule layer already exists and runs first on the MCP path.
+Extend it. Add ONNX NER only for a concrete workflow, avoid shipping spaCy
+transformer models by default, and decide whether PII also belongs at
+capture-write time (Milestone 5).
 
-## Deletion Checklist
+---
 
-Do not delete a Python component until its Rust replacement has shipped as default for at least one release.
+## 9. Deletion checklist
 
-- Python OCR recognition — **eligible now**: Rust OCR has been default; remove the dormant Python OCR engine and its runtime handshake once Milestone 1 confirms nothing else depends on it. (The rest of `ocr_service.py` still does post-process — remove only the recognition path.)
-- Python Chinese-CLIP inference — **not a demotion; retained** (2026-07-19 reversal). Remove its Python inference only after both Rust CLIP encoders are default for one release, existing vectors are migrated, new captures are Rust-indexed, and `search_nl` parity/rollback gates pass. The `screenshots` collection is migrated, never silently dropped or routinely re-encoded.
-- Python MiniLM inference + Rust-replaced Chroma semantic retrieval — only after the relevant Milestone 2 capability is stable for one release. Keep Chroma and any dual-write needed by `task_vectors` / `task_centroids` until the Milestone 4 task-clustering decision is complete.
-- Python bge-reranker inference — remove from calibration only after Milestone 2 parity/cutover, and remove from the default Python Smart Cluster path only after Milestone 3.
-- Python BGE classification inference — do not remove in Milestone 2 merely because the Rust runtime can load BGE. Remove only when Milestone 5 classification uses Rust directly, or while a deliberately supported Python→Rust inference bridge is active and tested.
-- Python Smart Cluster worker — only after Milestone 3 is stable.
-- Python HDBSCAN/PaCMAP — only after Milestone 4 is stable.
-- Python classification/PII dependencies — only after Milestone 5 is stable.
-- Python installer/venv/pyz/reverse IPC — only after Milestone 6 proves fresh install and upgrade without Python.
+### Python components — wait for a shipped replacement
 
-Migration scaffolding runs on the opposite clock. It is not a Python component
-waiting for a replacement; it is temporary instrumentation that must be removed
-as soon as the gate it proves is signed off, and at the latest before the
-capability's first production release:
+Do not delete a Python component until its Rust replacement has been the default
+for at least one release.
 
-- MiniLM shadow toggle, query/document probes, `semantic_shadow_samples` / `semantic_doc_encoder_runs`, and the settings card — delete with the M2.5 step-4 cutover. Full artifact list in the retirement block under M2.5.
-- Reranker, CLIP, and BGE shadow harnesses — same rule at their own cutovers.
-- The `rust_shadow` enum values — delete once no capability can still enter shadow mode.
+| Component | Condition |
+| --- | --- |
+| Python OCR recognition | **Eligible now.** Rust OCR has been default and Milestone 1 confirmed nothing else depends on it. Remove the dormant engine and its runtime handshake. The rest of `ocr_service.py` still does post-process — remove only the recognition path. |
+| Python Chinese-CLIP inference | **Retained capability, not a demotion.** Remove its Python inference only after both Rust CLIP encoders are default for one release, existing vectors are migrated, new captures are Rust-indexed, and the `search_nl` parity and rollback gates pass. The `screenshots` collection is migrated, never silently dropped or routinely re-encoded. |
+| Python MiniLM inference and Chroma semantic retrieval | Only after the relevant Milestone 2 capability is stable for one release. Note the three surviving Python MiniLM call sites listed in section 3 — the reranked query encode, the hot-layer rebuild, and the Smart Cluster worker — which move at step 6 and Milestones 3-4. Keep Chroma and any dual-write needed by `task_vectors` and `task_centroids` until the Milestone 4 decision is complete. |
+| Python bge-reranker inference | Remove from calibration and from the Smart Cluster scoring path together, after the M2.5 step 6 parity and cutover gates. Remove the remaining worker surface after Milestone 3. |
+| Python BGE classification inference | Do not remove in Milestone 2 merely because the Rust runtime can load BGE. Remove only when Milestone 5 classification uses Rust directly, or while a deliberately supported Python-to-Rust inference bridge is active and tested. |
+| Python Smart Cluster worker | Only after Milestone 3 is stable. |
+| Python HDBSCAN and PaCMAP | Only after Milestone 4 is stable. |
+| Python classification and PII dependencies | Only after Milestone 5 is stable. |
+| Python installer, venv, pyz, reverse IPC | Only after Milestone 6 proves fresh install and upgrade without Python. |
 
-## Branching And Release Discipline
+### Migration scaffolding — the opposite clock
 
-- Keep this roadmap inside the `carbonPaper` repository (for example `docs/python-removal-roadmap.md`) before treating milestone status as branch/PR truth. The current parent-directory `roadmap.md` is outside the repository and cannot be reviewed or versioned with implementation branches.
-- `m2/contracts-and-baseline` / PR #139 contains the Mini Milestone 1 collection semantics/tests, internal CLIP count diagnostics, and Chroma version pin. Keep the Python oracle in the next stacked PR so the already-small baseline PR remains reviewable. Do not include unrelated release-workflow edits or user-facing warnings.
-- Build the v0.8.4 Beta Milestone 2 as short, stacked branches/PRs rather than a big-bang branch: `m2/contracts-and-baseline`, `m2/python-oracle-contracts`, `m2/rust-onnx-runtime`, `m2/derived-vector-store`, `m2/minilm-dual-write-migration`, `m2/minilm-shadow-cutover`, `m2/minilm-query-cutover`, `m2/minilm-capture-indexing`, `m2/reranker-shadow-cutover`, `m2/clip-vector-migration`, `m2/clip-cutover`, `m2/search-ui-capabilities`, and `m2/bge-shadow`. Infrastructure may merge to `main` while disabled; each consumer cutover has its own gate and rollback. (`m2/minilm-query-cutover` and `m2/minilm-capture-indexing` were added on 2026-07-28 for M2.5 steps 4 and 5; calibration is no longer part of the query-cutover PR and rides with `m2/reranker-shadow-cutover`.)
-- Do not open a release branch until the intended capabilities have passed shadow mode on `main`. Release branches are stabilization-only; avoid accumulating new migration architecture there.
-- Intended backend selection is explicit per capability. Prefer enums (`python|rust_shadow|rust`, `chroma|dual|rust`) over one Boolean per replacement because inference and index ownership cut over at different times. **Reality:** only `rust_ocr_dml_beta` (a DirectML accelerator toggle) exists; OCR shipped default without a `rust_ocr` flag. Milestones 2-5 must not repeat that unobservable big-bang cutover.
-- Each flag/replacement should have a telemetry-free local diagnostic command that reports status and last error (the OCR runtime and `mcp_get_status` are the model to follow).
-- Each release should include a rollback path for one version.
-- Add a short release-note section: what moved from Python to Rust, what remains Python-backed, what data can be rebuilt, whether a model re-download is required.
+Scaffolding is not a component waiting for a replacement. It is temporary
+instrumentation, removed as soon as the gate it proves is signed off, and at the
+latest before the capability's first production release.
 
-## Immediate Next Step
+| Scaffolding | Status |
+| --- | --- |
+| MiniLM shadow toggle, query and document probes, `semantic_shadow_samples`, `semantic_doc_encoder_runs`, the settings card | **DELETED** with the M2.5 step-4 cutover. Tables are dropped in `storage/schema.rs`. |
+| The `rust_shadow` value of `semantic_runtime` | **DELETED** — normalizes to the shipped default. |
+| Reranker, CLIP, and BGE shadow harnesses | Not yet built. Same rule applies at their own cutovers: enforce deletion **in the cutover PR**, not as an end-of-milestone sweep. An unowned diagnostic panel never gets deleted later. |
 
-M2.5 step 3 is done: the shadow harness (passive per-query comparison, active
-query corpus, document re-encode probe) landed on `m2/minilm-shadow-cutover`
-together with the resident-vector read path, and its parity/latency numbers are
-recorded above. In progress is step 4 on `m2/minilm-query-cutover` — route the
-**non-reranked** NL semantic-text query through `semantic_index = rust`, keeping
-the `python` enum value as the one-release observable rollback. Reranked queries
-(which is every calibration query) stay on Python until step 6; see the step-4
-scope note for why splitting them there is cheaper than a one-release rerank
-bridge. That same PR must delete the shadow scaffolding per the retirement
-block; the harness has now served its purpose and must not reach a production
-build. The coverage denominator for the gate is the set of valid, mappable
-vectors in the Chroma hot-layer snapshot, not all SQLite screenshots.
+When deleting a shadow harness, check for functions the production path has since
+adopted. `minilm_sources` began life as the document-encoder probe's source
+builder and is now the capture worker's; deleting it as scaffolding would have
+removed production code.
 
-Step 5 (`m2/minilm-capture-indexing`) follows immediately and is not optional
-bookkeeping: until Rust encodes and enqueues new captures and owns retention,
-`semantic_index = rust` means Rust reads an index Python still writes, and the
-"with Python stopped" release gate cannot be evaluated for MiniLM at all. Only
-after that does the reranker step (6) run, which is also where Smart Cluster
-calibration moves. The separate CLIP vector migration/cutover sequence begins
-after those.
+---
 
-No Rust backend becomes authoritative until its Python behavior contract, dual-write/migration, shadow-query, lifecycle, performance, and rollback gates pass. The first recommended cutover is MiniLM semantic retrieval; CLIP follows only after both legacy-vector migration and new-capture Rust image indexing work. Chroma remains for Milestone 4 task clustering, and Python BGE remains for Milestone 5 classification. Until subject-level Rust ledgers exist, the internal count-level CLIP comparison is only a migration baseline, not a product health judgment.
+## 10. Branching and release discipline
+
+- **This roadmap lives in the repository** (`docs/python-removal-roadmap.md`) so
+  milestone status can be reviewed and versioned alongside implementation
+  branches. The former parent-directory `roadmap.md` was outside the repository
+  and could not be.
+- **Build Milestone 2 as short stacked branches**, not one big-bang branch:
+  `m2/contracts-and-baseline`, `m2/python-oracle-contracts`,
+  `m2/rust-onnx-runtime`, `m2/derived-vector-store`,
+  `m2/minilm-dual-write-migration`, `m2/minilm-shadow-cutover`,
+  `m2/minilm-query-cutover`, `m2/minilm-capture-indexing`,
+  `m2/reranker-shadow-cutover`, `m2/clip-vector-migration`, `m2/clip-cutover`,
+  `m2/search-ui-capabilities`, `m2/bge-shadow`. Infrastructure may merge to
+  `main` while disabled; each consumer cutover carries its own gate and rollback.
+- **Do not open a release branch** until the intended capabilities have passed
+  their gates on `main`. Release branches are stabilization-only; do not
+  accumulate new migration architecture there.
+- **Backend selection is explicit per capability.** Prefer enums
+  (`python|rust_shadow|rust`, `chroma|dual|rust`) over one boolean per
+  replacement, because inference and index ownership cut over at different times.
+  The cautionary precedent: only `rust_ocr_dml_beta` (a DirectML accelerator
+  toggle) ever existed for OCR, which shipped default with no `rust_ocr` flag.
+  Milestones 2-5 must not repeat that unobservable big-bang cutover.
+- **Every flag and replacement gets a telemetry-free local diagnostic** command
+  reporting status and last error. The OCR runtime and `mcp_get_status` are the
+  model to follow.
+- **Every release includes a rollback path for one version.**
+- **Every release note says** what moved from Python to Rust, what remains
+  Python-backed, what data can be rebuilt, and whether a model re-download is
+  required.
+
+---
+
+## 11. Immediate next step
+
+**M2.5 step 5 is implemented on `m2/minilm-capture-indexing` and awaiting an
+on-machine soak.** The step's three open items, in priority order:
+
+1. Decide the battery case. `is_idle` requires AC power, so a laptop on battery
+   never indexes and the backlog is bounded only by how long it stays unplugged.
+2. Add a bounded manual "index now" path, which section 4 already permits as the
+   alternative to idle gating and which also gives the battery case an out.
+3. Confirm during the soak that the freshness regression and the reported backlog
+   figures behave as described, including after a session lock and an app
+   restart.
+
+**Then step 6, on `m2/reranker-shadow-cutover`.** It is larger than the numbered
+list originally implied: it cuts over Smart Cluster calibration *and* the scoring
+worker together, because a persisted threshold cannot be produced by one scorer
+and applied by another. Budget for request batching, a measured CPU-only
+foreground latency figure, and threshold provenance recording.
+
+**Then the CLIP sequence** — steps 7 through 9, in that order, with the
+new-capture dual-write (step 8) landing before the text-query cutover (step 9).
+
+**Standing constraints.** No Rust backend becomes authoritative until its Python
+behavior contract, dual-write and migration, shadow-query, lifecycle,
+performance, and rollback gates pass. Chroma remains for Milestone 4 task
+clustering, and Python BGE remains for Milestone 5 classification.
+
+---
+
+## Appendix A — Decision log
+
+Only decisions that changed the plan's direction. The reasoning lives in the
+milestone bodies; this is an index so a reversal is not silently re-reversed.
+
+| Date | Decision |
+| --- | --- |
+| 2026-07-18 | Rebaselined the plan on a source audit of shipped `0.8.3`, superseding the 0.8.1-baseline plan (kept as `roadmap.0.8.1-original.md`). Version numbers stop tracking milestones. |
+| 2026-07-19 | Milestone 1 reduced to an internal migration baseline; its per-row ledger and rebuild executor moved to Milestone 2. |
+| 2026-07-19 | **Reversed the "demote Chinese-CLIP" decision.** It rested on a dead-code rationale that missed `search_by_text`, the live backend serving `search_nl` from two frontend surfaces and the MCP. CLIP is retained as a first-class search surface. |
+| 2026-07-19 | Milestone 2 reframed around behavioral equivalence rather than moving an ONNX call site. ChromaDB cannot be removed while `task_vectors` and `task_centroids` serve Milestone 4; Python BGE cannot be removed before classification has a Rust path. |
+| 2026-07-19 | Milestone 2 committed as the scope for v0.8.4 Beta, delivered as short stacked PRs, with disabled or shadow infrastructure allowed to land before individual cutovers. |
+| 2026-07-20 | DirectML parity rejected for MiniLM and the uint8 reranker after a five-gate audit failed (top-1 changed on 20.5% of queries). Both are CPU-only in Rust. |
+| 2026-07-27 | Step-3 shadow measurement accepted: the query encoder passes numerically, and the retrieval divergence is a recall superset rather than a defect. |
+| 2026-07-28 | Step 4 scoped to non-reranked retrieval only; calibration moves to step 6 rather than through a throwaway Rust-retrieve/Python-rerank bridge. |
+| 2026-07-28 | The "top-10 overlap ≥ 99%" release gate rewritten as a recall-superset gate, because the two paths use different retrieval methods. |
+| 2026-07-28 | Step 5 added: Rust capture-side MiniLM indexing, which the numbered sequence never contained even though the "with Python stopped" gate silently required it. |
+| 2026-07-29 | Step 6 enlarged to move the Smart Cluster scoring worker together with the reranker, and Milestone 3 reduced accordingly. |
+| 2026-07-29 | Step 5 decisions: Rust owns capture-path encoding with the Chroma mirror reversed; indexing is idle-gated and search freshness regresses; retention becomes first-party; the `index_incomplete` refusal is retired. |
+| 2026-07-30 | Document restructured around milestones. Stale "current reality" claims corrected against the tree: the `ml_contracts` traits have method surfaces but no implementations, the MiniLM shadow harness is already deleted, and Python still runs MiniLM outside the capture path. |

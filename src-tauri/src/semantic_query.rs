@@ -6,42 +6,37 @@
 //! that proved this path is gone (see the M2.5 retirement block); what remains
 //! is the read path itself and the observable fallback the enum rule requires.
 //!
-//! Two scope limits are deliberate and documented in the roadmap:
+//! One scope limit is deliberate and documented in the roadmap: **reranked
+//! queries stay on Python.** `enable_rerank = true` — which is every Smart
+//! Cluster calibration query — is not routed here. Python's `query_by_text`
+//! fuses retrieval and reranking into one call and the ML protocol has no
+//! standalone rerank operation, so serving the prefilter from Rust would need a
+//! Rust→Python rerank bridge living for exactly one release. Calibration moves
+//! with the reranker at M2.5 step 6.
 //!
-//! - **Reranked queries stay on Python.** `enable_rerank = true` — which is
-//!   every Smart Cluster calibration query — is not routed here. Python's
-//!   `query_by_text` fuses retrieval and reranking into one call and the ML
-//!   protocol has no standalone rerank operation, so serving the prefilter from
-//!   Rust would need a Rust→Python rerank bridge living for exactly one
-//!   release. Calibration moves with the reranker at M2.5 step 6.
-//! - **Rust reads an index Python still writes.** Nothing on the Rust capture
-//!   path encodes a new screenshot yet; `semantic_text` rows come from the M2.4
-//!   migration and Python's reverse-IPC dual-write. M2.5 step 5 closes that.
-//!
-//! Because Python owns the writes, coverage is the failure mode that matters:
-//! ranking an incomplete corpus returns plausible results with screenshots
-//! silently missing from them, which no user can detect. Three things can leave
-//! the local index short of the corpus, and each has its own refusal:
+//! Coverage is the failure mode this path has to reason about: ranking an
+//! incomplete corpus returns plausible results with screenshots silently
+//! missing from them, which no user can detect. Two things still mean the local
+//! store is a *prefix* of a corpus somebody else holds in full, and each keeps
+//! its refusal:
 //!
 //! - The M2.4 migration has not finished. It commits page by page and its rows
 //!   become query-visible immediately, so an interrupted run leaves a partial —
-//!   not empty — index. The once-per-revision sentinel gates this.
-//! - Python wrote a vector to Chroma that never reached the Rust store. The
-//!   dual-write is therefore durable on the Python side (a failed mirror is
-//!   queued and retried, exactly as expired-row deletions already were), and
-//!   Python reports the size of that outstanding queue both on every write and
-//!   once at startup, when it loads the queue back off disk.
+//!   not empty — index while Chroma still has the rest. The once-per-revision
+//!   sentinel gates this.
 //! - The store is empty outright, which is the unmigrated machine.
 //!
-//! While any of those hold, this module refuses to serve, so an index known to
-//! be behind Chroma sends the query to Python instead of ranking a corpus with
-//! holes in it.
-//!
-//! Only mirrors that can still arrive count as debt. A row Rust rejects
-//! permanently — its screenshot was deleted, and Chroma keeps documents for
-//! deleted screenshots until they age out — is dropped by Python rather than
-//! queued, because a row that is never coming would otherwise hold retrieval on
-//! Python for as long as the queue survives, which is forever.
+//! What no longer refuses is a capture-indexing backlog, and the reason is not
+//! that idle gating would trip it nightly. Through M2.5 step 4 the refusal was
+//! right because Python was the encoder: a vector it had written to Chroma and
+//! not yet mirrored was genuinely present in one store and absent from the
+//! other, so handing the query over recovered it. Step 5 makes Rust the only
+//! MiniLM encoder and reverses the mirror, so Chroma now receives its rows
+//! *from* this store. A screenshot waiting in the ledger is missing from both
+//! sides equally, and sending the query to Python would cost the user the faster
+//! path while recovering nothing. The backlog is therefore reported rather than
+//! acted on — a number in the backend diagnostic, alongside the count of jobs
+//! whose retry budget is spent and which will not clear themselves.
 //!
 //! Every refusal to serve from Rust falls back to Python and records why, so a
 //! user whose index is empty or whose worker is broken sees results rather than
@@ -54,13 +49,19 @@ use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{BackgroundScreenshotSummary, DerivedIndexKind, StorageState};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 /// User-initiated search is foreground work: deadline-bound, never idle-gated.
 /// Matches the deadline the shadow harness measured this path under.
+///
+/// The budget covers the wait for the semantic worker as well as the encode.
+/// Idle-gated capture indexing shares that one worker on a far more generous
+/// budget of its own, so a query that arrives mid-batch queues behind it; being
+/// refused here after five seconds and answered by Python is the point, since
+/// the alternative is a search box that hangs for as long as the batch runs.
 const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `rust_shadow` was retired with the step-4 cutover: nothing can enter shadow
@@ -118,13 +119,19 @@ pub struct SemanticBackendStatus {
     pub last_fallback_reason: Option<String>,
     /// Rust retrieval attempts that fell back since process start.
     pub fallback_count: u64,
-    /// Vectors Python has written to Chroma but not yet mirrored into the Rust
-    /// store, as last reported by Python's dual-write. Non-zero means the Rust
-    /// index is knowably behind and retrieval is served from Python.
-    pub pending_imports: u64,
     /// Query-visible `semantic_text` vectors held locally. `None` when the
     /// database could not be read (locked, or not yet initialized).
     pub indexed_vectors: Option<u64>,
+    /// Screenshots captured but not yet encoded, waiting for an idle window.
+    /// Ordinary operation rather than a fault — reported so the freshness cost
+    /// of idle gating is visible instead of merely felt.
+    pub index_backlog: Option<u64>,
+    /// Queued screenshots whose encode retry budget is spent. Unlike the
+    /// backlog, nothing clears these on its own.
+    pub index_stalled: Option<u64>,
+    /// Age in seconds of the oldest screenshot still waiting to be encoded.
+    /// `None` when nothing is waiting.
+    pub index_backlog_age_secs: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -135,22 +142,6 @@ struct BackendObservations {
 }
 
 static OBSERVATIONS: RwLock<Option<BackendObservations>> = RwLock::new(None);
-
-/// Outstanding dual-write debt as last reported by Python. Process-global
-/// because the reverse-IPC handler that receives it carries no `AppHandle`.
-/// Starting at zero is the honest default: before Python has said anything,
-/// nothing is known to be missing.
-static PENDING_IMPORTS: AtomicU64 = AtomicU64::new(0);
-
-/// Record how many vectors Python still owes the Rust store. Called from the
-/// reverse-IPC dual-write handler on every batch Python delivers.
-pub fn note_pending_imports(pending: u64) {
-    PENDING_IMPORTS.store(pending, Ordering::Relaxed);
-}
-
-fn pending_imports() -> u64 {
-    PENDING_IMPORTS.load(Ordering::Relaxed)
-}
 
 /// Caches the one-way transition of the M2.4 migration sentinel.
 ///
@@ -226,18 +217,30 @@ pub fn backend_status(storage: Option<&StorageState>) -> SemanticBackendStatus {
         ),
         None => (None, None, 0),
     };
+    // One ledger read for all three depth figures. Absent when the database is
+    // locked or uninitialized, which is honestly "not known" rather than zero.
+    let backlog = storage.and_then(|storage| {
+        storage
+            .derived_index_backlog(
+                DerivedIndexKind::SemanticText,
+                crate::minilm_index::MAX_ATTEMPTS,
+            )
+            .ok()
+    });
     SemanticBackendStatus {
         semantic_index: semantic_index_backend(),
         semantic_runtime: semantic_runtime_backend(),
         last_query_backend,
         last_fallback_reason,
         fallback_count,
-        pending_imports: pending_imports(),
         indexed_vectors: storage.and_then(|storage| {
             storage
                 .count_query_visible_embeddings(DerivedIndexKind::SemanticText)
                 .ok()
         }),
+        index_backlog: backlog.map(|backlog| backlog.claimable),
+        index_stalled: backlog.map(|backlog| backlog.exhausted),
+        index_backlog_age_secs: backlog.and_then(|backlog| backlog.oldest_claimable_age_secs),
     }
 }
 
@@ -283,17 +286,6 @@ pub async fn try_rust_nl_query(app: &AppHandle, query: &str, n_results: u32) -> 
     // not maintenance-gated. So this refusal costs the user nothing.
     if crate::maintenance::is_active() {
         return fell_back("maintenance_in_progress");
-    }
-    // Python has written vectors to Chroma that never reached the Rust store.
-    // Serving here would rank a corpus with known holes and show the user a
-    // plausible page that is quietly missing screenshots — the one failure
-    // this path cannot make observable after the fact. Python's queue drains
-    // on the next capture or clustering pass, so this is self-clearing.
-    let pending = pending_imports();
-    if pending > 0 {
-        return fell_back(&format!(
-            "index_incomplete: {pending} vector(s) awaiting mirror"
-        ));
     }
     // The M2.4 copy has not finished, so whatever is in the store is a prefix of
     // the corpus rather than the corpus. Read on a blocking thread: it takes the
@@ -608,18 +600,38 @@ mod tests {
     }
 
     #[test]
-    fn outstanding_dual_write_debt_is_reported_and_clears() {
+    fn an_indexing_backlog_is_reported_but_is_not_a_refusal() {
         let _guard = OBSERVATION_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        note_pending_imports(0);
-        assert_eq!(backend_status(None).pending_imports, 0);
-        note_pending_imports(17);
-        assert_eq!(backend_status(None).pending_imports, 17);
-        // Python reports the remaining queue on every write, so a drained
-        // queue restores the Rust path without a restart.
-        note_pending_imports(0);
-        assert_eq!(backend_status(None).pending_imports, 0);
+        // Step 5 removed the only refusal that a backlog could trigger. Rust is
+        // now the sole MiniLM encoder and Chroma is fed from this store, so a
+        // screenshot waiting in the ledger is missing from Python too; standing
+        // down would cost the faster path and recover nothing. The depth stays
+        // visible in the diagnostic, which is where the freshness cost of idle
+        // gating shows up.
+        let reasons = [
+            "maintenance_in_progress",
+            "migration_incomplete",
+            "rust_index_empty",
+        ];
+        for reason in reasons {
+            observe_fallback(reason);
+        }
+        let status = backend_status(None);
+        assert!(
+            !status
+                .last_fallback_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("index_incomplete"),
+            "a backlog must not be spelled as a fallback reason anymore"
+        );
+        // Nothing was read from a database, so the depths are unknown rather
+        // than zero — reporting zero would claim a complete index.
+        assert_eq!(status.index_backlog, None);
+        assert_eq!(status.index_stalled, None);
+        assert_eq!(status.index_backlog_age_secs, None);
     }
 
     fn scored(subject_key: &str, score: f32) -> crate::storage::ScoredSubject {

@@ -965,157 +965,16 @@ fn process_request(
             }
         }
 
-        "upsert_minilm_derived_embeddings" => {
-            if !storage.is_session_valid() {
-                return StorageResponse::error("AUTH_REQUIRED");
-            }
-            let Some(records) = req.get("records").and_then(|value| value.as_array()) else {
-                return StorageResponse::error("records must be an array");
-            };
-            if records.len() > 128 {
-                return StorageResponse::error("MiniLM dual-write batch exceeds 128 records");
-            }
-            // How many vectors Python has written to Chroma but not yet
-            // mirrored here, excluding this batch. Absent means Python predates
-            // this contract and reports nothing, which reads as no known debt.
-            let reported_pending = req
-                .get("pending_imports")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(0);
-            let mut completed = 0_u64;
-            let mut already_current = 0_u64;
-            let mut errors = Vec::new();
-            // Rows Rust will never accept, however often Python offers them.
-            // Counted separately because Python must drop these instead of
-            // queueing them; a permanently rejected row left in the retry queue
-            // would hold the Rust read path down for as long as the queue lives.
-            let mut permanent = 0_u64;
-            for record in records {
-                let screenshot_id = record
-                    .get("screenshot_id")
-                    .and_then(|value| value.as_i64())
-                    .unwrap_or(0);
-                let vector: Vec<f32> =
-                    match record.get("embedding").cloned().map(serde_json::from_value) {
-                        Some(Ok(vector)) => vector,
-                        Some(Err(error)) => {
-                            permanent += 1;
-                            errors.push(serde_json::json!({
-                                "screenshot_id": screenshot_id,
-                                "error": format!("invalid embedding: {error}"),
-                                "permanent": true,
-                            }));
-                            continue;
-                        }
-                        None => {
-                            permanent += 1;
-                            errors.push(serde_json::json!({
-                                "screenshot_id": screenshot_id,
-                                "error": "embedding is required",
-                                "permanent": true,
-                            }));
-                            continue;
-                        }
-                    };
-                match crate::minilm_migration::import_minilm_vector_from_python(
-                    storage,
-                    screenshot_id,
-                    vector,
-                ) {
-                    Ok(crate::storage::EnsureDerivedIndexJobResult::Queued)
-                    | Ok(crate::storage::EnsureDerivedIndexJobResult::Requeued) => completed += 1,
-                    Ok(_) => already_current += 1,
-                    Err(rejection) => {
-                        if rejection.permanent {
-                            permanent += 1;
-                        }
-                        errors.push(serde_json::json!({
-                            "screenshot_id": screenshot_id,
-                            "error": rejection.message,
-                            "permanent": rejection.permanent,
-                        }));
-                    }
-                }
-            }
-            // The Rust read path refuses to serve while any mirror is
-            // outstanding, so a dropped or rejected row degrades into "Python
-            // answers the query" rather than "the ranking quietly misses
-            // screenshots". Transiently rejected rows count too: Python requeues
-            // them, but it may not write again for a while, and until it does
-            // its report would understate the gap. Permanently rejected rows do
-            // not count — Python drops them, so they are never coming, and
-            // holding the read path down for a row that can never arrive would
-            // disable Rust retrieval forever rather than until the queue drains.
-            let outstanding = (errors.len() as u64).saturating_sub(permanent);
-            crate::semantic_query::note_pending_imports(
-                reported_pending.saturating_add(outstanding),
-            );
-            StorageResponse::success(serde_json::json!({
-                "completed": completed,
-                "already_current": already_current,
-                "errors": errors,
-            }))
-        }
-
-        // Python's durable mirror queue survives a monitor restart, but the Rust
-        // debt counter is process-global and starts at zero, so after an app
-        // restart Rust would believe a knowably incomplete index was complete
-        // and rank against it. Python reports the queue it just loaded — and the
-        // queue it is left holding after every retry pass — through this command,
-        // which writes nothing.
-        "report_minilm_import_debt" => {
-            if !storage.is_session_valid() {
-                return StorageResponse::error("AUTH_REQUIRED");
-            }
-            let Some(pending) = req.get("pending_imports").and_then(|value| value.as_u64()) else {
-                return StorageResponse::error("pending_imports must be a non-negative integer");
-            };
-            crate::semantic_query::note_pending_imports(pending);
-            StorageResponse::success(serde_json::json!({ "pending_imports": pending }))
-        }
-
-        "delete_minilm_derived_embeddings" => {
-            if !storage.is_session_valid() {
-                return StorageResponse::error("AUTH_REQUIRED");
-            }
-            let Some(ids) = req.get("screenshot_ids").and_then(|value| value.as_array()) else {
-                return StorageResponse::error("screenshot_ids must be an array");
-            };
-            if ids.len() > 128 {
-                return StorageResponse::error("MiniLM delete batch exceeds 128 records");
-            }
-            let mut deleted = 0_u64;
-            let mut errors = Vec::new();
-            for value in ids {
-                let screenshot_id = value.as_i64().unwrap_or(0);
-                if screenshot_id <= 0 {
-                    errors.push(serde_json::json!({
-                        "screenshot_id": screenshot_id,
-                        "error": "screenshot_id must be positive",
-                    }));
-                    continue;
-                }
-                match storage.delete_derived_index_subject(
-                    crate::storage::DerivedIndexKind::SemanticText,
-                    &screenshot_id.to_string(),
-                ) {
-                    Ok(true) => deleted += 1,
-                    Ok(false) => {}
-                    Err(error) => errors.push(serde_json::json!({
-                        "screenshot_id": screenshot_id,
-                        "error": error,
-                    })),
-                }
-            }
-            if errors.is_empty() {
-                StorageResponse::success(serde_json::json!({ "deleted": deleted }))
-            } else {
-                StorageResponse::error(&format!(
-                    "Failed to delete {} MiniLM rows",
-                    errors.len()
-                ))
-            }
-        }
+        // M2.5 step 5 retired three MiniLM mirror commands that lived here:
+        // `upsert_minilm_derived_embeddings`, `report_minilm_import_debt`, and
+        // `delete_minilm_derived_embeddings`. All three existed because Python
+        // owned MiniLM inference and Rust held a copy that could fall behind.
+        // Rust is now the only encoder, mirrors *to* Chroma through
+        // `upsert_task_vectors`, and expires its own rows against SQLite
+        // timestamps, so there is nothing left for Python to write or report
+        // here. Removing them rather than leaving them inert matters: a handler
+        // that still accepts vectors is a second writer for a store that is
+        // supposed to have exactly one.
 
         // ============ Smart Cluster reverse IPC ============
         "get_idle_state" => {

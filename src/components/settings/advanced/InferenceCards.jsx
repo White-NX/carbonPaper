@@ -243,7 +243,11 @@ export function SemanticBackendCard({ config, status, statusLoading, onToggleRus
   const { t } = useTranslation();
   const backend = status?.backend;
   const usesRustIndex = (config.semantic_index || 'rust') === 'rust';
-  const pending = backend?.pending_imports ?? 0;
+  // Captures waiting for an idle window to be encoded. Ordinary operation, not
+  // a fault, so it is shown plainly; only a stalled job — one whose retry
+  // budget is spent and which nothing will pick up again — gets a warning.
+  const backlog = backend?.index_backlog ?? 0;
+  const stalled = backend?.index_stalled ?? 0;
 
   const servedLabel = {
     rust: t('settings.advanced.semantic_backend.served_rust'),
@@ -290,8 +294,14 @@ export function SemanticBackendCard({ config, status, statusLoading, onToggleRus
             <span className="text-ide-text text-right">{servedLabel}</span>
             <span className="text-ide-muted">{t('settings.advanced.semantic_backend.indexed')}</span>
             <span className="text-ide-text text-right">{backend?.indexed_vectors ?? '—'}</span>
-            <span className="text-ide-muted">{t('settings.advanced.semantic_backend.pending')}</span>
-            <span className={`text-right ${pending ? 'text-ide-warning' : 'text-ide-text'}`}>{pending}</span>
+            <span className="text-ide-muted">{t('settings.advanced.semantic_backend.backlog')}</span>
+            <span className="text-ide-text text-right">{backend?.index_backlog ?? '—'}</span>
+            {stalled > 0 && (
+              <>
+                <span className="text-ide-muted">{t('settings.advanced.semantic_backend.stalled')}</span>
+                <span className="text-ide-warning text-right">{stalled}</span>
+              </>
+            )}
             <span className="text-ide-muted">{t('settings.advanced.semantic_backend.fallbacks')}</span>
             <span className="text-ide-text text-right">{backend?.fallback_count ?? 0}</span>
           </div>
@@ -301,9 +311,14 @@ export function SemanticBackendCard({ config, status, statusLoading, onToggleRus
               {t('settings.advanced.semantic_backend.last_reason')}: {backend.last_fallback_reason}
             </p>
           )}
-          {pending > 0 && (
+          {backlog > 0 && (
+            <p className="text-[11px] text-ide-muted leading-snug">
+              {t('settings.advanced.semantic_backend.backlog_hint')}
+            </p>
+          )}
+          {stalled > 0 && (
             <p className="text-[11px] text-ide-warning-muted leading-snug">
-              {t('settings.advanced.semantic_backend.pending_hint')}
+              {t('settings.advanced.semantic_backend.stalled_hint')}
             </p>
           )}
         </div>

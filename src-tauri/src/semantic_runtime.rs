@@ -327,10 +327,13 @@ impl SemanticRuntimeState {
         timeout: Duration,
         prefer_directml: bool,
     ) -> Result<MlResponse, String> {
-        let _request_guard = self.request_gate.lock().await;
-        // One deadline spans provider selection, the first attempt, and any CPU
-        // fallback, so the caller never waits materially longer than its own timeout.
+        // One deadline spans the wait for the worker, provider selection, the
+        // first attempt, and any CPU fallback, so the caller never waits
+        // materially longer than its own timeout. It is computed before the gate
+        // is taken because the wait for the gate is the longest of those steps.
         let deadline = Instant::now() + timeout;
+        let _request_guard =
+            acquire_request_slot(&self.request_gate, deadline, request.request_id()).await?;
         let model = request_model(&request);
         let provider = match self.select_provider(&app, prefer_directml, model).await {
             Ok(provider) => provider,
@@ -803,6 +806,33 @@ impl Drop for SemanticRuntimeState {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Wait for exclusive use of the single semantic worker, inside the caller's own
+/// deadline.
+///
+/// Background capture indexing and foreground search share this worker, and the
+/// background batch runs on a far more generous budget than a user query does.
+/// An unbounded wait here would therefore let a 5 s search hang for the length
+/// of a background batch — its own budget would never start counting, and it
+/// could not fall back to Python either, because nothing had failed yet.
+///
+/// Losing the wait is deliberately not recorded as a worker failure and does not
+/// restart anything: the worker is healthy, it is busy. The caller sees a
+/// `timeout` error and decides what to do with it.
+async fn acquire_request_slot(
+    gate: &tokio::sync::Mutex<()>,
+    deadline: Instant,
+    request_id: u64,
+) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), gate.lock())
+        .await
+        .map_err(|_| {
+            format!(
+                "timeout: semantic request {request_id} gave up waiting for the semantic worker \
+                 to finish another request"
+            )
+        })
 }
 
 fn request_model(request: &MlRequest) -> Option<MlSemanticModel> {
@@ -1309,6 +1339,39 @@ mod tests {
             MlRequest::EmbedText { timeout_ms, .. } => assert_eq!(timeout_ms, 1_500),
             other => panic!("unexpected request variant: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_busy_worker_is_refused_inside_the_deadline_rather_than_waited_out() {
+        // The regression this guards: the gate used to be taken before the
+        // deadline existed, so a query with a 5 s budget queued behind a
+        // background batch with a 120 s one waited the full batch out. Nothing
+        // downstream could rescue it, because no failure had been observed yet.
+        let gate = tokio::sync::Mutex::new(());
+        let held = gate.lock().await;
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let started = Instant::now();
+        let error = acquire_request_slot(&gate, deadline, 7)
+            .await
+            .expect_err("a held gate must not be waited out past the deadline");
+        assert_eq!(split_error(&error).0, "timeout");
+        assert!(error.contains("request 7"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2), "returned late");
+        drop(held);
+
+        // A free gate is handed over without consuming any of the budget.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(acquire_request_slot(&gate, deadline, 8).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_deadline_that_has_already_passed_never_blocks() {
+        let gate = tokio::sync::Mutex::new(());
+        let _held = gate.lock().await;
+        let error = acquire_request_slot(&gate, Instant::now(), 9)
+            .await
+            .expect_err("an expired deadline cannot acquire a held gate");
+        assert_eq!(split_error(&error).0, "timeout");
     }
 
     #[test]

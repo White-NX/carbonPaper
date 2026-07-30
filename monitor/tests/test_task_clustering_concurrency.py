@@ -12,6 +12,7 @@ class FakeCollection:
         self._run_release = run_release
         self._first_range_get = True
         self.add_calls = 0
+        self.upsert_calls = 0
 
     def get(self, ids=None, where=None, include=None):
         if self._first_range_get and where is not None and include and "embeddings" in include:
@@ -29,8 +30,8 @@ class FakeCollection:
     def delete(self, ids):
         return None
 
-    def upsert(self, ids, embeddings, metadatas):
-        return None
+    def upsert(self, ids, embeddings, metadatas, documents=None):
+        self.upsert_calls += len(ids)
 
     def count(self):
         return 0
@@ -67,8 +68,17 @@ class FakeEngine:
         return {"clusters": [], "noise_ids": []}
 
 
-def test_run_clustering_does_not_deadlock_add_snapshot(monkeypatch):
+def test_run_clustering_does_not_deadlock_the_rust_vector_mirror(monkeypatch):
+    """A clustering run and an incoming mirror must serialize, not deadlock.
+
+    Until M2.5 step 5 the concurrent writer here was `add_snapshot`, driven by
+    Python's own capture-path ingest queue. Rust owns that encode now, so the
+    writer that arrives mid-run is the `upsert_task_vectors` mirror — and it
+    arrives *more* readily than before, because both it and the clustering run
+    are gated on the machine being idle.
+    """
     monkeypatch.setattr(tc.TaskEmbedder, "is_model_available", staticmethod(lambda: True))
+    monkeypatch.setattr(tc.HotColdManager, "_encrypt", lambda self, text: text)
 
     run_entered = threading.Event()
     run_release = threading.Event()
@@ -78,7 +88,7 @@ def test_run_clustering_does_not_deadlock_add_snapshot(monkeypatch):
     manager._engine = FakeEngine()
 
     run_error = []
-    add_error = []
+    mirror_error = []
 
     def run_worker():
         try:
@@ -86,41 +96,42 @@ def test_run_clustering_does_not_deadlock_add_snapshot(monkeypatch):
         except Exception as exc:  # pragma: no cover
             run_error.append(exc)
 
-    def add_worker():
+    def mirror_worker():
         try:
-            manager.add_snapshot(
-                screenshot_id=42,
-                process_name="code.exe",
-                window_title="Editor",
-                ocr_text="hello",
-                timestamp=time.time(),
-                category="Development",
-            )
+            manager.upsert_task_vectors([{
+                "id": "42",
+                "embedding": [0.0] * tc.EMBEDDING_DIM,
+                "timestamp": time.time(),
+                "process_name": "code.exe",
+                "window_title": "Editor",
+                "category": "Development",
+                "document": "code.exe | Editor | hello",
+            }])
         except Exception as exc:  # pragma: no cover
-            add_error.append(exc)
+            mirror_error.append(exc)
 
     run_thread = threading.Thread(target=run_worker, daemon=True)
     run_thread.start()
 
     assert run_entered.wait(timeout=1.0), "run_clustering did not reach blocking point"
 
-    add_thread = threading.Thread(target=add_worker, daemon=True)
-    add_thread.start()
+    mirror_thread = threading.Thread(target=mirror_worker, daemon=True)
+    mirror_thread.start()
 
-    # add_snapshot should be blocked by clustering lock before release.
+    # The mirror should be blocked by the clustering lock before release.
     time.sleep(0.15)
-    assert add_thread.is_alive(), "add_snapshot should block while clustering holds lock"
+    assert mirror_thread.is_alive(), "the mirror should block while clustering holds the lock"
 
     run_release.set()
 
     run_thread.join(timeout=2.0)
-    add_thread.join(timeout=2.0)
+    mirror_thread.join(timeout=2.0)
 
     assert not run_thread.is_alive(), "run_clustering did not finish in time"
-    assert not add_thread.is_alive(), "add_snapshot remained blocked"
+    assert not mirror_thread.is_alive(), "the mirror remained blocked"
     assert run_error == []
-    assert add_error == []
-    assert collection.add_calls == 1
+    assert mirror_error == []
+    assert collection.upsert_calls == 1
 
 
 def test_scheduler_can_recover_after_failed_run(monkeypatch):

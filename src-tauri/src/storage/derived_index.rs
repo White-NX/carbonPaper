@@ -129,6 +129,21 @@ pub enum EnsureDerivedIndexJobResult {
     AlreadyProcessing,
 }
 
+/// Ledger depth for one index kind.
+///
+/// Under idle gating a non-zero `claimable` is ordinary operation — captures
+/// waiting for the next idle window — so the read path reports it instead of
+/// acting on it. `exhausted` is the number that cannot clear itself: those
+/// subjects stay missing from search until someone intervenes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedIndexBacklog {
+    pub claimable: u64,
+    pub exhausted: u64,
+    /// Age of the oldest claimable row by ledger update time. `None` when the
+    /// queue is empty.
+    pub oldest_claimable_age_secs: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DerivedIndexGeneration {
     pub index_kind: DerivedIndexKind,
@@ -838,73 +853,321 @@ impl StorageState {
         let guard = self.get_connection_named("list_derived_index_jobs")?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
         let mut statement = conn
-            .prepare(
+            .prepare(&format!(
                 r#"
-                SELECT subject_key, status, error_code, error, attempts,
-                       next_retry_at, model_id, model_revision,
-                       embedding_version, source_fingerprint, updated_at
+                SELECT {JOB_ROW_COLUMNS}
                 FROM derived_index_jobs
                 WHERE index_kind = ?1 AND (?2 IS NULL OR status = ?2)
                 ORDER BY updated_at, subject_key
                 LIMIT ?3 OFFSET ?4
-                "#,
-            )
+                "#
+            ))
             .map_err(|error| format!("Failed to prepare derived job query: {error}"))?;
         let rows = statement
             .query_map(
                 params![index_kind.as_str(), status_text, limit, offset],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, String>(10)?,
-                    ))
-                },
+                read_job_row,
             )
             .map_err(|error| format!("Failed to query derived jobs: {error}"))?;
         rows.map(|row| {
-            let (
-                subject_key,
-                status,
-                error_code,
-                error,
-                attempts,
-                next_retry_at,
-                model_id,
-                model_revision,
-                embedding_version,
-                source_fingerprint,
-                updated_at,
-            ) = row.map_err(|db_error| format!("Failed to read derived job row: {db_error}"))?;
-            Ok(DerivedIndexJobRecord {
-                spec: DerivedIndexJobSpec {
-                    index_kind,
-                    subject_key,
-                    model_id,
-                    model_revision,
-                    embedding_version: u32::try_from(embedding_version).map_err(|_| {
-                        format!("Invalid stored embedding version: {embedding_version}")
-                    })?,
-                    source_fingerprint,
-                },
-                status: DerivedIndexJobStatus::from_db(&status)?,
-                error_code,
-                error,
-                attempts: u32::try_from(attempts)
-                    .map_err(|_| format!("Invalid stored attempts: {attempts}"))?,
-                next_retry_at,
-                updated_at,
-            })
+            let row = row.map_err(|db_error| format!("Failed to read derived job row: {db_error}"))?;
+            job_record_from_row(index_kind, row)
         })
         .collect()
+    }
+
+    /// Ledger rows a worker may claim right now: never started, parked on a
+    /// locked session, or failed with the backoff elapsed and retry budget
+    /// intact. Deliberately narrower than [`Self::list_derived_index_jobs`],
+    /// which reports every row whether or not anything can be done with it.
+    ///
+    /// Oldest first, so a backlog drains in capture order rather than starving
+    /// whatever was queued while the machine was busy.
+    pub fn claimable_derived_index_jobs(
+        &self,
+        index_kind: DerivedIndexKind,
+        max_attempts: u32,
+        limit: u32,
+    ) -> Result<Vec<DerivedIndexJobRecord>, String> {
+        let limit = limit.clamp(1, 10_000);
+        let guard = self.get_connection_named("claimable_derived_index_jobs")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let mut statement = conn
+            .prepare(&format!(
+                r#"
+                SELECT {JOB_ROW_COLUMNS}
+                FROM derived_index_jobs
+                WHERE index_kind = ?1
+                  AND {CLAIMABLE_JOB_PREDICATE}
+                  AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+                ORDER BY updated_at, subject_key
+                LIMIT ?3
+                "#
+            ))
+            .map_err(|error| format!("Failed to prepare claimable job query: {error}"))?;
+        let rows = statement
+            .query_map(params![index_kind.as_str(), max_attempts, limit], read_job_row)
+            .map_err(|error| format!("Failed to query claimable derived jobs: {error}"))?;
+        rows.map(|row| {
+            let row =
+                row.map_err(|db_error| format!("Failed to read claimable job row: {db_error}"))?;
+            job_record_from_row(index_kind, row)
+        })
+        .collect()
+    }
+
+    /// Ledger depth, for the read path's backend diagnostic.
+    ///
+    /// `claimable` is ordinary operation under idle gating and is reported, not
+    /// acted on. `exhausted` is the number that cannot clear itself: a job whose
+    /// retry budget is spent stays missing from search until someone looks.
+    pub fn derived_index_backlog(
+        &self,
+        index_kind: DerivedIndexKind,
+        max_attempts: u32,
+    ) -> Result<DerivedIndexBacklog, String> {
+        let guard = self.get_connection_named("derived_index_backlog")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        conn.query_row(
+            &format!(
+                r#"
+                SELECT
+                    COALESCE(SUM(CASE WHEN {CLAIMABLE_JOB_PREDICATE} THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'failed' AND attempts >= ?2
+                                      THEN 1 ELSE 0 END), 0),
+                    CAST((julianday('now') - julianday(
+                        MIN(CASE WHEN {CLAIMABLE_JOB_PREDICATE} THEN updated_at END)
+                    )) * 86400 AS INTEGER)
+                FROM derived_index_jobs
+                WHERE index_kind = ?1
+                "#
+            ),
+            params![index_kind.as_str(), max_attempts],
+            |row| {
+                Ok(DerivedIndexBacklog {
+                    claimable: row.get::<_, i64>(0)?.max(0) as u64,
+                    exhausted: row.get::<_, i64>(1)?.max(0) as u64,
+                    oldest_claimable_age_secs: row.get::<_, Option<i64>>(2)?,
+                })
+            },
+        )
+        .map_err(|error| format!("Failed to read derived index backlog: {error}"))
+    }
+
+    /// Screenshots that should have a `semantic_text` vector but have no ledger
+    /// row at all, newest first.
+    ///
+    /// This is the repair path for an enqueue that never happened — the capture
+    /// ran while the session was locked, or the process died between the OCR
+    /// commit and the enqueue. It deliberately does not look for rows whose
+    /// *fingerprint* went stale, because deciding that requires decrypting and
+    /// rebuilding the source text of every screenshot; a model or contract
+    /// change is handled by [`Self::invalidate_derived_index_model`] instead.
+    ///
+    /// The `EXISTS` clause is an over-approximation of corpus membership, and
+    /// knowingly so: whether a screenshot has any text to encode depends on the
+    /// contents of `ocr_results.text_enc`, `screenshots.process_name_enc`, and
+    /// `screenshots.window_title_enc`, and an empty string is indistinguishable
+    /// from a full one in ciphertext. `minilm_sources` applies the real rule
+    /// after decryption and records what it rules out through
+    /// [`Self::exclude_derived_index_subject`], which is what keeps a screenshot
+    /// with nothing to encode from being handed back here on every pass.
+    ///
+    /// `retention_modifier` is a SQLite datetime modifier such as `-30 days`,
+    /// bound as a parameter. Screenshots older than it are outside the window
+    /// this index keeps at all, so they are not candidates.
+    pub fn list_semantic_text_index_candidates(
+        &self,
+        retention_modifier: &str,
+        limit: u32,
+    ) -> Result<Vec<i64>, String> {
+        let limit = limit.clamp(1, 10_000);
+        let guard = self.get_connection_named("list_semantic_text_index_candidates")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let mut statement = conn
+            .prepare(
+                r#"
+                SELECT s.id
+                FROM screenshots s
+                WHERE s.is_deleted = 0
+                  AND s.created_at >= datetime('now', ?1)
+                  AND EXISTS (
+                      SELECT 1 FROM ocr_results o
+                      WHERE o.screenshot_id = s.id AND o.is_deleted = 0
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM derived_index_jobs j
+                      WHERE j.index_kind = 'semantic_text'
+                        AND j.subject_key = CAST(s.id AS TEXT)
+                  )
+                ORDER BY s.created_at DESC, s.id DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(|error| format!("Failed to prepare index candidate query: {error}"))?;
+        let rows = statement
+            .query_map(params![retention_modifier, limit], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("Failed to query index candidates: {error}"))?;
+        rows.collect::<rusqlite::Result<Vec<i64>>>()
+            .map_err(|error| format!("Failed to read index candidate row: {error}"))
+    }
+
+    /// Subjects the semantic index should no longer hold: aged out of the
+    /// retention window, or with no live screenshot behind them.
+    ///
+    /// Ageing is the part that needs a query. Deletion is already handled
+    /// transactionally by `cleanup_derived_index_on_screenshot_soft_delete` and
+    /// its hard-delete twin, and [`Self::ensure_derived_index_job`] refuses to
+    /// queue work for a subject that is not live, so the `s.id IS NULL` branch
+    /// cannot be produced through the normal APIs. It is kept because a row that
+    /// arrived some other way — a database written before those triggers — has
+    /// no `created_at` to age against and would otherwise never be reclaimed.
+    pub fn list_expired_semantic_text_subjects(
+        &self,
+        retention_modifier: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, String> {
+        let limit = limit.clamp(1, 10_000);
+        let guard = self.get_connection_named("list_expired_semantic_text_subjects")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let mut statement = conn
+            .prepare(
+                r#"
+                SELECT t.subject_key
+                FROM (
+                    SELECT subject_key FROM derived_index_jobs
+                    WHERE index_kind = 'semantic_text'
+                    UNION
+                    SELECT subject_key FROM derived_embeddings
+                    WHERE index_kind = 'semantic_text'
+                ) t
+                LEFT JOIN screenshots s
+                    ON s.id = CAST(t.subject_key AS INTEGER) AND s.is_deleted = 0
+                WHERE s.id IS NULL OR s.created_at < datetime('now', ?1)
+                LIMIT ?2
+                "#,
+            )
+            .map_err(|error| format!("Failed to prepare expired subject query: {error}"))?;
+        let rows = statement
+            .query_map(params![retention_modifier, limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("Failed to query expired subjects: {error}"))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(|error| format!("Failed to read expired subject row: {error}"))
+    }
+
+    /// Records that a subject has nothing to index, so the repair scan stops
+    /// selecting it.
+    ///
+    /// [`Self::list_semantic_text_index_candidates`] decides corpus membership
+    /// from SQL alone — a live screenshot inside the retention window with at
+    /// least one OCR row — because the text that really decides it lives in
+    /// encrypted columns no predicate can read. `minilm_sources` applies the
+    /// real rule and drops screenshots whose process name, window title, and
+    /// OCR text are all empty. Nothing used to record that decision, so such a
+    /// screenshot was re-selected, re-decrypted, and re-dropped on every pass,
+    /// and enough of them would crowd genuinely missing screenshots out of the
+    /// scan's `LIMIT`.
+    ///
+    /// The row is terminal in the same sense as `discarded`: not claimable, not
+    /// counted as backlog, and not revived by a model contract change. It is
+    /// fingerprinted against the empty source, so a screenshot that later gains
+    /// text no longer matches it and [`Self::ensure_derived_index_job`] queues
+    /// fresh work for it like it would for any other source change. Expiry
+    /// reclaims the row with its screenshot.
+    ///
+    /// Returns `false` when the subject is no longer active: the lifecycle
+    /// triggers have already removed its rows and there is nothing to record.
+    pub fn exclude_derived_index_subject(
+        &self,
+        spec: &DerivedIndexJobSpec,
+        error_code: &str,
+        error: &str,
+    ) -> Result<bool, String> {
+        validate_job_spec(spec)?;
+        validate_required_text("error_code", error_code, MAX_METADATA_BYTES)?;
+        validate_required_text("error", error, MAX_METADATA_BYTES)?;
+        let mut guard = self.get_connection_named("exclude_derived_index_subject")?;
+        let conn = guard.as_mut().ok_or("Database not initialized")?;
+        let epoch_before = if spec.index_kind == DerivedIndexKind::SemanticText {
+            Some(read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?)
+        } else {
+            None
+        };
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Failed to start derived exclusion transaction: {error}"))?;
+        if !derived_subject_is_active(&tx, spec.index_kind, &spec.subject_key)? {
+            return Ok(false);
+        }
+        // A row that already describes this exact empty source is left alone.
+        // The M2.4 migration deliberately copies a legacy Chroma vector for a
+        // screenshot whose current SQLite text is empty — it cannot be
+        // recomputed from nothing — and stamps it with this same fingerprint.
+        let contract_matches: Option<bool> = tx
+            .query_row(
+                r#"
+                SELECT model_id = ?3 AND model_revision = ?4
+                       AND embedding_version = ?5 AND source_fingerprint = ?6
+                FROM derived_index_jobs
+                WHERE index_kind = ?1 AND subject_key = ?2
+                "#,
+                params![
+                    spec.index_kind.as_str(),
+                    spec.subject_key,
+                    spec.model_id,
+                    spec.model_revision,
+                    spec.embedding_version,
+                    spec.source_fingerprint,
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect derived index job: {error}"))?;
+        if contract_matches == Some(true) {
+            return Ok(true);
+        }
+        // Any vector still held describes a source that no longer exists, so it
+        // must not stay query-visible.
+        tx.execute(
+            "DELETE FROM derived_embeddings WHERE index_kind = ?1 AND subject_key = ?2",
+            params![spec.index_kind.as_str(), spec.subject_key],
+        )
+        .map_err(|error| format!("Failed to drop an excluded subject's vector: {error}"))?;
+        tx.execute(
+            r#"
+            INSERT INTO derived_index_jobs (
+                index_kind, subject_key, status, attempts, error_code, error,
+                model_id, model_revision, embedding_version, source_fingerprint,
+                updated_at
+            ) VALUES (?1, ?2, 'discarded', 0, ?7, ?8, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+            ON CONFLICT(index_kind, subject_key) DO UPDATE SET
+                status = 'discarded', attempts = 0, error_code = ?7, error = ?8,
+                next_retry_at = NULL, lease_token = NULL,
+                model_id = ?3, model_revision = ?4,
+                embedding_version = ?5, source_fingerprint = ?6,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+            params![
+                spec.index_kind.as_str(),
+                spec.subject_key,
+                spec.model_id,
+                spec.model_revision,
+                spec.embedding_version,
+                spec.source_fingerprint,
+                error_code,
+                error,
+            ],
+        )
+        .map_err(|error| format!("Failed to record a derived index exclusion: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("Failed to commit a derived exclusion: {error}"))?;
+        if let Some(epoch_before) = epoch_before {
+            let epoch_after = read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?;
+            self.note_semantic_cache_removal(&spec.subject_key, epoch_before, epoch_after);
+        }
+        Ok(true)
     }
 
     /// Deletes both the cached vector and its ledger row in one transaction.
@@ -1440,6 +1703,85 @@ type RawSnapshotMetadata = (
     Option<i64>,
     Option<i64>,
 );
+
+/// The `derived_index_jobs` projection shared by every ledger read, so the
+/// column list and [`read_job_row`] cannot drift apart.
+const JOB_ROW_COLUMNS: &str = "subject_key, status, error_code, error, attempts, \
+     next_retry_at, model_id, model_revision, embedding_version, source_fingerprint, \
+     updated_at";
+
+/// One definition of "a worker could still pick this up", with `?2` bound to
+/// the retry budget. `waiting_for_auth` counts because the session it stalled
+/// on may have been unlocked since.
+const CLAIMABLE_JOB_PREDICATE: &str = "(status IN ('pending', 'waiting_for_auth') \
+     OR (status = 'failed' AND attempts < ?2))";
+
+type JobRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    String,
+    String,
+    i64,
+    String,
+    String,
+);
+
+fn read_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
+}
+
+fn job_record_from_row(
+    index_kind: DerivedIndexKind,
+    row: JobRow,
+) -> Result<DerivedIndexJobRecord, String> {
+    let (
+        subject_key,
+        status,
+        error_code,
+        error,
+        attempts,
+        next_retry_at,
+        model_id,
+        model_revision,
+        embedding_version,
+        source_fingerprint,
+        updated_at,
+    ) = row;
+    Ok(DerivedIndexJobRecord {
+        spec: DerivedIndexJobSpec {
+            index_kind,
+            subject_key,
+            model_id,
+            model_revision,
+            embedding_version: u32::try_from(embedding_version)
+                .map_err(|_| format!("Invalid stored embedding version: {embedding_version}"))?,
+            source_fingerprint,
+        },
+        status: DerivedIndexJobStatus::from_db(&status)?,
+        error_code,
+        error,
+        attempts: u32::try_from(attempts)
+            .map_err(|_| format!("Invalid stored attempts: {attempts}"))?,
+        next_retry_at,
+        updated_at,
+    })
+}
 
 pub(super) fn derived_subject_is_active(
     conn: &rusqlite::Connection,
@@ -2612,6 +2954,335 @@ mod tests {
             .unwrap();
         assert_eq!(processing.status, DerivedIndexJobStatus::Processing);
         assert_eq!(processing.attempts, 0);
+    }
+
+    /// Give a screenshot a `created_at` the retention queries can reason about.
+    fn backdate_screenshot(storage: &StorageState, id: i64, modifier: &str) {
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        guard
+            .as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE screenshots SET created_at = datetime('now', ?2) WHERE id = ?1",
+                params![id, modifier],
+            )
+            .unwrap();
+    }
+
+    fn insert_screenshot_with_ocr(storage: &StorageState, id: i64) {
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        let conn = guard.as_ref().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO screenshots (id, image_path, image_hash) VALUES (?1, ?2, ?3)",
+            params![id, format!("{id}.enc"), format!("hash-{id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ocr_results (screenshot_id, text, text_hash) VALUES (?1, ?2, ?3)",
+            params![id, format!("text-{id}"), format!("text-hash-{id}")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn only_jobs_a_worker_could_actually_pick_up_are_claimable() {
+        let (_temp, storage) = test_storage();
+
+        // Never started.
+        let pending = job(DerivedIndexKind::SemanticText, "1");
+        ensure_active_subject(&storage, &pending);
+        storage.upsert_derived_index_job(&pending).unwrap();
+
+        // Already leased by someone else.
+        let processing = job(DerivedIndexKind::SemanticText, "2");
+        queue_and_claim(&storage, &processing);
+
+        // Failed with the budget intact and the backoff elapsed.
+        let retryable = job(DerivedIndexKind::SemanticText, "3");
+        let lease = queue_and_claim(&storage, &retryable);
+        storage
+            .mark_derived_index_job_failed(&retryable, &lease, "embed_failed", "boom", None)
+            .unwrap();
+
+        // Failed with the backoff still running.
+        let backing_off = job(DerivedIndexKind::SemanticText, "4");
+        let lease = queue_and_claim(&storage, &backing_off);
+        storage
+            .mark_derived_index_job_failed(
+                &backing_off,
+                &lease,
+                "embed_failed",
+                "boom",
+                Some("9999-12-31 23:59:59"),
+            )
+            .unwrap();
+
+        let claimable = storage
+            .claimable_derived_index_jobs(DerivedIndexKind::SemanticText, 5, 100)
+            .unwrap();
+        let subjects: Vec<&str> = claimable
+            .iter()
+            .map(|record| record.spec.subject_key.as_str())
+            .collect();
+        assert_eq!(subjects, vec!["1", "3"]);
+
+        // A spent retry budget stops the job being claimable: nothing picks it
+        // up again on its own, which is what the diagnostic calls stalled.
+        let starved: Vec<String> = storage
+            .claimable_derived_index_jobs(DerivedIndexKind::SemanticText, 1, 100)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.spec.subject_key)
+            .collect();
+        assert_eq!(starved, vec!["1".to_string()]);
+
+        let backlog = storage
+            .derived_index_backlog(DerivedIndexKind::SemanticText, 1)
+            .unwrap();
+        // Only the never-started job is still claimable at a budget of one; both
+        // failures have spent it, and a spent budget is what `exhausted` counts.
+        // The leased job is neither: someone is holding it right now.
+        assert_eq!(backlog.claimable, 1);
+        assert_eq!(backlog.exhausted, 2);
+        assert!(backlog.oldest_claimable_age_secs.is_some());
+
+        // With the real budget the retryable failure is claimable again, and so
+        // is the one still inside its backoff: this figure is queue depth, not
+        // what a worker could lease this instant. Nothing is stalled.
+        let generous = storage
+            .derived_index_backlog(DerivedIndexKind::SemanticText, 5)
+            .unwrap();
+        assert_eq!(generous.claimable, 3);
+        assert_eq!(generous.exhausted, 0);
+
+        // A different index kind must not leak into either number.
+        let clip = storage
+            .derived_index_backlog(DerivedIndexKind::ClipImage, 5)
+            .unwrap();
+        assert_eq!(clip, DerivedIndexBacklog::default());
+    }
+
+    #[test]
+    fn index_candidates_are_screenshots_with_text_no_ledger_row_and_inside_retention() {
+        let (_temp, storage) = test_storage();
+        for id in [10, 11, 12, 13] {
+            insert_screenshot_with_ocr(&storage, id);
+        }
+        // 11 already has a ledger row, 12 aged out, 13 was deleted.
+        let queued = job(DerivedIndexKind::SemanticText, "11");
+        storage.upsert_derived_index_job(&queued).unwrap();
+        backdate_screenshot(&storage, 12, "-40 days");
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .as_ref()
+                .unwrap()
+                .execute("UPDATE screenshots SET is_deleted = 1 WHERE id = 13", [])
+                .unwrap();
+        }
+        // A screenshot with no OCR row at all is not part of the corpus.
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .as_ref()
+                .unwrap()
+                .execute(
+                    "INSERT INTO screenshots (id, image_path, image_hash) VALUES (14, '14.enc', 'hash-14')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let candidates = storage
+            .list_semantic_text_index_candidates("-30 days", 100)
+            .unwrap();
+        assert_eq!(candidates, vec![10]);
+    }
+
+    /// The candidate scan can only over-approximate the corpus, so the ledger has
+    /// to remember what the decrypting builder ruled out. Without this the same
+    /// screenshot is handed back, re-decrypted, and re-dropped on every pass, and
+    /// once enough of them accumulate they fill the scan's `LIMIT` and the repair
+    /// path stops reaching screenshots that really are missing a vector.
+    #[test]
+    fn an_excluded_subject_leaves_the_repair_scan_for_good() {
+        let (_temp, storage) = test_storage();
+        insert_screenshot_with_ocr(&storage, 30);
+        insert_screenshot_with_ocr(&storage, 31);
+        assert_eq!(
+            storage
+                .list_semantic_text_index_candidates("-30 days", 100)
+                .unwrap(),
+            vec![31, 30]
+        );
+
+        let empty = job(DerivedIndexKind::SemanticText, "30");
+        assert!(storage
+            .exclude_derived_index_subject(&empty, "empty_source", "nothing to encode")
+            .unwrap());
+
+        // Out of the scan, and out of both worker-facing projections: nothing
+        // will lease it, and it is neither queue depth nor a stalled job.
+        assert_eq!(
+            storage
+                .list_semantic_text_index_candidates("-30 days", 100)
+                .unwrap(),
+            vec![31]
+        );
+        assert!(storage
+            .claimable_derived_index_jobs(DerivedIndexKind::SemanticText, 5, 100)
+            .unwrap()
+            .is_empty());
+        let backlog = storage
+            .derived_index_backlog(DerivedIndexKind::SemanticText, 5)
+            .unwrap();
+        assert_eq!(backlog.claimable, 0);
+        assert_eq!(backlog.exhausted, 0);
+
+        // Repeating the decision is a no-op rather than a second row.
+        assert!(storage
+            .exclude_derived_index_subject(&empty, "empty_source", "nothing to encode")
+            .unwrap());
+        let record = storage
+            .get_derived_index_job(DerivedIndexKind::SemanticText, "30")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, DerivedIndexJobStatus::Discarded);
+        assert_eq!(record.attempts, 0);
+        assert_eq!(record.error_code.as_deref(), Some("empty_source"));
+    }
+
+    #[test]
+    fn regaining_text_reclaims_an_excluded_subject() {
+        let (_temp, storage) = test_storage();
+        let empty = job(DerivedIndexKind::SemanticText, "32");
+        ensure_active_subject(&storage, &empty);
+        assert!(storage
+            .exclude_derived_index_subject(&empty, "empty_source", "nothing to encode")
+            .unwrap());
+
+        // The exclusion is fingerprinted against the empty source, so a
+        // re-OCR that produces text is an ordinary source change and not
+        // something the ledger has already settled.
+        let mut with_text = empty.clone();
+        with_text.source_fingerprint = "source-32-with-text".to_string();
+        assert_eq!(
+            storage.ensure_derived_index_job(&with_text).unwrap(),
+            EnsureDerivedIndexJobResult::Requeued
+        );
+        let claimable: Vec<String> = storage
+            .claimable_derived_index_jobs(DerivedIndexKind::SemanticText, 5, 100)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.spec.subject_key)
+            .collect();
+        assert_eq!(claimable, vec!["32".to_string()]);
+    }
+
+    #[test]
+    fn an_exclusion_drops_a_vector_whose_source_is_gone_but_spares_a_matching_one() {
+        let (_temp, storage) = test_storage();
+        // A vector encoded from text that has since disappeared cannot stay
+        // query-visible: it would keep ranking against a source nothing holds.
+        let stale = job(DerivedIndexKind::SemanticText, "33");
+        commit_vector(&storage, stale.clone(), vec![1.0, 0.0]).unwrap();
+        let mut now_empty = stale.clone();
+        now_empty.source_fingerprint = "source-33-empty".to_string();
+        assert!(storage
+            .exclude_derived_index_subject(&now_empty, "empty_source", "nothing to encode")
+            .unwrap());
+        assert!(storage
+            .get_query_visible_embedding(DerivedIndexKind::SemanticText, "33")
+            .unwrap()
+            .is_none());
+
+        // The M2.4 migration deliberately copies a legacy Chroma vector for a
+        // screenshot whose current text is empty, stamped with exactly this
+        // fingerprint. It cannot be recomputed, so excluding must not touch it.
+        let legacy = job(DerivedIndexKind::SemanticText, "34");
+        commit_vector(&storage, legacy.clone(), vec![0.0, 1.0]).unwrap();
+        assert!(storage
+            .exclude_derived_index_subject(&legacy, "empty_source", "nothing to encode")
+            .unwrap());
+        assert!(storage
+            .get_query_visible_embedding(DerivedIndexKind::SemanticText, "34")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn a_deleted_screenshot_is_reported_rather_than_recorded_as_excluded() {
+        let (_temp, storage) = test_storage();
+        // Nothing to record: the lifecycle triggers already removed the rows,
+        // and inserting one would resurrect a subject the schema retired.
+        let gone = job(DerivedIndexKind::SemanticText, "35");
+        assert!(!storage
+            .exclude_derived_index_subject(&gone, "empty_source", "nothing to encode")
+            .unwrap());
+        assert!(storage
+            .get_derived_index_job(DerivedIndexKind::SemanticText, "35")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn expiry_reaps_aged_subjects_and_leaves_the_rest_alone() {
+        let (_temp, storage) = test_storage();
+        for id in [20, 21] {
+            let spec = job(DerivedIndexKind::SemanticText, &id.to_string());
+            commit_vector(&storage, spec, vec![1.0, 0.0]).unwrap();
+        }
+        backdate_screenshot(&storage, 20, "-40 days");
+
+        let expired = storage
+            .list_expired_semantic_text_subjects("-30 days", 100)
+            .unwrap();
+        assert_eq!(expired, vec!["20".to_string()]);
+
+        assert!(storage
+            .delete_derived_index_subject(DerivedIndexKind::SemanticText, "20")
+            .unwrap());
+        assert!(storage
+            .list_expired_semantic_text_subjects("-30 days", 100)
+            .unwrap()
+            .is_empty());
+        // The row still inside the window survives the sweep.
+        assert!(storage
+            .get_query_visible_embedding(DerivedIndexKind::SemanticText, "21")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn expiry_also_sweeps_a_ledger_row_whose_screenshot_is_gone() {
+        // The schema triggers already delete derived rows with their screenshot,
+        // and `ensure_derived_index_job` refuses to queue work for a subject that
+        // is not live, so this branch cannot be reached through the normal APIs
+        // at all. It is a safety net for a row that arrived some other way — a
+        // database written before those triggers existed — which is otherwise
+        // invisible and never ages out, because ageing is decided against a
+        // screenshot row that no longer exists.
+        let (_temp, storage) = test_storage();
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .as_ref()
+                .unwrap()
+                .execute(
+                    "INSERT INTO derived_index_jobs
+                       (index_kind, subject_key, model_id, model_revision,
+                        embedding_version, source_fingerprint, status)
+                     VALUES ('semantic_text', '999', 'model-a', 'revision-1', 1,
+                             'source-999', 'pending')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let expired = storage
+            .list_expired_semantic_text_subjects("-30 days", 100)
+            .unwrap();
+        assert_eq!(expired, vec!["999".to_string()]);
     }
 
     #[test]

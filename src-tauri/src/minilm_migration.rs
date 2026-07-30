@@ -17,9 +17,8 @@
 use crate::credential_manager::CredentialManagerState;
 use crate::monitor::{authenticated_monitor_command, MonitorState};
 use crate::storage::{
-    BackgroundReadError, BackgroundScreenshotSummary, DerivedEmbeddingWrite, DerivedIndexJobSpec,
-    DerivedIndexJobStatus, DerivedIndexKind, EnsureDerivedIndexJobResult, MinilmMigrationPageRow,
-    MinilmMigrationRunRecord, StorageState,
+    BackgroundReadError, BackgroundScreenshotSummary, DerivedIndexJobSpec, DerivedIndexJobStatus,
+    DerivedIndexKind, MinilmMigrationPageRow, MinilmMigrationRunRecord, StorageState,
 };
 use base64::Engine as _;
 use chrono::Utc;
@@ -255,7 +254,7 @@ pub fn minilm_source_fingerprint(text: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn minilm_spec(screenshot_id: i64, text: &str) -> DerivedIndexJobSpec {
+pub(crate) fn minilm_job_spec(screenshot_id: i64, text: &str) -> DerivedIndexJobSpec {
     DerivedIndexJobSpec {
         index_kind: DerivedIndexKind::SemanticText,
         subject_key: screenshot_id.to_string(),
@@ -278,13 +277,13 @@ fn source_rows(
                 summary.window_title.as_deref().unwrap_or(""),
                 ocr.get(&summary.id).map(String::as_str).unwrap_or(""),
             );
-            let spec = minilm_spec(summary.id, &text);
+            let spec = minilm_job_spec(summary.id, &text);
             SourceRow { text, spec }
         })
         .collect()
 }
 
-fn validate_vector(vector: &[f32]) -> Result<(), String> {
+pub(crate) fn validate_minilm_vector(vector: &[f32]) -> Result<(), String> {
     if vector.len() != MINILM_DIMENSIONS {
         return Err(format!(
             "Expected {MINILM_DIMENSIONS} dimensions, got {}",
@@ -420,13 +419,6 @@ async fn background_read_with_auth_retry<T>(
             Err(BackgroundReadError::AuthRequired) => continue,
             Err(BackgroundReadError::Other(error)) => return Err(error),
         }
-    }
-}
-
-fn background_error(error: BackgroundReadError) -> String {
-    match error {
-        BackgroundReadError::AuthRequired => "AUTH_REQUIRED".to_string(),
-        BackgroundReadError::Other(error) => error,
     }
 }
 
@@ -711,7 +703,7 @@ async fn copy_chroma_hot_layer(
                     continue;
                 }
             };
-            if let Err(error) = validate_vector(&vector) {
+            if let Err(error) = validate_minilm_vector(&vector) {
                 unmappable_total += 1;
                 record_error(
                     &storage,
@@ -1214,101 +1206,6 @@ pub fn list_minilm_rebuild_errors(
     }))
 }
 
-/// Why one Python dual-write row could not be mirrored, and — the part the
-/// caller actually acts on — whether retrying it could ever succeed.
-///
-/// Python keeps a durable retry queue for failed mirrors, and the Rust read
-/// path stands down while that queue is non-empty. A row Rust will reject
-/// forever (its screenshot was deleted, its vector is malformed) would
-/// therefore stall the queue and disable Rust retrieval permanently, so the
-/// two kinds of failure have to be distinguishable over the wire.
-pub(crate) struct ImportRejection {
-    /// True when no amount of retrying changes the outcome, so the caller
-    /// should drop the row rather than queue it.
-    pub permanent: bool,
-    pub message: String,
-}
-
-impl ImportRejection {
-    fn permanent(message: impl Into<String>) -> Self {
-        Self {
-            permanent: true,
-            message: message.into(),
-        }
-    }
-
-    /// The store, the session or the source read failed. The same row may well
-    /// succeed once the session is valid again or the writer stops contending.
-    fn transient(message: impl Into<String>) -> Self {
-        Self {
-            permanent: false,
-            message: message.into(),
-        }
-    }
-}
-
-/// Best-effort Python→Rust dual-write for newly produced MiniLM vectors. The
-/// caller-provided metadata is deliberately ignored; source text and its
-/// fingerprint are rehydrated from SQLite.
-pub(crate) fn import_minilm_vector_from_python(
-    storage: &StorageState,
-    screenshot_id: i64,
-    vector: Vec<f32>,
-) -> Result<EnsureDerivedIndexJobResult, ImportRejection> {
-    if screenshot_id <= 0 {
-        return Err(ImportRejection::permanent("screenshot_id must be positive"));
-    }
-    // A vector of the wrong width, or one carrying non-finite values, is a
-    // property of the payload rather than of the moment it arrived.
-    validate_vector(&vector).map_err(ImportRejection::permanent)?;
-    let summaries = storage
-        .get_screenshot_summaries_by_ids_silent(&[screenshot_id])
-        .map_err(|error| ImportRejection::transient(background_error(error)))?;
-    let ocr = storage
-        .get_ocr_text_prefixes_by_screenshot_ids_silent(&[screenshot_id], MINILM_OCR_SNIPPET_CHARS)
-        .map_err(|error| ImportRejection::transient(background_error(error)))?;
-    let mut sources = source_rows(summaries, &ocr);
-    // Chroma keeps documents for screenshots the user has already deleted —
-    // Python only prunes the hot layer on age — so this is the expected fate of
-    // any queued id that gets deleted before its mirror lands, not an anomaly.
-    let source = sources
-        .pop()
-        .ok_or_else(|| {
-            ImportRejection::permanent("No active SQLite screenshot maps to screenshot_id")
-        })?;
-    if source.text.is_empty() {
-        return Err(ImportRejection::permanent(
-            "SQLite source produces an empty MiniLM input",
-        ));
-    }
-    let ensured = storage
-        .ensure_derived_index_job(&source.spec)
-        .map_err(ImportRejection::transient)?;
-    if matches!(
-        ensured,
-        EnsureDerivedIndexJobResult::Queued | EnsureDerivedIndexJobResult::Requeued
-    ) {
-        let lease = storage
-            .mark_derived_index_job_processing(&source.spec)
-            .map_err(ImportRejection::transient)?;
-        if let Err(error) = storage.commit_derived_embedding(&DerivedEmbeddingWrite {
-            job: source.spec.clone(),
-            lease_token: lease.clone(),
-            vector,
-        }) {
-            let _ = storage.mark_derived_index_job_failed(
-                &source.spec,
-                &lease,
-                "rust_store_write_failed",
-                &error,
-                None,
-            );
-            return Err(ImportRejection::transient(error));
-        }
-    }
-    Ok(ensured)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1333,7 +1230,7 @@ mod tests {
 
     #[test]
     fn spec_records_vector_space_contract_not_one_runtime_artifact() {
-        let spec = minilm_spec(7, "proc | title | OCR");
+        let spec = minilm_job_spec(7, "proc | title | OCR");
         assert_eq!(spec.model_revision, MINILM_VECTOR_SPACE_REVISION);
         assert_eq!(spec.model_revision, "minilm-l12-vector-space-v1");
         assert!(!spec
@@ -1353,12 +1250,12 @@ mod tests {
 
     #[test]
     fn vector_validation_rejects_wrong_shape_non_finite_and_zero_vectors() {
-        assert!(validate_vector(&vec![0.25; MINILM_DIMENSIONS]).is_ok());
-        assert!(validate_vector(&vec![0.25; 10]).is_err());
+        assert!(validate_minilm_vector(&vec![0.25; MINILM_DIMENSIONS]).is_ok());
+        assert!(validate_minilm_vector(&vec![0.25; 10]).is_err());
         let mut invalid = vec![0.25; MINILM_DIMENSIONS];
         invalid[3] = f32::NAN;
-        assert!(validate_vector(&invalid).is_err());
-        assert!(validate_vector(&vec![0.0; MINILM_DIMENSIONS])
+        assert!(validate_minilm_vector(&invalid).is_err());
+        assert!(validate_minilm_vector(&vec![0.0; MINILM_DIMENSIONS])
             .unwrap_err()
             .contains("zero vector"));
     }
