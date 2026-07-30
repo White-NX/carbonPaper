@@ -43,10 +43,31 @@ class ModelNotAvailableError(Exception):
     pass
 
 
+class ManagerBusyError(Exception):
+    """Raised when the hot-layer manager lock could not be taken in time.
+
+    Now that ``run_clustering`` no longer holds the manager lock across its
+    whole body, that lock is only ever held for a single Chroma call or a lazy
+    handle creation, so this should be unreachable. It exists to assert the
+    invariant rather than to be recovered from: the Rust mirror reads an
+    ``error`` field in the response body as a best-effort miss and moves on,
+    which beats parking a named-pipe handler thread for the length of a
+    clustering run.
+    """
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 EMBEDDING_DIM = 384
+# Longest a hot-layer write will wait for the manager lock before reporting
+# itself busy. Generous next to the milliseconds a Chroma upsert needs, and
+# short next to the minutes a clustering run takes. The longest legitimate
+# holds left are in the task-vector export path, which cannot overlap a mirror:
+# the migration that drives it holds the Rust maintenance guard, and the index
+# worker refuses to run while that guard is held.
+MANAGER_LOCK_BUSY_TIMEOUT_SECS = 5.0
 MAX_TASK_VECTOR_EXPORTS = 4
 TASK_VECTOR_EXPORT_LOGICAL_TIMEOUT_SECS = 10 * 60
 TASK_VECTOR_EXPORT_IDLE_TTL_SECS = 24 * 60 * 60
@@ -172,6 +193,39 @@ class TaskEmbedder:
             self._is_onnx = False
             logger.info("MiniLM-L12-v2 loaded (device=%s)", self._model.device)
 
+    def _acquire_runtime(self, attempts: int = 3):
+        """Return a consistent ``(model, tokenizer, is_onnx)`` snapshot.
+
+        The three pieces are read together under ``_lock`` so a concurrent
+        :meth:`unload` cannot null one of them between the reads. The caller
+        then runs its forward pass against these local references: an unload
+        landing mid-pass drops the singleton's handles while the objects
+        themselves stay alive until that pass returns.
+
+        ``Reranker.rerank`` has always done exactly this — snapshot the session
+        and tokenizer under its lock, then run the forward pass outside it —
+        which is why the reranker never had this bug and this class did.
+
+        The snapshot is what lets ``run_clustering`` keep unloading the model in
+        its ``finally``, worth ~479 MB resident on the ONNX backend, while no
+        longer holding the manager lock across the whole run. A foreground NL
+        search encodes outside that lock on purpose, and until now ``encode``
+        read ``_is_onnx``, ``_tokenizer`` and ``_model`` as three separate
+        unguarded attribute loads, so an interleaved unload turned the third
+        one into ``'NoneType' object has no attribute 'get_inputs'``.
+        """
+        for _ in range(max(1, attempts)):
+            self.load()
+            with self._lock:
+                # `load` assigns the tokenizer before the model on both
+                # backends, so a non-None model implies a usable tokenizer.
+                # Keep that order if either branch is ever rewritten.
+                if self._model is not None:
+                    return self._model, self._tokenizer, self._is_onnx
+        raise ModelNotAvailableError(
+            "MiniLM was unloaded repeatedly while a caller was trying to use it"
+        )
+
     def unload(self):
         """Release model & tokenizer to free memory."""
         with self._lock:
@@ -195,10 +249,13 @@ class TaskEmbedder:
 
     def encode(self, texts: List[str]) -> np.ndarray:
         """Batch-encode texts → (N, 384) L2-normalised numpy array."""
-        self.load()
+        # One consistent snapshot, then a forward pass on local references only:
+        # a concurrent unload() must not be able to null the model out from
+        # under a pass that has already started. See _acquire_runtime.
+        model, tokenizer, is_onnx = self._acquire_runtime()
 
-        if self._is_onnx:
-            encoded = self._tokenizer(
+        if is_onnx:
+            encoded = tokenizer(
                 texts,
                 padding=True,
                 truncation=True,
@@ -206,8 +263,8 @@ class TaskEmbedder:
                 return_tensors="np",
             )
             from onnx_utils import build_transformer_inputs
-            inputs = build_transformer_inputs(self._model, encoded)
-            outputs = self._model.run(None, inputs)
+            inputs = build_transformer_inputs(model, encoded)
+            outputs = model.run(None, inputs)
             token_embeddings = outputs[0]
 
             attention_mask = encoded["attention_mask"]
@@ -222,7 +279,7 @@ class TaskEmbedder:
 
         import torch
 
-        encoded = self._tokenizer(
+        encoded = tokenizer(
             texts,
             padding=True,
             truncation=True,
@@ -230,7 +287,7 @@ class TaskEmbedder:
             return_tensors="pt",
         )
         with torch.no_grad():
-            out = self._model(**encoded)
+            out = model(**encoded)
             # Mean pooling (standard for sentence-transformers)
             attention_mask = encoded["attention_mask"]
             token_embeddings = out.last_hidden_state
@@ -503,9 +560,19 @@ class HotColdManager:
             max_workers=1,
             thread_name_prefix="task-vector-export",
         )
-        # run_clustering calls helpers/properties that also acquire this lock.
-        # Use RLock to avoid self-deadlock on nested acquisitions.
+        # Guards Chroma collection access and the lazy collection handles, and
+        # nothing else. Held only for the length of one Chroma call, because
+        # every caller that reaches it may be a named-pipe handler thread and a
+        # parked handler costs a slot out of the IPC server's pool of 8.
+        # Still an RLock: the collection properties re-acquire it beneath
+        # callers that hold it.
         self._lock = threading.RLock()
+        # Separate, and deliberately not the manager lock: mutual exclusion
+        # between clustering runs only. Two concurrent HDBSCAN runs would
+        # double peak memory on a machine already checked for low memory, and
+        # the scheduler's plain `_running` bool has a check-then-set race
+        # between a scheduled run and a manual one.
+        self._clustering_lock = threading.Lock()
 
         logger.info("[task_clustering] HotColdManager ready (lazy loading collections)")
 
@@ -538,20 +605,34 @@ class HotColdManager:
             return self._cold_collection
 
     def unload_collections(self):
-        """Unload collections from memory to save HNSW overhead."""
+        """Drop the cached collection handles.
+
+        This does **not** free the HNSW indexes, despite what its previous name
+        and comment claimed. Measured on chromadb 1.5.1 against this project's
+        own 10,605-vector hot layer (2026-07-30): dropping the handles releases
+        0.0 MB, and the next query still answers in 1.7 ms against a 24 ms cold
+        load, so the index never left memory.
+
+        Two reasons. The index lives in the Rust core's cache
+        (``chroma_api_impl`` defaults to ``chromadb.api.rust.RustBindingsAPI``),
+        sized ``_getmaxstdio() // 5`` = 102 collections, which this database's
+        two collections never come close to filling, so nothing is ever
+        evicted. And the ``_client._collections`` pop this method used to
+        attempt was dead code: 1.5.1's client has no such attribute, so the
+        ``hasattr`` guard was always False. Only dropping the whole client
+        returns the memory (223 MB for both collections, ``_server.stop()``),
+        and that client is shared with the CLIP ``screenshots`` collection, so
+        a clustering run has no business dropping it.
+
+        What remains is still worth doing and cheap: the next access rebuilds a
+        fresh handle. Keep the lock, which makes the delete atomic against the
+        lazy initialisation in the collection properties.
+        """
         with self._lock:
             if hasattr(self, "_hot_collection"):
                 delattr(self, "_hot_collection")
             if hasattr(self, "_cold_collection"):
                 delattr(self, "_cold_collection")
-            
-            # Try to drop from Chroma's internal cache
-            try:
-                if hasattr(self._client, "_collections"):
-                    self._client._collections.pop("task_vectors", None)
-                    self._client._collections.pop("task_centroids", None)
-            except Exception:
-                pass
 
     # ---- encrypt / decrypt helpers (mirror VectorStore pattern) ----------
 
@@ -941,12 +1022,28 @@ class HotColdManager:
             })
             documents.append(self._encrypt(document))
 
-        self.hot_collection.upsert(
-            ids=ids,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            documents=documents,
-        )
+        # Bounded acquisition, on purpose. This method runs inside a named-pipe
+        # handler thread, and the pool has 8 slots: parking here for the length
+        # of a clustering run drains the pool and takes `status`, `search_nl`
+        # and the OCR post-process enqueue down with it. Now that the manager
+        # lock is only held for single Chroma calls this can never fire, which
+        # is exactly what makes it a useful assertion. Note the encryption
+        # above stays outside the lock — it is a reverse-IPC round trip per
+        # field, and the lock must never wait on the pipe.
+        if not self._lock.acquire(timeout=MANAGER_LOCK_BUSY_TIMEOUT_SECS):
+            raise ManagerBusyError(
+                "hot layer busy: manager lock held for more than "
+                f"{MANAGER_LOCK_BUSY_TIMEOUT_SECS:g}s"
+            )
+        try:
+            self.hot_collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                metadatas=metadatas,
+                documents=documents,
+            )
+        finally:
+            self._lock.release()
         return len(ids)
 
     # M2.5 step 5 removed `_dual_write_rust` and `add_snapshot` from this class.
@@ -1097,13 +1194,21 @@ class HotColdManager:
         # M2.5 step 5 the Rust semantic store keeps its own 30-day window
         # against SQLite timestamps, so the deletions no longer have to be
         # mirrored across. The two stores stop tracking each other.
+        #
+        # The read and the delete need the manager lock as a pair. They used to
+        # get it for free from the lock `run_clustering` held across its whole
+        # body; that lock is gone, and without this an id that a Rust mirror
+        # re-upserts between the two calls would be deleted right back out
+        # again. Both calls are single Chroma operations, so the hold is short
+        # enough not to reintroduce the pipe-handler stall.
         try:
-            expired = self.hot_collection.get(
-                where={"timestamp": {"$lt": cutoff}},
-            )
-            if expired["ids"]:
-                self.hot_collection.delete(ids=expired["ids"])
-                logger.info("Removed %d expired vectors from hot layer", len(expired["ids"]))
+            with self._lock:
+                expired = self.hot_collection.get(
+                    where={"timestamp": {"$lt": cutoff}},
+                )
+                if expired["ids"]:
+                    self.hot_collection.delete(ids=expired["ids"])
+                    logger.info("Removed %d expired vectors from hot layer", len(expired["ids"]))
         except Exception as e:
             logger.warning("Failed to clean expired hot vectors: %s", e)
 
@@ -1237,7 +1342,11 @@ class HotColdManager:
                     vectors = self._embedder.encode(texts_to_encode)
                     batch_ids = [e[0] for e in entries]
                     batch_metas = [e[1] for e in entries]
-                    self.hot_collection.add(
+                    # upsert, not add: a Rust mirror for one of these ids can now
+                    # interleave with the backfill, and `add` would fail the whole
+                    # page on the duplicate. That also demotes the dedupe `get`
+                    # above from a correctness requirement to an optimisation.
+                    self.hot_collection.upsert(
                         ids=batch_ids,
                         embeddings=vectors.tolist(),
                         metadatas=batch_metas,
@@ -1245,7 +1354,7 @@ class HotColdManager:
                     added += len(batch_ids)
                     logger.info("Backfilled %d/%d (page offset %d)", added, total, offset)
                 except Exception as e:
-                    logger.warning("Backfill encode/add failed at offset %d: %s", offset, e)
+                    logger.warning("Backfill encode/upsert failed at offset %d: %s", offset, e)
 
             offset += PAGE
 
@@ -1279,7 +1388,37 @@ class HotColdManager:
 
         Returns clustering results dict.
         """
-        with self._lock:
+        # Deliberately NOT the manager lock. That lock guards Chroma access and
+        # the lazy collection handles; holding it across this whole body — the
+        # input estimate, the vector fetch, the HDBSCAN/PaCMAP engine run, the
+        # per-cluster decrypt round trips and the backfill's re-encode — parked
+        # every incoming `upsert_task_vectors` mirror inside a named-pipe
+        # handler thread for minutes at a time, one slot per idle pass, until
+        # the pool of 8 was gone and the whole forward pipe answered "IPC server
+        # busy".
+        #
+        # The invariant restored here used to be spelled out in
+        # `_flush_pending_rust_deletes`, which M2.5 step 5 deleted along with
+        # the rest of the Python capture path: "IPC happens outside the lock;
+        # the manager lock also guards Chroma operations and must not wait on
+        # pipe round-trips." It reads the same in both directions — a lock that
+        # guards Chroma must not be held across IPC, and IPC must not wait on it.
+        #
+        # What we give up is that a run clusters the snapshot taken at its start
+        # rather than a corpus frozen for its duration. For an unsupervised
+        # background job over a 30-day window that is not a loss: a screenshot
+        # arriving mid-run is picked up by the next run.
+        if not self._clustering_lock.acquire(blocking=False):
+            logger.info("Clustering run refused: another run is in progress")
+            return {
+                "clusters": [],
+                "noise_ids": [],
+                "n_clusters": 0,
+                "n_noise": 0,
+                "n_total": 0,
+                "status": "already_running",
+            }
+        try:
             logger.info("Starting clustering run (range=%s–%s) …",
                         start_time or "auto", end_time or "auto")
 
@@ -1411,10 +1550,17 @@ class HotColdManager:
                     "clustering_mode": "batched" if use_approximate else "full",
                 }
             finally:
-                # Always unload the model after clustering to free memory
+                # Reclaims ~479 MB on the ONNX backend, measured 2026-07-30, so
+                # this stays even though the run no longer holds a lock that
+                # would keep other users away. TaskEmbedder._acquire_runtime is
+                # what makes it safe: an in-flight encode holds its own
+                # references and finishes on them.
                 self._embedder.unload()
-                # Unload collections to save HNSW memory overhead when idle
+                # Frees no memory — see unload_collections. Kept because the
+                # next access should start from a fresh handle.
                 self.unload_collections()
+        finally:
+            self._clustering_lock.release()
 
     # ---- Scheduled re-run helper -----------------------------------------
 
@@ -1476,13 +1622,14 @@ class HotColdManager:
         if enable_rerank:
             fetch_n = max(fetch_n, fetch_n * max(1, int(rerank_overfetch)))
 
-        with self._lock:
-            self._embedder.load()
-        # MiniLM forward (~50-200 ms on CPU) deliberately runs OUTSIDE the
-        # manager lock: holding it across encode would stall the foreground
-        # OCR ingest path on every NL search. The embedder's own state is
-        # already protected by load() being a no-op after first call and
-        # encode_single being thread-safe at the model level.
+        # No manager lock around the model load, and none around the forward
+        # pass. Both were the wrong place for it: this runs in a named-pipe
+        # handler thread, and a cold load takes 1.5 s on the ONNX backend and
+        # 22 s on torch — time the manager lock must never spend, since every
+        # hot-layer write waits behind it. TaskEmbedder now hands out a
+        # consistent (model, tokenizer, backend) snapshot per call, so an
+        # unload from a finishing clustering run cannot tear the model down
+        # underneath this encode.
         vec = self._embedder.encode_single(query.strip())
 
         try:
@@ -1713,6 +1860,13 @@ class ClusteringScheduler:
                 manual=False,
                 allow_full_low_memory=CLUSTERING_ALLOW_FULL_LOW_MEMORY,
             )
+            if result.get("status") == "already_running":
+                # A manual run beat us to the clustering guard. Do not touch
+                # `_last_run`: treating this as a completed run would push the
+                # next scheduled attempt out by a whole interval. Returning
+                # False sends the loop into its 60 s backoff instead.
+                logger.info("Scheduled clustering yielded to a run already in progress")
+                return False
             self._last_result = result
             self._last_run = time.time()
             self._save_config()
