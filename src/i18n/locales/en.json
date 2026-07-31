@@ -306,8 +306,13 @@
         "stalled": "Screenshots that failed indexing",
         "fallbacks": "Fallbacks",
         "last_reason": "Last fallback reason",
-        "backlog_hint": "Semantic indexing runs only while the computer is idle, so screenshots captured during active use become searchable by natural language after the next idle period.",
-        "stalled_hint": "These screenshots exhausted their indexing retries and will not be picked up again on their own. They stay out of natural-language search until indexing is rebuilt."
+        "backlog_hint": "Semantic indexing runs only while the computer is idle and on mains power, so screenshots captured during active use become searchable by natural language after the next idle period.",
+        "stalled_hint": "These screenshots exhausted their indexing retries and will not be picked up again on their own. They stay out of natural-language search until indexing is rebuilt.",
+        "run_now": "Index now",
+        "run_now_running": "Indexing…",
+        "run_now_hint": "If this computer is rarely idle or often on battery, index a batch of the waiting screenshots by hand.",
+        "run_done": "Indexed {{indexed}} screenshot(s); {{remaining}} still waiting.",
+        "run_skipped": "This run did not start: {{reason}}."
       },
       "onnx": {
         "title": "ONNX Inference (Experimental)",

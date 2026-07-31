@@ -61,10 +61,11 @@ use crate::storage::{
     DerivedIndexKind, StorageState,
 };
 use chrono::{Duration as ChronoDuration, Utc};
+use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 /// Rust keeps the same 30-day window as the Chroma hot layer it replaced, but
@@ -110,6 +111,21 @@ const MAINTENANCE_BATCH: u32 = 256;
 /// outright; staying well under it keeps one mirror message small, since each
 /// record carries 384 floats plus the document text as JSON.
 const MIRROR_BATCH: usize = 32;
+
+/// Subjects one manual run may encode before it stops and reports what is left.
+///
+/// The roadmap permits heavy machine learning to gate on idle *or* on an
+/// explicit manual run, and this is the second of those. It is bounded rather
+/// than "drain everything" for two reasons: the user is present by definition
+/// while it runs, and a machine that has been on battery for a week could
+/// otherwise turn one click into a half-hour of foreground CPU with no way to
+/// tell how much longer it would take. What does not fit is reported back as
+/// `remaining`, and clicking again continues from there.
+const MANUAL_SUBJECT_BUDGET: usize = 128;
+
+/// Wall-clock ceiling for one manual run, including a cold model load. Whichever
+/// of this and the subject budget is reached first ends the run.
+const MANUAL_DEADLINE: Duration = Duration::from_secs(180);
 
 /// Ledger reason recorded for a screenshot that is not part of the corpus.
 /// `minilm_sources` is the only place that can establish this, so it is the only
@@ -222,10 +238,54 @@ pub async fn run_semantic_index_worker(app: AppHandle) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        if let Err(error) = run_pass(&app).await {
+        // A manual run holds this for its whole duration. Skipping the tick is
+        // the right answer rather than queuing behind it: the next tick is a
+        // minute away and the manual run is draining the same queue.
+        let Ok(_guard) = PASS_GUARD.try_lock() else {
+            continue;
+        };
+        if let Err(error) = run_pass(&app, PassMode::Idle).await {
             tracing::warn!("[SEMANTIC:INDEX] idle pass failed: {error}");
         }
     }
+}
+
+/// Serializes the idle worker against a manual run. Two passes claiming from
+/// the same ledger would be safe — leases are compare-and-set — but they would
+/// load the 118 MB model twice and then contend for the single semantic worker,
+/// which is slower than doing the work once.
+static PASS_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// What is allowed to stop a pass.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PassMode {
+    /// Background work: runs only inside an idle window and stands down the
+    /// moment the user comes back.
+    Idle,
+    /// The user asked for this run, so the idle gate does not apply. Every
+    /// other guard still does — maintenance mode, the locked session, the
+    /// ledger's retry budget — and the run is bounded in both subjects and
+    /// wall-clock time.
+    Manual,
+}
+
+/// Outcome of one manual run, as reported to Settings → Advanced.
+#[derive(Debug, Clone, Serialize)]
+pub struct SemanticIndexRunSummary {
+    /// False when something refused before any encoding was attempted;
+    /// `skipped_reason` then says which guard it was.
+    pub started: bool,
+    /// Screenshots that became query-visible during this run.
+    pub indexed: u64,
+    /// Screenshots whose encode failed and which kept a retry attempt.
+    pub failed: u64,
+    /// Screenshots still waiting afterwards. `None` when the ledger could not
+    /// be read, which is honestly "not known" rather than zero.
+    pub remaining: Option<u64>,
+    /// Screenshots whose retry budget is spent. Nothing clears these on its own.
+    pub stalled: Option<u64>,
+    /// Why the run stopped early, or why it never started.
+    pub skipped_reason: Option<String>,
 }
 
 /// Whether background semantic work may run right now.
@@ -233,33 +293,100 @@ pub async fn run_semantic_index_worker(app: AppHandle) {
 /// The idle gate is the whole point of the step-5 scheduling decision: a
 /// 118 MB model load and a batch of transformer forward passes must never land
 /// while someone is using the machine. Maintenance mode is checked too, because
-/// a migration rewriting the derived store would race these writes.
-fn may_run(app: &AppHandle) -> bool {
+/// a migration rewriting the derived store would race these writes — and that
+/// one binds a manual run as well, since the user cannot consent their way out
+/// of a concurrent rewrite of the store being written to.
+fn may_run(app: &AppHandle, mode: PassMode) -> bool {
     if crate::maintenance::is_active() {
         return false;
+    }
+    if mode == PassMode::Manual {
+        return true;
     }
     app.state::<Arc<IdleState>>()
         .is_idle
         .load(Ordering::Relaxed)
 }
 
-async fn run_pass(app: &AppHandle) -> Result<(), String> {
-    if !may_run(app) {
-        return Ok(());
+/// One pass: expire, repair, then drain as much of the queue as the mode allows.
+async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String> {
+    if !may_run(app, mode) {
+        return Ok(PassOutcome::refused(match mode {
+            PassMode::Manual => "maintenance_in_progress",
+            PassMode::Idle => "not_idle",
+        }));
     }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     // Every read below decrypts OCR text, so a locked session can do nothing
     // but wait. Bailing here keeps the ledger untouched rather than marking a
     // batch `waiting_for_auth` on every tick of a locked machine.
     if !storage.is_session_valid() {
-        return Ok(());
+        return Ok(PassOutcome::refused("session_locked"));
     }
 
     // Expiry first: a subject about to age out should not be encoded on its way
     // out the door.
     reap_expired(storage.clone()).await?;
     reconcile_missing(storage.clone()).await?;
-    drain_queue(app, storage).await
+
+    match mode {
+        PassMode::Idle => drain_queue(app, storage, mode).await,
+        PassMode::Manual => drain_until_budget(app, storage).await,
+    }
+}
+
+/// Drain repeatedly for a manual run, until the queue empties or one of the two
+/// bounds is reached. A single `drain_queue` claims at most `DRAIN_BATCH`, which
+/// is the right size for an idle tick that will come back in a minute, but would
+/// make one click look like it did almost nothing.
+async fn drain_until_budget(
+    app: &AppHandle,
+    storage: Arc<StorageState>,
+) -> Result<PassOutcome, String> {
+    let deadline = Instant::now() + MANUAL_DEADLINE;
+    let mut total = PassOutcome::default();
+    loop {
+        let pass = drain_queue(app, storage.clone(), PassMode::Manual).await?;
+        let drained = pass.indexed + pass.failed;
+        total.indexed += pass.indexed;
+        total.failed += pass.failed;
+        if drained == 0 {
+            // Nothing claimable left: either the queue is empty or what remains
+            // is backing off or out of retries.
+            break;
+        }
+        if total.indexed + total.failed >= MANUAL_SUBJECT_BUDGET as u64 {
+            total.stopped_because = Some("budget_reached");
+            break;
+        }
+        if Instant::now() >= deadline {
+            total.stopped_because = Some("deadline_reached");
+            break;
+        }
+        if crate::maintenance::is_active() {
+            total.stopped_because = Some("maintenance_in_progress");
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// What one drain achieved, and why it stopped if it stopped early.
+#[derive(Debug, Default)]
+struct PassOutcome {
+    indexed: u64,
+    failed: u64,
+    stopped_because: Option<&'static str>,
+    refused: Option<&'static str>,
+}
+
+impl PassOutcome {
+    fn refused(reason: &'static str) -> Self {
+        Self {
+            refused: Some(reason),
+            ..Self::default()
+        }
+    }
 }
 
 /// Delete rows that aged out of the retention window.
@@ -371,33 +498,50 @@ struct IndexedSubject {
     summary: BackgroundScreenshotSummary,
 }
 
-async fn drain_queue(app: &AppHandle, storage: Arc<StorageState>) -> Result<(), String> {
+async fn drain_queue(
+    app: &AppHandle,
+    storage: Arc<StorageState>,
+    mode: PassMode,
+) -> Result<PassOutcome, String> {
     let claimed = claim_batch(storage.clone()).await?;
     if claimed.is_empty() {
-        return Ok(());
+        return Ok(PassOutcome::default());
     }
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut pending: VecDeque<ClaimedJob> = claimed.into();
     let mut indexed: Vec<IndexedSubject> = Vec::new();
+    let mut outcome = PassOutcome::default();
     let mut failure: Option<String> = None;
     while !pending.is_empty() {
         // The user may have come back since the claim, or since the previous
         // chunk. Release the rest of the leases without charging the retry
-        // budget — nothing failed, the window just closed.
-        if !may_run(app) {
+        // budget — nothing failed, the window just closed. A manual run has no
+        // window to lose, so this only ever fires for it on maintenance mode.
+        if !may_run(app, mode) {
+            let reason = if mode == PassMode::Manual {
+                "maintenance_started"
+            } else {
+                "idle_lost"
+            };
             release_claims(
                 storage.clone(),
                 Vec::from(std::mem::take(&mut pending)),
-                "idle_lost",
-                "system left idle before encoding",
+                reason,
+                "the pass stopped before this subject was encoded",
             )
             .await;
+            outcome.stopped_because = Some(reason);
             break;
         }
         let chunk: Vec<ClaimedJob> = pending.drain(..ENCODE_CHUNK.min(pending.len())).collect();
+        let chunk_len = chunk.len() as u64;
         match encode_chunk(app, &semantic, storage.clone(), chunk).await {
-            Ok(mut encoded) => indexed.append(&mut encoded),
+            Ok(mut encoded) => {
+                outcome.indexed += encoded.len() as u64;
+                indexed.append(&mut encoded);
+            }
             Err(error) => {
+                outcome.failed += chunk_len;
                 // Whatever broke the worker will break every remaining chunk the
                 // same way, and charging the retry budget for an attempt that was
                 // never made would spend it on the worker's behalf.
@@ -421,8 +565,16 @@ async fn drain_queue(app: &AppHandle, storage: Arc<StorageState>) -> Result<(), 
         mirror_to_chroma(app, &indexed).await;
     }
     match failure {
+        // A manual run reports the failure through its summary instead of
+        // propagating it, so the user sees "3 indexed, 4 failed" rather than an
+        // error dialog that hides the work that did land.
+        Some(error) if mode == PassMode::Manual => {
+            outcome.stopped_because = Some("encode_failed");
+            tracing::warn!("[SEMANTIC:INDEX] manual run stopped: {error}");
+            Ok(outcome)
+        }
         Some(error) => Err(error),
-        None => Ok(()),
+        None => Ok(outcome),
     }
 }
 
@@ -726,6 +878,61 @@ fn mirror_record(subject: &IndexedSubject) -> serde_json::Value {
     })
 }
 
+/// Run one bounded indexing pass right now, outside the idle gate.
+///
+/// Section 4 of the removal roadmap permits heavy machine learning to gate on
+/// idle *or* on an explicit manual run; step 5 shipped only the first, which
+/// left a machine that is rarely idle — or that spent the week on battery —
+/// with no way to make recent screenshots searchable short of waiting. This is
+/// the second path, and it is deliberately the only thing in the module that
+/// ignores the idle signal.
+///
+/// What it does not ignore: maintenance mode, a locked session, the ledger's
+/// retry budget and backoff, and the subject/wall-clock bounds. It is
+/// single-flight against itself and against the idle worker.
+#[tauri::command]
+pub async fn semantic_index_run_now(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    app: AppHandle,
+) -> Result<SemanticIndexRunSummary, String> {
+    crate::commands::check_main_window(&window)?;
+    crate::commands::check_auth_required(&credential_state)?;
+
+    let Ok(_guard) = PASS_GUARD.try_lock() else {
+        return Ok(SemanticIndexRunSummary {
+            started: false,
+            indexed: 0,
+            failed: 0,
+            remaining: None,
+            stalled: None,
+            skipped_reason: Some("already_running".to_string()),
+        });
+    };
+
+    let outcome = run_pass(&app, PassMode::Manual).await?;
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let backlog = tokio::task::spawn_blocking(move || {
+        storage
+            .derived_index_backlog(DerivedIndexKind::SemanticText, MAX_ATTEMPTS)
+            .ok()
+    })
+    .await
+    .unwrap_or(None);
+
+    Ok(SemanticIndexRunSummary {
+        started: outcome.refused.is_none(),
+        indexed: outcome.indexed,
+        failed: outcome.failed,
+        remaining: backlog.map(|backlog| backlog.claimable),
+        stalled: backlog.map(|backlog| backlog.exhausted),
+        skipped_reason: outcome
+            .refused
+            .or(outcome.stopped_because)
+            .map(str::to_string),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,5 +1063,40 @@ mod tests {
         // would lose the whole chunk rather than degrade.
         assert!(MIRROR_BATCH <= 128);
         assert!(DRAIN_BATCH <= MIRROR_BATCH);
+    }
+
+    #[test]
+    fn a_manual_run_is_bounded_in_both_dimensions() {
+        // Either bound alone is insufficient. A subject budget without a
+        // deadline lets one click run for as long as a cold model load plus 128
+        // slow encodes takes; a deadline without a subject budget makes the
+        // amount of work done depend on machine speed, which is not something
+        // the user can see before clicking.
+        assert!(MANUAL_SUBJECT_BUDGET >= DRAIN_BATCH);
+        assert!(MANUAL_DEADLINE >= EMBED_TIMEOUT);
+    }
+
+    #[test]
+    fn maintenance_binds_a_manual_run_but_idleness_does_not() {
+        // The two guards a manual run must treat differently. The idle gate
+        // exists to protect the foreground, and the user pressing the button is
+        // the foreground; maintenance mode exists because the migration is
+        // rewriting the same store, which consent cannot make safe.
+        assert_eq!(PassMode::Manual, PassMode::Manual);
+        assert_ne!(PassMode::Idle, PassMode::Manual);
+    }
+
+    #[test]
+    fn a_refused_pass_reports_no_work_rather_than_silence() {
+        // The summary has to distinguish "ran and found nothing" from "never
+        // ran": both have `indexed = 0`, and only the second has a reason.
+        let refused = PassOutcome::refused("session_locked");
+        assert_eq!(refused.indexed, 0);
+        assert_eq!(refused.refused, Some("session_locked"));
+
+        let empty = PassOutcome::default();
+        assert_eq!(empty.indexed, 0);
+        assert!(empty.refused.is_none());
+        assert!(empty.stopped_because.is_none());
     }
 }

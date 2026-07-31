@@ -21,6 +21,8 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [rustOcrModelDownloading, setRustOcrModelDownloading] = useState(false);
   const [semanticStatus, setSemanticStatus] = useState(null);
   const [semanticStatusLoading, setSemanticStatusLoading] = useState(false);
+  const [semanticIndexRunning, setSemanticIndexRunning] = useState(false);
+  const [semanticIndexRun, setSemanticIndexRun] = useState(null);
 
   const saveConfig = async (newConfig) => {
     const previousConfig = config;
@@ -161,6 +163,30 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     if (saved) await refreshSemanticStatus();
   };
 
+  /**
+   * The manual alternative to the idle gate. Capture-side indexing normally
+   * waits for an idle window on mains power, which on a machine that is rarely
+   * either can leave recent screenshots out of natural-language search
+   * indefinitely. The run is bounded in Rust — a subject budget and a deadline —
+   * so this only ever starts one pass and reports what is left over.
+   */
+  const handleRunSemanticIndexNow = async () => {
+    setSemanticIndexRunning(true);
+    setSemanticIndexRun(null);
+    try {
+      const summary = await invoke('semantic_index_run_now');
+      setSemanticIndexRun(summary);
+      await refreshSemanticStatus();
+      return summary;
+    } catch (err) {
+      console.warn('Manual semantic indexing run failed:', err);
+      setSemanticIndexRun({ started: false, skipped_reason: String(err) });
+      return null;
+    } finally {
+      setSemanticIndexRunning(false);
+    }
+  };
+
   useEffect(() => {
     refreshMlOcrStatus();
     const timer = window.setInterval(refreshMlOcrStatus, 5000);
@@ -289,6 +315,8 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     rustOcrModelDownloading,
     semanticStatus,
     semanticStatusLoading,
+    semanticIndexRunning,
+    semanticIndexRun,
     setCpuDropdownOpen,
     setGpuDropdownOpen,
     setClusteringDropdownOpen,
@@ -305,6 +333,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     handleRestartMlOcr,
     handleDownloadRustOcrModel,
     handleToggleRustSemanticIndex,
+    handleRunSemanticIndexNow,
     refreshSemanticStatus,
   };
 }

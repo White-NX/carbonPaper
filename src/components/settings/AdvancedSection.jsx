@@ -46,7 +46,10 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     handleDownloadRustOcrModel,
     semanticStatus,
     semanticStatusLoading,
+    semanticIndexRunning,
+    semanticIndexRun,
     handleToggleRustSemanticIndex,
+    handleRunSemanticIndexNow,
     refreshSemanticStatus,
   } = useAdvancedSectionController({ monitorStatus, t });
 
@@ -121,6 +124,9 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         statusLoading={semanticStatusLoading}
         onToggleRustIndex={handleToggleRustSemanticIndex}
         onRefresh={refreshSemanticStatus}
+        onRunIndexNow={handleRunSemanticIndexNow}
+        indexRunning={semanticIndexRunning}
+        indexRun={semanticIndexRun}
       />
 
       <ClusteringTechnicalCard

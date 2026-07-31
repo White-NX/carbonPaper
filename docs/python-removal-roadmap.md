@@ -5,7 +5,8 @@ data, without breaking OCR or search, and without letting background machine
 learning interfere with whatever the user has in the foreground.
 
 **Current milestone.** Milestone 2, targeted at v0.8.4 Beta. Steps 1-5 of the
-M2.5 cutover sequence are done; step 6 is next.
+M2.5 cutover sequence are merged; step 6 is in progress on
+`m2/reranker-shadow-cutover`.
 
 ---
 
@@ -556,8 +557,8 @@ The cutover sequence, with status:
 | 2 | MiniLM derived-cache dual-write and migration | **DONE** (M2.4) |
 | 3 | Rust semantic shadow queries against Chroma, Python authoritative | **DONE** 2026-07-27, harness since retired |
 | 4 | Cut over the **non-reranked** semantic-text retrieval path | **DONE**, merged |
-| 5 | Rust capture-side MiniLM indexing and retention ownership | **IMPLEMENTED, SOAKING** on `m2/minilm-capture-indexing` |
-| 6 | Reranker parity and shadow scoring, then cut over Smart Cluster calibration **and the scoring worker together** | **NEXT** — `m2/reranker-shadow-cutover` |
+| 5 | Rust capture-side MiniLM indexing and retention ownership | **DONE** — merged in PR #150 |
+| 6 | Reranker parity and shadow scoring, then cut over Smart Cluster calibration **and the scoring worker together** | **IN PROGRESS** — `m2/reranker-shadow-cutover` |
 | 7 | CLIP vector export and migration | PLANNED |
 | 8 | Rust CLIP image-encoder dual-write for new captures | PLANNED |
 | 9 | Rust CLIP text-query shadow mode, then cut over `search_nl` and MCP capability reporting | PLANNED |
@@ -679,7 +680,7 @@ observable rollback switch. `minilm_index::minilm_sources` was the
 document-encoder probe's source builder and is now the capture worker's — it is
 production code.
 
-##### Step 5 — Rust capture-side indexing and retention — IMPLEMENTED, SOAKING
+##### Step 5 — Rust capture-side indexing and retention — DONE
 
 **Why this step exists.** The numbered sequence originally had no Rust
 capture-side MiniLM indexing step, even though the M2.5 release gate requires
@@ -739,19 +740,44 @@ Three consequences, all deliberate and all recorded rather than smoothed over:
    searchable within seconds. The backlog depth and the age of the oldest waiting
    screenshot are reported in the backend diagnostic so the cost is visible
    rather than merely felt.
-2. **There is no manual-run path yet.** Section 4 permits heavy machine learning
-   to gate on idle *or* on an explicit manual run; this worker has only the
-   former. Adding a bounded "index now" action belongs with this step's soak
-   follow-up.
-3. **Idle requires AC power.** `idle.rs` computes `is_idle` as
-   `idle_secs >= IDLE_THRESHOLD_SECS && !fullscreen && ac_connected`, and
-   `power_saving_mode_enabled` defaults to true. On a laptop running on battery
-   the worker therefore never runs, so neither the Rust semantic index nor — since
-   Rust is now the capture-path encoder — the Chroma hot layer gains new rows for
-   as long as that lasts. The backlog is bounded only by how long the machine
-   stays unplugged. This needs a decision before the milestone is called done: a
-   manual run, a battery-time allowance, or an explicit statement that
-   battery-only machines index on the next AC session.
+2. **A bounded manual run is the second permitted path, and it now exists.**
+   Section 4 permits heavy machine learning to gate on idle *or* on an explicit
+   manual run; step 5 shipped only the former. `semantic_index_run_now`
+   (`minilm_index.rs`) is the latter: one pass, bounded by both a subject budget
+   and a wall-clock deadline, single-flight against the idle worker through a
+   shared pass guard, and reachable from the Settings → Advanced card next to the
+   backlog number that motivates pressing it. It ignores the idle signal and
+   nothing else — maintenance mode, a locked session, and the ledger's retry
+   budget and backoff all still apply, because the user consenting to spend their
+   own CPU does not make a concurrent rewrite of the derived store safe.
+3. **Battery: resolved, and the original analysis of it was wrong.** The
+   pre-implementation note said that because `is_idle` requires AC, "on a laptop
+   running on battery the worker never runs" and "the backlog is bounded only by
+   how long the machine stays unplugged". Both halves were wrong, in opposite
+   directions, and the correction is recorded here rather than quietly dropped.
+
+   `idle.rs` did not read AC power. It read `!PowerState.active`
+   (`idle.rs`, before this change), and `power.rs` only raises `active` when
+   `power_saving_mode_enabled` is on *and* AC drops — at which moment it also
+   calls `stop_monitor_impl` and stops capture. So the two configurations behaved
+   as follows, neither of them as described:
+
+   - **Power saving on (the default).** Unplugging stops capture, so no new
+     screenshots are produced and the backlog does not grow. It is frozen at
+     whatever accumulated before unplugging, not unbounded.
+   - **Power saving off.** `active` stays false, `ac_connected` therefore reads
+     true, and the indexer runs on battery — including the 118 MB model load.
+     Nobody decided that; it fell out of a variable named for the condition it
+     was standing in for.
+
+   The fix is to make the gate mean what its name says: `idle.rs` now calls
+   `power::is_ac_power_connected` directly, so "background machine learning does
+   not run on battery" holds in both configurations, and the composite rule lives
+   in one tested function (`composite_idle`) rather than inline in the monitor
+   loop. `power_saving_active` stays in the emitted event and the log line as a
+   separate observable, because it answers a different question — why capture
+   stopped, not why indexing did. A battery-only machine indexes on its next AC
+   session, or on demand through the manual run above.
 
 **Why the `index_incomplete` refusal did not survive.** Not because idle gating
 would trip it nightly. That refusal assumed Python held a complete corpus to fall
@@ -1295,22 +1321,19 @@ removed production code.
 
 ## 11. Immediate next step
 
-**M2.5 step 5 is implemented on `m2/minilm-capture-indexing` and awaiting an
-on-machine soak.** The step's three open items, in priority order:
+**M2.5 step 5 is merged** (PR #150), together with its three follow-up items:
+the battery case is decided and the idle gate now reads AC power directly, a
+bounded manual "index now" path exists, and the freshness cost is reported
+rather than hidden. What remains from that step is an on-machine soak — confirm
+the backlog figures behave as described across a session lock and an app
+restart, which only a real machine can show.
 
-1. Decide the battery case. `is_idle` requires AC power, so a laptop on battery
-   never indexes and the backlog is bounded only by how long it stays unplugged.
-2. Add a bounded manual "index now" path, which section 4 already permits as the
-   alternative to idle gating and which also gives the battery case an out.
-3. Confirm during the soak that the freshness regression and the reported backlog
-   figures behave as described, including after a session lock and an app
-   restart.
-
-**Then step 6, on `m2/reranker-shadow-cutover`.** It is larger than the numbered
-list originally implied: it cuts over Smart Cluster calibration *and* the scoring
-worker together, because a persisted threshold cannot be produced by one scorer
-and applied by another. Budget for request batching, a measured CPU-only
-foreground latency figure, and threshold provenance recording.
+**Step 6 is in progress on `m2/reranker-shadow-cutover`,** carrying the step-5
+follow-ups with it. It is larger than the numbered list originally implied: it
+cuts over Smart Cluster calibration *and* the scoring worker together, because a
+persisted threshold cannot be produced by one scorer and applied by another.
+Budget for request batching, a measured CPU-only foreground latency figure, and
+threshold provenance recording.
 
 **Then the CLIP sequence** — steps 7 through 9, in that order, with the
 new-capture dual-write (step 8) landing before the text-query cutover (step 9).
@@ -1342,3 +1365,5 @@ milestone bodies; this is an index so a reversal is not silently re-reversed.
 | 2026-07-29 | Step 6 enlarged to move the Smart Cluster scoring worker together with the reranker, and Milestone 3 reduced accordingly. |
 | 2026-07-29 | Step 5 decisions: Rust owns capture-path encoding with the Chroma mirror reversed; indexing is idle-gated and search freshness regresses; retention becomes first-party; the `index_incomplete` refusal is retired. |
 | 2026-07-30 | Document restructured around milestones. Stale "current reality" claims corrected against the tree: the `ml_contracts` traits have method surfaces but no implementations, the MiniLM shadow harness is already deleted, and Python still runs MiniLM outside the capture path. |
+| 2026-07-31 | **Step 5's battery analysis reversed on a source read.** `idle.rs` was gating on `!PowerState.active`, not on AC power, so the claim "the worker never runs on battery" held only with power saving enabled — where capture stops too, bounding the backlog — and was false with it disabled, where background inference ran on battery unnoticed. The gate now reads `power::is_ac_power_connected` directly. Battery-only machines index on the next AC session or through the new bounded manual run. |
+| 2026-07-31 | Steps 5 and 6 combined onto one branch, `m2/reranker-shadow-cutover`, rather than soaking step 5 separately: step 5 is merged to `main` already, so its follow-ups are ordinary changes rather than a gated cutover. |

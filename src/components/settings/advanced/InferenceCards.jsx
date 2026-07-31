@@ -238,8 +238,23 @@ export function DmlAccelerationCard({
  * enum rule requires. Deliberately small — it reports which backend answered
  * the last natural-language query and why Rust stood down, not a percentile
  * table. The retired shadow card was a development instrument; this is not.
+ *
+ * The one action it carries is the manual indexing run, which exists because
+ * capture-side indexing waits for an idle window on mains power. That is the
+ * right default and a poor fit for a machine that is rarely either, so the
+ * roadmap's "idle *or* an explicit manual run" needs its second half reachable
+ * next to the backlog number that motivates pressing it.
  */
-export function SemanticBackendCard({ config, status, statusLoading, onToggleRustIndex, onRefresh }) {
+export function SemanticBackendCard({
+  config,
+  status,
+  statusLoading,
+  onToggleRustIndex,
+  onRefresh,
+  onRunIndexNow,
+  indexRunning,
+  indexRun,
+}) {
   const { t } = useTranslation();
   const backend = status?.backend;
   const usesRustIndex = (config.semantic_index || 'rust') === 'rust';
@@ -253,6 +268,21 @@ export function SemanticBackendCard({ config, status, statusLoading, onToggleRus
     rust: t('settings.advanced.semantic_backend.served_rust'),
     python: t('settings.advanced.semantic_backend.served_python'),
   }[backend?.last_query_backend] || t('settings.advanced.semantic_backend.served_unknown');
+
+  // A finished run says what it did. `started: false` means a guard refused
+  // before any encoding happened, which is a different message from "ran and
+  // indexed nothing".
+  let runMessage = null;
+  if (indexRun) {
+    runMessage = indexRun.started
+      ? t('settings.advanced.semantic_backend.run_done', {
+        indexed: indexRun.indexed ?? 0,
+        remaining: indexRun.remaining ?? 0,
+      })
+      : t('settings.advanced.semantic_backend.run_skipped', {
+        reason: indexRun.skipped_reason || 'unknown',
+      });
+  }
 
   return (
     <div className="space-y-3">
@@ -321,6 +351,21 @@ export function SemanticBackendCard({ config, status, statusLoading, onToggleRus
               {t('settings.advanced.semantic_backend.stalled_hint')}
             </p>
           )}
+
+          <div className="pt-1 flex items-center justify-between gap-3">
+            <p className="text-[11px] text-ide-muted leading-snug flex-1">
+              {runMessage || t('settings.advanced.semantic_backend.run_now_hint')}
+            </p>
+            <button
+              onClick={onRunIndexNow}
+              disabled={indexRunning || !usesRustIndex}
+              className="shrink-0 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {indexRunning
+                ? t('settings.advanced.semantic_backend.run_now_running')
+                : t('settings.advanced.semantic_backend.run_now')}
+            </button>
+          </div>
         </div>
       </div>
     </div>
