@@ -1852,6 +1852,17 @@ pub(crate) async fn process_ocr_inner(
             error
         );
     }
+    // M2.5 step 5: record the semantic-index debt now, encode it later. The
+    // ledger row is what makes a missed capture observable; the encoding itself
+    // is idle-gated in `minilm_index`. A failure here is repaired by that
+    // worker's reconciliation pass, so it must not fail the OCR commit.
+    if let Err(error) = crate::minilm_index::enqueue_captured_screenshot(storage, screenshot_id) {
+        tracing::warn!(
+            "[SEMANTIC:INDEX] enqueue failed screenshot_id={}: {}",
+            screenshot_id,
+            error
+        );
+    }
     match enqueue_python_ocr_postprocess(
         app,
         screenshot_id,

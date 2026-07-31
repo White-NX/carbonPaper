@@ -16,6 +16,7 @@ mod logging;
 mod maintenance;
 mod mcp_server;
 mod mcp_token;
+mod minilm_index;
 mod minilm_migration;
 #[allow(dead_code)]
 mod ml_contracts;
@@ -973,6 +974,15 @@ pub fn run() {
                                     storage::SEMANTIC_CACHE_IDLE_TTL,
                                 );
                             }
+                        });
+
+                        // M2.5 step 5: Rust owns MiniLM capture indexing and
+                        // retention. Strictly idle-gated, so this loop spends
+                        // most of a working day deciding to do nothing.
+                        let app_handle_semantic_index = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            minilm_index::run_semantic_index_worker(app_handle_semantic_index)
+                                .await;
                         });
                     }
                 } else {

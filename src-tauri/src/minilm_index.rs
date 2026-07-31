@@ -1,0 +1,860 @@
+//! M2.5 step 5 — Rust-owned MiniLM capture indexing, retention, and the Chroma
+//! mirror.
+//!
+//! Before this step the only writers of `semantic_text` rows were the M2.4
+//! migration and Python's reverse-IPC dual-write, and the only reaper was
+//! Python's hot-layer expiry mirroring its deletions back. `semantic_index =
+//! rust` therefore meant "Rust reads an index Python writes". This module makes
+//! Rust the writer:
+//!
+//! - the capture path enqueues a ledger job as soon as the OCR row commits, or
+//!   records a terminal "nothing to encode" row when the screenshot has no text
+//!   at all — the ledger is what remembers that decision, because the candidate
+//!   scan that repairs missed enqueues cannot read it out of ciphertext;
+//! - an idle-gated worker encodes the queue in small chunks and commits vector
+//!   plus ledger in the one transaction M2.3 already provides;
+//! - the same worker ages rows out on its own 30-day rule, which is the part
+//!   nothing else was doing: screenshot *deletion* has always been handled
+//!   transactionally by the schema triggers
+//!   (`cleanup_derived_index_on_screenshot_soft_delete`), but expiry on age was
+//!   only ever mirrored over from Python, and that mirror is gone;
+//! - each newly encoded vector is mirrored *to* Python, the M2.4 dual-write
+//!   reversed, so the Chroma `task_vectors` hot layer Milestone 4 clustering
+//!   still reads keeps being fed without Python running MiniLM itself.
+//!
+//! Two consequences are deliberate and are written down rather than smoothed
+//! over.
+//!
+//! **Indexing is strictly idle-gated, so search freshness regresses.** MiniLM is
+//! a 118 MB model; the roadmap's idle rule covers exactly this kind of
+//! background capture indexing. Python encoded inline on the post-process path,
+//! so a screenshot was searchable within seconds. Here it is searchable after
+//! the next idle window. That is a real regression in freshness and the
+//! backlog is reported as a number rather than hidden.
+//!
+//! **A backlog is no longer a reason to refuse to serve.** The step-4 read path
+//! stood down whenever the Rust store was known to be behind, which was correct
+//! while Python held a complete corpus to fall back to. Once Rust is the
+//! encoder, Chroma receives its rows from this mirror, so both stores are behind
+//! by exactly the same screenshots — handing the query to Python would cost the
+//! user the faster path and recover nothing. See `semantic_query.rs`.
+//!
+//! **The Chroma mirror is best-effort and a lost row is not re-sent.** Rust
+//! holds the authoritative copy, so a mirror that fails while the monitor is
+//! down costs that screenshot its place in unsupervised task clustering — not
+//! its findability by search. Python's `_backfill_from_screenshots` only rebuilds
+//! the hot layer when it is found *entirely* empty, so a partial gap is not
+//! repaired; the Smart Cluster prefilter, which falls back to a live encode for
+//! any id the collection lacks, is unaffected. Closing that gap belongs with
+//! Milestone 4, which is where `task_vectors` is actually consumed.
+
+use crate::credential_manager::CredentialManagerState;
+use crate::idle::IdleState;
+use crate::minilm_migration::{
+    build_minilm_task_text, minilm_job_spec, validate_minilm_vector, MINILM_OCR_SNIPPET_CHARS,
+};
+use crate::ml_protocol::MlSemanticModel;
+use crate::monitor::{authenticated_monitor_command, MonitorState};
+use crate::semantic_runtime::SemanticRuntimeState;
+use crate::storage::{
+    BackgroundReadError, BackgroundScreenshotSummary, DerivedEmbeddingWrite, DerivedIndexJobSpec,
+    DerivedIndexKind, StorageState,
+};
+use chrono::{Duration as ChronoDuration, Utc};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+use tauri::{AppHandle, Manager};
+
+/// Rust keeps the same 30-day window as the Chroma hot layer it replaced, but
+/// decides it against SQLite `created_at` rather than mirroring Python's
+/// expiry. Expressed as a SQLite datetime modifier and always bound as a
+/// parameter, never interpolated.
+pub const SEMANTIC_TEXT_RETENTION: &str = "-30 days";
+
+/// How often the worker asks whether the machine has gone idle. The check
+/// itself is one atomic load, so a short cadence costs nothing and keeps the
+/// queue moving early in an idle window rather than up to an hour into it.
+const POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Subjects encoded per pass. The whole batch goes through one `embed_text`
+/// call, and the ML protocol caps a batch at `MAX_SEMANTIC_BATCH` (32).
+const DRAIN_BATCH: usize = 16;
+
+/// Subjects per `embed_text` call. A claimed batch is encoded in chunks so the
+/// semantic worker's request gate is released between them. Foreground search
+/// shares that one worker, so a chunk is the longest a user query can be made to
+/// wait for it — and the idle gate is re-checked between chunks, which is also
+/// the longest encoding can keep running after the user comes back.
+const ENCODE_CHUNK: usize = 4;
+
+/// Encode attempts before a subject is left alone. A job that spends this
+/// budget stops being claimable and starts being counted as `exhausted` in the
+/// backend diagnostic, because nothing will retry it on its own.
+pub(crate) const MAX_ATTEMPTS: u32 = 5;
+
+/// Backoff between encode attempts. Idle windows are long; retrying a failing
+/// model load every minute inside one would burn the budget in five minutes.
+const RETRY_BACKOFF_MINUTES: i64 = 30;
+
+/// Deadline for one batch encode, including a cold model load. Background work,
+/// so it is generous next to the 5 s a user-facing query is allowed.
+const EMBED_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Ledger repairs and expiry deletions per pass. Bounded so one pass cannot
+/// hold the process-wide database mutex through a whole backlog.
+const MAINTENANCE_BATCH: u32 = 256;
+
+/// Records per `upsert_task_vectors` request. Python rejects a batch above 128
+/// outright; staying well under it keeps one mirror message small, since each
+/// record carries 384 floats plus the document text as JSON.
+const MIRROR_BATCH: usize = 32;
+
+/// Ledger reason recorded for a screenshot that is not part of the corpus.
+/// `minilm_sources` is the only place that can establish this, so it is the only
+/// place that writes it.
+const EMPTY_SOURCE_CODE: &str = "empty_source";
+const EMPTY_SOURCE_REASON: &str =
+    "process name, window title, and OCR text are all empty, so there is nothing to encode";
+
+/// One screenshot's MiniLM model input, the ledger identity derived from it,
+/// and the metadata the Chroma mirror has to carry.
+pub(crate) struct MinilmSource {
+    pub text: String,
+    pub spec: DerivedIndexJobSpec,
+    /// Kept from the same read that produced `text`. The mirror needs
+    /// process/title/timestamp/category, and re-reading them later would pay a
+    /// second round of CNG decryption for values already in hand.
+    pub summary: BackgroundScreenshotSummary,
+}
+
+/// The corpus decision for one page of screenshots.
+pub(crate) struct MinilmSources {
+    /// Screenshots with something to encode.
+    pub indexable: HashMap<i64, MinilmSource>,
+    /// Screenshots whose combined text is empty. Python skipped these, so they
+    /// are not part of the corpus and must not be counted as missing from it —
+    /// but that is a fact only this builder can establish, because the text it
+    /// judges lives in encrypted columns the candidate scan cannot read. Callers
+    /// record it through `exclude_derived_index_subject` so the scan stops
+    /// re-deciding it once a minute. The spec is built from the empty text, so a
+    /// screenshot that later gains text no longer matches the recorded contract.
+    pub excluded: HashMap<i64, DerivedIndexJobSpec>,
+}
+
+/// Rebuild the MiniLM model input for `ids` from SQLite.
+///
+/// Deliberately the same assembly the M2.4 migration used — same summary read,
+/// same insertion-ordered OCR prefix, same `process | title | OCR[:200]`
+/// contract — because the source fingerprint is what decides whether a stored
+/// vector is still valid. Two builders would eventually disagree about a
+/// screenshot and silently invalidate its row.
+pub(crate) fn minilm_sources(
+    storage: &StorageState,
+    ids: &[i64],
+) -> Result<MinilmSources, BackgroundReadError> {
+    if ids.is_empty() {
+        return Ok(MinilmSources {
+            indexable: HashMap::new(),
+            excluded: HashMap::new(),
+        });
+    }
+    let summaries = storage.get_screenshot_summaries_by_ids_silent(ids)?;
+    let ocr = storage.get_ocr_text_prefixes_by_screenshot_ids_silent(ids, MINILM_OCR_SNIPPET_CHARS)?;
+    let mut indexable = HashMap::with_capacity(summaries.len());
+    let mut excluded = HashMap::new();
+    for summary in summaries {
+        let text = build_minilm_task_text(
+            summary.process_name.as_deref().unwrap_or(""),
+            summary.window_title.as_deref().unwrap_or(""),
+            ocr.get(&summary.id).map(String::as_str).unwrap_or(""),
+        );
+        let spec = minilm_job_spec(summary.id, &text);
+        if text.trim().is_empty() {
+            excluded.insert(summary.id, spec);
+            continue;
+        }
+        indexable.insert(
+            summary.id,
+            MinilmSource {
+                text,
+                spec,
+                summary,
+            },
+        );
+    }
+    Ok(MinilmSources {
+        indexable,
+        excluded,
+    })
+}
+
+/// Queue one freshly captured screenshot for semantic indexing.
+///
+/// Called from the OCR commit path so the ledger records the debt immediately,
+/// while the encoding itself waits for an idle window. A screenshot with no text
+/// at all gets a terminal ledger row instead of a queued one, which is what
+/// keeps the worker's repair scan from selecting it again for the rest of the
+/// retention window.
+///
+/// A failure here is recoverable and not worth failing the capture over: the
+/// worker's reconciliation pass finds any screenshot that has an OCR row and no
+/// ledger row, which is exactly what a missed enqueue leaves behind.
+pub fn enqueue_captured_screenshot(
+    storage: &StorageState,
+    screenshot_id: i64,
+) -> Result<(), String> {
+    let sources = minilm_sources(storage, &[screenshot_id]).map_err(|error| error.to_string())?;
+    if let Some(source) = sources.indexable.get(&screenshot_id) {
+        storage.ensure_derived_index_job(&source.spec)?;
+        return Ok(());
+    }
+    if let Some(spec) = sources.excluded.get(&screenshot_id) {
+        storage.exclude_derived_index_subject(spec, EMPTY_SOURCE_CODE, EMPTY_SOURCE_REASON)?;
+    }
+    Ok(())
+}
+
+/// Idle-gated capture indexing, retention, and repair.
+pub async fn run_semantic_index_worker(app: AppHandle) {
+    let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if let Err(error) = run_pass(&app).await {
+            tracing::warn!("[SEMANTIC:INDEX] idle pass failed: {error}");
+        }
+    }
+}
+
+/// Whether background semantic work may run right now.
+///
+/// The idle gate is the whole point of the step-5 scheduling decision: a
+/// 118 MB model load and a batch of transformer forward passes must never land
+/// while someone is using the machine. Maintenance mode is checked too, because
+/// a migration rewriting the derived store would race these writes.
+fn may_run(app: &AppHandle) -> bool {
+    if crate::maintenance::is_active() {
+        return false;
+    }
+    app.state::<Arc<IdleState>>()
+        .is_idle
+        .load(Ordering::Relaxed)
+}
+
+async fn run_pass(app: &AppHandle) -> Result<(), String> {
+    if !may_run(app) {
+        return Ok(());
+    }
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    // Every read below decrypts OCR text, so a locked session can do nothing
+    // but wait. Bailing here keeps the ledger untouched rather than marking a
+    // batch `waiting_for_auth` on every tick of a locked machine.
+    if !storage.is_session_valid() {
+        return Ok(());
+    }
+
+    // Expiry first: a subject about to age out should not be encoded on its way
+    // out the door.
+    reap_expired(storage.clone()).await?;
+    reconcile_missing(storage.clone()).await?;
+    drain_queue(app, storage).await
+}
+
+/// Delete rows that aged out of the retention window.
+///
+/// Deletion with the screenshot is already transactional in the schema, so what
+/// this adds is expiry on age — the job Python's hot-layer expiry used to do for
+/// Rust by mirroring its own deletions across. The query also sweeps subjects
+/// with no live screenshot at all, which after the triggers is a safety net for
+/// a row that predates them rather than the normal path.
+async fn reap_expired(storage: Arc<StorageState>) -> Result<(), String> {
+    let removed = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        let subjects = storage
+            .list_expired_semantic_text_subjects(SEMANTIC_TEXT_RETENTION, MAINTENANCE_BATCH)?;
+        let mut removed = 0usize;
+        for subject in subjects {
+            if storage.delete_derived_index_subject(DerivedIndexKind::SemanticText, &subject)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    })
+    .await
+    .map_err(|error| format!("reap task failed: {error}"))??;
+    if removed > 0 {
+        tracing::info!("[SEMANTIC:INDEX] expired {removed} semantic vector(s)");
+    }
+    Ok(())
+}
+
+/// Queue screenshots that should have a vector but have no ledger row.
+///
+/// This is the repair path for an enqueue that never ran: the capture happened
+/// while the session was locked, or the process died between the OCR commit and
+/// the enqueue. It is bounded to the retention window, so it never turns into a
+/// full-history backfill — M2.4 established that the corpus is the hot layer,
+/// not every screenshot ever taken.
+///
+/// The candidate query can only over-approximate the corpus, because it decides
+/// membership from ciphertext. Whatever it hands over that turns out to have no
+/// text is recorded as excluded rather than silently dropped: a silent drop
+/// would hand the same screenshot back on the next pass, forever, and once
+/// enough of them accumulated they would fill the query's `LIMIT` and starve the
+/// repair of screenshots that really are missing a vector.
+async fn reconcile_missing(storage: Arc<StorageState>) -> Result<(), String> {
+    let (queued, excluded) =
+        tokio::task::spawn_blocking(move || -> Result<(usize, usize), String> {
+            let ids = storage
+                .list_semantic_text_index_candidates(SEMANTIC_TEXT_RETENTION, MAINTENANCE_BATCH)?;
+            if ids.is_empty() {
+                return Ok((0, 0));
+            }
+            let sources = minilm_sources(&storage, &ids).map_err(|error| error.to_string())?;
+            let mut queued = 0usize;
+            for source in sources.indexable.values() {
+                match storage.ensure_derived_index_job(&source.spec) {
+                    Ok(_) => queued += 1,
+                    // A screenshot deleted between the candidate query and here.
+                    Err(error) => tracing::debug!(
+                        "[SEMANTIC:INDEX] skipped repair enqueue for {}: {error}",
+                        source.spec.subject_key
+                    ),
+                }
+            }
+            let mut excluded = 0usize;
+            for spec in sources.excluded.values() {
+                match storage.exclude_derived_index_subject(
+                    spec,
+                    EMPTY_SOURCE_CODE,
+                    EMPTY_SOURCE_REASON,
+                ) {
+                    Ok(true) => excluded += 1,
+                    // Deleted between the candidate query and here; the
+                    // lifecycle triggers already removed its rows.
+                    Ok(false) => {}
+                    Err(error) => tracing::debug!(
+                        "[SEMANTIC:INDEX] could not record exclusion for {}: {error}",
+                        spec.subject_key
+                    ),
+                }
+            }
+            Ok((queued, excluded))
+        })
+        .await
+        .map_err(|error| format!("reconcile task failed: {error}"))??;
+    if queued > 0 {
+        tracing::info!("[SEMANTIC:INDEX] repaired {queued} missing ledger row(s)");
+    }
+    if excluded > 0 {
+        tracing::info!("[SEMANTIC:INDEX] excluded {excluded} screenshot(s) with no text to encode");
+    }
+    Ok(())
+}
+
+/// One claimed job: its ledger identity, its model input, the metadata the
+/// mirror will need, and the lease that authorizes the commit.
+struct ClaimedJob {
+    spec: DerivedIndexJobSpec,
+    text: String,
+    summary: BackgroundScreenshotSummary,
+    lease_token: String,
+}
+
+/// One screenshot that became query-visible in this pass, in the shape the
+/// Chroma mirror sends.
+struct IndexedSubject {
+    id: i64,
+    vector: Vec<f32>,
+    text: String,
+    summary: BackgroundScreenshotSummary,
+}
+
+async fn drain_queue(app: &AppHandle, storage: Arc<StorageState>) -> Result<(), String> {
+    let claimed = claim_batch(storage.clone()).await?;
+    if claimed.is_empty() {
+        return Ok(());
+    }
+    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    let mut pending: VecDeque<ClaimedJob> = claimed.into();
+    let mut indexed: Vec<IndexedSubject> = Vec::new();
+    let mut failure: Option<String> = None;
+    while !pending.is_empty() {
+        // The user may have come back since the claim, or since the previous
+        // chunk. Release the rest of the leases without charging the retry
+        // budget — nothing failed, the window just closed.
+        if !may_run(app) {
+            release_claims(
+                storage.clone(),
+                Vec::from(std::mem::take(&mut pending)),
+                "idle_lost",
+                "system left idle before encoding",
+            )
+            .await;
+            break;
+        }
+        let chunk: Vec<ClaimedJob> = pending.drain(..ENCODE_CHUNK.min(pending.len())).collect();
+        match encode_chunk(app, &semantic, storage.clone(), chunk).await {
+            Ok(mut encoded) => indexed.append(&mut encoded),
+            Err(error) => {
+                // Whatever broke the worker will break every remaining chunk the
+                // same way, and charging the retry budget for an attempt that was
+                // never made would spend it on the worker's behalf.
+                if !pending.is_empty() {
+                    release_claims(
+                        storage.clone(),
+                        Vec::from(std::mem::take(&mut pending)),
+                        "batch_aborted",
+                        "an earlier chunk of the same pass failed to encode",
+                    )
+                    .await;
+                }
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+
+    if !indexed.is_empty() {
+        tracing::info!("[SEMANTIC:INDEX] indexed {} screenshot(s)", indexed.len());
+        mirror_to_chroma(app, &indexed).await;
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Encode and commit one chunk. The chunk's leases are consumed either way:
+/// success commits them, failure charges the retry budget with a backoff.
+async fn encode_chunk(
+    app: &AppHandle,
+    semantic: &Arc<SemanticRuntimeState>,
+    storage: Arc<StorageState>,
+    claimed: Vec<ClaimedJob>,
+) -> Result<Vec<IndexedSubject>, String> {
+    let texts: Vec<String> = claimed.iter().map(|job| job.text.clone()).collect();
+    let embedded = semantic
+        .embed_text(
+            app.clone(),
+            MlSemanticModel::MinilmL12,
+            texts,
+            EMBED_TIMEOUT,
+            // MiniLM has no approved DirectML parity; asking for it only costs
+            // a provider negotiation before the worker falls back to CPU.
+            false,
+        )
+        .await;
+
+    let vectors = match embedded {
+        Ok(result) if result.vectors.len() == claimed.len() => result.vectors,
+        Ok(result) => {
+            let error = format!(
+                "semantic worker returned {} vectors for {} inputs",
+                result.vectors.len(),
+                claimed.len()
+            );
+            fail_claims(storage, claimed, "embed_mismatch", &error).await;
+            return Err(error);
+        }
+        Err(error) => {
+            fail_claims(storage, claimed, "embed_failed", &error).await;
+            return Err(format!("embed failed: {error}"));
+        }
+    };
+
+    commit_batch(storage, claimed, vectors).await
+}
+
+/// Claim up to one batch, rebuilding each job's source text from SQLite.
+///
+/// The text is rebuilt rather than trusted from the ledger because a job queued
+/// at capture time may have been overtaken by a re-OCR: its stored fingerprint
+/// would then describe text that no longer exists. Such a job is re-queued
+/// against the current source instead of being encoded against a stale one.
+async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Vec<ClaimedJob>, String> {
+        let jobs = storage.claimable_derived_index_jobs(
+            DerivedIndexKind::SemanticText,
+            MAX_ATTEMPTS,
+            DRAIN_BATCH as u32,
+        )?;
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(jobs.len());
+        for job in &jobs {
+            match job.spec.subject_key.parse::<i64>() {
+                Ok(id) => ids.push(id),
+                Err(error) => tracing::warn!(
+                    "[SEMANTIC:INDEX] ignoring job with non-numeric subject '{}': {error}",
+                    job.spec.subject_key
+                ),
+            }
+        }
+        let sources = minilm_sources(&storage, &ids).map_err(|error| error.to_string())?;
+
+        let mut claimed = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let Ok(id) = job.spec.subject_key.parse::<i64>() else {
+                continue;
+            };
+            let Some(source) = sources.indexable.get(&id) else {
+                // Nothing to encode. Either the screenshot lost its text, and
+                // the exclusion has to be recorded or the repair scan will hand
+                // it straight back, or the screenshot itself is gone and the row
+                // goes with it.
+                let recorded = match sources.excluded.get(&id) {
+                    Some(spec) => storage
+                        .exclude_derived_index_subject(
+                            spec,
+                            EMPTY_SOURCE_CODE,
+                            EMPTY_SOURCE_REASON,
+                        )
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if !recorded {
+                    let _ = storage.delete_derived_index_subject(
+                        DerivedIndexKind::SemanticText,
+                        &job.spec.subject_key,
+                    );
+                }
+                continue;
+            };
+            if source.spec != job.spec {
+                // Re-queue against the current source. `ensure_derived_index_job`
+                // replaces the contract; the next pass claims the fresh row.
+                let _ = storage.ensure_derived_index_job(&source.spec);
+                continue;
+            }
+            match storage.mark_derived_index_job_processing(&job.spec) {
+                Ok(lease_token) => claimed.push(ClaimedJob {
+                    spec: job.spec,
+                    text: source.text.clone(),
+                    summary: source.summary.clone(),
+                    lease_token,
+                }),
+                // Lost the race to another claimant, or the row moved on.
+                Err(error) => tracing::debug!(
+                    "[SEMANTIC:INDEX] could not claim {}: {error}",
+                    job.spec.subject_key
+                ),
+            }
+        }
+        Ok(claimed)
+    })
+    .await
+    .map_err(|error| format!("claim task failed: {error}"))?
+}
+
+/// Commit the encoded batch, returning the subjects that became query-visible.
+async fn commit_batch(
+    storage: Arc<StorageState>,
+    claimed: Vec<ClaimedJob>,
+    vectors: Vec<Vec<f32>>,
+) -> Result<Vec<IndexedSubject>, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut indexed = Vec::with_capacity(claimed.len());
+        for (job, vector) in claimed.into_iter().zip(vectors) {
+            if let Err(error) = validate_minilm_vector(&vector) {
+                // A zero or non-finite vector would poison every cosine score
+                // it touches. Discard rather than retry: the input is stable,
+                // so the next attempt produces the same bad vector.
+                let _ = storage.mark_derived_index_job_discarded(
+                    &job.spec,
+                    &job.lease_token,
+                    "invalid_vector",
+                    &error,
+                );
+                tracing::warn!(
+                    "[SEMANTIC:INDEX] discarded {}: {error}",
+                    job.spec.subject_key
+                );
+                continue;
+            }
+            let write = DerivedEmbeddingWrite {
+                job: job.spec.clone(),
+                lease_token: job.lease_token.clone(),
+                vector: vector.clone(),
+            };
+            match storage.commit_derived_embedding(&write) {
+                Ok(()) => {
+                    let id = job.summary.id;
+                    // Smart Cluster scoring used to be queued by Python's
+                    // `add_snapshot`, right after it wrote the vector. Same
+                    // position, new writer: the prefilter needs the vector
+                    // to exist before the entry is worth anything.
+                    if let Err(error) = storage.enqueue_smart_cluster_pending(id) {
+                        tracing::debug!(
+                            "[SEMANTIC:INDEX] smart cluster enqueue failed for {id}: {error}"
+                        );
+                    }
+                    indexed.push(IndexedSubject {
+                        id,
+                        vector,
+                        text: job.text,
+                        summary: job.summary,
+                    });
+                }
+                Err(error) => tracing::warn!(
+                    "[SEMANTIC:INDEX] commit failed for {}: {error}",
+                    job.spec.subject_key
+                ),
+            }
+        }
+        Ok(indexed)
+    })
+    .await
+    .map_err(|error| format!("commit task failed: {error}"))?
+}
+
+/// Hand claimed jobs back without charging the retry budget.
+async fn release_claims(
+    storage: Arc<StorageState>,
+    claimed: Vec<ClaimedJob>,
+    reason_code: &'static str,
+    reason: &'static str,
+) {
+    let _ = tokio::task::spawn_blocking(move || {
+        for job in claimed {
+            let _ =
+                storage.requeue_derived_index_job(&job.spec, &job.lease_token, reason_code, reason);
+        }
+    })
+    .await;
+}
+
+/// Record an encode failure against the retry budget with a backoff.
+async fn fail_claims(
+    storage: Arc<StorageState>,
+    claimed: Vec<ClaimedJob>,
+    error_code: &'static str,
+    error: &str,
+) {
+    let next_retry_at = (Utc::now() + ChronoDuration::minutes(RETRY_BACKOFF_MINUTES))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let error = error.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        for job in claimed {
+            let _ = storage.mark_derived_index_job_failed(
+                &job.spec,
+                &job.lease_token,
+                error_code,
+                &error,
+                Some(&next_retry_at),
+            );
+        }
+    })
+    .await;
+}
+
+/// Mirror newly indexed vectors into Python's Chroma hot layer.
+///
+/// The M2.4 dual-write with its direction reversed. Milestone 4 task clustering
+/// still reads `task_vectors`, and Python no longer runs MiniLM, so without this
+/// the clustering corpus would stop growing. It reuses `upsert_task_vectors` —
+/// the command the M2.4 rollback path already established for "write a
+/// Rust-produced vector into the hot layer" — rather than inventing a second
+/// ingest contract for the same write.
+///
+/// The full row is sent, not just the vector. `add_snapshot` used to write the
+/// metadata and the document alongside it, and both are load-bearing: clustering
+/// selects hot vectors by `timestamp`, so a row that arrived without one would
+/// be silently outside every window, and the reranker scores the stored document
+/// text. Python encrypts the process name, window title, and document on its
+/// side exactly as it did when it built them itself.
+///
+/// Best-effort on purpose: Rust holds the authoritative copy, and a mirror lost
+/// here degrades unsupervised clustering rather than making a screenshot
+/// unfindable by search.
+async fn mirror_to_chroma(app: &AppHandle, indexed: &[IndexedSubject]) {
+    if indexed.is_empty() {
+        return;
+    }
+    let credential = app.state::<Arc<CredentialManagerState>>();
+    let monitor = app.state::<MonitorState>();
+    for chunk in indexed.chunks(MIRROR_BATCH) {
+        let records: Vec<serde_json::Value> = chunk.iter().map(mirror_record).collect();
+        let request = serde_json::json!({
+            "command": "upsert_task_vectors",
+            "records": records,
+        });
+        match authenticated_monitor_command(&credential, &monitor, request).await {
+            // Python reports a refused command in the response body rather than
+            // as a transport error, so an `error` field is the failure that
+            // actually shows up in practice: clustering disabled, the vault
+            // locked, or the monitor still starting.
+            Ok(response) => {
+                if let Some(error) = response.get("error").and_then(|value| value.as_str()) {
+                    tracing::debug!(
+                        "[SEMANTIC:INDEX] chroma mirror rejected {} vector(s): {error}",
+                        chunk.len()
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "[SEMANTIC:INDEX] chroma mirror deferred for {} vector(s): {error}",
+                    chunk.len()
+                );
+                // A transport failure applies to the pipe, not to this batch,
+                // so the remaining chunks would fail the same way.
+                return;
+            }
+        }
+    }
+}
+
+/// One `upsert_task_vectors` record, field-for-field what `add_snapshot` used
+/// to write into the hot layer for the same screenshot.
+fn mirror_record(subject: &IndexedSubject) -> serde_json::Value {
+    serde_json::json!({
+        "id": subject.id.to_string(),
+        "embedding": subject.vector,
+        // Seconds since the epoch, which is what `screenshots.created_at`
+        // yields here and what Chroma's `timestamp` metadata has always held.
+        "timestamp": subject.summary.timestamp.unwrap_or(0),
+        "process_name": subject.summary.process_name.clone().unwrap_or_default(),
+        "window_title": subject.summary.window_title.clone().unwrap_or_default(),
+        "category": subject.summary.category.clone().unwrap_or_default(),
+        // The encoder input doubles as the stored document, as it did when
+        // Python built both from one `build_task_text` call.
+        "document": subject.text,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_is_a_bound_sqlite_modifier_not_an_interpolated_one() {
+        // Both queries bind this as a parameter. A literal that ever stopped
+        // being a constant would otherwise be a SQL injection point in a
+        // datetime modifier, which is easy to miss.
+        assert!(SEMANTIC_TEXT_RETENTION.starts_with('-'));
+        assert!(SEMANTIC_TEXT_RETENTION.ends_with(" days"));
+    }
+
+    #[test]
+    fn a_batch_fits_the_protocol_limit() {
+        // Each chunk of the claimed batch goes through one `embed_text` call.
+        assert!(ENCODE_CHUNK <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
+        assert!(ENCODE_CHUNK <= DRAIN_BATCH);
+        assert!(DRAIN_BATCH <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
+    }
+
+    #[test]
+    fn a_screenshot_with_nothing_to_encode_is_outside_the_corpus() {
+        // The rule the candidate scan cannot express: it sees that a screenshot
+        // has OCR rows, not that they decrypt to nothing. A process name of ""
+        // happens whenever the foreground window belongs to a process this one
+        // cannot open, which on Windows includes every elevated window.
+        assert!(build_minilm_task_text("", "", "").is_empty());
+        assert!(build_minilm_task_text("", "", "   ").trim().is_empty());
+        assert!(!build_minilm_task_text("proc.exe", "", "").trim().is_empty());
+        assert!(!build_minilm_task_text("", "Title", "").trim().is_empty());
+        assert!(!build_minilm_task_text("", "", "text").trim().is_empty());
+    }
+
+    #[test]
+    fn an_exclusion_is_fingerprinted_so_regained_text_reclaims_it() {
+        // The exclusion is recorded against the empty source, which is what lets
+        // `ensure_derived_index_job` treat a screenshot that later gains text as
+        // an ordinary source change rather than as something already settled.
+        let empty = minilm_job_spec(1, &build_minilm_task_text("", "", ""));
+        let with_text = minilm_job_spec(1, &build_minilm_task_text("proc.exe", "", ""));
+        assert_eq!(empty.subject_key, with_text.subject_key);
+        assert_ne!(empty.source_fingerprint, with_text.source_fingerprint);
+    }
+
+    #[test]
+    fn the_retry_budget_and_backoff_outlast_a_single_idle_window() {
+        // A failing model load must not spend all five attempts inside one
+        // night of idleness, which would leave the subject `exhausted` by
+        // morning over a transient fault.
+        assert!(MAX_ATTEMPTS >= 3);
+        assert!(RETRY_BACKOFF_MINUTES >= 15);
+    }
+
+    fn indexed(id: i64) -> IndexedSubject {
+        IndexedSubject {
+            id,
+            vector: vec![0.5; crate::minilm_migration::MINILM_DIMENSIONS],
+            text: "proc.exe | Title | OCR".to_string(),
+            summary: BackgroundScreenshotSummary {
+                id,
+                window_title: Some("Title".to_string()),
+                process_name: Some("proc.exe".to_string()),
+                timestamp: Some(1_700_000_000),
+                category: Some("work".to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn a_mirror_record_carries_every_field_add_snapshot_used_to_write() {
+        // `upsert_task_vectors` reads exactly these keys. A vector arriving
+        // without `timestamp` would land outside every clustering window, and
+        // one without `document` would leave the reranker nothing to score —
+        // both silent, both only visible as degraded clustering months later.
+        let record = mirror_record(&indexed(42));
+        let mut keys: Vec<&str> = record
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "category",
+                "document",
+                "embedding",
+                "id",
+                "process_name",
+                "timestamp",
+                "window_title",
+            ]
+        );
+        // Python parses the id with `str.isdigit()`, so it has to be a string.
+        assert_eq!(record["id"], "42");
+        assert_eq!(record["timestamp"], 1_700_000_000);
+        assert_eq!(record["process_name"], "proc.exe");
+        assert_eq!(record["window_title"], "Title");
+        assert_eq!(record["category"], "work");
+        assert_eq!(record["document"], "proc.exe | Title | OCR");
+        assert_eq!(
+            record["embedding"].as_array().unwrap().len(),
+            crate::minilm_migration::MINILM_DIMENSIONS
+        );
+    }
+
+    #[test]
+    fn absent_metadata_mirrors_as_empty_strings_rather_than_null() {
+        // Python calls `str(...)` on each of these, so a JSON null would reach
+        // Chroma as the literal text "None".
+        let mut subject = indexed(7);
+        subject.summary.process_name = None;
+        subject.summary.window_title = None;
+        subject.summary.category = None;
+        subject.summary.timestamp = None;
+        let record = mirror_record(&subject);
+        assert_eq!(record["process_name"], "");
+        assert_eq!(record["window_title"], "");
+        assert_eq!(record["category"], "");
+        assert_eq!(record["timestamp"], 0);
+    }
+
+    #[test]
+    fn one_mirror_request_stays_inside_the_python_batch_limit() {
+        // `upsert_task_vectors` raises above 128 records, and a raised batch
+        // would lose the whole chunk rather than degrade.
+        assert!(MIRROR_BATCH <= 128);
+        assert!(DRAIN_BATCH <= MIRROR_BATCH);
+    }
+}

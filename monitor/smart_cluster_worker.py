@@ -446,11 +446,11 @@ class SmartClusterWorker:
         """Return a tuple of (valid_ids, (N, D) array of MiniLM vectors).
 
         Reuses embeddings already stored in the ``task_vectors`` hot-layer
-        collection (computed during ``HotColdManager.add_snapshot``); only ids
-        absent from the collection fall back to a live MiniLM forward pass.
-        Saves one encode per already-ingested snapshot, which is the common case
-        since the smart-cluster pending queue is populated right after the hot
-        layer insert.
+        collection; only ids absent from the collection fall back to a live
+        MiniLM forward pass. Since M2.5 step 5 those rows are mirrored in by
+        Rust, which queues the pending entry and sends the vector in the same
+        pass, so the fallback now also covers the short window between the two
+        and any mirror that did not arrive at all.
         """
         fetched: Dict[int, np.ndarray] = {}
 

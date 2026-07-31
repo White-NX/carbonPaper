@@ -14,30 +14,7 @@ logger = logging.getLogger(__name__)
 import win32file
 import win32pipe
 import pywintypes
-from typing import NamedTuple, Optional, Dict, Any, List
-
-
-class MinilmMirrorResult(NamedTuple):
-    """Outcome of one MiniLM dual-write batch, split by what to do next.
-
-    Rust serves natural-language retrieval from the mirrored store and stands
-    down while any mirror is outstanding, so "the batch failed" is not a useful
-    answer on its own — the caller has to know which rows are worth queueing.
-
-    ``retry_ids`` is ``None`` when the batch failed as a whole (the pipe was
-    down, the vault was locked, the response was malformed) and nothing is known
-    about individual rows; the caller then re-queues everything it sent.
-    ``dropped_ids`` are rows Rust rejected permanently — a deleted screenshot,
-    a malformed vector — which must be forgotten rather than retried forever.
-    """
-
-    delivered: bool
-    retry_ids: Optional[List[str]]
-    dropped_ids: List[str]
-
-    @classmethod
-    def whole_batch_failed(cls) -> "MinilmMirrorResult":
-        return cls(delivered=False, retry_ids=None, dropped_ids=[])
+from typing import Optional, Dict, Any, List
 
 
 IPC_PROTOCOL_VERSION = 2
@@ -108,9 +85,6 @@ READ_RETRY_COMMANDS = {
 
 IDEMPOTENT_RETRY_COMMANDS = {
     'update_screenshot_category',
-    'upsert_minilm_derived_embeddings',
-    'delete_minilm_derived_embeddings',
-    'report_minilm_import_debt',
     'set_ocr_postprocess_status',
     'record_ocr_postprocess_retry',
     'smart_cluster_enqueue_pending',
@@ -751,82 +725,6 @@ class StorageClient:
         if response.get('status') == 'success':
             return response.get('data', {'screenshots': []})
         raise RuntimeError(response.get('error', 'Unknown error during IPC get_screenshots_with_ocr_by_ids'))
-
-    def upsert_minilm_derived_embeddings(
-        self,
-        records: List[Dict[str, Any]],
-        pending_imports: int = 0,
-    ) -> MinilmMirrorResult:
-        """Batch dual-write of Python-produced MiniLM vectors to Rust.
-
-        ``pending_imports`` is how many mirrors are still queued for retry after
-        this batch. Rust reads it to decide whether its copy of the index is
-        complete enough to answer semantic queries, so understating it is worse
-        than reporting nothing.
-
-        Returns a :class:`MinilmMirrorResult` rather than a bare success flag,
-        because the caller has to tell a row worth retrying from one Rust will
-        reject every time it is offered.
-        """
-        if not records:
-            return MinilmMirrorResult(delivered=True, retry_ids=[], dropped_ids=[])
-        if len(records) > 128:
-            raise ValueError('MiniLM dual-write batch exceeds 128 records')
-        response = self._send_request({
-            'command': 'upsert_minilm_derived_embeddings',
-            'records': records,
-            'pending_imports': max(0, int(pending_imports)),
-        })
-        if response.get('status') != 'success':
-            return MinilmMirrorResult.whole_batch_failed()
-        errors = response.get('data', {}).get('errors', [])
-        if not isinstance(errors, list):
-            return MinilmMirrorResult.whole_batch_failed()
-        retry_ids: List[str] = []
-        dropped_ids: List[str] = []
-        for entry in errors:
-            if not isinstance(entry, dict):
-                # An unreadable error entry says nothing about which row failed,
-                # so fall back to re-queueing the whole batch.
-                return MinilmMirrorResult.whole_batch_failed()
-            doc_id = str(entry.get('screenshot_id', ''))
-            # Absent means an older Rust build that does not classify its
-            # rejections. Retrying is the safe reading: it can waste work, while
-            # dropping a row that was only transiently rejected loses it.
-            if entry.get('permanent') is True:
-                dropped_ids.append(doc_id)
-            else:
-                retry_ids.append(doc_id)
-        return MinilmMirrorResult(
-            delivered=not errors,
-            retry_ids=retry_ids,
-            dropped_ids=dropped_ids,
-        )
-
-    def report_minilm_import_debt(self, pending_imports: int) -> bool:
-        """Tell Rust how many MiniLM mirrors are still owed, writing nothing.
-
-        Rust's debt counter is process-global and starts at zero, so without
-        this the durable queue loaded at monitor startup would be invisible to
-        it and it would rank against an index it wrongly believed complete.
-        """
-        response = self._send_request({
-            'command': 'report_minilm_import_debt',
-            'pending_imports': max(0, int(pending_imports)),
-        })
-        return response.get('status') == 'success'
-
-    def delete_minilm_derived_embeddings(self, screenshot_ids: List[int]) -> bool:
-        """Mirror hot-layer expiry into the Rust-derived semantic cache."""
-        if not screenshot_ids:
-            return True
-        if len(screenshot_ids) > 128:
-            raise ValueError('MiniLM delete batch exceeds 128 records')
-        response = self._send_request({
-            'command': 'delete_minilm_derived_embeddings',
-            'screenshot_ids': [int(value) for value in screenshot_ids],
-        })
-        return response.get('status') == 'success'
 
     def update_screenshot_category(
         self,

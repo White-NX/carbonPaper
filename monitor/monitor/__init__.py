@@ -23,7 +23,6 @@ import uuid
 import base64
 import json
 import logging
-import queue
 import time
 import threading
 
@@ -41,9 +40,6 @@ _last_clustering_auth_check = 0.0
 _last_clustering_session_valid = False
 _clustering_auth_monitor_thread = None
 _clustering_auth_gate_lock = threading.Lock()
-_clustering_ingest_queue = None
-_clustering_ingest_thread = None
-_clustering_ingest_stop = threading.Event()
 _auth_token = None           # Auth token for IPC validation
 _last_seq_no = -1            # Last processed sequence number
 _seen_seq_nos = set()        # Accepted sequence numbers inside the replay window
@@ -142,79 +138,14 @@ def _start_clustering_auth_monitor():
     _clustering_auth_monitor_thread.start()
 
 
-def _start_clustering_ingest_worker(maxsize: int = 128):
-    global _clustering_ingest_queue, _clustering_ingest_thread
-    if _clustering_ingest_thread and _clustering_ingest_thread.is_alive():
-        return
-    _clustering_ingest_queue = queue.Queue(maxsize=max(1, maxsize))
-    _clustering_ingest_stop.clear()
-
-    def _loop():
-        while not _clustering_ingest_stop.is_set():
-            try:
-                item = _clustering_ingest_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            try:
-                if not (_clustering_manager and config.CLUSTERING_ENABLED):
-                    continue
-                if not (_clustering_scheduler_active and _last_clustering_session_valid):
-                    logger.debug(
-                        '[DIAG:clustering_ingest] skipped screenshot_id=%s (session locked/inactive)',
-                        item.get('screenshot_id'),
-                    )
-                    continue
-                started = time.perf_counter()
-                _clustering_manager.add_snapshot(**item)
-                logger.debug(
-                    '[DIAG:clustering_ingest] add_snapshot done screenshot_id=%s elapsed=%.3fs queue_size=%s',
-                    item.get('screenshot_id'),
-                    time.perf_counter() - started,
-                    _clustering_ingest_queue.qsize(),
-                )
-            except Exception as exc:
-                logger.warning(
-                    '[DIAG:clustering_ingest] add_snapshot failed screenshot_id=%s error=%s',
-                    item.get('screenshot_id'),
-                    exc,
-                )
-            finally:
-                _clustering_ingest_queue.task_done()
-
-    _clustering_ingest_thread = threading.Thread(
-        target=_loop,
-        name='clustering-ingest',
-        daemon=True,
-    )
-    _clustering_ingest_thread.start()
-
-
-def _stop_clustering_ingest_worker():
-    global _clustering_ingest_thread, _clustering_ingest_queue
-    _clustering_ingest_stop.set()
-    if _clustering_ingest_thread:
-        _clustering_ingest_thread.join(timeout=2.0)
-    _clustering_ingest_thread = None
-    _clustering_ingest_queue = None
-
-
-def _enqueue_clustering_snapshot(item: dict) -> bool:
-    if not (_clustering_manager and config.CLUSTERING_ENABLED):
-        return False
-    if not (_clustering_scheduler_active and _last_clustering_session_valid):
-        return False
-    if _clustering_ingest_queue is None:
-        _start_clustering_ingest_worker()
-    try:
-        _clustering_ingest_queue.put_nowait(item)
-        return True
-    except queue.Full:
-        logger.warning(
-            '[DIAG:clustering_ingest] queue full; dropped screenshot_id=%s maxsize=%s',
-            item.get('screenshot_id'),
-            _clustering_ingest_queue.maxsize,
-        )
-        return False
+# M2.5 step 5 removed the clustering ingest worker that used to run here.
+# It existed to hand each freshly OCR'd screenshot to
+# `HotColdManager.add_snapshot`, which encoded it with MiniLM and wrote the
+# Chroma hot layer. Rust now owns that encode: it queues the screenshot on the
+# OCR commit, encodes it on an idle-gated worker, and pushes the finished row
+# back through the `upsert_task_vectors` command. Keeping this queue as well
+# would embed every screenshot twice, and the Python half would run on the
+# capture path rather than while the machine is idle.
 
 
 def _delete_vectors_by_hashes(image_hashes):
@@ -521,21 +452,16 @@ def _handle_command_impl(req: dict):
             return {'error': 'OCR postprocess service is not initialised'}
         timeout_secs = int(req.get('timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
         try:
-            result = _ocr_worker.request(
+            # Sensitive-content filtering and classification only. The semantic
+            # index used to be fed from here too, by handing the same payload to
+            # the clustering ingest queue; M2.5 step 5 moved that to the Rust
+            # capture path, which enqueues the screenshot the moment its OCR row
+            # commits and encodes it while the machine is idle.
+            return _ocr_worker.request(
                 'enqueue_ocr_postprocess',
                 {'request': req},
                 timeout=max(30, min(600, timeout_secs)),
             )
-            if result.get('status') == 'success':
-                _enqueue_clustering_snapshot({
-                    'screenshot_id': screenshot_id,
-                    'process_name': req.get('process_name', ''),
-                    'window_title': req.get('window_title', ''),
-                    'ocr_text': req.get('ocr_text', ''),
-                    'timestamp': req.get('timestamp', 0),
-                    'category': '',
-                })
-            return result
         except Exception as e:
             logger.error(
                 '[DIAG:enqueue_ocr_postprocess] failed screenshot_id=%s error=%s',
@@ -760,7 +686,6 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     _clustering_auth_monitor_thread = None
     _last_clustering_auth_check = 0.0
     _last_clustering_session_valid = False
-    _stop_clustering_ingest_worker()
 
     if not pipe_name:
         pipe_name = os.environ.get('CARBON_MONITOR_PIPE')
@@ -825,7 +750,6 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
             _clustering_scheduler = ClusteringScheduler(_clustering_manager, storage_client=sc)
             unlocked = _sync_clustering_scheduler_auth_gate(force=True)
             _start_clustering_auth_monitor()
-            _start_clustering_ingest_worker()
             logger.info('Task clustering service initialised (scheduler_active=%s unlocked=%s)', _clustering_scheduler_active, unlocked)
         else:
             logger.warning('Task clustering service skipped: shared ChromaDB client is None')
@@ -868,7 +792,6 @@ def stop():
     """Shut down the OCR service and IPC server."""
     global _clustering_scheduler_active, _clustering_auth_monitor_thread
     stop_event.set()
-    _stop_clustering_ingest_worker()
     if _clustering_scheduler:
         try:
             _clustering_scheduler.stop()
