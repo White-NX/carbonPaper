@@ -95,6 +95,13 @@ pub struct MonitorState {
     pub game_mode_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     /// Set to true during intentional stop_monitor to suppress the watcher's monitor-exited event
     pub stopping: AtomicBool,
+    /// Whether the Python monitor was spawned with `rerank_runtime = python`,
+    /// i.e. whether its Smart Cluster worker was told to drain the queue.
+    ///
+    /// Read this through [`MonitorState::python_owns_smart_cluster_queue`]
+    /// rather than directly; the flag alone says nothing about whether the
+    /// process it describes is still alive.
+    python_smart_cluster_worker: AtomicBool,
     /// Prevents the monitor from restarting during migration tasks
     pub migration_lock: AtomicBool,
     recovery: Mutex<MonitorRecoveryState>,
@@ -121,10 +128,47 @@ impl MonitorState {
             game_mode_permanently_suppressed: AtomicBool::new(false),
             game_mode_task: Mutex::new(None),
             stopping: AtomicBool::new(false),
+            python_smart_cluster_worker: AtomicBool::new(false),
             migration_lock: AtomicBool::new(false),
             recovery: Mutex::new(MonitorRecoveryState::default()),
             python_ipc_client: AsyncMutex::new(None),
         }
+    }
+
+    /// Record which Smart Cluster drainer the monitor process just spawned was
+    /// told to run, taken from the `CARBONPAPER_RERANK_RUNTIME` value handed to
+    /// it. Cleared when that process goes away.
+    pub fn set_python_smart_cluster_worker(&self, enabled: bool) {
+        self.python_smart_cluster_worker
+            .store(enabled, Ordering::SeqCst);
+    }
+
+    /// Whether the Python worker is, right now, the drainer of
+    /// `smart_cluster_pending`.
+    ///
+    /// The two sides read the `rerank_runtime` switch at different times and
+    /// that difference is not cosmetic. Rust reads the registry on every pass,
+    /// while Python reads `CARBONPAPER_RERANK_RUNTIME` once, at startup
+    /// (`monitor/monitor/__init__.py`), from the value baked into its
+    /// environment at spawn. Setting the key back to `rust` under a monitor
+    /// that was started with `python` would therefore wake the Rust drainer
+    /// within a minute while the Python one keeps running — two workers on one
+    /// queue, scoring the same snapshots with logits from two providers the
+    /// 2026-07-20 audit measured as disagreeing on 20.5% of top-1 results, and
+    /// each deleting queue rows the other is still working through.
+    ///
+    /// So the value the live process was actually given wins until that process
+    /// restarts, and this is what says so. The liveness check is what keeps a
+    /// flag left over from a crashed monitor from silencing the Rust worker
+    /// forever.
+    pub fn python_owns_smart_cluster_queue(&self) -> bool {
+        if !self.python_smart_cluster_worker.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.process
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 }
 
@@ -244,6 +288,9 @@ fn set_monitor_recovery_crashed(
 }
 
 fn cleanup_monitor_runtime_after_unexpected_exit(state: &MonitorState) {
+    // The Python Smart Cluster worker died with its process, so the Rust one
+    // may take the queue back as soon as the switch allows it.
+    state.set_python_smart_cluster_worker(false);
     {
         let mut guard = state.reverse_ipc.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut server) = *guard {
@@ -741,19 +788,20 @@ pub async fn monitor_nl_cluster_query(
     // the Rust branch cannot serve a query the Python branch would have refused.
     crate::commands::check_auth_required(&credential_state)?;
 
-    // M2.5 step 4: the Rust semantic index serves bi-encoder retrieval only.
-    // Reranked queries — every Smart Cluster calibration query — stay on Python
-    // until step 6, because `query_by_text` fuses retrieval and reranking and
-    // the ML protocol exposes no standalone rerank operation.
-    if !enable_rerank {
-        match crate::semantic_query::try_rust_nl_query(&app, &query, n_results).await {
-            crate::semantic_query::RustQueryOutcome::Served(response) => return Ok(response),
-            crate::semantic_query::RustQueryOutcome::NotSelected => {}
-            crate::semantic_query::RustQueryOutcome::FellBack(reason) => {
-                tracing::warn!(
-                    "[SEMANTIC] rust retrieval unavailable, serving from python: {reason}"
-                );
-            }
+    // M2.5 step 6: both halves of the query are Rust-served now. Step 4 took
+    // the bi-encoder path; the reranked path — every Smart Cluster calibration
+    // query — followed once the cross-encoder had a Rust consumer, and it moved
+    // together with the scoring worker that compares against its thresholds.
+    let outcome = if enable_rerank {
+        crate::semantic_query::try_rust_reranked_nl_query(&app, &query, n_results).await
+    } else {
+        crate::semantic_query::try_rust_nl_query(&app, &query, n_results).await
+    };
+    match outcome {
+        crate::semantic_query::RustQueryOutcome::Served(response) => return Ok(response),
+        crate::semantic_query::RustQueryOutcome::NotSelected => {}
+        crate::semantic_query::RustQueryOutcome::FellBack(reason) => {
+            tracing::warn!("[SEMANTIC] rust retrieval unavailable, serving from python: {reason}");
         }
     }
 
@@ -765,25 +813,36 @@ pub async fn monitor_nl_cluster_query(
             "query": query,
             "n_results": n_results,
             "enable_rerank": enable_rerank,
-            "rerank_variant": rerank_variant.unwrap_or_else(|| "q4f16".to_string()),
+            // The only variant `model_management.rs` ever installs, and the only
+            // one `semantic_models.rs` resolves. The old `q4f16` default named a
+            // file that is never on disk, so a caller that omitted the argument
+            // asked Python to load something it could not find.
+            "rerank_variant": rerank_variant
+                .unwrap_or_else(|| crate::rerank::RERANK_VARIANT.to_string()),
         }),
     )
     .await?;
-    if !enable_rerank {
-        // Recorded here, not at the point the Rust path stood down: the
-        // diagnostic answers "who served the last query", and Python has only
-        // now answered. A reranked query never had a Rust path to choose
-        // between, so it leaves the diagnostic alone.
-        crate::semantic_query::observe_python_served();
-    }
+    // Recorded here, not at the point the Rust path stood down: the diagnostic
+    // answers "who served the last query", and Python has only now answered.
+    crate::semantic_query::observe_python_served();
     Ok(crate::semantic_query::tag_python_response(response))
 }
 
 #[tauri::command]
 pub async fn monitor_nl_cluster_reranker_status(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, MonitorState>,
 ) -> Result<Value, String> {
+    // M2.5 step 6: whoever scores answers for the scorer. Asking Python here
+    // while Rust serves the reranked query is wrong in both directions — it
+    // reports "unavailable" whenever Python is stopped or its model copy is
+    // missing, on a calibration screen that would have worked, and it reports
+    // "available" when the file Rust actually loads is absent.
+    if crate::rerank::rust_rerank_selected() {
+        crate::commands::check_auth_required(&credential_state)?;
+        return Ok(crate::rerank::reranker_status_value(&app));
+    }
     authenticated_monitor_command(
         &credential_state,
         &state,
@@ -796,7 +855,30 @@ pub async fn monitor_nl_cluster_reranker_status(
 pub async fn monitor_smart_cluster_worker_status(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, MonitorState>,
+    storage: State<'_, Arc<crate::storage::StorageState>>,
+    worker: State<'_, Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>,
 ) -> Result<Value, String> {
+    // M2.5 step 6: whichever worker owns the queue also answers for it. Asking
+    // Python while Rust drains would report a worker that has not been started
+    // — and the reverse holds too, which is why this asks who actually owns the
+    // queue rather than reading the switch: under a monitor spawned with
+    // `rerank_runtime = python`, the Python worker is the one draining however
+    // the registry key reads now.
+    if crate::rerank::rust_owns_smart_cluster_queue(Some(&state)) {
+        crate::commands::check_auth_required(&credential_state)?;
+        // The queue depth comes from the table rather than from the worker,
+        // which is what Python did too: the count has to be right even when no
+        // pass has run yet this session.
+        let storage = storage.inner().clone();
+        let pending = tokio::task::spawn_blocking(move || storage.count_smart_cluster_pending())
+            .await
+            .map_err(|error| format!("pending count task failed: {error}"))?
+            .unwrap_or(0);
+        return Ok(crate::smart_cluster_scoring::status_value(
+            worker.inner(),
+            pending,
+        ));
+    }
     authenticated_monitor_command(
         &credential_state,
         &state,
@@ -809,7 +891,13 @@ pub async fn monitor_smart_cluster_worker_status(
 pub async fn monitor_smart_cluster_drain_now(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, MonitorState>,
+    worker: State<'_, Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>,
 ) -> Result<Value, String> {
+    if crate::rerank::rust_owns_smart_cluster_queue(Some(&state)) {
+        crate::commands::check_auth_required(&credential_state)?;
+        worker.request_drain_now();
+        return Ok(serde_json::json!({ "status": "success" }));
+    }
     authenticated_monitor_command(
         &credential_state,
         &state,
@@ -822,30 +910,17 @@ pub async fn monitor_smart_cluster_drain_now(
 pub async fn monitor_smart_cluster_stop_drain(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, MonitorState>,
+    worker: State<'_, Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>,
 ) -> Result<Value, String> {
+    if crate::rerank::rust_owns_smart_cluster_queue(Some(&state)) {
+        crate::commands::check_auth_required(&credential_state)?;
+        worker.request_stop_drain();
+        return Ok(serde_json::json!({ "status": "success" }));
+    }
     authenticated_monitor_command(
         &credential_state,
         &state,
         serde_json::json!({ "command": "smart_cluster_stop_drain" }),
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn monitor_smart_cluster_calibrate_preview(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
-    query: String,
-    n_results: Option<u32>,
-) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({
-            "command": "smart_cluster_calibrate_preview",
-            "query": query,
-            "n_results": n_results.unwrap_or(30).min(200),
-        }),
     )
     .await
 }
@@ -1440,6 +1515,17 @@ pub async fn start_monitor_impl(
             .unwrap_or_else(|| crate::registry_config::get_bool("use_onnx").unwrap_or(true));
 
         // Sync persisted feature toggles into the Python monitor at startup.
+        //
+        // M2.5 step 6. Rust owns Smart Cluster scoring by default, and two
+        // drainers on one `smart_cluster_pending` queue would score the same
+        // snapshots twice against the same thresholds — with different logits,
+        // since Python's reranker prefers DirectML and Rust refuses it. Python
+        // reads this once, here, and leaves its worker unstarted. The value is
+        // also remembered on `MonitorState` below, because from that moment on
+        // it, and not the registry key it was read from, is what decides who
+        // owns the queue until this process exits.
+        let python_rerank_runtime = crate::rerank::rerank_runtime();
+        let python_drains_smart_clusters = python_rerank_runtime == "python";
         cmd_proc
             .env(
                 "CARBONPAPER_CLUSTERING_ENABLED",
@@ -1460,6 +1546,7 @@ pub async fn start_monitor_impl(
                     .to_string(),
             )
             .env("CARBONPAPER_USE_ONNX", use_onnx.to_string())
+            .env("CARBONPAPER_RERANK_RUNTIME", &python_rerank_runtime)
             .env(
                 "CARBONPAPER_OCR_TIMEOUT_SECS",
                 crate::registry_config::get_u32("ocr_timeout_secs")
@@ -1630,6 +1717,10 @@ pub async fn start_monitor_impl(
         }
 
         *process_guard = Some(child);
+        // Latched here, next to the handle whose lifetime it describes: from now
+        // until this process exits, the value Python was handed decides who
+        // drains `smart_cluster_pending`, whatever the registry key says later.
+        state.set_python_smart_cluster_worker(python_drains_smart_clusters);
 
         (python_executable, python_exists)
     };
@@ -1987,6 +2078,9 @@ pub async fn stop_monitor_impl(
     }
 
     // 清理状态
+    // The Python Smart Cluster worker stopped with its process; the queue is
+    // the Rust worker's again as soon as the switch allows it.
+    state.set_python_smart_cluster_worker(false);
     {
         let mut guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;

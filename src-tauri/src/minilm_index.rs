@@ -47,6 +47,14 @@
 //! repaired; the Smart Cluster prefilter, which falls back to a live encode for
 //! any id the collection lacks, is unaffected. Closing that gap belongs with
 //! Milestone 4, which is where `task_vectors` is actually consumed.
+//!
+//! **This pass is one of two background users of a single-slot worker.** Smart
+//! Cluster scoring (`smart_cluster_scoring.rs`) polls on the same 60-second
+//! cadence, gates on the same idle signal, and wants a different model from an
+//! engine that keeps one resident. Both therefore claim
+//! `semantic_runtime::BACKGROUND_PASS_GUARD` before touching the worker, and
+//! both stand down between chunks when a foreground query announces itself.
+
 
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
@@ -238,10 +246,12 @@ pub async fn run_semantic_index_worker(app: AppHandle) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        // A manual run holds this for its whole duration. Skipping the tick is
-        // the right answer rather than queuing behind it: the next tick is a
-        // minute away and the manual run is draining the same queue.
-        let Ok(_guard) = PASS_GUARD.try_lock() else {
+        // A manual run, or a Smart Cluster scoring pass, holds this for its
+        // whole duration. Skipping the tick is the right answer rather than
+        // queuing behind it: the next tick is a minute away, and whatever holds
+        // the guard is using the worker this pass would have to evict a model
+        // to reach.
+        let Ok(_guard) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
             continue;
         };
         if let Err(error) = run_pass(&app, PassMode::Idle).await {
@@ -249,12 +259,6 @@ pub async fn run_semantic_index_worker(app: AppHandle) {
         }
     }
 }
-
-/// Serializes the idle worker against a manual run. Two passes claiming from
-/// the same ledger would be safe — leases are compare-and-set — but they would
-/// load the 118 MB model twice and then contend for the single semantic worker,
-/// which is slower than doing the work once.
-static PASS_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// What is allowed to stop a pass.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -315,6 +319,18 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
             PassMode::Manual => "maintenance_in_progress",
             PassMode::Idle => "not_idle",
         }));
+    }
+    // Checked before the retention and repair reads, not only before the
+    // encode. Those reads take the process-wide database mutex, which the
+    // foreground query needs for its own cosine scan, so starting a pass here
+    // would spend part of a 5 s budget on work whose next chance is a minute
+    // away and costs nothing to defer.
+    if mode == PassMode::Idle
+        && app
+            .state::<Arc<SemanticRuntimeState>>()
+            .foreground_waiting()
+    {
+        return Ok(PassOutcome::refused("foreground_query"));
     }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     // Every read below decrypts OCR text, so a locked session can do nothing
@@ -517,12 +533,25 @@ async fn drain_queue(
         // chunk. Release the rest of the leases without charging the retry
         // budget — nothing failed, the window just closed. A manual run has no
         // window to lose, so this only ever fires for it on maintenance mode.
-        if !may_run(app, mode) {
-            let reason = if mode == PassMode::Manual {
+        //
+        // A foreground query is checked separately and for a separate reason.
+        // The idle signal is up to ten seconds stale (`idle.rs` polls
+        // `GetLastInputInfo` every 10 s), while a search arriving a second
+        // after the user touches the keyboard has a 5 s budget to reach the one
+        // semantic worker this loop is occupying. Waiting for `is_idle` to
+        // catch up would spend most of that budget.
+        let stopped = if !may_run(app, mode) {
+            Some(if mode == PassMode::Manual {
                 "maintenance_started"
             } else {
                 "idle_lost"
-            };
+            })
+        } else if mode == PassMode::Idle && semantic.foreground_waiting() {
+            Some("foreground_query")
+        } else {
+            None
+        };
+        if let Some(reason) = stopped {
             release_claims(
                 storage.clone(),
                 Vec::from(std::mem::take(&mut pending)),
@@ -899,14 +928,19 @@ pub async fn semantic_index_run_now(
     crate::commands::check_main_window(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
-    let Ok(_guard) = PASS_GUARD.try_lock() else {
+    // The guard is shared with Smart Cluster scoring now, so this no longer
+    // means only "an index run is already going". The reason string is
+    // interpolated raw into the Settings → Advanced line (`InferenceCards.jsx`)
+    // rather than mapped to a translation key, so widening it costs nothing and
+    // "already_running" would have been wrong half the time.
+    let Ok(_guard) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
         return Ok(SemanticIndexRunSummary {
             started: false,
             indexed: 0,
             failed: 0,
             remaining: None,
             stalled: None,
-            skipped_reason: Some("already_running".to_string()),
+            skipped_reason: Some("semantic_worker_busy".to_string()),
         });
     };
 

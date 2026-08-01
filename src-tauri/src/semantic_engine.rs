@@ -396,6 +396,53 @@ fn tokenized_batch(encodings: Vec<tokenizers::Encoding>) -> Result<TokenizedBatc
     })
 }
 
+/// Upper bound on intra-op threads, however many cores the machine has.
+///
+/// Half the cores is the share; this is the ceiling on that share. Past eight
+/// threads the cross-encoder's scaling has flattened well below linear, so the
+/// extra cores buy little and the pass would be taking a visible fraction of a
+/// large machine for a background job.
+const MAX_INTRA_THREADS: usize = 8;
+
+/// How many CPU threads one ONNX session may use inside a single operator.
+///
+/// This was pinned at 1 until the reranker cutover was measured, and 1 turned
+/// out to be the most expensive constant in the Smart Cluster path. On a
+/// 16-core machine, one realistic 325-token cross-encoder document costs
+/// 1.25 s at one thread, 0.55 s at four, and 0.31 s at eight. The scoring pass
+/// is idle-gated, so the cores it is declining to use are cores nobody wants.
+///
+/// Faster is also *quieter*, which is the part that matters more than
+/// throughput. A background rerank request cannot be interrupted once
+/// submitted, so its duration is exactly how long a foreground NL query can be
+/// stuck behind it (`rerank.rs::BACKGROUND_RERANK_CHUNK`). Halving the
+/// inference time halves that worst-case wait.
+///
+/// Half the cores rather than all of them: the idle signal `idle.rs` publishes
+/// is refreshed every 10 s, so a pass can still be running for a few seconds
+/// after the user comes back, and what they must not walk into is a machine
+/// with every core busy. `available_parallelism` failing is not worth an error
+/// — one thread is the old behavior and always works.
+fn intra_threads() -> usize {
+    if let Ok(raw) = std::env::var("CARBONPAPER_ONNX_INTRA_THREADS") {
+        if let Ok(threads) = raw.trim().parse::<usize>() {
+            if threads >= 1 {
+                return threads;
+            }
+        }
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    threads_for_cores(cores)
+}
+
+/// The share itself, separated from where the core count comes from so it can
+/// be checked without an environment variable or a real machine.
+fn threads_for_cores(cores: usize) -> usize {
+    (cores / 2).clamp(1, MAX_INTRA_THREADS)
+}
+
 fn load_session(
     resolved: &ResolvedSemanticModel,
     provider: MlProvider,
@@ -434,7 +481,7 @@ fn load_session(
         .with_optimization_level(optimization)
         .map_err(|error| format!("provider_unavailable: failed to set optimization: {error}"))?;
     let builder = builder
-        .with_intra_threads(1)
+        .with_intra_threads(intra_threads())
         .map_err(|error| format!("provider_unavailable: failed to set intra threads: {error}"))?;
     let builder = builder
         .with_inter_threads(1)
@@ -993,6 +1040,23 @@ fn elapsed_ms(started: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_background_pass_takes_half_the_machine_at_most() {
+        // The pass is idle-gated, so unused cores are cores nobody wants; but
+        // the idle signal is up to 10 s stale (`idle.rs`), so a user who comes
+        // back must not walk into every core busy. Half, capped.
+        assert_eq!(threads_for_cores(16), 8);
+        assert_eq!(threads_for_cores(8), 4);
+        assert_eq!(threads_for_cores(4), 2);
+        // Past the cap the extra cores buy little and cost visibility.
+        assert_eq!(threads_for_cores(64), MAX_INTRA_THREADS);
+        // Never zero: `with_intra_threads(0)` would hand ONNX Runtime a value
+        // it reads as "pick for me", which is the whole machine.
+        assert_eq!(threads_for_cores(1), 1);
+        assert_eq!(threads_for_cores(2), 1);
+        assert_eq!(threads_for_cores(0), 1);
+    }
 
     #[test]
     fn directml_only_advertises_models_that_pass_the_parity_gate() {

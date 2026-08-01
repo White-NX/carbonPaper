@@ -31,6 +31,7 @@ mod power;
 mod python;
 mod python_launcher;
 mod registry_config;
+mod rerank;
 mod resource_utils;
 mod reverse_ipc;
 mod reverse_ipc_protocol;
@@ -41,6 +42,7 @@ mod semantic_query;
 #[allow(dead_code)]
 mod semantic_runtime;
 mod sensitive_filter;
+mod smart_cluster_scoring;
 mod storage;
 mod updater;
 
@@ -819,6 +821,9 @@ pub fn run() {
         .manage(lightweight_state.clone())
         .manage(Arc::new(PowerState::new()))
         .manage(Arc::new(IdleState::new()))
+        .manage(Arc::new(
+            smart_cluster_scoring::SmartClusterWorkerState::default(),
+        ))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
@@ -984,6 +989,18 @@ pub fn run() {
                             minilm_index::run_semantic_index_worker(app_handle_semantic_index)
                                 .await;
                         });
+
+                        // M2.5 step 6: Rust owns Smart Cluster scoring, which
+                        // had to move with the calibration threshold it compares
+                        // against. Idle-gated like the indexer, and inert while
+                        // `rerank_runtime = python` hands the queue back.
+                        let app_handle_smart_cluster = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            smart_cluster_scoring::run_smart_cluster_worker(
+                                app_handle_smart_cluster,
+                            )
+                            .await;
+                        });
                     }
                 } else {
                     tracing::error!("Storage initialization deferred: public key unavailable");
@@ -1121,7 +1138,6 @@ pub fn run() {
             monitor::monitor_smart_cluster_worker_status,
             monitor::monitor_smart_cluster_drain_now,
             monitor::monitor_smart_cluster_stop_drain,
-            monitor::monitor_smart_cluster_calibrate_preview,
             monitor::monitor_presidio_set_language,
             monitor::monitor_classify_debug,
             ml_runtime::get_ml_ocr_status,

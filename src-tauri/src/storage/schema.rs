@@ -899,6 +899,17 @@ impl StorageState {
                 threshold REAL NOT NULL DEFAULT 0.0,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 dominant_color TEXT,
+                threshold_model_id TEXT,
+                threshold_model_revision TEXT,
+                threshold_variant TEXT,
+                threshold_provider TEXT,
+                threshold_calibrated_at TIMESTAMP,
+                threshold_rederive_failed_scorer TEXT,
+                anchor_vector BLOB,
+                anchor_vector_dimensions INTEGER,
+                anchor_vector_source_hash TEXT,
+                anchor_vector_model_id TEXT,
+                anchor_vector_model_revision TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -973,6 +984,72 @@ impl StorageState {
              CREATE INDEX IF NOT EXISTS idx_smart_cluster_summaries_updated_at ON smart_cluster_summaries(updated_at);
              CREATE INDEX IF NOT EXISTS idx_smart_cluster_pending_queued_at ON smart_cluster_pending(queued_at);",
         ).map_err(|e| format!("Failed to create smart_cluster indices: {}", e))?;
+
+        // M2.5 step 6 — threshold provenance, added here rather than with the
+        // other column migrations above because those run before this table
+        // exists. A Smart Cluster threshold is derived from calibration rerank
+        // scores and then compared against by the background worker, so the two
+        // sides have to agree on which scorer produced the number. Every
+        // threshold written before this existed came from the Python reranker;
+        // these columns are NULL for those rows, which is exactly how the
+        // re-derivation pass recognizes them. Four columns rather than one,
+        // because the model, its revision, the quantization variant, and the
+        // execution provider each move the logits independently.
+        Self::add_column_if_missing(conn, "smart_clusters", "threshold_model_id", "TEXT")?;
+        Self::add_column_if_missing(conn, "smart_clusters", "threshold_model_revision", "TEXT")?;
+        Self::add_column_if_missing(conn, "smart_clusters", "threshold_variant", "TEXT")?;
+        Self::add_column_if_missing(conn, "smart_clusters", "threshold_provider", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "smart_clusters",
+            "threshold_calibrated_at",
+            "TIMESTAMP",
+        )?;
+
+        // The verdict "this cluster's saved examples cannot produce a threshold
+        // under scorer X", recorded so the worker stops paying for the answer.
+        // Re-deriving costs a 570 MB cross-encoder load, and a cluster whose
+        // positive examples were deleted fails that derivation every time it is
+        // attempted — without this column, once a minute forever. It holds the
+        // scorer the attempt was made under rather than a bare flag, so a
+        // different build retries once instead of inheriting a verdict that was
+        // never about it; it is cleared whenever the examples are re-saved or a
+        // threshold is written, which are the two things that can change the
+        // answer.
+        Self::add_column_if_missing(
+            conn,
+            "smart_clusters",
+            "threshold_rederive_failed_scorer",
+            "TEXT",
+        )?;
+
+        // The cluster's anchor, already encoded by the bi-encoder.
+        //
+        // Not a speed-up of the encode itself, which is two milliseconds for a
+        // sentence. What it removes is a *model swap*: the scoring pass needs
+        // MiniLM to encode the anchors and the cross-encoder to score, the
+        // engine holds exactly one model resident, and the anchors were
+        // re-encoded at the head of every batch — so every batch paid to load
+        // MiniLM (0.50 s) and then load the 570 MB cross-encoder back over it
+        // (1.2 s warm). On a queue deep enough to need a hundred batches that
+        // is most of a forced drain's wall-clock budget spent swapping.
+        //
+        // Invalidation is by content rather than by call site: the row records
+        // the hash of the anchor text the vector was made from and the model
+        // that made it, and a mismatch on either re-encodes. Nothing has to
+        // remember to clear this when a cluster is edited, which is the failure
+        // mode that made re-encoding look like the safer option in the first
+        // place.
+        Self::add_column_if_missing(conn, "smart_clusters", "anchor_vector", "BLOB")?;
+        Self::add_column_if_missing(conn, "smart_clusters", "anchor_vector_dimensions", "INTEGER")?;
+        Self::add_column_if_missing(conn, "smart_clusters", "anchor_vector_source_hash", "TEXT")?;
+        Self::add_column_if_missing(conn, "smart_clusters", "anchor_vector_model_id", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "smart_clusters",
+            "anchor_vector_model_revision",
+            "TEXT",
+        )?;
 
         // Staging table for bitmap index migration (same structure as blind_bitmap_index)
         Self::create_table_if_missing(

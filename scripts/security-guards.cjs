@@ -25,7 +25,6 @@ const COMMAND_TIERS = {
   'monitor::monitor_smart_cluster_worker_status': 'session_required',
   'monitor::monitor_smart_cluster_drain_now': 'session_required',
   'monitor::monitor_smart_cluster_stop_drain': 'session_required',
-  'monitor::monitor_smart_cluster_calibrate_preview': 'session_required',
   'monitor::monitor_presidio_set_language': 'session_required',
   'monitor::monitor_classify_debug': 'session_required',
   'monitor::monitor_remove_local_anchors_by_process': 'session_required',

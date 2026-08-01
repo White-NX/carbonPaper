@@ -634,6 +634,11 @@ export const getSmartClusterWorkerStatus = async () => {
                 pending_count: response.pending_count || 0,
                 running: !!response.is_running,
                 forceRunning: !!response.is_force_running,
+                // M2.5 step 6: clusters the Rust scorer refused to score because
+                // their stored threshold came from the retired Python scorer and
+                // could not be re-derived from the saved calibration examples.
+                // Absent from the Python backend's payload, hence the default.
+                unverifiableThresholds: response.unverifiable_thresholds || 0,
             };
         } catch {
             return { pending_count: 0, running: false };

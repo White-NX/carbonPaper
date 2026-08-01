@@ -5,8 +5,9 @@ data, without breaking OCR or search, and without letting background machine
 learning interfere with whatever the user has in the foreground.
 
 **Current milestone.** Milestone 2, targeted at v0.8.4 Beta. Steps 1-5 of the
-M2.5 cutover sequence are merged; step 6 is in progress on
-`m2/reranker-shadow-cutover`.
+M2.5 cutover sequence are merged; step 6 is implemented on
+`m2/reranker-shadow-cutover` and waiting on an on-machine soak and two measured
+gate numbers.
 
 ---
 
@@ -47,7 +48,7 @@ again.
 | Milestone | Target | Status | What it is waiting on |
 | --- | --- | --- | --- |
 | M1 — Vector semantics and migration baseline | folded into M2 | **DONE** | — |
-| M2 — Rust ONNX inference and per-kind index ownership | v0.8.4 Beta | **IN PROGRESS** — 5 of 10 cutover steps done | reranker + Smart Cluster scoring (step 6), then CLIP (steps 7-9), then BGE shadow (step 10) |
+| M2 — Rust ONNX inference and per-kind index ownership | v0.8.4 Beta | **IN PROGRESS** — 5 of 10 cutover steps merged, step 6 implemented and soaking | step 6's measured latency and reranked-ordering numbers, then CLIP (steps 7-9), then BGE shadow (step 10) |
 | M3 — Smart Cluster worker in Rust | post-v0.8.4 Beta | **PLANNED** (scope reduced) | M2 step 6 |
 | M4 — Task clustering decision | post-M3 | **PLANNED** | M2 (embedding similarity) |
 | M5 — Classification and PII resolution | post-M4 | **PLANNED** | M2-M4 |
@@ -87,7 +88,9 @@ once than by porting each consumer separately.
 Capture, OCR, OCR storage, keyword search, thumbnails, the model asset registry,
 task and Smart Cluster persistence, MCP, app lifecycle — and, as of Milestone 2,
 MiniLM semantic-text inference, the derived embedding store, non-reranked
-semantic retrieval, capture-side semantic indexing, and semantic retention.
+semantic retrieval, capture-side semantic indexing, and semantic retention. On
+the step-6 branch, not yet merged: cross-encoder reranking, Smart Cluster
+calibration, and the Smart Cluster scoring worker.
 
 Specifics worth knowing before touching this area:
 
@@ -121,7 +124,9 @@ Specifics worth knowing before touching this area:
   MCP tool list drops `search_nl` when the Python monitor is not running
   (`mcp_server.rs:435`, `commands/mcp.rs`).
 - **bge-reranker** inference (`monitor/reranker.py`), which serves both Smart
-  Cluster calibration and the Smart Cluster scoring worker.
+  Cluster calibration and the Smart Cluster scoring worker. On `main`. The step-6
+  branch moves both to Rust and keeps this path as the `rerank_runtime = python`
+  rollback.
 - **BGE classification** (`monitor/classifier.py`), invoked from OCR
   post-process (`monitor/monitor/worker_process.py`).
 - **HDBSCAN / PaCMAP task clustering** (`monitor/task_clustering.py`), including
@@ -130,7 +135,8 @@ Specifics worth knowing before touching this area:
   reranked NL query encode (`task_clustering.py:1486`), the hot-layer rebuild
   (`_backfill_from_screenshots`, `task_clustering.py:1237`), and the Smart
   Cluster worker's own encode and live-encode fallback
-  (`smart_cluster_worker.py:296,479`).
+  (`smart_cluster_worker.py:296,479`). The step-6 branch moves the first and the
+  third; the hot-layer rebuild stays until Milestone 4.
 - **Presidio NER** as tier 2 of the MCP output PII filter, default-on
   (`sensitive_filter.rs:73` sets `presidio_enabled: true`; the call site is
   `mcp_server.rs:825-865`).
@@ -351,7 +357,7 @@ Rust inference bridge.
 | M2.2 | Separate Rust semantic runtime | **DONE** |
 | M2.3 | Rust-owned derived embedding storage and ledger | **DONE** 2026-07-21 |
 | M2.4 | Sentinel-triggered MiniLM migration | **DONE** 2026-07-24 |
-| M2.5 | Dual-write, shadow-query, then cut over by capability | **IN PROGRESS** — 5 of 10 steps |
+| M2.5 | Dual-write, shadow-query, then cut over by capability | **IN PROGRESS** — 5 of 10 steps merged, step 6 soaking |
 
 #### M2.1 — Freeze the Python behavior contract — DONE
 
@@ -558,7 +564,7 @@ The cutover sequence, with status:
 | 3 | Rust semantic shadow queries against Chroma, Python authoritative | **DONE** 2026-07-27, harness since retired |
 | 4 | Cut over the **non-reranked** semantic-text retrieval path | **DONE**, merged |
 | 5 | Rust capture-side MiniLM indexing and retention ownership | **DONE** — merged in PR #150 |
-| 6 | Reranker parity and shadow scoring, then cut over Smart Cluster calibration **and the scoring worker together** | **IN PROGRESS** — `m2/reranker-shadow-cutover` |
+| 6 | Reranker parity and shadow scoring, then cut over Smart Cluster calibration **and the scoring worker together** | **IMPLEMENTED, SOAKING** — `m2/reranker-shadow-cutover`; latency measured 2026-08-01 (see below), reranked-ordering numbers outstanding |
 | 7 | CLIP vector export and migration | PLANNED |
 | 8 | Rust CLIP image-encoder dual-write for new captures | PLANNED |
 | 9 | Rust CLIP text-query shadow mode, then cut over `search_nl` and MCP capability reporting | PLANNED |
@@ -593,6 +599,47 @@ artifact, not a divergence: the probe read OCR blocks in geometric order
 (`ORDER BY box_y1`) while the write path encoded them in engine order. The fix
 was to match engine order on the rebuild side. Production clustering vectors were
 never affected.
+
+##### Step 6 — measured cross-encoder latency (2026-08-01)
+
+Measured against a real 10,605-vector corpus and the shipped ONNX session
+configuration, on a 16-logical-core desktop.
+
+| Quantity | Measured |
+| --- | --- |
+| One document, 325 tokens, 1 intra-op thread | 1.18–1.25 s |
+| Same, 4 threads / 8 threads | 0.55 s / 0.31 s |
+| Per-document cost at batch 1 / 2 / 4 / 8 (1 thread) | 1.248 / 1.246 / 1.259 / 1.301 s |
+| Cross-encoder load (544 MB uint8, warm page cache) | 1.2 s |
+| MiniLM load / query encode | 0.50 s / 2 ms |
+| Prefilter pass rate at the shipped 0.40 cutoff | 0.39%–5.04% by anchor |
+
+Three of these changed decisions:
+
+**Batching buys nothing.** Per-document cost is flat to slightly worse from
+batch 1 to batch 8 at every thread count, because the session is sequential with
+one intra-op thread and has no batch parallelism to exploit. `MAX_COMMIT_PAIRS`
+shrinking a commit group to a single snapshot therefore costs no throughput, and
+`BACKGROUND_RERANK_CHUNK` could be lowered for free.
+
+**`BACKGROUND_RERANK_CHUNK` was above the foreground budget, not below it.** Its
+previous value of 4 held the single request slot for 4.72 s against a 5.0 s
+foreground query budget that still had to cover a 0.50 s MiniLM load — a margin
+of −0.22 s. Lowered to 1.
+
+**`with_intra_threads(1)` was the most expensive constant in the path.** Now
+`min(8, cores / 2)`, which is both roughly four times faster and four times more
+responsive when standing down, since a background request cannot be interrupted
+once submitted.
+
+Sequence length drives the cost almost linearly: 54 tokens 0.19 s, 84 tokens
+0.29 s, 190 tokens 0.66 s, 325 tokens 1.18 s. A 600-character OCR snippet — the
+`RERANK_OCR_SNIPPET_CHARS` cap — reaches roughly 325 tokens on mixed
+Chinese-English screen text.
+
+Reranked-ordering parity against the retired Python DirectML scorer is still
+outstanding; the threshold-provenance mechanism is what makes the cutover safe
+without it.
 
 ##### Step 4 — non-reranked retrieval cutover — DONE
 
@@ -825,7 +872,7 @@ vector read would have a second user.
 vector, so the Rust writer makes that call in the same position — which also puts
 the queue entry point in Rust before step 6 needs it.
 
-##### Step 6 — reranker and Smart Cluster scoring — NEXT
+##### Step 6 — reranker and Smart Cluster scoring — IMPLEMENTED, SOAKING
 
 **Scope: the scoring worker moves with the reranker.** An earlier version of this
 plan allowed the Python Smart Cluster worker to keep scoring while calibration
@@ -870,6 +917,158 @@ surface.
    `task_api.js` and `monitor.rs` default to `q4f16` — a variant that is never
    installed. Do not carry the dropdown across the cutover as a live switch.
 
+**What landed.**
+
+- `rerank.rs` — the consumer layer the cross-encoder never had. It holds the
+  document contract both callers share (`process | title | OCR[:600]`, joined on
+  the non-empty parts, `"(empty)"` when nothing survives), the chunking that a
+  64-document protocol cap forces on a path that over-fetches 120, one deadline
+  spanning every chunk, the `rerank_runtime` rollback switch, and
+  `ScorerIdentity` — model, revision, variant, provider — which is the thing a
+  stored threshold is measured against.
+- `semantic_query.rs` — `try_rust_reranked_nl_query` retrieves with the
+  bi-encoder and re-scores with the Rust cross-encoder, in the same two stages,
+  the same over-fetch factor, and the same descending raw-logit sort Python's
+  `query_by_text` performed in one call. The reranked response now names the
+  variant that produced its scores instead of leaving it null.
+- `smart_cluster_scoring.rs` — the Rust drainer of `smart_cluster_pending`.
+  Same three stages as `smart_cluster_worker.py` and the same constants, because
+  those constants produced the thresholds already on disk: MiniLM cosine
+  prefilter at 0.40, cross-encoder rerank of the survivors, assignment above the
+  cluster's threshold; 32 snapshots per idle pass and 128 per forced one, shrunk
+  so `(snapshots × clusters)` stays inside a 4096-pair budget. Idle-gated like
+  the indexer, so it inherits step 5's AC-power rule. A pass that leaves the
+  570 MB cross-encoder resident releases it when it finishes
+  (`semantic_runtime.rs::unload_model`), which is where Python's worker
+  unloaded its own reranker; the unload is conditioned on the reranker actually
+  being the resident model, so it cannot evict the MiniLM session the capture
+  indexer is about to reuse.
+- Storage — `smart_clusters` grows five `threshold_*` columns, written in the
+  same statement as the threshold itself, plus a sixth recording the scorer for
+  which re-derivation has been ruled out. `list_smart_cluster_scoring_targets`
+  reads what the scorer needs in one query, and
+  `get_query_visible_embeddings_by_subjects` reads a whole peeked batch of
+  vectors in one statement rather than taking the database mutex once per
+  screenshot while a foreground query waits behind it.
+- Python — `monitor/monitor/__init__.py` leaves the Smart Cluster worker
+  unstarted unless `CARBONPAPER_RERANK_RUNTIME` says `python`. Two drainers on
+  one queue would score the same snapshots twice, against different logits.
+- Frontend — the ONNX variant dropdown is gone from `NlClusterView`, and the
+  `rerankVariant` argument is gone from `nlClusterQuery`. The loaded variant is
+  still displayed, because "which variant produced this score" stays a real
+  question even when there is only one answer.
+
+**Decision 1 — every threshold on disk records its scorer, and a threshold from
+a retired scorer is re-derived rather than trusted or discarded.** Both other
+options are bad: trusting it applies Python's DirectML logits to Rust's CPU ones
+on a number the user never sees, and discarding it asks every user to redo
+calibration work they already did. So each cluster stores the model, revision,
+variant, and provider that produced its threshold, and a cluster whose recorded
+scorer is absent or different has its threshold recomputed from the calibration
+examples stored beside it — the same positives and negatives the user picked,
+re-scored with the current scorer, through the same formula the calibration UI
+applies. Nothing is invented.
+
+A cluster whose examples can no longer support a threshold — every positive
+screenshot deleted, typically — is **given up on, and said so**: the worker
+counts those clusters, the status payload carries the count, and the Smart
+Cluster screen shows how many stopped being scored and that recalibration is
+what resumes them. A cluster that quietly stops matching is indistinguishable
+from one that has nothing to match.
+
+Giving up is recorded rather than re-decided. Re-derivation loads a 570 MB
+cross-encoder, and a cluster with no positives left fails it identically every
+time, so the verdict — together with the scorer it was reached under — is
+written to the row, and the cluster is skipped from then on without touching the
+model. Re-saving the examples clears it, which is what recalibration does. Only
+a *transient* failure, such as a rerank that errored or timed out, is retried,
+and then only once per pass. When every enabled cluster has been given up on,
+the queued snapshots are dropped for the same reason the no-enabled-clusters
+branch drops them: nothing will ever score them, and holding them would leave a
+queue that grows with every capture and a status line claiming work is pending.
+
+**Decision 1a — the threshold is stamped with the backend that answered the
+calibration query, not with the one the switch selects.** Those are not the same
+thing. `monitor_nl_cluster_query` hands a reranked query to Python whenever the
+Rust path stands down for a reason of its own — `semantic_index` or
+`semantic_runtime` pointing elsewhere, maintenance, an unfinished M2.4
+migration, an empty Rust index, an error mid-query — none of which
+`rerank_runtime` knows about. Reading the switch would therefore stamp Rust's
+CPU identity onto a threshold derived from Python's DirectML logits, and the
+worker would trust it, which is the one outcome the provenance columns exist to
+prevent. The response already reports which engine served it; the frontend
+carries that value into `smart_cluster_create`, and a caller that cannot say
+leaves the columns NULL — indistinguishable from a pre-provenance threshold, and
+repaired the same way.
+
+**Decision 2 — status and rollback move as one surface.** Rather than three new
+Tauri commands, the three that already existed —
+`monitor_smart_cluster_worker_status`, `_drain_now`, `_stop_drain` — branch on
+`rerank_runtime`, and `monitor_nl_cluster_reranker_status` branches with them.
+The frontend contract does not move, and the rollback lever switches status,
+force-run, cancel, and availability reporting together instead of leaving the UI
+talking to one backend about another one's work. The reranker status in
+particular had to move: answered from Python while Rust reranks, it warns
+"unavailable" on a calibration screen that works whenever Python is stopped, and
+stays silent when the file Rust actually loads is missing.
+
+**Decision 3 — the calibration threshold formula is ported exactly, including
+the part that looks like a bug.** `base = min(positive) × 0.85`, then
+`max(base, max(negative) × 1.05)` when negatives exist. Reranker outputs are raw
+logits and are routinely negative, so multiplying a negative ceiling by 1.05
+moves it *down*, and the outer `max` is what keeps `base` standing in that case.
+Ported rather than corrected: changing it is a behavior change to calibration
+against thresholds already on disk, not a porting decision, and it belongs in
+its own change with its own release note.
+
+**What is not yet true.** The code is written, compiles, and passes its unit
+tests; two gate items need a real machine and are the reason this step is
+**SOAKING** rather than DONE:
+
+1. **The foreground latency figure is unmeasured.** The Rust cross-encoder is
+   CPU-only where Python's prefers DirectML, and a calibration query reranks 120
+   documents in two chunks after a possible cold 570 MB model load. The step's
+   own gate asks for a *measured* number, and no such number exists yet.
+   `RERANK_QUERY_TIMEOUT` is set to 120 s to cover the cold-load worst case,
+   which is a deadline, not a measurement.
+2. **Reranked end-to-end ordering has not been compared against Python.** The
+   release gate returns overlap@10 and top-1 agreement to pass/fail status at
+   this step. The shadow harness was deleted at step 4, so this is an offline
+   comparison to run before the cutover ships, not something the runtime
+   reports.
+
+**Decision 4 — the two background passes are serialized, and both give the
+worker up to the user.** Review of the soaking build found the scoring worker
+sharing nothing with the capture indexer it was modeled on. Both poll every
+60 seconds, both gate on the same idle signal, and both were spawned seconds
+apart, so they wake in the same window; but they want different models from an
+engine that keeps exactly one resident, and every swap re-reads the model file,
+re-hashes it in full (`semantic_models.rs::verify_model_files` — 570 MB for the
+cross-encoder), and rebuilds the ONNX session. Running them at once does not
+double throughput, it makes each pass evict the other's session. The guard that
+already existed for this was private to `minilm_index.rs`; it is now
+`semantic_runtime::BACKGROUND_PASS_GUARD` and both loops claim it. An idle tick
+that loses it skips, and a forced drain waits.
+
+The same review found the foreground path exposed to the background one.
+`acquire_request_slot` is a single slot held for a whole request, a background
+rerank could hold it for the length of a 64-document CPU batch, and an NL query
+has five seconds — which covers the wait, not just the encode. The idle signal
+cannot solve this: `idle.rs` polls `GetLastInputInfo` every ten seconds, so it
+learns the user is back well after the search they typed has already given up.
+So a foreground query now announces itself directly
+(`SemanticRuntimeState::foreground_lease`), background passes check that between
+clusters and between rerank chunks, and the background chunk is four documents
+rather than sixty-four, because a request in flight cannot be interrupted and
+the chunk size therefore *is* the worst-case foreground wait. A forced drain
+keeps the full chunk and does not yield: it is a button the same user pressed.
+
+Chunk size cannot move a score — a cross-encoder evaluates each pair
+independently, which is what made the existing batching legitimate — so this is
+a scheduling change and not a scoring one. The value of four is conservative
+pending the measurement item above; it is the constant to revisit once there is
+a real per-document CPU latency figure to divide the foreground budget by.
+
 ##### Configuration surface
 
 Enum backends, not ambiguous booleans, because inference and index ownership cut
@@ -879,8 +1078,30 @@ over at different times:
 | --- | --- | --- |
 | `semantic_runtime` | `python` \| `rust` | `rust` |
 | `semantic_index` | `chroma` \| `dual` \| `rust` | `rust` |
+| `rerank_runtime` | `python` \| `rust` | `rust` (step 6) |
 | `clip_runtime` | `python` \| `rust_shadow` \| `rust` | not yet introduced |
 | `clip_index` | `chroma` \| `dual` \| `rust` | not yet introduced |
+
+`rerank_runtime` is one lever for two consumers on purpose. Calibration and the
+background scorer must not be split across backends, so the switch moves the
+reranked query, the scoring worker, the worker status command, and the reranker
+availability report together — and it is passed to Python as
+`CARBONPAPER_RERANK_RUNTIME`, which is what keeps the Python worker from
+starting a second drainer on the same queue.
+
+**Changing `rerank_runtime` takes effect on the Smart Cluster queue only after
+the monitor process restarts.** The two sides read it at different times: Rust
+reads the registry on every pass, Python reads the environment variable once, at
+startup. So the value the running monitor was spawned with is what decides who
+drains `smart_cluster_pending`, and Rust honors that rather than the key —
+otherwise setting the key back to `rust` under a monitor started with `python`
+would wake a second drainer beside a live one, with each deleting queue rows the
+other is still working through and the two scoring the same snapshots on
+providers the 2026-07-20 audit measured as disagreeing on 20.5% of top-1
+results. `MonitorState::python_owns_smart_cluster_queue` is that arbitration;
+the worker writes the resulting arrangement to the log whenever it changes,
+including the interval where the switch says `python` but the monitor predates
+it and nothing is draining at all.
 
 Invalid or unavailable Rust configurations fall back observably for one release,
 with a local diagnostic explaining why. `rust_shadow` is retired from
@@ -980,9 +1201,12 @@ Smart Cluster — user-controllable, natural-language-anchored, already
 Rust-persisted in `storage/smart_cluster.rs` — is a **different system** from
 unsupervised task clustering. Do not conflate the two.
 
-**Where the code is.** Persistence and schema are Rust. The scoring worker
-`monitor/smart_cluster_worker.py` and `monitor/reranker.py` are still Python, and
-`monitor_smart_cluster_worker_status` (`monitor.rs:796`) forwards to Python.
+**Where the code is.** Persistence and schema are Rust. On `main`, the scoring
+worker `monitor/smart_cluster_worker.py` and `monitor/reranker.py` are still
+Python and `monitor_smart_cluster_worker_status` forwards to Python; M2.5 step 6
+moves the drain, the scoring, the status command, and the force-run and cancel
+levers to Rust and leaves the Python path reachable as the `rerank_runtime`
+rollback.
 
 **Scope reduced 2026-07-29.** The pending-queue drain and the reranker scoring
 move earlier, in M2.5 step 6, because the calibration threshold and the
@@ -992,14 +1216,16 @@ there. What remains here is the surface around that scorer.
 **Work.**
 
 - Keep the current good behavior intact: idle gate before load, idle re-check
-  during batches, manual force-run, reranker unload after idle, per-cluster
-  threshold assignment.
-- Port the status command, force-run, and queue plumbing.
+  during batches, manual force-run, reranker unload after a pass, per-cluster
+  threshold assignment. *(All carried across in M2.5 step 6; keep them intact.)*
+- Port the status command, force-run, and queue plumbing. *(Done in M2.5
+  step 6.)*
 - Add cheap assignment explainability if practical: prefilter score, rerank
-  score, threshold, model id and version.
-- Remove `monitor/smart_cluster_worker.py` from the default runtime path once the
-  Rust drain has run for a release. Keep the SQLite schema unless a migration is
-  clearly needed.
+  score, threshold, model id and version. The threshold's scorer identity is
+  already stored per cluster as of step 6, so this is now mostly a read.
+- Delete `monitor/smart_cluster_worker.py` and the `rerank_runtime = python`
+  rollback once the Rust drain has run for a release. Keep the SQLite schema
+  unless a migration is clearly needed.
 
 **Release gate.**
 
@@ -1259,8 +1485,9 @@ for at least one release.
 | --- | --- |
 | Python OCR recognition | **Eligible now.** Rust OCR has been default and Milestone 1 confirmed nothing else depends on it. Remove the dormant engine and its runtime handshake. The rest of `ocr_service.py` still does post-process — remove only the recognition path. |
 | Python Chinese-CLIP inference | **Retained capability, not a demotion.** Remove its Python inference only after both Rust CLIP encoders are default for one release, existing vectors are migrated, new captures are Rust-indexed, and the `search_nl` parity and rollback gates pass. The `screenshots` collection is migrated, never silently dropped or routinely re-encoded. |
-| Python MiniLM inference and Chroma semantic retrieval | Only after the relevant Milestone 2 capability is stable for one release. Note the three surviving Python MiniLM call sites listed in section 3 — the reranked query encode, the hot-layer rebuild, and the Smart Cluster worker — which move at step 6 and Milestones 3-4. Keep Chroma and any dual-write needed by `task_vectors` and `task_centroids` until the Milestone 4 decision is complete. |
-| Python bge-reranker inference | Remove from calibration and from the Smart Cluster scoring path together, after the M2.5 step 6 parity and cutover gates. Remove the remaining worker surface after Milestone 3. |
+| Python MiniLM inference and Chroma semantic retrieval | Only after the relevant Milestone 2 capability is stable for one release. Note the three surviving Python MiniLM call sites listed in section 3 — the reranked query encode, the hot-layer rebuild, and the Smart Cluster worker — of which the first and third move at step 6 and the second at Milestone 4. Keep Chroma and any dual-write needed by `task_vectors` and `task_centroids` until the Milestone 4 decision is complete. |
+| Python bge-reranker inference | Remove from calibration and from the Smart Cluster scoring path together, after the M2.5 step 6 parity and cutover gates. Step 6 leaves it in place as the `rerank_runtime = python` rollback for one release. Remove the remaining worker surface after Milestone 3. |
+| `monitor_smart_cluster_calibrate_preview` | **DELETED.** It was an auth-guarded Tauri command with no caller outside `api_contracts.test.js`: the calibration screen goes through `nlClusterQuery(..., enableRerank = true)`. The command, its Python handler, its security-guard entry, and its test reference were removed together. |
 | Python BGE classification inference | Do not remove in Milestone 2 merely because the Rust runtime can load BGE. Remove only when Milestone 5 classification uses Rust directly, or while a deliberately supported Python-to-Rust inference bridge is active and tested. |
 | Python Smart Cluster worker | Only after Milestone 3 is stable. |
 | Python HDBSCAN and PaCMAP | Only after Milestone 4 is stable. |
@@ -1277,6 +1504,7 @@ latest before the capability's first production release.
 | --- | --- |
 | MiniLM shadow toggle, query and document probes, `semantic_shadow_samples`, `semantic_doc_encoder_runs`, the settings card | **DELETED** with the M2.5 step-4 cutover. Tables are dropped in `storage/schema.rs`. |
 | The `rust_shadow` value of `semantic_runtime` | **DELETED** — normalizes to the shipped default. |
+| The reranker ONNX variant selector (`rerankVariant` argument, `available_variants` dropdown) | **DELETED** with M2.5 step 6. Only `model_uint8.onnx` is installed and the Rust engine pins it, so the selector offered choices that could not load and the `q4f16` default named a file that is never on disk. The loaded variant is still reported. |
 | Reranker, CLIP, and BGE shadow harnesses | Not yet built. Same rule applies at their own cutovers: enforce deletion **in the cutover PR**, not as an end-of-milestone sweep. An unowned diagnostic panel never gets deleted later. |
 
 When deleting a shadow harness, check for functions the production path has since
@@ -1328,12 +1556,26 @@ rather than hidden. What remains from that step is an on-machine soak — confir
 the backlog figures behave as described across a session lock and an app
 restart, which only a real machine can show.
 
-**Step 6 is in progress on `m2/reranker-shadow-cutover`,** carrying the step-5
-follow-ups with it. It is larger than the numbered list originally implied: it
-cuts over Smart Cluster calibration *and* the scoring worker together, because a
-persisted threshold cannot be produced by one scorer and applied by another.
-Budget for request batching, a measured CPU-only foreground latency figure, and
-threshold provenance recording.
+**Step 6 is implemented on `m2/reranker-shadow-cutover`,** carrying the step-5
+follow-ups with it. It cuts over Smart Cluster calibration *and* the scoring
+worker together, because a persisted threshold cannot be produced by one scorer
+and applied by another, and it stores the scorer identity next to every
+threshold so a number from a retired scorer is re-derived rather than trusted.
+
+Three things stand between it and DONE, and none of them can be settled by
+reading code:
+
+1. **Measure the foreground latency of a reranked calibration query** on a real
+   machine, cold and warm, and record it here. The step's gate asks for a
+   measured number, and the CPU-only cross-encoder is the reason it might not
+   be acceptable.
+2. **Compare reranked end-to-end ordering against Python** offline —
+   overlap@10 and top-1 agreement return to pass/fail status at this step.
+3. **Soak the scoring worker**: confirm that a threshold written by the Python
+   scorer is re-derived on the first pass, that a cluster with no usable
+   examples is reported rather than silently skipped and is not re-attempted on
+   the next pass, and that queue depth and the "run now" and "stop" controls
+   behave through an idle window and an app restart.
 
 **Then the CLIP sequence** — steps 7 through 9, in that order, with the
 new-capture dual-write (step 8) landing before the text-query cutover (step 9).
@@ -1367,3 +1609,11 @@ milestone bodies; this is an index so a reversal is not silently re-reversed.
 | 2026-07-30 | Document restructured around milestones. Stale "current reality" claims corrected against the tree: the `ml_contracts` traits have method surfaces but no implementations, the MiniLM shadow harness is already deleted, and Python still runs MiniLM outside the capture path. |
 | 2026-07-31 | **Step 5's battery analysis reversed on a source read.** `idle.rs` was gating on `!PowerState.active`, not on AC power, so the claim "the worker never runs on battery" held only with power saving enabled — where capture stops too, bounding the backlog — and was false with it disabled, where background inference ran on battery unnoticed. The gate now reads `power::is_ac_power_connected` directly. Battery-only machines index on the next AC session or through the new bounded manual run. |
 | 2026-07-31 | Steps 5 and 6 combined onto one branch, `m2/reranker-shadow-cutover`, rather than soaking step 5 separately: step 5 is merged to `main` already, so its follow-ups are ordinary changes rather than a gated cutover. |
+| 2026-07-31 | A Smart Cluster threshold from a retired scorer is **re-derived from its stored calibration examples**, not trusted and not discarded. Every threshold now records the model, revision, variant, and provider that produced it; a cluster whose examples can no longer support one is skipped and counted, and the count is shown to the user. |
+| 2026-08-01 | A calibration threshold records **the backend that answered the query**, taken from the response, not the one `rerank_runtime` selects. The reranked query falls back to Python for reasons that switch does not know about — an unfinished M2.4 migration, an empty Rust index, an index backend pointing at Chroma — so reading the switch stamped Rust's identity onto Python's logits and made the number trusted instead of repaired. Unknown backend records no provenance at all. |
+| 2026-08-01 | A cluster whose threshold **cannot** be re-derived is given up on durably, not retried. The verdict and the scorer it was reached under are stored on the row, so an idle machine stops reloading the 570 MB cross-encoder once a minute to re-reach it; re-saving the examples clears it, and a queue no remaining cluster can score is drained rather than held. |
+| 2026-07-31 | The reranker's availability report and the Smart Cluster worker's status, force-run, and cancel commands branch on `rerank_runtime` together with the scorer itself, instead of each moving on its own schedule. One lever, one backend, no UI talking to two workers at once. |
+| 2026-07-31 | The ONNX `rerank_variant` selector deleted rather than carried across, since only `model_uint8.onnx` is ever installed and the old `q4f16` default named a file that is never on disk. |
+| 2026-08-01 | The scoring pass **commits in small groups instead of at the end of a batch**. A queue entry may only be deleted once every enabled cluster has scored it, and the pass stands down mid-batch whenever the idle gate closes, a foreground query arrives, or a forced drain is cancelled — so deleting at the end put the next pass back at the same queue head, which `peek_smart_cluster_pending_batch` reads `ORDER BY queued_at ASC`. A machine whose idle windows were shorter than a batch takes to score would have repeated the same work indefinitely and never reached a newly captured screenshot. A group is bounded in `(snapshot × cluster)` pairs, which is what costs cross-encoder time, and grouping cannot move a score. |
+| 2026-08-01 | **The Python worker that is actually running outranks the `rerank_runtime` key.** Rust reads the registry every pass, Python reads its environment once at spawn, so setting the key back to `rust` under a monitor started with `python` would have started a second drainer beside a live one — both writing assignments and deleting each other's queue rows, on providers that disagree on 20.5% of top-1 results. Ownership is now decided by the value the live monitor was handed, the status, force-run, and cancel commands route by the same rule, and the arrangement is logged whenever it changes — including the interval where a rollback is set but no monitor has restarted to enact it. |
+| 2026-08-01 | `semantic_runtime` deliberately does **not** gate the Smart Cluster scoring pass. It selects which runtime answers an NL query; the scoring pass has no Python side to fall back to, since its prefilter vectors live in the Rust derived store and the Python worker only starts when `rerank_runtime` handed it the queue at spawn. Honoring it there would stop the queue being drained by anyone rather than move the work. |

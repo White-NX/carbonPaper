@@ -1083,6 +1083,7 @@
     "statusEnabled": "enabled",
     "statusPending": "Pending:",
     "idleWarning": "The background worker runs only when the system is idle.",
+    "unverifiableThresholds": "{{count}} cluster(s) have a match threshold that cannot be re-derived for the current scoring model, so they are not being scored. Recalibrate them to resume.",
     "noClusters": "No smart clusters yet",
     "noClustersHint": "Create a smart cluster to auto-archive related snapshots",
     "createFirst": "Create first cluster",

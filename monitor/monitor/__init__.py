@@ -767,8 +767,17 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     # Start smart cluster worker (idle-aware drain loop). Best-effort: any
     # failure here must not block monitor startup since smart clusters are
     # an optional feature.
+    #
+    # Since M2.5 step 6 Rust owns this queue by default. Two drainers on one
+    # `smart_cluster_pending` table would score the same snapshots twice, and
+    # against different logits — this worker's reranker prefers DirectML while
+    # the Rust engine refuses it for the same model. `CARBONPAPER_RERANK_RUNTIME`
+    # is the one-release rollback: set it to `python` and this worker takes the
+    # queue back, while the Rust one stands down on the same value.
     try:
-        if _clustering_manager is not None and storage_pipe:
+        if os.environ.get('CARBONPAPER_RERANK_RUNTIME', 'rust').strip().lower() != 'python':
+            logger.info('Smart Cluster worker not started: Rust owns scoring')
+        elif _clustering_manager is not None and storage_pipe:
             from smart_cluster_worker import SmartClusterWorker
             from storage_client import get_storage_client
             sc = get_storage_client()

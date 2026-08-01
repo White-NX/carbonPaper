@@ -173,20 +173,32 @@ export async function getTaskClusters() {
 }
 
 /**
- * Natural-language retrieval against the hot-layer MiniLM index (demo).
+ * Natural-language retrieval against the hot-layer MiniLM index.
  * Returns snapshots most similar to the query, ordered by descending similarity.
+ *
+ * The ONNX variant argument is gone as of M2.5 step 6: only `model_uint8.onnx`
+ * is ever installed and the Rust reranker pins it, so the old `q4f16` default
+ * named a file that is never on disk. The backend still reports which variant
+ * produced the scores, in `rerank_variant`.
+ *
+ * `backend` is which engine actually answered — `rust` or `python`. It is not
+ * decoration: a reranked query is a Smart Cluster calibration query, and the
+ * threshold derived from its scores is stored with the scorer that produced
+ * them. The Rust path stands down for several reasons the caller cannot see
+ * (an unfinished M2.4 migration, an empty Rust index, an index backend pointing
+ * at Chroma), so this field is the only honest answer to "whose logits are
+ * these".
+ *
  * @param {string} query
  * @param {number} [nResults=30]
  * @param {boolean} [enableRerank=false] - if true, over-fetches and re-scores with bge-reranker-v2-m3
- * @param {string} [rerankVariant='fp16'] - ONNX variant: 'fp16' | 'q4f16' | 'int8' | 'fp32'
- * @returns {Promise<{results: Array, reranked: boolean, rerank_variant: string|null}>}
+ * @returns {Promise<{results: Array, reranked: boolean, rerank_variant: string|null, backend: string|null}>}
  */
-export async function nlClusterQuery(query, nResults = 30, enableRerank = false, rerankVariant = 'q4f16') {
+export async function nlClusterQuery(query, nResults = 30, enableRerank = false) {
   const result = await withAuth(() => invoke('monitor_nl_cluster_query', {
     query,
     nResults,
     enableRerank,
-    rerankVariant,
   }));
   if (result && result.error) {
     const err = new Error(result.error);
@@ -197,6 +209,7 @@ export async function nlClusterQuery(query, nResults = 30, enableRerank = false,
     results: result?.results || [],
     reranked: !!result?.reranked,
     rerank_variant: result?.rerank_variant || null,
+    backend: result?.backend || null,
   };
 }
 
@@ -247,6 +260,10 @@ export async function getSmartClusterExamples(id) {
  * @param {number} req.threshold
  * @param {string} [req.dominant_color]
  * @param {Array} req.examples - [{ screenshot_id, is_positive, rerank_score }]
+ * @param {string} [req.scorer_backend] - the `backend` the calibration query
+ *   reported, i.e. which reranker produced the scores this threshold was
+ *   derived from. Omitted means "unknown", which the backend records as no
+ *   provenance at all and later repairs by re-deriving the threshold.
  * @returns {Promise<{id: number, enqueued: number}>}
  */
 export async function createSmartCluster(req) {
@@ -314,22 +331,4 @@ export async function smartClusterDrainNow() {
  */
 export async function smartClusterStopDrain() {
   return withAuth(() => invoke('monitor_smart_cluster_stop_drain'), { autoPrompt: true });
-}
-
-/**
- * Run a calibration preview query — same as nlClusterQuery with rerank=true
- * but routed through a dedicated command so future tuning (over-fetch, etc)
- * doesn't affect the explore demo.
- */
-export async function smartClusterCalibratePreview(query, nResults = 30) {
-  const result = await withAuth(() => invoke('monitor_smart_cluster_calibrate_preview', {
-    query,
-    nResults,
-  }), { autoPrompt: true });
-  if (result && result.error) {
-    const err = new Error(result.error);
-    if (result.error.startsWith('RERANKER_UNAVAILABLE')) err.code = 'RERANKER_UNAVAILABLE';
-    throw err;
-  }
-  return result?.results || [];
 }
