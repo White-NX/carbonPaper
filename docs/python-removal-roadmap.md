@@ -678,9 +678,20 @@ release:
   store necessarily encodes the query with the Rust runtime.
 
 Every refusal is recorded with its reason and read back through
-`get_ml_semantic_status.backend`, which the Settings → Advanced "semantic
-retrieval backend" card renders alongside the `semantic_index` switch. Both the
-diagnostic and the rollback are reachable without a registry editor.
+`get_ml_semantic_status.backend`, which the Settings → Advanced card renders
+alongside the `semantic_index` switch. Both the diagnostic and the rollback are
+reachable without a registry editor.
+
+That card was titled "semantic retrieval backend" and its switch "use Rust
+semantic retrieval" until 2026-08-01. Both were wider than the thing they
+control, which is MiniLM retrieval over screenshot *text* — the natural-language
+grouping view and Smart Cluster calibration — while `search_nl` in the main
+search box is Chinese-CLIP over images and does not move until step 9. A user
+reading the old label could not tell which of the two searches the switch
+governed, or whether turning it off stopped indexing (it does not: capture
+indexing is unconditional, and only the read path follows this switch). The
+label, the description, and a second line about what the switch does *not* do
+now say so.
 
 **Coverage is the failure mode this step defends against.** An empty Rust index
 falls back, but a *partially* filled one would not, and ranking an incomplete
@@ -787,16 +798,42 @@ Three consequences, all deliberate and all recorded rather than smoothed over:
    searchable within seconds. The backlog depth and the age of the oldest waiting
    screenshot are reported in the backend diagnostic so the cost is visible
    rather than merely felt.
-2. **A bounded manual run is the second permitted path, and it now exists.**
+2. **A manual run is the second permitted path, and it now exists.**
    Section 4 permits heavy machine learning to gate on idle *or* on an explicit
    manual run; step 5 shipped only the former. `semantic_index_run_now`
-   (`minilm_index.rs`) is the latter: one pass, bounded by both a subject budget
-   and a wall-clock deadline, single-flight against the idle worker through a
-   shared pass guard, and reachable from the Settings → Advanced card next to the
-   backlog number that motivates pressing it. It ignores the idle signal and
-   nothing else — maintenance mode, a locked session, and the ledger's retry
-   budget and backoff all still apply, because the user consenting to spend their
-   own CPU does not make a concurrent rewrite of the derived store safe.
+   (`minilm_index.rs`) is the latter: single-flight against the idle worker
+   through a shared pass guard, and reachable from the Settings → Advanced card
+   next to the backlog number that motivates pressing it. It ignores the idle
+   signal and nothing else — maintenance mode, a locked session, and the
+   ledger's retry budget and backoff all still apply, because the user
+   consenting to spend their own CPU does not make a concurrent rewrite of the
+   derived store safe.
+
+   **Correction (2026-08-01): the run drains the queue; the subject budget that
+   used to cap it at 128 screenshots is removed.** The budget was reasoned from
+   "the user is present, so do not turn one click into half an hour of
+   foreground CPU", and it was paired with a 180-second deadline meant to be the
+   real ceiling. The step-6 measurements make the arithmetic checkable, and it
+   does not hold: MiniLM loads in 0.50 s and encodes a query in 2 ms, so 128
+   subjects finish in seconds and the budget fired roughly two orders of
+   magnitude before the deadline it was supposed to complement. What the user
+   saw was a button that worked for a moment, stopped without saying why, and
+   had to be pressed dozens of times to clear a real backlog.
+
+   Presence is an argument for reporting and interruptibility, not for a fixed
+   stopping point, so that is what replaced it: the pass emits
+   `semantic-index-progress` after each encoded chunk against the queue depth it
+   started with, and `semantic_index_stop_now` ends it within one chunk, putting
+   everything claimed and unencoded back without charging a retry attempt. The
+   deadline stays at a raised 30 minutes as a runaway guard for a run nobody is
+   watching anymore, which is the job it can actually do.
+
+   Removing the budget exposed a second defect and fixed it. The drain loop did
+   not inspect why an inner `drain_queue` stopped, so a failing encode was
+   answered by claiming the next batch and failing identically; with the budget
+   gone that would have walked the entire backlog past a broken worker, charging
+   a retry attempt against every screenshot on the way. The loop now stops on
+   any reason the inner drain reports.
 3. **Battery: resolved, and the original analysis of it was wrong.** The
    pre-implementation note said that because `is_idle` requires AC, "on a laptop
    running on battery the worker never runs" and "the backlog is bounded only by
@@ -1551,10 +1588,13 @@ removed production code.
 
 **M2.5 step 5 is merged** (PR #150), together with its three follow-up items:
 the battery case is decided and the idle gate now reads AC power directly, a
-bounded manual "index now" path exists, and the freshness cost is reported
-rather than hidden. What remains from that step is an on-machine soak — confirm
-the backlog figures behave as described across a session lock and an app
-restart, which only a real machine can show.
+manual "index now" path exists, and the freshness cost is reported rather than
+hidden. That manual path was revised on 2026-08-01 — it drains the queue with a
+progress report and a stop button instead of stopping after 128 screenshots, and
+the settings card it lives on now names the scope it actually covers rather than
+"semantic retrieval" in general. What remains from that step is an on-machine
+soak — confirm the backlog figures behave as described across a session lock and
+an app restart, which only a real machine can show.
 
 **Step 6 is implemented on `m2/reranker-shadow-cutover`,** carrying the step-5
 follow-ups with it. It cuts over Smart Cluster calibration *and* the scoring

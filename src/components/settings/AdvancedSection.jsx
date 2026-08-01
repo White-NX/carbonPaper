@@ -48,8 +48,11 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     semanticStatusLoading,
     semanticIndexRunning,
     semanticIndexRun,
+    semanticIndexProgress,
+    semanticIndexStopping,
     handleToggleRustSemanticIndex,
     handleRunSemanticIndexNow,
+    handleStopSemanticIndex,
     refreshSemanticStatus,
   } = useAdvancedSectionController({ monitorStatus, t });
 
@@ -125,7 +128,10 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         onToggleRustIndex={handleToggleRustSemanticIndex}
         onRefresh={refreshSemanticStatus}
         onRunIndexNow={handleRunSemanticIndexNow}
+        onStopIndexNow={handleStopSemanticIndex}
         indexRunning={semanticIndexRunning}
+        indexStopping={semanticIndexStopping}
+        indexProgress={semanticIndexProgress}
         indexRun={semanticIndexRun}
       />
 

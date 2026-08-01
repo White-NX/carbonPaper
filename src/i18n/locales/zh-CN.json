@@ -292,9 +292,10 @@
         "description": "关闭后将禁用程序的所有外部网络请求，包括检查更新、下载模型等。"
       },
       "semantic_backend": {
-        "title": "语义检索后端",
-        "label": "使用 Rust 语义检索",
-        "description": "关闭后，自然语言检索交回 Python 与 ChromaDB 处理。向量数据保持不变，可以随时切换回来。",
+        "title": "截图文本语义检索",
+        "label": "使用 Rust 检索截图文本",
+        "description": "这里指按含义搜索截图上的文字，使用的是 MiniLM 文本模型，影响自然语言分组视图和智能聚类的标定查询。主搜索框里的自然语言搜索由 Chinese-CLIP 负责，不受这一项影响。",
+        "rollback_note": "关闭后检索交回 Python 与 ChromaDB 处理。向量数据保持不变，后台索引也照常进行，可以随时切换回来。",
         "diagnostic": "本地诊断",
         "refresh": "刷新诊断",
         "last_query": "上次检索由谁完成",
@@ -309,8 +310,12 @@
         "backlog_hint": "语义索引只在电脑空闲且接入电源时进行，因此使用期间截取的画面要等到下一个空闲时段才能被自然语言检索到。",
         "stalled_hint": "这些截图已经用完索引重试次数，不会再被自动处理，在重建索引之前它们不会出现在自然语言检索结果里。",
         "run_now": "立即索引",
-        "run_now_running": "正在索引…",
-        "run_now_hint": "如果这台电脑很少空闲或经常使用电池，可以手动索引一批等待中的截图。",
+        "run_now_hint": "如果这台电脑很少空闲或者经常使用电池，可以在这里手动索引等待中的截图。索引会一直进行到队列清空为止，期间会占用处理器，可以随时停止。",
+        "run_preparing": "正在索引。第一次运行需要先加载模型。",
+        "run_progress": "正在索引：已处理 {{processed}} / {{total}} 张，其中 {{indexed}} 张建立了索引。",
+        "run_stop": "停止",
+        "run_stop_pending": "正在停止…",
+        "run_stopping": "正在停止，当前这一批处理完就会结束。",
         "run_done": "本次索引了 {{indexed}} 张截图，还有 {{remaining}} 张在等待。",
         "run_skipped": "这次没有开始索引：{{reason}}。"
       },

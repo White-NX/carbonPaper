@@ -234,10 +234,16 @@ export function DmlAccelerationCard({
 }
 
 /**
- * Semantic retrieval backend: the rollback lever and the local diagnostic the
+ * Retrieval of screenshot text: the rollback lever and the local diagnostic the
  * enum rule requires. Deliberately small — it reports which backend answered
- * the last natural-language query and why Rust stood down, not a percentile
- * table. The retired shadow card was a development instrument; this is not.
+ * the last query and why Rust stood down, not a percentile table. The retired
+ * shadow card was a development instrument; this is not.
+ *
+ * The scope this card covers is narrower than "semantic search", and the label
+ * says so now. It is the MiniLM path over the text of a screenshot, which
+ * serves the natural-language grouping view and Smart Cluster calibration. The
+ * main search box's natural-language mode is Chinese-CLIP over images and is
+ * untouched by anything here.
  *
  * The one action it carries is the manual indexing run, which exists because
  * capture-side indexing waits for an idle window on mains power. That is the
@@ -252,7 +258,10 @@ export function SemanticBackendCard({
   onToggleRustIndex,
   onRefresh,
   onRunIndexNow,
+  onStopIndexNow,
   indexRunning,
+  indexStopping,
+  indexProgress,
   indexRun,
 }) {
   const { t } = useTranslation();
@@ -271,9 +280,31 @@ export function SemanticBackendCard({
 
   // A finished run says what it did. `started: false` means a guard refused
   // before any encoding happened, which is a different message from "ran and
-  // indexed nothing".
+  // indexed nothing". While it is still going, the per-chunk progress event
+  // takes the same line: the run drains the whole queue now, so on a deep
+  // backlog it can last minutes and a silent line would read as a hang.
+  const progressTotal = indexProgress?.total ?? 0;
+  const progressProcessed = indexProgress?.processed ?? 0;
+  const progressRatio = progressTotal > 0
+    ? Math.min(1, progressProcessed / progressTotal)
+    : null;
+
   let runMessage = null;
-  if (indexRun) {
+  if (indexRunning) {
+    if (indexStopping) {
+      runMessage = t('settings.advanced.semantic_backend.run_stopping');
+    } else if (indexProgress) {
+      runMessage = t('settings.advanced.semantic_backend.run_progress', {
+        processed: progressProcessed,
+        total: progressTotal,
+        indexed: indexProgress.indexed ?? 0,
+      });
+    } else {
+      // Nothing has been encoded yet: the pass is reading the ledger and
+      // loading a 118 MB model, which is the longest silent stretch of a run.
+      runMessage = t('settings.advanced.semantic_backend.run_preparing');
+    }
+  } else if (indexRun) {
     runMessage = indexRun.started
       ? t('settings.advanced.semantic_backend.run_done', {
         indexed: indexRun.indexed ?? 0,
@@ -299,6 +330,9 @@ export function SemanticBackendCard({
             </p>
             <p className="text-xs text-ide-muted mt-1">
               {t('settings.advanced.semantic_backend.description')}
+            </p>
+            <p className="text-xs text-ide-muted mt-1">
+              {t('settings.advanced.semantic_backend.rollback_note')}
             </p>
           </div>
           <SettingsSwitch checked={usesRustIndex} onChange={() => onToggleRustIndex(!usesRustIndex)} />
@@ -352,19 +386,41 @@ export function SemanticBackendCard({
             </p>
           )}
 
-          <div className="pt-1 flex items-center justify-between gap-3">
-            <p className="text-[11px] text-ide-muted leading-snug flex-1">
-              {runMessage || t('settings.advanced.semantic_backend.run_now_hint')}
-            </p>
-            <button
-              onClick={onRunIndexNow}
-              disabled={indexRunning || !usesRustIndex}
-              className="shrink-0 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {indexRunning
-                ? t('settings.advanced.semantic_backend.run_now_running')
-                : t('settings.advanced.semantic_backend.run_now')}
-            </button>
+          <div className="pt-1 flex items-start justify-between gap-3">
+            <div className="flex-1 min-w-0 space-y-1.5">
+              <p className="text-[11px] text-ide-muted leading-snug">
+                {runMessage || t('settings.advanced.semantic_backend.run_now_hint')}
+              </p>
+              {indexRunning && progressRatio !== null && (
+                <div className="w-full bg-ide-panel border border-ide-border rounded-full h-1.5 overflow-hidden">
+                  <div
+                    className="bg-ide-accent h-full transition-all duration-300 ease-out"
+                    style={{ width: `${Math.max(2, progressRatio * 100)}%` }}
+                  />
+                </div>
+              )}
+            </div>
+            {/* Not gated on the switch above. Capture indexing runs whichever
+                backend serves queries, so disabling the only control over it
+                while it keeps running would hide the work rather than stop it. */}
+            {indexRunning ? (
+              <button
+                onClick={onStopIndexNow}
+                disabled={indexStopping}
+                className="shrink-0 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {indexStopping
+                  ? t('settings.advanced.semantic_backend.run_stop_pending')
+                  : t('settings.advanced.semantic_backend.run_stop')}
+              </button>
+            ) : (
+              <button
+                onClick={onRunIndexNow}
+                className="shrink-0 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors"
+              >
+                {t('settings.advanced.semantic_backend.run_now')}
+              </button>
+            )}
           </div>
         </div>
       </div>

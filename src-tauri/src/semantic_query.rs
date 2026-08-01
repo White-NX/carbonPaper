@@ -134,6 +134,15 @@ pub struct SemanticBackendStatus {
     /// Age in seconds of the oldest screenshot still waiting to be encoded.
     /// `None` when nothing is waiting.
     pub index_backlog_age_secs: Option<i64>,
+    /// A manual indexing run is executing right now.
+    ///
+    /// Filled by `get_ml_semantic_status`, which can reach the run state, rather
+    /// than by [`backend_status`], which cannot and is also called from paths
+    /// that must not depend on it. The settings dialog unmounts when the user
+    /// switches tabs, and a run drains the whole queue rather than 128
+    /// screenshots, so "I started this, walked away, and came back" is now an
+    /// ordinary thing to do. This is how the reopened dialog finds out.
+    pub index_run_active: bool,
 }
 
 #[derive(Debug, Default)]
@@ -243,6 +252,9 @@ pub fn backend_status(storage: Option<&StorageState>) -> SemanticBackendStatus {
         index_backlog: backlog.map(|backlog| backlog.claimable),
         index_stalled: backlog.map(|backlog| backlog.exhausted),
         index_backlog_age_secs: backlog.and_then(|backlog| backlog.oldest_claimable_age_secs),
+        // Overwritten by the command; false is the honest answer for every
+        // caller that cannot see the run state.
+        index_run_active: false,
     }
 }
 

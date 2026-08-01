@@ -71,10 +71,10 @@ use crate::storage::{
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Rust keeps the same 30-day window as the Chroma hot layer it replaced, but
 /// decides it against SQLite `created_at` rather than mirroring Python's
@@ -87,8 +87,14 @@ pub const SEMANTIC_TEXT_RETENTION: &str = "-30 days";
 /// queue moving early in an idle window rather than up to an hour into it.
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Subjects encoded per pass. The whole batch goes through one `embed_text`
-/// call, and the ML protocol caps a batch at `MAX_SEMANTIC_BATCH` (32).
+/// Subjects claimed from the ledger per drain.
+///
+/// Claiming is one database round trip that decrypts and rebuilds every
+/// subject's model input, so it is done in batches rather than one job at a
+/// time. The claimed batch is then encoded in `ENCODE_CHUNK`-sized pieces, not
+/// in a single `embed_text` call — this constant bounds a *claim*, and the
+/// protocol's `MAX_SEMANTIC_BATCH` (32) bounds a chunk. An idle pass performs
+/// exactly one drain; a manual run repeats it until the queue empties.
 const DRAIN_BATCH: usize = 16;
 
 /// Subjects per `embed_text` call. A claimed batch is encoded in chunks so the
@@ -120,20 +126,32 @@ const MAINTENANCE_BATCH: u32 = 256;
 /// record carries 384 floats plus the document text as JSON.
 const MIRROR_BATCH: usize = 32;
 
-/// Subjects one manual run may encode before it stops and reports what is left.
+/// Wall-clock ceiling for one manual run, including a cold model load.
 ///
-/// The roadmap permits heavy machine learning to gate on idle *or* on an
-/// explicit manual run, and this is the second of those. It is bounded rather
-/// than "drain everything" for two reasons: the user is present by definition
-/// while it runs, and a machine that has been on battery for a week could
-/// otherwise turn one click into a half-hour of foreground CPU with no way to
-/// tell how much longer it would take. What does not fit is reported back as
-/// `remaining`, and clicking again continues from there.
-const MANUAL_SUBJECT_BUDGET: usize = 128;
+/// This is a runaway guard, not a budget, and the distinction is the whole
+/// point of the constant that used to sit next to it. `MANUAL_SUBJECT_BUDGET`
+/// stopped a run after 128 subjects; against a measured 0.50 s model load and a
+/// query encode of 2 ms it fired roughly two orders of magnitude sooner than
+/// this deadline, so one click did a few seconds of work, stopped without
+/// explanation, and a machine with a real backlog needed dozens of clicks to
+/// clear it. A bound that never binds for the reason it was written for is a
+/// bound in the wrong place.
+///
+/// What replaced it is what a present user actually needs: the run reports its
+/// progress while it goes (`SEMANTIC_INDEX_PROGRESS_EVENT`) and can be stopped
+/// at any point (`semantic_index_stop_now`). This deadline is left to end a run
+/// nobody is watching anymore — the settings dialog closed, the user walked
+/// away — rather than to keep the click short.
+const MANUAL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
-/// Wall-clock ceiling for one manual run, including a cold model load. Whichever
-/// of this and the subject budget is reached first ends the run.
-const MANUAL_DEADLINE: Duration = Duration::from_secs(180);
+/// Progress of the running manual pass, emitted after every encoded chunk.
+///
+/// `total` is the queue depth read once when the run started, so the ratio is
+/// against the backlog the user saw when they pressed the button. It can be an
+/// over-estimate: a job sitting in retry backoff counts as claimable but will
+/// not be claimed this run, so a run may legitimately end before `processed`
+/// reaches it. The finishing summary is what states the outcome.
+pub const SEMANTIC_INDEX_PROGRESS_EVENT: &str = "semantic-index-progress";
 
 /// Ledger reason recorded for a screenshot that is not part of the corpus.
 /// `minilm_sources` is the only place that can establish this, so it is the only
@@ -268,8 +286,8 @@ enum PassMode {
     Idle,
     /// The user asked for this run, so the idle gate does not apply. Every
     /// other guard still does — maintenance mode, the locked session, the
-    /// ledger's retry budget — and the run is bounded in both subjects and
-    /// wall-clock time.
+    /// ledger's retry budget — and the run stops on the user's word or on the
+    /// runaway deadline.
     Manual,
 }
 
@@ -290,6 +308,91 @@ pub struct SemanticIndexRunSummary {
     pub stalled: Option<u64>,
     /// Why the run stopped early, or why it never started.
     pub skipped_reason: Option<String>,
+}
+
+/// Manual-run state shared with the two Tauri commands that drive it.
+///
+/// The run is an async task the "index now" command awaits for its whole
+/// duration, so "stop" cannot be a return value from it and has to be a flag
+/// the pass polls between chunks — the same shape `SmartClusterWorkerState`
+/// uses for its forced drain, and for the same reason.
+///
+/// The counters exist because a run is now open-ended. While it was capped at
+/// 128 subjects a summary at the end was an adequate report; a run that may
+/// legitimately last minutes needs to say so as it goes.
+#[derive(Default)]
+pub struct SemanticIndexRunState {
+    /// A manual pass is executing right now.
+    running: AtomicBool,
+    /// Set by `semantic_index_stop_now`; checked between chunks and between
+    /// drains. Cleared when the next run starts, so a stop that arrives as a
+    /// run is finishing cannot cancel the following one.
+    stop_requested: AtomicBool,
+    /// Subjects that left the queue in this run, encoded or not. This is what
+    /// the progress ratio measures, because it is what actually shrinks the
+    /// backlog — an invalid vector is discarded rather than retried, and a
+    /// screenshot whose text vanished is excluded, neither of which is an
+    /// "indexed" outcome but both of which are progress.
+    processed: AtomicU64,
+    /// Subjects that became query-visible in this run.
+    indexed: AtomicU64,
+    /// Queue depth when this run started.
+    total: AtomicU64,
+}
+
+impl SemanticIndexRunState {
+    /// Ask the running pass to stop after the chunk it is encoding. A chunk is
+    /// four subjects and cannot be interrupted once submitted to the worker, so
+    /// this is prompt rather than immediate.
+    pub fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    fn stopped_by_user(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
+    }
+
+    /// Claim the run and reset its counters. The returned guard clears
+    /// `running` on every path out of the command, including the error one.
+    fn begin(self: &Arc<Self>) -> ActiveRun {
+        self.stop_requested.store(false, Ordering::SeqCst);
+        self.processed.store(0, Ordering::SeqCst);
+        self.indexed.store(0, Ordering::SeqCst);
+        self.total.store(0, Ordering::SeqCst);
+        self.running.store(true, Ordering::SeqCst);
+        ActiveRun(self.clone())
+    }
+
+    /// Record one finished chunk and tell the settings dialog about it.
+    ///
+    /// A dropped event costs a progress line, never correctness: the run's
+    /// summary is the authoritative report, and the dialog reconciles against
+    /// it when the command returns.
+    fn report_chunk(&self, app: &AppHandle, processed: u64, indexed: u64) {
+        let processed_total = self.processed.fetch_add(processed, Ordering::SeqCst) + processed;
+        let indexed_total = self.indexed.fetch_add(indexed, Ordering::SeqCst) + indexed;
+        let _ = app.emit(
+            SEMANTIC_INDEX_PROGRESS_EVENT,
+            serde_json::json!({
+                "processed": processed_total,
+                "indexed": indexed_total,
+                "total": self.total.load(Ordering::SeqCst),
+            }),
+        );
+    }
+}
+
+/// Holds `running` for the lifetime of one manual pass.
+struct ActiveRun(Arc<SemanticIndexRunState>);
+
+impl Drop for ActiveRun {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Whether background semantic work may run right now.
@@ -347,32 +450,62 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
 
     match mode {
         PassMode::Idle => drain_queue(app, storage, mode).await,
-        PassMode::Manual => drain_until_budget(app, storage).await,
+        PassMode::Manual => {
+            // The queue depth the user is about to watch drain, read once and
+            // after the repair pass that can add to it. Re-reading it per chunk
+            // would take the process-wide database mutex several times a second
+            // for a number that only ever goes down.
+            let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
+            let counting = storage.clone();
+            let total = tokio::task::spawn_blocking(move || {
+                counting
+                    .derived_index_backlog(DerivedIndexKind::SemanticText, MAX_ATTEMPTS)
+                    .map(|backlog| backlog.claimable)
+                    .unwrap_or(0)
+            })
+            .await
+            .unwrap_or(0);
+            run.total.store(total, Ordering::SeqCst);
+            drain_until_done(app, storage).await
+        }
     }
 }
 
-/// Drain repeatedly for a manual run, until the queue empties or one of the two
-/// bounds is reached. A single `drain_queue` claims at most `DRAIN_BATCH`, which
-/// is the right size for an idle tick that will come back in a minute, but would
-/// make one click look like it did almost nothing.
-async fn drain_until_budget(
+/// Drain repeatedly for a manual run, until the queue empties, the user stops
+/// it, or something refuses.
+///
+/// A single `drain_queue` claims at most `DRAIN_BATCH`, which is the right size
+/// for an idle tick that will come back in a minute, but would make one click
+/// look like it did almost nothing.
+async fn drain_until_done(
     app: &AppHandle,
     storage: Arc<StorageState>,
 ) -> Result<PassOutcome, String> {
     let deadline = Instant::now() + MANUAL_DEADLINE;
+    let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let mut total = PassOutcome::default();
     loop {
         let pass = drain_queue(app, storage.clone(), PassMode::Manual).await?;
         let drained = pass.indexed + pass.failed;
         total.indexed += pass.indexed;
         total.failed += pass.failed;
+        // A drain that stopped for a reason of its own has already released
+        // what it did not do, and claiming a fresh batch would walk straight
+        // back into the same stop. This mattered less while the subject budget
+        // capped the loop at eight drains; without it, a broken worker would
+        // otherwise be handed the whole backlog batch by batch, charging a
+        // retry attempt against each one on its way through.
+        if let Some(reason) = pass.stopped_because {
+            total.stopped_because = Some(reason);
+            break;
+        }
         if drained == 0 {
             // Nothing claimable left: either the queue is empty or what remains
             // is backing off or out of retries.
             break;
         }
-        if total.indexed + total.failed >= MANUAL_SUBJECT_BUDGET as u64 {
-            total.stopped_because = Some("budget_reached");
+        if run.stopped_by_user() {
+            total.stopped_because = Some("stopped_by_user");
             break;
         }
         if Instant::now() >= deadline {
@@ -524,6 +657,7 @@ async fn drain_queue(
         return Ok(PassOutcome::default());
     }
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let mut pending: VecDeque<ClaimedJob> = claimed.into();
     let mut indexed: Vec<IndexedSubject> = Vec::new();
     let mut outcome = PassOutcome::default();
@@ -532,7 +666,8 @@ async fn drain_queue(
         // The user may have come back since the claim, or since the previous
         // chunk. Release the rest of the leases without charging the retry
         // budget — nothing failed, the window just closed. A manual run has no
-        // window to lose, so this only ever fires for it on maintenance mode.
+        // window to lose, so this only ever fires for it on maintenance mode or
+        // on the stop button.
         //
         // A foreground query is checked separately and for a separate reason.
         // The idle signal is up to ten seconds stale (`idle.rs` polls
@@ -540,7 +675,9 @@ async fn drain_queue(
         // after the user touches the keyboard has a 5 s budget to reach the one
         // semantic worker this loop is occupying. Waiting for `is_idle` to
         // catch up would spend most of that budget.
-        let stopped = if !may_run(app, mode) {
+        let stopped = if mode == PassMode::Manual && run.stopped_by_user() {
+            Some("stopped_by_user")
+        } else if !may_run(app, mode) {
             Some(if mode == PassMode::Manual {
                 "maintenance_started"
             } else {
@@ -567,10 +704,19 @@ async fn drain_queue(
         match encode_chunk(app, &semantic, storage.clone(), chunk).await {
             Ok(mut encoded) => {
                 outcome.indexed += encoded.len() as u64;
+                // The whole chunk left the queue; not all of it necessarily
+                // became a vector, since an invalid one is discarded rather
+                // than retried. Both are progress, only one is an index.
+                if mode == PassMode::Manual {
+                    run.report_chunk(app, chunk_len, encoded.len() as u64);
+                }
                 indexed.append(&mut encoded);
             }
             Err(error) => {
                 outcome.failed += chunk_len;
+                if mode == PassMode::Manual {
+                    run.report_chunk(app, chunk_len, 0);
+                }
                 // Whatever broke the worker will break every remaining chunk the
                 // same way, and charging the retry budget for an attempt that was
                 // never made would spend it on the worker's behalf.
@@ -907,7 +1053,7 @@ fn mirror_record(subject: &IndexedSubject) -> serde_json::Value {
     })
 }
 
-/// Run one bounded indexing pass right now, outside the idle gate.
+/// Run an indexing pass right now, outside the idle gate.
 ///
 /// Section 4 of the removal roadmap permits heavy machine learning to gate on
 /// idle *or* on an explicit manual run; step 5 shipped only the first, which
@@ -916,9 +1062,18 @@ fn mirror_record(subject: &IndexedSubject) -> serde_json::Value {
 /// the second path, and it is deliberately the only thing in the module that
 /// ignores the idle signal.
 ///
-/// What it does not ignore: maintenance mode, a locked session, the ledger's
-/// retry budget and backoff, and the subject/wall-clock bounds. It is
-/// single-flight against itself and against the idle worker.
+/// It drains the queue rather than a slice of it. The user is present by
+/// definition, which is an argument for *reporting and interruptibility* — both
+/// of which this now has — and not, as the removed subject budget assumed, an
+/// argument for stopping after a fixed number of screenshots. What it still
+/// does not ignore: maintenance mode, a locked session, the ledger's retry
+/// budget and backoff, and the runaway deadline. It is single-flight against
+/// itself and against the idle worker.
+///
+/// Note that this does not require `semantic_index = rust`. Capture indexing is
+/// unconditional — the worker in this module writes vectors whichever backend
+/// serves queries — so gating the manual run on the read-path switch would
+/// disable the only control over work that is running either way.
 #[tauri::command]
 pub async fn semantic_index_run_now(
     window: tauri::Window,
@@ -943,6 +1098,9 @@ pub async fn semantic_index_run_now(
             skipped_reason: Some("semantic_worker_busy".to_string()),
         });
     };
+    let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
+    // Held for the rest of the command, so `running` clears on the `?` path too.
+    let _active = run.begin();
 
     let outcome = run_pass(&app, PassMode::Manual).await?;
     let storage = app.state::<Arc<StorageState>>().inner().clone();
@@ -967,6 +1125,35 @@ pub async fn semantic_index_run_now(
     })
 }
 
+/// Ask the running manual pass to stop.
+///
+/// Returns whether there was one to stop, so a dialog reopened after the run
+/// finished on its own does not report a cancellation that never happened.
+///
+/// This halts work and touches no user data, which is why it is not
+/// session-guarded: `stop_monitor` is the precedent, and requiring an unlock to
+/// *stop* something would be exactly backwards on a machine whose session
+/// locked while the run was going.
+///
+/// The pass checks the flag between chunks and between drains, so a stop takes
+/// effect within one chunk of four screenshots. Everything claimed and not yet
+/// encoded goes back to the queue without being charged a retry attempt: the
+/// user interrupting a pass is not those screenshots failing.
+#[tauri::command]
+pub async fn semantic_index_stop_now(
+    window: tauri::Window,
+    app: AppHandle,
+) -> Result<bool, String> {
+    crate::commands::check_main_window(&window)?;
+    let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
+    if !run.is_running() {
+        return Ok(false);
+    }
+    run.request_stop();
+    tracing::info!("[SEMANTIC:INDEX] manual run asked to stop");
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,10 +1169,45 @@ mod tests {
 
     #[test]
     fn a_batch_fits_the_protocol_limit() {
-        // Each chunk of the claimed batch goes through one `embed_text` call.
+        // Each chunk of the claimed batch goes through one `embed_text` call,
+        // and a chunk is carved out of a claim, so both have to fit.
         assert!(ENCODE_CHUNK <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
         assert!(ENCODE_CHUNK <= DRAIN_BATCH);
         assert!(DRAIN_BATCH <= crate::ml_protocol::MAX_SEMANTIC_BATCH);
+    }
+
+    #[test]
+    fn a_run_starts_clean_and_releases_itself() {
+        let state = Arc::new(SemanticIndexRunState::default());
+        assert!(!state.is_running());
+
+        // A stop that arrived while nothing was running — the user pressed it
+        // as the previous run was returning — must not cancel the next run
+        // before it has encoded anything.
+        state.request_stop();
+        {
+            let _active = state.begin();
+            assert!(state.is_running());
+            assert!(!state.stopped_by_user());
+            state.request_stop();
+            assert!(state.stopped_by_user());
+        }
+        // The guard cleared `running`, so the stop command reports honestly
+        // that there was nothing left to stop.
+        assert!(!state.is_running());
+    }
+
+    #[test]
+    fn progress_counts_what_left_the_queue_not_only_what_was_indexed() {
+        // A chunk of four whose fourth vector came back invalid shrinks the
+        // backlog by four and the index by three. Reporting three would leave
+        // the progress line short of the total forever on a corpus with any
+        // discarded subject in it.
+        let state = SemanticIndexRunState::default();
+        state.processed.fetch_add(4, Ordering::SeqCst);
+        state.indexed.fetch_add(3, Ordering::SeqCst);
+        assert_eq!(state.processed.load(Ordering::SeqCst), 4);
+        assert_eq!(state.indexed.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -1100,13 +1322,19 @@ mod tests {
     }
 
     #[test]
-    fn a_manual_run_is_bounded_in_both_dimensions() {
-        // Either bound alone is insufficient. A subject budget without a
-        // deadline lets one click run for as long as a cold model load plus 128
-        // slow encodes takes; a deadline without a subject budget makes the
-        // amount of work done depend on machine speed, which is not something
-        // the user can see before clicking.
-        assert!(MANUAL_SUBJECT_BUDGET >= DRAIN_BATCH);
+    fn the_manual_deadline_outlasts_the_work_it_is_guarding() {
+        // The old assertion here paired a subject budget with this deadline and
+        // argued that neither bound alone was sufficient — a deadline on its own
+        // "makes the amount of work done depend on machine speed, which is not
+        // something the user can see before clicking". That argument was
+        // answered rather than dropped: the run now reports its progress
+        // against the backlog it started with, so how far it gets is something
+        // the user watches instead of predicts, and the stop button ends it
+        // whenever they have seen enough.
+        //
+        // What is left to assert is that the runaway guard cannot fire in the
+        // middle of the first chunk it allowed to start, which would leave a
+        // cold model load having bought nothing.
         assert!(MANUAL_DEADLINE >= EMBED_TIMEOUT);
     }
 

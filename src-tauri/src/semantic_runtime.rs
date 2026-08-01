@@ -1235,8 +1235,15 @@ fn assign_kill_on_close_job(child: &Child) -> Result<SemanticJobHandle, String> 
 pub async fn get_ml_semantic_status(
     state: tauri::State<'_, Arc<SemanticRuntimeState>>,
     storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
+    index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
 ) -> Result<SemanticRuntimeStatus, String> {
     let mut status = state.status();
+    // Read before the blocking call below, so a run that finishes while the
+    // ledger read is queued behind the database mutex is not reported as still
+    // going. Erring towards "finished" is the safe direction: the settings
+    // dialog re-enables its button, and a button pressed against a run that is
+    // in fact still going is refused by the pass guard with a reason.
+    let run_active = index_run.is_running();
     // Filled here rather than in `status()` because the local index count needs
     // the database, and the internal callers of `status()` are on paths that
     // must not touch it. `async` plus `spawn_blocking` is deliberate: the count
@@ -1250,6 +1257,7 @@ pub async fn get_ml_semantic_status(
     })
     .await
     .map_err(|error| format!("Failed to read semantic backend status: {error}"))?;
+    status.backend.index_run_active = run_active;
     Ok(status)
 }
 
