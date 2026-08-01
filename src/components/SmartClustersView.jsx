@@ -396,6 +396,7 @@ export default function SmartClustersView({
         ...s,
         is_running: w.running && w.pending_count > 0,
         is_force_running: w.forceRunning && w.pending_count > 0,
+        unverifiable_thresholds: w.unverifiableThresholds || 0,
       });
     } catch (err) {
       if (isAuthRequiredError(err)) emitAuthRequired();
@@ -638,6 +639,26 @@ export default function SmartClustersView({
             {t('smartClusters.idleWarning', '后台工作线程仅在系统空闲时运行')}
           </span>
         </div>
+
+        {/*
+          A cluster whose threshold came from the retired Python scorer is
+          re-derived from its saved calibration examples. When even that fails —
+          typically because the marked screenshots were deleted — the cluster
+          stops being scored, and saying so is the only way the user can tell a
+          quiet cluster from a broken one.
+        */}
+        {statusData?.unverifiable_thresholds > 0 && (
+          <div className="flex items-center gap-2 px-2.5 py-1.5 bg-amber-500/10 border border-amber-500/30 rounded-lg">
+            <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span className="text-[11px] text-amber-400">
+              {t(
+                'smartClusters.unverifiableThresholds',
+                '{{count}} 个聚类的匹配阈值无法在当前打分模型下重新推导，已暂停打分。请重新校准这些聚类。',
+                { count: statusData.unverifiable_thresholds },
+              )}
+            </span>
+          </div>
+        )}
 
         {error && (
           <div className="flex items-center gap-2 px-2.5 py-1.5 bg-red-500/10 border border-red-500/30 rounded-lg">

@@ -292,9 +292,10 @@
         "description": "When disabled, all external network requests will be blocked, including update checks and model downloads."
       },
       "semantic_backend": {
-        "title": "Semantic retrieval backend",
-        "label": "Use Rust semantic retrieval",
-        "description": "When off, natural-language retrieval is handed back to Python and ChromaDB. Vector data is unaffected, so you can switch back at any time.",
+        "title": "Screenshot text retrieval",
+        "label": "Use Rust to search screenshot text",
+        "description": "This is the search that matches the text on your screenshots by meaning, using the MiniLM text model. It covers the natural-language grouping view and Smart Cluster calibration. Natural-language search in the main search box is served by Chinese-CLIP and is not affected by this setting.",
+        "rollback_note": "When off, retrieval is handed back to Python and ChromaDB. Vector data is unchanged and background indexing continues either way, so you can switch back at any time.",
         "diagnostic": "Local diagnostic",
         "refresh": "Refresh diagnostic",
         "last_query": "Last query served by",
@@ -306,8 +307,17 @@
         "stalled": "Screenshots that failed indexing",
         "fallbacks": "Fallbacks",
         "last_reason": "Last fallback reason",
-        "backlog_hint": "Semantic indexing runs only while the computer is idle, so screenshots captured during active use become searchable by natural language after the next idle period.",
-        "stalled_hint": "These screenshots exhausted their indexing retries and will not be picked up again on their own. They stay out of natural-language search until indexing is rebuilt."
+        "backlog_hint": "Semantic indexing runs only while the computer is idle and on mains power, so screenshots captured during active use become searchable by natural language after the next idle period.",
+        "stalled_hint": "These screenshots exhausted their indexing retries and will not be picked up again on their own. They stay out of natural-language search until indexing is rebuilt.",
+        "run_now": "Index now",
+        "run_now_hint": "If this computer is rarely idle or often on battery, index the waiting screenshots by hand here. A run continues until the queue is empty and uses the processor while it does, so you can stop it at any point.",
+        "run_preparing": "Indexing. The first batch has not finished yet; the first run has to load the model.",
+        "run_progress": "Indexing: {{processed}} of {{total}} processed, {{indexed}} of them indexed.",
+        "run_stop": "Stop",
+        "run_stop_pending": "Stopping…",
+        "run_stopping": "Stopping. The run ends once the current batch finishes.",
+        "run_done": "Indexed {{indexed}} screenshot(s); {{remaining}} still waiting.",
+        "run_skipped": "This run did not start: {{reason}}."
       },
       "onnx": {
         "title": "ONNX Inference (Experimental)",
@@ -1078,6 +1088,7 @@
     "statusEnabled": "enabled",
     "statusPending": "Pending:",
     "idleWarning": "The background worker runs only when the system is idle.",
+    "unverifiableThresholds": "{{count}} cluster(s) have a match threshold that cannot be re-derived for the current scoring model, so they are not being scored. Recalibrate them to resume.",
     "noClusters": "No smart clusters yet",
     "noClustersHint": "Create a smart cluster to auto-archive related snapshots",
     "createFirst": "Create first cluster",

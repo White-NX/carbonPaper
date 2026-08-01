@@ -17,7 +17,6 @@ HANDLED_CLUSTERING_COMMANDS = {
     "smart_cluster_drain_now",
     "smart_cluster_stop_drain",
     "smart_cluster_worker_status",
-    "smart_cluster_calibrate_preview",
     "start_task_vectors_export",
     "get_task_vectors_export_status",
     "export_task_vectors_page",
@@ -287,33 +286,6 @@ def handle_clustering_command(
                 "pending_count": pending_count,
             }
         except Exception as e:
-            return {"error": str(e)}
-
-    if cmd == "smart_cluster_calibrate_preview":
-        service_error = _requires_service(manager=manager)
-        if service_error:
-            return service_error
-        auth_error = _requires_auth(auth_gate)
-        if auth_error:
-            return auth_error
-        query = req.get("query", "")
-        n_results = int(req.get("n_results", 30))
-        try:
-            from task_clustering import ModelNotAvailableError
-            from reranker import RerankerNotAvailableError
-            try:
-                results = manager.query_by_text(
-                    query,
-                    n_results=n_results,
-                    enable_rerank=True,
-                )
-            except ModelNotAvailableError:
-                return {"error": "MiniLM model not downloaded — run clustering setup first"}
-            except RerankerNotAvailableError as e:
-                return {"error": f"RERANKER_UNAVAILABLE: {e}"}
-            return {"status": "success", "results": results}
-        except Exception as e:
-            logger.exception("smart_cluster_calibrate_preview failed")
             return {"error": str(e)}
 
     return None

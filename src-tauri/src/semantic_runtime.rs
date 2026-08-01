@@ -16,7 +16,7 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
@@ -31,6 +31,10 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// Deadline for releasing the resident model. Short on purpose: the worker only
+/// has to drop a session, and a background pass that has already finished its
+/// work must not sit waiting on the cleanup.
+const UNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticRuntimeStatus {
@@ -178,6 +182,10 @@ pub struct SemanticRuntimeState {
     lifecycle_lock: Mutex<()>,
     request_gate: tokio::sync::Mutex<()>,
     next_request_id: AtomicU64,
+    /// Foreground semantic requests currently queued for, or executing on, the
+    /// worker. Read by background callers as the signal to stand down; see
+    /// [`SemanticRuntimeState::foreground_lease`].
+    foreground_waiting: AtomicUsize,
 }
 
 impl Default for SemanticRuntimeState {
@@ -208,7 +216,39 @@ impl SemanticRuntimeState {
             lifecycle_lock: Mutex::new(()),
             request_gate: tokio::sync::Mutex::new(()),
             next_request_id: AtomicU64::new(1),
+            foreground_waiting: AtomicUsize::new(0),
         }
+    }
+
+    /// Announce that a user-facing request wants the worker, for the whole of
+    /// its queue-and-execute window.
+    ///
+    /// The idle gate cannot serve this purpose. `idle.rs` polls
+    /// `GetLastInputInfo` every 10 s, so "the user came back" reaches a
+    /// background loop up to ten seconds late, while the search that follows
+    /// them coming back arrives within a second or two and has a 5 s budget
+    /// (`semantic_query.rs::QUERY_EMBED_TIMEOUT`) that starts counting the
+    /// moment it queues. Background work therefore needs a signal that a
+    /// foreground request exists *now*, which is what this is.
+    ///
+    /// Standing down is advisory and cooperative: the request in flight when the
+    /// lease is taken still runs to completion, because the worker executes a
+    /// request synchronously and nothing can interrupt it mid-inference. What
+    /// the lease buys is that no *further* background request is submitted, so
+    /// the longest a foreground caller waits is one background chunk rather than
+    /// a whole batch — which is why the background rerank chunk is small
+    /// (`rerank.rs::BACKGROUND_RERANK_CHUNK`).
+    pub fn foreground_lease(self: &Arc<Self>) -> ForegroundLease {
+        self.foreground_waiting.fetch_add(1, Ordering::SeqCst);
+        ForegroundLease {
+            state: self.clone(),
+        }
+    }
+
+    /// Whether a foreground request is queued or executing. Background callers
+    /// check this between units of work and stand down when it is true.
+    pub fn foreground_waiting(&self) -> bool {
+        self.foreground_waiting.load(Ordering::SeqCst) > 0
     }
 
     pub async fn embed_text(
@@ -316,6 +356,54 @@ impl SemanticRuntimeState {
                 timings,
             }),
             other => Err(format!("protocol: unexpected reranker response: {other:?}")),
+        }
+    }
+
+    /// Release the resident model without stopping the worker process.
+    ///
+    /// M2.5 step 6. The engine holds exactly one model
+    /// (`semantic_engine.rs`, `loaded: Option<LoadedModel>`), and the
+    /// cross-encoder is 570 MB against MiniLM's 118 MB. The Python Smart Cluster
+    /// worker unloaded its reranker once a drain finished; a background pass in
+    /// Rust does the same, so an idle machine is not left holding half a
+    /// gigabyte because a scoring pass happened to run last.
+    ///
+    /// A no-op when no worker is running or nothing is loaded — otherwise this
+    /// would start a worker process for the sole purpose of telling it to
+    /// release nothing.
+    pub async fn unload_model(self: &Arc<Self>, app: AppHandle) -> Result<(), String> {
+        {
+            let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            if inner.process.is_none() || inner.loaded_model.is_none() {
+                return Ok(());
+            }
+        }
+        let request = MlRequest::Unload {
+            request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
+        };
+        let deadline = Instant::now() + UNLOAD_TIMEOUT;
+        let _request_guard =
+            acquire_request_slot(&self.request_gate, deadline, request.request_id()).await?;
+        // No provider negotiation and no DirectML fallback: unloading is
+        // whatever the running worker already is, and a worker that cannot be
+        // reached has nothing resident to free anyway.
+        let provider = {
+            let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            match inner.process.as_ref() {
+                Some(process) => process.provider,
+                None => return Ok(()),
+            }
+        };
+        let response = self
+            .send_once(&app, provider, request, Arc::new(Vec::new()), deadline)
+            .await?;
+        match response {
+            MlResponse::Unloaded { .. } => {
+                let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+                inner.loaded_model = None;
+                Ok(())
+            }
+            other => Err(format!("protocol: unexpected unload response: {other:?}")),
         }
     }
 
@@ -808,6 +896,42 @@ impl Drop for SemanticRuntimeState {
     }
 }
 
+/// Held for the length of one foreground semantic request. See
+/// [`SemanticRuntimeState::foreground_lease`].
+///
+/// A guard rather than a pair of calls because the foreground paths return
+/// early on a dozen different errors, and a leaked count would stop background
+/// work for the rest of the process's life.
+pub struct ForegroundLease {
+    state: Arc<SemanticRuntimeState>,
+}
+
+impl Drop for ForegroundLease {
+    fn drop(&mut self) {
+        self.state
+            .foreground_waiting
+            .fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Serializes every background pass that drives the semantic worker.
+///
+/// The worker executes one request at a time and the engine keeps exactly one
+/// model resident (`semantic_engine.rs::ensure_loaded` drops the current
+/// session before building the next one), so two background passes wanting
+/// different models do not run twice as fast — they take turns evicting each
+/// other. Each eviction costs a re-read of the model file, a full SHA-256 of it
+/// (`semantic_models.rs::verify_model_files`), and a fresh ONNX session; for
+/// the cross-encoder that file is 570 MB.
+///
+/// Both background loops therefore claim this before doing anything that
+/// touches the worker: capture indexing (`minilm_index.rs`, MiniLM) and Smart
+/// Cluster scoring (`smart_cluster_scoring.rs`, MiniLM anchors then the
+/// cross-encoder). It lives here rather than in either module because neither
+/// owns the other, and a guard private to one of them is exactly the shape this
+/// started as.
+pub static BACKGROUND_PASS_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Wait for exclusive use of the single semantic worker, inside the caller's own
 /// deadline.
 ///
@@ -1111,8 +1235,15 @@ fn assign_kill_on_close_job(child: &Child) -> Result<SemanticJobHandle, String> 
 pub async fn get_ml_semantic_status(
     state: tauri::State<'_, Arc<SemanticRuntimeState>>,
     storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
+    index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
 ) -> Result<SemanticRuntimeStatus, String> {
     let mut status = state.status();
+    // Read before the blocking call below, so a run that finishes while the
+    // ledger read is queued behind the database mutex is not reported as still
+    // going. Erring towards "finished" is the safe direction: the settings
+    // dialog re-enables its button, and a button pressed against a run that is
+    // in fact still going is refused by the pass guard with a reason.
+    let run_active = index_run.is_running();
     // Filled here rather than in `status()` because the local index count needs
     // the database, and the internal callers of `status()` are on paths that
     // must not touch it. `async` plus `spawn_blocking` is deliberate: the count
@@ -1126,6 +1257,7 @@ pub async fn get_ml_semantic_status(
     })
     .await
     .map_err(|error| format!("Failed to read semantic backend status: {error}"))?;
+    status.backend.index_run_active = run_active;
     Ok(status)
 }
 
@@ -1384,5 +1516,47 @@ mod tests {
         assert!(paths
             .iter()
             .any(|path| path == Path::new(r"C:\Windows\System32")));
+    }
+
+    #[test]
+    fn a_foreground_lease_is_visible_to_background_callers_and_released_on_drop() {
+        // The signal the background loops poll. A lease that outlived its
+        // request would stop capture indexing and Smart Cluster scoring for the
+        // rest of the process's life, which is why it is a guard and not a
+        // matched pair of calls.
+        let state = Arc::new(SemanticRuntimeState::new());
+        assert!(!state.foreground_waiting());
+        {
+            let _lease = state.foreground_lease();
+            assert!(state.foreground_waiting());
+        }
+        assert!(!state.foreground_waiting());
+    }
+
+    #[test]
+    fn concurrent_foreground_queries_hold_the_signal_until_the_last_one_finishes() {
+        // Two search boxes, or a retry racing the request it replaced. Counting
+        // rather than flagging is what keeps the first one to finish from
+        // telling the background loops the coast is clear.
+        let state = Arc::new(SemanticRuntimeState::new());
+        let first = state.foreground_lease();
+        let second = state.foreground_lease();
+        assert!(state.foreground_waiting());
+        drop(first);
+        assert!(state.foreground_waiting());
+        drop(second);
+        assert!(!state.foreground_waiting());
+    }
+
+    #[tokio::test]
+    async fn the_background_pass_guard_admits_one_pass_at_a_time() {
+        // Capture indexing and Smart Cluster scoring both claim this. Two
+        // passes wanting different models would take turns evicting a session
+        // rather than finishing sooner, which is the whole reason it is shared
+        // rather than private to either module.
+        let held = BACKGROUND_PASS_GUARD.lock().await;
+        assert!(BACKGROUND_PASS_GUARD.try_lock().is_err());
+        drop(held);
+        assert!(BACKGROUND_PASS_GUARD.try_lock().is_ok());
     }
 }

@@ -867,6 +867,30 @@ fn reranker_missing(base: &Path) -> Vec<String> {
     )
 }
 
+/// Where the pinned cross-encoder is installed, and whether every file it needs
+/// is there — M2.5 step 6.
+///
+/// Existence only, deliberately not the SHA-256 verification
+/// `resolve_semantic_model` performs before a load: this answers a status poll
+/// on the calibration screen, and hashing a 570 MB file on every poll would
+/// cost far more than the query the status describes. A file that exists but
+/// is corrupt still fails at load time, where the error is reported.
+pub fn reranker_install_status() -> (PathBuf, bool) {
+    // The subdirectory comes from the descriptor the loader resolves against,
+    // not from a third copy of the literal, so "installed" cannot end up
+    // describing a directory the engine never looks in.
+    let subdir = crate::semantic_models::descriptor(
+        crate::ml_protocol::MlSemanticModel::BgeRerankerV2M3,
+    )
+    .subdir
+    .unwrap_or_default();
+    let Some(base) = file_in_local_appdata().map(|dir| dir.join("models").join(subdir)) else {
+        return (PathBuf::new(), false);
+    };
+    let installed = reranker_missing(&base).is_empty();
+    (base, installed)
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelVariantStatus {
     pub runtime: &'static str,

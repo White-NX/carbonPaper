@@ -93,13 +93,17 @@ export default function NlClusterView({
   const [nResults, setNResults] = useState(isCalibrate ? 30 : 30);
   // In calibrate mode reranker is always on (we need rerank_score for threshold).
   const [enableRerank, setEnableRerank] = useState(isCalibrate);
-  const [rerankVariant, setRerankVariant] = useState('uint8');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [results, setResults] = useState([]);
   const [reranked, setReranked] = useState(false);
   const [activeVariant, setActiveVariant] = useState(null);
   const [lastQuery, setLastQuery] = useState('');
+  // Which engine produced the scores currently in `scoreById`. Saved alongside
+  // the threshold derived from them, because a reranked query is served by Rust
+  // or by Python depending on conditions this screen cannot see, and the two
+  // disagree enough that a threshold from one cannot be applied to the other.
+  const [lastBackend, setLastBackend] = useState(null);
   const [thumbnailCache, setThumbnailCache] = useState({});
   const [rerankerStatus, setRerankerStatus] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -127,13 +131,7 @@ export default function NlClusterView({
     if (!backendOnline) { setRerankerStatus(null); return; }
     let active = true;
     getRerankerStatus()
-      .then(s => {
-        if (!active) return;
-        setRerankerStatus(s);
-        if (s.available_variants.length) {
-          setRerankVariant(prev => s.available_variants.includes(prev) ? prev : s.available_variants[0]);
-        }
-      })
+      .then(s => { if (active) setRerankerStatus(s); })
       .catch(() => { if (active) setRerankerStatus({ available: false, loaded: false, available_variants: [], model_path: '' }); });
     return () => { active = false; };
   }, [backendOnline]);
@@ -147,17 +145,22 @@ export default function NlClusterView({
     setError(null);
     setResults([]);
     // In calibrate mode, clear selection when starting a fresh query against
-    // a different anchor — but preserve it if the same query is re-run.
+    // a different anchor — but preserve it if the same query is re-run. The
+    // cached scores go with it: they are what the saved threshold is derived
+    // from, and keeping scores from an earlier query would let one threshold
+    // mix numbers produced by two different backends.
     if (isCalibrate && trimmed !== lastQuery) {
       setSelection({});
+      setScoreById({});
     }
     try {
-      const { results: out, reranked: didRerank, rerank_variant: usedVariant } =
-        await nlClusterQuery(trimmed, nResults, enableRerank, rerankVariant);
+      const { results: out, reranked: didRerank, rerank_variant: usedVariant, backend } =
+        await nlClusterQuery(trimmed, nResults, enableRerank);
       setResults(out);
       setReranked(didRerank);
       setActiveVariant(usedVariant);
       setLastQuery(trimmed);
+      setLastBackend(backend);
       // Snapshot scores for threshold computation later.
       const scoreMap = {};
       for (const r of out) {
@@ -171,7 +174,7 @@ export default function NlClusterView({
     } finally {
       setLoading(false);
     }
-  }, [query, nResults, enableRerank, rerankVariant, backendOnline, isCalibrate, lastQuery]);
+  }, [query, nResults, enableRerank, backendOnline, isCalibrate, lastQuery]);
 
   useEffect(() => {
     if (!results.length) return; // Do not clear the cache on empty search results
@@ -212,15 +215,6 @@ export default function NlClusterView({
   }, [results]);
 
   const rerankUnavailable = enableRerank && rerankerStatus && !rerankerStatus.available;
-  const availableVariants = rerankerStatus?.available_variants || [];
-
-  const variantLabel = (v) => ({
-    fp16: 'fp16 (~1.1GB)',
-    q4f16: 'q4f16 (~670MB)',
-    int8: 'int8',
-    uint8: 'uint8 (~570MB)',
-    fp32: 'fp32',
-  }[v] || v);
 
   // Calibrate-mode handlers
   const toggleMark = (screenshotId, kind) => {
@@ -271,6 +265,9 @@ export default function NlClusterView({
         threshold,
         dominant_color: colorFromAnchor(lastQuery),
         examples: [...positives, ...negatives],
+        // Whose logits this threshold was computed from. Not the configured
+        // backend — the one that answered.
+        scorer_backend: lastBackend,
       });
       if (mountedRef.current) {
         // Reset on success
@@ -278,6 +275,7 @@ export default function NlClusterView({
         setResults([]);
         setQuery('');
         setLastQuery('');
+        setLastBackend(null);
       }
     } catch (err) {
       if (mountedRef.current) {
@@ -386,19 +384,13 @@ export default function NlClusterView({
               {t('nlCluster.enableReranker', '启用 reranker')}
             </label>
 
-            {enableRerank && availableVariants.length > 0 && (
-              <select
-                value={rerankVariant}
-                onChange={(e) => setRerankVariant(e.target.value)}
-                disabled={loading}
-                className="px-2 py-1 text-[11px] bg-ide-bg border border-ide-border rounded text-ide-text focus:outline-none focus:border-ide-accent"
-                title={t('nlCluster.onnxVariantTooltip', 'ONNX 变体（切换会触发模型重新加载）')}
-              >
-                {availableVariants.map((v) => (
-                  <option key={v} value={v}>{variantLabel(v)}</option>
-                ))}
-              </select>
-            )}
+            {/*
+              The ONNX variant dropdown is gone as of M2.5 step 6. Only
+              `model_uint8.onnx` is ever installed, and the Rust reranker pins
+              it, so the selector had been offering choices that could not load.
+              The loaded variant is still reported below, because "which
+              variant produced this score" stays a real question.
+            */}
 
             {rerankerStatus?.loaded && rerankerStatus.loaded_variant && (
               <span className="text-[10.5px] text-ide-muted">

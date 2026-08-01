@@ -26,7 +26,6 @@ import {
   mergeTasks,
   nlClusterQuery,
   saveClusteringResults,
-  smartClusterCalibratePreview,
   toggleSmartClusterEnabled,
   updateSmartClusterAnchor,
   updateSmartClusterThreshold,
@@ -54,7 +53,12 @@ describe('API contract payloads', () => {
       .mockResolvedValueOnce({ status: 'success', removed_count: 2 })
       .mockResolvedValueOnce({ status: 'success', deleted: true })
       .mockResolvedValueOnce({ status: 'success', deleted_count: 3 })
-      .mockResolvedValueOnce({ pending_count: 4, is_running: true, is_force_running: false })
+      .mockResolvedValueOnce({
+        pending_count: 4,
+        is_running: true,
+        is_force_running: false,
+        unverifiable_thresholds: 2,
+      })
       .mockResolvedValueOnce({ status: 'success', screenshots_count: 10 })
       .mockResolvedValueOnce({ status: 'success', enqueued: 2 });
 
@@ -66,6 +70,9 @@ describe('API contract payloads', () => {
       pending_count: 4,
       running: true,
       forceRunning: false,
+      // M2.5 step 6: clusters skipped because their stored threshold came from
+      // the retired scorer and could not be re-derived.
+      unverifiableThresholds: 2,
     });
     await getIndexHealth({ refreshVector: true });
     await retryVectorIndexing(12);
@@ -106,49 +113,54 @@ describe('API contract payloads', () => {
 
   it('sends task and natural-language clustering payloads', async () => {
     invoke
-      .mockResolvedValueOnce({ results: [{ id: 1 }], reranked: true, rerank_variant: 'q4f16' })
-      .mockResolvedValueOnce({ results: [{ id: 2 }] })
+      .mockResolvedValueOnce({
+        results: [{ id: 1 }],
+        reranked: true,
+        rerank_variant: 'uint8',
+        backend: 'python',
+      })
       .mockResolvedValueOnce({ task_id: 7, screenshots: [] })
       .mockResolvedValueOnce(99)
       .mockResolvedValueOnce([101, 102]);
 
-    await expect(nlClusterQuery('invoice', 12, true, 'q4f16')).resolves.toEqual({
+    // `backend` survives the wrapper: a reranked query is a Smart Cluster
+    // calibration query, and the threshold derived from these scores is stored
+    // with the scorer that produced them. Here the Rust path stood down and
+    // Python answered even though Rust reranking is the configured default,
+    // which is the case the field exists for.
+    await expect(nlClusterQuery('invoice', 12, true)).resolves.toEqual({
       results: [{ id: 1 }],
       reranked: true,
-      rerank_variant: 'q4f16',
+      rerank_variant: 'uint8',
+      backend: 'python',
     });
-    await expect(smartClusterCalibratePreview('invoice', 8)).resolves.toEqual([{ id: 2 }]);
     await getRelatedScreenshots(42, 6);
     await mergeTasks([1, 2]);
     await saveClusteringResults([{ label: 'Work', screenshot_ids: [42] }]);
 
+    // No `rerankVariant` key: M2.5 step 6 pinned the variant in Rust, and the
+    // old `q4f16` default named a file that is never installed.
     expect(invoke).toHaveBeenNthCalledWith(1, 'monitor_nl_cluster_query', {
       query: 'invoice',
       nResults: 12,
       enableRerank: true,
-      rerankVariant: 'q4f16',
     });
-    expect(invoke).toHaveBeenNthCalledWith(2, 'monitor_smart_cluster_calibrate_preview', {
-      query: 'invoice',
-      nResults: 8,
-    });
-    expect(invoke).toHaveBeenNthCalledWith(3, 'storage_get_related_screenshots', {
+    expect(invoke).toHaveBeenNthCalledWith(2, 'storage_get_related_screenshots', {
       screenshotId: 42,
       limit: 6,
     });
-    expect(invoke).toHaveBeenNthCalledWith(4, 'storage_merge_tasks', {
+    expect(invoke).toHaveBeenNthCalledWith(3, 'storage_merge_tasks', {
       taskIds: [1, 2],
     });
-    expect(invoke).toHaveBeenNthCalledWith(5, 'storage_save_clustering_results', {
+    expect(invoke).toHaveBeenNthCalledWith(4, 'storage_save_clustering_results', {
       tasks: [{ label: 'Work', screenshot_ids: [42] }],
     });
 
-    expect(withAuth).toHaveBeenCalledTimes(5);
+    expect(withAuth).toHaveBeenCalledTimes(4);
     expectWithAuth(1);
-    expectWithAuth(2, { autoPrompt: true });
-    expectWithAuth(3);
+    expectWithAuth(2);
+    expectWithAuth(3, { autoPrompt: true });
     expectWithAuth(4, { autoPrompt: true });
-    expectWithAuth(5, { autoPrompt: true });
   });
 
   it('sends smart cluster CRUD payloads', async () => {
@@ -158,6 +170,10 @@ describe('API contract payloads', () => {
       anchor_text: 'Invoices',
       threshold: 0.72,
       examples: [{ screenshot_id: 42, is_positive: true, rerank_score: 0.91 }],
+      // The backend the calibration query reported. Forwarded verbatim: the
+      // Rust command stamps the threshold with the scorer that actually
+      // produced these scores rather than with the configured one.
+      scorer_backend: 'rust',
     };
 
     await createSmartCluster(createRequest);

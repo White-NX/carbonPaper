@@ -985,6 +985,11 @@ fn process_request(
                     "is_idle": s.is_idle.load(Ordering::SeqCst),
                     "idle_secs": s.idle_secs.load(Ordering::SeqCst),
                     "fullscreen_exclusive": s.fullscreen_exclusive.load(Ordering::SeqCst),
+                    // Additive. The Python Smart Cluster worker gates on
+                    // `is_idle` alone, which already accounts for battery; this
+                    // is here so a log line from that worker can say which of
+                    // the three signals closed the gate.
+                    "ac_connected": s.ac_connected.load(Ordering::SeqCst),
                 })),
                 None => StorageResponse::error("IdleState not initialised"),
             }

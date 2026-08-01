@@ -5,12 +5,26 @@
 //!   1. Time since last keyboard/mouse input (`GetLastInputInfo`)
 //!   2. Foreground window is a non-browser fullscreen application
 //!      (reuses `capture::check_foreground_fullscreen`)
-//!   3. AC power connected (reuses `power::is_ac_power_connected` semantics
-//!      via the power state's `active` flag)
+//!   3. AC power connected, read directly from `power::is_ac_power_connected`
 //!
 //! Emits a `system-idle-changed` Tauri event whenever the composite state
-//! flips. Heavy ML work (smart cluster reranker, future LLM evaluators)
-//! gates on this signal so foreground apps and games are never disturbed.
+//! flips. Heavy ML work (smart cluster reranker, MiniLM capture indexing,
+//! future LLM evaluators) gates on this signal so foreground apps and games are
+//! never disturbed.
+//!
+//! **On the third signal.** This used to be read indirectly, as
+//! `!PowerState.active` — a flag that only rises when the user has left power
+//! saving mode *enabled* and the machine then loses AC. That made the gate mean
+//! two different things depending on a setting nobody connected to background
+//! inference: with power saving on, unplugging closed the gate (and stopped
+//! capture with it, so no backlog accumulated); with power saving off,
+//! unplugging left the gate wide open and a 118 MB model load ran on battery.
+//! The condition is now the power state itself, so "background machine learning
+//! does not run on battery" holds in both configurations. `power_saving_active`
+//! stays observable in the diagnostic, because it explains *why* capture
+//! stopped, which is a different question from why indexing did.
+
+use crate::power::is_ac_power_connected;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -31,6 +45,10 @@ pub struct IdleState {
     pub idle_secs: AtomicU64,
     /// Whether the foreground window is a fullscreen exclusive app (e.g. game).
     pub fullscreen_exclusive: AtomicBool,
+    /// Whether the machine is on AC power. Read from `GetSystemPowerStatus`,
+    /// not inferred from the power-saving setting, and fail-safe `true` when
+    /// Windows cannot answer — a desktop with no battery must not look unplugged.
+    pub ac_connected: AtomicBool,
     /// Whether the composite idle gate is open.
     pub is_idle: AtomicBool,
     /// Set to true when the monitor task should stop. The currently-running
@@ -47,6 +65,7 @@ impl IdleState {
         Self {
             idle_secs: AtomicU64::new(0),
             fullscreen_exclusive: AtomicBool::new(false),
+            ac_connected: AtomicBool::new(true),
             is_idle: AtomicBool::new(false),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             monitor_task: Mutex::new(None),
@@ -97,6 +116,14 @@ fn is_foreground_fullscreen_exclusive() -> bool {
     }
 }
 
+/// The composite gate, in one place so the monitor loop and its tests cannot
+/// drift apart. All three signals are required: the user has been away, no
+/// exclusive fullscreen application owns the screen, and the machine is on
+/// mains power.
+fn composite_idle(idle_secs: u64, fullscreen: bool, ac_connected: bool) -> bool {
+    idle_secs >= IDLE_THRESHOLD_SECS && !fullscreen && ac_connected
+}
+
 /// Start the idle monitor loop. Emits `system-idle-changed` on state flips.
 ///
 /// Idempotent: if a previous monitor task is running it is signalled to
@@ -134,18 +161,19 @@ pub fn start_idle_monitor(app: AppHandle) {
                 break;
             }
 
-            // Win32 calls (GetLastInputInfo + foreground/monitor lookup)
-            // are synchronous and can block briefly on contended desktops;
-            // run them on a blocking thread so the async runtime keeps
-            // dispatching reverse-IPC, monitor heartbeats etc.
+            // Win32 calls (GetLastInputInfo + foreground/monitor lookup +
+            // GetSystemPowerStatus) are synchronous and can block briefly on
+            // contended desktops; run them on a blocking thread so the async
+            // runtime keeps dispatching reverse-IPC, monitor heartbeats etc.
             let probe = tokio::task::spawn_blocking(|| {
                 let secs = get_idle_seconds();
                 let fullscreen = is_foreground_fullscreen_exclusive();
-                (secs, fullscreen)
+                let ac_connected = is_ac_power_connected();
+                (secs, fullscreen, ac_connected)
             })
             .await;
 
-            let (idle_secs, fullscreen) = match probe {
+            let (idle_secs, fullscreen, ac_connected) = match probe {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("idle probe join failed: {}", e);
@@ -153,14 +181,16 @@ pub fn start_idle_monitor(app: AppHandle) {
                 }
             };
 
-            // AC connected? Pull from PowerState. If power_saving is currently
-            // active (== AC unplugged), the worker should also stop.
-            let ac_connected = match app_clone.try_state::<Arc<crate::power::PowerState>>() {
-                Some(power_state) => !power_state.active.load(Ordering::SeqCst),
-                None => true, // fail-safe: assume AC connected if state missing
+            // Recorded for the diagnostic only. Power saving stops capture when
+            // it activates; the gate below is about whether background
+            // inference may run, which is a separate question with a separate
+            // answer on a machine whose owner turned power saving off.
+            let power_saving_active = match app_clone.try_state::<Arc<crate::power::PowerState>>() {
+                Some(power_state) => power_state.active.load(Ordering::SeqCst),
+                None => false,
             };
 
-            let is_idle = idle_secs >= IDLE_THRESHOLD_SECS && !fullscreen && ac_connected;
+            let is_idle = composite_idle(idle_secs, fullscreen, ac_connected);
 
             // Update state atomics
             let st = match app_clone.try_state::<Arc<IdleState>>() {
@@ -172,6 +202,7 @@ pub fn start_idle_monitor(app: AppHandle) {
             };
             st.idle_secs.store(idle_secs, Ordering::SeqCst);
             st.fullscreen_exclusive.store(fullscreen, Ordering::SeqCst);
+            st.ac_connected.store(ac_connected, Ordering::SeqCst);
             st.is_idle.store(is_idle, Ordering::SeqCst);
 
             // Emit event only on state flips to keep noise low.
@@ -183,14 +214,16 @@ pub fn start_idle_monitor(app: AppHandle) {
                         "idle_secs": idle_secs,
                         "fullscreen_exclusive": fullscreen,
                         "ac_connected": ac_connected,
+                        "power_saving_active": power_saving_active,
                     }),
                 );
                 tracing::info!(
-                    "Idle state changed: is_idle={} idle_secs={} fullscreen={} ac={}",
+                    "Idle state changed: is_idle={} idle_secs={} fullscreen={} ac={} power_saving_active={}",
                     is_idle,
                     idle_secs,
                     fullscreen,
-                    ac_connected
+                    ac_connected,
+                    power_saving_active
                 );
                 last_emitted_idle = Some(is_idle);
             }
@@ -221,6 +254,47 @@ pub fn get_idle_state(idle_state: tauri::State<'_, Arc<IdleState>>) -> serde_jso
         "is_idle": idle_state.is_idle.load(Ordering::SeqCst),
         "idle_secs": idle_state.idle_secs.load(Ordering::SeqCst),
         "fullscreen_exclusive": idle_state.fullscreen_exclusive.load(Ordering::SeqCst),
+        "ac_connected": idle_state.ac_connected.load(Ordering::SeqCst),
         "threshold_secs": IDLE_THRESHOLD_SECS,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The composite rule, extracted so the three signals can be asserted
+    /// without a desktop session. The monitor loop calls the same function.
+    fn gate(idle_secs: u64, fullscreen: bool, ac_connected: bool) -> bool {
+        composite_idle(idle_secs, fullscreen, ac_connected)
+    }
+
+    #[test]
+    fn battery_closes_the_gate_regardless_of_the_power_saving_setting() {
+        // The regression this pins down: `ac_connected` used to be derived from
+        // `PowerState.active`, which stays false when the user has turned power
+        // saving off. A laptop on battery then read as "AC connected" and ran a
+        // 118 MB model load in the background. The power-saving setting is not
+        // an input to this function at all anymore, which is the point.
+        assert!(!gate(IDLE_THRESHOLD_SECS, false, false));
+        assert!(!gate(IDLE_THRESHOLD_SECS * 10, false, false));
+    }
+
+    #[test]
+    fn all_three_signals_are_required() {
+        assert!(gate(IDLE_THRESHOLD_SECS, false, true));
+        assert!(!gate(IDLE_THRESHOLD_SECS - 1, false, true));
+        assert!(!gate(IDLE_THRESHOLD_SECS, true, true));
+    }
+
+    #[test]
+    fn a_fresh_state_reads_as_on_ac_and_not_idle() {
+        // `ac_connected` fails safe to true so a desktop whose power status
+        // cannot be queried is not treated as a laptop on battery, while
+        // `is_idle` fails safe to false so nothing heavy runs before the first
+        // probe has been taken.
+        let state = IdleState::new();
+        assert!(state.ac_connected.load(Ordering::SeqCst));
+        assert!(!state.is_idle.load(Ordering::SeqCst));
+    }
 }

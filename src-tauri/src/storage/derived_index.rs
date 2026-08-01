@@ -724,6 +724,61 @@ impl StorageState {
         .collect()
     }
 
+    /// Fetch the query-visible vectors for a set of subjects in one statement.
+    ///
+    /// The Smart Cluster prefilter needs a whole peeked batch of vectors at
+    /// once, and calling [`Self::get_query_visible_embedding`] per subject would
+    /// take and release the process-wide database mutex once per screenshot
+    /// while a foreground query waits behind it.
+    ///
+    /// Subjects with no visible row are simply absent from the map. That is the
+    /// normal case, not an error: a screenshot whose semantic vector has not
+    /// been encoded yet is queued in the ledger and will be scored on a later
+    /// pass, which is exactly what the caller does with a missing entry.
+    pub fn get_query_visible_embeddings_by_subjects(
+        &self,
+        index_kind: DerivedIndexKind,
+        subject_keys: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>, String> {
+        let mut out = std::collections::HashMap::new();
+        if subject_keys.is_empty() {
+            return Ok(out);
+        }
+        for subject_key in subject_keys {
+            validate_required_text("subject_key", subject_key, MAX_SUBJECT_KEY_BYTES)?;
+        }
+        let guard = self.get_connection_named("get_query_visible_embeddings_by_subjects")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        // Chunked to stay under SQLite's default 999-parameter ceiling, with
+        // one slot reserved for `index_kind`.
+        for chunk in subject_keys.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql =
+                visible_embedding_sql(&format!("AND e.subject_key IN ({placeholders})"), "");
+            let mut statement = conn
+                .prepare(&sql)
+                .map_err(|error| format!("Failed to prepare derived embedding batch: {error}"))?;
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+            let kind = index_kind.as_str();
+            params.push(&kind);
+            for subject_key in chunk {
+                params.push(subject_key);
+            }
+            let rows = statement
+                .query_map(params.as_slice(), map_embedding_row(index_kind))
+                .map_err(|error| format!("Failed to query derived embeddings: {error}"))?;
+            for row in rows {
+                let row = row
+                    .map_err(|error| format!("Failed to read derived embedding row: {error}"))?;
+                let record = decode_embedding_row(index_kind, row)?;
+                out.insert(record.job.subject_key.clone(), record.vector);
+            }
+        }
+        Ok(out)
+    }
+
     /// Count query-visible embeddings for one index kind. Reported for
     /// `semantic_text` in the Settings → Advanced backend diagnostic, where it
     /// is the local half of "how much of the corpus can Rust actually rank".
@@ -3591,6 +3646,94 @@ mod tests {
         let (_temp, storage) = test_storage();
         assert!(storage.semantic_text_topk(&[], 5).is_err());
         assert!(storage.semantic_text_topk(&[1.0, 0.0], 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn batch_vector_reads_return_only_query_visible_subjects() {
+        // The Smart Cluster prefilter reads a whole peeked batch at once. Two
+        // properties matter and neither is obvious from the signature: a
+        // subject whose rebuild is pending must not come back (its vector is
+        // stale), and a subject that was never indexed must be silently absent
+        // rather than an error, because that is the ordinary case for a
+        // screenshot still queued in the ledger.
+        let (_temp, storage) = test_storage();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "1"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "2"),
+            vec![0.0, 1.0],
+        )
+        .unwrap();
+        let pending = job(DerivedIndexKind::SemanticText, "3");
+        ensure_active_subject(&storage, &pending);
+        storage.upsert_derived_index_job(&pending).unwrap();
+
+        let subjects: Vec<String> = ["1", "2", "3", "999"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let vectors = storage
+            .get_query_visible_embeddings_by_subjects(DerivedIndexKind::SemanticText, &subjects)
+            .unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors.get("1").map(Vec::as_slice), Some([1.0, 0.0].as_slice()));
+        assert_eq!(vectors.get("2").map(Vec::as_slice), Some([0.0, 1.0].as_slice()));
+        assert!(!vectors.contains_key("3"), "a pending rebuild is not visible");
+        assert!(!vectors.contains_key("999"), "an unknown subject is absent");
+
+        // And the empty batch is not a query at all.
+        assert!(storage
+            .get_query_visible_embeddings_by_subjects(DerivedIndexKind::SemanticText, &[])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_batch_vector_read_agrees_with_the_single_subject_read() {
+        // The batch path duplicates `visible_embedding_sql`'s predicate, so it
+        // could drift from the single-subject reader that defines what
+        // "query-visible" means. This pins them together.
+        let (_temp, storage) = test_storage();
+        let spec = job(DerivedIndexKind::SemanticText, "7");
+        commit_vector(&storage, spec.clone(), vec![0.6, 0.8]).unwrap();
+
+        let single = storage
+            .get_query_visible_embedding(DerivedIndexKind::SemanticText, "7")
+            .unwrap()
+            .expect("committed vector is visible");
+        let batch = storage
+            .get_query_visible_embeddings_by_subjects(
+                DerivedIndexKind::SemanticText,
+                &["7".to_string()],
+            )
+            .unwrap();
+        assert_eq!(batch.get("7"), Some(&single.vector));
+
+        // Invalidating the model hides the row from both readers together.
+        storage
+            .invalidate_derived_index_model(
+                DerivedIndexKind::SemanticText,
+                &spec.model_id,
+                "revision-2",
+                spec.embedding_version,
+            )
+            .unwrap();
+        assert!(storage
+            .get_query_visible_embedding(DerivedIndexKind::SemanticText, "7")
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .get_query_visible_embeddings_by_subjects(
+                DerivedIndexKind::SemanticText,
+                &["7".to_string()]
+            )
+            .unwrap()
+            .is_empty());
     }
 
     fn data_epoch(storage: &StorageState) -> i64 {

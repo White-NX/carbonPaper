@@ -30,8 +30,13 @@ impl PowerState {
     }
 }
 
-/// Check if AC power is connected (not on battery)
-fn is_ac_power_connected() -> bool {
+/// Check if AC power is connected (not on battery).
+///
+/// Also the third input to the idle gate (`idle.rs`), which is why it is
+/// crate-visible rather than private: background inference must decide on the
+/// power state itself, not on whether the power-saving *setting* happens to
+/// have activated.
+pub(crate) fn is_ac_power_connected() -> bool {
     // SAFETY: `status` is initialized writable storage of the exact Win32 structure
     // type, and `GetSystemPowerStatus` does not retain its pointer.
     unsafe {

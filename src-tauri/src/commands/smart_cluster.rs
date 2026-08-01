@@ -37,6 +37,11 @@ pub struct CreateSmartClusterRequest {
     pub threshold: f64,
     pub dominant_color: Option<String>,
     pub examples: Vec<SmartClusterExample>,
+    /// Which backend served the calibration query these scores came from, as
+    /// reported in that query's `backend` field. Absent when the caller cannot
+    /// say, which is recorded as "no provenance" rather than guessed at.
+    #[serde(default)]
+    pub scorer_backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +106,24 @@ pub async fn smart_cluster_create(
         let anchor = normalize_anchor_text(&req.anchor_text)?;
         let id =
             state.create_smart_cluster(&anchor, req.threshold, req.dominant_color.as_deref())?;
+        // M2.5 step 6: stamp the scorer that produced this threshold — meaning
+        // the one that actually served the calibration query, which the caller
+        // reports back from that query's `backend` field. Reading the
+        // `rerank_runtime` switch instead would be a guess: `monitor_nl_cluster_query`
+        // hands a reranked query to Python whenever the Rust path stands down
+        // for a reason of its own — `semantic_index` or `semantic_runtime` set
+        // to something else, maintenance, an unfinished M2.4 migration, an empty
+        // Rust index, or an error mid-query — and a threshold derived from
+        // Python's DirectML logits stamped with Rust's CPU identity is the one
+        // outcome the provenance columns exist to prevent, because it is trusted
+        // instead of repaired.
+        if let Some(scorer) = scorer_stamp_for_backend(req.scorer_backend.as_deref()) {
+            state.update_smart_cluster_threshold_with_scorer(id, req.threshold, &scorer)?;
+        }
+        // No stamp at all when the backend is unknown. The provenance columns
+        // stay NULL, which reads exactly like a threshold written before they
+        // existed and routes the cluster into re-derivation on the worker's
+        // first pass — the repair path, rather than a fabricated identity.
         state.save_smart_cluster_examples(id, &req.examples)?;
 
         // Backfill — enqueue every non-deleted screenshot in the hot window for
@@ -111,6 +134,58 @@ pub async fn smart_cluster_create(
     })
     .await
     .map_err(|e| format!("Task execution failed: {}", e))?
+}
+
+/// The scorer identity for a threshold derived from scores a given backend
+/// produced. `None` when the backend is unknown or unrecognized.
+fn scorer_stamp_for_backend(
+    backend: Option<&str>,
+) -> Option<crate::storage::smart_cluster::SmartClusterScorer> {
+    match backend {
+        Some("rust") => {
+            let scorer = crate::rerank::ScorerIdentity::current();
+            Some(crate::storage::smart_cluster::SmartClusterScorer {
+                model_id: scorer.model_id,
+                model_revision: scorer.model_revision,
+                variant: scorer.variant,
+                provider: scorer.provider,
+            })
+        }
+        Some("python") => Some(python_scorer()),
+        _ => None,
+    }
+}
+
+/// Python picks its provider at load time and does not report it back, so the
+/// honest record is "the Python reranker, provider unknown" — which can never
+/// match the Rust identity and therefore never gets silently reused.
+fn python_scorer() -> crate::storage::smart_cluster::SmartClusterScorer {
+    crate::storage::smart_cluster::SmartClusterScorer {
+        model_id: "bge-reranker-v2-m3".to_string(),
+        model_revision: "python".to_string(),
+        variant: crate::rerank::RERANK_VARIANT.to_string(),
+        provider: "python".to_string(),
+    }
+}
+
+/// The scorer a number read off the screen right now was produced by.
+///
+/// Used for a hand-adjusted threshold, where the scores the user is reading are
+/// the ones already stored on the assignments — and those come from whichever
+/// worker the `rerank_runtime` switch has draining the queue. Not usable for
+/// calibration, where the query has its own reasons to fall back to Python; see
+/// `scorer_stamp_for_backend`.
+fn configured_scorer() -> crate::storage::smart_cluster::SmartClusterScorer {
+    if crate::rerank::rust_rerank_selected() {
+        let scorer = crate::rerank::ScorerIdentity::current();
+        return crate::storage::smart_cluster::SmartClusterScorer {
+            model_id: scorer.model_id,
+            model_revision: scorer.model_revision,
+            variant: scorer.variant,
+            provider: scorer.provider,
+        };
+    }
+    python_scorer()
 }
 
 /// Deletes cluster `id` and its dependent data.
@@ -144,6 +219,13 @@ pub fn smart_cluster_update_anchor(
 /// Changes the match threshold for cluster `id`.
 ///
 /// Authentication: required. Returns JSON `null`. Frontend: `lib/task_api.js`.
+///
+/// A hand-adjusted threshold is stamped with the current scorer for the same
+/// reason a calibrated one is: the number is only meaningful next to the logits
+/// it will be compared against. Unlike calibration, the logits the user is
+/// reading here are the ones stored on the cluster's assignments, which were
+/// produced by whichever worker the `rerank_runtime` switch has draining the
+/// queue — so the configured backend is the right answer rather than a guess.
 #[tauri::command]
 pub fn smart_cluster_update_threshold(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -152,7 +234,7 @@ pub fn smart_cluster_update_threshold(
     threshold: f64,
 ) -> Result<(), String> {
     check_auth_required(&credential_state)?;
-    state.update_smart_cluster_threshold(id, threshold)
+    state.update_smart_cluster_threshold_with_scorer(id, threshold, &configured_scorer())
 }
 
 /// Enables or disables scoring for cluster `id`.
@@ -319,4 +401,51 @@ pub fn smart_cluster_status(
         enabled_cluster_count,
         total_cluster_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rerank::ScorerIdentity;
+
+    #[test]
+    fn a_calibration_threshold_is_stamped_with_the_backend_that_served_the_query() {
+        let current = ScorerIdentity::current();
+        let rust = scorer_stamp_for_backend(Some("rust")).expect("rust is a known backend");
+        assert!(current.matches_stored(
+            Some(&rust.model_id),
+            Some(&rust.model_revision),
+            Some(&rust.variant),
+            Some(&rust.provider),
+        ));
+    }
+
+    #[test]
+    fn a_python_served_calibration_never_passes_for_the_rust_scorer() {
+        // The whole point of taking the backend from the response: a reranked
+        // query falls back to Python for reasons of its own — an unfinished
+        // M2.4 migration, an empty Rust index, `semantic_index` pointing at
+        // Chroma — none of which the `rerank_runtime` switch knows about. The
+        // 2026-07-20 audit put top-1 disagreement between those two providers
+        // at 20.5% on this model, so a threshold from one must never be trusted
+        // against logits from the other.
+        let current = ScorerIdentity::current();
+        let python = scorer_stamp_for_backend(Some("python")).expect("python is a known backend");
+        assert!(!current.matches_stored(
+            Some(&python.model_id),
+            Some(&python.model_revision),
+            Some(&python.variant),
+            Some(&python.provider),
+        ));
+    }
+
+    #[test]
+    fn an_unknown_backend_records_no_provenance_at_all() {
+        // Not an invented identity: leaving the columns NULL is indistinguishable
+        // from a threshold written before provenance existed, which is exactly
+        // the state the worker repairs by re-deriving.
+        assert!(scorer_stamp_for_backend(None).is_none());
+        assert!(scorer_stamp_for_backend(Some("")).is_none());
+        assert!(scorer_stamp_for_backend(Some("directml")).is_none());
+    }
 }

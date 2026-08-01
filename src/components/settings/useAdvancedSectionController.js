@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { withAuth } from '../../lib/auth_api';
 
 export function useAdvancedSectionController({ monitorStatus, t }) {
@@ -21,6 +22,10 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [rustOcrModelDownloading, setRustOcrModelDownloading] = useState(false);
   const [semanticStatus, setSemanticStatus] = useState(null);
   const [semanticStatusLoading, setSemanticStatusLoading] = useState(false);
+  const [semanticIndexRunning, setSemanticIndexRunning] = useState(false);
+  const [semanticIndexRun, setSemanticIndexRun] = useState(null);
+  const [semanticIndexProgress, setSemanticIndexProgress] = useState(null);
+  const [semanticIndexStopping, setSemanticIndexStopping] = useState(false);
 
   const saveConfig = async (newConfig) => {
     const previousConfig = config;
@@ -134,31 +139,145 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     refreshRustOcrModelStatus();
   }, []);
 
-  const refreshSemanticStatus = async () => {
-    setSemanticStatusLoading(true);
+  /**
+   * Read the backend diagnostic, and with it whether a manual indexing run is
+   * going.
+   *
+   * A run started from this hook is tracked by its own promise. A run this
+   * hook did not start — the settings dialog was closed or switched away from
+   * mid-run, which unmounts it — has no promise to await, so the backend flag
+   * is what tells the reopened dialog that its button should say "stop". The
+   * two must not fight over the same state, hence `ownsRun`.
+   */
+  const ownsRun = useRef(false);
+
+  const readSemanticStatus = async ({ quiet = false } = {}) => {
+    if (!quiet) setSemanticStatusLoading(true);
     try {
-      setSemanticStatus(await invoke('get_ml_semantic_status'));
+      const status = await invoke('get_ml_semantic_status');
+      setSemanticStatus(status);
+      if (!ownsRun.current) {
+        const active = Boolean(status?.backend?.index_run_active);
+        setSemanticIndexRunning(active);
+        if (!active) setSemanticIndexStopping(false);
+      }
     } catch (err) {
       console.warn('Failed to read semantic backend status:', err);
     } finally {
-      setSemanticStatusLoading(false);
+      if (!quiet) setSemanticStatusLoading(false);
     }
   };
+
+  // The refresh button hands its click event to whatever it calls, so the
+  // public wrapper takes no arguments rather than letting an event object
+  // arrive where the options object belongs.
+  const refreshSemanticStatus = () => readSemanticStatus();
 
   useEffect(() => {
     refreshSemanticStatus();
   }, []);
 
   /**
-   * The one-release rollback lever. `chroma` hands natural-language retrieval
-   * back to Python; the vectors stay where they are, so it is reversible at
-   * any time. `semantic_runtime` stays a separate registry-only switch because
-   * it rolls back Rust inference itself, which is a developer concern.
+   * Notice the end of a run this dialog does not own. Two seconds is far
+   * shorter than the time it takes to wonder why a button is still disabled,
+   * and the read itself is one ledger query. Not started for an owned run:
+   * that one already refreshes when its command returns.
+   */
+  useEffect(() => {
+    if (!semanticIndexRunning || ownsRun.current) return undefined;
+    const timer = window.setInterval(() => readSemanticStatus({ quiet: true }), 2000);
+    return () => window.clearInterval(timer);
+  }, [semanticIndexRunning]);
+
+  /**
+   * The one-release rollback lever. `chroma` hands retrieval of screenshot text
+   * back to Python; the vectors stay where they are and Rust keeps writing
+   * them, so it is reversible at any time and it does not stop indexing.
+   * `semantic_runtime` stays a separate registry-only switch because it rolls
+   * back Rust inference itself, which is a developer concern.
    */
   const handleToggleRustSemanticIndex = async (enabled) => {
     const newConfig = { ...config, semantic_index: enabled ? 'rust' : 'chroma' };
     const saved = await saveConfig(newConfig);
     if (saved) await refreshSemanticStatus();
+  };
+
+  /**
+   * Progress of a running manual pass, one event per encoded chunk of four.
+   *
+   * Subscribed for the lifetime of the settings section rather than for the
+   * lifetime of a run: the pass keeps going if this dialog is closed and
+   * reopened, and a subscription tied to `semanticIndexRunning` would miss the
+   * events that arrive in between.
+   */
+  useEffect(() => {
+    let unlisten = null;
+    let cancelled = false;
+    listen('semantic-index-progress', (event) => {
+      setSemanticIndexProgress(event.payload || null);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    }).catch((err) => {
+      console.warn('Failed to subscribe to semantic index progress:', err);
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  /**
+   * The manual alternative to the idle gate. Capture-side indexing normally
+   * waits for an idle window on mains power, which on a machine that is rarely
+   * either can leave recent screenshots out of natural-language search
+   * indefinitely.
+   *
+   * The run drains the whole queue, so it can last minutes on a deep backlog.
+   * That is why it reports progress as it goes and why it can be stopped: the
+   * bound that used to keep it short — 128 screenshots — made one click look
+   * like it had done nothing and needed pressing dozens of times.
+   */
+  const handleRunSemanticIndexNow = async () => {
+    ownsRun.current = true;
+    setSemanticIndexRunning(true);
+    setSemanticIndexStopping(false);
+    setSemanticIndexRun(null);
+    setSemanticIndexProgress(null);
+    try {
+      const summary = await invoke('semantic_index_run_now');
+      setSemanticIndexRun(summary);
+      await refreshSemanticStatus();
+      return summary;
+    } catch (err) {
+      console.warn('Manual semantic indexing run failed:', err);
+      setSemanticIndexRun({ started: false, skipped_reason: String(err) });
+      return null;
+    } finally {
+      // Cleared before the flags, so the status read inside
+      // `refreshSemanticStatus` above — which ran while this hook still owned
+      // the run — is not the one that decides them.
+      ownsRun.current = false;
+      setSemanticIndexRunning(false);
+      setSemanticIndexStopping(false);
+      setSemanticIndexProgress(null);
+    }
+  };
+
+  /**
+   * Ask the running pass to stop. It checks between chunks, so this returns
+   * long before the run does; the button stays in its "stopping" state until
+   * the run reports what did land — through its own promise when this dialog
+   * started it, or through the status poll when it did not.
+   */
+  const handleStopSemanticIndex = async () => {
+    setSemanticIndexStopping(true);
+    try {
+      await invoke('semantic_index_stop_now');
+    } catch (err) {
+      console.warn('Failed to stop the semantic indexing run:', err);
+      setSemanticIndexStopping(false);
+    }
   };
 
   useEffect(() => {
@@ -289,6 +408,10 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     rustOcrModelDownloading,
     semanticStatus,
     semanticStatusLoading,
+    semanticIndexRunning,
+    semanticIndexRun,
+    semanticIndexProgress,
+    semanticIndexStopping,
     setCpuDropdownOpen,
     setGpuDropdownOpen,
     setClusteringDropdownOpen,
@@ -305,6 +428,8 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     handleRestartMlOcr,
     handleDownloadRustOcrModel,
     handleToggleRustSemanticIndex,
+    handleRunSemanticIndexNow,
+    handleStopSemanticIndex,
     refreshSemanticStatus,
   };
 }

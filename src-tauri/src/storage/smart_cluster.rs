@@ -10,8 +10,57 @@
 use rusqlite::{params, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
+use super::derived_index::{decode_vector, encode_vector};
 use super::StorageState;
+
+/// The identity of an anchor text, for deciding whether a stored encoding of it
+/// is still the encoding of *this* text.
+///
+/// Hashed rather than compared directly so the check costs the same whatever
+/// the anchor's length, and so the stored column cannot become a second copy of
+/// the anchor that drifts from the first.
+pub fn anchor_text_hash(anchor_text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(anchor_text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Read the cached anchor encoding from a scoring-target row, if it has one.
+///
+/// A row that is missing any part, or whose blob no longer decodes at the
+/// recorded width, yields `None`: a cold cache costs one encode, and there is
+/// nothing here worth failing a whole scoring pass over.
+fn read_cached_anchor_vector(row: &Row<'_>) -> rusqlite::Result<Option<CachedAnchorVector>> {
+    let Some(bytes) = row.get::<_, Option<Vec<u8>>>(8)? else {
+        return Ok(None);
+    };
+    let Some(dimensions) = row.get::<_, Option<i64>>(9)? else {
+        return Ok(None);
+    };
+    let Some(source_hash) = row.get::<_, Option<String>>(10)? else {
+        return Ok(None);
+    };
+    let Some(model_id) = row.get::<_, Option<String>>(11)? else {
+        return Ok(None);
+    };
+    let Some(model_revision) = row.get::<_, Option<String>>(12)? else {
+        return Ok(None);
+    };
+    let Ok(dimensions) = usize::try_from(dimensions) else {
+        return Ok(None);
+    };
+    match decode_vector(&bytes, dimensions) {
+        Ok(vector) => Ok(Some(CachedAnchorVector {
+            vector,
+            source_hash,
+            model_id,
+            model_revision,
+        })),
+        Err(_) => Ok(None),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmartClusterRecord {
@@ -34,6 +83,57 @@ pub struct SmartClusterExample {
     pub screenshot_id: i64,
     pub is_positive: bool,
     pub rerank_score: Option<f64>,
+}
+
+/// The scorer that produced a stored threshold.
+///
+/// Mirrors `rerank::ScorerIdentity` as a storage type rather than reusing it,
+/// so the storage layer keeps no dependency on the inference layer. Empty
+/// strings represent a row written before provenance existed; `scorer_recorded`
+/// on the target below is what distinguishes that from a genuine value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartClusterScorer {
+    pub model_id: String,
+    pub model_revision: String,
+    pub variant: String,
+    pub provider: String,
+}
+
+/// A cluster's anchor as the bi-encoder left it, plus what it was made from.
+///
+/// The provenance is the whole point: this vector is only usable if the anchor
+/// text has not changed since it was encoded and the same model would encode it
+/// the same way today. Both are checked against the row rather than tracked by
+/// whoever edits a cluster, so there is no invalidation call to forget.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedAnchorVector {
+    pub vector: Vec<f32>,
+    /// SHA-256 of the anchor text this was encoded from.
+    pub source_hash: String,
+    pub model_id: String,
+    pub model_revision: String,
+}
+
+/// One enabled cluster, as the background scorer sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartClusterScoringTarget {
+    pub id: i64,
+    pub anchor_text: String,
+    pub threshold: f64,
+    pub scorer: SmartClusterScorer,
+    /// False for a threshold written before step 6, which is every threshold
+    /// produced by the Python DirectML reranker.
+    pub scorer_recorded: bool,
+    /// The scorer under which re-deriving this cluster's threshold from its
+    /// saved examples was already attempted and found impossible. `None` means
+    /// no attempt has been given up on; a value that equals the current scorer
+    /// means the worker must not attempt it again, because the answer cannot
+    /// change until the examples do.
+    pub rederive_failed_scorer: Option<String>,
+    /// The stored anchor encoding, when the row has one that decodes. `None`
+    /// means the pass has to encode the anchor itself and write the result
+    /// back; it is not an error, just a cold cache.
+    pub anchor_vector: Option<CachedAnchorVector>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,17 +378,163 @@ impl StorageState {
         Ok(())
     }
 
-    pub fn update_smart_cluster_threshold(&self, id: i64, threshold: f64) -> Result<(), String> {
-        let guard = self.get_connection_named("update_smart_cluster_threshold")?;
+    // `update_smart_cluster_threshold` — a threshold writer that left the
+    // provenance columns untouched — was removed with M2.5 step 6. It is not
+    // merely unused: a caller reaching for it would write a new number while
+    // leaving the *previous* scorer recorded beside it, and the worker would
+    // then trust that number instead of re-deriving it. Use
+    // `update_smart_cluster_threshold_with_scorer` below.
+
+    /// Write a threshold together with the scorer that produced it.
+    ///
+    /// The provenance is set in the same statement as the number, never
+    /// separately: a threshold whose recorded scorer does not describe the run
+    /// that produced it is worse than one with no provenance at all, because
+    /// the first is trusted and the second is repaired.
+    ///
+    /// Clears any "cannot be re-derived" verdict in the same statement. A
+    /// threshold arriving with its provenance is exactly the state that verdict
+    /// was blocking work on, so leaving it behind would keep a repaired cluster
+    /// marked as broken.
+    pub fn update_smart_cluster_threshold_with_scorer(
+        &self,
+        id: i64,
+        threshold: f64,
+        scorer: &SmartClusterScorer,
+    ) -> Result<(), String> {
+        let guard = self.get_connection_named("update_smart_cluster_threshold_with_scorer")?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
-            "UPDATE smart_clusters SET threshold = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            params![threshold, id],
+            "UPDATE smart_clusters \
+             SET threshold = ?, \
+                 threshold_model_id = ?, \
+                 threshold_model_revision = ?, \
+                 threshold_variant = ?, \
+                 threshold_provider = ?, \
+                 threshold_calibrated_at = CURRENT_TIMESTAMP, \
+                 threshold_rederive_failed_scorer = NULL, \
+                 updated_at = CURRENT_TIMESTAMP \
+             WHERE id = ?",
+            params![
+                threshold,
+                scorer.model_id,
+                scorer.model_revision,
+                scorer.variant,
+                scorer.provider,
+                id
+            ],
         )
         .map_err(|e| format!("Failed to update smart cluster threshold: {}", e))?;
         Ok(())
+    }
+
+    /// Record that `scorer` cannot re-derive a threshold for this cluster from
+    /// the examples it currently has.
+    ///
+    /// The worker calls this once and then skips the cluster, rather than
+    /// re-discovering the same answer on every pass at the cost of a 570 MB
+    /// model load. `updated_at` is deliberately left alone: the cluster list is
+    /// ordered by it, and a background verdict must not reshuffle the user's
+    /// clusters.
+    pub fn mark_smart_cluster_threshold_unverifiable(
+        &self,
+        id: i64,
+        scorer_fingerprint: &str,
+    ) -> Result<(), String> {
+        let guard = self.get_connection_named("mark_smart_cluster_threshold_unverifiable")?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
+        conn.execute(
+            "UPDATE smart_clusters SET threshold_rederive_failed_scorer = ? WHERE id = ?",
+            params![scorer_fingerprint, id],
+        )
+        .map_err(|e| format!("Failed to mark smart cluster threshold unverifiable: {}", e))?;
+        Ok(())
+    }
+
+    /// Store the bi-encoder's encoding of this cluster's anchor.
+    ///
+    /// Written by the background scorer after a cold-cache encode, so the next
+    /// batch does not have to bring MiniLM back into a single-model engine just
+    /// to re-derive a vector for text that has not changed.
+    ///
+    /// `updated_at` is deliberately left alone. The cluster list the user sees
+    /// is ordered by it, and a cache fill is not an edit to their cluster.
+    pub fn update_smart_cluster_anchor_vector(
+        &self,
+        id: i64,
+        vector: &[f32],
+        source_hash: &str,
+        model_id: &str,
+        model_revision: &str,
+    ) -> Result<(), String> {
+        let blob = encode_vector(vector)?;
+        let dimensions = i64::try_from(vector.len())
+            .map_err(|_| "Anchor vector dimensions exceed SQLite range".to_string())?;
+        let guard = self.get_connection_named("update_smart_cluster_anchor_vector")?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
+        conn.execute(
+            "UPDATE smart_clusters \
+             SET anchor_vector = ?, \
+                 anchor_vector_dimensions = ?, \
+                 anchor_vector_source_hash = ?, \
+                 anchor_vector_model_id = ?, \
+                 anchor_vector_model_revision = ? \
+             WHERE id = ?",
+            params![blob, dimensions, source_hash, model_id, model_revision, id],
+        )
+        .map_err(|e| format!("Failed to update smart cluster anchor vector: {}", e))?;
+        Ok(())
+    }
+
+    /// Everything the background scorer needs about one enabled cluster, in one
+    /// read: what to score against, what to compare to, who produced the number
+    /// being compared to, and whether repairing it has already been ruled out.
+    pub fn list_smart_cluster_scoring_targets(
+        &self,
+    ) -> Result<Vec<SmartClusterScoringTarget>, String> {
+        let guard = self.get_connection_named("list_smart_cluster_scoring_targets")?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, anchor_text, threshold, threshold_model_id, \
+                        threshold_model_revision, threshold_variant, threshold_provider, \
+                        threshold_rederive_failed_scorer, \
+                        anchor_vector, anchor_vector_dimensions, anchor_vector_source_hash, \
+                        anchor_vector_model_id, anchor_vector_model_revision \
+                 FROM smart_clusters WHERE enabled = 1 ORDER BY id",
+            )
+            .map_err(|e| format!("Failed to prepare scoring target query: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SmartClusterScoringTarget {
+                    id: row.get(0)?,
+                    anchor_text: row.get(1)?,
+                    threshold: row.get(2)?,
+                    scorer: SmartClusterScorer {
+                        model_id: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        model_revision: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        variant: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                        provider: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    },
+                    scorer_recorded: row.get::<_, Option<String>>(3)?.is_some(),
+                    rederive_failed_scorer: row.get::<_, Option<String>>(7)?,
+                    anchor_vector: read_cached_anchor_vector(row)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query scoring targets: {}", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("Failed to read scoring target row: {}", e))?);
+        }
+        Ok(out)
     }
 
     pub fn update_smart_cluster_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
@@ -308,6 +554,12 @@ impl StorageState {
     // Examples (positive/negative calibration)
     // ------------------------------------------------------------------
 
+    /// Replace a cluster's calibration examples.
+    ///
+    /// Also clears any "cannot be re-derived" verdict, in the same transaction.
+    /// That verdict is a statement about a specific set of examples — typically
+    /// that every positive one has been deleted — so a new set has to be given
+    /// its own chance rather than inheriting the old answer.
     pub fn save_smart_cluster_examples(
         &self,
         cluster_id: i64,
@@ -339,6 +591,11 @@ impl StorageState {
             )
             .map_err(|e| format!("Failed to insert example: {}", e))?;
         }
+        tx.execute(
+            "UPDATE smart_clusters SET threshold_rederive_failed_scorer = NULL WHERE id = ?",
+            params![cluster_id],
+        )
+        .map_err(|e| format!("Failed to clear rederive verdict: {}", e))?;
         tx.commit()
             .map_err(|e| format!("Failed to commit examples: {}", e))?;
         Ok(())
@@ -735,5 +992,156 @@ impl StorageState {
             )
             .map_err(|e| format!("Failed to count pending: {}", e))?;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credential_manager::CredentialManagerState;
+    use rusqlite::Connection;
+    use std::sync::Arc;
+
+    fn test_storage() -> (tempfile::TempDir, StorageState) {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        storage.init_tables(&connection).expect("initialize schema");
+        *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
+        (temp, storage)
+    }
+
+    /// Put the table back into the shape it had before the anchor cache
+    /// existed, so the next `init_tables` is a migration rather than a create.
+    fn drop_anchor_cache_columns(storage: &StorageState) {
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        let conn = guard.as_ref().expect("database");
+        for column in [
+            "anchor_vector",
+            "anchor_vector_dimensions",
+            "anchor_vector_source_hash",
+            "anchor_vector_model_id",
+            "anchor_vector_model_revision",
+        ] {
+            conn.execute_batch(&format!(
+                "ALTER TABLE smart_clusters DROP COLUMN {column}"
+            ))
+            .expect("drop anchor cache column");
+        }
+    }
+
+    fn reinitialize(storage: &StorageState) {
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        storage
+            .init_tables(guard.as_ref().expect("database"))
+            .expect("re-initialize schema");
+    }
+
+    fn insert_cluster(storage: &StorageState, anchor_text: &str) -> i64 {
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        let conn = guard.as_ref().expect("database");
+        conn.execute(
+            "INSERT INTO smart_clusters (anchor_text, threshold, enabled) VALUES (?, ?, 1)",
+            params![anchor_text, -2.5f64],
+        )
+        .expect("insert cluster");
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn a_database_written_before_the_anchor_cache_gains_it_without_losing_a_cluster() {
+        let (_temp, storage) = test_storage();
+        drop_anchor_cache_columns(&storage);
+        let id = insert_cluster(&storage, "receipts");
+        reinitialize(&storage);
+
+        let targets = storage
+            .list_smart_cluster_scoring_targets()
+            .expect("scoring targets");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, id);
+        assert_eq!(targets[0].anchor_text, "receipts");
+        // A cluster that predates the cache reads back as a cold cache, which
+        // costs one encode and is not an error.
+        assert!(targets[0].anchor_vector.is_none());
+    }
+
+    #[test]
+    fn a_cached_anchor_round_trips_with_the_provenance_that_makes_it_usable() {
+        let (_temp, storage) = test_storage();
+        let id = insert_cluster(&storage, "receipts");
+        let vector = vec![0.6f32, 0.8];
+        storage
+            .update_smart_cluster_anchor_vector(
+                id,
+                &vector,
+                &anchor_text_hash("receipts"),
+                "paraphrase-multilingual-MiniLM-L12-v2",
+                "2c4055b12046f11709e9df2c122e59ffbdc2f900",
+            )
+            .expect("cache the anchor vector");
+
+        let targets = storage
+            .list_smart_cluster_scoring_targets()
+            .expect("scoring targets");
+        let cached = targets[0]
+            .anchor_vector
+            .as_ref()
+            .expect("the vector just written");
+        assert_eq!(cached.vector, vector);
+        assert_eq!(cached.source_hash, anchor_text_hash("receipts"));
+        assert_eq!(cached.model_id, "paraphrase-multilingual-MiniLM-L12-v2");
+        assert_eq!(
+            cached.model_revision,
+            "2c4055b12046f11709e9df2c122e59ffbdc2f900"
+        );
+    }
+
+    #[test]
+    fn a_half_written_anchor_cache_reads_as_no_cache_rather_than_a_failed_pass() {
+        // Nothing writes these columns apart from one statement that sets all
+        // of them, so a row like this means something outside this code touched
+        // the database. Refusing to read the whole cluster list over it would
+        // stop scoring entirely; treating it as a cold cache costs one encode
+        // and repairs itself on the write-back.
+        let (_temp, storage) = test_storage();
+        let id = insert_cluster(&storage, "receipts");
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().expect("database");
+            conn.execute(
+                "UPDATE smart_clusters SET anchor_vector = ?, anchor_vector_dimensions = ? \
+                 WHERE id = ?",
+                params![vec![0u8; 8], 2i64, id],
+            )
+            .expect("write a vector with no provenance");
+        }
+        let targets = storage
+            .list_smart_cluster_scoring_targets()
+            .expect("scoring targets");
+        assert!(targets[0].anchor_vector.is_none());
+    }
+
+    #[test]
+    fn a_blob_that_no_longer_matches_its_recorded_width_reads_as_no_cache() {
+        let (_temp, storage) = test_storage();
+        let id = insert_cluster(&storage, "receipts");
+        storage
+            .update_smart_cluster_anchor_vector(id, &[0.6, 0.8], "hash", "model", "revision")
+            .expect("cache the anchor vector");
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().expect("database");
+            conn.execute(
+                "UPDATE smart_clusters SET anchor_vector_dimensions = 384 WHERE id = ?",
+                params![id],
+            )
+            .expect("corrupt the recorded width");
+        }
+        let targets = storage
+            .list_smart_cluster_scoring_targets()
+            .expect("scoring targets");
+        assert!(targets[0].anchor_vector.is_none());
     }
 }

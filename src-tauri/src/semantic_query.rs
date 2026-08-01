@@ -1,18 +1,20 @@
-//! M2.5 step 4 — production Rust semantic-text retrieval.
+//! M2.5 steps 4 and 6 — production Rust semantic-text retrieval.
 //!
-//! Replaces the Python/Chroma `nl_cluster_query` bi-encoder path with a Rust
-//! MiniLM query encode plus an exact cosine scan over the migrated derived
-//! store, and rehydrates the response metadata from SQLite. The shadow harness
-//! that proved this path is gone (see the M2.5 retirement block); what remains
-//! is the read path itself and the observable fallback the enum rule requires.
+//! Replaces the Python/Chroma `nl_cluster_query` path with a Rust MiniLM query
+//! encode plus an exact cosine scan over the migrated derived store, and
+//! rehydrates the response metadata from SQLite. The shadow harness that proved
+//! this path is gone (see the M2.5 retirement block); what remains is the read
+//! path itself and the observable fallback the enum rule requires.
 //!
-//! One scope limit is deliberate and documented in the roadmap: **reranked
-//! queries stay on Python.** `enable_rerank = true` — which is every Smart
-//! Cluster calibration query — is not routed here. Python's `query_by_text`
-//! fuses retrieval and reranking into one call and the ML protocol has no
-//! standalone rerank operation, so serving the prefilter from Rust would need a
-//! Rust→Python rerank bridge living for exactly one release. Calibration moves
-//! with the reranker at M2.5 step 6.
+//! **Both halves of the query now live here.** Step 4 cut over
+//! `enable_rerank = false` only, and left reranked queries — every Smart Cluster
+//! calibration query — on Python, because `query_by_text` fuses retrieval and
+//! reranking into one call and the ML protocol had no standalone rerank
+//! operation to bridge with. Step 6 moves the second half rather than building
+//! that bridge: `run_rust_reranked_nl_query` retrieves with the bi-encoder and
+//! re-scores with the Rust cross-encoder, and the scoring worker that compares
+//! against the thresholds this path produces moves in the same change. See
+//! `rerank.rs` for why those two could not be separated.
 //!
 //! Coverage is the failure mode this path has to reason about: ranking an
 //! incomplete corpus returns plausible results with screenshots silently
@@ -132,6 +134,15 @@ pub struct SemanticBackendStatus {
     /// Age in seconds of the oldest screenshot still waiting to be encoded.
     /// `None` when nothing is waiting.
     pub index_backlog_age_secs: Option<i64>,
+    /// A manual indexing run is executing right now.
+    ///
+    /// Filled by `get_ml_semantic_status`, which can reach the run state, rather
+    /// than by [`backend_status`], which cannot and is also called from paths
+    /// that must not depend on it. The settings dialog unmounts when the user
+    /// switches tabs, and a run drains the whole queue rather than 128
+    /// screenshots, so "I started this, walked away, and came back" is now an
+    /// ordinary thing to do. This is how the reopened dialog finds out.
+    pub index_run_active: bool,
 }
 
 #[derive(Debug, Default)]
@@ -241,6 +252,9 @@ pub fn backend_status(storage: Option<&StorageState>) -> SemanticBackendStatus {
         index_backlog: backlog.map(|backlog| backlog.claimable),
         index_stalled: backlog.map(|backlog| backlog.exhausted),
         index_backlog_age_secs: backlog.and_then(|backlog| backlog.oldest_claimable_age_secs),
+        // Overwritten by the command; false is the honest answer for every
+        // caller that cannot see the run state.
+        index_run_active: false,
     }
 }
 
@@ -261,6 +275,37 @@ pub enum RustQueryOutcome {
 /// thing that would justify surfacing an error here is a broken auth session,
 /// and Python rejects that identically one call later.
 pub async fn try_rust_nl_query(app: &AppHandle, query: &str, n_results: u32) -> RustQueryOutcome {
+    try_rust_nl_query_inner(app, query, n_results, false).await
+}
+
+/// Offer one **reranked** NL cluster query to the Rust path — M2.5 step 6.
+///
+/// Every Smart Cluster calibration query is one of these. Step 4 deliberately
+/// left them on Python because `query_by_text` fuses retrieval and reranking
+/// and the protocol had no standalone rerank operation to bridge with; step 6
+/// resolves that by moving both halves rather than building the bridge.
+///
+/// The extra refusal beyond the bi-encoder path's set is `rerank_runtime =
+/// python`, the one-release rollback. Everything else — maintenance, an
+/// unfinished migration, an empty index — refuses for the same reasons and
+/// hands the query back to Python identically.
+pub async fn try_rust_reranked_nl_query(
+    app: &AppHandle,
+    query: &str,
+    n_results: u32,
+) -> RustQueryOutcome {
+    if !crate::rerank::rust_rerank_selected() {
+        return RustQueryOutcome::NotSelected;
+    }
+    try_rust_nl_query_inner(app, query, n_results, true).await
+}
+
+async fn try_rust_nl_query_inner(
+    app: &AppHandle,
+    query: &str,
+    n_results: u32,
+    rerank: bool,
+) -> RustQueryOutcome {
     if semantic_index_backend() != "rust" {
         return RustQueryOutcome::NotSelected;
     }
@@ -277,8 +322,18 @@ pub async fn try_rust_nl_query(app: &AppHandle, query: &str, n_results: u32) -> 
         // Python returns an empty list for a blank query; matching that here
         // avoids paying for an encode that cannot rank anything.
         observe_served("rust");
-        return RustQueryOutcome::Served(success_response(Vec::new()));
+        return RustQueryOutcome::Served(success_response(Vec::new(), rerank));
     }
+    // Announce the query before anything slow, so the background loops stop
+    // submitting work to the single semantic worker while this one is on its
+    // way to it. Taken here rather than immediately before the encode because
+    // the migration check below is a blocking database read that can itself sit
+    // behind the process-wide mutex, and every millisecond spent holding the
+    // lease early is a millisecond the background pass is not starting a new
+    // chunk. Dropped by the guard on every path out of this function.
+    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    let _foreground = semantic.foreground_lease();
+
     // A migration is rewriting the derived store; reading it would race the
     // rewrite. Python is left to answer instead — it keeps serving from Chroma
     // throughout maintenance, because the migration only pauses the monitor's
@@ -299,7 +354,12 @@ pub async fn try_rust_nl_query(app: &AppHandle, query: &str, n_results: u32) -> 
         return fell_back("migration_incomplete");
     }
 
-    match run_rust_nl_query(app, trimmed, n_results).await {
+    let outcome = if rerank {
+        run_rust_reranked_nl_query(app, trimmed, n_results).await
+    } else {
+        run_rust_nl_query(app, trimmed, n_results).await
+    };
+    match outcome {
         Ok(results) if results.is_empty() => {
             // No threshold is applied on this path, so an empty ranking means
             // an empty (or entirely invisible) index — typically a machine that
@@ -309,7 +369,7 @@ pub async fn try_rust_nl_query(app: &AppHandle, query: &str, n_results: u32) -> 
         }
         Ok(results) => {
             observe_served("rust");
-            RustQueryOutcome::Served(success_response(results))
+            RustQueryOutcome::Served(success_response(results, rerank))
         }
         Err(error) => fell_back(&error),
     }
@@ -334,16 +394,116 @@ pub fn tag_python_response(mut response: serde_json::Value) -> serde_json::Value
 }
 
 /// Build the `nl_cluster_query` success envelope. Field-for-field the shape
-/// Python returns for the non-reranked path (`clustering_commands.py`), so the
-/// frontend and the contract tests cannot tell the backends apart.
-fn success_response(results: Vec<serde_json::Value>) -> serde_json::Value {
+/// Python returns, so the frontend and the contract tests cannot tell the
+/// backends apart. `rerank_variant` is non-null exactly when reranking ran,
+/// which is what `NlClusterView` reads to label the result.
+fn success_response(results: Vec<serde_json::Value>, reranked: bool) -> serde_json::Value {
     serde_json::json!({
         "status": "success",
         "results": results,
-        "reranked": false,
-        "rerank_variant": serde_json::Value::Null,
+        "reranked": reranked,
+        "rerank_variant": if reranked {
+            serde_json::Value::String(crate::rerank::RERANK_VARIANT.to_string())
+        } else {
+            serde_json::Value::Null
+        },
         "backend": "rust",
     })
+}
+
+/// Retrieve with the bi-encoder, then re-score with the cross-encoder.
+///
+/// The same two stages Python's `query_by_text` performs in one call, with the
+/// same over-fetch factor, the same 600-character document contract, and the
+/// same final sort by descending rerank score. The difference is that the
+/// candidates come from the Rust derived store rather than Chroma, which means
+/// a candidate whose screenshot has since been deleted is dropped during
+/// hydration instead of being scored and rendered from stale metadata.
+async fn run_rust_reranked_nl_query(
+    app: &AppHandle,
+    query: &str,
+    n_results: u32,
+) -> Result<Vec<serde_json::Value>, String> {
+    let k = n_results.max(1) as usize;
+    let fetch = k.saturating_mul(crate::rerank::RERANK_OVERFETCH as usize);
+    let mut candidates = run_rust_nl_query(app, query, fetch as u32).await?;
+    if candidates.is_empty() {
+        return Ok(candidates);
+    }
+
+    // The reranker sees more OCR than the index vector did, so the documents
+    // are built from a second, longer read rather than from anything cached.
+    let ids: Vec<i64> = candidates
+        .iter()
+        .filter_map(|row| row.get("screenshot_id").and_then(serde_json::Value::as_i64))
+        .collect();
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let ocr = tokio::task::spawn_blocking(move || {
+        storage.get_ocr_text_prefixes_by_screenshot_ids_silent(
+            &ids,
+            crate::rerank::RERANK_OCR_SNIPPET_CHARS,
+        )
+    })
+    .await
+    .map_err(|error| format!("rerank_read_failed: {error}"))?
+    .map_err(|error| format!("rerank_read_failed: {error}"))?;
+
+    let documents: Vec<String> = candidates
+        .iter()
+        .map(|row| {
+            let id = row
+                .get("screenshot_id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            crate::rerank::build_rerank_document(
+                row.get("process_name").and_then(|v| v.as_str()).unwrap_or(""),
+                row.get("window_title").and_then(|v| v.as_str()).unwrap_or(""),
+                ocr.get(&id).map(String::as_str).unwrap_or(""),
+            )
+        })
+        .collect();
+
+    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    let started = Instant::now();
+    let scores = crate::rerank::rerank_documents(
+        app,
+        &semantic,
+        query,
+        &documents,
+        crate::rerank::RERANK_QUERY_TIMEOUT,
+        crate::rerank::RerankPriority::Foreground,
+    )
+    .await
+    .map_err(|error| format!("rerank_failed: {error}"))?;
+    tracing::debug!(
+        "[SEMANTIC] rust rerank scored {} document(s) in {:.1}ms",
+        documents.len(),
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+
+    for (row, score) in candidates.iter_mut().zip(scores) {
+        if let serde_json::Value::Object(map) = row {
+            map.insert(
+                "rerank_score".to_string(),
+                serde_json::json!(f64::from(score)),
+            );
+        }
+    }
+    // Raw logits, descending, exactly as Python sorts them. A row that somehow
+    // has no score sorts last rather than being dropped, which mirrors
+    // Python's `float("-inf")` default.
+    candidates.sort_by(|left, right| {
+        let score = |row: &serde_json::Value| {
+            row.get("rerank_score")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(f64::NEG_INFINITY)
+        };
+        score(right)
+            .partial_cmp(&score(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(k);
+    Ok(candidates)
 }
 
 async fn run_rust_nl_query(
@@ -528,12 +688,23 @@ mod tests {
 
     #[test]
     fn success_envelope_matches_the_python_non_reranked_contract() {
-        let response = success_response(vec![serde_json::json!({"screenshot_id": 7})]);
+        let response = success_response(vec![serde_json::json!({"screenshot_id": 7})], false);
         assert_eq!(response["status"], "success");
         assert_eq!(response["reranked"], false);
         assert!(response["rerank_variant"].is_null());
         assert_eq!(response["backend"], "rust");
         assert_eq!(response["results"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_reranked_envelope_names_the_variant_that_produced_the_scores() {
+        // `NlClusterView` reads `reranked` to decide whether to show scores at
+        // all, and `rerank_variant` to label them. A reranked response that
+        // left the variant null would render as an un-reranked one.
+        let response = success_response(vec![serde_json::json!({"screenshot_id": 7})], true);
+        assert_eq!(response["reranked"], true);
+        assert_eq!(response["rerank_variant"], crate::rerank::RERANK_VARIANT);
+        assert_eq!(response["backend"], "rust");
     }
 
     #[test]
