@@ -54,10 +54,22 @@
 //! this pass's three hundred, and it announces itself through
 //! `SemanticRuntimeState::foreground_lease` rather than through the idle signal,
 //! which `idle.rs` refreshes only every ten seconds — far too slow for a search
-//! typed a second after the user sits down. An idle pass checks that signal
-//! between clusters and, through `RerankPriority::Background`, between rerank
-//! chunks; a forced drain does not, because it is a button the same user just
-//! pressed.
+//! typed a second after the user sits down. Both passes check that signal
+//! between clusters, between commit groups, and — through
+//! `RerankPriority::Background` — between rerank chunks, which is what bounds
+//! the wait at one document rather than at one batch.
+//!
+//! **A forced drain observes it too, and waits rather than ending.** It used to
+//! read straight past it on the grounds that the user had pressed its button.
+//! That is a sound argument about consent and the wrong answer about cost: a
+//! reranked calibration query wants the same cross-encoder this pass is
+//! feeding, so interleaving does not share the worker between them, it halves
+//! both. A plain search wants MiniLM instead, and taking it mid-pass evicts a
+//! 570 MB session this pass then re-reads. Waiting and resuming keeps the
+//! button meaning what it says without making the query it collides with pay
+//! for it; [`stand_aside_for_foreground`] is where that happens, and
+//! [`FORCED_FOREGROUND_WAIT_BUDGET`] is what stops a drain sitting out a whole
+//! calibration session in silence.
 //!
 //! **Standing down has to leave progress behind.** Every one of those checks
 //! can end a pass part-way through a batch, and the idle gate closes the moment
@@ -75,7 +87,7 @@ use crate::ml_protocol::MlSemanticModel;
 use crate::rerank::{
     build_rerank_document, ScorerIdentity, SmartClusterQueueOwner, RERANK_OCR_SNIPPET_CHARS,
 };
-use crate::semantic_runtime::SemanticRuntimeState;
+use crate::semantic_runtime::{SemanticRuntimeState, FOREGROUND_POLL_INTERVAL};
 use crate::storage::smart_cluster::{
     anchor_text_hash, CachedAnchorVector, SmartClusterScorer, SmartClusterScoringTarget,
 };
@@ -127,6 +139,51 @@ const ANCHOR_EMBED_TIMEOUT: Duration = Duration::from_secs(120);
 /// Wall-clock ceiling on one forced drain, so "run now" cannot become an
 /// unbounded foreground job on a machine with a deep queue.
 const FORCED_DEADLINE: Duration = Duration::from_secs(600);
+
+/// How long a forced drain may spend, in total, standing aside for foreground
+/// queries before it gives up and says so.
+///
+/// Waiting out one query is right: a reranked calibration query is at most
+/// `MAX_RERANK_RESULTS * RERANK_OVERFETCH` documents at 0.31–1.18 s each, so a
+/// couple of minutes on the slowest machine measured, and the queue is not
+/// going anywhere. Waiting out a calibration *session* is not: the drain would
+/// spend its whole [`FORCED_DEADLINE`] never reaching the worker and then log
+/// that it ran out of time, which reads as a deep queue rather than as a run
+/// that politely never started.
+///
+/// Counted across the drain rather than per pause, because it is the total the
+/// user is unknowingly spending that decides whether their click accomplished
+/// anything. Ending here costs nothing but the button: the idle pass picks the
+/// same queue up a minute later.
+const FORCED_FOREGROUND_WAIT_BUDGET: Duration = Duration::from_secs(180);
+
+/// The one stand-down reason a forced drain resumes from instead of ending on.
+///
+/// Every other reason [`stand_down_reason`] gives is a verdict about whether
+/// the pass should exist at all — the user came back, pressed stop, or the
+/// clock ran out. This one is a verdict about *when*, so a forced drain answers
+/// it by waiting; an idle pass answers it by ending, because its next tick is a
+/// minute away and nobody asked for it.
+const FOREGROUND_QUERY_STOP: &str = "a foreground query holds the semantic worker";
+
+/// Reason for a forced drain that spent [`FORCED_FOREGROUND_WAIT_BUDGET`]
+/// waiting for a worker it never got. Distinguished from the wall-clock budget
+/// because the two say different things: one queue is deep, the other machine
+/// was busy answering that same user's searches.
+const WAITED_OUT_BY_FOREGROUND: &str =
+    "foreground queries held the semantic worker for the whole wait budget";
+
+/// The stand-down reasons a pass ends on, as opposed to the one it may resume
+/// from.
+///
+/// Named rather than written inline because each is produced from two places —
+/// [`stand_down_reason`] and [`stand_aside_for_foreground`] — and read by
+/// comparison against [`FOREGROUND_QUERY_STOP`]. Two of them colliding by value
+/// is the failure the comparison cannot survive, and three copies of a string
+/// literal is how that collision gets written by accident.
+const STOP_REQUESTED: &str = "stop was requested";
+const FORCED_DEADLINE_REACHED: &str = "the forced drain reached its wall-clock budget";
+const MAY_NOT_RUN: &str = "the pass may no longer run";
 
 /// Worker state shared with the Tauri commands that drive it.
 #[derive(Default)]
@@ -314,31 +371,35 @@ fn may_run(app: &AppHandle, forced: bool) -> bool {
     // budget, against this pass's 300 s. Checked separately from the idle gate
     // because the idle signal is up to ten seconds stale (`idle.rs` polls every
     // 10 s) and the query that follows the user returning arrives well inside
-    // that window. Standing down ends the pass rather than pausing it; the
-    // queue is untouched and the next tick is a minute away.
-    if app
-        .state::<Arc<SemanticRuntimeState>>()
-        .foreground_waiting()
-    {
-        return false;
-    }
+    // that window.
+    //
+    // Only the idle gate is asked here. The foreground lease binds a forced
+    // drain as well, but it is not a reason for one to stop existing — it is a
+    // reason to wait — so `stand_down_reason` is where both modes read it and
+    // `run_pass` is where they part ways.
     app.state::<Arc<IdleState>>()
         .is_idle
         .load(Ordering::Relaxed)
 }
 
-/// Why this pass has to stop, or `None` if it may keep going.
+/// Why this pass has to stop where it is, or `None` if it may keep going.
 ///
-/// Every reason here leaves the remaining work queued, so the callers all
-/// respond the same way: stop where they are and let the next pass pick it up.
-/// It exists as one function because the checks have to happen in more than one
-/// loop — between batches, between commit groups, between clusters, and between
-/// threshold re-derivations — and a check that only some of those loops perform
-/// is how a bound ends up not binding.
+/// Every reason here leaves the remaining work queued, so the loops all respond
+/// the same way: stop where they are and hand the answer up. It exists as one
+/// function because the checks have to happen in more than one loop — between
+/// batches, between commit groups, between clusters, and between threshold
+/// re-derivations — and a check that only some of those loops perform is how a
+/// bound ends up not binding.
 ///
 /// The wall-clock deadline is forced-only. An idle pass runs a single batch and
 /// is bounded by the idle gate closing, which is the honest bound for it; a
 /// forced drain has no such gate, which is exactly why it needs a clock.
+///
+/// [`FOREGROUND_QUERY_STOP`] is the one answer that does not mean the same
+/// thing to both modes — an idle pass ends on it and a forced drain waits it
+/// out — so it is returned ahead of the idle gate rather than folded into "may
+/// no longer run". A reason a caller cannot tell apart is a reason it cannot
+/// act differently on.
 fn stand_down_reason(
     app: &AppHandle,
     state: &Arc<SmartClusterWorkerState>,
@@ -347,16 +408,90 @@ fn stand_down_reason(
 ) -> Option<&'static str> {
     if forced {
         if state.aborted() {
-            return Some("stop was requested");
+            return Some(STOP_REQUESTED);
         }
         if Instant::now() >= deadline {
-            return Some("the forced drain reached its wall-clock budget");
+            return Some(FORCED_DEADLINE_REACHED);
         }
     }
+    if app
+        .state::<Arc<SemanticRuntimeState>>()
+        .foreground_waiting()
+    {
+        return Some(FOREGROUND_QUERY_STOP);
+    }
     if !may_run(app, forced) {
-        return Some("the pass may no longer run");
+        return Some(MAY_NOT_RUN);
     }
     None
+}
+
+/// Wait out a foreground query rather than competing with it, and say why the
+/// drain must end if one of its own bounds expires first.
+///
+/// `None` once the worker is free. `waited` accumulates across every call in a
+/// drain, because [`FORCED_FOREGROUND_WAIT_BUDGET`] is a budget for the drain
+/// and not for any one pause.
+///
+/// The ways out other than the worker coming free are the ones the drain
+/// already had — the stop button, the wall-clock deadline, maintenance mode and
+/// the rest of `may_run` — checked here because a pause is exactly where a
+/// drain is most likely to be sitting when one of them fires. Nothing is held
+/// while this waits: the batch it left released its groups uncommitted and took
+/// no database lock with it, so a drain that never resumes leaves the queue
+/// exactly as it found it.
+///
+/// Idle passes never call this. Standing aside costs a wait, and a wait is only
+/// worth paying for work somebody is waiting on; an idle tick that ends here
+/// would come back a minute later anyway.
+async fn stand_aside_for_foreground(
+    app: &AppHandle,
+    state: &Arc<SmartClusterWorkerState>,
+    deadline: Instant,
+    waited: &mut Duration,
+) -> Option<&'static str> {
+    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    if !semantic.foreground_waiting() {
+        return None;
+    }
+    let started = Instant::now();
+    tracing::info!("[SMART_CLUSTER] forced drain standing aside for a foreground query");
+    let outcome = loop {
+        if state.aborted() {
+            break Some(STOP_REQUESTED);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break Some(FORCED_DEADLINE_REACHED);
+        }
+        if *waited + now.duration_since(started) >= FORCED_FOREGROUND_WAIT_BUDGET {
+            break Some(WAITED_OUT_BY_FOREGROUND);
+        }
+        // Maintenance mode and the queue-ownership verdict can both change
+        // under a drain that is doing nothing, and neither is worth resuming
+        // into. The idle gate is deliberately not consulted: a forced drain
+        // does not have one, and waiting is not the moment to grow one.
+        if !may_run(app, true) {
+            break Some(MAY_NOT_RUN);
+        }
+        if !semantic.foreground_waiting() {
+            break None;
+        }
+        tokio::time::sleep(FOREGROUND_POLL_INTERVAL).await;
+    };
+    *waited += started.elapsed();
+    match outcome {
+        None => tracing::info!(
+            "[SMART_CLUSTER] forced drain resuming after {:.1}s; the foreground query is done",
+            started.elapsed().as_secs_f64()
+        ),
+        Some(reason) => tracing::info!(
+            "[SMART_CLUSTER] forced drain ending while stood aside: {reason} \
+             (waited {:.1}s in total)",
+            waited.as_secs_f64()
+        ),
+    }
+    outcome
 }
 
 async fn run_pass(
@@ -367,6 +502,13 @@ async fn run_pass(
     if !may_run(app, forced) {
         return Ok(());
     }
+    // The deadline is the forced drain's runaway clock and starts at the click
+    // rather than at the first score, so a drain that spends its opening
+    // minutes waiting is honest about having spent them. An idle pass never
+    // reads it.
+    let deadline = Instant::now() + FORCED_DEADLINE;
+    let mut waited = Duration::ZERO;
+    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     // Unattended work must never ask Rust to decrypt protected data before the
     // user has unlocked the session.
@@ -375,7 +517,6 @@ async fn run_pass(
     }
 
     let mut scored_anything = false;
-    let deadline = Instant::now() + FORCED_DEADLINE;
     // Clusters whose re-derivation failed for a reason that may not repeat — a
     // rerank error or timeout. Remembered for the length of this pass so a
     // forced drain does not re-attempt, and re-pay for, the same failure once
@@ -383,13 +524,35 @@ async fn run_pass(
     // a transient failure deserves another try by then.
     let mut rederive_failed_this_pass: HashSet<i64> = HashSet::new();
     let result = loop {
+        // One read of the lease per iteration, and waiting is the response to
+        // it rather than a separate check in front of it. A pre-check would
+        // race: the lease can be taken again in the moment between a wait
+        // returning and the stand-down check reading it, and a forced drain
+        // that broke on that would end for the very reason it is supposed to
+        // wait out — intermittently, which is the worst way for it to happen.
         if let Some(reason) = stand_down_reason(app, state, forced, deadline) {
-            if forced {
-                tracing::info!("[SMART_CLUSTER] forced drain stopped between batches: {reason}");
+            if !forced || reason != FOREGROUND_QUERY_STOP {
+                if forced {
+                    tracing::info!(
+                        "[SMART_CLUSTER] forced drain stopped between batches: {reason}"
+                    );
+                }
+                break Ok(());
             }
-            break Ok(());
+            // Waiting before claiming a batch, not after: a batch read and then
+            // held across a pause is a batch nothing else can take either, and
+            // the drain would leave its groups uncommitted one cluster later
+            // anyway. Looping back rather than falling through keeps the lease
+            // read in one place.
+            if let Some(reason) =
+                stand_aside_for_foreground(app, state, deadline, &mut waited).await
+            {
+                tracing::info!("[SMART_CLUSTER] forced drain stopped between batches: {reason}");
+                break Ok(());
+            }
+            continue;
         }
-        let more = match run_batch(
+        let batch = match run_batch(
             app,
             state,
             storage.clone(),
@@ -399,11 +562,24 @@ async fn run_pass(
         )
         .await
         {
-            Ok(more) => more,
+            Ok(batch) => batch,
             Err(error) => break Err(error),
         };
         scored_anything = true;
-        if !more || !forced {
+        // A foreground query is the one interruption a forced drain walks back
+        // into rather than ends on, and the wait at the top of the loop is what
+        // makes "walks back in" mean "once it clears" instead of "immediately".
+        // The poll interval is charged to the wait budget here rather than left
+        // to the top of the loop so that a lease flapping across the batch read
+        // — back-to-back queries from a calibration session — cannot turn this
+        // into one database round trip per iteration for the length of the
+        // deadline.
+        if forced && batch.stopped_because == Some(FOREGROUND_QUERY_STOP) {
+            tokio::time::sleep(FOREGROUND_POLL_INTERVAL).await;
+            waited += FOREGROUND_POLL_INTERVAL;
+            continue;
+        }
+        if batch.stopped_because.is_some() || !batch.more || !forced {
             // An idle pass processes one batch per tick, as Python did; the tick
             // is a minute away and the queue is not going anywhere.
             break Ok(());
@@ -425,7 +601,6 @@ async fn run_pass(
     // would land *behind* the query it was meant to help and then free the
     // MiniLM session that query had just paid to load. The next pass is a
     // minute away and will release it then.
-    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     if scored_anything && !semantic.foreground_waiting() && reranker_is_resident(app) {
         if let Err(error) = semantic.unload_model(app.clone()).await {
             tracing::debug!("[SMART_CLUSTER] reranker unload after the pass failed: {error}");
@@ -442,7 +617,41 @@ fn reranker_is_resident(app: &AppHandle) -> bool {
         .is_some_and(|loaded| loaded == expected)
 }
 
-/// Process one batch. Returns whether more work is likely to remain.
+/// What one batch concluded.
+///
+/// The reason is carried out rather than collapsed into "no more work" because
+/// exactly one of them — [`FOREGROUND_QUERY_STOP`] — is something a forced
+/// drain resumes from, and a caller that could not tell it apart would either
+/// end a drain the user is watching or spin re-reading the queue for the length
+/// of the deadline.
+struct BatchProgress {
+    /// Whether the queue is likely to still hold work. Meaningless when the
+    /// batch stopped early, since it never got far enough to find out.
+    more: bool,
+    /// Why the batch stopped part-way, if it did. `None` means it finished.
+    stopped_because: Option<&'static str>,
+}
+
+impl BatchProgress {
+    /// A batch that ran to the end. `more` is what the queue count said.
+    fn completed(more: bool) -> Self {
+        Self {
+            more,
+            stopped_because: None,
+        }
+    }
+
+    /// A batch that stopped part-way. Whatever it committed stands; the rest is
+    /// still queued, so there is by construction more work.
+    fn stopped(reason: &'static str) -> Self {
+        Self {
+            more: true,
+            stopped_because: Some(reason),
+        }
+    }
+}
+
+/// Process one batch.
 async fn run_batch(
     app: &AppHandle,
     state: &Arc<SmartClusterWorkerState>,
@@ -450,7 +659,7 @@ async fn run_batch(
     forced: bool,
     deadline: Instant,
     rederive_failed_this_pass: &mut HashSet<i64>,
-) -> Result<bool, String> {
+) -> Result<BatchProgress, String> {
     let read = {
         let storage = storage.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<BatchInputs>, String> {
@@ -485,7 +694,7 @@ async fn run_batch(
         .map_err(|error| format!("smart cluster read task failed: {error}"))??
     };
     let Some(inputs) = read else {
-        return Ok(false);
+        return Ok(BatchProgress::completed(false));
     };
 
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
@@ -508,21 +717,21 @@ async fn run_batch(
     state
         .unverifiable_thresholds
         .store(resolution.unverifiable as u64, Ordering::SeqCst);
-    if resolution.interrupted {
+    if let Some(reason) = resolution.interrupted {
         // Resolution stood down part-way, so `usable` is a prefix of the
         // enabled clusters rather than all of them. Scoring against a prefix
         // would be a silent loss of coverage: the queue entries are deleted
         // once every cluster in `usable` has scored them, so the clusters this
         // stopped short of would never see these screenshots again. Nothing is
         // deleted and nothing is scored; the next pass starts over.
-        return Ok(false);
+        return Ok(BatchProgress::stopped(reason));
     }
     let targets = resolution.usable;
     if targets.is_empty() {
         if resolution.retryable > 0 {
             // At least one cluster failed for a reason that may not repeat, so
             // the ids stay queued for a pass that can score them.
-            return Ok(false);
+            return Ok(BatchProgress::completed(false));
         }
         // Every enabled cluster has been given up on: its saved examples cannot
         // produce a threshold under this scorer, and nothing but a
@@ -534,7 +743,7 @@ async fn run_batch(
         // The warning banner keeps saying which clusters need attention, and a
         // rescan re-enqueues the window once they have it.
         delete_pending(storage, &inputs.ids).await?;
-        return Ok(inputs.remaining > 0);
+        return Ok(BatchProgress::completed(inputs.remaining > 0));
     }
 
     let anchors = embed_anchors(app, &semantic, storage.clone(), &targets).await?;
@@ -557,11 +766,11 @@ async fn run_batch(
     // own, and the prefilter compares one stored vector against one anchor.
     let group_size = commit_group_size(targets.len());
     let mut assigned = 0u64;
-    let mut interrupted = false;
+    let mut interrupted: Option<&'static str> = None;
     for group in inputs.ids.chunks(group_size) {
         if let Some(reason) = stand_down_reason(app, state, forced, deadline) {
             tracing::debug!("[SMART_CLUSTER] leaving the batch before a commit group: {reason}");
-            interrupted = true;
+            interrupted = Some(reason);
             break;
         }
         let documents = load_documents(storage.clone(), group).await?;
@@ -582,7 +791,7 @@ async fn run_batch(
             // scored again next pass.
             if let Some(reason) = stand_down_reason(app, state, forced, deadline) {
                 tracing::debug!("[SMART_CLUSTER] leaving the batch between clusters: {reason}");
-                interrupted = true;
+                interrupted = Some(reason);
                 break;
             }
             let Some(anchor) = anchors.get(&target.id) else {
@@ -601,8 +810,12 @@ async fn run_batch(
                 &semantic,
                 &target.anchor_text,
                 &docs,
-                RERANK_TIMEOUT,
-                rerank_priority(forced),
+                crate::rerank::RerankBudget::Total(RERANK_TIMEOUT),
+                // Background for a forced drain too; see [`SCORING_PRIORITY`].
+                SCORING_PRIORITY,
+                // Not the query the calibration page is watching, so it neither
+                // advances that page's progress bar nor answers its stop button.
+                None,
             )
             .await
             {
@@ -615,7 +828,7 @@ async fn run_batch(
                         "[SMART_CLUSTER] standing down for a foreground query; \
                          the current group stays queued"
                     );
-                    interrupted = true;
+                    interrupted = Some(FOREGROUND_QUERY_STOP);
                     break;
                 }
                 Err(error) => {
@@ -635,7 +848,7 @@ async fn run_batch(
                 assigned += recorded;
             }
         }
-        if interrupted {
+        if interrupted.is_some() {
             // Committed groups stay committed; this one is scored again next
             // pass, which is the whole of what standing down now costs.
             break;
@@ -646,10 +859,10 @@ async fn run_batch(
     if assigned > 0 {
         tracing::info!("[SMART_CLUSTER] recorded {assigned} assignment(s)");
     }
-    if interrupted {
-        return Ok(false);
+    match interrupted {
+        Some(reason) => Ok(BatchProgress::stopped(reason)),
+        None => Ok(BatchProgress::completed(inputs.remaining > 0)),
     }
-    Ok(inputs.remaining > 0)
 }
 
 /// How many snapshots are scored against every enabled cluster before the
@@ -665,18 +878,20 @@ fn commit_group_size(cluster_count: usize) -> usize {
     (MAX_COMMIT_PAIRS / cluster_count.max(1) as i64).max(1) as usize
 }
 
-/// Which rerank contract a pass runs under.
+/// The rerank contract every pass in this module runs under, forced or not.
 ///
-/// A forced drain is a button the user pressed and is watching, so it takes the
-/// full protocol chunk and does not stand down. An idle pass is background work
-/// by definition and yields to anything a user is waiting on.
-fn rerank_priority(forced: bool) -> crate::rerank::RerankPriority {
-    if forced {
-        crate::rerank::RerankPriority::Foreground
-    } else {
-        crate::rerank::RerankPriority::Background
-    }
-}
+/// [`crate::rerank::RerankPriority`] names what a call does to the worker — how
+/// big a chunk it submits, and whether it checks between chunks — not who asked
+/// for it. A forced drain is still different from an idle tick, in a bigger
+/// batch, in ignoring the idle gate, and in waiting and resuming rather than
+/// ending; none of those require holding the worker through somebody else's
+/// query. It used to run `Foreground` here, which bought it a whole
+/// `rerank_documents` call with no check inside it — a commit group's
+/// candidates when scoring, around nineteen seconds at [`MAX_COMMIT_PAIRS`] on
+/// the slowest machine measured, and a cluster's entire saved example set when
+/// re-deriving a threshold, which nothing bounds at all. A foreground query has
+/// five seconds to reach the same single slot.
+const SCORING_PRIORITY: crate::rerank::RerankPriority = crate::rerank::RerankPriority::Background;
 
 struct BatchInputs {
     targets: Vec<SmartClusterScoringTarget>,
@@ -701,11 +916,12 @@ struct ThresholdResolution {
     /// has been given up on, which is what lets the caller drain a queue that
     /// nothing will ever score.
     retryable: usize,
-    /// The pass stood down before every enabled cluster had been considered.
+    /// Why the pass stood down before every enabled cluster had been
+    /// considered, if it did.
     ///
     /// `usable` is then a prefix rather than a verdict on the whole set, which
     /// the caller must not score against — see `run_batch`.
-    interrupted: bool,
+    interrupted: Option<&'static str>,
 }
 
 /// Keep only the clusters whose threshold this build's scorer can be compared
@@ -740,7 +956,7 @@ async fn resolve_thresholds(
         usable: Vec::with_capacity(targets.len()),
         unverifiable: 0,
         retryable: 0,
-        interrupted: false,
+        interrupted: None,
     };
     for mut target in targets {
         if scorer.matches_stored(
@@ -769,10 +985,10 @@ async fn resolve_thresholds(
                 "[SMART_CLUSTER] stopping threshold resolution before cluster {}: {reason}",
                 target.id
             );
-            resolution.interrupted = true;
+            resolution.interrupted = Some(reason);
             break;
         }
-        match rederive_threshold(app, semantic, storage.clone(), &target, scorer, forced).await {
+        match rederive_threshold(app, semantic, storage.clone(), &target, scorer).await {
             Ok(Some(threshold)) => {
                 tracing::info!(
                     "[SMART_CLUSTER] re-derived threshold for cluster {} under the current scorer: {:.4} -> {threshold:.4}",
@@ -808,24 +1024,30 @@ async fn resolve_thresholds(
                     );
                 }
             }
+            Err(error) if crate::rerank::is_yield(&error) => {
+                // A foreground query took the worker before this cluster was
+                // asked anything. That is not a verdict about the cluster, so
+                // it must not be recorded as one: marking it retryable would
+                // leave it out of `usable` while the batch went on to score and
+                // then *delete* the queue entries against the clusters that had
+                // already resolved, and this one would never see those
+                // screenshots again. Ending resolution instead costs the pass
+                // the batch it had not started and nothing else.
+                tracing::debug!(
+                    "[SMART_CLUSTER] threshold re-derivation for cluster {} stood down for a foreground query",
+                    target.id
+                );
+                resolution.interrupted = Some(FOREGROUND_QUERY_STOP);
+                break;
+            }
             Err(error) => {
                 resolution.unverifiable += 1;
                 resolution.retryable += 1;
                 failed_this_pass.insert(target.id);
-                if crate::rerank::is_yield(&error) {
-                    // A foreground query took the worker. Counted as retryable
-                    // like any transient failure, but not logged as a fault —
-                    // nothing about this cluster went wrong.
-                    tracing::debug!(
-                        "[SMART_CLUSTER] threshold re-derivation for cluster {} stood down for a foreground query",
-                        target.id
-                    );
-                } else {
-                    tracing::warn!(
-                        "[SMART_CLUSTER] could not re-derive the threshold for cluster {}: {error}",
-                        target.id
-                    );
-                }
+                tracing::warn!(
+                    "[SMART_CLUSTER] could not re-derive the threshold for cluster {}: {error}",
+                    target.id
+                );
             }
         }
     }
@@ -855,7 +1077,6 @@ async fn rederive_threshold(
     storage: Arc<StorageState>,
     target: &SmartClusterScoringTarget,
     scorer: &ScorerIdentity,
-    forced: bool,
 ) -> Result<Option<f64>, String> {
     let cluster_id = target.id;
     let examples = {
@@ -891,8 +1112,11 @@ async fn rederive_threshold(
         semantic,
         &target.anchor_text,
         &docs,
-        RERANK_TIMEOUT,
-        rerank_priority(forced),
+        crate::rerank::RerankBudget::Total(RERANK_TIMEOUT),
+        // Background here for the same reason as the scoring call above; see
+        // [`SCORING_PRIORITY`].
+        SCORING_PRIORITY,
+        None,
     )
     .await?;
 
@@ -1316,19 +1540,66 @@ mod tests {
     }
 
     #[test]
-    fn only_an_idle_pass_gives_the_worker_up_to_a_foreground_query() {
-        // A forced drain is a button the user pressed and is watching, so it
-        // keeps the full protocol chunk and does not stand down. An idle pass
-        // is background work by definition, and standing down between small
-        // chunks is what bounds how long a search waits for the one worker.
-        assert_eq!(
-            rerank_priority(false),
-            crate::rerank::RerankPriority::Background
-        );
-        assert_eq!(
-            rerank_priority(true),
-            crate::rerank::RerankPriority::Foreground
-        );
+    fn a_batch_that_stopped_part_way_still_reports_work_remaining() {
+        // `more` is what makes a forced drain come back for another batch, and
+        // an interruption by definition leaves the batch it was in unfinished.
+        // Reporting "no more work" there would end the drain at the first
+        // foreground query it met.
+        let stopped = BatchProgress::stopped(FOREGROUND_QUERY_STOP);
+        assert!(stopped.more);
+        assert_eq!(stopped.stopped_because, Some(FOREGROUND_QUERY_STOP));
+
+        let finished = BatchProgress::completed(false);
+        assert!(!finished.more);
+        assert!(finished.stopped_because.is_none());
+    }
+
+    #[test]
+    fn the_reason_a_forced_drain_resumes_from_is_distinguishable() {
+        // The drain waits on exactly one of `stand_down_reason`'s answers and
+        // ends on the rest, and it tells them apart by value. Two reasons that
+        // compared equal would make it either wait out a stop button or end on
+        // a query it should have waited for.
+        //
+        // Compared against the constants the code actually returns, not against
+        // copies written here: a test holding its own copy of a string is a test
+        // that agrees with itself about a collision it cannot see.
+        for other in [
+            STOP_REQUESTED,
+            FORCED_DEADLINE_REACHED,
+            MAY_NOT_RUN,
+            WAITED_OUT_BY_FOREGROUND,
+        ] {
+            assert_ne!(other, FOREGROUND_QUERY_STOP);
+        }
+    }
+
+    #[test]
+    fn a_forced_drain_cannot_wait_out_its_own_deadline() {
+        // The wait budget has to leave time to actually score something, or the
+        // button becomes a way to spend ten minutes doing nothing and then log
+        // that the queue was deep. It also has to outlast one whole reranked
+        // calibration query, or the common collision — search, then drain —
+        // ends the drain rather than sequencing it.
+        assert!(FORCED_FOREGROUND_WAIT_BUDGET < FORCED_DEADLINE);
+        let worst_query = Duration::from_millis(1180)
+            * (crate::rerank::MAX_RERANK_RESULTS * crate::rerank::RERANK_OVERFETCH);
+        assert!(FORCED_FOREGROUND_WAIT_BUDGET > worst_query);
+    }
+
+    #[test]
+    fn no_pass_in_this_module_holds_the_worker_through_a_foreground_query() {
+        // Both modes run their cross-encoder calls under the background
+        // contract, which is what bounds a foreground query's wait at one
+        // document rather than at one commit group. A forced drain is still
+        // different, but in scheduling — a bigger batch, no idle gate, and a
+        // pass that waits and resumes — not in what it does to the worker while
+        // somebody is blocked on it.
+        //
+        // This is the invariant `rerank.rs::FOREGROUND_RERANK_CHUNK` leans on
+        // to justify fourteen inter-chunk gaps where there used to be one.
+        assert_eq!(SCORING_PRIORITY, crate::rerank::RerankPriority::Background);
+        assert_ne!(SCORING_PRIORITY, crate::rerank::RerankPriority::Foreground);
     }
 
     #[test]
@@ -1576,18 +1847,21 @@ mod tests {
             usable: vec![legacy_target(1, None)],
             unverifiable: 0,
             retryable: 0,
-            interrupted: false,
+            interrupted: None,
         };
-        assert!(!complete.interrupted);
+        assert!(complete.interrupted.is_none());
 
         let stopped_early = ThresholdResolution {
             usable: vec![legacy_target(1, None)],
             unverifiable: 0,
             retryable: 0,
-            interrupted: true,
+            interrupted: Some(FOREGROUND_QUERY_STOP),
         };
         // Same non-empty `usable`, opposite handling.
-        assert!(stopped_early.interrupted);
+        assert!(stopped_early.interrupted.is_some());
         assert_eq!(stopped_early.usable.len(), complete.usable.len());
+        // And the reason travels with it, because a forced drain resumes from
+        // this one and ends on the others.
+        assert_eq!(stopped_early.interrupted, Some(FOREGROUND_QUERY_STOP));
     }
 }

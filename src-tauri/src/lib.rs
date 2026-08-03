@@ -825,6 +825,7 @@ pub fn run() {
             smart_cluster_scoring::SmartClusterWorkerState::default(),
         ))
         .manage(Arc::new(minilm_index::SemanticIndexRunState::default()))
+        .manage(Arc::new(rerank::RerankQueryState::default()))
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
@@ -1151,6 +1152,7 @@ pub fn run() {
             semantic_runtime::restart_ml_semantic_worker,
             minilm_index::semantic_index_run_now,
             minilm_index::semantic_index_stop_now,
+            rerank::nl_rerank_stop_now,
             minilm_migration::get_minilm_rebuild_status,
             minilm_migration::list_minilm_rebuild_errors,
             maintenance::get_maintenance_status,

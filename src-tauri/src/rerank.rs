@@ -25,13 +25,14 @@
 //! `smart_cluster_scoring.rs`.
 
 use crate::registry_config;
-use crate::ml_protocol::{MlProvider, MlSemanticModel, MAX_RERANK_DOCUMENTS};
+use crate::ml_protocol::{MlProvider, MlSemanticModel};
 use crate::semantic_models::descriptor;
 use crate::semantic_runtime::SemanticRuntimeState;
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// OCR characters that go into a reranked document.
 ///
@@ -57,14 +58,134 @@ pub const RERANK_VARIANT: &str = "uint8";
 /// result. Matches Python's `rerank_overfetch` default.
 pub const RERANK_OVERFETCH: u32 = 4;
 
-/// Deadline for one user-facing reranked query, covering retrieval, every
-/// rerank chunk, and a cold 570 MB model load.
+/// Ceiling on `n_results` for a reranked query.
 ///
-/// Far longer than the 5 s the non-reranked path allows, and deliberately so:
-/// this path is only ever reached from Smart Cluster calibration, where the
-/// user has asked for a preview and is watching a progress line, and where
-/// there is no second backend to fall back to once the cutover lands.
-pub const RERANK_QUERY_TIMEOUT: Duration = Duration::from_secs(120);
+/// The cost of this path is `n_results * RERANK_OVERFETCH` cross-encoder
+/// documents and nothing else, so the result count is the only knob that moves
+/// it. The picker used to offer 10, 30, 60, and 120, which at the measured
+/// per-document costs spans twelve minutes of range on one machine — and the
+/// two largest options could not finish inside any budget worth waiting for
+/// even on the sixteen-core desktop the latency was measured on. Calibration
+/// needs enough candidates to mark three positives, not a hundred and twenty of
+/// them, so the useful part of that range is the part that is kept.
+///
+/// Applied where the command enters rather than inside the Rust path, so the
+/// bound holds for a query Python answers too. The two backends are compared
+/// against each other and a threshold derived from one is stored next to a
+/// scorer identity from the other; letting them see different candidate counts
+/// would make that comparison meaningless.
+pub const MAX_RERANK_RESULTS: u32 = 30;
+
+/// Budget for one chunk of a user-facing reranked query, and the only thing
+/// that ends such a query other than the user.
+///
+/// This replaces a 120 s budget that spanned the whole call. That constant
+/// could not do the job it was written for. It had to cover a cold 570 MB model
+/// load plus every chunk, while the document count it was covering varied by a
+/// factor of twelve and the per-document cost by a factor of four across
+/// machines — so on a four-core laptop the default request already sat on the
+/// line, and a two-core machine exceeded it outright. What the user got there
+/// was two minutes of an unlabelled spinner, then the whole thing thrown away
+/// and re-run on Python.
+///
+/// A slow machine is not a broken one, and the difference is what this budget
+/// measures instead: each chunk gets its own allowance, so the query ends when
+/// the worker *stops producing*, not when the machine turns out to be modest.
+/// Generous enough to cover the cold model load, which lands inside the first
+/// chunk and is the one legitimately slow step; after that a chunk of
+/// `FOREGROUND_RERANK_CHUNK` documents costs single-digit seconds even at one
+/// intra-op thread, so reaching this at all means the worker is stuck.
+///
+/// What makes an open-ended budget acceptable is that the user can see the
+/// progress and stop it. That is the same argument `minilm_index.rs` records
+/// for dropping the subject cap on the manual indexing run, and it applies here
+/// for the same reason.
+pub const RERANK_CHUNK_STALL: Duration = Duration::from_secs(180);
+
+/// Runaway guard on a whole reranked query, for a run nobody is watching
+/// anymore — the page was navigated away from, the window hidden.
+///
+/// Deliberately far above any real query: `MAX_RERANK_RESULTS * RERANK_OVERFETCH`
+/// documents at the slowest measured per-document cost is under three minutes.
+/// Reaching this means chunks kept completing just under the stall budget,
+/// which no working configuration does.
+pub const RERANK_QUERY_CEILING: Duration = Duration::from_secs(15 * 60);
+
+/// How a rerank call is bounded in time.
+///
+/// Two shapes because two situations. A background pass has nobody watching
+/// and no way to be told to stop, so it must end on its own and a single total
+/// deadline is exactly right. A user-facing query has both, so bounding the
+/// total is the wrong instrument — it punishes a slow machine for being slow,
+/// which the user can already see and act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RerankBudget {
+    /// One deadline for the whole call, chunks included.
+    Total(Duration),
+    /// A budget each chunk gets on its own, under a ceiling on the whole call.
+    PerChunk { chunk: Duration, ceiling: Duration },
+}
+
+impl RerankBudget {
+    /// The budget a user-facing query runs under.
+    pub fn interactive() -> Self {
+        Self::PerChunk {
+            chunk: RERANK_CHUNK_STALL,
+            ceiling: RERANK_QUERY_CEILING,
+        }
+    }
+}
+
+/// What a [`RerankBudget`] means once a call is actually running: when the call
+/// is over, and what the chunk about to be submitted may spend.
+///
+/// Separated from the chunk loop because the difference between the two budget
+/// shapes lives entirely in this arithmetic, and inside an async function that
+/// needs a worker and an `AppHandle` it can only be checked by running a rerank.
+/// Here it is a pure function of the budget and the clock, so both shapes can be
+/// stated as the properties they are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RerankClock {
+    /// When the whole call is over, whichever shape the budget has. Fixed when
+    /// the call starts: a chunk finishing never moves it.
+    deadline: Instant,
+    /// What one chunk may spend, when a chunk is bounded separately from the
+    /// call. `None` means the chunk may spend everything the call has left,
+    /// which is what makes `Total` a budget for the pass rather than for a
+    /// chunk of it.
+    chunk: Option<Duration>,
+}
+
+impl RerankClock {
+    fn start(budget: RerankBudget, now: Instant) -> Self {
+        match budget {
+            RerankBudget::Total(total) => Self {
+                deadline: now + total,
+                chunk: None,
+            },
+            RerankBudget::PerChunk { chunk, ceiling } => Self {
+                deadline: now + ceiling,
+                chunk: Some(chunk),
+            },
+        }
+    }
+
+    /// What the chunk about to be submitted may spend, or `None` when the call
+    /// is out of budget and must stop instead of submitting.
+    ///
+    /// Never `Some(ZERO)`: a zero timeout travels to the worker as
+    /// `timeout_ms: 0`, so handing one out would submit a chunk that cannot
+    /// succeed and would be charged for the attempt.
+    fn allowance(&self, now: Instant) -> Option<Duration> {
+        let remaining = self.deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            return None;
+        }
+        // Never more than what is left overall, so the per-chunk shape stays
+        // bounded by its ceiling on the last chunk rather than overrunning it.
+        Some(self.chunk.map_or(remaining, |chunk| chunk.min(remaining)))
+    }
+}
 
 const RERANK_RUNTIMES: &[&str] = &["python", "rust"];
 const DEFAULT_RERANK_RUNTIME: &str = "rust";
@@ -224,14 +345,32 @@ pub fn reranker_status_value(app: &AppHandle) -> serde_json::Value {
     let (model_dir, available) = crate::model_management::reranker_install_status();
     let loaded = app
         .try_state::<Arc<SemanticRuntimeState>>()
-        .map(|semantic| semantic.status())
-        .and_then(|status| status.loaded_model)
-        .is_some_and(|loaded| loaded == descriptor.model_id);
+        .is_some_and(|semantic| reranker_resident(semantic.inner()));
     reranker_status_payload(
         available,
         loaded,
         &model_dir.join(descriptor.model_file).display().to_string(),
     )
+}
+
+/// Whether the cross-encoder is the model currently resident in the engine.
+///
+/// Answers the calibration screen's status query, which is what lets that
+/// screen distinguish "the model is being read" from "the model is missing".
+///
+/// Not a "can this query skip the load?" test, on any path that reranks. Such a
+/// path retrieves first, the retrieval encodes the query with MiniLM, and the
+/// engine keeps one model resident (`semantic_engine.rs::ensure_loaded`) — so a
+/// reranked query has always just evicted the cross-encoder by the time it
+/// could ask. There is no fast path here to detect: there is a 570 MB read
+/// before the first chunk of every reranked query, which is why
+/// `semantic_query.rs` announces that load unconditionally.
+pub fn reranker_resident(semantic: &Arc<SemanticRuntimeState>) -> bool {
+    let descriptor = descriptor(MlSemanticModel::BgeRerankerV2M3);
+    semantic
+        .status()
+        .loaded_model
+        .is_some_and(|loaded| loaded == descriptor.model_id)
 }
 
 fn reranker_status_payload(
@@ -308,29 +447,279 @@ pub fn build_rerank_document(process: &str, title: &str, ocr_text: &str) -> Stri
 /// parallelism to exploit. Larger chunks bought latency risk and nothing else.
 pub const BACKGROUND_RERANK_CHUNK: usize = 1;
 
+/// Documents per foreground rerank request.
+///
+/// Was `MAX_RERANK_DOCUMENTS`, the largest the protocol allows, on the
+/// reasoning that a user-facing query should get the fewest round trips. That
+/// reasoning assumed the query had nothing to say until it was finished. Now it
+/// reports after every chunk, and the chunk is what the progress bar advances
+/// by, so 64 meant a bar that moved twice on the default request and a stop
+/// button that took a third of the query to be noticed.
+///
+/// Eight is free in throughput terms: per-document cost was measured flat from
+/// batch 1 to batch 8 at every thread count, because the session is sequential
+/// and has no batch parallelism to exploit. What it buys is fifteen progress
+/// steps on the default request instead of two, and a cancel that lands within
+/// single-digit seconds.
+///
+/// **What shrinking it does cost is fourteen inter-chunk gaps where there was
+/// one, and that only stays free while every other pass honors the lease.** The
+/// engine keeps one model resident (`semantic_engine.rs::ensure_loaded`), so any
+/// MiniLM request landing between two chunks evicts the cross-encoder, and the
+/// next chunk pays a 570 MB re-read, a full SHA-256 re-verification
+/// (`semantic_models.rs::verify_model_files`), and a fresh ONNX session — 1.2 s
+/// on a warm page cache, against roughly 2.5 s of actual scoring in a chunk.
+/// Multiply by fourteen and the interleaved query is slower than the
+/// un-interleaved one it replaced, on both sides.
+///
+/// The whole query holds a `foreground_lease` for exactly this reason, and the
+/// invariant it buys is that *no* pass keeps submitting while one is held —
+/// not only the idle loops. The two user-initiated passes were the gap: a
+/// manual index run (`minilm_index.rs`) and a forced Smart Cluster drain
+/// (`smart_cluster_scoring.rs`) both used to read past the check on the grounds
+/// that the user had asked for them, which is a fair argument about consent and
+/// the wrong answer about cost. What each of them was costing differs, and
+/// neither cost is one the user could see or consented to:
+///
+/// - The index run wants MiniLM, so every chunk it lands here is an eviction of
+///   the model this query is using and a reload before the next one.
+/// - The drain wants the same cross-encoder, so it evicts nothing — it simply
+///   takes turns at the single slot, which halves this query rather than
+///   sharing anything with it, and re-derives a cluster threshold at MiniLM
+///   whenever an anchor changed.
+///
+/// Both now stand aside and resume rather than stand down, so their button
+/// still means something, and both submit under `RerankPriority::Background`
+/// so that "stops submitting" takes effect within one document rather than
+/// within one batch. Reverting either of those puts this constant back to 64.
+pub const FOREGROUND_RERANK_CHUNK: usize = 8;
+
 /// Who a rerank is being run for.
 ///
 /// Decides both the chunk size and whether the call stands down when a
 /// foreground query appears. Passed explicitly rather than inferred from the
-/// caller, because the Smart Cluster worker is background on an idle pass and
-/// foreground on the "run now" the user just clicked.
+/// caller — though as it stands only one caller passes `Foreground`, which is
+/// the honest shape of it: this names what a call does to the worker, not who
+/// asked for the work.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RerankPriority {
-    /// A user is waiting on this. Takes the largest chunk the protocol allows
-    /// and never yields — including a forced Smart Cluster drain, which is a
-    /// button the user pressed.
+    /// A user is blocked on this exact result. Never yields, because there is
+    /// nothing it could yield to that matters more.
+    ///
+    /// Only the reranked natural-language query uses this. A forced Smart
+    /// Cluster drain does not, even though a user pressed its button: the
+    /// button asks for the queue to be drained, not for a search typed a minute
+    /// later to wait a commit group for the worker.
     Foreground,
-    /// Idle-gated background scoring. Small chunks, and stands down between
-    /// them the moment a foreground request wants the worker.
+    /// Every pass that feeds the worker on its own schedule, idle or forced.
+    /// Small chunks, and stands down between them the moment a foreground
+    /// request wants the worker.
     Background,
 }
 
 impl RerankPriority {
     fn chunk_size(self) -> usize {
         match self {
-            Self::Foreground => MAX_RERANK_DOCUMENTS,
+            Self::Foreground => FOREGROUND_RERANK_CHUNK,
             Self::Background => BACKGROUND_RERANK_CHUNK,
         }
+    }
+}
+
+/// Progress event for the reranked natural-language query, one per finished
+/// chunk plus one for each phase that precedes the first.
+///
+/// A dropped event costs a progress line and never correctness: the command's
+/// return value is the authoritative outcome, and the view reconciles against
+/// it when the promise settles.
+pub const NL_RERANK_PROGRESS_EVENT: &str = "nl-rerank-progress";
+
+/// Error prefix marking a reranked query the user stopped.
+///
+/// Distinguished from every other error for one reason: an ordinary failure on
+/// the Rust path hands the query to Python, which is right for a stuck worker
+/// and wrong for a stop button. Re-running on the other backend the work
+/// somebody just asked to end is the opposite of what they asked for.
+pub const CANCELLED_BY_USER: &str = "cancelled_by_user";
+
+/// Whether an error from [`rerank_documents`] is the user's stop.
+pub fn is_cancelled(error: &str) -> bool {
+    error.starts_with(CANCELLED_BY_USER)
+}
+
+/// Which stage of a reranked query is running, as reported to the view.
+///
+/// Three because the wait has three visibly different parts and only one of
+/// them has a denominator. The old UI collapsed them into one static line —
+/// "encode, retrieve, load reranker, rerank" — which was accurate about the
+/// pipeline and told a user watching it for two minutes nothing about where in
+/// that pipeline they were.
+#[derive(Clone, Copy, Debug)]
+pub enum RerankPhase {
+    /// Bi-encoder query encode and the cosine scan. Milliseconds.
+    Retrieving,
+    /// The cross-encoder is being read from disk: seconds to tens of seconds
+    /// for 570 MB, and the most common reason a calibration query feels broken.
+    /// Reported on every reranked query rather than only the first one, because
+    /// the retrieval that precedes it evicts the cross-encoder every time — see
+    /// `semantic_query.rs::run_rust_reranked_nl_query`.
+    LoadingModel,
+    /// Scoring, with `scored` of `total` documents done.
+    Reranking,
+    /// The query is being answered by Python instead — the `rerank_runtime`
+    /// rollback, or any of the conditions that make the Rust path stand down.
+    ///
+    /// Reported because the alternative is worse than saying nothing: Python
+    /// fuses retrieval and reranking into one opaque IPC call, so there is no
+    /// progress to show and no chunk boundary to stop at, and a view that did
+    /// not know this would leave a stop button that silently does nothing under
+    /// a progress bar that never moves.
+    ExternalBackend,
+}
+
+impl RerankPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Retrieving => "retrieving",
+            Self::LoadingModel => "loading_model",
+            Self::Reranking => "reranking",
+            Self::ExternalBackend => "external_backend",
+        }
+    }
+}
+
+/// The running user-facing reranked query: what it has finished, and whether
+/// the user has asked it to stop.
+///
+/// One query holds this at a time, but a query outlives the view that started
+/// it: closing the calibration page unmounts the view and leaves the query
+/// scoring. So a claim is a serial number rather than a flag, and only the
+/// holder of the current serial reports progress or releases the state. A
+/// superseded query reads as cancelled, because nobody is waiting on it.
+#[derive(Default)]
+pub struct RerankQueryState {
+    /// Serial of the query holding this state; zero when none does.
+    holder: AtomicU64,
+    /// Source of claim serials. Never reset, so a serial is never reused.
+    next_serial: AtomicU64,
+    /// Set by `nl_rerank_stop_now`; checked between chunks. Cleared when the
+    /// next query starts, so a stop arriving as one finishes cannot cancel the
+    /// one after it.
+    cancel_requested: AtomicBool,
+    scored: AtomicU64,
+    total: AtomicU64,
+}
+
+impl RerankQueryState {
+    /// Ask the running query to stop after the chunk it is scoring. A chunk
+    /// cannot be interrupted once submitted to the worker, so this is prompt
+    /// rather than immediate.
+    pub fn request_cancel(&self) {
+        self.cancel_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.holder.load(Ordering::SeqCst) != 0
+    }
+
+    /// Claim the query and reset its counters. The returned guard releases the
+    /// claim on every path out, including the error and cancel ones.
+    pub fn begin(self: &Arc<Self>) -> ActiveRerankQuery {
+        let serial = self.next_serial.fetch_add(1, Ordering::SeqCst) + 1;
+        // The stop is cleared before the claim and the counters after it, so
+        // the query being displaced can neither keep a stop meant for it nor
+        // add a chunk to the counters of the one taking over.
+        self.cancel_requested.store(false, Ordering::SeqCst);
+        self.holder.store(serial, Ordering::SeqCst);
+        self.scored.store(0, Ordering::SeqCst);
+        self.total.store(0, Ordering::SeqCst);
+        ActiveRerankQuery {
+            state: self.clone(),
+            serial,
+        }
+    }
+
+    /// Announce that another backend took the query, from a caller that never
+    /// claimed this state and never will.
+    ///
+    /// Deliberately not a claim: nothing here can be stopped or counted, and
+    /// taking the state would leave the stop command reporting that it had
+    /// something to cancel when it does not.
+    pub fn report_external_backend(app: &AppHandle) {
+        let _ = app.emit(
+            NL_RERANK_PROGRESS_EVENT,
+            serde_json::json!({
+                "phase": RerankPhase::ExternalBackend.label(),
+                "scored": 0,
+                "total": 0,
+            }),
+        );
+    }
+
+    fn emit(&self, app: &AppHandle, phase: RerankPhase) {
+        let _ = app.emit(
+            NL_RERANK_PROGRESS_EVENT,
+            serde_json::json!({
+                "phase": phase.label(),
+                "scored": self.scored.load(Ordering::SeqCst),
+                "total": self.total.load(Ordering::SeqCst),
+            }),
+        );
+    }
+}
+
+/// Holds the claim for the lifetime of one user-facing reranked query.
+pub struct ActiveRerankQuery {
+    state: Arc<RerankQueryState>,
+    serial: u64,
+}
+
+impl ActiveRerankQuery {
+    /// Whether this query still holds the state it claimed.
+    fn is_current(&self) -> bool {
+        self.state.holder.load(Ordering::SeqCst) == self.serial
+    }
+
+    /// Whether this query should stop: the user asked it to, or a later query
+    /// took the state from it.
+    fn cancelled(&self) -> bool {
+        !self.is_current() || self.state.cancel_requested.load(Ordering::SeqCst)
+    }
+
+    /// Announce a phase that has no denominator of its own.
+    pub fn report_phase(&self, app: &AppHandle, phase: RerankPhase) {
+        if self.is_current() {
+            self.state.emit(app, phase);
+        }
+    }
+
+    /// Record the documents one finished chunk scored.
+    fn report_chunk(&self, app: &AppHandle, scored: u64, total: u64) {
+        if self.record_chunk(scored, total) {
+            self.state.emit(app, RerankPhase::Reranking);
+        }
+    }
+
+    /// Add one chunk to the counters, and say whether it counted — a
+    /// superseded query belongs to nobody's progress bar.
+    fn record_chunk(&self, scored: u64, total: u64) -> bool {
+        if !self.is_current() {
+            return false;
+        }
+        self.state.total.store(total, Ordering::SeqCst);
+        self.state.scored.fetch_add(scored, Ordering::SeqCst);
+        true
+    }
+}
+
+impl Drop for ActiveRerankQuery {
+    fn drop(&mut self) {
+        let _ = self.state.holder.compare_exchange(
+            self.serial,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 }
 
@@ -339,8 +728,10 @@ impl RerankPriority {
 ///
 /// It travels as an error because that is the only channel `rerank_documents`
 /// has, but it means the opposite of one: nothing was attempted, nothing is
-/// broken, and the caller should leave its work queued for a later pass instead
-/// of charging a retry budget or logging a fault.
+/// broken, and the caller should leave its work queued rather than charge a
+/// retry budget or log a fault. What the caller does next is the one thing that
+/// differs between passes — an idle one ends and waits for its next tick, a
+/// forced one waits for the lease to clear and claims a fresh batch.
 pub const YIELDED_TO_FOREGROUND: &str = "yielded_to_foreground";
 
 /// Whether an error from [`rerank_documents`] is the stand-down marker.
@@ -361,28 +752,46 @@ pub fn is_yield(error: &str) -> bool {
 /// calls in a way that, say, a softmax over the batch would not be. Python
 /// already relies on this — `reranker.py` runs its own `batch_size = 8` loop.
 ///
-/// One deadline spans every chunk, so a query cannot quietly take
-/// `chunks × timeout`.
+/// One deadline spans every chunk for a background call, so a pass cannot
+/// quietly take `chunks × timeout`. A user-facing call is bounded per chunk
+/// instead; see [`RerankBudget`].
 ///
 /// A background call additionally checks between chunks whether a foreground
 /// request is waiting, and stops if one is. The check is between chunks rather
 /// than inside them because the worker runs a request to completion; a small
 /// `BACKGROUND_RERANK_CHUNK` is what makes "between chunks" soon enough to
 /// matter.
+///
+/// `watcher` is the user-facing query being reported and stopped, and only the
+/// reranked natural-language query ever passes one. Every Smart Cluster call is
+/// `None`, forced drain included: that drain is work a user asked for, but it
+/// is not the query the calibration page is watching, so advancing that page's
+/// progress bar or answering its stop button would be reporting one run's
+/// progress on another run's screen.
 pub async fn rerank_documents(
     app: &AppHandle,
     semantic: &Arc<SemanticRuntimeState>,
     query: &str,
     documents: &[String],
-    timeout: Duration,
+    budget: RerankBudget,
     priority: RerankPriority,
+    watcher: Option<&ActiveRerankQuery>,
 ) -> Result<Vec<f32>, String> {
     if documents.is_empty() {
         return Ok(Vec::new());
     }
-    let deadline = Instant::now() + timeout;
+    let clock = RerankClock::start(budget, Instant::now());
     let mut scores = Vec::with_capacity(documents.len());
     for chunk in documents.chunks(priority.chunk_size()) {
+        if let Some(watcher) = watcher {
+            if watcher.cancelled() {
+                return Err(format!(
+                    "{CANCELLED_BY_USER}: stopped after {} of {} documents",
+                    scores.len(),
+                    documents.len()
+                ));
+            }
+        }
         if priority == RerankPriority::Background && semantic.foreground_waiting() {
             return Err(format!(
                 "{YIELDED_TO_FOREGROUND}: stood down after {} of {} documents so a foreground \
@@ -391,20 +800,21 @@ pub async fn rerank_documents(
                 documents.len()
             ));
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        // What this chunk may spend, and `None` when the call has nothing left
+        // to spend at all.
+        let Some(allowance) = clock.allowance(Instant::now()) else {
             return Err(format!(
                 "timeout: reranking ran out of budget after {} of {} documents",
                 scores.len(),
                 documents.len()
             ));
-        }
+        };
         let result = semantic
             .rerank(
                 app.clone(),
                 query.to_string(),
                 chunk.to_vec(),
-                remaining,
+                allowance,
                 // DirectML parity is not approved for this model; asking for it
                 // only costs a provider negotiation before the fallback to CPU.
                 false,
@@ -418,8 +828,40 @@ pub async fn rerank_documents(
             ));
         }
         scores.extend(result.scores);
+        if let Some(watcher) = watcher {
+            watcher.report_chunk(app, chunk.len() as u64, documents.len() as u64);
+        }
     }
     Ok(scores)
+}
+
+/// Ask the running reranked natural-language query to stop.
+///
+/// Returns whether there was one to stop, so a view that pressed the button as
+/// the query was settling on its own does not report a cancellation that never
+/// happened.
+///
+/// Not session-guarded, for the reason `semantic_index_stop_now` records:
+/// this halts work and touches no user data, and requiring an unlock to *stop*
+/// something would be exactly backwards on a machine whose session locked while
+/// the query was running.
+///
+/// The query checks between chunks, so a stop takes effect within one chunk of
+/// `FOREGROUND_RERANK_CHUNK` documents. Nothing is written on either side of
+/// this, so a stopped query costs only the CPU it had already spent.
+#[tauri::command]
+pub async fn nl_rerank_stop_now(
+    window: tauri::Window,
+    app: AppHandle,
+) -> Result<bool, String> {
+    crate::commands::check_main_window(&window)?;
+    let query = app.state::<Arc<RerankQueryState>>().inner().clone();
+    if !query.is_running() {
+        return Ok(false);
+    }
+    query.request_cancel();
+    tracing::info!("[SEMANTIC] reranked query asked to stop");
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -464,7 +906,196 @@ mod tests {
         // The reason chunking exists rather than being an optimization: the
         // default calibration request is 30 * 4 documents against a cap of 64.
         let calibration_documents = 30 * RERANK_OVERFETCH as usize;
-        assert!(calibration_documents > MAX_RERANK_DOCUMENTS);
+        assert!(calibration_documents > crate::ml_protocol::MAX_RERANK_DOCUMENTS);
+        // And the foreground chunk stays inside that cap, which is what the
+        // protocol validator rejects a request for exceeding.
+        assert!(FOREGROUND_RERANK_CHUNK <= crate::ml_protocol::MAX_RERANK_DOCUMENTS);
+    }
+
+    #[test]
+    fn the_result_cap_bounds_what_one_query_can_cost() {
+        // The cap is on results, but what it is really bounding is documents,
+        // because that is what the cross-encoder is paid per. The retired 120
+        // option asked for 480 of them, which exceeded the old whole-query
+        // budget even on the machine the per-document cost was measured on.
+        assert_eq!(MAX_RERANK_RESULTS, 30);
+        let documents = MAX_RERANK_RESULTS as usize * RERANK_OVERFETCH as usize;
+        assert_eq!(documents, 120);
+        // Slowest measured per-document cost, one intra-op thread.
+        let worst_case = Duration::from_millis(1250) * documents as u32;
+        assert!(worst_case < RERANK_QUERY_CEILING);
+        // And the ceiling is a runaway guard, not a budget the slowest machine
+        // is expected to brush against.
+        assert!(worst_case * 4 < RERANK_QUERY_CEILING);
+    }
+
+    #[test]
+    fn a_foreground_chunk_stays_well_inside_its_stall_budget() {
+        // Reaching the stall budget has to mean the worker stopped producing,
+        // not that the machine is slow, or the budget is measuring the wrong
+        // thing again. One chunk at the slowest measured per-document cost:
+        let slowest_chunk = Duration::from_millis(1250) * FOREGROUND_RERANK_CHUNK as u32;
+        assert!(slowest_chunk * 10 < RERANK_CHUNK_STALL);
+        // The first chunk also absorbs a cold 570 MB model load, which is the
+        // reason the budget is minutes rather than seconds.
+        assert!(RERANK_CHUNK_STALL >= Duration::from_secs(120));
+    }
+
+    #[test]
+    fn a_background_call_keeps_one_deadline_for_the_whole_pass() {
+        // Nobody is watching a background pass and nothing can tell it to stop,
+        // so a total deadline is the only thing that ends a runaway. What that
+        // requires of the arithmetic is that finishing a chunk buys nothing:
+        // every chunk's allowance runs out at the *same instant*, whichever
+        // chunk it is and however long the ones before it took. That instant is
+        // the deadline, and `chunks × budget` is therefore not reachable.
+        const TOTAL: Duration = Duration::from_secs(300);
+        let start = Instant::now();
+        let clock = RerankClock::start(RerankBudget::Total(TOTAL), start);
+        for elapsed in [0, 1, 100, 299] {
+            let at = start + Duration::from_secs(elapsed);
+            let allowance = clock.allowance(at).expect("budget left");
+            assert_eq!(
+                (at + allowance).duration_since(start),
+                TOTAL,
+                "a chunk starting {elapsed}s in was given an allowance that outlives the pass"
+            );
+        }
+        // And the pass stops rather than submitting a chunk it cannot pay for.
+        assert_eq!(clock.allowance(start + TOTAL), None);
+        assert_eq!(clock.allowance(start + TOTAL + Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn a_user_facing_call_renews_its_allowance_for_every_chunk() {
+        // The opposite property, and the reason the shape exists: a chunk gets
+        // its own budget measured from when *it* started, so a machine that
+        // takes fifteen minutes over a query it is visibly making progress on
+        // is not cut off for being slow. This is what the retired 120 s
+        // whole-query timeout got wrong.
+        let start = Instant::now();
+        let clock = RerankClock::start(RerankBudget::interactive(), start);
+        for elapsed in [0, 180, 600] {
+            let at = start + Duration::from_secs(elapsed);
+            assert_eq!(
+                clock.allowance(at),
+                Some(RERANK_CHUNK_STALL),
+                "the chunk starting {elapsed}s in was not given a full stall budget"
+            );
+        }
+        // Until the ceiling is close enough that a whole chunk would overrun
+        // it. The runaway guard wins there, or it would not be a guard.
+        let near_ceiling = start + RERANK_QUERY_CEILING - Duration::from_secs(30);
+        assert_eq!(clock.allowance(near_ceiling), Some(Duration::from_secs(30)));
+        assert_eq!(clock.allowance(start + RERANK_QUERY_CEILING), None);
+    }
+
+    #[test]
+    fn the_two_budget_shapes_answer_differently_for_the_same_chunk() {
+        // Pinned as a contrast, using the same number for both shapes so that
+        // only the shape differs. The first chunk cannot tell them apart, which
+        // is why a test that stops at the first chunk — or at the enum's
+        // shape — proves nothing about either branch.
+        let start = Instant::now();
+        let total = RerankClock::start(RerankBudget::Total(RERANK_CHUNK_STALL), start);
+        let per_chunk = RerankClock::start(RerankBudget::interactive(), start);
+        assert_eq!(total.allowance(start), per_chunk.allowance(start));
+
+        // A later chunk can: one is spending a budget down, the other is
+        // renewing it.
+        let late = start + Duration::from_secs(100);
+        assert_eq!(total.allowance(late), Some(Duration::from_secs(80)));
+        assert_eq!(per_chunk.allowance(late), Some(RERANK_CHUNK_STALL));
+
+        // And at the number both were given, one pass is over while the other
+        // is twelve minutes from its ceiling.
+        let spent = start + RERANK_CHUNK_STALL;
+        assert_eq!(total.allowance(spent), None);
+        assert_eq!(per_chunk.allowance(spent), Some(RERANK_CHUNK_STALL));
+    }
+
+    #[test]
+    fn a_user_facing_query_runs_under_the_two_budgets_written_for_it() {
+        // The constants each carry an argument in their doc comments about what
+        // they are bounding; `interactive` is where those arguments are
+        // actually applied, and a transposition here would silently bound the
+        // query at three minutes total.
+        assert_eq!(
+            RerankBudget::interactive(),
+            RerankBudget::PerChunk {
+                chunk: RERANK_CHUNK_STALL,
+                ceiling: RERANK_QUERY_CEILING,
+            }
+        );
+        assert!(RERANK_CHUNK_STALL < RERANK_QUERY_CEILING);
+    }
+
+    #[test]
+    fn a_stop_is_not_an_error_that_falls_back_to_python() {
+        // Both travel as errors because that is the only channel the chunk loop
+        // has, and both mean something other than "this failed" — so both are
+        // recognized by prefix rather than by string equality, since each
+        // carries its own progress detail.
+        let stopped = format!("{CANCELLED_BY_USER}: stopped after 24 of 120 documents");
+        assert!(is_cancelled(&stopped));
+        assert!(!is_yield(&stopped));
+        assert!(!is_cancelled("timeout: reranking ran out of budget"));
+        assert!(!is_cancelled("model_mismatch: reranker returned 3 scores"));
+    }
+
+    #[test]
+    fn a_query_state_reports_its_stop_only_while_it_is_running() {
+        let state = Arc::new(RerankQueryState::default());
+        assert!(!state.is_running());
+        state.request_cancel();
+        {
+            let active = state.begin();
+            // `begin` clears a stop left over from the previous query, so a
+            // click that landed as the last one settled cannot cancel this one.
+            assert!(!active.cancelled());
+            assert!(state.is_running());
+            state.request_cancel();
+            assert!(active.cancelled());
+        }
+        // The guard releases the claim however the query ended, including by
+        // the cancel that was just requested.
+        assert!(!state.is_running());
+    }
+
+    #[test]
+    fn a_superseded_query_neither_counts_nor_releases() {
+        // The calibration view was closed mid-query and reopened: the first
+        // query is still scoring when the second claims the state.
+        let state = Arc::new(RerankQueryState::default());
+        let first = state.begin();
+        assert!(first.record_chunk(8, 120));
+
+        let second = state.begin();
+        assert_eq!(state.scored.load(Ordering::SeqCst), 0);
+
+        assert!(first.cancelled());
+        assert!(!second.cancelled());
+        assert!(!first.record_chunk(8, 120));
+        assert_eq!(state.scored.load(Ordering::SeqCst), 0);
+
+        // The abandoned query ending must not answer for the running one, or
+        // the stop button reports that there is nothing left to stop.
+        drop(first);
+        assert!(state.is_running());
+        drop(second);
+        assert!(!state.is_running());
+    }
+
+    #[test]
+    fn a_stop_outlives_the_query_that_supersedes_it() {
+        // The user pressed stop, then closed the page and started another
+        // query before the chunk boundary that would have honoured it. `begin`
+        // clears the flag, so being superseded is what carries the stop.
+        let state = Arc::new(RerankQueryState::default());
+        let first = state.begin();
+        state.request_cancel();
+        let _second = state.begin();
+        assert!(first.cancelled());
     }
 
     #[test]
@@ -568,7 +1199,7 @@ mod tests {
         // the worst-case wait, and it has to fit inside the 5 s budget
         // (`semantic_query.rs::QUERY_EMBED_TIMEOUT`) together with the model
         // swap that query still has to pay for.
-        assert!(BACKGROUND_RERANK_CHUNK < MAX_RERANK_DOCUMENTS);
+        assert!(BACKGROUND_RERANK_CHUNK < crate::ml_protocol::MAX_RERANK_DOCUMENTS);
         assert!(BACKGROUND_RERANK_CHUNK >= 1);
         assert_eq!(
             RerankPriority::Background.chunk_size(),
@@ -591,11 +1222,19 @@ mod tests {
              {worst_wait_ms} ms of work inside a {QUERY_BUDGET_MS} ms budget"
         );
 
-        // A user-facing rerank keeps the largest chunk the protocol allows:
-        // nothing is waiting behind it that it should make room for.
+        // A user-facing rerank no longer takes the largest chunk the protocol
+        // allows. It reports after every chunk and can be stopped between them,
+        // so the chunk is the resolution of both the progress bar and the stop
+        // button — and 64 gave the default request a bar that moved twice.
         assert_eq!(
             RerankPriority::Foreground.chunk_size(),
-            MAX_RERANK_DOCUMENTS
+            FOREGROUND_RERANK_CHUNK
+        );
+        let steps = (MAX_RERANK_RESULTS as usize * RERANK_OVERFETCH as usize)
+            .div_ceil(FOREGROUND_RERANK_CHUNK);
+        assert!(
+            steps >= 10,
+            "a progress bar that advances {steps} times over a whole query is a spinner"
         );
     }
 

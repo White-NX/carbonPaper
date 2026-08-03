@@ -783,7 +783,17 @@ pub async fn monitor_nl_cluster_query(
     rerank_variant: Option<String>,
 ) -> Result<Value, String> {
     let enable_rerank = enable_rerank.unwrap_or(false);
-    let n_results = n_results.unwrap_or(30).min(200);
+    // A non-reranked query keeps its old generous bound: it costs one query
+    // encode and a cosine scan, and 200 of those is sub-second. A reranked one
+    // is paid per candidate by a CPU cross-encoder, so its bound is the one
+    // thing that decides how long the user waits — see `MAX_RERANK_RESULTS`.
+    // Clamped here rather than inside the Rust path so it holds for a query
+    // Python answers too, and the two stay comparable.
+    let n_results = n_results.unwrap_or(30).min(if enable_rerank {
+        crate::rerank::MAX_RERANK_RESULTS
+    } else {
+        200
+    });
     // Checked here rather than only inside `authenticated_monitor_command` so
     // the Rust branch cannot serve a query the Python branch would have refused.
     crate::commands::check_auth_required(&credential_state)?;
@@ -803,6 +813,31 @@ pub async fn monitor_nl_cluster_query(
         crate::semantic_query::RustQueryOutcome::FellBack(reason) => {
             tracing::warn!("[SEMANTIC] rust retrieval unavailable, serving from python: {reason}");
         }
+        // The user stopped it. Every other outcome here reaches for Python;
+        // this one must not, because the whole point of the stop was to end
+        // the wait, and Python would restart it from the beginning.
+        //
+        // Returned as a success with `cancelled` set rather than as an error:
+        // the view has to tell "you stopped this" apart from "this broke", and
+        // an `Err` is rendered as a failure by every caller of this command.
+        crate::semantic_query::RustQueryOutcome::Cancelled => {
+            return Ok(serde_json::json!({
+                "status": "cancelled",
+                "cancelled": true,
+                "results": [],
+                "reranked": false,
+                "rerank_variant": null,
+                "backend": "rust",
+            }));
+        }
+    }
+
+    // Everything below runs on Python. For a reranked query that is a wait of
+    // the same order as the Rust one with none of its reporting, so the view is
+    // told which it is getting rather than being left to show a progress bar
+    // that will never move and a stop button that would silently do nothing.
+    if enable_rerank {
+        crate::rerank::RerankQueryState::report_external_backend(&app);
     }
 
     let response = authenticated_monitor_command(

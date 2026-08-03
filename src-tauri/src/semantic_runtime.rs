@@ -238,6 +238,16 @@ impl SemanticRuntimeState {
     /// the longest a foreground caller waits is one background chunk rather than
     /// a whole batch — which is why the background rerank chunk is small
     /// (`rerank.rs::BACKGROUND_RERANK_CHUNK`).
+    ///
+    /// **Every pass that drives the worker observes this, including the two the
+    /// user started.** The idle loops were the obvious readers, but a manual
+    /// index run and a forced Smart Cluster drain are also long sequences of
+    /// requests against a single slot, and a reranked query interleaved with
+    /// either of them costs a model eviction per chunk rather than a share of
+    /// the worker. What differs between the readers is only what they do about
+    /// it: an idle pass ends, because its next tick is a minute away and nobody
+    /// asked for it; a user-initiated pass waits and resumes, because somebody
+    /// pressed a button. Neither of them keeps submitting.
     pub fn foreground_lease(self: &Arc<Self>) -> ForegroundLease {
         self.foreground_waiting.fetch_add(1, Ordering::SeqCst);
         ForegroundLease {
@@ -245,8 +255,10 @@ impl SemanticRuntimeState {
         }
     }
 
-    /// Whether a foreground request is queued or executing. Background callers
-    /// check this between units of work and stand down when it is true.
+    /// Whether a foreground request is queued or executing. Every pass that
+    /// drives the worker checks this between units of work and stops submitting
+    /// while it is true — the idle loops by ending, the user-initiated ones by
+    /// waiting on [`FOREGROUND_POLL_INTERVAL`] until it clears.
     pub fn foreground_waiting(&self) -> bool {
         self.foreground_waiting.load(Ordering::SeqCst) > 0
     }
@@ -913,6 +925,17 @@ impl Drop for ForegroundLease {
             .fetch_sub(1, Ordering::SeqCst);
     }
 }
+
+/// How often a pass that stood aside for a foreground request re-checks whether
+/// it may resume.
+///
+/// A tick is one atomic load, so a short interval costs nothing measurable, and
+/// what it buys is that the worker goes back to work promptly once the query
+/// releases its lease instead of sitting idle for the rest of a poll window.
+/// Deliberately far shorter than any request this arbitrates between: the
+/// shortest of them, a MiniLM query encode, is a 0.50 s load plus 2 ms of
+/// inference.
+pub const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Serializes every background pass that drives the semantic worker.
 ///

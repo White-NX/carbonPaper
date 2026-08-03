@@ -641,6 +641,104 @@ Reranked-ordering parity against the retired Python DirectML scorer is still
 outstanding; the threshold-provenance mechanism is what makes the cutover safe
 without it.
 
+##### Step 6 follow-up — the calibration wait (2026-08-02)
+
+Dividing the measured per-document cost into the shipped constants showed the
+calibration query could not finish inside its own budget on ordinary hardware,
+which the step-6 measurement pass had not checked because it measured the
+scoring path. `intra_threads` is `clamp(cores / 2, 1, 8)` and the picker offered
+10, 30, 60, and 120 results at an over-fetch of four, so the shipped
+configuration spanned 40 to 480 documents at 0.31 to 1.18 s each against one
+120 s deadline:
+
+| Logical cores | Threads | Per document | top 10 | top 30 | top 60 | top 120 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16 | 8 | 0.31 s | 12 s | 37 s | 74 s | **149 s** |
+| 8 | 4 | 0.55 s | 22 s | 66 s | **132 s** | **264 s** |
+| 4 | 2 | ~0.8 s (interpolated) | 32 s | 96 s | **192 s** | **384 s** |
+| 2 | 1 | 1.18 s | 47 s | **142 s** | — | — |
+
+The default request was on the line at four cores and over it at two, and the
+largest option exceeded the deadline on the sixteen-core machine the latency was
+measured on. Exceeding it was not a hard failure — the query fell back to Python
+and eventually returned — but it cost the user two minutes of an unlabelled
+spinner, discarded every score already computed, and then started over. It
+becomes a hard failure when the fallback is removed, which this milestone is in
+the middle of doing.
+
+Four changes, none of which touch a score:
+
+**The result picker is capped at 30, enforced in the backend.** A calibration
+session needs enough candidates to mark three positives, not 480 documents of
+them. `rerank.rs::MAX_RERANK_RESULTS` clamps at the command boundary rather than
+inside the Rust path, so the bound holds for a query Python answers too and the
+two backends stay comparable. The non-reranked query keeps its old bound of 200:
+it costs one encode and a cosine scan.
+
+**The whole-query deadline becomes a per-chunk one.** A total deadline cannot
+tell a slow machine from a stuck worker, and on this path the two needed
+different answers. Each chunk now gets `RERANK_CHUNK_STALL` (180 s, sized to
+cover a cold 544 MB model load, which lands inside the first chunk), under a
+`RERANK_QUERY_CEILING` of 15 minutes as a runaway guard for a query nobody is
+watching anymore. What makes an open-ended budget acceptable is the same
+argument step 5 recorded for dropping the subject cap on the manual indexing
+run: presence argues for reporting and interruptibility, not for a fixed
+stopping point.
+
+**The foreground chunk drops from 64 to 8.** Batching was already measured to
+buy nothing, so this is free in throughput, and the chunk is the resolution of
+both the progress bar and the stop button.
+
+What it is not free in is inter-chunk gaps: fourteen where there was one. The
+engine keeps a single model resident, so each gap is a place another pass can
+take the worker, and the first draft of this change justified the shrink with
+"the whole query holds a `foreground_lease` and background callers check it
+before submitting" — which was true of the idle loops and false of the two
+passes a user starts. A manual index run (`minilm_index.rs`) and a forced Smart
+Cluster drain (`smart_cluster_scoring.rs`) both read straight past the lease on
+the grounds that somebody had pressed their button. That is a sound argument
+about consent and the wrong answer about cost, and the two were costing
+different things: the index run wants MiniLM, so every chunk it lands between
+two rerank chunks evicts the cross-encoder and buys the next chunk a 570 MB
+re-read, a full SHA-256 re-verification, and a fresh ONNX session — about 1.2 s
+against roughly 2.5 s of actual scoring. The drain wants the same
+cross-encoder, so it evicts nothing and instead simply takes turns at the one
+slot, which halves the query rather than sharing anything with it.
+
+So the shrink is paired with closing that gap. **Both user-initiated passes now
+stand aside and resume rather than stand down**: they stop submitting the
+moment a lease is taken, wait on a 250 ms poll for it to clear, and then claim
+a fresh batch, so their button still means something without the collision
+being charged to the query. Each carries its own wait budget — five minutes for
+the index run against its thirty-minute deadline, three for the drain against
+its ten — and ends under a reason that names the actual cause rather than
+reporting a deadline it spent waiting. Both also submit under
+`RerankPriority::Background` now, forced drain included, so "stops submitting"
+takes effect within one document rather than within one whole rerank call: the
+drain used to run at `Foreground`, which bought it a commit group's candidates
+uninterrupted when scoring — around nineteen seconds on the slowest machine
+measured — and a cluster's entire saved example set when re-deriving a
+threshold, against the five seconds a plain search has to reach the same
+worker.
+
+Reverting either pass to "ignore the lease" puts the foreground chunk back to
+64.
+
+**The query reports itself and can be stopped.** `nl-rerank-progress` carries a
+phase and a scored/total ratio after every chunk; `nl_rerank_stop_now` ends the
+query within one chunk. A stop is *not* a fallback — `RustQueryOutcome::Cancelled`
+returns a success with `cancelled: true` rather than handing the query to
+Python, because re-running on the other backend the work somebody just asked to
+end would take longer than not stopping at all. The three phases are named
+separately because only one of them has a denominator: retrieval is
+milliseconds, the model load is one opaque 544 MB read, and reranking is the
+part that takes minutes.
+
+A query Python answers reports `external_backend` and hides the stop button.
+Python fuses retrieval and reranking into one IPC call, so there is no progress
+to show and no chunk boundary to stop at, and the alternative to saying so is a
+bar that never moves above a button that silently does nothing.
+
 ##### Step 4 — non-reranked retrieval cutover — DONE
 
 `semantic_query.rs` serves the non-reranked natural-language query from a Rust
@@ -1657,3 +1755,7 @@ milestone bodies; this is an index so a reversal is not silently re-reversed.
 | 2026-08-01 | The scoring pass **commits in small groups instead of at the end of a batch**. A queue entry may only be deleted once every enabled cluster has scored it, and the pass stands down mid-batch whenever the idle gate closes, a foreground query arrives, or a forced drain is cancelled — so deleting at the end put the next pass back at the same queue head, which `peek_smart_cluster_pending_batch` reads `ORDER BY queued_at ASC`. A machine whose idle windows were shorter than a batch takes to score would have repeated the same work indefinitely and never reached a newly captured screenshot. A group is bounded in `(snapshot × cluster)` pairs, which is what costs cross-encoder time, and grouping cannot move a score. |
 | 2026-08-01 | **The Python worker that is actually running outranks the `rerank_runtime` key.** Rust reads the registry every pass, Python reads its environment once at spawn, so setting the key back to `rust` under a monitor started with `python` would have started a second drainer beside a live one — both writing assignments and deleting each other's queue rows, on providers that disagree on 20.5% of top-1 results. Ownership is now decided by the value the live monitor was handed, the status, force-run, and cancel commands route by the same rule, and the arrangement is logged whenever it changes — including the interval where a rollback is set but no monitor has restarted to enact it. |
 | 2026-08-01 | `semantic_runtime` deliberately does **not** gate the Smart Cluster scoring pass. It selects which runtime answers an NL query; the scoring pass has no Python side to fall back to, since its prefilter vectors live in the Rust derived store and the Python worker only starts when `rerank_runtime` handed it the queue at spawn. Honoring it there would stop the queue being drained by anyone rather than move the work. |
+| 2026-08-02 | **The calibration query is bounded per chunk, not per query.** Dividing the step-6 latency figures into the shipped constants showed a 120 s whole-query deadline that the default request already brushed on a four-core machine and exceeded on a two-core one, while the largest picker option exceeded it on the sixteen-core machine the latency was measured on. A total deadline cannot distinguish a slow machine from a stuck worker; each chunk now gets its own allowance under a runaway ceiling, and the result picker is capped at 30 so the document count stops varying twelvefold. |
+| 2026-08-02 | **A reranked query reports its phase and can be stopped**, and a stop is not a fallback. Every other reason the Rust path stops serving hands the query to Python; this one must not, because re-running the work somebody just asked to end takes longer than not stopping. The foreground chunk drops from 64 to 8 to give the progress bar and the stop button a usable resolution, which is free because batching was already measured to buy nothing. A query Python answers reports itself as such and hides the button rather than offering one its backend cannot honour. |
+| 2026-08-02 | **The foreground lease binds the two passes a user starts, and they wait rather than end.** Reverses the rule that a manual index run and a forced Smart Cluster drain may ignore it because somebody pressed their button. Consent to run is not consent to the cost: with the foreground chunk at 8 there are fourteen inter-chunk gaps per query, and a MiniLM pass landing in one evicts the cross-encoder for a 570 MB reload, while a drain landing in one takes turns at the single slot and halves the query instead of sharing it. Both now stop submitting while a lease is held and resume when it clears, each under its own wait budget, and both run their cross-encoder calls at `Background` so standing down takes one document rather than one whole rerank call. The forced drain's old `Foreground` priority is what let a plain search wait a commit group — about nineteen seconds — for a five-second budget. |
+| 2026-08-02 | A rerank that **yielded** during Smart Cluster threshold re-derivation is no longer recorded as a retryable failure. It is not a verdict about the cluster — nothing was asked — and treating it as one left that cluster out of `usable` while the batch went on to score against the rest and then delete the queue entries, so the cluster it never reached would never see those screenshots again. The whole resolution now stops instead, which costs the batch it had not started and nothing else. |
