@@ -133,6 +133,10 @@ describe('API contract payloads', () => {
       reranked: true,
       rerank_variant: 'uint8',
       backend: 'python',
+      // Absent on the wire means "not cancelled". The field only appears when
+      // the user stopped the query, and it is a success rather than an error
+      // because nothing failed.
+      cancelled: false,
     });
     await getRelatedScreenshots(42, 6);
     await mergeTasks([1, 2]);

@@ -2,11 +2,12 @@ import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next';
 import {
   Search, Loader2, Sparkles, AlertCircle, Zap, Info,
-  ThumbsUp, ThumbsDown, Save, RotateCcw, X,
+  ThumbsUp, ThumbsDown, Save, RotateCcw, X, Square,
 } from 'lucide-react';
-import { nlClusterQuery, getRerankerStatus } from '../lib/task_api';
+import { nlClusterQuery, nlRerankStopNow, getRerankerStatus } from '../lib/task_api';
 import { fetchThumbnailBatch } from '../lib/monitor_api';
 import { ThumbnailCard } from './ThumbnailCard';
+import { useTauriEventListener } from '../hooks/useTauriEventListener';
 
 const SAMPLE_QUERIES = [
   '关于神经网络训练的代码与文档',
@@ -15,6 +16,19 @@ const SAMPLE_QUERIES = [
 ];
 
 const MIN_POSITIVES_FOR_SAVE = 3;
+
+/**
+ * Result counts the picker offers.
+ *
+ * Was 10 / 30 / 60 / 120. A reranked query costs a CPU cross-encoder pass per
+ * candidate and pulls four candidates per requested result, so 120 asked for
+ * 480 of them — which at the measured per-document latency could not finish
+ * inside any budget worth waiting for, on any machine, including the one the
+ * latency was measured on. The backend clamps to 30 for reranked queries
+ * (`rerank.rs::MAX_RERANK_RESULTS`); this is the same bound where the user can
+ * see it, so the picker does not offer a choice that would be silently ignored.
+ */
+const RESULT_LIMITS = [10, 30];
 
 function formatSimilarity(sim) {
   if (sim === null || sim === undefined || Number.isNaN(sim)) return '—';
@@ -107,6 +121,14 @@ export default function NlClusterView({
   const [thumbnailCache, setThumbnailCache] = useState({});
   const [rerankerStatus, setRerankerStatus] = useState(null);
   const [saving, setSaving] = useState(false);
+  // Where the running query is, as the backend reports it after each chunk.
+  // `null` between queries. Only reranked queries emit this; a plain retrieval
+  // finishes in milliseconds and has nothing to report.
+  const [progress, setProgress] = useState(null);
+  const [stopping, setStopping] = useState(false);
+  // Set when the last query ended because the user stopped it, so the empty
+  // result area can say so instead of reading as "no matching snapshots".
+  const [cancelled, setCancelled] = useState(false);
 
   // Calibration selection: Map<screenshot_id, 'positive' | 'negative'>
   // Stored as a plain object for JSON serialization; the Map semantics are
@@ -118,11 +140,18 @@ export default function NlClusterView({
 
   const mountedRef = useRef(true);
   const cacheKeysRef = useRef([]);
+  // Whether a query of ours is still running in the backend. A ref because the
+  // unmount cleanup below cannot read the latest `loading`.
+  const inFlightRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      // Unmounting closes the view, not the query it started: without this the
+      // backend keeps scoring for minutes with nobody left to watch or stop it,
+      // and the next query has to share the semantic worker with it.
+      if (inFlightRef.current) nlRerankStopNow().catch(() => {});
     };
   }, []);
 
@@ -136,14 +165,26 @@ export default function NlClusterView({
     return () => { active = false; };
   }, [backendOnline]);
 
+  // Progress of the running reranked query, one event per finished chunk.
+  // Subscribed for the view's lifetime, not the query's: MainArea keeps this
+  // view mounted while another tab is in front, and a per-query subscription
+  // would race the first event.
+  useTauriEventListener('nl-rerank-progress', (event) => {
+    setProgress(event.payload || null);
+  });
+
   const handleSubmit = useCallback(async (e) => {
     e?.preventDefault?.();
     const trimmed = query.trim();
     if (!trimmed || !backendOnline) return;
 
     setLoading(true);
+    inFlightRef.current = true;
     setError(null);
     setResults([]);
+    setProgress(null);
+    setStopping(false);
+    setCancelled(false);
     // In calibrate mode, clear selection when starting a fresh query against
     // a different anchor — but preserve it if the same query is re-run. The
     // cached scores go with it: they are what the saved threshold is derived
@@ -154,8 +195,15 @@ export default function NlClusterView({
       setScoreById({});
     }
     try {
-      const { results: out, reranked: didRerank, rerank_variant: usedVariant, backend } =
+      const { results: out, reranked: didRerank, rerank_variant: usedVariant, backend, cancelled: wasCancelled } =
         await nlClusterQuery(trimmed, nResults, enableRerank);
+      // A stopped query returns no ranking, so nothing about the previous one
+      // is replaced — including `lastQuery`, which is what decides whether the
+      // next attempt keeps the marks the user has already made.
+      if (wasCancelled) {
+        setCancelled(true);
+        return;
+      }
       setResults(out);
       setReranked(didRerank);
       setActiveVariant(usedVariant);
@@ -172,9 +220,34 @@ export default function NlClusterView({
       setError(msg);
       console.error('nl_cluster_query failed:', err);
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
+      setStopping(false);
+      setProgress(null);
     }
   }, [query, nResults, enableRerank, backendOnline, isCalibrate, lastQuery]);
+
+  /**
+   * Stop the running query. The backend checks between chunks of eight
+   * documents, so the button stays in its "stopping" state until the query's
+   * own promise settles — which is what clears `loading`.
+   *
+   * Resolving `false` means there was nothing to stop, which on this screen has
+   * one cause: Python is answering. Its rerank is a single opaque IPC call with
+   * no chunk boundary to stop at, so the honest response is to say so and put
+   * the button back rather than leave it spinning on a request that will never
+   * be honoured.
+   */
+  const handleStop = useCallback(async () => {
+    setStopping(true);
+    try {
+      const stopped = await nlRerankStopNow();
+      if (!stopped) setStopping(false);
+    } catch (err) {
+      console.warn('Failed to stop the reranked query:', err);
+      setStopping(false);
+    }
+  }, []);
 
   useEffect(() => {
     if (!results.length) return; // Do not clear the cache on empty search results
@@ -305,6 +378,58 @@ export default function NlClusterView({
     return computeThreshold(positives, negatives);
   }, [isCalibrate, selection, scoreById]);
 
+  /**
+   * How far the reranking phase has got, or `null` when there is no denominator
+   * to divide by.
+   *
+   * Only the reranking phase has one. Retrieval is milliseconds and the model
+   * load reports no ratio at all — it is one 544 MB read whose duration depends
+   * on the disk, and a fabricated percentage there would be the same lie the
+   * old static line told, only with a number attached.
+   */
+  const progressPercent = useMemo(() => {
+    if (progress?.phase !== 'reranking') return null;
+    const total = Number(progress.total) || 0;
+    if (total <= 0) return null;
+    const scored = Number(progress.scored) || 0;
+    return Math.min(100, Math.round((scored / total) * 100));
+  }, [progress]);
+
+  /**
+   * What the wait is currently spent on.
+   *
+   * Replaces "encode -> retrieve -> load reranker -> rerank", which named the
+   * whole pipeline at every moment and therefore located the user at none of
+   * them. Each phase says which of those four steps is actually running, and
+   * the reranking one carries the count, because that is the step that takes
+   * minutes.
+   */
+  const progressLabel = useMemo(() => {
+    if (!enableRerank) return t('nlCluster.loadingSearching', '正在编码查询并匹配快照…');
+    switch (progress?.phase) {
+      case 'retrieving':
+        return t('nlCluster.progressRetrieving', '正在召回候选快照…');
+      case 'loading_model':
+        return t('nlCluster.progressLoadingModel', '正在加载重排模型（约 570 MB），每次重排检索都要先做这一步…');
+      case 'reranking':
+        return t('nlCluster.progressReranking', '正在重排候选 {{scored}}/{{total}}', {
+          scored: Number(progress.scored) || 0,
+          total: Number(progress.total) || 0,
+        });
+      case 'external_backend':
+        return t('nlCluster.progressExternalBackend', '正在由 Python 后端重排，这一路径不报告进度…');
+      default:
+        return t('nlCluster.progressStarting', '正在准备…');
+    }
+  }, [enableRerank, progress, t]);
+
+  /**
+   * Python's rerank has no chunk boundary to stop at, so the button is hidden
+   * rather than shown and refused. Everything else — including the moments
+   * before the first progress event — is stoppable.
+   */
+  const canStop = enableRerank && progress?.phase !== 'external_backend';
+
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Toolbar */}
@@ -351,19 +476,33 @@ export default function NlClusterView({
             className="px-2 py-1.5 text-xs bg-ide-bg border border-ide-border rounded-lg text-ide-text focus:outline-none focus:border-ide-accent"
             title={t('nlCluster.resultsLimitTooltip', '返回结果数量')}
           >
-            <option value={10}>{t('nlCluster.topLimit', 'top {{count}}', { count: 10 })}</option>
-            <option value={30}>{t('nlCluster.topLimit', 'top {{count}}', { count: 30 })}</option>
-            <option value={60}>{t('nlCluster.topLimit', 'top {{count}}', { count: 60 })}</option>
-            <option value={120}>{t('nlCluster.topLimit', 'top {{count}}', { count: 120 })}</option>
+            {RESULT_LIMITS.map((limit) => (
+              <option key={limit} value={limit}>
+                {t('nlCluster.topLimit', 'top {{count}}', { count: limit })}
+              </option>
+            ))}
           </select>
-          <button
-            type="submit"
-            disabled={loading || !backendOnline || !query.trim()}
-            className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-accent bg-ide-accent/20 text-ide-accent hover:bg-ide-accent/30 disabled:opacity-40 transition-colors"
-          >
-            {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}
-            {isCalibrate ? t('nlCluster.previewCandidates', '预览候选') : t('nlCluster.search', '检索')}
-          </button>
+          {loading && canStop ? (
+            <button
+              type="button"
+              onClick={handleStop}
+              disabled={stopping}
+              className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-border text-ide-muted hover:text-ide-text hover:bg-ide-hover/40 disabled:opacity-40 transition-colors"
+              title={t('nlCluster.stopTooltip', '停止本次检索')}
+            >
+              <Square className="w-3 h-3" />
+              {stopping ? t('nlCluster.stopping', '正在停止…') : t('nlCluster.stop', '停止')}
+            </button>
+          ) : (
+            <button
+              type="submit"
+              disabled={loading || !backendOnline || !query.trim()}
+              className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-accent bg-ide-accent/20 text-ide-accent hover:bg-ide-accent/30 disabled:opacity-40 transition-colors"
+            >
+              {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}
+              {isCalibrate ? t('nlCluster.previewCandidates', '预览候选') : t('nlCluster.search', '检索')}
+            </button>
+          )}
         </form>
 
         {/* Mode-specific second row */}
@@ -465,21 +604,49 @@ export default function NlClusterView({
       {/* Results */}
       <div className="flex-1 overflow-y-auto p-4">
         {loading ? (
-          <div className="flex flex-col items-center justify-center h-40 gap-2 text-ide-muted">
+          <div className="flex flex-col items-center justify-center h-40 gap-3 text-ide-muted">
             <Loader2 className="w-5 h-5 animate-spin" />
-            <span className="text-xs">
-              {enableRerank ? t('nlCluster.loadingReranking', '编码 → 召回 → 加载 reranker → 重排…') : t('nlCluster.loadingSearching', '正在编码查询并匹配快照…')}
-            </span>
+            <div className="w-64 max-w-full flex flex-col gap-1.5">
+              <div className="flex items-baseline justify-between gap-2 text-xs">
+                <span>{progressLabel}</span>
+                {progressPercent !== null && (
+                  <span className="font-mono text-[11px] tabular-nums text-ide-text">
+                    {progressPercent}%
+                  </span>
+                )}
+              </div>
+              {/*
+                Indeterminate until the first chunk lands. A bar pinned at zero
+                through a 544 MB model load is the thing this replaced; the
+                phase label above says what that wait is for, and the track
+                below stays plain rather than pretending to advance.
+              */}
+              <div className="h-1 w-full rounded-full bg-ide-border/60 overflow-hidden">
+                {progressPercent !== null && (
+                  <div
+                    className="h-full rounded-full bg-ide-accent transition-[width] duration-300 ease-out"
+                    style={{ width: `${progressPercent}%` }}
+                  />
+                )}
+              </div>
+              {stopping && (
+                <span className="text-[11px] opacity-70">
+                  {t('nlCluster.stoppingHint', '正在停止，最多再等一个批次…')}
+                </span>
+              )}
+            </div>
           </div>
         ) : !results.length ? (
           <div className="flex flex-col items-center justify-center h-40 gap-2 text-ide-muted text-sm">
             <Sparkles className="w-6 h-6 opacity-40" />
             <span>
-              {lastQuery
-                ? t('nlCluster.noResults', '没有匹配的快照')
-                : isCalibrate
-                  ? t('nlCluster.calibrateInstruction', '输入描述并点击"预览候选"，系统会列出最相关的快照供你标记')
-                  : t('nlCluster.exploreInstruction', '输入一个自然语言描述，系统会从 hot 层向量索引中召回最相似的快照')}
+              {cancelled
+                ? t('nlCluster.cancelledNotice', '已停止本次检索，还没有结果')
+                : lastQuery
+                  ? t('nlCluster.noResults', '没有匹配的快照')
+                  : isCalibrate
+                    ? t('nlCluster.calibrateInstruction', '输入描述并点击"预览候选"，系统会列出最相关的快照供你标记')
+                    : t('nlCluster.exploreInstruction', '输入一个自然语言描述，系统会从 hot 层向量索引中召回最相似的快照')}
             </span>
             <span className="text-[11px] opacity-70">
               {t('nlCluster.demoWarning', '本演示直接复用任务聚类的 MiniLM 向量库（仅限近 30 天 hot 层数据）')}

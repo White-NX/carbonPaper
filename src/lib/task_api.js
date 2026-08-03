@@ -189,10 +189,18 @@ export async function getTaskClusters() {
  * at Chroma), so this field is the only honest answer to "whose logits are
  * these".
  *
+ * `cancelled` is set when the user stopped a reranked query through
+ * `nlRerankStopNow`. It is a success rather than an error on purpose: nothing
+ * failed, and rendering it as a failure would tell the user their own click
+ * broke something. `results` is empty in that case — partial rankings are not
+ * returned, because a cross-encoder ordering over a prefix of the candidates is
+ * not the ordering over all of them and the threshold derived from it would be
+ * wrong.
+ *
  * @param {string} query
- * @param {number} [nResults=30]
+ * @param {number} [nResults=30] - clamped to 30 by the backend when reranking
  * @param {boolean} [enableRerank=false] - if true, over-fetches and re-scores with bge-reranker-v2-m3
- * @returns {Promise<{results: Array, reranked: boolean, rerank_variant: string|null, backend: string|null}>}
+ * @returns {Promise<{results: Array, reranked: boolean, rerank_variant: string|null, backend: string|null, cancelled: boolean}>}
  */
 export async function nlClusterQuery(query, nResults = 30, enableRerank = false) {
   const result = await withAuth(() => invoke('monitor_nl_cluster_query', {
@@ -210,7 +218,24 @@ export async function nlClusterQuery(query, nResults = 30, enableRerank = false)
     reranked: !!result?.reranked,
     rerank_variant: result?.rerank_variant || null,
     backend: result?.backend || null,
+    cancelled: !!result?.cancelled,
   };
+}
+
+/**
+ * Ask the running reranked query to stop.
+ *
+ * Resolves to whether there was one to stop. The query checks between chunks of
+ * eight documents, so this returns long before the query's own promise does;
+ * that promise then settles with `cancelled: true`.
+ *
+ * Not wrapped in `withAuth`: stopping work touches no user data, and prompting
+ * for Windows Hello in order to *cancel* something would be exactly backwards.
+ *
+ * @returns {Promise<boolean>}
+ */
+export async function nlRerankStopNow() {
+  return invoke('nl_rerank_stop_now');
 }
 
 /**

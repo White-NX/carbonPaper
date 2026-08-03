@@ -53,7 +53,17 @@
 //! cadence, gates on the same idle signal, and wants a different model from an
 //! engine that keeps one resident. Both therefore claim
 //! `semantic_runtime::BACKGROUND_PASS_GUARD` before touching the worker, and
-//! both stand down between chunks when a foreground query announces itself.
+//! both stop feeding it when a foreground query announces itself.
+//!
+//! **An idle pass stands down; a manual run stands aside.** Both stop
+//! submitting the moment a foreground query takes a lease, because interleaving
+//! against a single-model engine buys an eviction per chunk rather than shared
+//! progress ([`crate::semantic_runtime::BACKGROUND_PASS_GUARD`] states that
+//! cost). What differs is what happens next. An idle pass ends: nobody asked
+//! for it and its next tick is a minute away. A manual run waits and resumes,
+//! because somebody pressed a button, and a run that an unrelated search
+//! silently cancelled would make that button unreliable. See
+//! [`stand_aside_for_foreground`].
 
 
 use crate::credential_manager::CredentialManagerState;
@@ -143,6 +153,49 @@ const MIRROR_BATCH: usize = 32;
 /// nobody is watching anymore — the settings dialog closed, the user walked
 /// away — rather than to keep the click short.
 const MANUAL_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// How long a manual run may spend, in total, standing aside for foreground
+/// queries before it gives up and says so.
+///
+/// Waiting is the right response to one query: a reranked calibration query is
+/// 120 documents at 0.31–1.18 s each, so a couple of minutes, and the queue is
+/// not going anywhere. But a calibration *session* is a sequence of those, and
+/// without a budget of its own a run could sit out the whole `MANUAL_DEADLINE`
+/// and then report "deadline_reached, 0 indexed" — which reads as the indexer
+/// being broken rather than as the run having politely never started. Ending
+/// sooner, under a reason that names the actual cause, is the honest version of
+/// the same outcome, and the idle worker picks the queue up either way.
+///
+/// Counted across the whole run rather than per wait, because it is the total
+/// the user is unknowingly spending, not any single pause, that decides whether
+/// the click accomplished anything.
+const MANUAL_FOREGROUND_WAIT_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+/// The one stop reason a manual drain resumes from instead of ending on.
+///
+/// A drain reports it when a foreground query took the worker mid-batch; the
+/// claims it was holding are released uncharged, exactly as for every other
+/// interruption, and [`drain_until_done`] waits for the lease to clear and
+/// claims a fresh batch. Idle passes report the same string and do end on it,
+/// which is why the constant names the condition rather than the response.
+const FOREGROUND_QUERY_STOP: &str = "foreground_query";
+
+/// Reason for a manual run that spent [`MANUAL_FOREGROUND_WAIT_BUDGET`] waiting
+/// for a worker it never got. Distinguished from [`DEADLINE_REACHED`] because
+/// the two say different things to the user: one machine is slow, the other was
+/// busy answering that user's own searches.
+const WAITED_OUT_BY_FOREGROUND: &str = "foreground_query_held_the_worker";
+
+/// The stop reasons a run ends on, as opposed to the one it may resume from.
+///
+/// Named rather than written inline because each is produced from two or three
+/// places and read by comparison against [`FOREGROUND_QUERY_STOP`]. Two of them
+/// colliding by value is the failure that comparison cannot survive, and
+/// several copies of a string literal is how such a collision gets written by
+/// accident.
+const STOPPED_BY_USER: &str = "stopped_by_user";
+const MAINTENANCE_STARTED: &str = "maintenance_started";
+const DEADLINE_REACHED: &str = "deadline_reached";
 
 /// Progress of the running manual pass, emitted after every encoded chunk.
 ///
@@ -425,15 +478,30 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
     }
     // Checked before the retention and repair reads, not only before the
     // encode. Those reads take the process-wide database mutex, which the
-    // foreground query needs for its own cosine scan, so starting a pass here
-    // would spend part of a 5 s budget on work whose next chance is a minute
-    // away and costs nothing to defer.
-    if mode == PassMode::Idle
-        && app
+    // foreground query needs to rehydrate its results, so starting a pass here
+    // would spend part of a 5 s budget on work that costs nothing to defer.
+    //
+    // An idle pass refuses; a manual run waits, for the reason `drain_queue`
+    // records. Waiting here is still cheap for it — the deadline it is spending
+    // is thirty minutes — and it keeps the whole run on one side of the query
+    // rather than starting it a few database reads deep. The deadline is the
+    // manual run's runaway clock and starts at the click rather than at the
+    // first encode, so a run that spends its first minutes waiting is honest
+    // about having spent them; an idle pass never reads it.
+    let deadline = Instant::now() + MANUAL_DEADLINE;
+    let mut waited = Duration::ZERO;
+    if mode == PassMode::Idle {
+        if app
             .state::<Arc<SemanticRuntimeState>>()
             .foreground_waiting()
-    {
-        return Ok(PassOutcome::refused("foreground_query"));
+        {
+            return Ok(PassOutcome::refused(FOREGROUND_QUERY_STOP));
+        }
+    } else if let Some(reason) = stand_aside_for_foreground(app, deadline, &mut waited).await {
+        // Nothing was attempted, so this is a refusal rather than a stop: the
+        // summary says "skipped, and here is which guard", which is the true
+        // account of a click that never reached the worker.
+        return Ok(PassOutcome::refused(reason));
     }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     // Every read below decrypts OCR text, so a locked session can do nothing
@@ -466,9 +534,68 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
             .await
             .unwrap_or(0);
             run.total.store(total, Ordering::SeqCst);
-            drain_until_done(app, storage).await
+            drain_until_done(app, storage, deadline, waited).await
         }
     }
+}
+
+/// Wait out a foreground query rather than competing with it, and say why the
+/// run must end if one of its own bounds expires first.
+///
+/// `None` once the worker is free. `waited` accumulates across every call in a
+/// run, because [`MANUAL_FOREGROUND_WAIT_BUDGET`] is a budget for the run and
+/// not for any one pause.
+///
+/// The three ways out other than the worker coming free are the three the run
+/// already had — the stop button, maintenance mode, and the runaway deadline —
+/// checked here because a pause is exactly where a run is most likely to be
+/// sitting when one of them fires. Nothing is claimed while this waits: the
+/// drain released its leases uncharged on its way out, so a run that never
+/// resumes leaves the ledger exactly as it found it.
+async fn stand_aside_for_foreground(
+    app: &AppHandle,
+    deadline: Instant,
+    waited: &mut Duration,
+) -> Option<&'static str> {
+    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    if !semantic.foreground_waiting() {
+        return None;
+    }
+    let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
+    let started = Instant::now();
+    tracing::info!("[SEMANTIC:INDEX] manual run standing aside for a foreground query");
+    let outcome = loop {
+        if run.stopped_by_user() {
+            break Some(STOPPED_BY_USER);
+        }
+        if crate::maintenance::is_active() {
+            break Some(MAINTENANCE_STARTED);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break Some(DEADLINE_REACHED);
+        }
+        if *waited + now.duration_since(started) >= MANUAL_FOREGROUND_WAIT_BUDGET {
+            break Some(WAITED_OUT_BY_FOREGROUND);
+        }
+        if !semantic.foreground_waiting() {
+            break None;
+        }
+        tokio::time::sleep(crate::semantic_runtime::FOREGROUND_POLL_INTERVAL).await;
+    };
+    *waited += started.elapsed();
+    match outcome {
+        None => tracing::info!(
+            "[SEMANTIC:INDEX] manual run resuming after {:.1}s; the foreground query is done",
+            started.elapsed().as_secs_f64()
+        ),
+        Some(reason) => tracing::info!(
+            "[SEMANTIC:INDEX] manual run ending while stood aside: {reason} \
+             (waited {:.1}s in total)",
+            waited.as_secs_f64()
+        ),
+    }
+    outcome
 }
 
 /// Drain repeatedly for a manual run, until the queue empties, the user stops
@@ -477,14 +604,25 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
 /// A single `drain_queue` claims at most `DRAIN_BATCH`, which is the right size
 /// for an idle tick that will come back in a minute, but would make one click
 /// look like it did almost nothing.
+///
+/// `waited` carries in whatever [`run_pass`] already spent standing aside, so
+/// the wait budget covers the run rather than resetting at the first drain.
 async fn drain_until_done(
     app: &AppHandle,
     storage: Arc<StorageState>,
+    deadline: Instant,
+    mut waited: Duration,
 ) -> Result<PassOutcome, String> {
-    let deadline = Instant::now() + MANUAL_DEADLINE;
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let mut total = PassOutcome::default();
     loop {
+        // Before claiming anything, not after: a batch claimed and then held
+        // through a pause is a batch nobody else can encode, and the leases
+        // would be released uncharged one chunk later anyway.
+        if let Some(reason) = stand_aside_for_foreground(app, deadline, &mut waited).await {
+            total.stopped_because = Some(reason);
+            break;
+        }
         let pass = drain_queue(app, storage.clone(), PassMode::Manual).await?;
         let drained = pass.indexed + pass.failed;
         total.indexed += pass.indexed;
@@ -495,9 +633,22 @@ async fn drain_until_done(
         // capped the loop at eight drains; without it, a broken worker would
         // otherwise be handed the whole backlog batch by batch, charging a
         // retry attempt against each one on its way through.
+        //
+        // A foreground query is the one reason that is not like that: walking
+        // back into it is exactly right once it clears, and the wait at the top
+        // of the loop is what makes "once it clears" true rather than
+        // immediate. The sleep is charged to the wait budget so that a lease
+        // flapping between the wait and the claim — back-to-back queries from a
+        // calibration session — cannot turn this into one ledger round trip per
+        // iteration for the length of the deadline.
         if let Some(reason) = pass.stopped_because {
-            total.stopped_because = Some(reason);
-            break;
+            if reason != FOREGROUND_QUERY_STOP {
+                total.stopped_because = Some(reason);
+                break;
+            }
+            tokio::time::sleep(crate::semantic_runtime::FOREGROUND_POLL_INTERVAL).await;
+            waited += crate::semantic_runtime::FOREGROUND_POLL_INTERVAL;
+            continue;
         }
         if drained == 0 {
             // Nothing claimable left: either the queue is empty or what remains
@@ -505,11 +656,11 @@ async fn drain_until_done(
             break;
         }
         if run.stopped_by_user() {
-            total.stopped_because = Some("stopped_by_user");
+            total.stopped_because = Some(STOPPED_BY_USER);
             break;
         }
         if Instant::now() >= deadline {
-            total.stopped_because = Some("deadline_reached");
+            total.stopped_because = Some(DEADLINE_REACHED);
             break;
         }
         if crate::maintenance::is_active() {
@@ -666,25 +817,38 @@ async fn drain_queue(
         // The user may have come back since the claim, or since the previous
         // chunk. Release the rest of the leases without charging the retry
         // budget — nothing failed, the window just closed. A manual run has no
-        // window to lose, so this only ever fires for it on maintenance mode or
-        // on the stop button.
+        // idle window to lose, so for it that only ever fires on maintenance
+        // mode or on the stop button.
         //
-        // A foreground query is checked separately and for a separate reason.
-        // The idle signal is up to ten seconds stale (`idle.rs` polls
-        // `GetLastInputInfo` every 10 s), while a search arriving a second
-        // after the user touches the keyboard has a 5 s budget to reach the one
-        // semantic worker this loop is occupying. Waiting for `is_idle` to
-        // catch up would spend most of that budget.
+        // A foreground query is checked separately, for a separate reason, and
+        // — unlike the idle gate — it binds a manual run too. The idle signal is
+        // up to ten seconds stale (`idle.rs` polls `GetLastInputInfo` every
+        // 10 s), while a search arriving a second after the user touches the
+        // keyboard has a 5 s budget to reach the one semantic worker this loop
+        // is occupying. Waiting for `is_idle` to catch up would spend most of
+        // that budget.
+        //
+        // The manual case is not the same trade and was originally left out of
+        // it: consent to run covers competing for the worker, but not what
+        // competing costs here. This pass wants MiniLM, so a chunk of it
+        // landing between two cross-encoder chunks evicts the model that query
+        // is using and charges the next chunk a reload
+        // (`semantic_runtime.rs::BACKGROUND_PASS_GUARD`) — and a reranked query
+        // now offers fourteen such gaps rather than one
+        // (`rerank.rs::FOREGROUND_RERANK_CHUNK`). Interleaving therefore makes
+        // both sides slower than running them in sequence, which is not a trade
+        // the user consented to and not one they can see. So the run stands
+        // aside here and resumes in `drain_until_done`; only the idle pass ends.
         let stopped = if mode == PassMode::Manual && run.stopped_by_user() {
-            Some("stopped_by_user")
+            Some(STOPPED_BY_USER)
         } else if !may_run(app, mode) {
             Some(if mode == PassMode::Manual {
-                "maintenance_started"
+                MAINTENANCE_STARTED
             } else {
                 "idle_lost"
             })
-        } else if mode == PassMode::Idle && semantic.foreground_waiting() {
-            Some("foreground_query")
+        } else if semantic.foreground_waiting() {
+            Some(FOREGROUND_QUERY_STOP)
         } else {
             None
         };
@@ -1336,6 +1500,44 @@ mod tests {
         // middle of the first chunk it allowed to start, which would leave a
         // cold model load having bought nothing.
         assert!(MANUAL_DEADLINE >= EMBED_TIMEOUT);
+    }
+
+    #[test]
+    fn a_manual_run_cannot_wait_out_its_own_deadline() {
+        // The counterpart of the runaway guard: a run that stands aside for
+        // every foreground query it meets has to keep enough of its deadline to
+        // reach the worker, or the click spends thirty minutes and reports
+        // "deadline_reached, 0 indexed" — the indexer looking broken when it was
+        // only being polite.
+        assert!(MANUAL_FOREGROUND_WAIT_BUDGET < MANUAL_DEADLINE);
+        // And it has to outlast one whole reranked calibration query, or the
+        // ordinary collision — search, then index — ends the run instead of
+        // sequencing it. The same bound `smart_cluster_scoring.rs` holds its
+        // forced drain to, against the same measured per-document cost.
+        let worst_query = Duration::from_millis(1180)
+            * (crate::rerank::MAX_RERANK_RESULTS * crate::rerank::RERANK_OVERFETCH);
+        assert!(MANUAL_FOREGROUND_WAIT_BUDGET > worst_query);
+    }
+
+    #[test]
+    fn a_run_that_stood_aside_is_not_reported_as_a_slow_one() {
+        // The two ways a manual run can end without indexing anything, and the
+        // reason they are separate strings: one says the machine could not keep
+        // up, the other says the machine was busy with this user's own searches.
+        // Collapsing them would send somebody looking for a performance problem
+        // that is not there.
+        assert_ne!(WAITED_OUT_BY_FOREGROUND, DEADLINE_REACHED);
+        // And the reason a drain resumes from must not read as either of the
+        // reasons it ends on, or `drain_until_done` either loops on a stop or
+        // ends on a query it should have waited for.
+        for ends_the_run in [
+            STOPPED_BY_USER,
+            MAINTENANCE_STARTED,
+            DEADLINE_REACHED,
+            WAITED_OUT_BY_FOREGROUND,
+        ] {
+            assert_ne!(ends_the_run, FOREGROUND_QUERY_STOP);
+        }
     }
 
     #[test]

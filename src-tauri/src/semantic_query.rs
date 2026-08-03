@@ -266,6 +266,10 @@ pub enum RustQueryOutcome {
     NotSelected,
     /// Rust was selected but could not serve. The caller must use Python.
     FellBack(String),
+    /// The user stopped the query. Distinct from `FellBack` because the caller
+    /// must *not* hand it to Python: re-running on the other backend the work
+    /// somebody just asked to end would take longer than not stopping at all.
+    Cancelled,
 }
 
 /// Offer one non-reranked NL cluster query to the Rust semantic index.
@@ -371,6 +375,13 @@ async fn try_rust_nl_query_inner(
             observe_served("rust");
             RustQueryOutcome::Served(success_response(results, rerank))
         }
+        // A stop is the one error that must not be retried on Python. It is
+        // also not a fallback worth counting: nothing was wrong with the Rust
+        // path, the user simply stopped waiting.
+        Err(error) if crate::rerank::is_cancelled(&error) => {
+            tracing::info!("[SEMANTIC] reranked query stopped by the user: {error}");
+            RustQueryOutcome::Cancelled
+        }
         Err(error) => fell_back(&error),
     }
 }
@@ -419,13 +430,25 @@ fn success_response(results: Vec<serde_json::Value>, reranked: bool) -> serde_js
 /// candidates come from the Rust derived store rather than Chroma, which means
 /// a candidate whose screenshot has since been deleted is dropped during
 /// hydration instead of being scored and rendered from stale metadata.
+///
+/// This is the only path in the codebase a user waits on for minutes, so it is
+/// also the only one that reports itself as it goes. The claim is taken before
+/// retrieval rather than before the rerank, so the stop button is live for the
+/// whole wait rather than only for the part that happens to be slow.
 async fn run_rust_reranked_nl_query(
     app: &AppHandle,
     query: &str,
     n_results: u32,
 ) -> Result<Vec<serde_json::Value>, String> {
+    let watcher = app
+        .state::<Arc<crate::rerank::RerankQueryState>>()
+        .inner()
+        .clone();
+    let watcher = watcher.begin();
+
     let k = n_results.max(1) as usize;
     let fetch = k.saturating_mul(crate::rerank::RERANK_OVERFETCH as usize);
+    watcher.report_phase(app, crate::rerank::RerankPhase::Retrieving);
     let mut candidates = run_rust_nl_query(app, query, fetch as u32).await?;
     if candidates.is_empty() {
         return Ok(candidates);
@@ -464,17 +487,38 @@ async fn run_rust_reranked_nl_query(
         .collect();
 
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    // Announced before the first chunk rather than inferred from a chunk that
+    // takes unusually long, because the alternative is a progress bar that sits
+    // at zero for half a minute and looks stuck.
+    //
+    // Unconditional, and it has to be. The retrieval above encoded the query
+    // with MiniLM, which evicts the cross-encoder
+    // (`semantic_runtime.rs::BACKGROUND_PASS_GUARD` states what that costs), so by
+    // the time this line runs the model has been unloaded — by this query, not
+    // by whatever else the machine was doing. Every reranked query pays the
+    // 570 MB read, and a resident cross-encoder is not a state this path can
+    // reach, so there is no fast path here worth testing for.
+    watcher.report_phase(app, crate::rerank::RerankPhase::LoadingModel);
     let started = Instant::now();
     let scores = crate::rerank::rerank_documents(
         app,
         &semantic,
         query,
         &documents,
-        crate::rerank::RERANK_QUERY_TIMEOUT,
+        crate::rerank::RerankBudget::interactive(),
         crate::rerank::RerankPriority::Foreground,
+        Some(&watcher),
     )
     .await
-    .map_err(|error| format!("rerank_failed: {error}"))?;
+    // A stop keeps its own marker: the caller distinguishes it from a failure
+    // and must not answer it by re-running the query on Python.
+    .map_err(|error| {
+        if crate::rerank::is_cancelled(&error) {
+            error
+        } else {
+            format!("rerank_failed: {error}")
+        }
+    })?;
     tracing::debug!(
         "[SEMANTIC] rust rerank scored {} document(s) in {:.1}ms",
         documents.len(),
