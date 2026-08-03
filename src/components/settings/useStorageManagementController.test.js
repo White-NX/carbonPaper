@@ -60,12 +60,14 @@ describe('useStorageManagementController', () => {
       monitorStatus: 'stopped',
     }));
 
-    await waitFor(() => expect(getIndexHealth).toHaveBeenCalledWith({ refreshVector: false }));
-    expect(result.current.indexHealth).toMatchObject({
+    // Wait on the state, not on the call: the call is recorded synchronously
+    // during mount, so waiting on it can return before the response is applied.
+    await waitFor(() => expect(result.current.indexHealth).toMatchObject({
       monitor_available: false,
       screenshots_count: 12,
       ocr_rows_count: 34,
-    });
+    }));
+    expect(getIndexHealth).toHaveBeenCalledWith({ refreshVector: false });
   });
 
   it('does not request vector refresh from the overview refresh when the monitor is stopped', async () => {
