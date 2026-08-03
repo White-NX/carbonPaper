@@ -492,13 +492,12 @@ async fn run_rust_reranked_nl_query(
     // at zero for half a minute and looks stuck.
     //
     // Unconditional, and it has to be. The retrieval above encoded the query
-    // with MiniLM, and the engine keeps exactly one model resident
-    // (`semantic_engine.rs::ensure_loaded`), so by the time this line runs the
-    // cross-encoder has been evicted — by this query, not by whatever else the
-    // machine was doing. Every reranked query pays the 570 MB read, and a
-    // resident cross-encoder is not a state this path can reach. Asking
-    // `rerank::reranker_resident` here, as this used to, was a question with a
-    // constant answer: right by accident, and read as a fast path that exists.
+    // with MiniLM, which evicts the cross-encoder
+    // (`semantic_runtime.rs::BACKGROUND_PASS_GUARD` states what that costs), so by
+    // the time this line runs the model has been unloaded — by this query, not
+    // by whatever else the machine was doing. Every reranked query pays the
+    // 570 MB read, and a resident cross-encoder is not a state this path can
+    // reach, so there is no fast path here worth testing for.
     watcher.report_phase(app, crate::rerank::RerankPhase::LoadingModel);
     let started = Instant::now();
     let scores = crate::rerank::rerank_documents(

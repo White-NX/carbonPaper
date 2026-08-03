@@ -359,12 +359,11 @@ pub fn reranker_status_value(app: &AppHandle) -> serde_json::Value {
 /// screen distinguish "the model is being read" from "the model is missing".
 ///
 /// Not a "can this query skip the load?" test, on any path that reranks. Such a
-/// path retrieves first, the retrieval encodes the query with MiniLM, and the
-/// engine keeps one model resident (`semantic_engine.rs::ensure_loaded`) — so a
-/// reranked query has always just evicted the cross-encoder by the time it
-/// could ask. There is no fast path here to detect: there is a 570 MB read
-/// before the first chunk of every reranked query, which is why
-/// `semantic_query.rs` announces that load unconditionally.
+/// path retrieves first, and the retrieval encodes the query with MiniLM, which
+/// evicts the cross-encoder ([`crate::semantic_runtime::BACKGROUND_PASS_GUARD`]
+/// states what that costs). Every reranked query therefore pays the 570 MB read
+/// before its first chunk, which is why `semantic_query.rs` announces that load
+/// unconditionally rather than asking this.
 pub fn reranker_resident(semantic: &Arc<SemanticRuntimeState>) -> bool {
     let descriptor = descriptor(MlSemanticModel::BgeRerankerV2M3);
     semantic
@@ -449,6 +448,17 @@ pub const BACKGROUND_RERANK_CHUNK: usize = 1;
 
 /// Documents per foreground rerank request.
 ///
+/// **Do not raise this without confirming that every pass still stands aside
+/// for the foreground lease.** Eight leaves fourteen inter-chunk gaps on the
+/// default request where 64 left one, and a gap is where another pass can
+/// evict the cross-encoder and charge the next chunk a full reload —
+/// [`crate::semantic_runtime::BACKGROUND_PASS_GUARD`] states that cost, which
+/// runs to about half a chunk's worth of scoring. Fourteen of them outweigh
+/// everything else on this constant. The query holds a `foreground_lease` so
+/// they cannot happen, both user-initiated passes stand aside for it, and both
+/// submit under [`RerankPriority::Background`] so that standing aside takes one
+/// document rather than one batch. Reverting any of that puts this back to 64.
+///
 /// Was `MAX_RERANK_DOCUMENTS`, the largest the protocol allows, on the
 /// reasoning that a user-facing query should get the fewest round trips. That
 /// reasoning assumed the query had nothing to say until it was finished. Now it
@@ -461,37 +471,6 @@ pub const BACKGROUND_RERANK_CHUNK: usize = 1;
 /// and has no batch parallelism to exploit. What it buys is fifteen progress
 /// steps on the default request instead of two, and a cancel that lands within
 /// single-digit seconds.
-///
-/// **What shrinking it does cost is fourteen inter-chunk gaps where there was
-/// one, and that only stays free while every other pass honors the lease.** The
-/// engine keeps one model resident (`semantic_engine.rs::ensure_loaded`), so any
-/// MiniLM request landing between two chunks evicts the cross-encoder, and the
-/// next chunk pays a 570 MB re-read, a full SHA-256 re-verification
-/// (`semantic_models.rs::verify_model_files`), and a fresh ONNX session — 1.2 s
-/// on a warm page cache, against roughly 2.5 s of actual scoring in a chunk.
-/// Multiply by fourteen and the interleaved query is slower than the
-/// un-interleaved one it replaced, on both sides.
-///
-/// The whole query holds a `foreground_lease` for exactly this reason, and the
-/// invariant it buys is that *no* pass keeps submitting while one is held —
-/// not only the idle loops. The two user-initiated passes were the gap: a
-/// manual index run (`minilm_index.rs`) and a forced Smart Cluster drain
-/// (`smart_cluster_scoring.rs`) both used to read past the check on the grounds
-/// that the user had asked for them, which is a fair argument about consent and
-/// the wrong answer about cost. What each of them was costing differs, and
-/// neither cost is one the user could see or consented to:
-///
-/// - The index run wants MiniLM, so every chunk it lands here is an eviction of
-///   the model this query is using and a reload before the next one.
-/// - The drain wants the same cross-encoder, so it evicts nothing — it simply
-///   takes turns at the single slot, which halves this query rather than
-///   sharing anything with it, and re-derives a cluster threshold at MiniLM
-///   whenever an anchor changed.
-///
-/// Both now stand aside and resume rather than stand down, so their button
-/// still means something, and both submit under `RerankPriority::Background`
-/// so that "stops submitting" takes effect within one document rather than
-/// within one batch. Reverting either of those puts this constant back to 64.
 pub const FOREGROUND_RERANK_CHUNK: usize = 8;
 
 /// Who a rerank is being run for.
@@ -868,6 +847,11 @@ pub async fn nl_rerank_stop_now(
 mod tests {
     use super::*;
 
+    /// Per-document rerank cost on the slowest configuration measured on
+    /// 2026-08-01: 1.18 s, two cores at one intra-op thread. Rounded up, so a
+    /// bound that clears this clears the measurement with room to spare.
+    const SLOWEST_DOCUMENT: Duration = Duration::from_millis(1250);
+
     #[test]
     fn a_document_matches_the_python_join_contract() {
         assert_eq!(
@@ -921,8 +905,8 @@ mod tests {
         assert_eq!(MAX_RERANK_RESULTS, 30);
         let documents = MAX_RERANK_RESULTS as usize * RERANK_OVERFETCH as usize;
         assert_eq!(documents, 120);
-        // Slowest measured per-document cost, one intra-op thread.
-        let worst_case = Duration::from_millis(1250) * documents as u32;
+        // Slowest per-document cost measured, rounded up.
+        let worst_case = SLOWEST_DOCUMENT * documents as u32;
         assert!(worst_case < RERANK_QUERY_CEILING);
         // And the ceiling is a runaway guard, not a budget the slowest machine
         // is expected to brush against.
@@ -933,8 +917,8 @@ mod tests {
     fn a_foreground_chunk_stays_well_inside_its_stall_budget() {
         // Reaching the stall budget has to mean the worker stopped producing,
         // not that the machine is slow, or the budget is measuring the wrong
-        // thing again. One chunk at the slowest measured per-document cost:
-        let slowest_chunk = Duration::from_millis(1250) * FOREGROUND_RERANK_CHUNK as u32;
+        // thing again. One chunk at the slowest per-document cost measured:
+        let slowest_chunk = SLOWEST_DOCUMENT * FOREGROUND_RERANK_CHUNK as u32;
         assert!(slowest_chunk * 10 < RERANK_CHUNK_STALL);
         // The first chunk also absorbs a cold 570 MB model load, which is the
         // reason the budget is minutes rather than seconds.

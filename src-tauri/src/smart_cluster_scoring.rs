@@ -64,12 +64,12 @@
 //! That is a sound argument about consent and the wrong answer about cost: a
 //! reranked calibration query wants the same cross-encoder this pass is
 //! feeding, so interleaving does not share the worker between them, it halves
-//! both. A plain search wants MiniLM instead, and taking it mid-pass evicts a
-//! 570 MB session this pass then re-reads. Waiting and resuming keeps the
-//! button meaning what it says without making the query it collides with pay
-//! for it; [`stand_aside_for_foreground`] is where that happens, and
-//! [`FORCED_FOREGROUND_WAIT_BUDGET`] is what stops a drain sitting out a whole
-//! calibration session in silence.
+//! both; a plain search wants MiniLM instead and evicts what this pass is
+//! holding ([`crate::semantic_runtime::BACKGROUND_PASS_GUARD`] states that
+//! cost). Waiting and resuming keeps the button meaning what it says without
+//! making the query it collides with pay for it; [`stand_aside_for_foreground`]
+//! is where that happens, and [`FORCED_FOREGROUND_WAIT_BUDGET`] is what stops a
+//! drain sitting out a whole calibration session in silence.
 //!
 //! **Standing down has to leave progress behind.** Every one of those checks
 //! can end a pass part-way through a batch, and the idle gate closes the moment

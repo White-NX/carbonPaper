@@ -237,17 +237,18 @@ impl SemanticRuntimeState {
     /// the lease buys is that no *further* background request is submitted, so
     /// the longest a foreground caller waits is one background chunk rather than
     /// a whole batch — which is why the background rerank chunk is small
-    /// (`rerank.rs::BACKGROUND_RERANK_CHUNK`).
+    /// ([`crate::rerank::BACKGROUND_RERANK_CHUNK`]).
     ///
     /// **Every pass that drives the worker observes this, including the two the
     /// user started.** The idle loops were the obvious readers, but a manual
     /// index run and a forced Smart Cluster drain are also long sequences of
-    /// requests against a single slot, and a reranked query interleaved with
-    /// either of them costs a model eviction per chunk rather than a share of
-    /// the worker. What differs between the readers is only what they do about
-    /// it: an idle pass ends, because its next tick is a minute away and nobody
-    /// asked for it; a user-initiated pass waits and resumes, because somebody
-    /// pressed a button. Neither of them keeps submitting.
+    /// requests against a single slot, so interleaving a reranked query with
+    /// either of them buys a model eviction per chunk rather than a share of
+    /// the worker — [`BACKGROUND_PASS_GUARD`] is where that cost is stated.
+    /// What differs between the readers is only what they do about it: an idle
+    /// pass ends, because its next tick is a minute away and nobody asked for
+    /// it; a user-initiated pass waits and resumes, because somebody pressed a
+    /// button. Neither of them keeps submitting.
     pub fn foreground_lease(self: &Arc<Self>) -> ForegroundLease {
         self.foreground_waiting.fetch_add(1, Ordering::SeqCst);
         ForegroundLease {
@@ -940,12 +941,19 @@ pub const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Serializes every background pass that drives the semantic worker.
 ///
 /// The worker executes one request at a time and the engine keeps exactly one
-/// model resident (`semantic_engine.rs::ensure_loaded` drops the current
-/// session before building the next one), so two background passes wanting
-/// different models do not run twice as fast — they take turns evicting each
-/// other. Each eviction costs a re-read of the model file, a full SHA-256 of it
+/// model resident (`SemanticEngine::ensure_loaded`, in the separate
+/// `semantic-worker` crate, drops the current session before building the next
+/// one), so two background passes wanting different models do not run twice as
+/// fast — they take turns evicting each other. Each eviction costs a re-read of
+/// the model file, a full SHA-256 of it
 /// (`semantic_models.rs::verify_model_files`), and a fresh ONNX session; for
-/// the cross-encoder that file is 570 MB.
+/// the cross-encoder that file is 570 MB, about 1.2 s on a warm page cache
+/// against roughly 2.5 s of scoring in a foreground rerank chunk.
+///
+/// **This paragraph is where that cost is stated.** Chunk sizes, wait budgets,
+/// and the question of which passes may keep submitting all turn on it, and
+/// they point here rather than restating it — so an engine that one day caches
+/// two models invalidates one paragraph instead of seven.
 ///
 /// Both background loops therefore claim this before doing anything that
 /// touches the worker: capture indexing (`minilm_index.rs`, MiniLM) and Smart

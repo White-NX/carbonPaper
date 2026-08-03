@@ -56,13 +56,14 @@
 //! both stop feeding it when a foreground query announces itself.
 //!
 //! **An idle pass stands down; a manual run stands aside.** Both stop
-//! submitting the moment a foreground query takes a lease, because an engine
-//! that keeps one model resident turns interleaving into a 570 MB eviction
-//! between chunks rather than into shared progress. What differs is what
-//! happens next. An idle pass ends: nobody asked for it and its next tick is a
-//! minute away. A manual run waits and resumes, because somebody pressed a
-//! button, and a run that an unrelated search silently cancelled would make
-//! that button unreliable. See [`stand_aside_for_foreground`].
+//! submitting the moment a foreground query takes a lease, because interleaving
+//! against a single-model engine buys an eviction per chunk rather than shared
+//! progress ([`crate::semantic_runtime::BACKGROUND_PASS_GUARD`] states that
+//! cost). What differs is what happens next. An idle pass ends: nobody asked
+//! for it and its next tick is a minute away. A manual run waits and resumes,
+//! because somebody pressed a button, and a run that an unrelated search
+//! silently cancelled would make that button unreliable. See
+//! [`stand_aside_for_foreground`].
 
 
 use crate::credential_manager::CredentialManagerState;
@@ -828,11 +829,11 @@ async fn drain_queue(
         // that budget.
         //
         // The manual case is not the same trade and was originally left out of
-        // it: consent to run covers competing for the worker. What it does not
-        // cover is what competing actually costs here. The engine keeps one
-        // model resident (`semantic_engine.rs::ensure_loaded`), so a MiniLM
-        // chunk landing between two cross-encoder chunks evicts a 570 MB
-        // session, re-reads it, and re-hashes it in full — and a reranked query
+        // it: consent to run covers competing for the worker, but not what
+        // competing costs here. This pass wants MiniLM, so a chunk of it
+        // landing between two cross-encoder chunks evicts the model that query
+        // is using and charges the next chunk a reload
+        // (`semantic_runtime.rs::BACKGROUND_PASS_GUARD`) — and a reranked query
         // now offers fourteen such gaps rather than one
         // (`rerank.rs::FOREGROUND_RERANK_CHUNK`). Interleaving therefore makes
         // both sides slower than running them in sequence, which is not a trade
