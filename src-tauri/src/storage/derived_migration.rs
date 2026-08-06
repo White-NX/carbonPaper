@@ -436,10 +436,18 @@ impl StorageState {
     /// Only legitimate after a full-scope run, which is why the kind is passed
     /// explicitly rather than read from the run row: a caller that reconciles
     /// has to have decided that its snapshot was the whole corpus.
+    ///
+    /// `preserve_writes_after` exempts rows written at or after a durable
+    /// snapshot floor. A resumed migration needs this because normal indexing
+    /// may have committed current rows after an earlier attempt failed; those
+    /// rows cannot be present in the persisted snapshot and must not be mistaken
+    /// for stale pre-migration extras. `None` retains the strict snapshot-only
+    /// behavior for callers that exclude concurrent writes by other means.
     pub fn reconcile_derived_migration_scope(
         &self,
         index_kind: DerivedIndexKind,
         run_id: &str,
+        preserve_writes_after: Option<&str>,
     ) -> Result<u64, String> {
         let mut guard = self.get_connection_named("reconcile_derived_migration_scope")?;
         let conn = guard.as_mut().ok_or("Database not initialized")?;
@@ -454,8 +462,9 @@ impl StorageState {
                    AND subject_key NOT IN (
                        SELECT subject_key FROM derived_migration_subjects WHERE run_id = ?1
                    )
+                   AND (?3 IS NULL OR datetime(updated_at) < datetime(?3))
                 "#,
-                params![run_id, index_kind.as_str()],
+                params![run_id, index_kind.as_str(), preserve_writes_after],
             )
             .map_err(|error| format!("Failed to reconcile migrated embeddings: {error}"))?;
         let jobs = tx
@@ -466,8 +475,9 @@ impl StorageState {
                    AND subject_key NOT IN (
                        SELECT subject_key FROM derived_migration_subjects WHERE run_id = ?1
                    )
+                   AND (?3 IS NULL OR datetime(updated_at) < datetime(?3))
                 "#,
-                params![run_id, index_kind.as_str()],
+                params![run_id, index_kind.as_str(), preserve_writes_after],
             )
             .map_err(|error| format!("Failed to reconcile migrated jobs: {error}"))?;
         let removed = u64::try_from(vectors.max(jobs))
@@ -1023,6 +1033,36 @@ mod tests {
         }
     }
 
+    fn insert_completed_row(
+        connection: &Connection,
+        index_kind: DerivedIndexKind,
+        subject_key: &str,
+        updated_at: &str,
+    ) {
+        connection
+            .execute(
+                r#"
+                INSERT INTO derived_index_jobs (
+                    index_kind, subject_key, status, model_id, model_revision,
+                    embedding_version, source_fingerprint, updated_at
+                ) VALUES (?1, ?2, 'completed', 'model', 'revision', 1, 'source', ?3)
+                "#,
+                rusqlite::params![index_kind.as_str(), subject_key, updated_at],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                INSERT INTO derived_embeddings (
+                    index_kind, subject_key, dimensions, vector_f32, model_id,
+                    model_revision, embedding_version, source_fingerprint, updated_at
+                ) VALUES (?1, ?2, 1, X'0000803F', 'model', 'revision', 1, 'source', ?3)
+                "#,
+                rusqlite::params![index_kind.as_str(), subject_key, updated_at],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn page_import_advances_cursor_with_vectors_in_one_transaction() {
         let storage = test_storage();
@@ -1203,5 +1243,110 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("cannot import"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn reconcile_preserves_rows_written_after_the_snapshot_floor() {
+        let storage = test_storage();
+        let mut run = run_record();
+        run.index_kind = DerivedIndexKind::ClipImage;
+        run.started_at = "2026-01-01T00:00:00Z".to_string();
+        storage.create_derived_migration_run(&run).unwrap();
+
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let connection = guard.as_ref().unwrap();
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO derived_migration_subjects (
+                        run_id, subject_key, outcome, source_fingerprint
+                    ) VALUES (?1, 'snapshot-row', 'migrated', 'source')
+                    "#,
+                    [&run.run_id],
+                )
+                .unwrap();
+            insert_completed_row(
+                connection,
+                DerivedIndexKind::ClipImage,
+                "snapshot-row",
+                "2025-12-31 23:59:00",
+            );
+            insert_completed_row(
+                connection,
+                DerivedIndexKind::ClipImage,
+                "stale-extra",
+                "2025-12-31 23:59:00",
+            );
+            insert_completed_row(
+                connection,
+                DerivedIndexKind::ClipImage,
+                "worker-write",
+                "2026-01-01 00:00:01",
+            );
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO derived_index_jobs (
+                        index_kind, subject_key, status, model_id, model_revision,
+                        embedding_version, source_fingerprint, updated_at
+                    ) VALUES ('clip_image', 'fresh-pending', 'pending', 'model',
+                              'revision', 1, 'source', '2026-01-01 00:00:01')
+                    "#,
+                    [],
+                )
+                .unwrap();
+        }
+
+        let removed = storage
+            .reconcile_derived_migration_scope(
+                DerivedIndexKind::ClipImage,
+                &run.run_id,
+                Some(&run.started_at),
+            )
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        let connection = guard.as_ref().unwrap();
+        for subject in ["snapshot-row", "worker-write", "fresh-pending"] {
+            let jobs: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM derived_index_jobs
+                     WHERE index_kind = 'clip_image' AND subject_key = ?1",
+                    [subject],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(jobs, 1, "ledger row {subject} should survive reconcile");
+        }
+        for subject in ["snapshot-row", "worker-write"] {
+            let vectors: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM derived_embeddings
+                     WHERE index_kind = 'clip_image' AND subject_key = ?1",
+                    [subject],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(vectors, 1, "embedding {subject} should survive reconcile");
+        }
+        let stale_jobs: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM derived_index_jobs
+                 WHERE index_kind = 'clip_image' AND subject_key = 'stale-extra'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stale_vectors: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM derived_embeddings
+                 WHERE index_kind = 'clip_image' AND subject_key = 'stale-extra'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((stale_jobs, stale_vectors), (0, 0));
     }
 }

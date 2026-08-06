@@ -603,8 +603,15 @@ async fn run_clip_migration(
             // outside the persisted snapshot can always be removed.
             run.phase = "reconciling".to_string();
             persist_run(&storage, &state, &mut run)?;
-            let removed = storage
-                .reconcile_derived_migration_scope(DerivedIndexKind::ClipImage, &run.run_id)?;
+            let removed = storage.reconcile_derived_migration_scope(
+                DerivedIndexKind::ClipImage,
+                &run.run_id,
+                // The snapshot starts after the run does. Using the durable
+                // run start as a conservative floor preserves captures the
+                // Rust worker encoded after a failed run released
+                // maintenance but before this persisted snapshot resumed.
+                Some(&run.started_at),
+            )?;
             run.removed_extra = removed;
             persist_run(&storage, &state, &mut run)?;
 

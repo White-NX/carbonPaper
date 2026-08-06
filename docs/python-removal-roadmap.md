@@ -1430,15 +1430,15 @@ CLIP commands were registered in `lib.rs` without policy entries in
 `scripts/security-guards.cjs`, so `npm run test:security` — and therefore
 `test:backend:fast` — failed on the branch as authored.
 
-**Still open, and deliberately not fixed here.**
-`reconcile_derived_migration_scope` deletes every `clip_image` row whose subject
-is not in the run's snapshot. Rows the capture path encoded *after* the snapshot
-was taken are not in it, so a resumed run can delete freshly indexed screenshots,
-which the repair scan then re-encodes. The window is small while a run completes
-in one session and grows to days when a run fails and is retried at the next
-launch. It wants a "written after the snapshot" exemption; it is recorded here
-rather than changed, because it is migration semantics rather than part of this
-fix.
+**The resumed-snapshot reconcile now protects newer Rust writes.**
+`reconcile_derived_migration_scope` still removes pre-migration rows whose
+subjects are absent from the persisted Chroma snapshot, but the CLIP caller
+supplies the durable migration start as a conservative snapshot floor. Jobs and
+embeddings written at or after that floor survive reconciliation, including
+captures encoded after a failed attempt released maintenance and before the next
+launch resumed its snapshot. The run start is deliberately conservative: the
+actual snapshot begins later, and older snapshot-external rows are the only ones
+the cleanup is meant to remove.
 
 ##### Configuration surface
 Enum backends, not ambiguous booleans, because inference and index ownership cut

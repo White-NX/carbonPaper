@@ -552,8 +552,11 @@ async fn run_minilm_migration(
             // so rows outside the persisted snapshot can always be removed.
             run.phase = "reconciling".to_string();
             persist_run(&storage, &state, &mut run)?;
-            let removed = storage
-                .reconcile_derived_migration_scope(DerivedIndexKind::SemanticText, &run.run_id)?;
+            let removed = storage.reconcile_derived_migration_scope(
+                DerivedIndexKind::SemanticText,
+                &run.run_id,
+                None,
+            )?;
             run.removed_extra = removed;
             persist_run(&storage, &state, &mut run)?;
 

@@ -52,6 +52,8 @@ describe('ClipBackfillDialog', () => {
   });
 
   afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
     vi.clearAllMocks();
   });
 
@@ -94,6 +96,58 @@ describe('ClipBackfillDialog', () => {
     await settle();
 
     expect(screen.queryByText(/clipBackfill\.lead/)).toBeNull();
+  });
+
+  it('keeps polling while the migration is unsettled', async () => {
+    vi.useFakeTimers();
+    getClipBackfillOffer
+      .mockResolvedValueOnce(offer({ migration_settled: false, should_ask: false }))
+      .mockResolvedValueOnce(offer());
+    render(<ClipBackfillDialog />);
+    await settle();
+
+    expect(getClipBackfillOffer).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/clipBackfill\.lead/)).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000);
+    });
+
+    expect(getClipBackfillOffer).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/clipBackfill\.lead.*1200/)).toBeInTheDocument();
+  });
+
+  it('stops polling after a settled migration reports no work', async () => {
+    vi.useFakeTimers();
+    getClipBackfillOffer.mockResolvedValue(
+      offer({ should_ask: false, never_indexed: 0, stalled: 0 })
+    );
+    render(<ClipBackfillDialog />);
+    await settle();
+
+    expect(getClipBackfillOffer).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60000);
+    });
+
+    expect(getClipBackfillOffer).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries after a transient offer read failure', async () => {
+    vi.useFakeTimers();
+    getClipBackfillOffer.mockRejectedValueOnce(new Error('locked'));
+    render(<ClipBackfillDialog />);
+    await settle();
+
+    expect(getClipBackfillOffer).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15000);
+    });
+
+    expect(getClipBackfillOffer).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/clipBackfill\.lead.*1200/)).toBeInTheDocument();
   });
 
   it('does not ask again once an answer is recorded', async () => {

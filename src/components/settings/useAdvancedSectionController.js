@@ -162,9 +162,10 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
    * hook did not start — the settings dialog was closed or switched away from
    * mid-run, which unmounts it — has no promise to await, so the backend flag
    * is what tells the reopened dialog that its button should say "stop". The
-   * two must not fight over the same state, hence `ownsRun`.
+   * two must not fight over the same state, hence the per-index ownership refs.
    */
   const ownsRun = useRef(false);
+  const ownsClipRun = useRef(false);
 
   const readSemanticStatus = async ({ quiet = false } = {}) => {
     if (!quiet) setSemanticStatusLoading(true);
@@ -175,6 +176,11 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
         const active = Boolean(status?.backend?.index_run_active);
         setSemanticIndexRunning(active);
         if (!active) setSemanticIndexStopping(false);
+      }
+      if (!ownsClipRun.current) {
+        const active = Boolean(status?.clip_backend?.index_run_active);
+        setClipIndexRunning(active);
+        if (!active) setClipIndexStopping(false);
       }
     } catch (err) {
       console.warn('Failed to read semantic backend status:', err);
@@ -193,16 +199,18 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   }, []);
 
   /**
-   * Notice the end of a run this dialog does not own. Two seconds is far
+   * Notice the end of either run this dialog does not own. Two seconds is far
    * shorter than the time it takes to wonder why a button is still disabled,
    * and the read itself is one ledger query. Not started for an owned run:
    * that one already refreshes when its command returns.
    */
   useEffect(() => {
-    if (!semanticIndexRunning || ownsRun.current) return undefined;
+    const watchingSemantic = semanticIndexRunning && !ownsRun.current;
+    const watchingClip = clipIndexRunning && !ownsClipRun.current;
+    if (!watchingSemantic && !watchingClip) return undefined;
     const timer = window.setInterval(() => readSemanticStatus({ quiet: true }), 2000);
     return () => window.clearInterval(timer);
-  }, [semanticIndexRunning]);
+  }, [semanticIndexRunning, clipIndexRunning]);
 
   /**
    * The one-release rollback lever. `chroma` hands retrieval of screenshot text
@@ -332,6 +340,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
    * request just like the MiniLM one.
    */
   const handleRunClipIndexNow = async () => {
+    ownsClipRun.current = true;
     setClipIndexRunning(true);
     setClipIndexStopping(false);
     setClipIndexRun(null);
@@ -346,6 +355,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       setClipIndexRun({ started: false, skipped_reason: String(err) });
       return null;
     } finally {
+      ownsClipRun.current = false;
       setClipIndexRunning(false);
       setClipIndexStopping(false);
       setClipIndexProgress(null);

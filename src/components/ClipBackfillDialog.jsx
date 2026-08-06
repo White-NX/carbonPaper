@@ -74,9 +74,11 @@ export default function ClipBackfillDialog() {
     const tick = async () => {
       const next = await refresh();
       if (cancelled) return;
-      // A recorded answer is final until the settings card changes it, so there
-      // is nothing left to poll for.
-      if (next?.decision) return;
+      // A recorded answer is final until the settings card changes it. A
+      // settled migration with no work is terminal too. `should_ask` alone is
+      // not a stop signal: it is also false while the migration is unfinished,
+      // and a failed refresh returns no offer at all; both cases must retry.
+      if (next?.decision || (next?.migration_settled && !next.should_ask)) return;
       timer = setTimeout(tick, POLL_MS);
     };
     tick();
