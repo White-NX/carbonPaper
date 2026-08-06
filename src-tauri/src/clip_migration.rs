@@ -928,7 +928,6 @@ pub fn get_clip_rebuild_status(
 
 #[tauri::command]
 pub fn list_clip_rebuild_errors(
-    app: AppHandle,
     credential: State<'_, Arc<CredentialManagerState>>,
     migration: State<'_, Arc<ClipMigrationState>>,
     storage: State<'_, Arc<StorageState>>,
@@ -950,7 +949,6 @@ pub fn list_clip_rebuild_errors(
                 .flatten()
                 .map(|run| run.run_id)
         });
-    let _ = app;
     let Some(run_id) = run_id else {
         return Ok(serde_json::json!({ "errors": [] }));
     };

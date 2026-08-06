@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 WORKER_PROTOCOL_VERSION = 2
 
 
+def _python_owns_clip_encoding() -> bool:
+    """Return the CLIP capture owner latched into this worker at spawn."""
+    return os.environ.get("CARBONPAPER_CLIP_RUNTIME", "rust").strip().lower() == "python"
+
+
 class OcrPostprocessQueue:
     """Bounded best-effort OCR post-processing queue.
 
@@ -156,12 +161,9 @@ class OcrPostprocessQueue:
             self._vector_retry_backlog.pop(key, None)
 
     def _handle_vector_indexing(self, job: Dict[str, Any]) -> bool:
-        from PIL import Image
-
         screenshot_id = job.get("screenshot_id")
         image_hash = job.get("image_hash", "")
         ocr_text = job.get("ocr_text", "")
-        image_bytes = job.get("image_bytes") or b""
 
         # M2.5 step 8: Rust owns CLIP encoding on the capture path. Running both
         # would embed every screenshot twice — once here on DirectML, once in
@@ -171,9 +173,12 @@ class OcrPostprocessQueue:
         # what decides ownership until the process exits; that is the same
         # arbitration `CARBONPAPER_RERANK_RUNTIME` uses for the Smart Cluster
         # queue, and for the same reason.
-        if os.environ.get("CARBONPAPER_CLIP_RUNTIME", "rust").strip().lower() != "python":
+        if not _python_owns_clip_encoding():
             return True
 
+        from PIL import Image
+
+        image_bytes = job.get("image_bytes") or b""
         if self.ocr_worker.enable_vector_store and self.ocr_worker.vector_store and ocr_text.strip():
             try:
                 image_pil = Image.open(io.BytesIO(image_bytes))
@@ -341,8 +346,9 @@ def _json_safe(obj):
 def _enqueue_ocr_postprocess(req: Dict[str, Any], postprocess_queue: Optional[OcrPostprocessQueue]) -> Dict[str, Any]:
     """Enqueue vector/classification work for OCR produced by Rust.
 
-    Image bytes are fetched through the existing authenticated reverse IPC so
-    the Rust caller never duplicates a potentially large binary payload.
+    Image bytes are fetched through authenticated reverse IPC only while the
+    legacy Python CLIP encoder owns the capture path. Rust-owned CLIP jobs still
+    enter this queue for text-only classification and persistent status updates.
     """
     from storage_client import get_storage_client
 
@@ -357,12 +363,14 @@ def _enqueue_ocr_postprocess(req: Dict[str, Any], postprocess_queue: Optional[Oc
     sc = get_storage_client()
     if not sc:
         return {"error": "Storage client not available"}
-    response = sc.get_temp_image_bytes(int(screenshot_id))
-    if response.get("status") != "success":
-        return {"error": f"Failed to fetch image: {response.get('error', 'unknown')}"}
-    image_bytes = response.get("data", {}).get("image_bytes")
-    if not image_bytes:
-        return {"error": "No image data returned from storage"}
+    image_bytes = b""
+    if _python_owns_clip_encoding():
+        response = sc.get_temp_image_bytes(int(screenshot_id))
+        if response.get("status") != "success":
+            return {"error": f"Failed to fetch image: {response.get('error', 'unknown')}"}
+        image_bytes = response.get("data", {}).get("image_bytes")
+        if not image_bytes:
+            return {"error": "No image data returned from storage"}
     enqueued = postprocess_queue.enqueue({
         "screenshot_id": int(screenshot_id),
         "image_hash": req.get("image_hash", ""),

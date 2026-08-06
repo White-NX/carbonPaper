@@ -1,7 +1,7 @@
 import pytest
 
 import monitor.config as config
-from monitor.worker_process import OcrPostprocessQueue
+from monitor.worker_process import OcrPostprocessQueue, _enqueue_ocr_postprocess
 from ocr_service import OCRService, _parse_ocr_idle_unload_secs
 
 
@@ -43,11 +43,13 @@ class DummyClassifier:
 class DummyStorageClient:
     def __init__(self):
         self.updates = []
+        self.image_fetches = []
 
     def get_temp_image_bytes(self, screenshot_id):
         from PIL import Image
         import io
 
+        self.image_fetches.append(screenshot_id)
         image = Image.new("RGB", (2, 2), color="white")
         buf = io.BytesIO()
         image.save(buf, format="PNG")
@@ -149,6 +151,51 @@ def python_owns_clip(monkeypatch):
     `clip_runtime = python` rollback puts a real monitor into.
     """
     monkeypatch.setenv("CARBONPAPER_CLIP_RUNTIME", "python")
+
+
+def test_rust_owned_postprocess_enqueue_skips_image_fetch(monkeypatch):
+    monkeypatch.delenv("CARBONPAPER_CLIP_RUNTIME", raising=False)
+    storage = DummyStorageClient()
+    postprocess_queue = OcrPostprocessQueue(DummyOcrWorker(), None, maxsize=4)
+    monkeypatch.setattr("storage_client.get_storage_client", lambda: storage)
+
+    result = _enqueue_ocr_postprocess({
+        "screenshot_id": 42,
+        "image_hash": "hash-42",
+        "window_title": "Editor",
+        "process_name": "code.exe",
+        "timestamp": 123,
+        "ocr_text": "classification text",
+    }, postprocess_queue)
+    queued = postprocess_queue._queue.get_nowait()
+    postprocess_queue._queue.task_done()
+
+    assert result["status"] == "success"
+    assert result["postprocess_enqueued"] is True
+    assert storage.image_fetches == []
+    assert queued["image_bytes"] == b""
+
+
+def test_python_owned_postprocess_enqueue_fetches_image(monkeypatch, python_owns_clip):
+    storage = DummyStorageClient()
+    postprocess_queue = OcrPostprocessQueue(DummyOcrWorker(), None, maxsize=4)
+    monkeypatch.setattr("storage_client.get_storage_client", lambda: storage)
+
+    result = _enqueue_ocr_postprocess({
+        "screenshot_id": 43,
+        "image_hash": "hash-43",
+        "window_title": "Editor",
+        "process_name": "code.exe",
+        "timestamp": 124,
+        "ocr_text": "indexed text",
+    }, postprocess_queue)
+    queued = postprocess_queue._queue.get_nowait()
+    postprocess_queue._queue.task_done()
+
+    assert result["status"] == "success"
+    assert result["postprocess_enqueued"] is True
+    assert storage.image_fetches == [43]
+    assert queued["image_bytes"]
 
 
 def test_rust_owned_clip_runtime_skips_python_vector_indexing(monkeypatch):
