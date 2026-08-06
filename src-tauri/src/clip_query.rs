@@ -1,52 +1,6 @@
 //! M2.5 step 9 — Rust-owned Chinese-CLIP text-to-image search.
 //!
-//! `search_nl` is the main search box's natural-language mode and the MCP tool
-//! of the same name. Its backend has always been Python: a CLIP text encode
-//! scored against the Chroma `screenshots` image-vector collection. This module
-//! is the Rust replacement — the same text encoder, the same 0.32 similarity
-//! floor, the same over-fetch/filter/paginate order, and the same JSON fields —
-//! reading the derived store step 7 migrated and step 8 keeps current.
-//!
-//! ## What it is, and what it is not
-//!
-//! This is *cross-modal* retrieval: a text query scored against vectors that
-//! encode what a screenshot **looks like**. It is not the semantic-text search
-//! `semantic_query.rs` serves, which is MiniLM over OCR, and the two are not
-//! comparable — different models, different modalities, scores on different
-//! scales. Milestone 1 settled that both are kept and labelled separately
-//! rather than folded together, and nothing here reopens that.
-//!
-//! ## Why the ordering constraint mattered
-//!
-//! Step 8 had to land first. Cutting the read path over while new screenshots
-//! still depended on Python's image encoder would leave every historical
-//! screenshot searchable and every new one silently absent — a failure that
-//! looks exactly like "the search is fine" until somebody goes looking for
-//! yesterday.
-//!
-//! ## Deliberate behaviour differences, recorded rather than smoothed over
-//!
-//! **The time filter now works.** Python filters on
-//! `metadata["created_at"]`, and nothing ever wrote that key:
-//! `worker_process.py` passes `window_title`, `process_name`, and `timestamp`
-//! to `add_image`, so `created_at` is absent for every capture-written row and
-//! the start/end bounds silently pass everything. Rust reads the timestamp from
-//! SQLite, so a bounded query returns bounded results. That is a bug fix with a
-//! release note, not a porting decision, and it is the one behaviour a user can
-//! notice between the two backends.
-//!
-//! **Deleted screenshots stop appearing.** Python renders process name, title,
-//! and OCR text out of Chroma metadata, so a screenshot deleted after indexing
-//! is still returned from a stale copy until the row is reaped. Rust resolves
-//! every hit to a live SQLite screenshot and drops what no longer maps, which
-//! means a Rust response can be shorter than `limit` where the Python one was
-//! not. Same difference step 4 recorded for the semantic-text path.
-//!
-//! **Hits are resolved through the image hash, not scored by screenshot.** The
-//! collection is keyed by image hash and `screenshots.image_hash` is UNIQUE, so
-//! each hit maps to exactly one screenshot — but it maps through a lookup rather
-//! than by parsing the key, which is why a hit whose screenshot is gone drops
-//! out here instead of being rendered from a stale metadata copy.
+//! Provides text encoding and vector similarity queries against the Rust CLIP image index.
 
 use crate::clip_migration::{
     clip_document_id, clip_memory_uri, CLIP_DIMENSIONS, CLIP_VECTOR_SPACE_REVISION,
@@ -67,35 +21,13 @@ use tauri::{AppHandle, Manager};
 /// absolute terms; this is the floor below which a match is noise.
 pub const CLIP_MIN_SIMILARITY: f32 = 0.32;
 
-/// Budget for the query encode, including the wait for the single semantic
-/// worker.
-///
-/// The encode itself is cheap: measured 2026-08-04, the CLIP text tower answers
-/// in about 98 ms warm, so a search is dominated by the scan and by hydration,
-/// not by inference. What this budget has to cover is the two waits around it.
-/// A cold 177 MB model load costs about 4.8 s, and a query arriving while the
-/// capture indexer holds the request slot waits out one image — 0.68 s at
-/// 1920×1080, 2.21 s at 3840×2160. Eight seconds covered the cold load with
-/// almost nothing left for the second, so fifteen is the number that covers
-/// both and still gives up long before a user decides the search is broken.
-///
-/// Falling back does not skip the load, incidentally: Python's CLIP session has
-/// to load the same weights. The budget is about bounding the wait, not about
-/// finding a faster answer elsewhere.
+/// Timeout budget for text encoding, covering model load and worker wait.
 const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Python's own bound on `limit`, preserved so the two backends cannot be told
 /// apart by a caller that asks for too much.
 pub const MAX_CLIP_RESULTS: u32 = 200;
 
-/// `rust_shadow` is deliberately absent.
-///
-/// The roadmap's configuration table sketched one, and step 4 then retired
-/// MiniLM's for the reason that applies here too: a shadow value nobody can
-/// enter is a switch that does nothing, and the migration-diagnostics rule
-/// forbids shipping one. The parity evidence for this cutover is measured
-/// offline, before it lands, rather than by a runtime toggle a user would find
-/// in a settings panel and be unable to act on.
 const CLIP_RUNTIMES: &[&str] = &["python", "rust"];
 const CLIP_INDEXES: &[&str] = &["chroma", "dual", "rust"];
 

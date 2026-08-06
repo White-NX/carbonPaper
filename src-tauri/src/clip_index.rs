@@ -1,59 +1,8 @@
-//! M2.5 step 8 — Rust-owned Chinese-CLIP capture indexing and the Chroma mirror.
+//! M2.5 step 8 — Rust-owned Chinese-CLIP capture indexing and Chroma mirror.
 //!
-//! Step 7 copies the existing image vectors into the Rust store; this step is
-//! what keeps that store from going stale the moment the copy finishes. The
-//! roadmap makes the ordering load-bearing: cutting over visual search (step 9)
-//! while new screenshots still depend solely on Python image encoding would
-//! leave old data searchable while new captures silently stop being indexed —
-//! the one failure no user can detect and no later instrument can reconstruct.
-//!
-//! The shape deliberately mirrors [`crate::minilm_index`], because the two
-//! solve the same problem against the same single-slot worker:
-//!
-//! - the capture path enqueues a ledger job when the OCR row commits;
-//! - an idle-gated worker claims, decodes, encodes, and commits vector plus
-//!   ledger in the one transaction M2.3 provides;
-//! - a repair scan picks up whatever a missed enqueue left behind;
-//! - each newly encoded vector is mirrored into Python's Chroma `screenshots`
-//!   collection, so `clip_runtime = python` stays a real rollback rather than a
-//!   switch that serves a collection frozen at the migration.
-//!
-//! Four things differ from MiniLM, each following from what an image vector is
-//! rather than from taste.
-//!
-//! **The subject is an image hash, not a screenshot.** That is the key the
-//! Chroma collection has always used, and it is what `(index_kind,
-//! subject_key)` records here. `screenshots.image_hash` is UNIQUE and the
-//! capture path skips a hash it already holds, so the relation is one-to-one —
-//! but the ledger, the query, and the mirror all address an image while
-//! everything that can answer "does this carry text?" addresses a screenshot,
-//! so the translation happens explicitly rather than by assuming the two keys
-//! are interchangeable.
-//!
-//! **There is no retention window.** `task_vectors` is a rolling ~30-day hot
-//! layer; the `screenshots` collection never expired anything, and Python
-//! removed a row only when the screenshot was deleted. Ageing CLIP rows out at
-//! 30 days would quietly shrink visual search to the last month — a capability
-//! change wearing a migration's clothes. So the only reaper here is for
-//! subjects with no live screenshot left, and it is a safety net rather than a
-//! live path: the M2.3 delete triggers already remove a row inside the deleting
-//! transaction.
-//!
-//! **Encoding is materially more expensive.** MiniLM encodes a 256-token string;
-//! this decodes a full screenshot from encrypted storage, resizes it, and runs a
-//! vision transformer. The chunk size is therefore one image rather than four,
-//! which is also what makes the stop button and the progress bar useful at a
-//! resolution a user can perceive.
-//!
-//! **It runs on CPU.** `semantic_engine::provider_supports_model` would permit
-//! DirectML for CLIP — the 2026-07-20 audit that banned it covered MiniLM and
-//! the cross-encoder, not this model. It is still refused here, and the reason
-//! is recorded rather than assumed: Python's CLIP session prefers DirectML
-//! (`onnx_utils.build_session`), so a migrated collection already contains
-//! DirectML-produced vectors. Adding a second, unmeasured provider difference on
-//! top of that during the one release where the two must rank comparably is not
-//! a trade worth making before somebody runs the five-gate audit on this model.
-//! Revisiting it is a measurement, not a code change.
+//! Enqueues captured screenshot images for CLIP vector indexing, manages
+//! background/foreground index workers, performs periodic repair scans, and
+//! mirrors new vectors to the Python Chroma screenshot collection for backwards compatibility.
 
 use crate::clip_migration::{
     clip_job_spec, clip_memory_uri, diagnostic_code, validate_clip_vector,
@@ -83,18 +32,7 @@ const DRAIN_BATCH: usize = 8;
 
 /// Images submitted to the worker per request.
 ///
-/// One, and not as a judgement call. A request carries raw RGB against a 32 MiB
-/// protocol ceiling (`ml_protocol.rs::MAX_ML_IMAGE_BYTES`), so the batch a
-/// screenshot allows depends on the display: five at 1920×1080, and exactly one
-/// at 3840×2160, where a single frame is already 23.7 MiB. Any fixed value above
-/// one fails on a large monitor.
-///
-/// Nothing is lost by it. Measured 2026-08-04 on this project's own CLIP
-/// session, per-image cost is flat from batch 1 to batch 4 — 0.682 s, 0.683 s,
-/// 0.622 s at 1920×1080 — the same absence of batch parallelism the step-6
-/// cross-encoder measurements found. And a request in flight cannot be
-/// interrupted, so the chunk is also the worst-case wait a foreground search
-/// inherits when it arrives mid-pass: one image, not four.
+/// Kept at 1 image to avoid exceeding protocol payload byte limits on high-resolution displays.
 const ENCODE_CHUNK: usize = 1;
 
 /// Attempts before a subject stops being claimable. Shared value with the
@@ -103,15 +41,7 @@ pub(crate) const MAX_ATTEMPTS: u32 = 5;
 
 const RETRY_BACKOFF_MINUTES: i64 = 30;
 
-/// One image's read, decode, resize, and forward pass.
-///
-/// A runaway guard rather than an expectation. Measured cold — including the
-/// 177 MB model load — one 1920×1080 capture takes 5.5 s, and the encode itself
-/// scales with the *source* size rather than with the 224² the model sees:
-/// 0.38 s at 1280×720, 0.67 s at 1920×1080, 2.21 s at 3840×2160, because decode
-/// and resize dominate. Three minutes leaves room for a machine several times
-/// slower than the one measured without letting a genuinely stuck worker hold a
-/// lease all night.
+/// Timeout guard for a single image read, decode, resize, and forward pass.
 const EMBED_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Rows examined per repair or reaper pass.
@@ -121,49 +51,13 @@ const MAINTENANCE_BATCH: u32 = 256;
 /// vector is 512 floats rather than 384 and travels as JSON.
 const MIRROR_BATCH: usize = 16;
 
-/// OCR characters carried in a mirrored Chroma document.
-///
-/// Python stored the whole OCR text. Truncating is a deliberate, bounded
-/// divergence: the document is never scored — CLIP ranks against the image
-/// vector — and its only consumer is the `ocr_text` field a rolled-back search
-/// renders, which the two result views cut to 150 characters anyway. What it
-/// buys is that one mirror request stays a few tens of kilobytes instead of
-/// carrying whole documents through a named pipe that also serves capture.
+/// Maximum OCR characters carried in a mirrored Chroma document.
 const MIRROR_OCR_SNIPPET_CHARS: usize = 2_000;
 
-/// How far back the automatic repair scan looks.
-///
-/// This scan exists to catch an enqueue that never ran — a transient failure on
-/// the OCR commit path — and that is a recent-screenshot problem: the worker
-/// wakes every minute, so anything missed is picked up within minutes and a week
-/// is generous slack for a machine that is rarely idle.
-///
-/// It must stay bounded, and the reason is the whole point of the step-7
-/// migration. An unbounded scan cannot tell "this screenshot's enqueue was
-/// missed" from "the migration has not copied this screenshot's vector yet",
-/// because both look identical in SQL: an eligible image with no ledger row. It
-/// would therefore answer a failed or unfinished copy by re-encoding the whole
-/// history through a vision transformer — hours of work to reproduce vectors
-/// the machine already holds in Chroma, which is exactly what `clip_migration`
-/// float-copies rather than re-encodes, and what the roadmap's migration gate
-/// forbids ("existing CLIP vectors are float-copied, not re-encoded").
-///
-/// Whole-history coverage is not abandoned, it is made explicit: it belongs to
-/// the migration, and to a backfill the user is asked about and agrees to.
-/// Expressed as a SQLite datetime modifier and always bound as a parameter.
+/// Bounded time window for automatic repair scans, catching recently missed enqueues.
 const REPAIR_SCAN_WINDOW: &str = "-7 days";
 
-/// How long a manual run will wait out *consecutive* foreground queries before
-/// ending and saying so.
-///
-/// Consecutive rather than cumulative, which it was until the run deadline
-/// below was removed. While a run could not exceed an hour, a total budget was
-/// a reasonable second bound on it. Once a backfill legitimately runs for
-/// hours, a total budget becomes an undeclared deadline of its own: a user who
-/// searches now and then would spend it in the first afternoon and the run
-/// would end far from finished, reporting a reason that describes none of what
-/// actually happened. What the budget is really for is a run that cannot make
-/// progress at all, and that is a *continuous* condition.
+/// Maximum consecutive wait budget for manual indexing runs when held by foreground queries.
 const MANUAL_FOREGROUND_WAIT_BUDGET: Duration = Duration::from_secs(5 * 60);
 
 const FOREGROUND_POLL: Duration = Duration::from_millis(250);

@@ -1,45 +1,6 @@
 //! Resumable, foreground Chinese-CLIP image-vector migration — M2.5 step 7.
 //!
-//! Copies the existing Chroma `screenshots` collection into the Rust derived
-//! cache under `clip_image`, from a stable persisted ID snapshot, then removes
-//! Rust rows outside that snapshot's scope. **No inference runs here.** The
-//! roadmap's migration gate is explicit that existing CLIP vectors are
-//! float-copied rather than re-encoded: re-encoding tens of thousands of
-//! screenshots through a vision transformer is hours of work to reproduce
-//! vectors the machine already has.
-//!
-//! Triggered exclusively by an `app_metadata` sentinel at startup, exactly like
-//! the MiniLM copy it borrows its orchestration from. There is no manual start
-//! and no cancellation; closing the app is the only interruption, and the run
-//! resumes from its persisted cursor on the next launch.
-//!
-//! ## Why this migration maps ids instead of parsing them
-//!
-//! `task_vectors` is keyed by `str(screenshot_id)`, so MiniLM recovers its
-//! subject key by parsing. The CLIP collection is keyed by
-//! `md5("memory://" + image_hash)` (`vector_store.py::_compute_id`), which is
-//! not invertible. Two ways back exist and only one is acceptable:
-//!
-//! - Read the stored `image_path` metadata. It is encrypted at rest
-//!   (`vector_store.py::add_image` runs it through `_encrypt_text`), so this
-//!   would mean decrypting user file paths into an IPC payload to recover
-//!   something SQLite already holds.
-//! - Hash forward. Rust lists its own eligible image hashes, computes the same
-//!   MD5 over each, and matches. Nothing sensitive crosses the pipe, and an id
-//!   the map does not contain is exactly the definition of an orphan.
-//!
-//! The second is what this module does. The map is built once per run and held
-//! for its duration — roughly 100 bytes per screenshot, against a copy that
-//! already runs under maintenance mode.
-//!
-//! ## Why the source fingerprint is the image hash
-//!
-//! A `semantic_text` row's fingerprint covers text that can change under it, so
-//! a re-OCR invalidates the vector. A CLIP image vector is a function of the
-//! pixels alone, and `image_hash` *is* the identity of those pixels — the same
-//! hash cannot denote different pixels. So the fingerprint is derived from the
-//! hash, which makes a migrated row and a Rust-encoded row of the same image
-//! agree on their contract without either having to know which produced it.
+//! Copies existing Chroma `screenshots` vectors into the Rust derived index cache without re-encoding images.
 
 use crate::credential_manager::CredentialManagerState;
 use crate::migration_support::{self, ExportPage, MigrationPhaseSink, SnapshotCommands};
@@ -64,18 +25,7 @@ const SNAPSHOT_COMMANDS: SnapshotCommands = SnapshotCommands {
 };
 
 pub const CLIP_MODEL_ID: &str = "chinese-clip-vit-base-patch16";
-/// Compatibility contract for the shared CLIP vector space.
-///
-/// Recorded instead of a concrete ONNX artifact revision for the same reason
-/// MiniLM records one: legacy Chroma rows carry no provenance, so claiming they
-/// came from `model_q4.onnx` would be an invention. Rust-encoded rows join the
-/// same space, which is what lets the two coexist in one index.
-///
-/// A user whose collection was built by the PyTorch path and one whose was
-/// built by `onnxruntime-directml` both land here. That is a deliberate
-/// tolerance, not an oversight: both are Chinese-CLIP ViT-B/16 projections into
-/// the same 512-dimensional space, and cross-modal retrieval at a 0.32 cosine
-/// floor does not resolve the difference between them.
+/// Compatibility contract revision for the shared CLIP vector space.
 pub const CLIP_VECTOR_SPACE_REVISION: &str = "chinese-clip-vit-b16-vector-space-v1";
 const CLIP_MIGRATION_MODE: &str = "sentinel_copy_chroma_screenshots_v1";
 pub const CLIP_EMBEDDING_VERSION: u32 = 1;
@@ -88,12 +38,7 @@ const MAX_DIAGNOSTICS: usize = 500;
 /// How often startup re-checks for an unlocked vault before starting the copy.
 const AUTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The `image_path` every capture-written CLIP row was keyed under.
-///
-/// `worker_process.py` passes `f"memory://{image_hash}"` to `add_image`, which
-/// MD5s it into the document id. Reproducing that string exactly is the whole
-/// mapping, so it lives in one function with a test rather than being inlined
-/// at the two places that need it.
+/// Formats the synthetic memory URI for an image hash.
 pub fn clip_memory_uri(image_hash: &str) -> String {
     format!("memory://{image_hash}")
 }

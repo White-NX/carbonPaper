@@ -1175,32 +1175,7 @@ impl StorageState {
 
     /// Image hashes the CLIP index should hold but has no ledger row for.
     ///
-    /// Two differences from [`Self::list_semantic_text_index_candidates`], both
-    /// following from what the collection means rather than from taste:
-    ///
-    /// - **No *inherent* retention window.** `task_vectors` is a rolling ~30-day
-    ///   hot layer whose expired rows compress into centroids, so the MiniLM
-    ///   scan has an age bound built into what it indexes at all. The Chroma
-    ///   `screenshots` collection never had one — Python only ever removed a row
-    ///   when the screenshot itself was deleted — so this index covers the whole
-    ///   history and `created_after` bounds the *scan*, not the corpus.
-    /// - **Keyed by image hash, not screenshot id.** `screenshots.image_hash`
-    ///   carries a UNIQUE constraint and the capture path skips a hash it
-    ///   already holds, so the relation is one-to-one; what changes is the key
-    ///   type the ledger and the Chroma collection are addressed by.
-    ///
-    /// `created_after` is a SQLite datetime modifier (`-7 days`), always bound
-    /// as a parameter and never interpolated, or `None` for the whole history.
-    /// The distinction is the whole point of the caller's gate: an unbounded
-    /// scan cannot tell "this screenshot's enqueue was missed" from "the
-    /// migration has not copied this screenshot's vector yet", and answering the
-    /// second by re-encoding is hours of vision-transformer work to reproduce
-    /// vectors the machine already holds.
-    ///
-    /// The OCR-row requirement mirrors `worker_process.py`, which indexes an
-    /// image only when `ocr_text.strip()` is non-empty. It is the SQL half of
-    /// that rule; the text itself is encrypted, so the claiming worker applies
-    /// the rest.
+    /// `created_after` is an optional SQLite datetime modifier (`-7 days`) to bound the scan.
     pub fn list_clip_image_index_candidates(
         &self,
         created_after: Option<&str>,

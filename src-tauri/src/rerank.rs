@@ -1,28 +1,7 @@
-//! M2.5 step 6 — the Rust cross-encoder consumer layer.
+//! M2.5 step 6 — Rust cross-encoder consumer layer.
 //!
-//! `semantic_engine::rerank` and the `Rerank` protocol operation have existed
-//! since M2.2; what was missing was anything that called them. This module is
-//! that layer: the document contract shared by both consumers, the batching
-//! that a 64-document protocol cap forces on a path that over-fetches 120, the
-//! rollback switch, and the scorer identity that a stored threshold is
-//! measured against.
-//!
-//! **Why calibration and the scoring worker move together.** A Smart Cluster's
-//! threshold is derived from calibration rerank scores and then written to
-//! `smart_clusters.threshold`, where the background worker compares its own
-//! logits against it. Two different scorers on those two sides means
-//! assignments that quietly over- or under-fire against a number the user
-//! never sees. And the two sides genuinely disagree here: Python's reranker
-//! prefers DirectML (`reranker.py`, provider list), while the Rust engine
-//! refuses DirectML for this model outright after the 2026-07-20 parity audit.
-//! Same ONNX file, different provider, different logits.
-//!
-//! **Provenance rather than a flag day.** Every threshold already on disk was
-//! produced by the Python DirectML scorer. Rather than either trusting it or
-//! demanding that the user recalibrate, each threshold records the scorer that
-//! produced it, and a threshold whose scorer no longer exists is re-derived
-//! from the calibration examples that are already stored alongside it. See
-//! `smart_cluster_scoring.rs`.
+//! Provides batching, progress reporting, stall handling, and scorer identity tracking
+//! for cross-encoder reranking operations.
 
 use crate::ml_protocol::{MlProvider, MlSemanticModel};
 use crate::registry_config;
@@ -59,56 +38,15 @@ pub const RERANK_VARIANT: &str = "uint8";
 pub const RERANK_OVERFETCH: u32 = 4;
 
 /// Ceiling on `n_results` for a reranked query.
-///
-/// The cost of this path is `n_results * RERANK_OVERFETCH` cross-encoder
-/// documents and nothing else, so the result count is the only knob that moves
-/// it. The picker used to offer 10, 30, 60, and 120, which at the measured
-/// per-document costs spans twelve minutes of range on one machine — and the
-/// two largest options could not finish inside any budget worth waiting for
-/// even on the sixteen-core desktop the latency was measured on. Calibration
-/// needs enough candidates to mark three positives, not a hundred and twenty of
-/// them, so the useful part of that range is the part that is kept.
-///
-/// Applied where the command enters rather than inside the Rust path, so the
-/// bound holds for a query Python answers too. The two backends are compared
-/// against each other and a threshold derived from one is stored next to a
-/// scorer identity from the other; letting them see different candidate counts
-/// would make that comparison meaningless.
 pub const MAX_RERANK_RESULTS: u32 = 30;
 
-/// Budget for one chunk of a user-facing reranked query, and the only thing
-/// that ends such a query other than the user.
+/// Stall timeout for a single chunk of a user-facing reranked query.
 ///
-/// This replaces a 120 s budget that spanned the whole call. That constant
-/// could not do the job it was written for. It had to cover a cold 570 MB model
-/// load plus every chunk, while the document count it was covering varied by a
-/// factor of twelve and the per-document cost by a factor of four across
-/// machines — so on a four-core laptop the default request already sat on the
-/// line, and a two-core machine exceeded it outright. What the user got there
-/// was two minutes of an unlabelled spinner, then the whole thing thrown away
-/// and re-run on Python.
-///
-/// A slow machine is not a broken one, and the difference is what this budget
-/// measures instead: each chunk gets its own allowance, so the query ends when
-/// the worker *stops producing*, not when the machine turns out to be modest.
-/// Generous enough to cover the cold model load, which lands inside the first
-/// chunk and is the one legitimately slow step; after that a chunk of
-/// `FOREGROUND_RERANK_CHUNK` documents costs single-digit seconds even at one
-/// intra-op thread, so reaching this at all means the worker is stuck.
-///
-/// What makes an open-ended budget acceptable is that the user can see the
-/// progress and stop it. That is the same argument `minilm_index.rs` records
-/// for dropping the subject cap on the manual indexing run, and it applies here
-/// for the same reason.
+/// Ensures the query ends if the scoring worker stops producing results,
+/// without penalizing slower hardware during chunk evaluation.
 pub const RERANK_CHUNK_STALL: Duration = Duration::from_secs(180);
 
-/// Runaway guard on a whole reranked query, for a run nobody is watching
-/// anymore — the page was navigated away from, the window hidden.
-///
-/// Deliberately far above any real query: `MAX_RERANK_RESULTS * RERANK_OVERFETCH`
-/// documents at the slowest measured per-document cost is under three minutes.
-/// Reaching this means chunks kept completing just under the stall budget,
-/// which no working configuration does.
+/// Runaway guard ceiling for an unmonitored reranked query.
 pub const RERANK_QUERY_CEILING: Duration = Duration::from_secs(15 * 60);
 
 /// How a rerank call is bounded in time.
@@ -522,33 +460,16 @@ pub fn is_cancelled(error: &str) -> bool {
     error.starts_with(CANCELLED_BY_USER)
 }
 
-/// Which stage of a reranked query is running, as reported to the view.
-///
-/// Three because the wait has three visibly different parts and only one of
-/// them has a denominator. The old UI collapsed them into one static line —
-/// "encode, retrieve, load reranker, rerank" — which was accurate about the
-/// pipeline and told a user watching it for two minutes nothing about where in
-/// that pipeline they were.
+/// Stage of a reranked query, reported for progress tracking.
 #[derive(Clone, Copy, Debug)]
 pub enum RerankPhase {
-    /// Bi-encoder query encode and the cosine scan. Milliseconds.
+    /// Bi-encoder query encoding and initial vector retrieval.
     Retrieving,
-    /// The cross-encoder is being read from disk: seconds to tens of seconds
-    /// for 570 MB, and the most common reason a calibration query feels broken.
-    /// Reported on every reranked query rather than only the first one, because
-    /// the retrieval that precedes it evicts the cross-encoder every time — see
-    /// `semantic_query.rs::run_rust_reranked_nl_query`.
+    /// Loading the cross-encoder model from disk into memory.
     LoadingModel,
-    /// Scoring, with `scored` of `total` documents done.
+    /// Scoring documents in chunks (`scored` out of `total`).
     Reranking,
-    /// The query is being answered by Python instead — the `rerank_runtime`
-    /// rollback, or any of the conditions that make the Rust path stand down.
-    ///
-    /// Reported because the alternative is worse than saying nothing: Python
-    /// fuses retrieval and reranking into one opaque IPC call, so there is no
-    /// progress to show and no chunk boundary to stop at, and a view that did
-    /// not know this would leave a stop button that silently does nothing under
-    /// a progress bar that never moves.
+    /// Fallback execution handled by the Python backend.
     ExternalBackend,
 }
 
