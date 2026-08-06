@@ -1167,6 +1167,7 @@ pub fn run() {
             ml_runtime::take_ocr_model_repair_request,
             ml_runtime::debug_trigger_ocr_model_repair_notification,
             semantic_runtime::get_ml_semantic_status,
+            semantic_runtime::get_background_index_progress,
             semantic_runtime::restart_ml_semantic_worker,
             minilm_index::semantic_index_run_now,
             minilm_index::semantic_index_stop_now,

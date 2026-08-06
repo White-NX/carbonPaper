@@ -30,6 +30,10 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         hasClusterTask,
         canCancelClusterTask,
         clusterProgress,
+        hasSemanticIndexTask,
+        semanticIndexPercent,
+        hasClipIndexTask,
+        clipIndexPercent,
         showProgressBar,
         progressFillPercent,
         taskSummaryPlaceholder,
@@ -196,6 +200,32 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                                     {t('search.task.stop', '停止')}
                                 </button>
                             )}
+                        </div>
+                    )}
+                    {hasSemanticIndexTask && (
+                        <div className="p-3 bg-amber-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">
+                            <div className="flex items-center gap-2 text-amber-500 text-sm font-bold">
+                                <Loader2 size={14} className="animate-spin" />
+                                {t('search.task.semanticIndexRunningTitle')}
+                            </div>
+                            <div className="text-xs text-ide-muted leading-relaxed">
+                                {t('search.task.semanticIndexRunningDesc', {
+                                    progress: semanticIndexPercent === null ? '…' : Math.round(semanticIndexPercent),
+                                })}
+                            </div>
+                        </div>
+                    )}
+                    {hasClipIndexTask && (
+                        <div className="p-3 bg-orange-500/10 border-b border-ide-border flex flex-col gap-1 shrink-0">
+                            <div className="flex items-center gap-2 text-orange-500 text-sm font-bold">
+                                <Loader2 size={14} className="animate-spin" />
+                                {t('search.task.clipIndexRunningTitle')}
+                            </div>
+                            <div className="text-xs text-ide-muted leading-relaxed">
+                                {t('search.task.clipIndexRunningDesc', {
+                                    progress: clipIndexPercent === null ? '…' : Math.round(clipIndexPercent),
+                                })}
+                            </div>
                         </div>
                     )}
                     {isMigrating && (

@@ -62,7 +62,7 @@ use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
 use crate::ml_protocol::{MlImageInput, MlSemanticModel};
 use crate::monitor::{authenticated_monitor_command, MonitorState};
-use crate::semantic_runtime::SemanticRuntimeState;
+use crate::semantic_runtime::{IndexRunProgress, SemanticRuntimeState};
 use crate::storage::{
     BackgroundReadError, BackgroundScreenshotSummary, DerivedEmbeddingWrite, DerivedIndexJobSpec,
     DerivedIndexKind, StorageState,
@@ -318,6 +318,22 @@ impl ClipIndexRunState {
 
     fn stopped_by_user(&self) -> bool {
         self.stop_requested.load(Ordering::SeqCst)
+    }
+
+    /// Counters as they stand, for a caller that polls rather than listens.
+    ///
+    /// The progress event is the primary channel and stays that way; this exists
+    /// for the search box, which can mount in the middle of a run that has been
+    /// going for hours and would otherwise show nothing until the next chunk
+    /// lands. Reads four atomics and touches neither the worker nor the
+    /// database, which is what makes it safe on a poll loop.
+    pub fn progress(&self) -> IndexRunProgress {
+        IndexRunProgress {
+            running: self.running.load(Ordering::SeqCst),
+            processed: self.processed.load(Ordering::SeqCst),
+            indexed: self.indexed.load(Ordering::SeqCst),
+            total: self.total.load(Ordering::SeqCst),
+        }
     }
 
     fn begin(self: &Arc<Self>) -> ActiveRun {

@@ -172,6 +172,7 @@ const COMMAND_TIERS = {
   'ml_runtime::take_ocr_model_repair_request': 'public',
   'ml_runtime::debug_trigger_ocr_model_repair_notification': 'session_required',
   'semantic_runtime::get_ml_semantic_status': 'public',
+  'semantic_runtime::get_background_index_progress': 'public',
   'semantic_runtime::restart_ml_semantic_worker': 'runtime_public',
   'minilm_index::semantic_index_run_now': 'session_required',
   'minilm_index::semantic_index_stop_now': 'runtime_public',

@@ -1307,6 +1307,58 @@ pub async fn get_ml_semantic_status(
     Ok(status)
 }
 
+/// One manual index run, as a poller reads it.
+///
+/// Every field is an atomic load. That is the point: the search box already
+/// polls the delete queue and the Smart Cluster worker every four seconds, and
+/// both of those take the process-wide database mutex for their counts. A third
+/// poll doing the same would put a lock acquisition on that cadence for numbers
+/// that only decorate a placeholder, so this one reads nothing but the run's own
+/// counters.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct IndexRunProgress {
+    /// A manual run is executing. An idle pass never sets this — only
+    /// `begin()` does, and only the two "index now" commands call it — so this
+    /// means "somebody pressed a button", not "the machine is busy".
+    pub running: bool,
+    /// Subjects that left the queue in this run, encoded or not.
+    pub processed: u64,
+    /// Subjects that became query-visible in this run.
+    pub indexed: u64,
+    /// Queue depth when the run started. Zero until the run's repair scan has
+    /// finished counting, which is why a caller has to treat zero as "unknown"
+    /// rather than as "nothing to do".
+    pub total: u64,
+}
+
+/// Both manual index runs, for the search box.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BackgroundIndexProgress {
+    pub semantic: IndexRunProgress,
+    pub clip: IndexRunProgress,
+}
+
+/// Read both manual index runs at once.
+///
+/// One command rather than two because the caller is a four-second poll loop and
+/// one IPC round trip is cheaper than two for data this small.
+///
+/// Deliberately *not* session-guarded, for the same reason
+/// [`crate::clip_index::clip_index_stop_now`] is not: a CLIP backfill of a full
+/// history runs for hours, so outliving a session lock is its ordinary case, and
+/// a status read that went blank exactly when the run was longest would hide the
+/// thing it exists to explain. It returns counters and no user data.
+#[tauri::command]
+pub fn get_background_index_progress(
+    index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
+    clip_run: tauri::State<'_, Arc<crate::clip_index::ClipIndexRunState>>,
+) -> Result<BackgroundIndexProgress, String> {
+    Ok(BackgroundIndexProgress {
+        semantic: index_run.progress(),
+        clip: clip_run.progress(),
+    })
+}
+
 #[tauri::command]
 pub fn restart_ml_semantic_worker(
     window: tauri::Window,

@@ -646,6 +646,22 @@ export const getSmartClusterWorkerStatus = async () => {
     });
 };
 
+export const getBackgroundIndexProgress = async () => {
+    try {
+        const response = await invoke('get_background_index_progress');
+        return {
+            semantic: response?.semantic || { running: false, processed: 0, indexed: 0, total: 0 },
+            clip: response?.clip || { running: false, processed: 0, indexed: 0, total: 0 },
+        };
+    } catch (e) {
+        console.warn('Failed to get background index progress', e);
+        return {
+            semantic: { running: false, processed: 0, indexed: 0, total: 0 },
+            clip: { running: false, processed: 0, indexed: 0, total: 0 },
+        };
+    }
+};
+
 export const getIndexHealth = async ({ refreshVector = false } = {}) => {
     return withAuth(
         () => invoke('storage_get_index_health', { refreshVector }),
