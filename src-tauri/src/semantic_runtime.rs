@@ -59,6 +59,11 @@ pub struct SemanticRuntimeStatus {
     /// read-only field is what survives of the retired shadow settings card —
     /// the enum rule requires a local diagnostic, not a dev panel.
     pub backend: crate::semantic_query::SemanticBackendStatus,
+    /// The same diagnostic for the Chinese-CLIP image index (M2.5 step 9).
+    /// Separate rather than folded in, because the two searches cut over on
+    /// their own schedules and each has its own rollback lever: a user reading
+    /// one field could not tell which of the two it described.
+    pub clip_backend: crate::clip_query::ClipBackendStatus,
 }
 
 #[derive(Debug)]
@@ -645,6 +650,7 @@ impl SemanticRuntimeState {
             last_elapsed_ms: inner.last_elapsed_ms,
             directml_disabled_for_session: inner.directml_disabled_for_session,
             backend: crate::semantic_query::backend_status(None),
+            clip_backend: crate::clip_query::backend_status(None),
         }
     }
 
@@ -921,9 +927,7 @@ pub struct ForegroundLease {
 
 impl Drop for ForegroundLease {
     fn drop(&mut self) {
-        self.state
-            .foreground_waiting
-            .fetch_sub(1, Ordering::SeqCst);
+        self.state.foreground_waiting.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1267,6 +1271,7 @@ pub async fn get_ml_semantic_status(
     state: tauri::State<'_, Arc<SemanticRuntimeState>>,
     storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
     index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
+    clip_run: tauri::State<'_, Arc<crate::clip_index::ClipIndexRunState>>,
 ) -> Result<SemanticRuntimeStatus, String> {
     let mut status = state.status();
     // Read before the blocking call below, so a run that finishes while the
@@ -1275,6 +1280,7 @@ pub async fn get_ml_semantic_status(
     // dialog re-enables its button, and a button pressed against a run that is
     // in fact still going is refused by the pass guard with a reason.
     let run_active = index_run.is_running();
+    let clip_run_active = clip_run.is_running();
     // Filled here rather than in `status()` because the local index count needs
     // the database, and the internal callers of `status()` are on paths that
     // must not touch it. `async` plus `spawn_blocking` is deliberate: the count
@@ -1283,12 +1289,21 @@ pub async fn get_ml_semantic_status(
     // thread dispatching IPC. A synchronous command here would freeze the UI
     // for as long as a vacuum or a migration page holds the lock.
     let storage = storage.inner().clone();
-    status.backend = tokio::task::spawn_blocking(move || {
-        crate::semantic_query::backend_status(Some(storage.as_ref()))
+    // One hop onto a blocking thread for both diagnostics rather than two: each
+    // takes the process-wide database mutex, and a settings dialog refreshing
+    // this every few seconds should not queue for it twice.
+    let (semantic_backend, clip_backend) = tokio::task::spawn_blocking(move || {
+        (
+            crate::semantic_query::backend_status(Some(storage.as_ref())),
+            crate::clip_query::backend_status(Some(storage.as_ref())),
+        )
     })
     .await
     .map_err(|error| format!("Failed to read semantic backend status: {error}"))?;
+    status.backend = semantic_backend;
     status.backend.index_run_active = run_active;
+    status.clip_backend = clip_backend;
+    status.clip_backend.index_run_active = clip_run_active;
     Ok(status)
 }
 

@@ -223,7 +223,7 @@ async fn handle_mcp(
         "initialize" => handle_initialize(req.id),
         "notifications/initialized" => JsonRpcResponse::success(req.id, serde_json::json!({})),
         "ping" => JsonRpcResponse::success(req.id, serde_json::json!({})),
-        "tools/list" => handle_tools_list(&state, req.id),
+        "tools/list" => handle_tools_list(req.id),
         "tools/call" => handle_tools_call(&state, req.id, req.params).await,
         other => {
             tracing::warn!("MCP unknown method: {}", other);
@@ -252,8 +252,11 @@ fn handle_initialize(id: Option<Value>) -> JsonRpcResponse {
 
 // ==================== Tool definitions ====================
 
-fn handle_tools_list(state: &McpServerInner, id: Option<Value>) -> JsonRpcResponse {
-    let mut tools = serde_json::json!({
+fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
+    // Keep the tool table deterministic and independent of database/runtime
+    // health. A backend may be temporarily unavailable when the tool is called;
+    // that is a runtime result, not a change to the MCP tool contract.
+    let tools = serde_json::json!({
         "tools": [
             {
                 "name": "get_snapshots_by_time_range",
@@ -300,7 +303,7 @@ fn handle_tools_list(state: &McpServerInner, id: Option<Value>) -> JsonRpcRespon
             },
             {
                 "name": "search_nl",
-                "description": "Natural language semantic search over screenshots using vector embeddings. Requires the Python monitor process to be running.",
+                "description": "Natural language visual search over screenshots: a text query matched against what each screenshot looks like, using Chinese-CLIP image embeddings. Complements search_ocr_text, which matches the literal text on screen.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -419,23 +422,28 @@ fn handle_tools_list(state: &McpServerInner, id: Option<Value>) -> JsonRpcRespon
             }
         ]
     });
-    let python_running = state
-        .app_handle
-        .try_state::<crate::monitor::MonitorState>()
-        .map(|monitor| {
-            monitor
-                .process
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some()
-        })
-        .unwrap_or(false);
-    if !python_running {
-        if let Some(items) = tools.get_mut("tools").and_then(Value::as_array_mut) {
-            items.retain(|tool| tool.get("name").and_then(Value::as_str) != Some("search_nl"));
-        }
-    }
     JsonRpcResponse::success(id, tools)
+}
+
+#[cfg(test)]
+mod tool_list_tests {
+    use super::*;
+
+    #[test]
+    fn tools_list_always_advertises_search_nl() {
+        let response = handle_tools_list(Some(serde_json::json!(1)));
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("tools/list result should contain a tools array");
+
+        assert!(tools
+            .iter()
+            .any(|tool| { tool.get("name").and_then(Value::as_str) == Some("search_nl") }));
+    }
 }
 
 // ==================== Tool dispatch ====================
@@ -1363,19 +1371,67 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
 async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, String> {
     require_authenticated_session(&state.app_handle)?;
 
-    let monitor_state = state.app_handle.state::<MonitorState>();
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .ok_or("Missing required parameter: query")?
+        .to_string();
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .min(u64::from(crate::clip_query::MAX_CLIP_RESULTS)) as u32;
+    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let process_names: Vec<String> = args
+        .get("process_names")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let start_time = args.get("start_time").and_then(Value::as_f64);
+    let end_time = args.get("end_time").and_then(Value::as_f64);
 
-    let payload = serde_json::json!({
-        "command": "search_nl",
-        "query": args.get("query").ok_or("Missing required parameter: query")?,
-        "limit": args.get("limit").unwrap_or(&serde_json::json!(20)),
-        "offset": args.get("offset").unwrap_or(&serde_json::json!(0)),
-        "process_names": args.get("process_names"),
-        "start_time": args.get("start_time"),
-        "end_time": args.get("end_time"),
-    });
+    // M2.5 step 9: the same Rust-first routing `monitor_search_nl` uses, so the
+    // agent and the search box cannot end up on different backends. The PII
+    // filtering below is unchanged and runs over whichever one answered.
+    let rust = crate::clip_query::try_rust_clip_query(
+        &state.app_handle,
+        crate::clip_query::ClipQueryRequest {
+            query: &query,
+            limit,
+            offset,
+            process_names: &process_names,
+            start_time,
+            end_time,
+        },
+    )
+    .await;
 
-    let result = monitor::forward_command_to_python(&monitor_state, payload).await?;
+    let result = match rust {
+        crate::clip_query::ClipQueryOutcome::Served(results) => Value::Array(results),
+        outcome => {
+            if let crate::clip_query::ClipQueryOutcome::FellBack(reason) = &outcome {
+                tracing::info!("[CLIP] MCP search_nl fell back to Python: {reason}");
+            }
+            let monitor_state = state.app_handle.state::<MonitorState>();
+            let payload = serde_json::json!({
+                "command": "search_nl",
+                "query": query,
+                "limit": limit,
+                "offset": offset,
+                "process_names": process_names,
+                "start_time": start_time,
+                "end_time": end_time,
+            });
+            let answered = monitor::forward_command_to_python(&monitor_state, payload).await?;
+            crate::clip_query::observe_python_served();
+            answered
+        }
+    };
 
     // Dictionary filter (tier 1)
     let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
@@ -2306,11 +2362,18 @@ pub async fn restore_if_enabled(
 }
 
 /// Get the configured port from policy.
+pub(crate) fn port_from_policy(policy: &Value) -> u16 {
+    policy
+        .get("mcp_port")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u16)
+        .unwrap_or(DEFAULT_MCP_PORT)
+}
+
 pub fn get_port(storage_state: &StorageState) -> u16 {
     storage_state
         .load_policy()
         .ok()
-        .and_then(|p| p.get("mcp_port").and_then(|v| v.as_u64()))
-        .map(|v| v as u16)
+        .map(|policy| port_from_policy(&policy))
         .unwrap_or(DEFAULT_MCP_PORT)
 }

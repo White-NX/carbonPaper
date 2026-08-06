@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { withAuth } from '../../lib/auth_api';
+import { getClipBackfillOffer, setClipBackfillDecision } from '../../lib/task_api';
 
 export function useAdvancedSectionController({ monitorStatus, t }) {
   const [config, setConfig] = useState(null);
@@ -24,6 +25,20 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [semanticStatusLoading, setSemanticStatusLoading] = useState(false);
   const [semanticIndexRunning, setSemanticIndexRunning] = useState(false);
   const [semanticIndexRun, setSemanticIndexRun] = useState(null);
+  // The CLIP image index has its own run, its own progress event and its own
+  // rollback lever. Kept separate from the MiniLM ones above rather than shared:
+  // the two passes can be running at once, and one status line for both would
+  // report whichever finished last.
+  const [clipIndexRunning, setClipIndexRunning] = useState(false);
+  const [clipIndexRun, setClipIndexRun] = useState(null);
+  const [clipIndexStopping, setClipIndexStopping] = useState(false);
+  const [clipIndexProgress, setClipIndexProgress] = useState(null);
+  // Whether a backfill of everything the step-7 migration could not deliver has
+  // been offered, and what the user said. The dialog asks once; this is where
+  // the answer stays changeable, which is the whole reason declining is safe to
+  // record durably.
+  const [clipBackfill, setClipBackfill] = useState(null);
+  const [clipBackfillBusy, setClipBackfillBusy] = useState(false);
   const [semanticIndexProgress, setSemanticIndexProgress] = useState(null);
   const [semanticIndexStopping, setSemanticIndexStopping] = useState(false);
 
@@ -203,6 +218,18 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   };
 
   /**
+   * The same one-release rollback for visual search. `chroma` hands the
+   * text-to-image query back to Python; Rust keeps encoding new captures and
+   * keeps mirroring them into the Chroma collection, so the switch is
+   * reversible at any time and does not stop indexing either.
+   */
+  const handleToggleRustClipIndex = async (enabled) => {
+    const newConfig = { ...config, clip_index: enabled ? 'rust' : 'chroma' };
+    const saved = await saveConfig(newConfig);
+    if (saved) await refreshSemanticStatus();
+  };
+
+  /**
    * Progress of a running manual pass, one event per encoded chunk of four.
    *
    * Subscribed for the lifetime of the settings section rather than for the
@@ -220,6 +247,24 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       else unlisten = fn;
     }).catch((err) => {
       console.warn('Failed to subscribe to semantic index progress:', err);
+    });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  /** The same subscription for the CLIP pass, for the same reason. */
+  useEffect(() => {
+    let unlisten = null;
+    let cancelled = false;
+    listen('clip-index-progress', (event) => {
+      setClipIndexProgress(event.payload || null);
+    }).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    }).catch((err) => {
+      console.warn('Failed to subscribe to CLIP index progress:', err);
     });
     return () => {
       cancelled = true;
@@ -279,6 +324,66 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       setSemanticIndexStopping(false);
     }
   };
+
+  /**
+   * The CLIP counterpart. Encoding an image costs far more than encoding a
+   * line of text, so this run is the one most likely to last long enough for
+   * somebody to walk away from — which is why it reports progress and stops on
+   * request just like the MiniLM one.
+   */
+  const handleRunClipIndexNow = async () => {
+    setClipIndexRunning(true);
+    setClipIndexStopping(false);
+    setClipIndexRun(null);
+    setClipIndexProgress(null);
+    try {
+      const summary = await invoke('clip_index_run_now');
+      setClipIndexRun(summary);
+      await refreshSemanticStatus();
+      return summary;
+    } catch (err) {
+      console.warn('Manual CLIP indexing run failed:', err);
+      setClipIndexRun({ started: false, skipped_reason: String(err) });
+      return null;
+    } finally {
+      setClipIndexRunning(false);
+      setClipIndexStopping(false);
+      setClipIndexProgress(null);
+    }
+  };
+
+  const handleStopClipIndex = async () => {
+    setClipIndexStopping(true);
+    try {
+      await invoke('clip_index_stop_now');
+    } catch (err) {
+      console.warn('Failed to stop the CLIP indexing run:', err);
+      setClipIndexStopping(false);
+    }
+  };
+
+  const refreshClipBackfill = async () => {
+    try {
+      setClipBackfill(await getClipBackfillOffer());
+    } catch (err) {
+      console.warn('Failed to read the CLIP backfill offer:', err);
+    }
+  };
+
+  const handleClipBackfillDecision = async (decision) => {
+    setClipBackfillBusy(true);
+    try {
+      setClipBackfill(await setClipBackfillDecision(decision));
+    } catch (err) {
+      console.warn('Failed to record the CLIP backfill decision:', err);
+    } finally {
+      setClipBackfillBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshClipBackfill();
+  }, []);
 
   useEffect(() => {
     refreshMlOcrStatus();
@@ -410,6 +515,13 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     semanticStatusLoading,
     semanticIndexRunning,
     semanticIndexRun,
+    clipIndexRunning,
+    clipIndexRun,
+    clipIndexStopping,
+    clipIndexProgress,
+    clipBackfill,
+    clipBackfillBusy,
+    handleClipBackfillDecision,
     semanticIndexProgress,
     semanticIndexStopping,
     setCpuDropdownOpen,
@@ -430,6 +542,9 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     handleToggleRustSemanticIndex,
     handleRunSemanticIndexNow,
     handleStopSemanticIndex,
+    handleToggleRustClipIndex,
+    handleRunClipIndexNow,
+    handleStopClipIndex,
     refreshSemanticStatus,
   };
 }

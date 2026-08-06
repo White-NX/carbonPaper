@@ -113,7 +113,9 @@ mod tests {
 
     #[test]
     fn reverse_ipc_allowlist_rejects_mutations() {
-        assert!(reverse_ipc_command_allowed("get_screenshots_with_ocr_by_ids"));
+        assert!(reverse_ipc_command_allowed(
+            "get_screenshots_with_ocr_by_ids"
+        ));
         assert!(reverse_ipc_command_allowed("get_auth_status"));
         assert!(!reverse_ipc_command_allowed("save_screenshot"));
         assert!(!reverse_ipc_command_allowed("save_extension_screenshot"));

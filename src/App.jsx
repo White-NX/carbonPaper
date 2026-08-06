@@ -15,8 +15,9 @@ import TopBar from './components/TopBar';
 import { NotificationToast, NotificationPanel } from './components/Notifications';
 import ErrorWindow from './components/ErrorWindow';
 import HmacMigrationDialog from './components/HmacMigrationDialog';
+import ClipBackfillDialog from './components/ClipBackfillDialog';
 import StartupVacuumDialog from './components/StartupVacuumDialog';
-import MinilmMigrationOverlay from './components/MinilmMigrationOverlay';
+import VectorMigrationOverlay from './components/VectorMigrationOverlay';
 import OcrModelRepairCard from './components/OcrModelRepairCard';
 import { deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 import { UpdateModal } from './components/UpdateModal';
@@ -284,10 +285,12 @@ function App() {
         <StartupVacuumDialog />
 
         {/* Top-level, non-dismissable maintenance overlay: covers the whole
-            window (TopBar included) while the MiniLM migration runs. */}
-        <MinilmMigrationOverlay />
+            window (TopBar included) whenever the app is in maintenance mode,
+            which currently means either vector migration. */}
+        <VectorMigrationOverlay />
 
         {isAuthenticated && <HmacMigrationDialog />}
+        {isAuthenticated && <ClipBackfillDialog />}
 
         <ExtensionSetupWizard
           isVisible={backendStatus === 'online' && isAuthenticated && showExtensionSetup}

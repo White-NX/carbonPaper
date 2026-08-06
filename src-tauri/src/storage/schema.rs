@@ -124,6 +124,11 @@ impl StorageState {
 
     /// Initialize database tables.
     pub(super) fn init_tables(&self, conn: &Connection) -> Result<(), String> {
+        // Must run before the CREATE batch below, or `IF NOT EXISTS` would
+        // create the new empty tables first and leave the legacy rows stranded
+        // under the old names.
+        Self::upgrade_migration_tables_to_derived(conn)?;
+
         conn.execute_batch(
             r#"
             -- Screenshot records
@@ -247,11 +252,16 @@ impl StorageState {
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Durable orchestration state for the foreground MiniLM migration.
-            -- The vector cache and sidecar remain rebuildable; these rows only
-            -- make a long-running upgrade resumable and diagnosable.
-            CREATE TABLE IF NOT EXISTS minilm_migration_runs (
+            -- Durable orchestration state for a foreground derived-index
+            -- migration. The vector cache and sidecar remain rebuildable; these
+            -- rows only make a long-running upgrade resumable and diagnosable.
+            --
+            -- One row set per `index_kind`, because MiniLM and CLIP migrate from
+            -- different Chroma collections on different schedules and each has
+            -- to be able to resume without reading the other's cursor.
+            CREATE TABLE IF NOT EXISTS derived_migration_runs (
                 run_id TEXT PRIMARY KEY,
+                index_kind TEXT NOT NULL DEFAULT 'semantic_text',
                 mode TEXT NOT NULL,
                 vector_space_revision TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -280,20 +290,22 @@ impl StorageState {
                 finished_at TEXT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_minilm_migration_runs_updated
-                ON minilm_migration_runs(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_derived_migration_runs_updated
+                ON derived_migration_runs(index_kind, updated_at DESC);
 
-            CREATE TABLE IF NOT EXISTS minilm_migration_subjects (
+            -- `run_id` is globally unique, so these two need no `index_kind` of
+            -- their own; they reach it through the run they belong to.
+            CREATE TABLE IF NOT EXISTS derived_migration_subjects (
                 run_id TEXT NOT NULL,
                 subject_key TEXT NOT NULL,
                 outcome TEXT NOT NULL,
                 source_fingerprint TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (run_id, subject_key),
-                FOREIGN KEY (run_id) REFERENCES minilm_migration_runs(run_id) ON DELETE CASCADE
+                FOREIGN KEY (run_id) REFERENCES derived_migration_runs(run_id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS minilm_migration_run_errors (
+            CREATE TABLE IF NOT EXISTS derived_migration_run_errors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
                 subject_key TEXT,
@@ -301,11 +313,11 @@ impl StorageState {
                 code TEXT NOT NULL,
                 error TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (run_id) REFERENCES minilm_migration_runs(run_id) ON DELETE CASCADE
+                FOREIGN KEY (run_id) REFERENCES derived_migration_runs(run_id) ON DELETE CASCADE
             );
 
-            CREATE INDEX IF NOT EXISTS idx_minilm_migration_errors_run
-                ON minilm_migration_run_errors(run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_derived_migration_errors_run
+                ON derived_migration_run_errors(run_id, id);
 
             DROP TRIGGER IF EXISTS derived_embeddings_epoch_after_insert;
             CREATE TRIGGER derived_embeddings_epoch_after_insert
@@ -786,6 +798,10 @@ impl StorageState {
         )?;
         Self::add_column_if_missing(conn, "derived_index_jobs", "lease_token", "TEXT")?;
 
+        // `derived_migration_runs.index_kind` is deliberately not here: the
+        // CREATE batch indexes over it, so it has to be in place before that
+        // batch runs. See `upgrade_migration_tables_to_derived`.
+
         // M2.5 step-4 cutover: drop the retired shadow-comparison tables. They
         // only ever held query hashes and parity/latency numbers — never query
         // text or screenshot content — so dropping them loses no user data. A
@@ -1041,7 +1057,12 @@ impl StorageState {
         // mode that made re-encoding look like the safer option in the first
         // place.
         Self::add_column_if_missing(conn, "smart_clusters", "anchor_vector", "BLOB")?;
-        Self::add_column_if_missing(conn, "smart_clusters", "anchor_vector_dimensions", "INTEGER")?;
+        Self::add_column_if_missing(
+            conn,
+            "smart_clusters",
+            "anchor_vector_dimensions",
+            "INTEGER",
+        )?;
         Self::add_column_if_missing(conn, "smart_clusters", "anchor_vector_source_hash", "TEXT")?;
         Self::add_column_if_missing(conn, "smart_clusters", "anchor_vector_model_id", "TEXT")?;
         Self::add_column_if_missing(
@@ -1129,5 +1150,296 @@ impl StorageState {
         conn.execute_batch(create_sql)
             .map_err(|e| format!("Failed to create table {}: {}", _table_name, e))?;
         Ok(())
+    }
+
+    /// Carry the M2.4 migration tables over to the kind-agnostic names.
+    ///
+    /// The three tables were introduced for MiniLM alone and named for it. M2.5
+    /// step 7 migrates a second index kind (CLIP images) through the same
+    /// orchestration, so the discriminator moved into the rows and the names
+    /// stopped being true. Renaming rather than creating a parallel set keeps
+    /// one code path for a page loop whose transactional cursor rules are the
+    /// part worth not writing twice.
+    ///
+    /// `ALTER TABLE ... RENAME TO` also rewrites the foreign keys that point at
+    /// the runs table, so the child tables keep referencing it after the move.
+    /// Rows already present belong to a settled MiniLM run and are left alone;
+    /// the `index_kind` default files them under `semantic_text`.
+    ///
+    /// The whole step has to finish before the CREATE batch runs. `IF NOT
+    /// EXISTS` compares table names and nothing else, so a renamed table keeps
+    /// its old column set through the batch, and the batch immediately indexes
+    /// over `index_kind` — leaving the column to `ensure_schema` further down
+    /// would abort initialization before it ever got there.
+    fn upgrade_migration_tables_to_derived(conn: &Connection) -> Result<(), String> {
+        for (legacy, current) in [
+            ("minilm_migration_runs", "derived_migration_runs"),
+            ("minilm_migration_subjects", "derived_migration_subjects"),
+            (
+                "minilm_migration_run_errors",
+                "derived_migration_run_errors",
+            ),
+        ] {
+            if !Self::table_exists(conn, legacy)? || Self::table_exists(conn, current)? {
+                continue;
+            }
+            conn.execute_batch(&format!("ALTER TABLE {legacy} RENAME TO {current};"))
+                .map_err(|e| format!("Failed to rename {legacy} to {current}: {e}"))?;
+        }
+        // Guarded on the table because a fresh install has none of this: the
+        // CREATE batch declares `index_kind` itself, and an unguarded ALTER
+        // would fail against a table that does not exist yet.
+        if Self::table_exists(conn, "derived_migration_runs")? {
+            Self::add_column_if_missing(
+                conn,
+                "derived_migration_runs",
+                "index_kind",
+                "TEXT NOT NULL DEFAULT 'semantic_text'",
+            )?;
+        }
+        // The old indexes survive the rename attached to the renamed tables.
+        // Dropping them lets the CREATE batch install the ones whose definition
+        // now leads with `index_kind`.
+        conn.execute_batch(
+            r#"
+            DROP INDEX IF EXISTS idx_minilm_migration_runs_updated;
+            DROP INDEX IF EXISTS idx_minilm_migration_errors_run;
+            "#,
+        )
+        .map_err(|e| format!("Failed to drop legacy migration indexes: {e}"))?;
+        Ok(())
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|e| format!("Failed to check for table {table}: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credential_manager::CredentialManagerState;
+    use std::sync::Arc;
+
+    /// The migration tables as M2.4 shipped them, before the rename moved them
+    /// off MiniLM. An upgrading install hands `init_tables` exactly this shape,
+    /// so the fixture reproduces it in full rather than a convenient subset:
+    /// the column it does *not* have, `index_kind`, is the whole point.
+    const LEGACY_MIGRATION_TABLES: &str = r#"
+        CREATE TABLE minilm_migration_runs (
+            run_id TEXT PRIMARY KEY,
+            mode TEXT NOT NULL,
+            vector_space_revision TEXT NOT NULL,
+            status TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            export_id TEXT,
+            export_cursor INTEGER NOT NULL DEFAULT 0 CHECK (export_cursor >= 0),
+            chroma_total INTEGER NOT NULL DEFAULT 0 CHECK (chroma_total >= 0),
+            chroma_processed INTEGER NOT NULL DEFAULT 0 CHECK (chroma_processed >= 0),
+            migrated INTEGER NOT NULL DEFAULT 0 CHECK (migrated >= 0),
+            legacy_unverified INTEGER NOT NULL DEFAULT 0 CHECK (legacy_unverified >= 0),
+            already_current INTEGER NOT NULL DEFAULT 0 CHECK (already_current >= 0),
+            failed INTEGER NOT NULL DEFAULT 0 CHECK (failed >= 0),
+            discarded INTEGER NOT NULL DEFAULT 0 CHECK (discarded >= 0),
+            unmappable INTEGER NOT NULL DEFAULT 0 CHECK (unmappable >= 0),
+            removed_extra INTEGER NOT NULL DEFAULT 0 CHECK (removed_extra >= 0),
+            publish_current INTEGER NOT NULL DEFAULT 0 CHECK (publish_current >= 0),
+            publish_total INTEGER NOT NULL DEFAULT 0 CHECK (publish_total >= 0),
+            required_free_bytes INTEGER NOT NULL DEFAULT 0 CHECK (required_free_bytes >= 0),
+            available_free_bytes INTEGER NOT NULL DEFAULT 0 CHECK (available_free_bytes >= 0),
+            monitor_was_running INTEGER NOT NULL DEFAULT 0,
+            monitor_was_paused INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            heartbeat_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT
+        );
+
+        CREATE TABLE minilm_migration_subjects (
+            run_id TEXT NOT NULL,
+            subject_key TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            source_fingerprint TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (run_id, subject_key),
+            FOREIGN KEY (run_id) REFERENCES minilm_migration_runs(run_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE minilm_migration_run_errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            subject_key TEXT,
+            phase TEXT NOT NULL,
+            code TEXT NOT NULL,
+            error TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (run_id) REFERENCES minilm_migration_runs(run_id) ON DELETE CASCADE
+        );
+    "#;
+
+    /// Kept apart from the tables because the half-upgraded fixture must not
+    /// have them: a stale index sitting under the new name would let
+    /// `CREATE INDEX IF NOT EXISTS` skip out and hide the very failure the
+    /// test is looking for.
+    const LEGACY_MIGRATION_INDEXES: &str = r#"
+        CREATE INDEX idx_minilm_migration_runs_updated
+            ON minilm_migration_runs(updated_at DESC);
+        CREATE INDEX idx_minilm_migration_errors_run
+            ON minilm_migration_run_errors(run_id, id);
+    "#;
+
+    fn test_storage() -> (tempfile::TempDir, StorageState) {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential);
+        (temp, storage)
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("read table info");
+        let mut columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table info")
+            .filter_map(Result::ok);
+        columns.any(|name| name == column)
+    }
+
+    fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
+            params![kind, name],
+            |row| row.get::<_, bool>(0),
+        )
+        .expect("read sqlite_master")
+    }
+
+    fn insert_legacy_run(conn: &Connection, table: &str, run_id: &str) {
+        conn.execute_batch(&format!(
+            "INSERT INTO {table}
+                 (run_id, mode, vector_space_revision, status, phase)
+             VALUES
+                 ('{run_id}', 'copy_chroma_hot_layer', 'revision-1', 'completed', 'finished');"
+        ))
+        .expect("insert legacy run row");
+    }
+
+    /// The upgrade path a released install actually takes: MiniLM-named tables
+    /// carrying settled rows, opened by a build whose schema indexes over
+    /// `index_kind`.
+    #[test]
+    fn init_tables_carries_legacy_minilm_migration_tables_over() {
+        let (_temp, storage) = test_storage();
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch(LEGACY_MIGRATION_TABLES)
+            .expect("install legacy migration tables");
+        conn.execute_batch(LEGACY_MIGRATION_INDEXES)
+            .expect("install legacy migration indexes");
+        insert_legacy_run(&conn, "minilm_migration_runs", "run-legacy");
+        conn.execute_batch(
+            "INSERT INTO minilm_migration_subjects
+                 (run_id, subject_key, outcome, source_fingerprint)
+             VALUES ('run-legacy', 'screenshot:1', 'migrated', 'fingerprint-1');",
+        )
+        .expect("insert legacy subject row");
+
+        storage
+            .init_tables(&conn)
+            .expect("initialize schema over a legacy database");
+
+        assert!(column_exists(&conn, "derived_migration_runs", "index_kind"));
+        assert!(object_exists(
+            &conn,
+            "index",
+            "idx_derived_migration_runs_updated"
+        ));
+        assert!(!object_exists(&conn, "table", "minilm_migration_runs"));
+        assert!(!object_exists(
+            &conn,
+            "index",
+            "idx_minilm_migration_runs_updated"
+        ));
+
+        // A settled MiniLM run keeps its rows and lands under the default kind.
+        let kind: String = conn
+            .query_row(
+                "SELECT index_kind FROM derived_migration_runs WHERE run_id = 'run-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy run survives the upgrade");
+        assert_eq!(kind, "semantic_text");
+        let subjects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM derived_migration_subjects WHERE run_id = 'run-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count carried-over subjects");
+        assert_eq!(subjects, 1);
+
+        // Every later launch runs the same path against the upgraded database.
+        storage
+            .init_tables(&conn)
+            .expect("re-initialize an already upgraded database");
+    }
+
+    /// The state a database is left in when the upgrade fails partway: the
+    /// rename commits on its own, then the CREATE batch aborts. Restarting has
+    /// to finish the job instead of tripping over the same missing column.
+    #[test]
+    fn init_tables_repairs_a_half_upgraded_migration_runs_table() {
+        let (_temp, storage) = test_storage();
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch(
+            &LEGACY_MIGRATION_TABLES.replace("minilm_migration_", "derived_migration_"),
+        )
+        .expect("install half-upgraded migration tables");
+        insert_legacy_run(&conn, "derived_migration_runs", "run-half");
+
+        storage
+            .init_tables(&conn)
+            .expect("initialize schema over a half-upgraded database");
+
+        assert!(column_exists(&conn, "derived_migration_runs", "index_kind"));
+        assert!(object_exists(
+            &conn,
+            "index",
+            "idx_derived_migration_runs_updated"
+        ));
+        let kind: String = conn
+            .query_row(
+                "SELECT index_kind FROM derived_migration_runs WHERE run_id = 'run-half'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("half-upgraded run survives the repair");
+        assert_eq!(kind, "semantic_text");
+    }
+
+    /// A fresh install has no migration tables at all, so the upgrade step has
+    /// to leave an absent table alone rather than trying to alter it.
+    #[test]
+    fn init_tables_defines_index_kind_on_a_fresh_database() {
+        let (_temp, storage) = test_storage();
+        let conn = Connection::open_in_memory().expect("in-memory database");
+
+        storage
+            .init_tables(&conn)
+            .expect("initialize schema on a fresh database");
+
+        assert!(column_exists(&conn, "derived_migration_runs", "index_kind"));
+        assert!(object_exists(
+            &conn,
+            "index",
+            "idx_derived_migration_runs_updated"
+        ));
     }
 }

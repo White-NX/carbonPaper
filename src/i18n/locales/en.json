@@ -319,6 +319,34 @@
         "run_done": "Indexed {{indexed}} screenshot(s); {{remaining}} still waiting.",
         "run_skipped": "This run did not start: {{reason}}."
       },
+      "clip_backend": {
+        "title": "Screenshot image search",
+        "label": "Use Rust for text-to-image search",
+        "description": "The main search box's natural-language mode: describe what a screenshot looked like and find it, matched by the Chinese-CLIP image model against the screenshot's visual content. It is a different search from the one above, which matches recognised text by meaning.",
+        "rollback_note": "When off, this search is handed back to Python and ChromaDB. Vector data is unchanged and background indexing continues either way, so you can switch back at any time.",
+        "diagnostic": "Local diagnostic",
+        "refresh": "Refresh diagnostic",
+        "last_query": "Last query served by",
+        "served_rust": "Rust",
+        "served_python": "Python",
+        "served_unknown": "No query since startup",
+        "indexed": "Images indexed locally",
+        "backlog": "Images awaiting encoding",
+        "stalled": "Images that failed encoding",
+        "fallbacks": "Fallbacks",
+        "last_reason": "Last fallback reason",
+        "backlog_hint": "Image encoding runs only while the computer is idle and on mains power, so screenshots captured during active use become findable by image search after the next idle period.",
+        "stalled_hint": "These images exhausted their encoding retries and will not be picked up again on their own. They stay out of image search until indexing is rebuilt.",
+        "run_now": "Index now",
+        "run_now_hint": "Encoding one image is far slower than encoding a line of text. If this computer is rarely idle or often on battery, index the waiting images by hand here. A run uses the processor while it goes, so you can stop it at any point.",
+        "run_preparing": "Encoding. The first image has not finished yet; the first run has to load the model.",
+        "run_progress": "Encoding: {{processed}} of {{total}} processed, {{indexed}} of them indexed.",
+        "run_stop": "Stop",
+        "run_stop_pending": "Stopping…",
+        "run_stopping": "Stopping. The run ends once the current image finishes.",
+        "run_done": "Indexed {{indexed}} image(s); {{remaining}} still waiting.",
+        "run_skipped": "This run did not start: {{reason}}."
+      },
       "onnx": {
         "title": "ONNX Inference (Experimental)",
         "label": "Use ONNX model inference",
@@ -1318,9 +1346,42 @@
       "trigger_ocr_model_repair_notification": "Test OCR Model Repair Notification"
     }
   },
-  "minilmMigration": {
-    "title": "Data migration in progress",
-    "subtitle": "Task vectors are being migrated to the local Rust index. The app is in maintenance mode while this runs.",
+  "clipBackfill": {
+    "title": "Image index backfill",
+    "lead": "The image index migration has finished, but {{count}} screenshots had no image vector to migrate. They will not appear in the search box's natural-language results unless they are encoded again.",
+    "missing": "Screenshots to encode",
+    "stalled": "Screenshots that failed earlier",
+    "estimateLabel": "Estimated time",
+    "estimateUnderAMinute": "under a minute",
+    "estimateMinutes": "about {{minutes}} min",
+    "estimateHours": "about {{hours}} h",
+    "estimateHoursMinutes": "about {{hours}} h {{minutes}} min",
+    "skippedDeleted": "A further {{count}} vectors were skipped because their screenshots have been deleted. That is expected and needs no action.",
+    "failedImports": "{{count}} vectors could not be read. See the migration diagnostics for details.",
+    "whenItRuns": "The backfill only runs while the computer is idle and on mains power, so it will not interrupt what you are doing. You can speed it up or stop it under Settings → Advanced at any time, and you can change your mind later.",
+    "approve": "Start the backfill",
+    "decline": "Not now",
+    "cardPending": "{{count}} screenshots have no image index. A backfill would take {{estimate}}.",
+    "cardApproved": "Backfill allowed; it will finish gradually while the computer is idle.",
+    "cardDeclined": "Backfill declined. These screenshots will not appear in text-to-image results.",
+    "cardApprove": "Start the backfill",
+    "cardDecline": "Cancel the backfill"
+  },
+  "vectorMigration": {
+    "kinds": {
+      "minilm": {
+        "title": "Migrating the text index",
+        "subtitle": "Screenshot-text vectors are being moved into the local Rust index. The app is in maintenance mode while this runs."
+      },
+      "clip": {
+        "title": "Migrating the image index",
+        "subtitle": "Screenshot-image vectors are being moved into the local Rust index. The app is in maintenance mode while this runs."
+      },
+      "unknown": {
+        "title": "Maintenance in progress",
+        "subtitle": "The app is running a maintenance task. Some features stay unavailable until it finishes."
+      }
+    },
     "eta": "Estimated time remaining: {{eta}} ",
     "safeWrite": "Writing to disk. Please do not force-quit the app.",
     "waitingForAuth": "Your session has expired. Complete Windows Hello authentication and the migration will continue automatically.",

@@ -10,25 +10,30 @@
 //! run simply resumes on the next launch/unlock from the persisted cursor.
 //!
 //! The whole run executes under global maintenance mode with durable
-//! `minilm_migration_runs` state, so a crash resumes from the persisted
+//! `derived_migration_runs` state, so a crash resumes from the persisted
 //! cursor instead of starting over. Chroma/Python remains the authoritative
 //! query backend throughout M2.4.
 
 use crate::credential_manager::CredentialManagerState;
-use crate::monitor::{authenticated_monitor_command, MonitorState};
+use crate::migration_support::{self, ExportPage, MigrationPhaseSink, SnapshotCommands};
 use crate::storage::{
-    BackgroundReadError, BackgroundScreenshotSummary, DerivedIndexJobSpec, DerivedIndexJobStatus,
-    DerivedIndexKind, MinilmMigrationPageRow, MinilmMigrationRunRecord, StorageState,
+    BackgroundScreenshotSummary, DerivedIndexJobSpec, DerivedIndexJobStatus, DerivedIndexKind,
+    DerivedMigrationPageRow, DerivedMigrationRunRecord, StorageState,
 };
-use base64::Engine as _;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
+
+/// The Python commands that drive the `task_vectors` snapshot.
+const SNAPSHOT_COMMANDS: SnapshotCommands = SnapshotCommands {
+    start: "start_task_vectors_export",
+    status: "get_task_vectors_export_status",
+    page: "export_task_vectors_page",
+    finish: "finish_task_vectors_export",
+};
 
 pub const MINILM_MODEL_ID: &str = "paraphrase-multilingual-MiniLM-L12-v2";
 /// Compatibility contract for the shared MiniLM vector space. Legacy Chroma
@@ -47,11 +52,8 @@ pub const MINILM_MIN_L2_NORM: f32 = 1e-6;
 pub const MINILM_OCR_SNIPPET_CHARS: usize = 200;
 const CHROMA_PAGE_SIZE: u64 = 128;
 const MAX_DIAGNOSTICS: usize = 500;
-const AUTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// Python enforces a 10 minute logical snapshot deadline; allow a little slack
-/// before the Rust side also gives up.
-const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(11 * 60);
+/// How often startup re-checks for an unlocked vault before starting the copy.
+const AUTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MinilmMigrationDiagnostic {
@@ -114,7 +116,7 @@ impl Default for MinilmRebuildStatus {
     }
 }
 
-fn status_from_run(run: &MinilmMigrationRunRecord, running: bool) -> MinilmRebuildStatus {
+fn status_from_run(run: &DerivedMigrationRunRecord, running: bool) -> MinilmRebuildStatus {
     MinilmRebuildStatus {
         running,
         phase: run.phase.clone(),
@@ -189,44 +191,15 @@ impl MinilmMigrationState {
     }
 }
 
+impl MigrationPhaseSink for MinilmMigrationState {
+    fn set_phase(&self, phase: &str) {
+        self.update(|status| status.phase = phase.to_string());
+    }
+}
+
 struct SourceRow {
     text: String,
     spec: DerivedIndexJobSpec,
-}
-
-#[derive(Deserialize)]
-struct TaskVectorExportStart {
-    export_id: String,
-}
-
-#[derive(Deserialize)]
-struct TaskVectorExportStatus {
-    state: String,
-    #[serde(default)]
-    total: u64,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TaskVectorExportError {
-    id: Option<String>,
-    error: String,
-}
-
-#[derive(Deserialize)]
-struct TaskVectorExportPage {
-    ids: Vec<String>,
-    dimensions: usize,
-    #[serde(default)]
-    embeddings_f32_le_b64: String,
-    #[serde(default)]
-    missing_ids: Vec<String>,
-    #[serde(default)]
-    errors: Vec<TaskVectorExportError>,
-    next_cursor: u64,
-    done: bool,
-    total: u64,
 }
 
 pub fn build_minilm_task_text(process_name: &str, window_title: &str, ocr_text: &str) -> String {
@@ -284,153 +257,18 @@ fn source_rows(
 }
 
 pub(crate) fn validate_minilm_vector(vector: &[f32]) -> Result<(), String> {
-    if vector.len() != MINILM_DIMENSIONS {
-        return Err(format!(
-            "Expected {MINILM_DIMENSIONS} dimensions, got {}",
-            vector.len()
-        ));
-    }
-    if vector.iter().any(|value| !value.is_finite()) {
-        return Err("Embedding contains a non-finite value".to_string());
-    }
-    let norm_squared: f32 = vector.iter().map(|value| value * value).sum();
-    if norm_squared.sqrt() <= MINILM_MIN_L2_NORM {
-        return Err("Embedding is a zero vector".to_string());
-    }
-    Ok(())
-}
-
-/// Decode the little-endian float32 page payload into per-id vectors.
-fn decode_export_page_vectors(page: &TaskVectorExportPage) -> Result<Vec<Vec<f32>>, String> {
-    if page.dimensions != MINILM_DIMENSIONS {
-        return Err(format!(
-            "Chroma export page has {} dimensions, expected {MINILM_DIMENSIONS}",
-            page.dimensions
-        ));
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(page.embeddings_f32_le_b64.as_bytes())
-        .map_err(|error| format!("Invalid Base64 embedding payload: {error}"))?;
-    let expected = page
-        .ids
-        .len()
-        .checked_mul(page.dimensions)
-        .and_then(|floats| floats.checked_mul(4))
-        .ok_or_else(|| "Chroma export page size overflow".to_string())?;
-    if bytes.len() != expected {
-        return Err(format!(
-            "Chroma export payload is {} bytes, expected {expected} for {} ids",
-            bytes.len(),
-            page.ids.len()
-        ));
-    }
-    let mut vectors = Vec::with_capacity(page.ids.len());
-    for row in bytes.chunks_exact(page.dimensions * 4) {
-        vectors.push(
-            row.chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect(),
-        );
-    }
-    Ok(vectors)
-}
-
-fn parse_monitor_success(response: serde_json::Value) -> Result<serde_json::Value, String> {
-    if let Some(error) = response.get("error").and_then(|value| value.as_str()) {
-        return Err(error.to_string());
-    }
-    if response.get("status").and_then(|value| value.as_str()) == Some("error") {
-        return Err(response
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or("Monitor command failed")
-            .to_string());
-    }
-    Ok(response)
-}
-
-fn is_auth_required_error(error: &str) -> bool {
-    error.contains("AUTH_REQUIRED")
-}
-
-fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339()
-}
-
-fn new_run_id() -> String {
-    let mut digest = Sha256::new();
-    digest.update(
-        Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or_default()
-            .to_le_bytes(),
-    );
-    digest.update(std::process::id().to_le_bytes());
-    let hex = format!("{:x}", digest.finalize());
-    format!("minilm-{}", &hex[..32])
-}
-
-/// Cancellation no longer exists: the mandatory copy blocks until the user
-/// unlocks. Closing the app is the only interruption, and the run resumes
-/// from its persisted cursor on the next launch/unlock.
-async fn wait_for_auth(app: &AppHandle, state: &MinilmMigrationState) {
-    loop {
-        let authenticated = app
-            .try_state::<Arc<CredentialManagerState>>()
-            .map(|value| value.is_session_valid())
-            .unwrap_or(false);
-        if authenticated {
-            return;
-        }
-        state.update(|status| status.phase = "waiting_for_auth".to_string());
-        tokio::time::sleep(AUTH_POLL_INTERVAL).await;
-    }
-}
-
-async fn monitor_command_with_auth_retry(
-    app: &AppHandle,
-    state: &MinilmMigrationState,
-    payload: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    loop {
-        wait_for_auth(app, state).await;
-        let credential = app.state::<Arc<CredentialManagerState>>();
-        let monitor = app.state::<MonitorState>();
-        let result = authenticated_monitor_command(&credential, &monitor, payload.clone())
-            .await
-            .and_then(parse_monitor_success);
-        match result {
-            Err(error) if is_auth_required_error(&error) => continue,
-            other => return other,
-        }
-    }
-}
-
-async fn background_read_with_auth_retry<T>(
-    app: &AppHandle,
-    state: &MinilmMigrationState,
-    mut read: impl FnMut(&StorageState) -> Result<T, BackgroundReadError>,
-) -> Result<T, String> {
-    let storage = app.state::<Arc<StorageState>>().inner().clone();
-    loop {
-        wait_for_auth(app, state).await;
-        match read(&storage) {
-            Ok(value) => return Ok(value),
-            Err(BackgroundReadError::AuthRequired) => continue,
-            Err(BackgroundReadError::Other(error)) => return Err(error),
-        }
-    }
+    migration_support::validate_migrated_vector(vector, MINILM_DIMENSIONS, MINILM_MIN_L2_NORM)
 }
 
 /// Persist the worker-owned run record and mirror it into the UI status.
 fn persist_run(
     storage: &StorageState,
     state: &MinilmMigrationState,
-    run: &mut MinilmMigrationRunRecord,
+    run: &mut DerivedMigrationRunRecord,
 ) -> Result<(), String> {
-    run.heartbeat_at = now_rfc3339();
+    run.heartbeat_at = migration_support::now_rfc3339();
     run.updated_at = run.heartbeat_at.clone();
-    storage.update_minilm_migration_run(run)?;
+    storage.update_derived_migration_run(run)?;
     let running = state.running.load(Ordering::SeqCst);
     state.update(|status| *status = status_from_run(run, running));
     Ok(())
@@ -447,148 +285,9 @@ fn record_error(
 ) {
     state.diagnostic(subject_key.map(str::to_string), phase, code, error);
     if let Err(persist_error) =
-        storage.record_minilm_migration_error(run_id, subject_key, phase, code, error)
+        storage.record_derived_migration_error(run_id, subject_key, phase, code, error)
     {
         tracing::warn!("[MINILM] failed to persist migration diagnostic: {persist_error}");
-    }
-}
-
-/// Saved monitor/capture state so the migration can restore exactly what the
-/// user had, instead of unconditionally resuming.
-struct MonitorRestore {
-    was_running: bool,
-    was_paused: bool,
-    started_by_migration: bool,
-}
-
-async fn prepare_monitor_for_migration(app: &AppHandle) -> Result<MonitorRestore, String> {
-    let monitor = app.state::<MonitorState>();
-    let capture = app.state::<Arc<crate::capture::CaptureState>>();
-    let was_running = monitor
-        .process
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some();
-    let was_paused = capture.paused.load(Ordering::SeqCst);
-    let mut started_by_migration = false;
-    if !was_running {
-        // The Chroma hot layer only speaks through the Python monitor.
-        crate::monitor::start_monitor_impl(app.state::<MonitorState>(), app.clone())
-            .await
-            .map_err(|error| format!("Cannot start the monitor for the migration: {error}"))?;
-        started_by_migration = true;
-    }
-    if !was_paused {
-        let _ = crate::monitor::pause_monitor_impl(
-            app.state::<MonitorState>(),
-            app.state::<Arc<crate::capture::CaptureState>>(),
-            app.clone(),
-        )
-        .await;
-    }
-    Ok(MonitorRestore {
-        was_running,
-        was_paused,
-        started_by_migration,
-    })
-}
-
-async fn restore_monitor_after_migration(app: &AppHandle, restore: &MonitorRestore) {
-    if restore.started_by_migration && !restore.was_running {
-        let _ = crate::monitor::stop_monitor_impl(
-            app.state::<MonitorState>(),
-            app.state::<Arc<crate::capture::CaptureState>>(),
-            app.clone(),
-        )
-        .await;
-        return;
-    }
-    if !restore.was_paused {
-        let _ = crate::monitor::resume_monitor_impl(
-            app.state::<MonitorState>(),
-            app.state::<Arc<crate::capture::CaptureState>>(),
-            app.clone(),
-        )
-        .await;
-    }
-}
-
-/// Query the persisted snapshot's readiness without creating a new one.
-/// Returns `None` when Python no longer knows the export (memory and disk).
-async fn attach_chroma_snapshot(
-    app: &AppHandle,
-    state: &MinilmMigrationState,
-    export_id: &str,
-) -> Result<Option<u64>, String> {
-    let response = monitor_command_with_auth_retry(
-        app,
-        state,
-        serde_json::json!({
-            "command": "get_task_vectors_export_status",
-            "export_id": export_id,
-        }),
-    )
-    .await?;
-    let status: TaskVectorExportStatus = serde_json::from_value(response)
-        .map_err(|error| format!("Invalid Chroma export status: {error}"))?;
-    match status.state.as_str() {
-        "ready" => Ok(Some(status.total)),
-        _ => Ok(None),
-    }
-}
-
-/// Start (or re-attach to) the asynchronous Python ID snapshot and wait until
-/// it is ready. `start_task_vectors_export` returns immediately; readiness is
-/// polled so a slow Chroma `get` cannot exhaust one long IPC window.
-async fn wait_for_chroma_snapshot(
-    app: &AppHandle,
-    state: &MinilmMigrationState,
-    export_id: &str,
-) -> Result<u64, String> {
-    let response = monitor_command_with_auth_retry(
-        app,
-        state,
-        serde_json::json!({
-            "command": "start_task_vectors_export",
-            "export_id": export_id,
-        }),
-    )
-    .await?;
-    let started: TaskVectorExportStart = serde_json::from_value(response)
-        .map_err(|error| format!("Invalid Chroma export start response: {error}"))?;
-    if started.export_id != export_id {
-        return Err("Chroma export id mismatch".to_string());
-    }
-
-    let deadline = tokio::time::Instant::now() + SNAPSHOT_DEADLINE;
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(
-                "Chroma ID snapshot did not become ready within its deadline; restart the monitor and retry"
-                    .to_string(),
-            );
-        }
-        let response = monitor_command_with_auth_retry(
-            app,
-            state,
-            serde_json::json!({
-                "command": "get_task_vectors_export_status",
-                "export_id": export_id,
-            }),
-        )
-        .await?;
-        let status: TaskVectorExportStatus = serde_json::from_value(response)
-            .map_err(|error| format!("Invalid Chroma export status: {error}"))?;
-        match status.state.as_str() {
-            "ready" => return Ok(status.total),
-            "preparing" => tokio::time::sleep(SNAPSHOT_POLL_INTERVAL).await,
-            other => {
-                return Err(format!(
-                    "Chroma ID snapshot is {other}: {}",
-                    status.error.unwrap_or_else(|| "no detail".to_string())
-                ))
-            }
-        }
     }
 }
 
@@ -598,7 +297,7 @@ async fn wait_for_chroma_snapshot(
 async fn copy_chroma_hot_layer(
     app: &AppHandle,
     state: &Arc<MinilmMigrationState>,
-    run: &mut MinilmMigrationRunRecord,
+    run: &mut DerivedMigrationRunRecord,
 ) -> Result<(), String> {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
 
@@ -609,22 +308,24 @@ async fn copy_chroma_hot_layer(
     // the durable cursor. A snapshot Python cannot restore forces a reset.
     let mut total = None;
     if let Some(export_id) = run.export_id.clone() {
-        total = attach_chroma_snapshot(app, state, &export_id).await?;
+        total = migration_support::attach_snapshot(app, &**state, SNAPSHOT_COMMANDS, &export_id)
+            .await?;
         if total.is_none() {
-            storage.reset_minilm_migration_export(&run.run_id)?;
+            storage.reset_derived_migration_export(&run.run_id)?;
             *run = storage
-                .get_minilm_migration_run(&run.run_id)?
+                .get_derived_migration_run(&run.run_id)?
                 .ok_or("MiniLM migration run disappeared during reset")?;
         }
     }
     let total = match total {
         Some(total) => total,
         None => {
-            let export_id = new_run_id();
+            let export_id = migration_support::new_run_id("minilm");
             run.export_id = Some(export_id.clone());
             run.phase = "snapshotting_chroma".to_string();
             persist_run(&storage, state, run)?;
-            wait_for_chroma_snapshot(app, state, &export_id).await?
+            migration_support::wait_for_snapshot(app, &**state, SNAPSHOT_COMMANDS, &export_id)
+                .await?
         }
     };
     run.chroma_total = total;
@@ -634,9 +335,9 @@ async fn copy_chroma_hot_layer(
     let mut unmappable_total = run.unmappable;
     let mut cursor = run.export_cursor;
     loop {
-        let response = monitor_command_with_auth_retry(
+        let response = migration_support::monitor_command_with_auth_retry(
             app,
-            state,
+            &**state,
             serde_json::json!({
                 "command": "export_task_vectors_page",
                 "export_id": run.export_id,
@@ -645,7 +346,7 @@ async fn copy_chroma_hot_layer(
             }),
         )
         .await?;
-        let page: TaskVectorExportPage = serde_json::from_value(response)
+        let page: ExportPage = serde_json::from_value(response)
             .map_err(|error| format!("Invalid Chroma vector export page: {error}"))?;
         if page.total != run.chroma_total {
             return Err(format!(
@@ -656,7 +357,7 @@ async fn copy_chroma_hot_layer(
         if !page.done && page.next_cursor <= cursor {
             return Err("Chroma export cursor did not advance".to_string());
         }
-        let vectors = decode_export_page_vectors(&page)?;
+        let vectors = migration_support::decode_export_page_vectors(&page, MINILM_DIMENSIONS)?;
 
         for missing_id in &page.missing_ids {
             unmappable_total += 1;
@@ -720,11 +421,12 @@ async fn copy_chroma_hot_layer(
         }
 
         let ids: Vec<i64> = valid.iter().map(|(id, _, _)| *id).collect();
-        let summaries = background_read_with_auth_retry(app, state, |storage| {
-            storage.get_screenshot_summaries_by_ids_silent(&ids)
-        })
-        .await?;
-        let ocr = background_read_with_auth_retry(app, state, |storage| {
+        let summaries =
+            migration_support::background_read_with_auth_retry(app, &**state, |storage| {
+                storage.get_screenshot_summaries_by_ids_silent(&ids)
+            })
+            .await?;
+        let ocr = migration_support::background_read_with_auth_retry(app, &**state, |storage| {
             storage.get_ocr_text_prefixes_by_screenshot_ids_silent(&ids, MINILM_OCR_SNIPPET_CHARS)
         })
         .await?;
@@ -758,16 +460,22 @@ async fn copy_chroma_hot_layer(
             } else {
                 "migrated"
             };
-            rows.push(MinilmMigrationPageRow {
+            rows.push(DerivedMigrationPageRow {
                 job: source.spec,
                 vector,
                 outcome: outcome.to_string(),
             });
         }
 
-        storage.commit_minilm_migration_page(&run.run_id, cursor, page.next_cursor, &rows)?;
+        storage.commit_derived_migration_page(
+            &run.run_id,
+            DerivedIndexKind::SemanticText,
+            cursor,
+            page.next_cursor,
+            &rows,
+        )?;
         *run = storage
-            .get_minilm_migration_run(&run.run_id)?
+            .get_derived_migration_run(&run.run_id)?
             .ok_or("MiniLM migration run disappeared during copy")?;
         run.unmappable = unmappable_total;
         persist_run(&storage, state, run)?;
@@ -785,64 +493,53 @@ async fn copy_chroma_hot_layer(
 async fn publish_generation(
     app: &AppHandle,
     state: &Arc<MinilmMigrationState>,
-    run: &mut MinilmMigrationRunRecord,
+    run: &mut DerivedMigrationRunRecord,
 ) -> Result<(), String> {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     run.phase = "publishing_sync".to_string();
     persist_run(&storage, state, run)?;
 
-    let blocking_storage = storage.clone();
     let progress_state = state.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        blocking_storage.publish_derived_index_generation_with_progress(
-            DerivedIndexKind::SemanticText,
-            move |phase, current, total| {
-                // In-memory only: DB writes here would contend with the
-                // publication's own connection usage.
-                progress_state.update(|status| {
-                    status.phase = phase.to_string();
-                    status.publish_current = current;
-                    status.publish_total = total;
-                });
-            },
-            // The migration is no longer cancellable.
-            || false,
-        )
-    })
-    .await
-    .map_err(|error| format!("Generation publication worker crashed: {error:?}"))?;
+    migration_support::publish_generation(
+        app,
+        DerivedIndexKind::SemanticText,
+        move |phase, current, total| {
+            // In-memory only: DB writes here would contend with the
+            // publication's own connection usage.
+            progress_state.update(|status| {
+                status.phase = phase.to_string();
+                status.publish_current = current;
+                status.publish_total = total;
+            });
+        },
+    )
+    .await?;
 
-    match result {
-        Ok(_generation) => {
-            let status_snapshot = state
-                .status
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            run.publish_current = status_snapshot.publish_current;
-            run.publish_total = status_snapshot.publish_total;
-            run.phase = "publishing_commit".to_string();
-            persist_run(&storage, state, run)?;
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    let status_snapshot = state
+        .status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    run.publish_current = status_snapshot.publish_current;
+    run.publish_total = status_snapshot.publish_total;
+    run.phase = "publishing_commit".to_string();
+    persist_run(&storage, state, run)
 }
 
 async fn run_minilm_migration(
     app: AppHandle,
     state: Arc<MinilmMigrationState>,
-    mut run: MinilmMigrationRunRecord,
+    mut run: DerivedMigrationRunRecord,
     maintenance: crate::maintenance::MaintenanceGuard,
 ) {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
 
     let result = async {
-        wait_for_auth(&app, &state).await;
+        migration_support::wait_for_auth(&app, &*state).await;
 
-        let restore = prepare_monitor_for_migration(&app).await?;
-        run.monitor_was_running = restore.was_running;
-        run.monitor_was_paused = restore.was_paused;
+        let restore = migration_support::prepare_monitor_for_migration(&app).await?;
+        run.monitor_was_running = restore.was_running();
+        run.monitor_was_paused = restore.was_paused();
 
         let phase_result = async {
             // Everything after prepare_monitor_for_migration must flow through
@@ -855,7 +552,8 @@ async fn run_minilm_migration(
             // so rows outside the persisted snapshot can always be removed.
             run.phase = "reconciling".to_string();
             persist_run(&storage, &state, &mut run)?;
-            let removed = storage.reconcile_minilm_migration_scope(&run.run_id)?;
+            let removed = storage
+                .reconcile_derived_migration_scope(DerivedIndexKind::SemanticText, &run.run_id)?;
             run.removed_extra = removed;
             persist_run(&storage, &state, &mut run)?;
 
@@ -866,32 +564,36 @@ async fn run_minilm_migration(
         // Best-effort snapshot release; the Python-side TTLs cover failures.
         if phase_result.is_ok() {
             if let Some(export_id) = run.export_id.clone() {
-                let credential = app.state::<Arc<CredentialManagerState>>();
-                let monitor = app.state::<MonitorState>();
-                let _ = authenticated_monitor_command(
-                    &credential,
-                    &monitor,
-                    serde_json::json!({
-                        "command": "finish_task_vectors_export",
-                        "export_id": export_id,
-                    }),
-                )
-                .await;
+                migration_support::release_snapshot(&app, SNAPSHOT_COMMANDS, &export_id).await;
             }
         }
 
-        restore_monitor_after_migration(&app, &restore).await;
+        migration_support::restore_monitor_after_migration(&app, &restore).await;
         phase_result
     }
     .await;
 
     let has_errors = run.failed > 0 || run.unmappable > 0 || run.discarded > 0;
-    run.finished_at = Some(now_rfc3339());
+    run.finished_at = Some(migration_support::now_rfc3339());
     match &result {
         Err(error) => {
             run.status = "failed".to_string();
             run.phase = "failed".to_string();
             run.last_error = Some(error.clone());
+            // Same reasoning as the CLIP copy: a resume clears `last_error`, so
+            // without this row the only account of why the run needed resuming
+            // is erased by the resume itself. The overlay shows `last_error`
+            // while the run is live; this is what remains afterwards.
+            tracing::warn!("[MINILM] migration run {} failed: {error}", run.run_id);
+            record_error(
+                &storage,
+                &state,
+                &run.run_id,
+                None,
+                "run",
+                "run_failed",
+                error,
+            );
         }
         _ if has_errors => {
             run.status = "completed_with_errors".to_string();
@@ -902,11 +604,25 @@ async fn run_minilm_migration(
             run.phase = "completed".to_string();
         }
     }
+    if result.is_ok() {
+        tracing::info!(
+            "[MINILM] migration run {} {}: {} copied, {} already current, {} unmappable, {} removed out of scope, of {} Chroma row(s)",
+            run.run_id,
+            run.status,
+            run.migrated,
+            run.already_current,
+            run.unmappable,
+            run.removed_extra,
+            run.chroma_total,
+        );
+    }
     // Terminally quarantined legacy rows do not make the copy unfinished.
     // Transient orchestration failures keep status `failed`, do not write the
     // sentinel, and therefore resume after the next launch/unlock.
     if run_settles_sentinel(&run) {
-        if let Err(error) = storage.mark_minilm_auto_migration_done(&run.vector_space_revision) {
+        if let Err(error) = storage
+            .mark_auto_migration_done(DerivedIndexKind::SemanticText, &run.vector_space_revision)
+        {
             tracing::warn!("[MINILM] failed to write the auto-migration sentinel: {error}");
         }
     }
@@ -920,13 +636,13 @@ async fn run_minilm_migration(
     drop(maintenance);
 }
 
-fn run_is_resumable(run: &MinilmMigrationRunRecord) -> bool {
+fn run_is_resumable(run: &DerivedMigrationRunRecord) -> bool {
     matches!(run.status.as_str(), "running" | "failed")
         && run.phase != "completed"
         && run.phase != "completed_with_errors"
 }
 
-fn run_is_compatible_resume(run: &MinilmMigrationRunRecord) -> bool {
+fn run_is_compatible_resume(run: &DerivedMigrationRunRecord) -> bool {
     run.mode == MINILM_MIGRATION_MODE
         && run.vector_space_revision == MINILM_VECTOR_SPACE_REVISION
         && run_is_resumable(run)
@@ -936,7 +652,7 @@ fn run_is_compatible_resume(run: &MinilmMigrationRunRecord) -> bool {
 /// reconcile, and generation publication complete. `completed_with_errors`
 /// contains only terminally quarantined legacy rows (invalid ids/vectors,
 /// disappeared rows, or inactive screenshots), not transient worker errors.
-fn run_settles_sentinel(run: &MinilmMigrationRunRecord) -> bool {
+fn run_settles_sentinel(run: &DerivedMigrationRunRecord) -> bool {
     matches!(run.status.as_str(), "completed" | "completed_with_errors")
 }
 
@@ -998,7 +714,8 @@ async fn run_auto_migration(app: AppHandle) -> Result<(), String> {
     let migration = app.state::<Arc<MinilmMigrationState>>().inner().clone();
     // Re-evaluate every poll so the unlock-instant decision wins.
     loop {
-        let sentinel_done = storage.is_minilm_auto_migration_done(MINILM_VECTOR_SPACE_REVISION)?;
+        let sentinel_done = storage
+            .is_auto_migration_done(DerivedIndexKind::SemanticText, MINILM_VECTOR_SPACE_REVISION)?;
         match auto_migration_decision(sentinel_done) {
             AutoMigrationDecision::AlreadyDone => return Ok(()),
             AutoMigrationDecision::Start => {}
@@ -1032,7 +749,7 @@ fn start_minilm_migration_inner(
     // Resume only state created by this sentinel-only orchestration mode. Old
     // manual/time-bounded runs may have partial snapshots and must never be
     // reconciled as if they covered the complete Chroma hot layer.
-    let mut run = match storage.get_latest_minilm_migration_run()? {
+    let mut run = match storage.get_latest_derived_migration_run(DerivedIndexKind::SemanticText)? {
         Some(previous) if run_is_compatible_resume(&previous) => {
             let mut resumed = previous;
             resumed.status = "running".to_string();
@@ -1041,8 +758,9 @@ fn start_minilm_migration_inner(
             resumed.finished_at = None;
             resumed
         }
-        _ => MinilmMigrationRunRecord {
-            run_id: new_run_id(),
+        _ => DerivedMigrationRunRecord {
+            index_kind: DerivedIndexKind::SemanticText,
+            run_id: migration_support::new_run_id("minilm"),
             mode: MINILM_MIGRATION_MODE.to_string(),
             vector_space_revision: MINILM_VECTOR_SPACE_REVISION.to_string(),
             status: "running".to_string(),
@@ -1065,9 +783,9 @@ fn start_minilm_migration_inner(
             monitor_was_running: false,
             monitor_was_paused: false,
             last_error: None,
-            started_at: now_rfc3339(),
-            heartbeat_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
+            started_at: migration_support::now_rfc3339(),
+            heartbeat_at: migration_support::now_rfc3339(),
+            updated_at: migration_support::now_rfc3339(),
             finished_at: None,
         },
     };
@@ -1076,7 +794,7 @@ fn start_minilm_migration_inner(
     // Disk preflight before any vector write. The Chroma snapshot size is not
     // known yet, so active screenshots are the conservative upper bound.
     let expected_rows = storage.count_active_screenshots()?.max(0) as u64;
-    let preflight = storage.minilm_migration_disk_preflight(expected_rows)?;
+    let preflight = storage.derived_migration_disk_preflight(MINILM_DIMENSIONS, expected_rows)?;
     run.required_free_bytes = preflight.required_free_bytes;
     run.available_free_bytes = preflight.available_free_bytes;
     if !preflight.sufficient {
@@ -1091,10 +809,10 @@ fn start_minilm_migration_inner(
         return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
     };
 
-    if is_new_run && storage.get_minilm_migration_run(&run.run_id)?.is_none() {
-        storage.create_minilm_migration_run(&run)?;
+    if is_new_run && storage.get_derived_migration_run(&run.run_id)?.is_none() {
+        storage.create_derived_migration_run(&run)?;
     } else {
-        storage.update_minilm_migration_run(&run)?;
+        storage.update_derived_migration_run(&run)?;
     }
 
     *migration
@@ -1131,7 +849,7 @@ pub fn get_minilm_rebuild_status(
     // No live worker: report the latest persisted run so an interrupted
     // migration is visible (and resumable) after a restart.
     let storage = app.state::<Arc<StorageState>>().inner().clone();
-    match storage.get_latest_minilm_migration_run() {
+    match storage.get_latest_derived_migration_run(DerivedIndexKind::SemanticText) {
         Ok(Some(run)) => {
             let mut status = status_from_run(&run, false);
             if run_is_resumable(&run) {
@@ -1176,13 +894,13 @@ pub fn list_minilm_rebuild_errors(
         .clone()
         .or_else(|| {
             app.state::<Arc<StorageState>>()
-                .get_latest_minilm_migration_run()
+                .get_latest_derived_migration_run(DerivedIndexKind::SemanticText)
                 .ok()
                 .flatten()
                 .map(|run| run.run_id)
         });
     let persisted = match &run_id {
-        Some(run_id) => storage.list_minilm_migration_errors(run_id, offset, limit)?,
+        Some(run_id) => storage.list_derived_migration_errors(run_id, offset, limit)?,
         None => Vec::new(),
     };
     let failed = storage.list_derived_index_jobs(
@@ -1240,55 +958,15 @@ mod tests {
     }
 
     #[test]
-    fn auth_required_detection_accepts_monitor_error_context() {
-        assert!(is_auth_required_error("AUTH_REQUIRED"));
-        assert!(is_auth_required_error(
-            "monitor rejected request: AUTH_REQUIRED"
-        ));
-        assert!(!is_auth_required_error("monitor unavailable"));
-    }
-
-    #[test]
-    fn vector_validation_rejects_wrong_shape_non_finite_and_zero_vectors() {
+    fn vector_validation_pins_the_minilm_width() {
+        // The shared validator covers non-finite and zero vectors; what is
+        // MiniLM's own is that 384 is the only accepted width, so a CLIP row
+        // cannot be imported into this index by mistake.
         assert!(validate_minilm_vector(&vec![0.25; MINILM_DIMENSIONS]).is_ok());
-        assert!(validate_minilm_vector(&vec![0.25; 10]).is_err());
-        let mut invalid = vec![0.25; MINILM_DIMENSIONS];
-        invalid[3] = f32::NAN;
-        assert!(validate_minilm_vector(&invalid).is_err());
+        assert!(validate_minilm_vector(&vec![0.25; 512]).is_err());
         assert!(validate_minilm_vector(&vec![0.0; MINILM_DIMENSIONS])
             .unwrap_err()
             .contains("zero vector"));
-    }
-
-    #[test]
-    fn export_page_base64_roundtrip_and_size_check() {
-        let vector: Vec<f32> = (0..MINILM_DIMENSIONS).map(|i| i as f32 * 0.5).collect();
-        let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let page = TaskVectorExportPage {
-            ids: vec!["7".to_string()],
-            dimensions: MINILM_DIMENSIONS,
-            embeddings_f32_le_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-            missing_ids: Vec::new(),
-            errors: Vec::new(),
-            next_cursor: 1,
-            done: true,
-            total: 1,
-        };
-        let decoded = decode_export_page_vectors(&page).unwrap();
-        assert_eq!(decoded, vec![vector]);
-
-        let truncated = TaskVectorExportPage {
-            embeddings_f32_le_b64: base64::engine::general_purpose::STANDARD
-                .encode(&bytes[..bytes.len() - 4]),
-            ids: vec!["7".to_string()],
-            dimensions: MINILM_DIMENSIONS,
-            missing_ids: Vec::new(),
-            errors: Vec::new(),
-            next_cursor: 1,
-            done: true,
-            total: 1,
-        };
-        assert!(decode_export_page_vectors(&truncated).is_err());
     }
 
     #[test]
@@ -1317,8 +995,9 @@ mod tests {
         assert!(!run_is_compatible_resume(&old_vector_space));
     }
 
-    fn test_run(status: &str) -> MinilmMigrationRunRecord {
-        MinilmMigrationRunRecord {
+    fn test_run(status: &str) -> DerivedMigrationRunRecord {
+        DerivedMigrationRunRecord {
+            index_kind: DerivedIndexKind::SemanticText,
             run_id: "run".to_string(),
             mode: MINILM_MIGRATION_MODE.to_string(),
             vector_space_revision: MINILM_VECTOR_SPACE_REVISION.to_string(),

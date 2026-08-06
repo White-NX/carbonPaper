@@ -1335,7 +1335,9 @@ mod tests {
         assert!(is_monitor_unavailable_error(
             "Read frame length error: connection reset"
         ));
-        assert!(is_monitor_unavailable_error("IPC response timed out after 30s"));
+        assert!(is_monitor_unavailable_error(
+            "IPC response timed out after 30s"
+        ));
 
         // Failures reported by Python (or unknown errors) consume the budget.
         assert!(!is_monitor_unavailable_error("postprocess worker crashed"));

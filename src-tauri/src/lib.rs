@@ -6,6 +6,9 @@
 mod analysis;
 mod autostart;
 mod capture;
+mod clip_index;
+mod clip_migration;
+mod clip_query;
 pub mod commands;
 mod credential_manager;
 pub mod error;
@@ -16,6 +19,7 @@ mod logging;
 mod maintenance;
 mod mcp_server;
 mod mcp_token;
+mod migration_support;
 mod minilm_index;
 mod minilm_migration;
 #[allow(dead_code)]
@@ -811,6 +815,8 @@ pub fn run() {
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(semantic_runtime::SemanticRuntimeState::new()))
         .manage(Arc::new(minilm_migration::MinilmMigrationState::new()))
+        .manage(Arc::new(clip_migration::ClipMigrationState::new()))
+        .manage(Arc::new(clip_index::ClipIndexRunState::default()))
         .manage(Arc::new(CaptureState::default()))
         .manage(AnalysisState::default())
         .manage(updater::UpdaterState::new())
@@ -954,9 +960,12 @@ pub fn run() {
                             StorageState::backfill_plaintext_process_names(storage_clone);
                         });
 
-                        // Sentinel-gated one-time M2.4a Chroma copy; waits for
-                        // unlock internally before starting.
+                        // Sentinel-gated one-time Chroma copies; each waits for
+                        // unlock internally before starting. The CLIP one also
+                        // waits out the MiniLM one's maintenance guard, so the
+                        // two never pause and restore capture at the same time.
                         minilm_migration::spawn_minilm_auto_migration(app.handle().clone());
+                        clip_migration::spawn_clip_auto_migration(app.handle().clone());
 
                         let app_handle_cleanup = app.handle().clone();
                         tauri::async_runtime::spawn(async move {
@@ -990,6 +999,15 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             minilm_index::run_semantic_index_worker(app_handle_semantic_index)
                                 .await;
+                        });
+
+                        // M2.5 step 8: the same for Chinese-CLIP image vectors.
+                        // A third claimant of one single-slot worker, which is
+                        // why all three take `BACKGROUND_PASS_GUARD` rather than
+                        // trusting their poll intervals to keep them apart.
+                        let app_handle_clip_index = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            clip_index::run_clip_index_worker(app_handle_clip_index).await;
                         });
 
                         // M2.5 step 6: Rust owns Smart Cluster scoring, which
@@ -1152,9 +1170,15 @@ pub fn run() {
             semantic_runtime::restart_ml_semantic_worker,
             minilm_index::semantic_index_run_now,
             minilm_index::semantic_index_stop_now,
+            clip_index::clip_index_run_now,
+            clip_index::clip_index_stop_now,
+            clip_index::get_clip_backfill_offer,
+            clip_index::set_clip_backfill_decision,
             rerank::nl_rerank_stop_now,
             minilm_migration::get_minilm_rebuild_status,
             minilm_migration::list_minilm_rebuild_errors,
+            clip_migration::get_clip_rebuild_status,
+            clip_migration::list_clip_rebuild_errors,
             maintenance::get_maintenance_status,
             monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）

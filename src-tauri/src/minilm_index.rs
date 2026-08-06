@@ -65,7 +65,6 @@
 //! silently cancelled would make that button unreliable. See
 //! [`stand_aside_for_foreground`].
 
-
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
 use crate::minilm_migration::{
@@ -256,7 +255,8 @@ pub(crate) fn minilm_sources(
         });
     }
     let summaries = storage.get_screenshot_summaries_by_ids_silent(ids)?;
-    let ocr = storage.get_ocr_text_prefixes_by_screenshot_ids_silent(ids, MINILM_OCR_SNIPPET_CHARS)?;
+    let ocr =
+        storage.get_ocr_text_prefixes_by_screenshot_ids_silent(ids, MINILM_OCR_SNIPPET_CHARS)?;
     let mut indexable = HashMap::with_capacity(summaries.len());
     let mut excluded = HashMap::new();
     for summary in summaries {
@@ -998,11 +998,7 @@ async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, Stri
                 // goes with it.
                 let recorded = match sources.excluded.get(&id) {
                     Some(spec) => storage
-                        .exclude_derived_index_subject(
-                            spec,
-                            EMPTY_SOURCE_CODE,
-                            EMPTY_SOURCE_REASON,
-                        )
+                        .exclude_derived_index_subject(spec, EMPTY_SOURCE_CODE, EMPTY_SOURCE_REASON)
                         .unwrap_or(false),
                     None => false,
                 };

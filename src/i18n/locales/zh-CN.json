@@ -319,6 +319,34 @@
         "run_done": "本次索引了 {{indexed}} 张截图，还有 {{remaining}} 张在等待。",
         "run_skipped": "这次没有开始索引：{{reason}}。"
       },
+      "clip_backend": {
+        "title": "截图画面检索（文搜图）",
+        "label": "使用 Rust 进行文搜图",
+        "description": "主搜索框的自然语言模式：用一句话描述画面内容来找截图，由 Chinese-CLIP 图像模型匹配截图“看起来像什么”。它与上面按文字含义检索的那一项是两种不同的搜索。",
+        "rollback_note": "关闭后，这项检索交回 Python 与 ChromaDB。向量数据保持不变，后台索引也照常运行，因此可随时切换回来。",
+        "diagnostic": "本地诊断",
+        "refresh": "刷新诊断",
+        "last_query": "上次检索由谁完成",
+        "served_rust": "Rust",
+        "served_python": "Python",
+        "served_unknown": "启动以来尚无检索",
+        "indexed": "本地已索引的画面",
+        "backlog": "等待编码的画面",
+        "stalled": "编码失败的画面",
+        "fallbacks": "回退次数",
+        "last_reason": "上次回退原因",
+        "backlog_hint": "画面编码只在电脑空闲且接入电源时进行，因此使用期间截取的画面要等到下一个空闲时段才能被文搜图找到。",
+        "stalled_hint": "这些画面已经用尽编码重试次数，不会再被自动处理。在重建索引之前，它们不会出现在文搜图结果里。",
+        "run_now": "立即编码",
+        "run_now_hint": "编码一张画面比编码一行文字慢得多。如果这台电脑很少空闲或经常用电池，可以在这里手动处理等待中的画面；运行期间会占用处理器，可随时停止。",
+        "run_preparing": "正在编码。第一批还没完成，首次运行需要先加载模型。",
+        "run_progress": "正在编码：已处理 {{processed}} / {{total}} 张，其中 {{indexed}} 张已建立索引。",
+        "run_stop": "停止",
+        "run_stop_pending": "正在停止…",
+        "run_stopping": "正在停止。当前这张画面处理完就会结束。",
+        "run_done": "本次索引了 {{indexed}} 张画面，还有 {{remaining}} 张在等待。",
+        "run_skipped": "本次没有开始索引：{{reason}}。"
+      },
       "onnx": {
         "title": "ONNX 推理 (测试性)",
         "label": "使用 ONNX 模型推理",
@@ -1318,9 +1346,42 @@
       "trigger_ocr_model_repair_notification": "测试 OCR 模型修复通知"
     }
   },
-  "minilmMigration": {
-    "title": "语义索引迁移中",
-    "subtitle": "正在进行数据库迁移。迁移期间应用处于维护模式。",
+  "clipBackfill": {
+    "title": "画面索引补算",
+    "lead": "画面索引迁移已完成，但有 {{count}} 张截图没有可迁移的画面向量。它们不会出现在主搜索框的自然语言搜索结果里，除非重新计算。",
+    "missing": "需要补算的截图",
+    "stalled": "此前索引失败的截图",
+    "estimateLabel": "预计耗时",
+    "estimateUnderAMinute": "不到 1 分钟",
+    "estimateMinutes": "约 {{minutes}} 分钟",
+    "estimateHours": "约 {{hours}} 小时",
+    "estimateHoursMinutes": "约 {{hours}} 小时 {{minutes}} 分钟",
+    "skippedDeleted": "另有 {{count}} 条向量因对应截图已被删除而跳过，这是正常的，无需处理。",
+    "failedImports": "有 {{count}} 条向量无法读取，详情见迁移诊断。",
+    "whenItRuns": "补算只在电脑空闲且接入电源时进行，不会打扰你正在做的事。可以随时在“设置 → 高级”里手动加速或停止，也可以之后再改变主意。",
+    "approve": "开始补算",
+    "decline": "暂不补算",
+    "cardPending": "还有 {{count}} 张截图没有画面索引，补算预计需要{{estimate}}。",
+    "cardApproved": "已允许补算，将在空闲时逐步完成。",
+    "cardDeclined": "已选择不补算，这些截图不会出现在文搜图结果里。",
+    "cardApprove": "开始补算",
+    "cardDecline": "取消补算"
+  },
+  "vectorMigration": {
+    "kinds": {
+      "minilm": {
+        "title": "文本索引迁移中",
+        "subtitle": "正在把截图文本的向量迁移到本地 Rust 索引。迁移期间应用处于维护模式。"
+      },
+      "clip": {
+        "title": "画面索引迁移中",
+        "subtitle": "正在把截图画面的向量迁移到本地 Rust 索引。迁移期间应用处于维护模式。"
+      },
+      "unknown": {
+        "title": "正在进行维护",
+        "subtitle": "应用正在执行一项维护任务，完成之前部分功能不可用。"
+      }
+    },
     "eta": "预计剩余时间：{{eta}}",
     "safeWrite": "正在写入磁盘，请勿强制关闭应用。",
     "waitingForAuth": "会话已过期。请完成 Windows Hello 认证，迁移随后会自动继续。",

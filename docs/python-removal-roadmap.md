@@ -5,9 +5,11 @@ data, without breaking OCR or search, and without letting background machine
 learning interfere with whatever the user has in the foreground.
 
 **Current milestone.** Milestone 2, targeted at v0.8.4 Beta. Steps 1-5 of the
-M2.5 cutover sequence are merged; step 6 is implemented on
-`m2/reranker-shadow-cutover` and waiting on an on-machine soak and two measured
-gate numbers.
+M2.5 cutover sequence are merged. Step 6 is implemented on
+`m2/reranker-shadow-cutover`, and steps 7-9 — the whole CLIP sequence — on
+`m2/clip-vector-migration`. Both are waiting on an on-machine soak; step 9
+additionally skipped its shadow phase, which section 6 records as an outstanding
+gate item rather than a closed one.
 
 ---
 
@@ -48,7 +50,7 @@ again.
 | Milestone | Target | Status | What it is waiting on |
 | --- | --- | --- | --- |
 | M1 — Vector semantics and migration baseline | folded into M2 | **DONE** | — |
-| M2 — Rust ONNX inference and per-kind index ownership | v0.8.4 Beta | **IN PROGRESS** — 5 of 10 cutover steps merged, step 6 implemented and soaking | step 6's measured latency and reranked-ordering numbers, then CLIP (steps 7-9), then BGE shadow (step 10) |
+| M2 — Rust ONNX inference and per-kind index ownership | v0.8.4 Beta | **IN PROGRESS** — 5 of 10 cutover steps merged; steps 6 and 7-9 implemented and soaking | step 6's reranked-ordering numbers; steps 7-9's end-to-end retrieval comparison and a migration run against a real collection; then BGE shadow (step 10) |
 | M3 — Smart Cluster worker in Rust | post-v0.8.4 Beta | **PLANNED** (scope reduced) | M2 step 6 |
 | M4 — Task clustering decision | post-M3 | **PLANNED** | M2 (embedding similarity) |
 | M5 — Classification and PII resolution | post-M4 | **PLANNED** | M2-M4 |
@@ -120,9 +122,9 @@ Specifics worth knowing before touching this area:
 ### What Python still owns today
 
 - **Chinese-CLIP** image and text inference, and the Chroma `screenshots`
-  collection. `search_nl` still forwards to Python (`monitor.rs:600`), and the
-  MCP tool list drops `search_nl` when the Python monitor is not running
-  (`mcp_server.rs:435`, `commands/mcp.rs`).
+  collection. `search_nl` still has the Python path (`monitor.rs:600`), while
+  the MCP tool list advertises it statically and leaves backend selection and
+  temporary unavailability to call time (`mcp_server.rs`, `commands/mcp.rs`).
 - **bge-reranker** inference (`monitor/reranker.py`), which serves both Smart
   Cluster calibration and the Smart Cluster scoring worker. On `main`. The step-6
   branch moves both to Rust and keeps this path as the `rerank_runtime = python`
@@ -358,6 +360,7 @@ Rust inference bridge.
 | M2.3 | Rust-owned derived embedding storage and ledger | **DONE** 2026-07-21 |
 | M2.4 | Sentinel-triggered MiniLM migration | **DONE** 2026-07-24 |
 | M2.5 | Dual-write, shadow-query, then cut over by capability | **IN PROGRESS** — 5 of 10 steps merged, step 6 soaking |
+| M2.6 | Bounded-memory ANN reads from the `.cpdvec` sidecar | **PLANNED** — the persistence shell exists; no query path consumes ANN data yet |
 
 #### M2.1 — Freeze the Python behavior contract — DONE
 
@@ -422,9 +425,13 @@ Landed on `m2/derived-vector-store`. Two layers, by design:
 1. **A SQLite `derived_embeddings` cache** holding the migrated or generated
    float32 vector plus `index_kind`, `subject_key`, dimensions, model id and
    revision, embedding version, source fingerprint, and timestamps.
-2. **A generation-versioned ANN sidecar** used purely as a rebuildable
-   acceleration layer, written via temporary file, fsync, and atomic replace, and
-   validated by header and checksum. It is never authoritative.
+2. **A generation-versioned `.cpdvec` sidecar container** used purely as a
+   rebuildable acceleration layer. It is written through a temporary file,
+   fsync, and atomic replace, then validated by its header and checksum. The
+   current payload is a flat, paged exact-scan snapshot; it is not yet an ANN
+   graph and no production query opens it. M2.6 is the follow-up that will add
+   an ANN layout and reader without changing the ownership or publication
+   contract. The sidecar is never authoritative.
 
 Persisting derived vectors is what avoids an expensive CLIP re-encode during
 migration, and it gives ledger and vector writes one transactional boundary.
@@ -459,9 +466,9 @@ explicit and never automatic resurrection.
 - Deletion, model-version invalidation, duplicate image hashes, session lock and
   unlock, and interrupted writes each have tests.
 
-The initial sidecar payload is a flat exact-scan snapshot. SQLite remains
-authoritative, so the payload can be replaced by an ANN layout later without
-changing persistence or generation semantics.
+The initial sidecar payload is deliberately a flat exact-scan snapshot. SQLite
+remains authoritative, so M2.6 can replace the payload and add an ANN reader
+without changing persistence, visibility, or generation semantics.
 
 #### M2.4 — Sentinel-triggered MiniLM migration — DONE 2026-07-24
 
@@ -565,9 +572,9 @@ The cutover sequence, with status:
 | 4 | Cut over the **non-reranked** semantic-text retrieval path | **DONE**, merged |
 | 5 | Rust capture-side MiniLM indexing and retention ownership | **DONE** — merged in PR #150 |
 | 6 | Reranker parity and shadow scoring, then cut over Smart Cluster calibration **and the scoring worker together** | **IMPLEMENTED, SOAKING** — `m2/reranker-shadow-cutover`; latency measured 2026-08-01 (see below), reranked-ordering numbers outstanding |
-| 7 | CLIP vector export and migration | PLANNED |
-| 8 | Rust CLIP image-encoder dual-write for new captures | PLANNED |
-| 9 | Rust CLIP text-query shadow mode, then cut over `search_nl` and MCP capability reporting | PLANNED |
+| 7 | CLIP vector export and migration | **IMPLEMENTED, SOAKING** — `m2/clip-vector-migration` |
+| 8 | Rust CLIP image-encoder dual-write for new captures | **IMPLEMENTED, SOAKING** — same branch |
+| 9 | Rust CLIP text-query shadow mode, then cut over `search_nl` and MCP capability reporting | **IMPLEMENTED, SOAKING** — same branch; **the shadow phase was skipped**, see below |
 | 10 | BGE in the shared Rust runtime, shadow mode only | PLANNED |
 
 Two ordering constraints are load-bearing. **Step 8 precedes step 9:** do not cut
@@ -1204,8 +1211,236 @@ a scheduling change and not a scoring one. The value of four is conservative
 pending the measurement item above; it is the constant to revisit once there is
 a real per-document CPU latency figure to divide the foreground budget by.
 
-##### Configuration surface
+##### Steps 7-9 — the CLIP sequence — IMPLEMENTED, SOAKING
 
+Landed together on `m2/clip-vector-migration`, in the mandated order: migrate
+the existing vectors, take over capture-side encoding, then cut the read path
+over. Steps 8 and 9 are one branch rather than two because the ordering
+constraint between them is a *correctness* rule, not a review convenience — a
+tree in which step 9 is merged and step 8 is not is a tree where visual search
+silently stops covering new screenshots.
+
+**What landed.**
+
+- `migration_support.rs` — the parts of a derived-index migration that do not
+  depend on which index it fills: waiting out a locked vault without losing the
+  run, pausing and exactly restoring the monitor, polling an asynchronous Python
+  snapshot to readiness, decoding a Base64 float32 page, and publishing a
+  generation on a blocking worker. Extracted from `minilm_migration.rs`, which
+  now uses it, so the two migrations cannot drift on the cursor discipline that
+  is the hard part of both.
+- `monitor/collection_export.py` — the same extraction on the Python side. The
+  snapshot registry, the atomically renamed manifest, the four TTLs, and the
+  page payload are now one module that `HotColdManager` and `VectorStore` both
+  delegate to. The MiniLM export tests pass unchanged against it, which is what
+  makes the refactor checkable rather than merely plausible.
+- Storage — `minilm_migration_*` became `derived_migration_*` with an
+  `index_kind` column, renamed in place so the settled MiniLM run rows survive.
+  `derived_index.rs` grew `clip_image_topk`, a CLIP candidate scan, and an
+  orphan scan; `semantic_cache.rs` now holds one resident matrix **per kind**
+  with its own idle clock and hard memory budget, because the two searches are
+  used at different times and are not even the same width. A corpus that exceeds
+  its budget uses a paged exact scan and bounded top-K heap instead of truncating
+  history or retaining an unbounded matrix.
+- `clip_migration.rs` — the sentinel-triggered copy of the Chroma `screenshots`
+  collection into `clip_image`. No inference: existing vectors are float-copied,
+  as the gate requires.
+- `clip_index.rs` — capture-side encoding, the repair scan, the orphan reaper,
+  the Chroma mirror, and a manual run with progress and a stop button.
+- `clip_query.rs` — the Rust `search_nl`, with the `clip_runtime` and
+  `clip_index` rollback levers and the read-only backend diagnostic beside them.
+- `monitor_search_nl` and the MCP `search_nl` tool both route Rust-first through
+  one function, so the agent and the search box cannot end up on different
+  backends.
+
+**Decision 1 — the migration maps ids forward instead of reading them back.**
+`task_vectors` is keyed by `str(screenshot_id)`, so the MiniLM copy recovers its
+subject key by parsing. The CLIP collection is keyed by `md5("memory://" +
+image_hash)` (`vector_store.py::_compute_id`), which is not invertible, and the
+`image_path` metadata that would answer the question is *encrypted at rest*.
+Reading it back would mean decrypting user file paths into an IPC payload to
+recover something SQLite already holds. So Rust lists its own eligible image
+hashes, computes the same MD5 over each, and matches. Nothing sensitive crosses
+the pipe, and a Chroma id no hash reproduces is exactly the definition of an
+orphan — which is the ordinary consequence of deleting a screenshot, so a
+collection with any deletion history finishes `completed_with_errors` and that
+outcome still settles the sentinel.
+
+The MD5 contract is pinned in a test against values produced by CPython's own
+`hashlib`, not against the Rust implementation restated. It is the one place
+where a silent divergence would orphan every row in the collection while looking
+exactly like an empty index.
+
+**Decision 2 — the CLIP index has no retention window, deliberately.**
+`task_vectors` is a rolling ~30-day hot layer, so step 5 gave MiniLM a 30-day
+rule. The `screenshots` collection never expired anything: Python removed a row
+only when the screenshot itself was deleted. Ageing CLIP rows out at 30 days
+would quietly shrink visual search to the last month — a capability change
+wearing a migration's clothes. The only reaper here is for subjects with no live
+screenshot, and it is a safety net rather than a live path, because the M2.3
+delete triggers already remove the row inside the deleting transaction.
+
+**Decision 3 — Rust CLIP runs on CPU, and that is a choice with a reason.**
+`semantic_engine::provider_supports_model` permits DirectML for CLIP; the
+2026-07-20 audit that banned it covered MiniLM and the cross-encoder. It is
+still refused here. Python's CLIP session prefers DirectML
+(`onnx_utils.build_session`), so a migrated collection already contains
+DirectML-produced vectors; adding a second unmeasured provider difference on top
+of that, during the one release where the two must rank comparably, is not a
+trade worth making before somebody runs the five-gate audit on this model.
+Revisiting it is a measurement, not a code change.
+
+**Decision 4 — `clip_runtime` has no `rust_shadow` value.** The configuration
+table below sketched one. Step 4 had already retired MiniLM's for the reason
+that applies here too: a shadow value nobody can enter is a switch that does
+nothing, and the migration-diagnostics rule forbids shipping one. See the
+honesty note at the end of this section for what that costs.
+
+##### Steps 7-9 — measured parity and latency (2026-08-04)
+
+**Numeric parity — passes with three orders of magnitude to spare.** Run through
+the M2.1 harness (`tools/validate_rust_semantic.py --provider cpu`) against the
+installed pinned model files:
+
+| Contract | Measured | Gate |
+| --- | --- | --- |
+| `clip.tokenization.input_ids` / `attention_mask` / `token_type_ids` | exact, 0 mismatches | exact |
+| `clip.text_embeddings` | max abs 2.4e-7, min cosine 1.0 | ≤ 1e-4, ≥ 0.99999 |
+| `clip.image_embeddings` | max abs 3.0e-7, min cosine 1.0 | ≤ 1e-4, ≥ 0.99999 |
+
+This is the half of the step-9 gate that catches a genuine Rust inference bug,
+and it is clean for both towers.
+
+**Latency — measured on a 16-logical-core desktop, CPU provider**
+(`tools/measure_clip_latency.py`, added with this step):
+
+| Quantity | Measured |
+| --- | --- |
+| Cold first image, including the 177 MB model load | 5.51 s |
+| One image at 1280×720 / 1920×1080 / 2560×1440 / 3840×2160 | 0.38 / 0.67 / 1.08 / 2.21 s |
+| Per-image cost at batch 1 / 2 / 4 (1920×1080) | 0.682 / 0.683 / 0.622 s |
+| Query text encode, warm | ~98 ms |
+
+Three of these changed decisions:
+
+**Encode cost scales with the source screenshot, not with the model's input.**
+CLIP resizes everything to 224², so the inference is constant; the 6× spread
+from 720p to 4K is decode and resize. A 4K machine pays three times what a 1080p
+one does for the same corpus, which is worth knowing before reading a backlog
+figure as a duration.
+
+**Batching buys nothing here either.** Flat from batch 1 to 4, the same absence
+of batch parallelism the step-6 cross-encoder measurements found. So
+`ENCODE_CHUNK = 1` costs no throughput — and it is not merely preferred, it is
+forced: a request carries raw RGB against a 32 MiB protocol ceiling
+(`ml_protocol.rs::MAX_ML_IMAGE_BYTES`), which admits five 1080p frames but
+exactly one at 3840×2160. Any fixed chunk above one fails on a large display.
+
+**The query budget was too tight and is now 15 s.** The encode is ~98 ms, but a
+cold model load is ~4.8 s and a query arriving while the capture indexer holds
+the single request slot waits out one image on top of that. The original 8 s
+covered the first and left almost nothing for the second. Falling back does not
+avoid the load — Python's CLIP session loads the same weights — so the budget is
+about bounding the wait, not about finding a faster answer elsewhere.
+
+##### Steps 7-9 — what is **not** proven, stated plainly
+
+The shadow phase step 9 was specified with **was not built**, at the maintainer's
+direction, and the offline parity evidence above does not fully replace it. What
+that leaves outstanding:
+
+1. **End-to-end retrieval agreement against Python is unmeasured.** The numbers
+   above prove the two encoders produce the same vectors. They do not prove that
+   `search_nl` returns the same *page* — that is a property of the retrieval
+   method, the filters, and the pagination, and it is exactly what the retired
+   MiniLM shadow harness measured before step 4. The expected difference here is
+   the same recall-superset shape step 3 accepted: Chroma is approximate (HNSW),
+   the Rust path is an exact cosine scan over the same collection. A
+   Python-top result *absent* from the Rust store would still be a real coverage
+   defect and would still block the cutover; nothing currently measures that.
+2. **The migration has not been run against a real collection.** Every part of
+   it is unit-tested, and the id contract is pinned cross-language, but the
+   number that matters — how many rows of an actual `screenshots` collection map,
+   and how many come back as orphans — needs a populated machine.
+3. **The time-filter bug fix is a real user-visible behaviour change.** Python
+   filters on `metadata["created_at"]`, which nothing ever wrote, so time bounds
+   have silently passed everything for as long as this feature has existed. Rust
+   reads the timestamp from SQLite and the filter works. This wants a release
+   note; it is not a parity gap to be closed.
+4. **CPU-only was chosen without measuring the DirectML alternative** for this
+   model, as decision 3 records.
+
+None of these are reasons the code is wrong. They are the reasons this step is
+**SOAKING** rather than DONE, and they should be settled before the branch is
+called a cutover rather than an implementation.
+
+##### Steps 7-9 — the repair scan, the overlay, and who decides — 2026-08-04
+
+Review of the branch before merge found one defect and two omissions, all in the
+same seam: what happens when the step-7 copy does not deliver.
+
+**The repair scan silently substituted itself for the migration.** `clip_index`
+queued every eligible image with no ledger row, which is indistinguishable in
+SQL from "the copy has not reached this one yet". So a migration that failed
+mid-run dropped the maintenance guard and was answered, within the minute, by
+the idle worker re-encoding the entire history through a vision transformer —
+roughly 0.15 s + 0.25 s per source megapixel per image, so hours to days on a
+real corpus. Nothing logged it, nothing showed it, and the next launch resumed
+the run and cleared `last_error`, so the record of the failure was erased by the
+retry. The outcome was a correct index, eventually, at a cost the migration
+exists precisely to avoid — and in direct conflict with this document's own
+gate, that existing CLIP vectors are float-copied and never routinely
+re-encoded, and with its rule that a rebuild be "explicit, budgeted, and
+idempotent, never automatic resurrection".
+
+The scan now has three scopes. Until the sentinel settles it does not run at
+all: the right answer to an unfinished copy is to let it finish. Once settled it
+sweeps a seven-day window, which is what a missed enqueue looks like. It sweeps
+the whole history only after the user is shown what that would cost and agrees.
+The capture path is untouched in all three, so new screenshots are indexed
+regardless — the ordering constraint between steps 8 and 9 still holds.
+
+**The user is asked, and the numbers are honest.** `get_clip_backfill_offer`
+reports three populations separately, because collapsing them would be
+misleading in both directions: rows skipped because their screenshot was deleted
+(the ordinary result of any deletion history, and nothing to fix), rows that
+genuinely could not be imported, and images that never had a vector to copy.
+Only the third is what a backfill would encode, and the estimate covers only it.
+The estimate is `0.15 s + 0.25 s × source megapixels`, fitted to the four points
+measured above and reproducing all of them within 1.5%; `screenshots.width` and
+`height` make it a real per-machine number rather than a six-fold range. The
+answer is durable in `app_metadata`, cleared when a fresh run starts, and
+reversible from the Settings card.
+
+**The migration had no overlay.** It held the maintenance guard, rejected the
+monitor start/stop/pause/resume commands and paused capture, with nothing on
+screen: `MinilmMigrationOverlay` only ever polled MiniLM. It is now
+`VectorMigrationOverlay` and keys on *maintenance mode* rather than on one
+migration's `running` flag, so the app can no longer sit in maintenance with
+nothing to explain it, including for whatever maintenance task is added next.
+
+**Three smaller corrections in the same area.** `clip_index_stop_now` required
+an unlocked session, where its MiniLM counterpart deliberately does not — and
+the argument is stronger here, since a backfill measured in hours will routinely
+outlive a session lock. `MANUAL_DEADLINE` was removed: a one-hour ceiling on a
+seven-hour job is an undeclared failure, and the bounds that remain are the work
+itself and a stop button that now always works. The foreground-wait budget
+became consecutive rather than cumulative for the same reason. And the four
+CLIP commands were registered in `lib.rs` without policy entries in
+`scripts/security-guards.cjs`, so `npm run test:security` — and therefore
+`test:backend:fast` — failed on the branch as authored.
+
+**Still open, and deliberately not fixed here.**
+`reconcile_derived_migration_scope` deletes every `clip_image` row whose subject
+is not in the run's snapshot. Rows the capture path encoded *after* the snapshot
+was taken are not in it, so a resumed run can delete freshly indexed screenshots,
+which the repair scan then re-encodes. The window is small while a run completes
+in one session and grows to days when a run fails and is retried at the next
+launch. It wants a "written after the snapshot" exemption; it is recorded here
+rather than changed, because it is migration semantics rather than part of this
+fix.
+
+##### Configuration surface
 Enum backends, not ambiguous booleans, because inference and index ownership cut
 over at different times:
 
@@ -1214,8 +1449,17 @@ over at different times:
 | `semantic_runtime` | `python` \| `rust` | `rust` |
 | `semantic_index` | `chroma` \| `dual` \| `rust` | `rust` |
 | `rerank_runtime` | `python` \| `rust` | `rust` (step 6) |
-| `clip_runtime` | `python` \| `rust_shadow` \| `rust` | not yet introduced |
-| `clip_index` | `chroma` \| `dual` \| `rust` | not yet introduced |
+| `clip_runtime` | `python` \| `rust` | `rust` (step 9) |
+| `clip_index` | `chroma` \| `dual` \| `rust` | `rust` (step 9) |
+
+`clip_runtime` ships without the `rust_shadow` value this table used to
+anticipate, for the reason step 4 retired MiniLM's: nothing can enter shadow
+mode, so offering the value would ship a switch that does nothing. It is also
+passed to Python as `CARBONPAPER_CLIP_RUNTIME`, which is what stops the Python
+post-process from encoding every screenshot a second time — the same
+read-once-at-spawn arbitration `CARBONPAPER_RERANK_RUNTIME` uses for the Smart
+Cluster queue, and for the same reason: two encoders on one capture path would
+write conflicting vectors into the one collection they both target.
 
 `rerank_runtime` is one lever for two consumers on purpose. Calibration and the
 background scorer must not be split across backends, so the switch moves the
@@ -1302,7 +1546,7 @@ clustering do not regress: Python BGE remains until its consumer migrates, and
 `task_vectors` and `task_centroids` remain available to the Milestone 4 path.
 
 **Lifecycle.** Embedding migration and rebuild are interruptible and resumable.
-Session lock and unlock, process crash, partial ANN generation, model upgrade,
+Session lock and unlock, process crash, partial `.cpdvec` generation, model upgrade,
 rollback to the previous release, and deletion are all tested without screenshot
 loss or silent vector loss.
 
@@ -1323,6 +1567,119 @@ ship a harness; a production release may not.
 
 **Depends on.** Milestone 1's semantics and decisions, landed and reviewed,
 including the count-level caveats.
+
+#### M2.6 — Bounded-memory ANN reads from the `.cpdvec` sidecar — PLANNED
+
+**Target.** After the M2.5 CLIP read-path soak. It is not a prerequisite for the
+functional Rust cutover while the bounded exact path meets its release budget;
+it is the scaling follow-up before growing histories make linear cold scans an
+accepted product cost.
+
+**Goal.** Keep CLIP's no-retention, full-history corpus without making either
+private heap or cold-query time grow with every screenshot ever captured.
+`clip_image` is the first consumer because it is the unbounded collection;
+`semantic_text` may reuse the reader later, but its roughly 30-day hot layer is
+not the reason this work exists.
+
+**Where the code is.** M2.3 already supplies the durable boundary this work
+needs. `storage/derived_index.rs::publish_derived_index_generation_with_progress`
+writes immutable `.cpdvec` generations and binds each one to `index_kind`,
+`generation`, `data_epoch`, row count, dimensions, model id and revision,
+embedding version, and SHA-256 checksum. Publication uses a temporary file and
+rename, old finalized generations survive until startup cleanup, and SQLite
+remains the owner of every query-visible vector.
+
+What it does **not** supply yet is ANN retrieval. The current `.cpdvec` payload
+is a flat vector snapshot, while `clip_image_topk` and `semantic_text_topk` read
+SQLite through `semantic_cache.rs`; no query opens the sidecar. The immediate
+memory guard is therefore intentionally conservative: `semantic_text` may keep
+at most 32 MiB resident and `clip_image` at most 128 MiB. An index that does not
+fit is still searched completely by a paged exact scan with a bounded top-K
+heap. That preserves coverage and bounds private heap, but its cold-query IO and
+CPU cost still scale linearly with history. The current roughly 52k-row CLIP
+corpus already has about 101 MiB of f32 matrix data before keys and allocator
+overhead; larger histories therefore take the streaming path by policy. M2.6
+replaces that scaling path; it does not replace the exact fallback.
+
+**Work.**
+
+1. **Freeze an ANN payload contract inside `.cpdvec`.** Select and pin a mature
+   ANN implementation with cosine or inner-product support, serialized immutable
+   indexes, Windows support, and bounded or memory-mapped reads. Do not hand-roll
+   the nearest-neighbor algorithm. Add the ANN algorithm, implementation and
+   format versions, distance metric, build parameters, and vector encoding to
+   the existing header contract. A file whose kind, generation, `data_epoch`,
+   dimensions, model contract, format version, or checksum does not match is
+   unusable, not "close enough". Keep the payload limited to derived vectors and
+   compact subject keys; do not add decrypted OCR, file paths, or screenshot
+   metadata to the sidecar.
+2. **Build without moving the memory spike into maintenance.** Construct a new
+   generation from a stable, query-visible SQLite snapshot using paged input and
+   an explicit build-memory budget. Building must not require a second complete
+   `Vec<f32>` matrix in private heap. It runs as idle-gated derived maintenance,
+   never on the capture transaction or the first foreground query, and retains
+   the existing temporary-file, sync, verify, rename, and epoch-recheck sequence.
+   If the data epoch changes before publication, discard the build and leave the
+   current reader on exact scan until a fresh generation is ready.
+3. **Use ANN only for candidate generation.** A query opens the current valid
+   generation, asks ANN for an over-fetched candidate set, exact-scores those
+   candidate vectors from the mapped payload or bounded SQLite reads, then
+   applies the existing SQLite visibility check, hydration, similarity floor,
+   filters, and pagination contract. If filtering consumes the candidate set,
+   deepen the ANN search within a fixed request budget; if it still cannot fill
+   the requested page, fall back to the current paged exact scan rather than
+   returning a silently shortened result.
+4. **Keep failure semantics boring.** A missing, stale, partial, corrupt, or
+   model-incompatible sidecar, an unsupported CPU, an ANN reader failure, or a
+   database/data-directory generation change all select exact scan for that
+   query. They never truncate the corpus, trigger CLIP re-encoding, or make the
+   search surface unavailable. Readers pin one immutable generation for the
+   query lifetime; runtime cleanup must not delete a file that may still be
+   mapped or open.
+5. **Bound the reader, not just the Rust containers.** Prefer memory mapping or
+   page-backed access for vector payloads and keep candidate ids, exact-score
+   vectors, and graph scratch space under recorded limits. Virtual mapping size
+   is not the memory gate: measure process private bytes, RSS/working set, page
+   faults, and peak build memory. Do not rebuild full `subjects` and `positions`
+   hash maps beside the ANN graph; use compact integer ids plus a bounded or
+   mapped subject table. The existing 32/128 MiB resident-cache budgets remain
+   the fallback ceilings until measurements justify changing them.
+6. **Roll out behind an internal accelerator flag and read-only diagnostic.**
+   Exact scan remains the oracle during shadow measurement. The diagnostic must
+   name `ann`, `resident_exact`, or `streaming_exact`, the generation and epoch
+   used, and the reason for any fallback. This is migration scaffolding under
+   the section-4 rule: it does not become another permanent settings panel. A
+   measured recall regression disables the accelerator and routes reads through
+   exact scan until the generation or ANN parameters are repaired.
+
+**Release gate.** Before ANN can become the default CLIP reader, record and pass
+all of the following on representative real collections and synthetic 1x, 3x,
+and 10x histories:
+
+- candidate recall and final Recall@K against the paged exact oracle, including
+  sparse process/time filters and near-threshold queries; the implementation PR
+  freezes numeric pass thresholds before the flag can leave shadow mode;
+- warm and cold p50/p95 query latency, first-open time, sidecar rebuild time,
+  sidecar size, private bytes/RSS, page faults, and peak build memory;
+- capture-write p95 and maximum latency while building and publishing a
+  generation, with no foreground database-lock interval that grows with row
+  count;
+- deletion, new capture, model upgrade, format upgrade, data-directory switch,
+  interrupted publication, checksum failure, stale epoch, concurrent queries,
+  and startup cleanup, each proving that the result is either a valid ANN answer
+  or the complete exact fallback;
+- an exact-scan kill switch that remains usable for one released version after
+  ANN becomes default.
+
+**Non-goals.** This work does not introduce a CLIP retention window, make the
+sidecar authoritative, remove `derived_embeddings`, or turn an approximate
+index into a claim of exact ranking. "Full history" continues to mean every
+query-visible CLIP row is part of the indexed corpus and sidecar failure cannot
+remove old history; ANN ranking quality is governed separately by the measured
+recall gate above.
+
+**Depends on.** M2.3 generation safety, the M2.5 CLIP migration and read-path
+soak, and the bounded-memory exact fallback in `semantic_cache.rs`.
 
 ---
 
@@ -1532,9 +1889,9 @@ shape (`components/settings/agent-access/agentAccessConstants.js`).
 - `mcp_get_status` returns `server_version`, `skill.tool_schema_version`, and
   `capabilities`, including `search_nl` availability and the
   `python_monitor_not_running` disabled reason (`commands/mcp.rs`).
-- 12 MCP tools exposed. `search_nl` is dropped from the tool list when its
-  backend is unavailable (`mcp_server.rs:435`), so capability awareness already
-  works.
+- 12 MCP tools exposed. The tool list is a static protocol contract, including
+  `search_nl`; backend readiness remains available through `mcp_get_status` and
+  call-time errors rather than changing `tools/list` (`mcp_server.rs`).
 
 **Remaining.**
 
@@ -1700,23 +2057,37 @@ worker together, because a persisted threshold cannot be produced by one scorer
 and applied by another, and it stores the scorer identity next to every
 threshold so a number from a retired scorer is re-derived rather than trusted.
 
-Three things stand between it and DONE, and none of them can be settled by
-reading code:
+Its foreground latency was measured on 2026-08-01 and its constants revised
+accordingly. What is still outstanding is the **reranked end-to-end ordering
+comparison against Python** — overlap@10 and top-1 agreement return to pass/fail
+status at that step — and the scoring worker's own soak: that a Python-written
+threshold is re-derived on the first pass, that a cluster with no usable examples
+is reported rather than silently skipped and is not re-attempted, and that queue
+depth and the run/stop controls behave through an idle window and an app restart.
 
-1. **Measure the foreground latency of a reranked calibration query** on a real
-   machine, cold and warm, and record it here. The step's gate asks for a
-   measured number, and the CPU-only cross-encoder is the reason it might not
-   be acceptable.
-2. **Compare reranked end-to-end ordering against Python** offline —
-   overlap@10 and top-1 agreement return to pass/fail status at this step.
-3. **Soak the scoring worker**: confirm that a threshold written by the Python
-   scorer is re-derived on the first pass, that a cluster with no usable
-   examples is reported rather than silently skipped and is not re-attempted on
-   the next pass, and that queue depth and the "run now" and "stop" controls
-   behave through an idle window and an app restart.
+**Steps 7-9 are implemented on `m2/clip-vector-migration`.** The CLIP sequence
+landed as one branch, in order, because the constraint between steps 8 and 9 is a
+correctness rule rather than a review convenience. Numeric parity is measured and
+clean for both CLIP towers, and the CPU latency figures behind the chunk size and
+the query budget are recorded in section 6.
 
-**Then the CLIP sequence** — steps 7 through 9, in that order, with the
-new-capture dual-write (step 8) landing before the text-query cutover (step 9).
+Three things stand between that branch and DONE, and the first is the one that
+matters:
+
+1. **Compare `search_nl` end to end against Python** on a populated collection.
+   The encoders agree to 3e-7; that says nothing about whether the two return the
+   same page, which is a property of the retrieval method and the filters. Expect
+   the step-3 recall-superset shape — exact scan versus HNSW — and treat a
+   Python-top result *absent* from the Rust store as blocking.
+2. **Run the step-7 migration against a real `screenshots` collection** and
+   record how many rows map and how many come back as orphans. The id contract is
+   pinned cross-language, but the mapping rate is a fact about a user's data.
+3. **Soak the CLIP indexer**: that a new capture becomes findable after an idle
+   window, that the manual run's progress and stop behave through a session lock
+   and an app restart, and that the Chroma mirror keeps the `clip_runtime =
+   python` rollback usable.
+
+**Then BGE shadow mode** (step 10), which does not remove Python BGE.
 
 **Standing constraints.** No Rust backend becomes authoritative until its Python
 behavior contract, dual-write and migration, shadow-query, lifecycle,
@@ -1759,3 +2130,12 @@ milestone bodies; this is an index so a reversal is not silently re-reversed.
 | 2026-08-02 | **A reranked query reports its phase and can be stopped**, and a stop is not a fallback. Every other reason the Rust path stops serving hands the query to Python; this one must not, because re-running the work somebody just asked to end takes longer than not stopping. The foreground chunk drops from 64 to 8 to give the progress bar and the stop button a usable resolution, which is free because batching was already measured to buy nothing. A query Python answers reports itself as such and hides the button rather than offering one its backend cannot honour. |
 | 2026-08-02 | **The foreground lease binds the two passes a user starts, and they wait rather than end.** Reverses the rule that a manual index run and a forced Smart Cluster drain may ignore it because somebody pressed their button. Consent to run is not consent to the cost: with the foreground chunk at 8 there are fourteen inter-chunk gaps per query, and a MiniLM pass landing in one evicts the cross-encoder for a 570 MB reload, while a drain landing in one takes turns at the single slot and halves the query instead of sharing it. Both now stop submitting while a lease is held and resume when it clears, each under its own wait budget, and both run their cross-encoder calls at `Background` so standing down takes one document rather than one whole rerank call. The forced drain's old `Foreground` priority is what let a plain search wait a commit group — about nineteen seconds — for a five-second budget. |
 | 2026-08-02 | A rerank that **yielded** during Smart Cluster threshold re-derivation is no longer recorded as a retryable failure. It is not a verdict about the cluster — nothing was asked — and treating it as one left that cluster out of `usable` while the batch went on to score against the rest and then delete the queue entries, so the cluster it never reached would never see those screenshots again. The whole resolution now stops instead, which costs the batch it had not started and nothing else. |
+| 2026-08-04 | **Steps 7-9 implemented as one branch**, in the mandated order. The migration maps Chroma ids forward by hashing SQLite's own image hashes rather than decrypting the stored `image_path` back out of the collection, so nothing sensitive crosses the pipe and an unmatched id is by definition an orphan. The MD5 key contract is pinned against CPython's `hashlib`, because a silent divergence there would orphan an entire collection while looking like an empty index. |
+| 2026-08-04 | The CLIP index gets **no retention window**. `task_vectors` is a 30-day hot layer and step 5 gave MiniLM a matching rule; the `screenshots` collection never expired anything, so ageing CLIP rows out would shrink visual search to the last month — a capability change wearing a migration's clothes. The only reaper is for images with no live screenshot, behind the delete triggers that already handle the ordinary path. |
+| 2026-08-04 | Rust CLIP runs **CPU-only**, though `provider_supports_model` would permit DirectML for it. Python's CLIP session prefers DirectML, so a migrated collection already mixes providers; adding a second unmeasured difference during the one release where the two must rank comparably is not worth it before somebody runs the five-gate audit on this model. |
+| 2026-08-04 | `clip_runtime` ships **without a `rust_shadow` value**, and step 9's shadow phase was skipped at the maintainer's direction. Parity is evidenced offline instead — the M2.1 harness measures both CLIP towers at max abs 2.4e-7 and 3.0e-7 against a 1e-4 gate. What that does not cover is end-to-end retrieval agreement, recorded in section 6 as outstanding rather than treated as satisfied by the encoder numbers. |
+| 2026-08-04 | **`ENCODE_CHUNK` is one image because the protocol forces it**, not merely because batching is unhelpful. A request carries raw RGB against a 32 MiB ceiling, which admits five 1080p frames and exactly one at 3840x2160; any fixed chunk above one fails on a large display. Measurement confirmed batching buys nothing anyway (0.682/0.683/0.622 s per image at batch 1/2/4), the same result step 6 found for the cross-encoder. |
+| 2026-08-04 | The migration tables were **renamed `minilm_migration_*` to `derived_migration_*` with an `index_kind` column**, in place, and the snapshot-export mechanics extracted on both sides (`migration_support.rs`, `monitor/collection_export.py`). Two migrations copying from two collections under two cursors would duplicate the one part that is genuinely hard — the transactional page/cursor discipline — and the shipped MiniLM export tests pass unchanged against the shared code, which is what makes the extraction checkable. |
+| 2026-08-04 | The `search_nl` **time filter now works, and that is a bug fix with a release note**. Python filters on `metadata["created_at"]`, which `worker_process.py` never wrote, so start/end bounds have silently passed everything for as long as the feature has existed. Rust reads the timestamp from SQLite. Recorded as a deliberate behaviour change rather than left to look like a parity gap. |
+| 2026-08-04 | MCP `search_nl` availability stops meaning **"is Python running"**. Two backends can answer it now, so the capability flag reports which one would. `tools/list` remains a static contract and always advertises the tool; temporary backend unavailability is reported by status and at call time instead of changing the schema. |
+| 2026-08-06 | The existing `.cpdvec` file is recorded as a **generation-safe flat snapshot, not an ANN reader already in production**. M2.6 adds the ANN payload and query integration for the no-retention CLIP corpus, while SQLite stays authoritative and the bounded paged exact scan remains the complete fallback. |

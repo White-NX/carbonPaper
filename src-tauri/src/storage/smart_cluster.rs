@@ -1024,10 +1024,8 @@ mod tests {
             "anchor_vector_model_id",
             "anchor_vector_model_revision",
         ] {
-            conn.execute_batch(&format!(
-                "ALTER TABLE smart_clusters DROP COLUMN {column}"
-            ))
-            .expect("drop anchor cache column");
+            conn.execute_batch(&format!("ALTER TABLE smart_clusters DROP COLUMN {column}"))
+                .expect("drop anchor cache column");
         }
     }
 

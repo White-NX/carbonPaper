@@ -151,6 +151,47 @@ export async function listMinilmRebuildErrors(offset = 0, limit = 100) {
   return withAuth(() => invoke('list_minilm_rebuild_errors', { offset, limit }));
 }
 
+/**
+ * The same, for the Chinese-CLIP image-vector migration (M2.5 step 7).
+ *
+ * A separate command rather than one parameterised by index kind, because the
+ * two runs have separate state and separate sentinels and only their
+ * orchestration is shared. The response shape is field-compatible with the
+ * MiniLM one, which is what lets a single overlay render either.
+ */
+export async function getClipRebuildStatus() {
+  return invoke('get_clip_rebuild_status');
+}
+
+/** List diagnostics for the CLIP migration run. */
+export async function listClipRebuildErrors(offset = 0, limit = 100) {
+  return withAuth(() => invoke('list_clip_rebuild_errors', { offset, limit }));
+}
+
+/**
+ * What a CLIP backfill would cover and cost.
+ *
+ * Read-only and unauthenticated, so the dialog can poll it while waiting for
+ * the step-7 copy to settle. The counts it returns are deliberately separate:
+ * `skipped_deleted` is the ordinary consequence of having deleted screenshots
+ * and needs no action, while `never_indexed` is what a backfill would encode
+ * and what `estimated_seconds` is an estimate for.
+ */
+export async function getClipBackfillOffer() {
+  return invoke('get_clip_backfill_offer');
+}
+
+/**
+ * Record the answer. `approved` widens the automatic repair scan from recent
+ * screenshots to the whole history; `declined` leaves it narrow. Returns the
+ * refreshed offer.
+ */
+export async function setClipBackfillDecision(decision) {
+  return withAuth(() => invoke('set_clip_backfill_decision', { decision }), {
+    autoPrompt: true,
+  });
+}
+
 /** Whether the app is in global maintenance mode (blocking overlay shown). */
 export async function getMaintenanceStatus() {
   return invoke('get_maintenance_status');

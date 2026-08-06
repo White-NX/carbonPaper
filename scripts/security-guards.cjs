@@ -175,9 +175,15 @@ const COMMAND_TIERS = {
   'semantic_runtime::restart_ml_semantic_worker': 'runtime_public',
   'minilm_index::semantic_index_run_now': 'session_required',
   'minilm_index::semantic_index_stop_now': 'runtime_public',
+  'clip_index::clip_index_run_now': 'session_required',
+  'clip_index::clip_index_stop_now': 'runtime_public',
+  'clip_index::get_clip_backfill_offer': 'public',
+  'clip_index::set_clip_backfill_decision': 'session_required',
   'rerank::nl_rerank_stop_now': 'runtime_public',
   'minilm_migration::get_minilm_rebuild_status': 'public',
   'minilm_migration::list_minilm_rebuild_errors': 'session_required',
+  'clip_migration::get_clip_rebuild_status': 'public',
+  'clip_migration::list_clip_rebuild_errors': 'session_required',
   'maintenance::get_maintenance_status': 'public',
 };
 

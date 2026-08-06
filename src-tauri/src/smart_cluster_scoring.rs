@@ -81,7 +81,6 @@
 //! head — a machine whose idle windows are shorter than a batch takes to score
 //! would redo the same work forever and never reach a newly captured screenshot.
 
-
 use crate::idle::IdleState;
 use crate::ml_protocol::MlSemanticModel;
 use crate::rerank::{
@@ -324,7 +323,9 @@ pub async fn run_smart_cluster_worker(app: AppHandle) {
         let guard = if forced {
             Some(crate::semantic_runtime::BACKGROUND_PASS_GUARD.lock().await)
         } else {
-            crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock().ok()
+            crate::semantic_runtime::BACKGROUND_PASS_GUARD
+                .try_lock()
+                .ok()
         };
         match guard {
             Some(_guard) => {
@@ -801,10 +802,7 @@ async fn run_batch(
             if candidates.is_empty() {
                 continue;
             }
-            let docs: Vec<String> = candidates
-                .iter()
-                .map(|id| documents[id].clone())
-                .collect();
+            let docs: Vec<String> = candidates.iter().map(|id| documents[id].clone()).collect();
             let scores = match crate::rerank::rerank_documents(
                 app,
                 &semantic,
@@ -1088,7 +1086,10 @@ async fn rederive_threshold(
     if examples.is_empty() {
         return Ok(None);
     }
-    let ids: Vec<i64> = examples.iter().map(|example| example.screenshot_id).collect();
+    let ids: Vec<i64> = examples
+        .iter()
+        .map(|example| example.screenshot_id)
+        .collect();
     let documents = load_documents(storage.clone(), &ids).await?;
     let scored: Vec<(bool, String)> = examples
         .iter()
@@ -1379,10 +1380,7 @@ fn cosine(left: &[f32], right: &[f32]) -> f32 {
     if left.len() != right.len() {
         return f32::NEG_INFINITY;
     }
-    left.iter()
-        .zip(right)
-        .map(|(a, b)| a * b)
-        .sum::<f32>()
+    left.iter().zip(right).map(|(a, b)| a * b).sum::<f32>()
 }
 
 async fn record_assignments(
@@ -1637,7 +1635,10 @@ mod tests {
             let batch = batch_size_for(false, clusters) as usize;
             let group = commit_group_size(clusters);
             assert!(group >= 1, "clusters={clusters}");
-            assert!(group < batch, "clusters={clusters} batch={batch} group={group}");
+            assert!(
+                group < batch,
+                "clusters={clusters} batch={batch} group={group}"
+            );
         }
         // Concretely, at the shipped idle batch of 32 with one cluster enabled,
         // a pass commits twice rather than once.
@@ -1746,7 +1747,8 @@ mod tests {
 
         // A verdict recorded under a different scorer is not this build's
         // verdict, so the cluster gets its one attempt here.
-        let other_scorer = legacy_target(2, Some("bge-reranker-v2-m3|r1|uint8|directml".to_string()));
+        let other_scorer =
+            legacy_target(2, Some("bge-reranker-v2-m3|r1|uint8|directml".to_string()));
         assert_ne!(
             other_scorer.rederive_failed_scorer.as_deref(),
             Some(fingerprint.as_str())

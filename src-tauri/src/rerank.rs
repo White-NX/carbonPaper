@@ -24,8 +24,8 @@
 //! from the calibration examples that are already stored alongside it. See
 //! `smart_cluster_scoring.rs`.
 
-use crate::registry_config;
 use crate::ml_protocol::{MlProvider, MlSemanticModel};
+use crate::registry_config;
 use crate::semantic_models::descriptor;
 use crate::semantic_runtime::SemanticRuntimeState;
 use serde::Serialize;
@@ -372,11 +372,7 @@ pub fn reranker_resident(semantic: &Arc<SemanticRuntimeState>) -> bool {
         .is_some_and(|loaded| loaded == descriptor.model_id)
 }
 
-fn reranker_status_payload(
-    available: bool,
-    loaded: bool,
-    model_path: &str,
-) -> serde_json::Value {
+fn reranker_status_payload(available: bool, loaded: bool, model_path: &str) -> serde_json::Value {
     serde_json::json!({
         "status": "success",
         "available": available,
@@ -693,12 +689,10 @@ impl ActiveRerankQuery {
 
 impl Drop for ActiveRerankQuery {
     fn drop(&mut self) {
-        let _ = self.state.holder.compare_exchange(
-            self.serial,
-            0,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        let _ =
+            self.state
+                .holder
+                .compare_exchange(self.serial, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
@@ -829,10 +823,7 @@ pub async fn rerank_documents(
 /// `FOREGROUND_RERANK_CHUNK` documents. Nothing is written on either side of
 /// this, so a stopped query costs only the CPU it had already spent.
 #[tauri::command]
-pub async fn nl_rerank_stop_now(
-    window: tauri::Window,
-    app: AppHandle,
-) -> Result<bool, String> {
+pub async fn nl_rerank_stop_now(window: tauri::Window, app: AppHandle) -> Result<bool, String> {
     crate::commands::check_main_window(&window)?;
     let query = app.state::<Arc<RerankQueryState>>().inner().clone();
     if !query.is_running() {
@@ -947,7 +938,10 @@ mod tests {
         }
         // And the pass stops rather than submitting a chunk it cannot pay for.
         assert_eq!(clock.allowance(start + TOTAL), None);
-        assert_eq!(clock.allowance(start + TOTAL + Duration::from_secs(60)), None);
+        assert_eq!(
+            clock.allowance(start + TOTAL + Duration::from_secs(60)),
+            None
+        );
     }
 
     #[test]
@@ -1094,10 +1088,7 @@ mod tests {
         // The switch is read live on this side and once at startup on Python's,
         // so flipping it back to `rust` under a monitor that was started with
         // `python` must not wake a second drainer. The spawned value wins.
-        assert_eq!(
-            queue_owner_from(true, true),
-            SmartClusterQueueOwner::Python
-        );
+        assert_eq!(queue_owner_from(true, true), SmartClusterQueueOwner::Python);
         assert_eq!(
             queue_owner_from(false, true),
             SmartClusterQueueOwner::Python

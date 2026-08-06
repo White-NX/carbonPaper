@@ -99,6 +99,21 @@ pub fn semantic_index_backend() -> String {
     )
 }
 
+/// Whether `value` names a selectable semantic inference backend.
+///
+/// Exposed for the same reason as its CLIP counterpart in
+/// `clip_query.rs::is_selectable_clip_runtime`: the settings command validates
+/// against this list instead of maintaining a second copy that can silently
+/// fall behind it.
+pub fn is_selectable_semantic_runtime(value: &str) -> bool {
+    RUNTIME_BACKENDS.contains(&value)
+}
+
+/// Whether `value` names a selectable semantic index owner.
+pub fn is_selectable_semantic_index(value: &str) -> bool {
+    INDEX_BACKENDS.contains(&value)
+}
+
 fn normalize_enum(value: Option<String>, allowed: &[&str], default: &str) -> String {
     match value {
         Some(value) if allowed.contains(&value.as_str()) => value,
@@ -177,7 +192,10 @@ fn migration_settled(storage: &StorageState) -> bool {
         return true;
     }
     let settled = storage
-        .is_minilm_auto_migration_done(crate::minilm_migration::MINILM_VECTOR_SPACE_REVISION)
+        .is_auto_migration_done(
+            DerivedIndexKind::SemanticText,
+            crate::minilm_migration::MINILM_VECTOR_SPACE_REVISION,
+        )
         // A database that cannot be read cannot vouch for its own completeness.
         .unwrap_or(false);
     if settled {
@@ -479,8 +497,12 @@ async fn run_rust_reranked_nl_query(
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
             crate::rerank::build_rerank_document(
-                row.get("process_name").and_then(|v| v.as_str()).unwrap_or(""),
-                row.get("window_title").and_then(|v| v.as_str()).unwrap_or(""),
+                row.get("process_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                row.get("window_title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
                 ocr.get(&id).map(String::as_str).unwrap_or(""),
             )
         })
