@@ -6,6 +6,7 @@
 mod analysis;
 mod autostart;
 mod capture;
+mod classification_runtime;
 mod clip_index;
 mod clip_migration;
 mod clip_query;
@@ -1025,6 +1026,10 @@ pub fn run() {
                 } else {
                     tracing::error!("Storage initialization deferred: public key unavailable");
                 }
+
+                // Apply preference migrations before any monitor can spawn a
+                // worker that reads the unified DirectML setting.
+                commands::utility::migrate_dml_config();
 
                 if registry_config::get_bool("game_mode_enabled").unwrap_or(false) {
                     tracing::info!("Restoring game mode monitor on startup");

@@ -81,6 +81,7 @@ READ_RETRY_COMMANDS = {
     'get_auth_status',
     'get_temp_image',
     'screenshot_exists',
+    'bge_embed_texts',
 }
 
 IDEMPOTENT_RETRY_COMMANDS = {
@@ -742,6 +743,34 @@ class StorageClient:
             request['category_confidence'] = float(category_confidence)
         response = self._send_request(request)
         return response.get('status') == 'success'
+
+    def embed_bge_texts(self, texts: List[str]) -> Dict[str, Any]:
+        """Run BGE text embedding in the shared Rust semantic worker."""
+        response = self._send_request(
+            {
+                'command': 'bge_embed_texts',
+                'texts': [str(text) for text in texts],
+            },
+            timeout=150,
+        )
+        if response.get('status') == 'success':
+            data = response.get('data')
+            if isinstance(data, dict):
+                return data
+        raise RuntimeError(response.get('error', 'Rust BGE inference failed'))
+
+    def record_classification_python_fallback(self, error: str) -> None:
+        """Best-effort diagnostic after Python serves a failed Rust request."""
+        self._send_request({
+            'command': 'classification_record_python_fallback',
+            'error': str(error),
+        })
+
+    def record_classification_python_inference(self) -> None:
+        """Record that the explicit Python rollback served an inference."""
+        self._send_request({
+            'command': 'classification_record_python_inference',
+        })
 
     # ---- Smart Cluster reverse IPC --------------------------------------
 

@@ -574,7 +574,7 @@ async fn handle_client(
                 }
             }
         } else {
-            let response = process_request(&req, &storage, &app_handle);
+            let response = process_request(&req, &storage, &app_handle).await;
 
             // 发送响应
             let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
@@ -594,7 +594,7 @@ async fn handle_client(
 }
 
 /// 处理存储请求
-fn process_request(
+async fn process_request(
     req: &serde_json::Value,
     storage: &StorageState,
     app_handle: &tauri::AppHandle,
@@ -608,6 +608,44 @@ fn process_request(
     }
 
     let response = match command {
+        "bge_embed_texts" => {
+            let texts = match req.get("texts").and_then(|value| value.as_array()) {
+                Some(values) => {
+                    let mut texts = Vec::with_capacity(values.len());
+                    for (index, value) in values.iter().enumerate() {
+                        let Some(text) = value.as_str() else {
+                            return StorageResponse::error(&format!(
+                                "texts[{index}] must be a string"
+                            ));
+                        };
+                        texts.push(text.to_string());
+                    }
+                    texts
+                }
+                None => return StorageResponse::error("texts must be an array"),
+            };
+            match crate::classification_runtime::embed_bge_texts(app_handle.clone(), texts).await {
+                Ok(result) => StorageResponse::success(
+                    serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
+                ),
+                Err(error) => StorageResponse::error(&error),
+            }
+        }
+
+        "classification_record_python_fallback" => {
+            let error = req
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Rust BGE inference was unavailable");
+            crate::classification_runtime::record_python_fallback(error);
+            StorageResponse::success(serde_json::json!({ "recorded": true }))
+        }
+
+        "classification_record_python_inference" => {
+            crate::classification_runtime::record_python_inference();
+            StorageResponse::success(serde_json::json!({ "recorded": true }))
+        }
+
         "save_screenshot" => {
             // 解析保存截图请求
             let request = match serde_json::from_value::<SaveScreenshotRequest>(req.clone()) {
@@ -1730,7 +1768,7 @@ async fn process_nmh_request(
                         let ocr_guard = ocr_slot.into_task_guard(screenshot_id);
                         tokio::spawn(async move {
                             let _ocr_guard = ocr_guard;
-                            let route = crate::capture::OcrRouteConfig::from_registry();
+                            let route = crate::capture::OcrRouteConfig::from_app(&app_clone);
                             let result = process_extension_ocr(
                                 &app_clone,
                                 &storage_arc,
@@ -2042,8 +2080,8 @@ async fn process_extension_ocr(
     timestamp_ms: i64,
     route: crate::capture::OcrRouteConfig,
 ) -> Result<(), String> {
-    let provider = if route.use_directml_beta {
-        "directml_beta"
+    let provider = if route.use_directml {
+        "directml"
     } else {
         "cpu"
     };

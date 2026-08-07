@@ -27,6 +27,16 @@ from typing import Tuple, List, Dict, Optional, Any
 
 logger = logging.getLogger(__name__)
 
+_RUST_SCHEDULING_YIELDS = (
+    "foreground_busy:",
+    "background_busy:",
+)
+
+
+def _is_rust_scheduling_yield(error: Exception) -> bool:
+    message = str(error)
+    return any(marker in message for marker in _RUST_SCHEDULING_YIELDS)
+
 # ---------------------------------------------------------------------------
 # Weight scheme constants
 # ---------------------------------------------------------------------------
@@ -479,6 +489,9 @@ class TextEmbedder:
     _model = None
     _tokenizer = None
     _is_onnx = False
+    _initialized = False
+    _selected_runtime = None
+    _last_backend = None
     _lock = threading.Lock()
 
     def __new__(cls):
@@ -488,61 +501,143 @@ class TextEmbedder:
 
     def initialize(self):
         """Load model & tokenizer (lazy, called once)."""
-        if self._model is not None:
+        if self._initialized:
             return
 
         with self._lock:
-            if self._model is not None:
+            if self._initialized:
                 return
 
-            model_path = os.environ.get("BGE_MODEL_PATH")
-            if not model_path:
-                model_path = os.path.join(
-                    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                    "carbonPaper",
-                    "models",
-                    "bge-small-zh-v1.5",
+            runtime = os.environ.get(
+                "CARBONPAPER_CLASSIFICATION_RUNTIME", "rust"
+            ).strip().lower()
+            self._selected_runtime = runtime if runtime in ("rust", "python") else "rust"
+            if self._selected_runtime == "rust":
+                logger.info(
+                    "BGE-small-zh-v1.5 classification inference routed to Rust"
                 )
+                self._initialized = True
+                return
 
-            from onnx_utils import is_onnx_testing_enabled, get_onnx_model_path, create_onnx_session
+            self._initialize_python_model()
+            self._initialized = True
 
-            if is_onnx_testing_enabled():
-                primary_onnx_path = os.path.join(
-                    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                    "CarbonPaper",
-                    "models-onnx",
-                    "bge-small-zh-v1.5",
-                )
-                if not os.environ.get("BGE_MODEL_PATH") and (
-                    get_onnx_model_path(primary_onnx_path, "model_int8.onnx")
-                    or get_onnx_model_path(primary_onnx_path, os.path.join("onnx", "model_quantized.onnx"))
-                ):
-                    model_path = primary_onnx_path
-                onnx_file = get_onnx_model_path(model_path, "model_int8.onnx") or get_onnx_model_path(model_path, os.path.join("onnx", "model_quantized.onnx"))
-                if onnx_file:
-                    from logging_config import log_model_loading
-                    log_model_loading("BGE-small-zh-v1.5 (ONNX)")
-                    logger.info("Loading BGE-small-zh-v1.5 from ONNX: %s ...", onnx_file)
-                    from numpy_tokenizer import NumpyTokenizer
-                    self._tokenizer = NumpyTokenizer(model_path)
-                    self._model = create_onnx_session(onnx_file)
-                    self._is_onnx = True
-                    logger.info("BGE-small-zh-v1.5 loaded successfully via ONNX")
-                    return
+    def _initialize_python_model(self):
+        """Load the legacy local runtime for explicit rollback or fallback."""
+        if self._model is not None:
+            return
 
-            from transformers import AutoTokenizer, AutoModel
-            from logging_config import log_model_loading
-            log_model_loading("BGE-small-zh-v1.5")
-            logger.info("Loading BGE-small-zh-v1.5 from %s ...", model_path)
-            self._tokenizer = AutoTokenizer.from_pretrained(model_path)
-            self._model = AutoModel.from_pretrained(model_path)
-            self._model.eval()
-            self._is_onnx = False
-            logger.info("BGE-small-zh-v1.5 loaded successfully (device=%s)", self._model.device)
+        model_path = os.environ.get("BGE_MODEL_PATH")
+        if not model_path:
+            model_path = os.path.join(
+                os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                "carbonPaper",
+                "models",
+                "bge-small-zh-v1.5",
+            )
+
+        from onnx_utils import is_onnx_testing_enabled, get_onnx_model_path, create_onnx_session
+
+        if is_onnx_testing_enabled():
+            primary_onnx_path = os.path.join(
+                os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                "CarbonPaper",
+                "models-onnx",
+                "bge-small-zh-v1.5",
+            )
+            if not os.environ.get("BGE_MODEL_PATH") and (
+                get_onnx_model_path(primary_onnx_path, "model_int8.onnx")
+                or get_onnx_model_path(primary_onnx_path, os.path.join("onnx", "model_quantized.onnx"))
+            ):
+                model_path = primary_onnx_path
+            onnx_file = get_onnx_model_path(model_path, "model_int8.onnx") or get_onnx_model_path(model_path, os.path.join("onnx", "model_quantized.onnx"))
+            if onnx_file:
+                from logging_config import log_model_loading
+                log_model_loading("BGE-small-zh-v1.5 (ONNX)")
+                logger.info("Loading BGE-small-zh-v1.5 from ONNX: %s ...", onnx_file)
+                from numpy_tokenizer import NumpyTokenizer
+                self._tokenizer = NumpyTokenizer(model_path)
+                self._model = create_onnx_session(onnx_file)
+                self._is_onnx = True
+                logger.info("BGE-small-zh-v1.5 loaded successfully via ONNX")
+                return
+
+        from transformers import AutoTokenizer, AutoModel
+        from logging_config import log_model_loading
+        log_model_loading("BGE-small-zh-v1.5")
+        logger.info("Loading BGE-small-zh-v1.5 from %s ...", model_path)
+        self._tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self._model = AutoModel.from_pretrained(model_path)
+        self._model.eval()
+        self._is_onnx = False
+        logger.info("BGE-small-zh-v1.5 loaded successfully (device=%s)", self._model.device)
 
     def encode(self, texts: List[str]) -> np.ndarray:
         """Batch-encode texts; returns (N, dim) L2-normalised numpy array."""
         self.initialize()
+
+        if self._selected_runtime == "rust":
+            try:
+                result = self._encode_rust(texts)
+                self._last_backend = "rust"
+                return result
+            except Exception as exc:
+                # A foreground query deliberately outranks background
+                # classification. Do not answer that scheduling decision by
+                # loading the same model in Python and competing anyway.
+                if _is_rust_scheduling_yield(exc):
+                    raise
+                logger.warning(
+                    "Rust BGE inference failed; falling back to Python for this request: %s",
+                    exc,
+                )
+                with self._lock:
+                    self._initialize_python_model()
+                result = self._encode_python(texts)
+                self._last_backend = "python"
+                try:
+                    from storage_client import get_storage_client
+                    storage = get_storage_client()
+                    if storage:
+                        storage.record_classification_python_fallback(str(exc))
+                except Exception as diagnostic_exc:
+                    logger.debug(
+                        "Failed to record BGE Python fallback: %s", diagnostic_exc
+                    )
+                return result
+
+        result = self._encode_python(texts)
+        self._last_backend = "python"
+        try:
+            from storage_client import get_storage_client
+            storage = get_storage_client()
+            if storage:
+                storage.record_classification_python_inference()
+        except Exception as diagnostic_exc:
+            logger.debug(
+                "Failed to record Python BGE inference: %s", diagnostic_exc
+            )
+        return result
+
+    @staticmethod
+    def _encode_rust(texts: List[str]) -> np.ndarray:
+        from storage_client import get_storage_client
+
+        storage = get_storage_client()
+        if not storage:
+            raise RuntimeError("Rust storage client is unavailable")
+        response = storage.embed_bge_texts(texts)
+        vectors = np.asarray(response.get("vectors"), dtype=np.float32)
+        dimensions = int(response.get("dimensions") or 0)
+        if vectors.ndim != 2 or vectors.shape != (len(texts), dimensions):
+            raise RuntimeError(
+                f"Rust BGE returned shape {vectors.shape}, expected ({len(texts)}, {dimensions})"
+            )
+        return vectors
+
+    def _encode_python(self, texts: List[str]) -> np.ndarray:
+        if self._model is None or self._tokenizer is None:
+            raise RuntimeError("Python BGE runtime is not initialised")
 
         if self._is_onnx:
             encoded = self._tokenizer(

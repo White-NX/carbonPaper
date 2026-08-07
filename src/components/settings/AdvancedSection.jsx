@@ -4,7 +4,7 @@ import AdvancedWarning from './advanced/AdvancedWarning';
 import ClusteringTechnicalCard from './advanced/ClusteringTechnicalCard';
 import CpuLimitCard from './advanced/CpuLimitCard';
 import DatabaseMaintenanceCard from './advanced/DatabaseMaintenanceCard';
-import { ClipBackendCard, DmlAccelerationCard, OcrEngineCard, OnnxRuntimeCard, SemanticBackendCard } from './advanced/InferenceCards';
+import { ClassificationBackendCard, ClipBackendCard, DmlAccelerationCard, OcrEngineCard, OnnxRuntimeCard, SemanticBackendCard } from './advanced/InferenceCards';
 import NetworkAccessCard from './advanced/NetworkAccessCard';
 import OcrQueueCard from './advanced/OcrQueueCard';
 import { useAdvancedSectionController } from './useAdvancedSectionController';
@@ -20,6 +20,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     cpuChanged,
     dmlChanged,
     onnxChanged,
+    classificationRuntimeChanged,
     gpus,
     gpuLoading,
     vacuumRunning,
@@ -35,6 +36,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     clearCpuChanged,
     clearDmlChanged,
     clearOnnxChanged,
+    clearClassificationRuntimeChanged,
     handleToggle,
     handleCpuPercentChange,
     handleOcrTimeoutDraftChange,
@@ -56,6 +58,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     clipBackfillBusy,
     handleClipBackfillDecision,
     handleToggleRustClipIndex,
+    handleToggleRustClassification,
     handleRunClipIndexNow,
     handleStopClipIndex,
     semanticIndexProgress,
@@ -129,6 +132,16 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         onToggle={handleToggle}
         onRestartMonitor={onRestartMonitor}
         onClearChanged={clearOnnxChanged}
+      />
+
+      <ClassificationBackendCard
+        config={config}
+        status={semanticStatus}
+        monitorStatus={monitorStatus}
+        runtimeChanged={classificationRuntimeChanged}
+        onToggleRust={handleToggleRustClassification}
+        onRestartMonitor={onRestartMonitor}
+        onClearChanged={clearClassificationRuntimeChanged}
       />
 
       <SemanticBackendCard

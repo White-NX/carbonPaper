@@ -169,6 +169,11 @@ const BACKEND_SELECTIONS: &[BackendSelection] = &[
         read: crate::clip_query::clip_index_backend,
         accepts: crate::clip_query::is_selectable_clip_index,
     },
+    BackendSelection {
+        key: "classification_runtime",
+        read: crate::classification_runtime::classification_runtime,
+        accepts: crate::classification_runtime::is_selectable_classification_runtime,
+    },
 ];
 
 /// Returns advanced runtime configuration as a JSON object.
@@ -180,7 +185,6 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let cpu_limit_enabled = registry_config::get_bool("cpu_limit_enabled").unwrap_or(true);
     let cpu_limit_percent = registry_config::get_u32("cpu_limit_percent").unwrap_or(10);
     let ocr_timeout_secs = registry_config::get_u32("ocr_timeout_secs").unwrap_or(120);
-    let rust_ocr_dml_beta = registry_config::get_bool("rust_ocr_dml_beta").unwrap_or(false);
     let use_dml = registry_config::get_bool("use_dml").unwrap_or(false);
     let dml_device_id = registry_config::get_u32("dml_device_id").unwrap_or(0);
     let game_mode_enabled = registry_config::get_bool("game_mode_enabled").unwrap_or(true);
@@ -199,7 +203,6 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "cpu_limit_enabled": cpu_limit_enabled,
         "cpu_limit_percent": cpu_limit_percent,
         "ocr_timeout_secs": ocr_timeout_secs,
-        "rust_ocr_dml_beta": rust_ocr_dml_beta,
         "use_dml": use_dml,
         "dml_device_id": dml_device_id,
         "game_mode_enabled": game_mode_enabled,
@@ -246,12 +249,6 @@ pub fn set_advanced_config(
     if let Some(v) = config.get("ocr_timeout_secs").and_then(|v| v.as_u64()) {
         let clamped = (v as u32).clamp(30, 600);
         registry_config::set_u32("ocr_timeout_secs", clamped)?;
-    }
-    if let Some(v) = config.get("rust_ocr_dml_beta").and_then(|v| v.as_bool()) {
-        // Temporary migration setting. It intentionally does not mirror the
-        // existing Python DML preference and will be removed when the Rust
-        // runtime adopts the unified application DML configuration.
-        registry_config::set_bool("rust_ocr_dml_beta", v)?;
     }
     if let Some(v) = config.get("use_dml").and_then(|v| v.as_bool()) {
         registry_config::set_bool("use_dml", v)?;
@@ -437,6 +434,48 @@ pub fn set_extension_enhancement(
 ) -> Result<(), String> {
     crate::commands::check_auth_required(&credential_state)?;
     registry_config::set_bool("extension_enhanced_global", enabled)
+}
+
+/// One-time migration for the retired Rust OCR DirectML toggle.
+///
+/// The beta toggle was a separate preference while the Rust OCR worker was
+/// being brought online. Its value is carried into `use_dml` only when the
+/// unified preference has never been written; an explicit existing value wins.
+/// The old registry value is removed after a successful migration so it cannot
+/// reappear as a second source of truth.
+pub fn migrate_dml_config() {
+    const LEGACY_KEY: &str = "rust_ocr_dml_beta";
+    let Some(legacy) = registry_config::get_bool(LEGACY_KEY) else {
+        return;
+    };
+
+    let current = registry_config::get_bool("use_dml");
+    if current.is_none() {
+        if let Err(error) =
+            registry_config::set_bool("use_dml", migrated_dml_value(current, legacy))
+        {
+            tracing::warn!(
+                "Failed to migrate legacy Rust OCR DirectML preference: {}",
+                error
+            );
+            return;
+        }
+    }
+
+    match registry_config::delete_value(LEGACY_KEY) {
+        Ok(()) => tracing::info!(
+            "Migrated legacy Rust OCR DirectML preference into use_dml (legacy={})",
+            legacy
+        ),
+        Err(error) => tracing::warn!(
+            "Migrated use_dml but could not remove legacy Rust OCR DirectML preference: {}",
+            error
+        ),
+    }
+}
+
+fn migrated_dml_value(current: Option<bool>, legacy: bool) -> bool {
+    current.unwrap_or(legacy)
 }
 
 /// One-time migration: the per-browser enhancement toggles
@@ -687,7 +726,15 @@ pub fn open_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{migrated_enhancement_value, BACKEND_SELECTIONS};
+    use super::{migrated_dml_value, migrated_enhancement_value, BACKEND_SELECTIONS};
+
+    #[test]
+    fn dml_migration_preserves_an_explicit_unified_preference() {
+        assert!(migrated_dml_value(None, true));
+        assert!(!migrated_dml_value(None, false));
+        assert!(migrated_dml_value(Some(true), false));
+        assert!(!migrated_dml_value(Some(false), true));
+    }
 
     #[test]
     fn test_migrated_enhancement_value() {
@@ -709,6 +756,7 @@ mod tests {
             "semantic_index",
             "clip_runtime",
             "clip_index",
+            "classification_runtime",
         ] {
             assert!(
                 BACKEND_SELECTIONS

@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 import monitor.config as config
@@ -40,6 +42,14 @@ class DummyClassifier:
         return "Development", 0.87654
 
 
+class YieldingClassifier:
+    def __init__(self, error):
+        self.error = error
+
+    def classify(self, **_kwargs):
+        raise RuntimeError(self.error)
+
+
 class DummyStorageClient:
     def __init__(self):
         self.updates = []
@@ -60,6 +70,24 @@ class DummyStorageClient:
 
     def update_screenshot_category(self, screenshot_id, category, category_confidence=None):
         self.updates.append((screenshot_id, category, category_confidence))
+        return True
+
+
+class LifecycleStorageClient(DummyStorageClient):
+    def __init__(self):
+        super().__init__()
+        self.postprocess_statuses = []
+        self.postprocess_retries = []
+        self.pending = threading.Event()
+
+    def set_ocr_postprocess_status(self, screenshot_id, status, error=None):
+        self.postprocess_statuses.append((screenshot_id, status, error))
+        if status == "pending":
+            self.pending.set()
+        return True
+
+    def record_ocr_postprocess_retry(self, screenshot_id, error):
+        self.postprocess_retries.append((screenshot_id, error))
         return True
 
 
@@ -104,6 +132,49 @@ def test_ocr_postprocess_updates_category_async_path(monkeypatch):
 
     assert classifier.calls == [("Editor", "async classification text", "code.exe")]
     assert storage.updates == [(42, "Development", 0.8765)]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "foreground_busy: reranked query active",
+        "background_busy: CLIP batch active",
+    ],
+)
+def test_classification_scheduling_yield_returns_persistent_job_to_pending(
+    monkeypatch, reason
+):
+    storage = LifecycleStorageClient()
+    queue = OcrPostprocessQueue(
+        DummyOcrWorker(), YieldingClassifier(reason), maxsize=1
+    )
+    monkeypatch.setattr(config, "CLASSIFICATION_ENABLED", True)
+    monkeypatch.setattr("storage_client.get_storage_client", lambda: storage)
+
+    queue.start()
+    try:
+        assert queue.enqueue(
+            {
+                "screenshot_id": 43,
+                "window_title": "Editor",
+                "process_name": "code.exe",
+                "ocr_text": "deferred classification text",
+                "image_bytes": b"",
+                "_persistent_postprocess": True,
+            }
+        )
+        assert storage.pending.wait(timeout=2.0)
+    finally:
+        queue.stop()
+
+    assert storage.postprocess_statuses == [
+        (43, "processing", None),
+        (43, "pending", reason),
+    ]
+    assert storage.postprocess_retries == []
+    assert queue.processed == 0
+    assert queue.failed == 0
+    assert queue.deferred == 1
 
 
 def test_ocr_service_loads_python_engine_only_on_first_inference(monkeypatch):

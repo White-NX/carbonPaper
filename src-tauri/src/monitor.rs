@@ -108,6 +108,10 @@ pub struct MonitorState {
     /// Read this through [`MonitorState::python_owns_clip_encoding`] rather
     /// than directly, for the reason that method records.
     python_clip_encoder: AtomicBool,
+    /// Classification runtime handed to the live Python monitor at spawn.
+    /// Unlike the registry selection, this value changes only with the child
+    /// process lifecycle.
+    active_classification_runtime: Mutex<Option<String>>,
     /// Prevents the monitor from restarting during migration tasks
     pub migration_lock: AtomicBool,
     recovery: Mutex<MonitorRecoveryState>,
@@ -136,6 +140,7 @@ impl MonitorState {
             stopping: AtomicBool::new(false),
             python_smart_cluster_worker: AtomicBool::new(false),
             python_clip_encoder: AtomicBool::new(false),
+            active_classification_runtime: Mutex::new(None),
             migration_lock: AtomicBool::new(false),
             recovery: Mutex::new(MonitorRecoveryState::default()),
             python_ipc_client: AsyncMutex::new(None),
@@ -211,6 +216,47 @@ impl MonitorState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
+    }
+
+    pub fn set_active_classification_runtime(&self, runtime: Option<String>) {
+        let mut active = self
+            .active_classification_runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *active = runtime;
+    }
+
+    /// Runtime selected by the environment of the currently live monitor.
+    pub fn active_classification_runtime(&self) -> Option<String> {
+        let running = self
+            .process
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some();
+        if !running {
+            return None;
+        }
+        self.active_classification_runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Whether game mode currently prevents GPU inference.
+    ///
+    /// The two flags have different lifetimes: the ordinary suppression is
+    /// cleared when GPU pressure falls, while the permanent flag lasts until
+    /// game mode (or the application) is restarted. Callers that choose a
+    /// provider must observe both flags so a Rust worker cannot bypass the
+    /// Python monitor's game-mode policy.
+    pub fn is_dml_suppressed(&self) -> bool {
+        self.game_mode_dml_suppressed.load(Ordering::SeqCst)
+            || self.game_mode_permanently_suppressed.load(Ordering::SeqCst)
+    }
+
+    /// Combines the persisted preference with the live game-mode policy.
+    pub fn allows_directml(&self, configured: bool) -> bool {
+        configured && !self.is_dml_suppressed()
     }
 }
 
@@ -333,6 +379,7 @@ fn cleanup_monitor_runtime_after_unexpected_exit(state: &MonitorState) {
     // The Python Smart Cluster worker died with its process, so the Rust one
     // may take the queue back as soon as the switch allows it.
     state.set_python_smart_cluster_worker(false);
+    state.set_active_classification_runtime(None);
     {
         let mut guard = state.reverse_ipc.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut server) = *guard {
@@ -1646,6 +1693,11 @@ pub async fn start_monitor_impl(
         // not the registry key it came from — decides who encodes captures.
         let python_clip_runtime = crate::clip_query::clip_runtime();
         let python_encodes_clip = python_clip_runtime == "python";
+        // BGE classification remains orchestrated by the post-process worker,
+        // but its embedder calls the shared Rust semantic worker by default.
+        // The child reads this once, so changing the rollback lever takes effect
+        // with the same monitor restart as the other inference runtime flags.
+        let python_classification_runtime = crate::classification_runtime::classification_runtime();
         cmd_proc
             .env(
                 "CARBONPAPER_CLUSTERING_ENABLED",
@@ -1674,6 +1726,10 @@ pub async fn start_monitor_impl(
             // the collection they both target.
             .env("CARBONPAPER_CLIP_RUNTIME", &python_clip_runtime)
             .env(
+                "CARBONPAPER_CLASSIFICATION_RUNTIME",
+                &python_classification_runtime,
+            )
+            .env(
                 "CARBONPAPER_OCR_TIMEOUT_SECS",
                 crate::registry_config::get_u32("ocr_timeout_secs")
                     .unwrap_or(120)
@@ -1695,44 +1751,38 @@ pub async fn start_monitor_impl(
                 );
         }
 
-        // Pass DirectML configuration
-        if crate::registry_config::get_bool("use_dml").unwrap_or(false) {
-            // 检查游戏模式是否抑制了 DML（临时或永久）
-            let suppressed = state.game_mode_dml_suppressed.load(Ordering::SeqCst)
-                || state
-                    .game_mode_permanently_suppressed
-                    .load(Ordering::SeqCst);
-            if !suppressed {
-                // 先枚举可用 GPU，如果完全没有可用显卡则跳过 DML
-                let gpus = enumerate_gpus_internal().unwrap_or_default();
-                if gpus.is_empty() {
-                    tracing::warn!(
-                        "No compatible GPU detected, skipping DirectML (falling back to CPU)"
-                    );
-                } else {
-                    cmd_proc.env("CARBONPAPER_USE_DML", "1");
-                    let mut device_id =
-                        crate::registry_config::get_u32("dml_device_id").unwrap_or(0);
-                    // 校验 device_id 是否仍然有效，无效则回退到第一张可用卡
-                    if !gpus
-                        .iter()
-                        .any(|g| g.get("id").and_then(|v| v.as_u64()) == Some(device_id as u64))
-                    {
-                        let fallback_id =
-                            gpus[0].get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                        tracing::warn!(
-                            "DML device_id {} no longer exists, falling back to {}",
-                            device_id,
-                            fallback_id
-                        );
-                        device_id = fallback_id;
-                        let _ = crate::registry_config::set_u32("dml_device_id", device_id);
-                    }
-                    cmd_proc.env("CARBONPAPER_DML_DEVICE_ID", device_id.to_string());
-                }
+        // Pass DirectML configuration. The persisted preference is not enough:
+        // game mode can temporarily or permanently suppress GPU inference.
+        let configured_dml = crate::registry_config::get_bool("use_dml").unwrap_or(false);
+        if state.allows_directml(configured_dml) {
+            // 先枚举可用 GPU，如果完全没有可用显卡则跳过 DML
+            let gpus = enumerate_gpus_internal().unwrap_or_default();
+            if gpus.is_empty() {
+                tracing::warn!(
+                    "No compatible GPU detected, skipping DirectML (falling back to CPU)"
+                );
             } else {
-                tracing::info!("Game mode: DML suppressed, starting Python without DML");
+                cmd_proc.env("CARBONPAPER_USE_DML", "1");
+                let mut device_id = crate::registry_config::get_u32("dml_device_id").unwrap_or(0);
+                // 校验 device_id 是否仍然有效，无效则回退到第一张可用卡
+                if !gpus
+                    .iter()
+                    .any(|g| g.get("id").and_then(|v| v.as_u64()) == Some(device_id as u64))
+                {
+                    let fallback_id =
+                        gpus[0].get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    tracing::warn!(
+                        "DML device_id {} no longer exists, falling back to {}",
+                        device_id,
+                        fallback_id
+                    );
+                    device_id = fallback_id;
+                    let _ = crate::registry_config::set_u32("dml_device_id", device_id);
+                }
+                cmd_proc.env("CARBONPAPER_DML_DEVICE_ID", device_id.to_string());
             }
+        } else if configured_dml {
+            tracing::info!("Game mode: DML suppressed, starting Python without DML");
         }
 
         cmd_proc
@@ -1848,6 +1898,7 @@ pub async fn start_monitor_impl(
         // drains `smart_cluster_pending`, whatever the registry key says later.
         state.set_python_smart_cluster_worker(python_drains_smart_clusters);
         state.set_python_clip_encoder(python_encodes_clip);
+        state.set_active_classification_runtime(Some(python_classification_runtime));
 
         (python_executable, python_exists)
     };
@@ -2208,6 +2259,7 @@ pub async fn stop_monitor_impl(
     // The Python Smart Cluster worker stopped with its process; the queue is
     // the Rust worker's again as soon as the switch allows it.
     state.set_python_smart_cluster_worker(false);
+    state.set_active_classification_runtime(None);
     {
         let mut guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
@@ -2476,6 +2528,13 @@ fn query_gpu_memory_usage(device_id: u32) -> Result<f64, String> {
     }
 }
 
+fn stop_rust_directml_worker_for_game_mode(app: &AppHandle) {
+    let semantic = app.state::<Arc<crate::semantic_runtime::SemanticRuntimeState>>();
+    if semantic.inner().stop_if_directml() {
+        tracing::info!("Game mode: stopped resident Rust DirectML semantic worker");
+    }
+}
+
 /// 启动游戏模式监控循环（GPU 负载 + 全屏非浏览器检测）
 pub fn start_game_mode_monitor(app: AppHandle) {
     let monitor_state = app.state::<MonitorState>();
@@ -2611,6 +2670,7 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                     state
                         .game_mode_permanently_suppressed
                         .store(true, Ordering::SeqCst);
+                    stop_rust_directml_worker_for_game_mode(&app_clone);
                     let _ = app_clone.emit(
                         "game-mode-status",
                         serde_json::json!({
@@ -2638,6 +2698,7 @@ pub fn start_game_mode_monitor(app: AppHandle) {
                     usage * 100.0
                 );
                 state.game_mode_dml_suppressed.store(true, Ordering::SeqCst);
+                stop_rust_directml_worker_for_game_mode(&app_clone);
                 let _ = app_clone.emit(
                     "game-mode-status",
                     serde_json::json!({"active": true, "usage": usage}),
@@ -2829,5 +2890,25 @@ mod tests {
         assert_eq!(recovery["last_error"], "pipe failed");
         assert_eq!(recovery["crash_count"], 1);
         assert!(recovery["last_crashed_at_ms"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn directml_policy_requires_both_preference_and_clear_game_mode() {
+        let state = MonitorState::new();
+        assert!(!state.allows_directml(false));
+        assert!(state.allows_directml(true));
+
+        state.game_mode_dml_suppressed.store(true, Ordering::SeqCst);
+        assert!(state.is_dml_suppressed());
+        assert!(!state.allows_directml(true));
+
+        state
+            .game_mode_dml_suppressed
+            .store(false, Ordering::SeqCst);
+        state
+            .game_mode_permanently_suppressed
+            .store(true, Ordering::SeqCst);
+        assert!(state.is_dml_suppressed());
+        assert!(!state.allows_directml(true));
     }
 }

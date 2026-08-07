@@ -790,6 +790,9 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
     worker_env = {
         'CARBONPAPER_CLUSTERING_ENABLED': str(config.CLUSTERING_ENABLED),
         'CARBONPAPER_CLASSIFICATION_ENABLED': str(config.CLASSIFICATION_ENABLED),
+        'CARBONPAPER_CLASSIFICATION_RUNTIME': os.environ.get(
+            'CARBONPAPER_CLASSIFICATION_RUNTIME', 'rust'
+        ),
         'CARBONPAPER_CLUSTERING_ALLOW_FULL_LOW_MEMORY': str(config.CLUSTERING_ALLOW_FULL_LOW_MEMORY),
         'CARBONPAPER_USE_ONNX': os.environ.get('CARBONPAPER_USE_ONNX', 'true'),
         'CARBONPAPER_OCR_TIMEOUT_SECS': str(getattr(config, '_ocr_timeout_secs', 120)),

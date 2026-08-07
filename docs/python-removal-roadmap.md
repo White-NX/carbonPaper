@@ -6,10 +6,15 @@ learning interfere with whatever the user has in the foreground.
 
 **Current milestone.** Milestone 2, targeted at v0.8.4 Beta. Steps 1-5 of the
 M2.5 cutover sequence are merged. Step 6 is implemented on
-`m2/reranker-shadow-cutover`, and steps 7-9 — the whole CLIP sequence — on
-`m2/clip-vector-migration`. Both are waiting on an on-machine soak; step 9
-additionally skipped its shadow phase, which section 6 records as an outstanding
-gate item rather than a closed one.
+`m2/reranker-shadow-cutover`, steps 7-9 — the whole CLIP sequence — on
+`m2/clip-vector-migration`, and step 10 in the current working tree. Steps 6-10
+are waiting on their on-machine gates. Steps 9 and 10 deliberately skipped
+shadow mode: both are direct Rust-default cutovers with explicit Python rollback,
+so the missing live comparisons remain open gate items rather than implied
+evidence.
+
+**Source snapshot.** Updated on 2026-08-07 against commit `f96c56a` plus the
+uncommitted M2.5 step-10 working tree described below.
 
 ---
 
@@ -50,7 +55,7 @@ again.
 | Milestone | Target | Status | What it is waiting on |
 | --- | --- | --- | --- |
 | M1 — Vector semantics and migration baseline | folded into M2 | **DONE** | — |
-| M2 — Rust ONNX inference and per-kind index ownership | v0.8.4 Beta | **IN PROGRESS** — 5 of 10 cutover steps merged; steps 6 and 7-9 implemented and soaking | step 6's reranked-ordering numbers; steps 7-9's end-to-end retrieval comparison and a migration run against a real collection; then BGE shadow (step 10) |
+| M2 — Rust ONNX inference and per-kind index ownership | v0.8.4 Beta | **IN PROGRESS** — 5 of 10 cutover steps merged; steps 6-10 implemented and soaking | step 6's reranked-ordering numbers; steps 7-9's end-to-end retrieval comparison and a migration run against a real collection; step 10's BGE parity and monitor soak |
 | M3 — Smart Cluster worker in Rust | post-v0.8.4 Beta | **PLANNED** (scope reduced) | M2 step 6 |
 | M4 — Task clustering decision | post-M3 | **PLANNED** | M2 (embedding similarity) |
 | M5 — Classification and PII resolution | post-M4 | **PLANNED** | M2-M4 |
@@ -77,8 +82,10 @@ of DLL working set. Model registration, install status, sizing, and OCR
 `onnxruntime-directml` inference, ChromaDB, and post-process orchestration.
 
 **Hop 2 — move ONNX inference from Python into Rust. OCR and MiniLM retrieval
-done.** Everything else still runs its ONNX session inside the Python
-`onnxruntime`.
+are merged; reranking, CLIP, and BGE classification inference are implemented
+in the current branch sequence.** BGE is intentionally narrower than a full
+classification port: Python still runs the classifier and calls the Rust
+semantic worker for embeddings through reverse IPC.
 
 This is why Milestone 2 is organized around a shared runtime rather than one
 feature per release: embedding, reranking, and classification already sit on one
@@ -129,8 +136,13 @@ Specifics worth knowing before touching this area:
   Cluster calibration and the Smart Cluster scoring worker. On `main`. The step-6
   branch moves both to Rust and keeps this path as the `rerank_runtime = python`
   rollback.
-- **BGE classification** (`monitor/classifier.py`), invoked from OCR
-  post-process (`monitor/monitor/worker_process.py`).
+- **BGE classification orchestration** (`monitor/classifier.py`), invoked from
+  OCR post-process (`monitor/monitor/worker_process.py`). In the current working
+  tree its default embedder calls the shared Rust semantic worker; Python still
+  owns anchor loading, scoring, thresholds, learned anchors, and persistence of
+  the selected category. The local Python ONNX path remains the explicit
+  rollback and the per-request fallback after an ordinary Rust failure. A
+  foreground-priority refusal does not start a competing Python model.
 - **HDBSCAN / PaCMAP task clustering** (`monitor/task_clustering.py`), including
   the `task_vectors` hot layer and the `task_centroids` cold layer.
 - **MiniLM inference in three places that are not the capture path**: the
@@ -342,14 +354,15 @@ disabled. Each of MiniLM, the reranker, and CLIP moves through
 counts toward the v0.8.4 Beta completion claim only after its own gate passes.
 
 **Explicitly out of scope for this milestone's production cutover:** BGE
-classification and `task_centroids`, even though the shared Rust runtime may
-exercise BGE in shadow mode.
+classification orchestration and `task_centroids`. Step 10 moves only the BGE
+embedding inference call into the shared Rust runtime through a supported
+Python-to-Rust bridge; the classifier itself remains a Milestone 5 consumer.
 
 **What Milestone 2 cannot do.** Removing Python ONNX and Chroma here would be a
 functional regression. Chroma stays available for the still-live task-clustering
-collections until Milestone 4, and Python BGE stays available until
-classification has a Rust consumer (Milestone 5) or a deliberately supported
-Rust inference bridge.
+collections until Milestone 4. Step 10 supplies the supported Rust inference
+bridge, but local Python BGE stays available through its rollback window and
+Python classification orchestration stays until Milestone 5.
 
 #### Sub-milestone status
 
@@ -359,7 +372,7 @@ Rust inference bridge.
 | M2.2 | Separate Rust semantic runtime | **DONE** |
 | M2.3 | Rust-owned derived embedding storage and ledger | **DONE** 2026-07-21 |
 | M2.4 | Sentinel-triggered MiniLM migration | **DONE** 2026-07-24 |
-| M2.5 | Dual-write, shadow-query, then cut over by capability | **IN PROGRESS** — 5 of 10 steps merged, step 6 soaking |
+| M2.5 | Dual-write, shadow-query, then cut over by capability | **IN PROGRESS** — 5 of 10 steps merged, steps 6-10 soaking |
 | M2.6 | Bounded-memory ANN reads from the `.cpdvec` sidecar | **PLANNED** — the persistence shell exists; no query path consumes ANN data yet |
 
 #### M2.1 — Freeze the Python behavior contract — DONE
@@ -575,14 +588,15 @@ The cutover sequence, with status:
 | 7 | CLIP vector export and migration | **IMPLEMENTED, SOAKING** — `m2/clip-vector-migration` |
 | 8 | Rust CLIP image-encoder dual-write for new captures | **IMPLEMENTED, SOAKING** — same branch |
 | 9 | Rust CLIP text-query shadow mode, then cut over `search_nl` and MCP capability reporting | **IMPLEMENTED, SOAKING** — same branch; **the shadow phase was skipped**, see below |
-| 10 | BGE in the shared Rust runtime, shadow mode only | PLANNED |
+| 10 | Rust-default BGE classification inference through reverse IPC, with Python rollback | **IMPLEMENTED, SOAKING** — current working tree; shadow mode skipped |
 
 Two ordering constraints are load-bearing. **Step 8 precedes step 9:** do not cut
 over visual search while new screenshots still depend solely on Python image
 encoding, or old data will be searchable while new captures silently stop being
-indexed. **Step 10 does not remove Python BGE:** the classification consumer is a
-Milestone 5 item, and Python BGE inference stays until classification has a Rust
-path or a deliberately supported Rust inference bridge.
+indexed. **Step 10 does not remove Python classification:** scoring, thresholds,
+anchors, and post-process orchestration remain a Milestone 5 item. It does make
+the supported Rust inference bridge the default and retains local Python ONNX as
+the manual rollback and automatic fallback.
 
 ##### Step 3 — measured result (2026-07-27)
 
@@ -1440,6 +1454,79 @@ launch resumed its snapshot. The run start is deliberately conservative: the
 actual snapshot begins later, and older snapshot-external rows are the only ones
 the cleanup is meant to remove.
 
+##### Step 10 — Rust-default BGE classification inference — IMPLEMENTED, SOAKING
+
+Step 10 skipped the planned shadow-only phase at the maintainer's direction. It
+uses the same operational shape as the earlier direct cutovers: Rust is the
+default, Python remains an explicit rollback, and the comparison that a live
+shadow would have produced stays an open on-machine gate.
+
+**What changed.** `TextEmbedder` in `monitor/classifier.py` still receives every
+classification request, but its default `rust` path sends the text batch through
+`StorageClient.embed_bge_texts` and authenticated reverse IPC. The
+`bge_embed_texts` handler in `reverse_ipc.rs` validates the request and calls
+`classification_runtime::embed_bge_texts`, which loads `BgeSmallZh` in the
+shared semantic worker. The response names the model and dimension; Python
+rejects a vector matrix whose row count or width does not match the request.
+The Rust boundary accepts at most 512 texts and 262,144 UTF-8 bytes per reverse
+IPC request. It preserves input order while splitting that aggregate into
+semantic-worker requests of at most 32 texts, then verifies every chunk's row
+count and dimensions before merging the vectors in the original order. An
+anchor index above 32 texts is therefore expected to span multiple worker
+requests; it does not trigger Python fallback merely because it exceeds one
+worker request.
+
+This is a supported inference bridge, not the Milestone 5 classifier port.
+`ClassificationService` still loads `anchors.json`, builds and invalidates the
+anchor index, blends process-local and global anchor scores, applies the title,
+OCR, relevance, and minimum-confidence thresholds, learns user anchors, and
+writes the selected category from the OCR post-process worker. No derived index
+or migration is introduced by this step.
+
+**Scheduling and fallback.** Classification waits up to 15 seconds for a queued
+foreground semantic request to take priority, then returns `foreground_busy`
+without loading Python BGE; falling back in that case would put two copies of
+the same model in competition with the foreground request the scheduler was
+trying to protect. Other Rust errors fall back for that request only after the
+legacy Python model loads successfully. Rust failures and completed Python
+fallbacks are counted separately, so a refusal that did not produce a Python
+result is not reported as a fallback. The Rust inference call retains one
+120-second deadline across all chunks; each chunk receives only the time
+remaining on that shared deadline.
+
+**Rollback and diagnostics.** `classification_runtime = rust|python` defaults
+to `rust`. Settings -> Advanced exposes the same switch and restart action as
+the existing inference rollback controls. Rust passes the selected value to the
+monitor as `CARBONPAPER_CLASSIFICATION_RUNTIME`; both the nested post-process
+worker and `MonitorState` latch it for that child process. Changing the registry
+selection therefore does not change the live path until the monitor restarts.
+`get_ml_semantic_status` reports the selected runtime, the active monitor
+runtime, the last serving backend, Rust success count, completed fallback count,
+and the last Rust failure. The migration oracle forces `python`, so it remains
+the independent side of the parity contract instead of calling back into Rust.
+
+**What remains before DONE.** The implementation and automated contracts pass,
+but these machine-dependent gates are still open:
+
+1. Run the M2.1 BGE oracle against the installed pinned model and record token
+   equality, maximum absolute vector error, and minimum cosine for CPU. Repeat
+   for DirectML if that provider is enabled for the release configuration.
+2. On a populated profile, run the same title/OCR/process samples once with
+   `classification_runtime=python` and once with `rust`, restarting the monitor
+   between them. Record category agreement, confidence deltas, and any threshold
+   crossings, including learned and process-scoped anchors.
+3. Record cold and warm BGE latency, semantic-worker memory, OCR post-process
+   completion time, and foreground-search latency while automatic
+   classification is active. Exercise the 15-second priority refusal rather
+   than assuming it from unit tests alone. The benchmark's production-batch
+   gate must also pass: the complete anchor batch must fit the 512-text bridge
+   limit and every internally generated worker chunk must fit the 32-text
+   protocol limit.
+4. Soak normal capture, monitor restart, semantic-worker failure, and explicit
+   Python rollback on a real profile. Confirm that ordinary failures complete
+   through Python, `foreground_busy` does not start Python BGE, and the selected
+   versus active runtime display changes only after restart.
+
 ##### Configuration surface
 Enum backends, not ambiguous booleans, because inference and index ownership cut
 over at different times:
@@ -1451,6 +1538,7 @@ over at different times:
 | `rerank_runtime` | `python` \| `rust` | `rust` (step 6) |
 | `clip_runtime` | `python` \| `rust` | `rust` (step 9) |
 | `clip_index` | `chroma` \| `dual` \| `rust` | `rust` (step 9) |
+| `classification_runtime` | `python` \| `rust` | `rust` (step 10) |
 
 `clip_runtime` ships without the `rust_shadow` value this table used to
 anticipate, for the reason step 4 retired MiniLM's: nothing can enter shadow
@@ -1484,8 +1572,10 @@ it and nothing is draining at all.
 
 Invalid or unavailable Rust configurations fall back observably for one release,
 with a local diagnostic explaining why. `rust_shadow` is retired from
-`semantic_runtime` now that nothing can enter shadow mode for MiniLM; CLIP will
-introduce and then retire its own.
+`semantic_runtime` now that nothing can enter shadow mode for MiniLM; CLIP and
+BGE classification inference ship without a shadow value. Step 10's
+`foreground_busy` refusal is deliberately not a fallback because loading Python
+BGE would compete with the foreground semantic request.
 
 Search response schemas, filters, offsets, limits, thresholds, MCP tool
 availability, and frontend labels are preserved and explicitly tested. OCR
@@ -1542,8 +1632,9 @@ Python-backed are advertised honestly and remain usable through fallback.
 capability advertised as Rust-read and Python-written.
 
 **No regressions elsewhere.** Existing automatic classification and task
-clustering do not regress: Python BGE remains until its consumer migrates, and
-`task_vectors` and `task_centroids` remain available to the Milestone 4 path.
+clustering do not regress: Python still owns classification orchestration and
+keeps local BGE as the step-10 rollback, while `task_vectors` and
+`task_centroids` remain available to the Milestone 4 path.
 
 **Lifecycle.** Embedding migration and rebuild are interruptible and resumable.
 Session lock and unlock, process crash, partial `.cpdvec` generation, model upgrade,
@@ -1772,9 +1863,11 @@ idle-gated (`task_clustering.py:1696`), but there is no Rust replacement.
 **Goal.** Remove the remaining Python-only machine-learning features, or make
 them optional add-ons.
 
-**Where the code is.** Classification (`monitor/classifier.py`, BGE via ONNX with
-a torch fallback) runs inside OCR post-process
-(`monitor/monitor/worker_process.py`). PII is a **two-tier MCP-output filter**:
+**Where the code is.** Classification orchestration (`monitor/classifier.py`)
+runs inside OCR post-process (`monitor/monitor/worker_process.py`). Step 10
+routes BGE embeddings to Rust by default, with local Python ONNX and torch kept
+as rollback; anchor scoring, learning, thresholds, and category assignment have
+not moved. PII is a **two-tier MCP-output filter**:
 tier 1 is Rust aho-corasick dictionary masking (`sensitive_filter.rs`), tier 2 is
 Python Presidio NER, default-on (`presidio_enabled: true` at
 `sensitive_filter.rs:73`, applied at `mcp_server.rs:825-865`). The Rust rule
@@ -1783,10 +1876,10 @@ is untouched. `torch`, `spacy`, and `presidio-*` remain in `requirements.txt`.
 
 **Work.**
 
-- Replace Python BGE classification with Rust embedding-based scoring using the
-  Milestone 2 engine, or with simple process and title rules, or with
-  user-defined Smart Clusters — or remove automatic classification from the
-  default experience.
+- Replace the remaining Python classification orchestration with Rust
+  embedding-based scoring using the Milestone 2 engine, or with simple process
+  and title rules, or with user-defined Smart Clusters — or remove automatic
+  classification from the default experience.
 - PII: keep and extend the Rust deterministic rules. Decide Presidio and spaCy's
   fate — add ONNX NER only for a concrete workflow, otherwise make advanced PII
   optional and not part of the default install. Clarify whether PII also applies
@@ -1980,7 +2073,7 @@ for at least one release.
 | Python MiniLM inference and Chroma semantic retrieval | Only after the relevant Milestone 2 capability is stable for one release. Note the three surviving Python MiniLM call sites listed in section 3 — the reranked query encode, the hot-layer rebuild, and the Smart Cluster worker — of which the first and third move at step 6 and the second at Milestone 4. Keep Chroma and any dual-write needed by `task_vectors` and `task_centroids` until the Milestone 4 decision is complete. |
 | Python bge-reranker inference | Remove from calibration and from the Smart Cluster scoring path together, after the M2.5 step 6 parity and cutover gates. Step 6 leaves it in place as the `rerank_runtime = python` rollback for one release. Remove the remaining worker surface after Milestone 3. |
 | `monitor_smart_cluster_calibrate_preview` | **DELETED.** It was an auth-guarded Tauri command with no caller outside `api_contracts.test.js`: the calibration screen goes through `nlClusterQuery(..., enableRerank = true)`. The command, its Python handler, its security-guard entry, and its test reference were removed together. |
-| Python BGE classification inference | Do not remove in Milestone 2 merely because the Rust runtime can load BGE. Remove only when Milestone 5 classification uses Rust directly, or while a deliberately supported Python-to-Rust inference bridge is active and tested. |
+| Python BGE classification inference | **Not eligible yet.** Step 10 supplies a supported, tested Python-to-Rust inference bridge, but the local Python runtime is still the manual and automatic rollback for its release window. Remove that local inference path only after the step-10 parity and soak gates pass and Rust has been the default for one release. Python classification orchestration remains until Milestone 5 even after that inference path becomes removable. |
 | Python Smart Cluster worker | Only after Milestone 3 is stable. |
 | Python HDBSCAN and PaCMAP | Only after Milestone 4 is stable. |
 | Python classification and PII dependencies | Only after Milestone 5 is stable. |
@@ -1997,7 +2090,8 @@ latest before the capability's first production release.
 | MiniLM shadow toggle, query and document probes, `semantic_shadow_samples`, `semantic_doc_encoder_runs`, the settings card | **DELETED** with the M2.5 step-4 cutover. Tables are dropped in `storage/schema.rs`. |
 | The `rust_shadow` value of `semantic_runtime` | **DELETED** — normalizes to the shipped default. |
 | The reranker ONNX variant selector (`rerankVariant` argument, `available_variants` dropdown) | **DELETED** with M2.5 step 6. Only `model_uint8.onnx` is installed and the Rust engine pins it, so the selector offered choices that could not load and the `q4f16` default named a file that is never on disk. The loaded variant is still reported. |
-| Reranker, CLIP, and BGE shadow harnesses | Not yet built. Same rule applies at their own cutovers: enforce deletion **in the cutover PR**, not as an end-of-milestone sweep. An unowned diagnostic panel never gets deleted later. |
+| Reranker shadow harness | Not yet built. If step 6 adds one for its outstanding ordering comparison, delete it in the cutover PR rather than leaving an unowned diagnostic panel. |
+| CLIP and BGE shadow harnesses | **NOT BUILT BY DECISION.** Steps 9 and 10 cut directly to Rust-default with Python rollback. Their offline and on-machine comparisons are release evidence, not persistent production modes or UI. |
 
 When deleting a shadow harness, check for functions the production path has since
 adopted. `minilm_sources` began life as the document-encoder probe's source
@@ -2018,7 +2112,7 @@ removed production code.
   `m2/minilm-dual-write-migration`, `m2/minilm-shadow-cutover`,
   `m2/minilm-query-cutover`, `m2/minilm-capture-indexing`,
   `m2/reranker-shadow-cutover`, `m2/clip-vector-migration`, `m2/clip-cutover`,
-  `m2/search-ui-capabilities`, `m2/bge-shadow`. Infrastructure may merge to
+  `m2/search-ui-capabilities`, `m2/bge-inference-cutover`. Infrastructure may merge to
   `main` while disabled; each consumer cutover carries its own gate and rollback.
 - **Do not open a release branch** until the intended capabilities have passed
   their gates on `main`. Release branches are stabilization-only; do not
@@ -2026,8 +2120,8 @@ removed production code.
 - **Backend selection is explicit per capability.** Prefer enums
   (`python|rust_shadow|rust`, `chroma|dual|rust`) over one boolean per
   replacement, because inference and index ownership cut over at different times.
-  The cautionary precedent: only `rust_ocr_dml_beta` (a DirectML accelerator
-  toggle) ever existed for OCR, which shipped default with no `rust_ocr` flag.
+  The cautionary precedent: an earlier one-off Rust OCR DirectML accelerator
+  toggle existed without an explicit OCR backend selection flag.
   Milestones 2-5 must not repeat that unobservable big-bang cutover.
 - **Every flag and replacement gets a telemetry-free local diagnostic** command
   reporting status and last error. The OCR runtime and `mcp_get_status` are the
@@ -2087,12 +2181,18 @@ matters:
    and an app restart, and that the Chroma mirror keeps the `clip_runtime =
    python` rollback usable.
 
-**Then BGE shadow mode** (step 10), which does not remove Python BGE.
+**Step 10 is implemented in the current working tree.** BGE inference is Rust by
+default through authenticated reverse IPC, while Python keeps the classifier,
+the explicit rollback, and ordinary per-request fallback. Its next work is the
+four on-machine gates listed in the step-10 section: numeric parity, category and
+confidence agreement across a monitor restart, latency and foreground-isolation
+measurement, and a real-profile failure/rollback soak.
 
 **Standing constraints.** No Rust backend becomes authoritative until its Python
-behavior contract, dual-write and migration, shadow-query, lifecycle,
-performance, and rollback gates pass. Chroma remains for Milestone 4 task
-clustering, and Python BGE remains for Milestone 5 classification.
+behavior contract, applicable data-migration gate, comparison evidence,
+lifecycle, performance, and rollback gates pass. Chroma remains for Milestone 4
+task clustering. Python classification remains for Milestone 5, and local
+Python BGE remains through the step-10 rollback window.
 
 ---
 
@@ -2139,3 +2239,4 @@ milestone bodies; this is an index so a reversal is not silently re-reversed.
 | 2026-08-04 | The `search_nl` **time filter now works, and that is a bug fix with a release note**. Python filters on `metadata["created_at"]`, which `worker_process.py` never wrote, so start/end bounds have silently passed everything for as long as the feature has existed. Rust reads the timestamp from SQLite. Recorded as a deliberate behaviour change rather than left to look like a parity gap. |
 | 2026-08-04 | MCP `search_nl` availability stops meaning **"is Python running"**. Two backends can answer it now, so the capability flag reports which one would. `tools/list` remains a static contract and always advertises the tool; temporary backend unavailability is reported by status and at call time instead of changing the schema. |
 | 2026-08-06 | The existing `.cpdvec` file is recorded as a **generation-safe flat snapshot, not an ANN reader already in production**. M2.6 adds the ANN payload and query integration for the no-retention CLIP corpus, while SQLite stays authoritative and the bounded paged exact scan remains the complete fallback. |
+| 2026-08-07 | Step 10 changed from BGE shadow-only to a **direct Rust-default inference bridge** at the maintainer's direction. Python still owns classification orchestration and stays available through `classification_runtime=python`; ordinary Rust failures fall back per request, while `foreground_busy` does not load Python and compete with foreground semantic work. The selected value is latched at monitor spawn, so the Settings change takes effect only after monitor restart. |

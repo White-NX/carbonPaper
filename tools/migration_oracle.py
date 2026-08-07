@@ -348,6 +348,10 @@ def _resolve_model_files(model_root: Path, reranker_variant: str) -> Dict[str, P
 def _configure_cpu_onnx(model_root: Path) -> None:
     os.environ["CARBONPAPER_USE_ONNX"] = "1"
     os.environ["CARBONPAPER_USE_DML"] = "0"
+    # The oracle defines the Python side of the migration contract. Production
+    # classification defaults to Rust, so force the legacy embedder here rather
+    # than accidentally calling back into a running application over IPC.
+    os.environ["CARBONPAPER_CLASSIFICATION_RUNTIME"] = "python"
     os.environ["CARBONPAPER_ONNX_LOAD_MODE"] = "buffer"
     os.environ["MODEL_PATH"] = str(model_root)
     os.environ["MINILM_MODEL_PATH"] = str(

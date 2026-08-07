@@ -218,25 +218,32 @@ impl MlRuntimeState {
         app: AppHandle,
         image: Arc<RgbImage>,
         timeout: Duration,
-        use_directml_beta: bool,
+        use_directml: bool,
     ) -> Result<MlOcrResult, String> {
         // The worker protocol is single-request. Holding this gate across
         // provider selection, startup and the response prevents a concurrent
         // provider switch from killing an in-flight request.
         let _request_guard = self.request_gate.lock().await;
+        // A capture task may outlive the game-mode transition that created it.
+        // Clamp the route again here so a stale task cannot start or retain a
+        // DirectML worker after suppression becomes active.
+        let use_directml = use_directml
+            && app
+                .state::<crate::monitor::MonitorState>()
+                .allows_directml(true);
         let directml_disabled = self
             .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .directml_disabled_for_session;
-        let provider = if use_directml_beta && !directml_disabled {
+        let provider = if use_directml && !directml_disabled {
             MlProvider::DirectMl
         } else {
             MlProvider::Cpu
         };
-        if use_directml_beta && directml_disabled {
+        if use_directml && directml_disabled {
             tracing::warn!(
-                "[ML:DML] DirectML Beta is disabled for this session after an earlier failure; using CPU"
+                "[ML:DML] DirectML is disabled for this session after an earlier failure; using CPU"
             );
         }
         let state_for_start = self.clone();
@@ -369,7 +376,7 @@ impl MlRuntimeState {
             .as_ref()
             .map(|process| match process.provider {
                 MlProvider::Cpu => "cpu",
-                MlProvider::DirectMl => "directml_beta",
+                MlProvider::DirectMl => "directml",
             })
             .unwrap_or("none");
         MlRuntimeStatus {
@@ -560,7 +567,7 @@ impl MlRuntimeState {
 
     fn disable_directml_for_session(&self, error: &str) {
         tracing::warn!(
-            "[ML:DML] disabling temporary DirectML Beta provider for this session: {}",
+            "[ML:DML] disabling DirectML provider for this session: {}",
             error
         );
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

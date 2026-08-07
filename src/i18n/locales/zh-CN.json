@@ -246,8 +246,6 @@
         "use_rust": "使用 Rust OCR",
         "rust_desc": "使用隔离的 Rust ML 进程直接处理 RGB 捕获帧。",
         "python_desc": "Python OCR 不再作为截图 OCR 回退路径。",
-        "dml_beta": "DirectML Beta",
-        "dml_beta_desc": "临时实验开关，默认关闭；未来会废弃并合并到统一的 DirectML 设置。",
         "model_ready": "PP-OCRv5 Mobile 已安装",
         "model_missing": "需要安装 PP-OCRv5 Mobile 模型",
         "model_bundled": "PP-OCRv5 Mobile 随 CarbonPaper 安装",
@@ -263,9 +261,9 @@
         "retry_failed": "重试失败截图（{{count}}）"
       },
       "dml": {
-        "title": "OCR 推理加速",
+        "title": "DirectML 推理加速",
         "label": "使用 DirectML 进行推理",
-        "description": "启用后将使用 GPU 进行 OCR 推理加速，需要 DirectX 12 兼容的显卡。",
+        "description": "启用后将使用 GPU 加速支持 DirectML 的 OCR 和向量推理，需要 DirectX 12 兼容的显卡。",
         "notice": "注意：在主要 GPU 上运行 DirectML 可能会影响游戏性能。",
         "changed_notice": "DirectML 设置将在下次启动监控服务时生效",
         "gpu_select": "选择 GPU 设备",
@@ -346,6 +344,25 @@
         "run_stopping": "正在停止。当前这张画面处理完就会结束。",
         "run_done": "本次索引了 {{indexed}} 张画面，还有 {{remaining}} 张在等待。",
         "run_skipped": "本次没有开始索引：{{reason}}。"
+      },
+      "classification_backend": {
+        "title": "截图内容自动分类",
+        "label": "使用 Rust 运行 BGE 分类推理",
+        "description": "使用 BGE-small-zh 将窗口标题和必要的 OCR 文本与分类锚点进行匹配。分类结果会写入截图，并用于分类筛选和任务摘要。",
+        "rollback_note": "关闭后恢复由 Python 本地运行时执行 BGE。分类规则、已有类别和学习锚点不会改变。",
+        "selected": "选择的运行时",
+        "active": "当前监控进程",
+        "runtime_rust": "Rust（默认）",
+        "runtime_python": "Python（回滚）",
+        "runtime_stopped": "未运行",
+        "last_inference": "上次推理由谁完成",
+        "served_rust": "Rust",
+        "served_python": "Python",
+        "served_unknown": "本次启动后尚未分类",
+        "successes": "Rust 成功次数",
+        "fallbacks": "自动回退次数",
+        "last_reason": "上次 Rust 失败原因",
+        "changed_notice": "分类运行时将在监控服务重启后生效"
       },
       "onnx": {
         "title": "ONNX 推理 (测试性)",
