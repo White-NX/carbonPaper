@@ -951,11 +951,15 @@ fn assign_kill_on_close_job(child: &Child) -> Result<MlJobHandle, String> {
 }
 
 #[tauri::command]
-pub fn get_ml_ocr_status(
+pub async fn get_ml_ocr_status(
     state: tauri::State<'_, Arc<MlRuntimeState>>,
     storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
-) -> MlRuntimeStatus {
-    state.status(storage.count_failed_ocr().unwrap_or(0))
+) -> Result<MlRuntimeStatus, String> {
+    let state = state.inner().clone();
+    let storage = storage.inner().clone();
+    tokio::task::spawn_blocking(move || state.status(storage.count_failed_ocr().unwrap_or(0)))
+        .await
+        .map_err(|error| format!("OCR status task failed: {error}"))
 }
 
 #[tauri::command]

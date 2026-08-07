@@ -1217,6 +1217,7 @@ pub fn run() {
             commands::storage::storage_get_categories_from_db,
             commands::storage::storage_batch_get_categories,
             commands::migration::storage_get_startup_vacuum_status,
+            commands::migration::storage_is_startup_vacuum_in_progress,
             commands::migration::storage_run_startup_vacuum_if_needed,
             commands::migration::storage_run_manual_vacuum,
             commands::migration::storage_check_hmac_migration_status,

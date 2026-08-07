@@ -33,6 +33,7 @@ const offer = (overrides = {}) => ({
   failed_imports: 0,
   estimated_seconds: 3 * 3600 + 30 * 60,
   migration_status: 'completed_with_errors',
+  diagnostics_deferred: false,
   ...overrides,
 });
 
@@ -111,6 +112,28 @@ describe('ClipBackfillDialog', () => {
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(15000);
+    });
+
+    expect(getClipBackfillOffer).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(/clipBackfill\.lead.*1200/)).toBeInTheDocument();
+  });
+
+  it('keeps polling while the expensive census waits for idle time', async () => {
+    vi.useFakeTimers();
+    getClipBackfillOffer
+      .mockResolvedValueOnce(offer({
+        should_ask: false,
+        never_indexed: 0,
+        diagnostics_deferred: true,
+      }))
+      .mockResolvedValueOnce(offer());
+    render(<ClipBackfillDialog />);
+    await settle();
+
+    await act(async () => {
+      vi.advanceTimersByTime(15000);
+      await Promise.resolve();
+      await Promise.resolve();
     });
 
     expect(getClipBackfillOffer).toHaveBeenCalledTimes(2);

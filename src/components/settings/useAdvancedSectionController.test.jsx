@@ -1,5 +1,5 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 
 import { getClipBackfillOffer } from '../../lib/task_api';
@@ -24,6 +24,7 @@ describe('useAdvancedSectionController', () => {
   let clipRunActive;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     clipRunActive = true;
     getClipBackfillOffer.mockResolvedValue({
       migration_settled: true,
@@ -34,7 +35,7 @@ describe('useAdvancedSectionController', () => {
     });
     invoke.mockImplementation(async (command) => {
       if (command === 'get_advanced_config') return {};
-      if (command === 'storage_get_startup_vacuum_status') return { in_progress: false };
+      if (command === 'storage_is_startup_vacuum_in_progress') return false;
       if (command === 'get_rust_ocr_model_status') return {};
       if (command === 'get_ml_ocr_status') return {};
       if (command === 'get_ml_semantic_status') {
@@ -46,6 +47,11 @@ describe('useAdvancedSectionController', () => {
       if (command === 'clip_index_stop_now') return true;
       return undefined;
     });
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
   });
 
   it('restores and can stop a CLIP run owned by an earlier settings mount', async () => {
@@ -77,5 +83,58 @@ describe('useAdvancedSectionController', () => {
 
     expect(reopened.result.current.clipIndexRunning).toBe(false);
     expect(reopened.result.current.clipIndexStopping).toBe(false);
+    expect(invoke).toHaveBeenCalledWith('storage_is_startup_vacuum_in_progress');
+    expect(invoke).not.toHaveBeenCalledWith('storage_get_startup_vacuum_status');
+    expect(invoke).toHaveBeenCalledWith('get_ml_semantic_status', {
+      refreshDiagnostics: true,
+    });
+    expect(getClipBackfillOffer).toHaveBeenCalledWith(true);
+  });
+
+  it('waits for each OCR status request before scheduling the next poll', async () => {
+    vi.useFakeTimers();
+    clipRunActive = false;
+    const ocrResolvers = [];
+    invoke.mockImplementation((command) => {
+      if (command === 'get_advanced_config') return Promise.resolve({});
+      if (command === 'storage_is_startup_vacuum_in_progress') return Promise.resolve(false);
+      if (command === 'get_rust_ocr_model_status') return Promise.resolve({});
+      if (command === 'get_ml_ocr_status') {
+        return new Promise((resolve) => ocrResolvers.push(resolve));
+      }
+      if (command === 'get_ml_semantic_status') {
+        return Promise.resolve({
+          backend: { index_run_active: false },
+          clip_backend: { index_run_active: false },
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const hook = renderHook(() => useAdvancedSectionController({
+      monitorStatus: 'stopped',
+      t,
+    }));
+
+    await act(async () => Promise.resolve());
+    expect(invoke.mock.calls.filter(([command]) => command === 'get_ml_ocr_status')).toHaveLength(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(15000);
+      await Promise.resolve();
+    });
+    expect(invoke.mock.calls.filter(([command]) => command === 'get_ml_ocr_status')).toHaveLength(1);
+
+    await act(async () => {
+      ocrResolvers[0]({ state: 'stopped' });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+    expect(invoke.mock.calls.filter(([command]) => command === 'get_ml_ocr_status')).toHaveLength(2);
+
+    hook.unmount();
   });
 });

@@ -807,7 +807,7 @@ impl StorageState {
         let conn = guard.as_ref().ok_or("Database not initialized")?;
         let count: i64 = conn
             .query_row(
-                &visible_embedding_aggregate_sql(),
+                &visible_embedding_count_sql(),
                 [index_kind.as_str()],
                 |row| row.get(0),
             )
@@ -2139,6 +2139,15 @@ fn visible_embedding_exists_sql() -> String {
         SELECT 1
         {VISIBLE_EMBEDDING_SOURCE}
         LIMIT 1
+        "#
+    )
+}
+
+fn visible_embedding_count_sql() -> String {
+    format!(
+        r#"
+        SELECT COUNT(*)
+        {VISIBLE_EMBEDDING_SOURCE}
         "#
     )
 }

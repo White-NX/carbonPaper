@@ -119,6 +119,8 @@ pub struct StorageState {
 struct NamedConnectionGuard<'a> {
     guard: std::sync::MutexGuard<'a, Option<Connection>>,
     lock_holder: &'a Mutex<&'static str>,
+    caller: &'static str,
+    acquired_at: std::time::Instant,
 }
 
 impl Deref for NamedConnectionGuard<'_> {
@@ -137,6 +139,14 @@ impl DerefMut for NamedConnectionGuard<'_> {
 
 impl Drop for NamedConnectionGuard<'_> {
     fn drop(&mut self) {
+        let hold_duration = self.acquired_at.elapsed();
+        if hold_duration.as_secs() >= 1 {
+            tracing::warn!(
+                "[DIAG:DB] Mutex hold took {:?} for '{}'",
+                hold_duration,
+                self.caller
+            );
+        }
         if let Ok(mut holder) = self.lock_holder.lock() {
             *holder = "";
         }
@@ -246,24 +256,26 @@ impl StorageState {
         let current_holder = self.lock_holder.lock().ok().map(|g| *g).unwrap_or("?");
         let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
         let wait_dur = wait_start.elapsed();
+        if guard.is_none() {
+            return Err("Database not initialized".to_string());
+        }
         // Update lock holder to current caller
         if let Ok(mut h) = self.lock_holder.lock() {
             *h = caller;
         }
         if wait_dur.as_secs() >= 10 {
             tracing::warn!(
-                "[DIAG:DB] Mutex wait took {:?} for '{}' (was held by '{}')",
+                "[DIAG:DB] Mutex wait took {:?} for '{}' (holder at wait start: '{}')",
                 wait_dur,
                 caller,
                 current_holder
             );
         }
-        if guard.is_none() {
-            return Err("Database not initialized".to_string());
-        }
         Ok(NamedConnectionGuard {
             guard,
             lock_holder: &self.lock_holder,
+            caller,
+            acquired_at: std::time::Instant::now(),
         })
     }
 

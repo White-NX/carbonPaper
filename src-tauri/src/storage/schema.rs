@@ -623,7 +623,6 @@ impl StorageState {
     pub fn check_startup_vacuum_needed(&self) -> Result<bool, String> {
         let guard = self.get_connection_named("startup_vacuum_check")?;
         let conn = guard.as_ref().unwrap();
-        Self::set_auto_vacuum_incremental(conn)?;
         Ok(Self::is_startup_vacuum_pending(conn))
     }
 

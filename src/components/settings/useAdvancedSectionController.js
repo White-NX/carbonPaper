@@ -41,6 +41,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [clipBackfillBusy, setClipBackfillBusy] = useState(false);
   const [semanticIndexProgress, setSemanticIndexProgress] = useState(null);
   const [semanticIndexStopping, setSemanticIndexStopping] = useState(false);
+  const mlOcrStatusRequestRef = useRef(null);
 
   const saveConfig = async (newConfig) => {
     const previousConfig = config;
@@ -97,8 +98,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
 
   const refreshVacuumRunningStatus = async () => {
     try {
-      const status = await invoke('storage_get_startup_vacuum_status');
-      setVacuumRunning(Boolean(status?.in_progress));
+      setVacuumRunning(Boolean(await invoke('storage_is_startup_vacuum_in_progress')));
     } catch {
       setVacuumRunning(false);
     }
@@ -131,15 +131,23 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     refreshVacuumRunningStatus();
   }, []);
 
-  const refreshMlOcrStatus = async () => {
+  const refreshMlOcrStatus = () => {
+    if (mlOcrStatusRequestRef.current) return mlOcrStatusRequestRef.current;
+
     setMlOcrStatusLoading(true);
-    try {
-      setMlOcrStatus(await invoke('get_ml_ocr_status'));
-    } catch (err) {
-      console.warn('Failed to read Rust ML OCR status:', err);
-    } finally {
-      setMlOcrStatusLoading(false);
-    }
+    const request = (async () => {
+      try {
+        setMlOcrStatus(await invoke('get_ml_ocr_status'));
+      } catch (err) {
+        console.warn('Failed to read Rust ML OCR status:', err);
+      } finally {
+        setMlOcrStatusLoading(false);
+      }
+    })();
+    mlOcrStatusRequestRef.current = request.finally(() => {
+      mlOcrStatusRequestRef.current = null;
+    });
+    return mlOcrStatusRequestRef.current;
   };
 
   const refreshRustOcrModelStatus = async () => {
@@ -167,10 +175,10 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const ownsRun = useRef(false);
   const ownsClipRun = useRef(false);
 
-  const readSemanticStatus = async ({ quiet = false } = {}) => {
+  const readSemanticStatus = async ({ quiet = false, refreshDiagnostics = false } = {}) => {
     if (!quiet) setSemanticStatusLoading(true);
     try {
-      const status = await invoke('get_ml_semantic_status');
+      const status = await invoke('get_ml_semantic_status', { refreshDiagnostics });
       setSemanticStatus(status);
       if (!ownsRun.current) {
         const active = Boolean(status?.backend?.index_run_active);
@@ -192,10 +200,16 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   // The refresh button hands its click event to whatever it calls, so the
   // public wrapper takes no arguments rather than letting an event object
   // arrive where the options object belongs.
-  const refreshSemanticStatus = () => readSemanticStatus();
+  const refreshSemanticStatus = async () => {
+    const [status] = await Promise.all([
+      readSemanticStatus({ refreshDiagnostics: true }),
+      refreshClipBackfill(true),
+    ]);
+    return status;
+  };
 
   useEffect(() => {
-    refreshSemanticStatus();
+    readSemanticStatus();
   }, []);
 
   /**
@@ -372,9 +386,9 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     }
   };
 
-  const refreshClipBackfill = async () => {
+  const refreshClipBackfill = async (allowExpensive = false) => {
     try {
-      setClipBackfill(await getClipBackfillOffer());
+      setClipBackfill(await getClipBackfillOffer(allowExpensive));
     } catch (err) {
       console.warn('Failed to read the CLIP backfill offer:', err);
     }
@@ -396,9 +410,17 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   }, []);
 
   useEffect(() => {
-    refreshMlOcrStatus();
-    const timer = window.setInterval(refreshMlOcrStatus, 5000);
-    return () => window.clearInterval(timer);
+    let cancelled = false;
+    let timer = null;
+    const poll = async () => {
+      await refreshMlOcrStatus();
+      if (!cancelled) timer = window.setTimeout(poll, 5000);
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
   }, []);
 
   const handleDownloadRustOcrModel = async () => {

@@ -235,6 +235,19 @@ pub fn observe_python_served() {
 }
 
 pub fn backend_status(storage: Option<&StorageState>) -> SemanticBackendStatus {
+    backend_status_impl(storage, true)
+}
+
+pub(crate) fn backend_status_without_vector_count(
+    storage: Option<&StorageState>,
+) -> SemanticBackendStatus {
+    backend_status_impl(storage, false)
+}
+
+fn backend_status_impl(
+    storage: Option<&StorageState>,
+    include_vector_count: bool,
+) -> SemanticBackendStatus {
     let guard = OBSERVATIONS
         .read()
         .unwrap_or_else(|error| error.into_inner());
@@ -262,11 +275,15 @@ pub fn backend_status(storage: Option<&StorageState>) -> SemanticBackendStatus {
         last_query_backend,
         last_fallback_reason,
         fallback_count,
-        indexed_vectors: storage.and_then(|storage| {
-            storage
-                .count_query_visible_embeddings(DerivedIndexKind::SemanticText)
-                .ok()
-        }),
+        indexed_vectors: include_vector_count
+            .then(|| {
+                storage.and_then(|storage| {
+                    storage
+                        .count_query_visible_embeddings(DerivedIndexKind::SemanticText)
+                        .ok()
+                })
+            })
+            .flatten(),
         index_backlog: backlog.map(|backlog| backlog.claimable),
         index_stalled: backlog.map(|backlog| backlog.exhausted),
         index_backlog_age_secs: backlog.and_then(|backlog| backlog.oldest_claimable_age_secs),
