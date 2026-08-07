@@ -246,8 +246,6 @@
         "use_rust": "Use Rust OCR",
         "rust_desc": "Runs OCR directly on RGB capture frames in an isolated Rust ML process.",
         "python_desc": "Python OCR is no longer used as the screenshot OCR fallback.",
-        "dml_beta": "DirectML Beta",
-        "dml_beta_desc": "Temporary experimental switch, off by default. It will be removed in favor of the unified DirectML setting.",
         "model_ready": "PP-OCRv5 Mobile is installed",
         "model_missing": "PP-OCRv5 Mobile must be installed",
         "model_bundled": "PP-OCRv5 Mobile is bundled with CarbonPaper",
@@ -263,9 +261,9 @@
         "retry_failed": "Retry failed screenshots ({{count}})"
       },
       "dml": {
-        "title": "OCR inference acceleration",
+        "title": "DirectML inference acceleration",
         "label": "Use DirectML for inference",
-        "description": "When enabled, uses GPU for OCR inference acceleration; requires DirectX 12 compatible GPU",
+        "description": "When enabled, uses the GPU for DirectML-capable OCR and vector inference; requires a DirectX 12 compatible GPU",
         "changed_notice": "DirectML changes take effect when the monitor service restarts",
         "notice": "Note: Running DirectML on the primary GPU may impact gaming performance.",
         "gpu_select": "Select GPU device",
@@ -346,6 +344,25 @@
         "run_stopping": "Stopping. The run ends once the current image finishes.",
         "run_done": "Indexed {{indexed}} image(s); {{remaining}} still waiting.",
         "run_skipped": "This run did not start: {{reason}}."
+      },
+      "classification_backend": {
+        "title": "Automatic screenshot classification",
+        "label": "Use Rust for BGE classification inference",
+        "description": "BGE-small-zh matches window titles and, when needed, OCR text against classification anchors. The result is stored on the screenshot and used by category filters and task summaries.",
+        "rollback_note": "When off, BGE runs in the local Python runtime again. Classification rules, existing categories, and learned anchors are unchanged.",
+        "selected": "Selected runtime",
+        "active": "Active monitor runtime",
+        "runtime_rust": "Rust (default)",
+        "runtime_python": "Python (rollback)",
+        "runtime_stopped": "Not running",
+        "last_inference": "Last inference served by",
+        "served_rust": "Rust",
+        "served_python": "Python",
+        "served_unknown": "No classification since startup",
+        "successes": "Rust successes",
+        "fallbacks": "Automatic fallbacks",
+        "last_reason": "Last Rust failure",
+        "changed_notice": "The classification runtime takes effect after the monitor service restarts"
       },
       "onnx": {
         "title": "ONNX Inference (Experimental)",

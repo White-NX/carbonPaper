@@ -19,7 +19,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -64,6 +64,10 @@ pub struct SemanticRuntimeStatus {
     /// their own schedules and each has its own rollback lever: a user reading
     /// one field could not tell which of the two it described.
     pub clip_backend: crate::clip_query::ClipBackendStatus,
+    /// BGE automatic-classification inference selection and fallback history.
+    /// Classification has no derived index, so its diagnostic is only runtime
+    /// ownership, the last backend that served it, and the last Rust failure.
+    pub classification_backend: crate::classification_runtime::ClassificationBackendStatus,
 }
 
 const BACKEND_DIAGNOSTIC_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -453,25 +457,46 @@ impl SemanticRuntimeState {
         let deadline = Instant::now() + timeout;
         let _request_guard =
             acquire_request_slot(&self.request_gate, deadline, request.request_id()).await?;
+        // Re-read game mode after waiting for the single request slot. A BGE
+        // chunk can queue while another model is running, and suppression may
+        // begin during that wait. Using the earlier value here could start a
+        // fresh DirectML worker after game mode had already taken the GPU back.
+        let prefer_directml = directml_allowed_for_request(&app, prefer_directml);
         let model = request_model(&request);
-        let provider = match self.select_provider(&app, prefer_directml, model).await {
+        let mut provider = match self.select_provider(&app, prefer_directml, model).await {
             Ok(provider) => provider,
             Err(error) => {
-                self.disable_directml_for_session(&error);
-                self.restart_process("directml_startup_fallback");
+                if directml_allowed_for_request(&app, true) {
+                    self.disable_directml_for_session(&error);
+                    self.restart_process("directml_startup_fallback");
+                } else {
+                    self.stop_if_directml();
+                }
                 return self
                     .send_once(&app, MlProvider::Cpu, request, body, deadline)
                     .await;
             }
         };
+        // Suppression can also arrive while a cold DirectML worker is starting.
+        // Tear that worker down before submitting the request and continue on
+        // CPU without treating an intentional game-mode transition as a broken
+        // DirectML session.
+        if provider == MlProvider::DirectMl && !directml_allowed_for_request(&app, true) {
+            self.stop_if_directml();
+            provider = MlProvider::Cpu;
+        }
         let first = self
             .send_once(&app, provider, request.clone(), body.clone(), deadline)
             .await;
         if provider == MlProvider::DirectMl {
             if let Err(error) = &first {
                 if should_fallback_from_directml(error) {
-                    self.disable_directml_for_session(error);
-                    self.restart_process("directml_fallback");
+                    if directml_allowed_for_request(&app, true) {
+                        self.disable_directml_for_session(error);
+                        self.restart_process("directml_fallback");
+                    } else {
+                        self.stop_if_directml();
+                    }
                     return self
                         .send_once(&app, MlProvider::Cpu, request, body, deadline)
                         .await;
@@ -664,6 +689,7 @@ impl SemanticRuntimeState {
             directml_disabled_for_session: inner.directml_disabled_for_session,
             backend: crate::semantic_query::backend_status(None),
             clip_backend: crate::clip_query::backend_status(None),
+            classification_backend: crate::classification_runtime::backend_status(None),
         }
     }
 
@@ -673,6 +699,28 @@ impl SemanticRuntimeState {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         self.stop_locked();
+    }
+
+    /// Stop a resident DirectML worker when game mode takes the GPU back.
+    /// CPU workers are left alone because suppression targets GPU contention,
+    /// and killing a CPU worker would only add an avoidable cold start later.
+    pub fn stop_if_directml(&self) -> bool {
+        let _lifecycle_guard = self
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let is_directml = self
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .process
+            .as_ref()
+            .map(|process| process.provider == MlProvider::DirectMl)
+            .unwrap_or(false);
+        if is_directml {
+            self.stop_locked();
+        }
+        is_directml
     }
 
     fn stop_locked(&self) {
@@ -694,12 +742,22 @@ impl SemanticRuntimeState {
     fn ensure_process(
         &self,
         app: &AppHandle,
-        provider: MlProvider,
+        requested_provider: MlProvider,
     ) -> Result<Arc<SemanticMlChild>, String> {
         let _guard = self
             .lifecycle_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        // This is the last provider decision before a process can be reused or
+        // spawned. Keeping it inside the lifecycle lock closes the remaining
+        // gap between the async request-level check and worker startup.
+        let provider = if requested_provider == MlProvider::DirectMl
+            && !directml_allowed_for_request(app, true)
+        {
+            MlProvider::Cpu
+        } else {
+            requested_provider
+        };
         {
             let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(process) = &inner.process {
@@ -972,12 +1030,12 @@ pub const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// they point here rather than restating it — so an engine that one day caches
 /// two models invalidates one paragraph instead of seven.
 ///
-/// Both background loops therefore claim this before doing anything that
-/// touches the worker: capture indexing (`minilm_index.rs`, MiniLM) and Smart
-/// Cluster scoring (`smart_cluster_scoring.rs`, MiniLM anchors then the
-/// cross-encoder). It lives here rather than in either module because neither
-/// owns the other, and a guard private to one of them is exactly the shape this
-/// started as.
+/// Every background model batch therefore claims this before touching the
+/// worker: MiniLM capture indexing, CLIP image indexing, BGE automatic
+/// classification, and Smart Cluster scoring (MiniLM anchors followed by the
+/// cross-encoder). It lives here rather than in one of those modules because
+/// none owns the others, and a guard private to any one path would recreate the
+/// same model-thrashing bug at the next boundary.
 pub static BACKGROUND_PASS_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Wait for exclusive use of the single semantic worker, inside the caller's own
@@ -1105,6 +1163,13 @@ fn route_provider(
             MlProvider::Cpu
         }
     })
+}
+
+fn directml_allowed_for_request(app: &AppHandle, requested: bool) -> bool {
+    requested
+        && app
+            .state::<crate::monitor::MonitorState>()
+            .allows_directml(true)
 }
 
 fn response_request_id(response: &MlResponse) -> Option<u64> {
@@ -1282,12 +1347,15 @@ fn assign_kill_on_close_job(child: &Child) -> Result<SemanticJobHandle, String> 
 #[tauri::command]
 pub async fn get_ml_semantic_status(
     state: tauri::State<'_, Arc<SemanticRuntimeState>>,
+    monitor: tauri::State<'_, crate::monitor::MonitorState>,
     storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
     index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
     clip_run: tauri::State<'_, Arc<crate::clip_index::ClipIndexRunState>>,
     refresh_diagnostics: Option<bool>,
 ) -> Result<SemanticRuntimeStatus, String> {
     let mut status = state.status();
+    status.classification_backend =
+        crate::classification_runtime::backend_status(monitor.active_classification_runtime());
     // Read before the blocking call below, so a run that finishes while the
     // ledger read is queued behind the database mutex is not reported as still
     // going. Erring towards "finished" is the safe direction: the settings
@@ -1404,10 +1472,14 @@ pub fn get_background_index_progress(
 pub fn restart_ml_semantic_worker(
     window: tauri::Window,
     state: tauri::State<'_, Arc<SemanticRuntimeState>>,
+    monitor: tauri::State<'_, crate::monitor::MonitorState>,
 ) -> Result<SemanticRuntimeStatus, String> {
     crate::commands::check_main_window(&window)?;
     state.stop();
-    Ok(state.status())
+    let mut status = state.status();
+    status.classification_backend =
+        crate::classification_runtime::backend_status(monitor.active_classification_runtime());
+    Ok(status)
 }
 
 #[cfg(test)]

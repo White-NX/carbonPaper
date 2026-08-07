@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, ChevronDown, Cpu, Database, Image as ImageIcon, Monitor, RefreshCw, Zap } from 'lucide-react';
+import { AlertTriangle, ChevronDown, Cpu, Database, Image as ImageIcon, Monitor, RefreshCw, Tags, Zap } from 'lucide-react';
 import SettingsHelpTooltip from '../SettingsHelpTooltip';
 import { SettingsSwitch } from '../SettingsControls';
 import { formatEstimate } from '../../ClipBackfillDialog';
@@ -58,21 +58,6 @@ export function OcrEngineCard({
               '隔离的 Rust ML 进程直接读取 RGB 捕获帧。',
             )}
           </p>
-        </div>
-
-        <div className="flex items-center justify-between gap-4">
-            <div className="flex-1 min-w-0">
-              <p className="text-sm text-ide-text font-medium">
-                {t('settings.advanced.rust_ocr.dml_beta', 'DirectML Beta')}
-              </p>
-              <p className="text-xs text-ide-muted mt-1">
-                {t('settings.advanced.rust_ocr.dml_beta_desc', '临时实验开关，默认关闭；未来会废弃并合并到统一的 DirectML 设置。')}
-              </p>
-            </div>
-            <SettingsSwitch
-              checked={Boolean(config.rust_ocr_dml_beta)}
-              onChange={() => onToggle('rust_ocr_dml_beta')}
-            />
         </div>
 
         <div className="flex items-center justify-between gap-4 rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3">
@@ -633,6 +618,98 @@ export function ClipBackendCard({
             )}
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+export function ClassificationBackendCard({
+  config,
+  status,
+  monitorStatus,
+  runtimeChanged,
+  onToggleRust,
+  onRestartMonitor,
+  onClearChanged,
+}) {
+  const { t } = useTranslation();
+  const usesRust = (config.classification_runtime || 'rust') === 'rust';
+  const backend = status?.classification_backend;
+  const servedLabel = {
+    rust: t('settings.advanced.classification_backend.served_rust'),
+    python: t('settings.advanced.classification_backend.served_python'),
+  }[backend?.last_backend] || t('settings.advanced.classification_backend.served_unknown');
+  const activeLabel = {
+    rust: t('settings.advanced.classification_backend.runtime_rust'),
+    python: t('settings.advanced.classification_backend.runtime_python'),
+  }[backend?.active_runtime] || t('settings.advanced.classification_backend.runtime_stopped');
+
+  return (
+    <div className="space-y-3">
+      <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
+        <Tags className="w-4 h-4" />
+        {t('settings.advanced.classification_backend.title')}
+      </label>
+
+      <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex-1 min-w-0">
+            <p className="text-sm text-ide-text font-medium">
+              {t('settings.advanced.classification_backend.label')}
+            </p>
+            <p className="text-xs text-ide-muted mt-1">
+              {t('settings.advanced.classification_backend.description')}
+            </p>
+            <p className="text-xs text-ide-muted mt-1">
+              {t('settings.advanced.classification_backend.rollback_note')}
+            </p>
+          </div>
+          <SettingsSwitch checked={usesRust} onChange={() => onToggleRust(!usesRust)} />
+        </div>
+
+        <div className="rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3 space-y-2">
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+            <span className="text-ide-muted">
+              {t('settings.advanced.classification_backend.selected')}
+            </span>
+            <span className="text-ide-text text-right">
+              {usesRust
+                ? t('settings.advanced.classification_backend.runtime_rust')
+                : t('settings.advanced.classification_backend.runtime_python')}
+            </span>
+            <span className="text-ide-muted">
+              {t('settings.advanced.classification_backend.last_inference')}
+            </span>
+            <span className="text-ide-text text-right">{servedLabel}</span>
+            <span className="text-ide-muted">
+              {t('settings.advanced.classification_backend.active')}
+            </span>
+            <span className="text-ide-text text-right">{activeLabel}</span>
+            <span className="text-ide-muted">
+              {t('settings.advanced.classification_backend.successes')}
+            </span>
+            <span className="text-ide-text text-right">{backend?.success_count ?? 0}</span>
+            <span className="text-ide-muted">
+              {t('settings.advanced.classification_backend.fallbacks')}
+            </span>
+            <span className="text-ide-text text-right">{backend?.fallback_count ?? 0}</span>
+          </div>
+          {backend?.last_error && (
+            <p className="text-[11px] text-ide-warning-muted leading-snug break-words">
+              {t('settings.advanced.classification_backend.last_reason')}: {backend.last_error}
+            </p>
+          )}
+        </div>
+
+        {runtimeChanged && (
+          <ChangedNotice
+            monitorStatus={monitorStatus}
+            onRestartMonitor={onRestartMonitor}
+            onClearChanged={onClearChanged}
+          >
+            {t('settings.advanced.classification_backend.changed_notice')}
+          </ChangedNotice>
+        )}
       </div>
     </div>
   );

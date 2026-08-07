@@ -24,6 +24,20 @@ from .worker_supervisor import WorkerSupervisor, attach_response_metadata
 logger = logging.getLogger(__name__)
 WORKER_PROTOCOL_VERSION = 2
 
+_CLASSIFICATION_SCHEDULING_YIELDS = (
+    "foreground_busy:",
+    "background_busy:",
+)
+
+
+class _PostprocessDeferred(RuntimeError):
+    """The job yielded its model slot and must remain durably pending."""
+
+
+def _is_classification_scheduling_yield(error: Exception) -> bool:
+    message = str(error)
+    return any(marker in message for marker in _CLASSIFICATION_SCHEDULING_YIELDS)
+
 
 def _python_owns_clip_encoding() -> bool:
     """Return the CLIP capture owner latched into this worker at spawn."""
@@ -48,6 +62,7 @@ class OcrPostprocessQueue:
         self.dropped = 0
         self.processed = 0
         self.failed = 0
+        self.deferred = 0
         self.vector_failed = 0
         self.vector_retry_enqueued = 0
         self.last_indexing_error: Optional[str] = None
@@ -116,6 +131,47 @@ class OcrPostprocessQueue:
                         pass
                 self._handle_job(job)
                 self.processed += 1
+            except _PostprocessDeferred as exc:
+                self.deferred += 1
+                persisted = False
+                if job.get("_persistent_postprocess"):
+                    try:
+                        from storage_client import get_storage_client
+                        sc = get_storage_client()
+                        if sc:
+                            persisted = bool(
+                                sc.set_ocr_postprocess_status(
+                                    int(job.get("screenshot_id")), "pending", str(exc)
+                                )
+                            )
+                    except Exception:
+                        logger.warning(
+                            "[DIAG:ocr_postprocess] failed to persist deferred state screenshot_id=%s",
+                            job.get("screenshot_id"),
+                            exc_info=True,
+                        )
+                if not persisted and job.get("_persistent_postprocess"):
+                    # Storage trouble should not strand the row in `processing`.
+                    # This fallback may charge one ordinary retry, but preserves
+                    # the work when the preferred no-penalty transition failed.
+                    try:
+                        from storage_client import get_storage_client
+                        sc = get_storage_client()
+                        if sc:
+                            sc.record_ocr_postprocess_retry(
+                                int(job.get("screenshot_id")), str(exc)
+                            )
+                    except Exception:
+                        logger.warning(
+                            "[DIAG:ocr_postprocess] failed to persist deferred retry screenshot_id=%s",
+                            job.get("screenshot_id"),
+                            exc_info=True,
+                        )
+                logger.info(
+                    "[DIAG:ocr_postprocess] deferred screenshot_id=%s reason=%s",
+                    job.get("screenshot_id"),
+                    exc,
+                )
             except Exception as exc:
                 self.failed += 1
                 if job.get("_persistent_postprocess"):
@@ -275,6 +331,8 @@ class OcrPostprocessQueue:
                     category_confidence,
                 )
             except Exception as exc:
+                if _is_classification_scheduling_yield(exc):
+                    raise _PostprocessDeferred(str(exc)) from exc
                 logger.warning("Classification failed: %s", exc)
 
         logger.info(
@@ -329,6 +387,7 @@ class OcrPostprocessQueue:
             "dropped": self.dropped,
             "processed": self.processed,
             "failed": self.failed,
+            "deferred": self.deferred,
             "vector_failed": self.vector_failed,
             "vector_retry_enqueued": self.vector_retry_enqueued,
             "vector_retry_backlog_count": backlog_count,

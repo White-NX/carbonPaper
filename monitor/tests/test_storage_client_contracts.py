@@ -121,6 +121,47 @@ def test_storage_client_smart_cluster_reverse_ipc_payload_contract():
     ]
 
 
+def test_storage_client_bge_bridge_payload_and_retry_contract():
+    client = sc.StorageClient("test-pipe")
+    calls = []
+    responses = [
+        {"status": "success", "data": {"dimensions": 2, "vectors": [[0.0, 1.0]]}},
+        {"status": "success", "data": {"recorded": True}},
+        {"status": "success", "data": {"recorded": True}},
+    ]
+
+    def fake_send(request, timeout=sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS):
+        calls.append((request, timeout))
+        return responses.pop(0)
+
+    client._send_request = fake_send
+
+    assert client.embed_bge_texts(["alpha"]) == {
+        "dimensions": 2,
+        "vectors": [[0.0, 1.0]],
+    }
+    client.record_classification_python_fallback("worker_stopped: test")
+    client.record_classification_python_inference()
+
+    assert calls == [
+        ({"command": "bge_embed_texts", "texts": ["alpha"]}, 150),
+        (
+            {
+                "command": "classification_record_python_fallback",
+                "error": "worker_stopped: test",
+            },
+            sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS,
+        ),
+        (
+            {"command": "classification_record_python_inference"},
+            sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS,
+        ),
+    ]
+    assert "bge_embed_texts" in sc.READ_RETRY_COMMANDS
+    assert "classification_record_python_fallback" not in sc.SAFE_RETRY_AFTER_SEND_COMMANDS
+    assert "classification_record_python_inference" not in sc.SAFE_RETRY_AFTER_SEND_COMMANDS
+
+
 def test_the_retired_minilm_mirror_commands_are_not_retried_as_idempotent():
     """M2.5 step 5 removed the Python→Rust MiniLM mirror in both directions.
 

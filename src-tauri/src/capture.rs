@@ -1660,10 +1660,10 @@ async fn process_ocr_async(
     let in_flight_after_inc = capture_state.in_flight_ocr_count.load(Ordering::SeqCst);
 
     let task_started = std::time::Instant::now();
-    let route = OcrRouteConfig::from_registry();
+    let route = OcrRouteConfig::from_app(app);
     let initial_engine = "rust";
-    let initial_provider = if route.use_directml_beta {
-        "directml_beta"
+    let initial_provider = if route.use_directml {
+        "directml"
     } else {
         "cpu"
     };
@@ -1770,14 +1770,14 @@ async fn process_ocr_async(
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OcrRouteConfig {
-    pub(crate) use_directml_beta: bool,
+    pub(crate) use_directml: bool,
 }
 
 impl OcrRouteConfig {
-    pub(crate) fn from_registry() -> Self {
+    pub(crate) fn from_app(app: &tauri::AppHandle) -> Self {
+        let configured = crate::registry_config::get_bool("use_dml").unwrap_or(false);
         Self {
-            use_directml_beta: crate::registry_config::get_bool("rust_ocr_dml_beta")
-                .unwrap_or(false),
+            use_directml: app.state::<MonitorState>().allows_directml(configured),
         }
     }
 }
@@ -1794,11 +1794,15 @@ pub(crate) async fn process_ocr_inner(
     timeout_secs: u32,
     route: OcrRouteConfig,
 ) -> Result<(), String> {
-    let use_directml_beta = route.use_directml_beta;
+    // Re-check suppression at the request boundary in case game mode changed
+    // after the capture task read its initial route.
+    let use_directml = app
+        .state::<MonitorState>()
+        .allows_directml(route.use_directml);
     tracing::info!(
-        "[ML:ROUTER] Raw RGB Rust OCR selected screenshot_id={} dml_beta={} dimensions={}x{} bytes={} timeout_secs={}",
+        "[ML:ROUTER] Raw RGB Rust OCR selected screenshot_id={} directml={} dimensions={}x{} bytes={} timeout_secs={}",
         screenshot_id,
-        use_directml_beta,
+        use_directml,
         rgb_image.width(),
         rgb_image.height(),
         rgb_image.as_raw().len(),
@@ -1813,7 +1817,7 @@ pub(crate) async fn process_ocr_inner(
             app.clone(),
             rgb_image,
             std::time::Duration::from_secs(timeout_secs as u64),
-            use_directml_beta,
+            use_directml,
         )
         .await?;
     let ocr_results = convert_ml_ocr_blocks(output.blocks)?;
@@ -1831,11 +1835,7 @@ pub(crate) async fn process_ocr_inner(
         "completed",
         Some("rust"),
         Some("ppocrv5-ch-mobile"),
-        Some(if use_directml_beta {
-            "directml_beta"
-        } else {
-            "cpu"
-        }),
+        Some(if use_directml { "directml" } else { "cpu" }),
         None,
         Some(output.timings.request_total_ms),
     ) {

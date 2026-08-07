@@ -13,6 +13,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [cpuChanged, setCpuChanged] = useState(false);
   const [dmlChanged, setDmlChanged] = useState(false);
   const [onnxChanged, setOnnxChanged] = useState(false);
+  const [classificationRuntimeChanged, setClassificationRuntimeChanged] = useState(false);
   const [gpus, setGpus] = useState([]);
   const [gpuLoading, setGpuLoading] = useState(false);
   const [vacuumRunning, setVacuumRunning] = useState(false);
@@ -251,6 +252,17 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     if (saved) await refreshSemanticStatus();
   };
 
+  const handleToggleRustClassification = async (enabled) => {
+    const newConfig = {
+      ...config,
+      classification_runtime: enabled ? 'rust' : 'python',
+    };
+    const saved = await saveConfig(newConfig);
+    if (!saved) return;
+    setClassificationRuntimeChanged(true);
+    await refreshSemanticStatus();
+  };
+
   /**
    * Progress of a running manual pass, one event per encoded chunk of four.
    *
@@ -446,17 +458,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     if (key === 'clustering_allow_full_low_memory') {
       await syncOcrConfigToMonitor(newConfig);
     }
-    if (key === 'rust_ocr_dml_beta') {
-      try {
-        await withAuth(
-          () => invoke('restart_ml_ocr_worker'),
-          { autoPrompt: true },
-        );
-      } catch (err) {
-        console.warn('Failed to restart Rust ML OCR worker:', err);
-      }
-      await refreshMlOcrStatus();
-    }
   };
 
   const handleRestartMlOcr = async () => {
@@ -534,6 +535,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     cpuChanged,
     dmlChanged,
     onnxChanged,
+    classificationRuntimeChanged,
     gpus,
     gpuLoading,
     vacuumRunning,
@@ -562,6 +564,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     clearCpuChanged: () => setCpuChanged(false),
     clearDmlChanged: () => setDmlChanged(false),
     clearOnnxChanged: () => setOnnxChanged(false),
+    clearClassificationRuntimeChanged: () => setClassificationRuntimeChanged(false),
     handleToggle,
     handleCpuPercentChange,
     handleOcrTimeoutDraftChange,
@@ -575,6 +578,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     handleRunSemanticIndexNow,
     handleStopSemanticIndex,
     handleToggleRustClipIndex,
+    handleToggleRustClassification,
     handleRunClipIndexNow,
     handleStopClipIndex,
     refreshSemanticStatus,
