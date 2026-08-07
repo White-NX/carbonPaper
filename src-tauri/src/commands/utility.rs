@@ -121,6 +121,56 @@ pub fn close_process(window: tauri::Window) -> Result<(), String> {
     std::process::exit(0);
 }
 
+/// One registry-backed backend-selection enum.
+///
+/// `get_advanced_config` and `set_advanced_config` both walk [`BACKEND_SELECTIONS`],
+/// so a capability cannot end up readable but not writable. The CLIP pair
+/// shipped exactly that way: `clip_query.rs` read `clip_runtime` and
+/// `clip_index` from the registry while nothing in the app ever wrote them, so
+/// the settings switch saved a value that was silently dropped and sprang back
+/// to Rust the next time the dialog was opened, and the documented one-release
+/// rollback was reachable only by hand-editing the registry.
+struct BackendSelection {
+    /// Registry value name, and the JSON key the settings panel uses.
+    key: &'static str,
+    /// Current selection, already normalized to the shipped default when the
+    /// value is absent or names a backend that no longer exists.
+    read: fn() -> String,
+    /// Whether a requested value names a backend that exists.
+    accepts: fn(&str) -> bool,
+}
+
+/// M2.5 per-capability backend selection. Enums, not booleans, because
+/// inference runtime and index ownership cut over at different times.
+///
+/// The `*_runtime` keys carry one caveat the `*_index` keys do not: they are
+/// handed to the Python child process as environment variables when the monitor
+/// spawns, so rolling inference back also takes a monitor restart before the
+/// child honours it. Index ownership is re-read per query and takes effect at
+/// once.
+const BACKEND_SELECTIONS: &[BackendSelection] = &[
+    BackendSelection {
+        key: "semantic_runtime",
+        read: crate::semantic_query::semantic_runtime_backend,
+        accepts: crate::semantic_query::is_selectable_semantic_runtime,
+    },
+    BackendSelection {
+        key: "semantic_index",
+        read: crate::semantic_query::semantic_index_backend,
+        accepts: crate::semantic_query::is_selectable_semantic_index,
+    },
+    BackendSelection {
+        key: "clip_runtime",
+        read: crate::clip_query::clip_runtime,
+        accepts: crate::clip_query::is_selectable_clip_runtime,
+    },
+    BackendSelection {
+        key: "clip_index",
+        read: crate::clip_query::clip_index_backend,
+        accepts: crate::clip_query::is_selectable_clip_index,
+    },
+];
+
 /// Returns advanced runtime configuration as a JSON object.
 ///
 /// Authentication: not required; the object contains preferences but no secrets.
@@ -144,12 +194,8 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         registry_config::get_bool("clustering_allow_full_low_memory").unwrap_or(false);
     let network_enabled = registry_config::get_bool("network_enabled").unwrap_or(true);
     let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
-    // M2.5 per-capability backend selection. Enums, not booleans, because
-    // inference runtime and index ownership cut over at different times.
-    let semantic_runtime = crate::semantic_query::semantic_runtime_backend();
-    let semantic_index = crate::semantic_query::semantic_index_backend();
 
-    Ok(serde_json::json!({
+    let mut config = serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
         "cpu_limit_percent": cpu_limit_percent,
         "ocr_timeout_secs": ocr_timeout_secs,
@@ -164,9 +210,21 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "clustering_allow_full_low_memory": clustering_allow_full_low_memory,
         "network_enabled": network_enabled,
         "use_onnx": use_onnx,
-        "semantic_runtime": semantic_runtime,
-        "semantic_index": semantic_index,
-    }))
+    });
+    // Every backend selection is reported, including the ones only a developer
+    // would change. A settings card that reads a key this object omits sees
+    // `undefined`, falls back to the shipped default, and renders a switch that
+    // does not reflect what was saved.
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| "advanced config is not a JSON object".to_string())?;
+    for selection in BACKEND_SELECTIONS {
+        object.insert(
+            selection.key.to_string(),
+            serde_json::Value::String((selection.read)()),
+        );
+    }
+    Ok(config)
 }
 
 /// Applies a partial advanced-configuration JSON object.
@@ -236,15 +294,14 @@ pub fn set_advanced_config(
     }
     // M2.5 backend selection. Unknown enum values are ignored so the runtime
     // keeps observably falling back to the previous default. `rust_shadow` was
-    // retired with the step-4 cutover and is no longer accepted.
-    if let Some(v) = config.get("semantic_runtime").and_then(|v| v.as_str()) {
-        if ["python", "rust"].contains(&v) {
-            registry_config::set_string("semantic_runtime", v)?;
-        }
-    }
-    if let Some(v) = config.get("semantic_index").and_then(|v| v.as_str()) {
-        if ["chroma", "dual", "rust"].contains(&v) {
-            registry_config::set_string("semantic_index", v)?;
+    // retired with the step-4 cutover and is no longer accepted. Every
+    // selection walks [`BACKEND_SELECTIONS`], so a capability cannot end up
+    // readable but not writable — which is what the CLIP pair shipped as.
+    for selection in BACKEND_SELECTIONS {
+        if let Some(v) = config.get(selection.key).and_then(|v| v.as_str()) {
+            if (selection.accepts)(v) {
+                registry_config::set_string(selection.key, v)?;
+            }
         }
     }
     Ok(())
@@ -630,7 +687,7 @@ pub fn open_path(
 
 #[cfg(test)]
 mod tests {
-    use super::migrated_enhancement_value;
+    use super::{migrated_enhancement_value, BACKEND_SELECTIONS};
 
     #[test]
     fn test_migrated_enhancement_value() {
@@ -639,5 +696,41 @@ mod tests {
         assert!(migrated_enhancement_value(Some(true), Some(false)));
         assert!(!migrated_enhancement_value(Some(false), Some(false)));
         assert!(!migrated_enhancement_value(None, None));
+    }
+
+    #[test]
+    fn every_rollback_lever_is_in_the_selection_table() {
+        // The regression the table exists for. `clip_runtime` and `clip_index`
+        // were read by `clip_query` and written by nobody, so the switch in the
+        // settings panel saved nothing and rolling visual search back to Python
+        // meant editing the registry by hand.
+        for key in [
+            "semantic_runtime",
+            "semantic_index",
+            "clip_runtime",
+            "clip_index",
+        ] {
+            assert!(
+                BACKEND_SELECTIONS
+                    .iter()
+                    .any(|selection| selection.key == key),
+                "{key} is not in BACKEND_SELECTIONS, so it is neither readable nor writable"
+            );
+        }
+    }
+
+    #[test]
+    fn every_selection_reads_back_a_value_it_would_accept() {
+        // Catches a default that drifts out of its own list of accepted values:
+        // the getter would hand the settings panel a selection the setter then
+        // refuses to store, and the switch would spring back on every save.
+        for selection in BACKEND_SELECTIONS {
+            let current = (selection.read)();
+            assert!(
+                (selection.accepts)(&current),
+                "{} reads back {current}, which set_advanced_config would reject",
+                selection.key
+            );
+        }
     }
 }

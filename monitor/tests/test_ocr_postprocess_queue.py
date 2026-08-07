@@ -1,5 +1,7 @@
+import pytest
+
 import monitor.config as config
-from monitor.worker_process import OcrPostprocessQueue
+from monitor.worker_process import OcrPostprocessQueue, _enqueue_ocr_postprocess
 from ocr_service import OCRService, _parse_ocr_idle_unload_secs
 
 
@@ -41,11 +43,13 @@ class DummyClassifier:
 class DummyStorageClient:
     def __init__(self):
         self.updates = []
+        self.image_fetches = []
 
     def get_temp_image_bytes(self, screenshot_id):
         from PIL import Image
         import io
 
+        self.image_fetches.append(screenshot_id)
         image = Image.new("RGB", (2, 2), color="white")
         buf = io.BytesIO()
         image.save(buf, format="PNG")
@@ -137,7 +141,91 @@ def test_invalid_ocr_idle_unload_value_falls_back_to_default():
     assert _parse_ocr_idle_unload_secs("10") == 30.0
 
 
-def test_vector_indexing_failure_records_retry_backlog():
+@pytest.fixture
+def python_owns_clip(monkeypatch):
+    """Opt this test into the legacy Python CLIP encoder.
+
+    M2.5 step 8 made Rust the only encoder on the capture path unless
+    `CARBONPAPER_CLIP_RUNTIME` says otherwise, so a test that exercises the
+    Python one has to ask for it by name — which is also the arrangement the
+    `clip_runtime = python` rollback puts a real monitor into.
+    """
+    monkeypatch.setenv("CARBONPAPER_CLIP_RUNTIME", "python")
+
+
+def test_rust_owned_postprocess_enqueue_skips_image_fetch(monkeypatch):
+    monkeypatch.delenv("CARBONPAPER_CLIP_RUNTIME", raising=False)
+    storage = DummyStorageClient()
+    postprocess_queue = OcrPostprocessQueue(DummyOcrWorker(), None, maxsize=4)
+    monkeypatch.setattr("storage_client.get_storage_client", lambda: storage)
+
+    result = _enqueue_ocr_postprocess({
+        "screenshot_id": 42,
+        "image_hash": "hash-42",
+        "window_title": "Editor",
+        "process_name": "code.exe",
+        "timestamp": 123,
+        "ocr_text": "classification text",
+    }, postprocess_queue)
+    queued = postprocess_queue._queue.get_nowait()
+    postprocess_queue._queue.task_done()
+
+    assert result["status"] == "success"
+    assert result["postprocess_enqueued"] is True
+    assert storage.image_fetches == []
+    assert queued["image_bytes"] == b""
+
+
+def test_python_owned_postprocess_enqueue_fetches_image(monkeypatch, python_owns_clip):
+    storage = DummyStorageClient()
+    postprocess_queue = OcrPostprocessQueue(DummyOcrWorker(), None, maxsize=4)
+    monkeypatch.setattr("storage_client.get_storage_client", lambda: storage)
+
+    result = _enqueue_ocr_postprocess({
+        "screenshot_id": 43,
+        "image_hash": "hash-43",
+        "window_title": "Editor",
+        "process_name": "code.exe",
+        "timestamp": 124,
+        "ocr_text": "indexed text",
+    }, postprocess_queue)
+    queued = postprocess_queue._queue.get_nowait()
+    postprocess_queue._queue.task_done()
+
+    assert result["status"] == "success"
+    assert result["postprocess_enqueued"] is True
+    assert storage.image_fetches == [43]
+    assert queued["image_bytes"]
+
+
+def test_rust_owned_clip_runtime_skips_python_vector_indexing(monkeypatch):
+    """The step-8 default: Rust encodes, so this path must not encode again.
+
+    Two encoders on one screenshot would embed every capture twice and write
+    conflicting vectors into the one collection they both target. The job is
+    still reported as handled, because nothing failed — the work simply belongs
+    to somebody else now.
+    """
+    monkeypatch.delenv("CARBONPAPER_CLIP_RUNTIME", raising=False)
+    vector_store = SuccessfulVectorStore()
+    queue = OcrPostprocessQueue(DummyVectorWorker(vector_store), None, maxsize=4)
+
+    ok = queue._handle_vector_indexing({
+        "screenshot_id": 42,
+        "image_hash": "hash-42",
+        "window_title": "Editor",
+        "process_name": "code.exe",
+        "timestamp": 123,
+        "ocr_text": "indexed text",
+        "image_bytes": _png_bytes(),
+    })
+
+    assert ok is True
+    assert vector_store.calls == []
+    assert queue.status_snapshot()["vector_failed"] == 0
+
+
+def test_vector_indexing_failure_records_retry_backlog(python_owns_clip):
     queue = OcrPostprocessQueue(DummyVectorWorker(FailingVectorStore()), None, maxsize=4)
 
     ok = queue._handle_vector_indexing({
@@ -158,7 +246,7 @@ def test_vector_indexing_failure_records_retry_backlog():
     assert snapshot["last_indexing_error_at"] is not None
 
 
-def test_vector_retry_enqueues_retry_only_job_without_classification(monkeypatch):
+def test_vector_retry_enqueues_retry_only_job_without_classification(monkeypatch, python_owns_clip):
     vector_store = SuccessfulVectorStore()
     classifier = DummyClassifier()
     storage = DummyStorageClient()

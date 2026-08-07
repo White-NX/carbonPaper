@@ -1863,6 +1863,18 @@ pub(crate) async fn process_ocr_inner(
             error
         );
     }
+    // M2.5 step 8: the same debt for the CLIP image index. Keyed by image hash
+    // rather than screenshot id, because that is what the Chroma collection this
+    // replaces was keyed by and what the migrated rows already carry.
+    if let Err(error) =
+        crate::clip_index::enqueue_captured_screenshot(storage, screenshot_id, image_hash)
+    {
+        tracing::warn!(
+            "[CLIP:INDEX] enqueue failed screenshot_id={}: {}",
+            screenshot_id,
+            error
+        );
+    }
     match enqueue_python_ocr_postprocess(
         app,
         screenshot_id,

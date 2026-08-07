@@ -879,11 +879,10 @@ pub fn reranker_install_status() -> (PathBuf, bool) {
     // The subdirectory comes from the descriptor the loader resolves against,
     // not from a third copy of the literal, so "installed" cannot end up
     // describing a directory the engine never looks in.
-    let subdir = crate::semantic_models::descriptor(
-        crate::ml_protocol::MlSemanticModel::BgeRerankerV2M3,
-    )
-    .subdir
-    .unwrap_or_default();
+    let subdir =
+        crate::semantic_models::descriptor(crate::ml_protocol::MlSemanticModel::BgeRerankerV2M3)
+            .subdir
+            .unwrap_or_default();
     let Some(base) = file_in_local_appdata().map(|dir| dir.join("models").join(subdir)) else {
         return (PathBuf::new(), false);
     };

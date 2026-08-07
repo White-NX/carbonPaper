@@ -1,18 +1,35 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Database, KeyRound, Loader2, ShieldAlert } from 'lucide-react';
-import { getMinilmRebuildStatus } from '../lib/task_api';
+import { Database, Image as ImageIcon, KeyRound, Loader2, ShieldAlert, Wrench } from 'lucide-react';
+import {
+  getClipRebuildStatus,
+  getMaintenanceStatus,
+  getMinilmRebuildStatus,
+} from '../lib/task_api';
 import { requestAuth } from '../lib/auth_api';
 import { cn } from '../lib/utils';
 
 const ACTIVE_POLL_MS = 1000;
 const IDLE_POLL_MS = 3000;
-// Phases whose progress pair drives the bar and the ETA estimate.
+// Phases whose progress pair drives the bar and the ETA estimate. Shared by
+// both migrations: they run the same orchestration out of `migration_support`
+// and therefore report the same phase names.
 const PROGRESS_SOURCES = {
   copying_chroma: ['chroma_processed', 'chroma_total'],
   publishing_write: ['publish_current', 'publish_total'],
   publishing_sync: ['publish_current', 'publish_total'],
   publishing_verify: ['publish_current', 'publish_total'],
+};
+
+/**
+ * Which detailed status to read, keyed by the reason string the backend passes
+ * to `maintenance::enter`. Keeping the two in step is what stops this overlay
+ * from going blank the next time a migration is added: an unrecognised reason
+ * still renders a box, just without progress.
+ */
+const MIGRATION_KINDS = {
+  minilm_migration: { id: 'minilm', icon: Database, read: getMinilmRebuildStatus },
+  clip_migration: { id: 'clip', icon: ImageIcon, read: getClipRebuildStatus },
 };
 
 function formatEta(seconds) {
@@ -26,19 +43,46 @@ function formatEta(seconds) {
 
 /**
  * Full-window, non-dismissable maintenance overlay for the sentinel-triggered
- * MiniLM migration. The run cannot be cancelled: closing the app merely
+ * vector migrations. Neither run can be cancelled: closing the app merely
  * interrupts it, and it resumes on the next launch/unlock.
+ *
+ * Visibility is decided by *maintenance mode*, not by any one migration's
+ * `running` flag. The guard is taken before a run marks itself running and
+ * dropped after it clears that flag, so maintenance strictly contains both
+ * runs — and gating on the outer condition means the app can no longer sit in
+ * maintenance mode with nothing on screen to explain it. That is what the CLIP
+ * migration shipped as until now: it held the guard, rejected the monitor
+ * commands, paused capture, and had no overlay, because this component only
+ * ever polled MiniLM.
  */
-export default function MinilmMigrationOverlay() {
+export default function VectorMigrationOverlay() {
   const { t } = useTranslation();
-  const [status, setStatus] = useState(null);
+  // `{ kind, icon, status }`, or null when the app is not in maintenance mode.
+  const [active, setActive] = useState(null);
   const [reauthenticating, setReauthenticating] = useState(false);
   const samplesRef = useRef([]);
 
   const poll = useCallback(async () => {
     try {
-      const next = await getMinilmRebuildStatus();
-      setStatus(next);
+      const maintenance = await getMaintenanceStatus();
+      if (!maintenance?.active) {
+        setActive(null);
+        samplesRef.current = [];
+        return;
+      }
+      const kind = MIGRATION_KINDS[maintenance.reason];
+      // A detailed read that fails costs the box its progress bar, not its
+      // presence: the app is demonstrably in maintenance mode either way.
+      let next = null;
+      if (kind) {
+        try {
+          next = await kind.read();
+        } catch {
+          next = null;
+        }
+      }
+      setActive({ kind: kind?.id ?? 'unknown', icon: kind?.icon, status: next });
+
       const source = PROGRESS_SOURCES[next?.phase];
       if (next?.running && source) {
         const value = next[source[0]] ?? 0;
@@ -56,24 +100,26 @@ export default function MinilmMigrationOverlay() {
     }
   }, []);
 
+  const running = Boolean(active?.status?.running);
   useEffect(() => {
     let timer;
     let cancelled = false;
     const tick = async () => {
       await poll();
       if (cancelled) return;
-      timer = setTimeout(tick, status?.running ? ACTIVE_POLL_MS : IDLE_POLL_MS);
+      timer = setTimeout(tick, running ? ACTIVE_POLL_MS : IDLE_POLL_MS);
     };
     tick();
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [poll, status?.running]);
+  }, [poll, running]);
 
-  const visible = Boolean(status?.running);
-  if (!visible) return null;
+  if (!active) return null;
 
+  const status = active.status ?? {};
+  const kindKey = `vectorMigration.kinds.${active.kind}`;
   const phase = status.phase || 'starting';
   const source = PROGRESS_SOURCES[phase];
   const current = source ? status[source[0]] ?? 0 : 0;
@@ -94,8 +140,8 @@ export default function MinilmMigrationOverlay() {
   const isPublishSync = phase === 'publishing_sync';
   const errorCount =
     (status.failed ?? 0) + (status.unmappable ?? 0) + (status.discarded ?? 0);
-  const phaseText = t(`minilmMigration.phases.${phase}`, {
-    defaultValue: t('minilmMigration.phases.working'),
+  const phaseText = t(`vectorMigration.phases.${phase}`, {
+    defaultValue: t('vectorMigration.phases.working'),
   });
 
   // This overlay covers AuthMask (z-50), so while the run is stuck in
@@ -112,7 +158,8 @@ export default function MinilmMigrationOverlay() {
     }
   };
 
-  const HeaderIcon = waitingForAuth ? ShieldAlert : Database;
+  const KindIcon = active.icon ?? Wrench;
+  const HeaderIcon = waitingForAuth ? ShieldAlert : KindIcon;
 
   return (
     <div className="absolute inset-0 z-[200] flex flex-col items-center justify-center bg-ide-bg/80 backdrop-blur-sm text-ide-muted">
@@ -126,10 +173,10 @@ export default function MinilmMigrationOverlay() {
           </div>
           <div className="min-w-0">
             <h2 className="text-lg font-semibold text-ide-text">
-              {t('minilmMigration.title')}
+              {t(`${kindKey}.title`)}
             </h2>
             <p className="text-xs text-ide-muted">
-              {t('minilmMigration.subtitle')}
+              {t(`${kindKey}.subtitle`)}
             </p>
           </div>
         </div>
@@ -156,7 +203,7 @@ export default function MinilmMigrationOverlay() {
             </div>
             {eta && (
               <p className="text-xs text-ide-muted">
-                {t('minilmMigration.eta', { eta })}
+                {t('vectorMigration.eta', { eta })}
               </p>
             )}
           </div>
@@ -164,7 +211,7 @@ export default function MinilmMigrationOverlay() {
           {isPublishSync && (
             <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg">
               <p className="text-xs text-amber-400 leading-relaxed">
-                {t('minilmMigration.safeWrite')}
+                {t('vectorMigration.safeWrite')}
               </p>
             </div>
           )}
@@ -172,7 +219,7 @@ export default function MinilmMigrationOverlay() {
           {waitingForAuth && (
             <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg">
               <p className="text-xs text-amber-400 leading-relaxed">
-                {t('minilmMigration.waitingForAuth')}
+                {t('vectorMigration.waitingForAuth')}
               </p>
             </div>
           )}
@@ -180,7 +227,7 @@ export default function MinilmMigrationOverlay() {
           {(errorCount > 0 || status.last_error) && (
             <div className="text-xs px-3 py-2 rounded bg-red-500/10 text-red-400 min-w-0">
               {errorCount > 0 && (
-                <p>{t('minilmMigration.errorCount', { count: errorCount })}</p>
+                <p>{t('vectorMigration.errorCount', { count: errorCount })}</p>
               )}
               {status.last_error && (
                 <p className="truncate" title={status.last_error}>{status.last_error}</p>
@@ -189,7 +236,7 @@ export default function MinilmMigrationOverlay() {
           )}
 
           <p className="text-[11px] text-ide-muted">
-            {t('minilmMigration.blockedHint')}
+            {t('vectorMigration.blockedHint')}
           </p>
         </div>
 
@@ -206,7 +253,7 @@ export default function MinilmMigrationOverlay() {
               ) : (
                 <KeyRound className="w-3.5 h-3.5" />
               )}
-              {t('minilmMigration.reauth')}
+              {t('vectorMigration.reauth')}
             </button>
           </div>
         )}

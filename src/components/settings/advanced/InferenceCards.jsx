@@ -1,8 +1,9 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, ChevronDown, Cpu, Database, Monitor, RefreshCw, Zap } from 'lucide-react';
+import { AlertTriangle, ChevronDown, Cpu, Database, Image as ImageIcon, Monitor, RefreshCw, Zap } from 'lucide-react';
 import SettingsHelpTooltip from '../SettingsHelpTooltip';
 import { SettingsSwitch } from '../SettingsControls';
+import { formatEstimate } from '../../ClipBackfillDialog';
 
 function ChangedNotice({
   children,
@@ -419,6 +420,215 @@ export function SemanticBackendCard({
                 className="shrink-0 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors"
               >
                 {t('settings.advanced.semantic_backend.run_now')}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The M2.5 step-9 counterpart of {@link SemanticBackendCard}, for visual search.
+ *
+ * A separate card rather than a second row inside that one, because the two
+ * govern different searches and roll back independently: this switch is the
+ * main search box's natural-language mode — a text query matched against what a
+ * screenshot *looks like* — while the other is the grouping view's search over
+ * recognised text. A user who could not tell which was which would have no way
+ * to act on either.
+ */
+export function ClipBackendCard({
+  config,
+  status,
+  statusLoading,
+  onToggleRustIndex,
+  onRefresh,
+  onRunIndexNow,
+  onStopIndexNow,
+  indexRunning,
+  indexStopping,
+  indexProgress,
+  indexRun,
+  backfill,
+  backfillBusy,
+  onBackfillDecision,
+}) {
+  const { t } = useTranslation();
+  const backend = status?.clip_backend;
+  const usesRustIndex = (config.clip_index || 'rust') === 'rust';
+  const backlog = backend?.index_backlog ?? 0;
+  const stalled = backend?.index_stalled ?? 0;
+
+  const servedLabel = {
+    rust: t('settings.advanced.clip_backend.served_rust'),
+    python: t('settings.advanced.clip_backend.served_python'),
+  }[backend?.last_query_backend] || t('settings.advanced.clip_backend.served_unknown');
+
+  const progressTotal = indexProgress?.total ?? 0;
+  const progressProcessed = indexProgress?.processed ?? 0;
+  const progressRatio = progressTotal > 0
+    ? Math.min(1, progressProcessed / progressTotal)
+    : null;
+
+  let runMessage = null;
+  if (indexRunning) {
+    if (indexStopping) {
+      runMessage = t('settings.advanced.clip_backend.run_stopping');
+    } else if (indexProgress) {
+      runMessage = t('settings.advanced.clip_backend.run_progress', {
+        processed: progressProcessed,
+        total: progressTotal,
+        indexed: indexProgress.indexed ?? 0,
+      });
+    } else {
+      // Nothing encoded yet: the pass is reading the ledger and loading a
+      // 177 MB model, which is the longest silent stretch of a run.
+      runMessage = t('settings.advanced.clip_backend.run_preparing');
+    }
+  } else if (indexRun) {
+    runMessage = indexRun.started
+      ? t('settings.advanced.clip_backend.run_done', {
+        indexed: indexRun.indexed ?? 0,
+        remaining: indexRun.remaining ?? 0,
+      })
+      : t('settings.advanced.clip_backend.run_skipped', {
+        reason: indexRun.skipped_reason || 'unknown',
+      });
+  }
+
+  return (
+    <div className="space-y-3">
+      <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
+        <ImageIcon className="w-4 h-4" />
+        {t('settings.advanced.clip_backend.title')}
+      </label>
+
+      <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex-1 min-w-0">
+            <p className="text-sm text-ide-text font-medium">
+              {t('settings.advanced.clip_backend.label')}
+            </p>
+            <p className="text-xs text-ide-muted mt-1">
+              {t('settings.advanced.clip_backend.description')}
+            </p>
+            <p className="text-xs text-ide-muted mt-1">
+              {t('settings.advanced.clip_backend.rollback_note')}
+            </p>
+          </div>
+          <SettingsSwitch checked={usesRustIndex} onChange={() => onToggleRustIndex(!usesRustIndex)} />
+        </div>
+
+        <div className="rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-ide-muted">
+              {t('settings.advanced.clip_backend.diagnostic')}
+            </p>
+            <button
+              onClick={onRefresh}
+              disabled={statusLoading}
+              className="p-1.5 text-ide-muted hover:text-ide-text hover:bg-ide-hover rounded transition-colors disabled:opacity-50"
+              title={t('settings.advanced.clip_backend.refresh')}
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${statusLoading ? 'animate-spin' : ''}`} />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+            <span className="text-ide-muted">{t('settings.advanced.clip_backend.last_query')}</span>
+            <span className="text-ide-text text-right">{servedLabel}</span>
+            <span className="text-ide-muted">{t('settings.advanced.clip_backend.indexed')}</span>
+            <span className="text-ide-text text-right">{backend?.indexed_vectors ?? '—'}</span>
+            <span className="text-ide-muted">{t('settings.advanced.clip_backend.backlog')}</span>
+            <span className="text-ide-text text-right">{backend?.index_backlog ?? '—'}</span>
+            {stalled > 0 && (
+              <>
+                <span className="text-ide-muted">{t('settings.advanced.clip_backend.stalled')}</span>
+                <span className="text-ide-warning text-right">{stalled}</span>
+              </>
+            )}
+            <span className="text-ide-muted">{t('settings.advanced.clip_backend.fallbacks')}</span>
+            <span className="text-ide-text text-right">{backend?.fallback_count ?? 0}</span>
+          </div>
+
+          {backend?.last_fallback_reason && (
+            <p className="text-[11px] text-ide-warning-muted leading-snug">
+              {t('settings.advanced.clip_backend.last_reason')}: {backend.last_fallback_reason}
+            </p>
+          )}
+          {backlog > 0 && (
+            <p className="text-[11px] text-ide-muted leading-snug">
+              {t('settings.advanced.clip_backend.backlog_hint')}
+            </p>
+          )}
+          {stalled > 0 && (
+            <p className="text-[11px] text-ide-warning-muted leading-snug">
+              {t('settings.advanced.clip_backend.stalled_hint')}
+            </p>
+          )}
+
+          {/* The backfill decision, kept reversible. The dialog asks once when
+              the migration settles; without a control here, "not now" would be
+              permanent in practice, which is not what the user was told when
+              they chose it. */}
+          {backfill?.migration_settled && (backfill.never_indexed > 0 || backfill.decision) && (
+            <div className="pt-1 flex items-start justify-between gap-3 border-t border-ide-border/40">
+              <p className="text-[11px] text-ide-muted leading-snug flex-1 min-w-0 pt-1">
+                {backfill.decision === 'approved'
+                  ? t('clipBackfill.cardApproved')
+                  : backfill.decision === 'declined'
+                    ? t('clipBackfill.cardDeclined')
+                    : t('clipBackfill.cardPending', {
+                      count: backfill.never_indexed,
+                      estimate: formatEstimate(t, backfill.estimated_seconds) ?? '—',
+                    })}
+              </p>
+              <button
+                onClick={() =>
+                  onBackfillDecision(backfill.decision === 'approved' ? 'declined' : 'approved')
+                }
+                disabled={backfillBusy}
+                className="shrink-0 mt-0.5 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors disabled:opacity-50"
+              >
+                {backfill.decision === 'approved'
+                  ? t('clipBackfill.cardDecline')
+                  : t('clipBackfill.cardApprove')}
+              </button>
+            </div>
+          )}
+
+          <div className="pt-1 flex items-start justify-between gap-3">
+            <div className="flex-1 min-w-0 space-y-1.5">
+              <p className="text-[11px] text-ide-muted leading-snug">
+                {runMessage || t('settings.advanced.clip_backend.run_now_hint')}
+              </p>
+              {indexRunning && progressRatio !== null && (
+                <div className="w-full bg-ide-panel border border-ide-border rounded-full h-1.5 overflow-hidden">
+                  <div
+                    className="bg-ide-accent h-full transition-all duration-300 ease-out"
+                    style={{ width: `${Math.max(2, progressRatio * 100)}%` }}
+                  />
+                </div>
+              )}
+            </div>
+            {indexRunning ? (
+              <button
+                onClick={onStopIndexNow}
+                disabled={indexStopping}
+                className="shrink-0 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {indexStopping
+                  ? t('settings.advanced.clip_backend.run_stop_pending')
+                  : t('settings.advanced.clip_backend.run_stop')}
+              </button>
+            ) : (
+              <button
+                onClick={onRunIndexNow}
+                className="shrink-0 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors"
+              >
+                {t('settings.advanced.clip_backend.run_now')}
               </button>
             )}
           </div>

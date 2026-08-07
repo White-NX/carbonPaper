@@ -140,7 +140,9 @@ where
     for result in results {
         match result {
             Ok(mut part) => merged.append(&mut part),
-            Err(BackgroundReadError::AuthRequired) => return Err(BackgroundReadError::AuthRequired),
+            Err(BackgroundReadError::AuthRequired) => {
+                return Err(BackgroundReadError::AuthRequired)
+            }
             Err(error) if first_error.is_none() => first_error = Some(error),
             Err(_) => {}
         }
@@ -1435,6 +1437,78 @@ impl StorageState {
         .map_err(|e| format!("Failed to count expected CLIP image rows: {}", e))
     }
 
+    /// Every distinct `image_hash` that a CLIP vector may legitimately belong to.
+    ///
+    /// The same population `count_expected_clip_image_rows` counts, returned
+    /// rather than counted. The M2.5 step-7 migration needs it because the
+    /// Chroma `screenshots` collection is keyed by `md5("memory://" +
+    /// image_hash)` and MD5 cannot be inverted: the only way back to a subject
+    /// key is to hash the hashes SQLite already holds and match. An exported id
+    /// that no row here reproduces is an orphan — a screenshot deleted after it
+    /// was indexed — and the importer quarantines it rather than guessing.
+    pub fn list_clip_eligible_image_hashes(&self) -> Result<Vec<String>, String> {
+        let guard = self.get_connection_named("list_clip_eligible_image_hashes")?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT s.image_hash FROM screenshots s
+                 WHERE s.is_deleted = 0
+                   AND EXISTS (
+                       SELECT 1 FROM ocr_results o
+                        WHERE o.screenshot_id = s.id AND o.is_deleted = 0
+                   )",
+            )
+            .map_err(|e| format!("Failed to prepare the CLIP image hash scan: {}", e))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("Failed to scan CLIP image hashes: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read a CLIP image hash: {}", e))
+    }
+
+    /// Active screenshot ids for each of `image_hashes`.
+    ///
+    /// The CLIP index is keyed by image hash, while everything that can answer
+    /// "does this image carry text?" is keyed by screenshot id. In the shipped
+    /// schema `image_hash` is UNIQUE, so each hash resolves to at most one live
+    /// screenshot; the return type is a list because the caller should not have
+    /// to depend on that constraint, and the rows are ordered newest-first so a
+    /// caller that wants one representative gets a defined answer either way.
+    pub(crate) fn map_image_hashes_to_screenshot_ids(
+        &self,
+        image_hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<i64>>, String> {
+        use std::collections::HashMap;
+        if image_hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let guard = self.get_connection_named("map_image_hashes_to_screenshot_ids")?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database connection is None".to_string())?;
+        let placeholders = vec!["?"; image_hashes.len()].join(",");
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT image_hash, id FROM screenshots
+                 WHERE is_deleted = 0 AND image_hash IN ({placeholders})
+                 ORDER BY created_at DESC, id DESC"
+            ))
+            .map_err(|e| format!("Failed to prepare the image hash mapping: {}", e))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(image_hashes.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| format!("Failed to map image hashes: {}", e))?;
+        let mut mapped: HashMap<String, Vec<i64>> = HashMap::new();
+        for row in rows {
+            let (hash, id) = row.map_err(|e| format!("Failed to read a mapped row: {}", e))?;
+            mapped.entry(hash).or_default().push(id);
+        }
+        Ok(mapped)
+    }
+
     pub fn get_index_storage_stats(&self) -> Result<IndexStorageStats, String> {
         Ok(IndexStorageStats {
             screenshots_count: self.count_active_screenshots()?,
@@ -2142,10 +2216,7 @@ impl StorageState {
                     chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
 
                 let mut stmt = conn.prepare(&sql).map_err(|e| {
-                    BackgroundReadError::Other(format!(
-                        "Failed to prepare OCR prefix query: {}",
-                        e
-                    ))
+                    BackgroundReadError::Other(format!("Failed to prepare OCR prefix query: {}", e))
                 })?;
 
                 let rows = stmt
@@ -2177,9 +2248,7 @@ impl StorageState {
         let mut groups: Vec<Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)>> = Vec::new();
         for row in raw_rows {
             match groups.last_mut() {
-                Some(group) if group.last().map(|(id, _, _)| *id) == Some(row.0) => {
-                    group.push(row)
-                }
+                Some(group) if group.last().map(|(id, _, _)| *id) == Some(row.0) => group.push(row),
                 _ => groups.push(vec![row]),
             }
         }

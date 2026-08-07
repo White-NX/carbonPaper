@@ -650,6 +650,72 @@ def _handle_command_impl(req: dict):
             logger.error('presidio_check_idle failed: %s', e)
             return {'error': str(e)}
 
+    # ----- CLIP image-vector snapshot export (M2.5 step 7 migration) -----
+    #
+    # The counterpart to `start_task_vectors_export` and friends, for the
+    # `screenshots` collection instead of the MiniLM hot layer. Rust drives the
+    # whole sequence and holds the durable cursor; these four calls are stateless
+    # apart from the snapshot registry the vector store owns.
+    #
+    # Unlike the MiniLM exports, these cannot be served from this process. The
+    # clustering manager those forward to lives here; the CLIP collection lives
+    # in the model worker child, and `_ocr_worker` is only a proxy to it. So the
+    # store's availability is not something this handler can test — it forwards,
+    # and the child answers.
+    #
+    # Auth is required for the same reason the clustering exports require it:
+    # a snapshot is a bulk read of derived user content, and an export id is a
+    # capability to page through it.
+    if cmd in (
+        'start_clip_vectors_export',
+        'get_clip_vectors_export_status',
+        'export_clip_vectors_page',
+        'finish_clip_vectors_export',
+    ):
+        if not _ocr_worker or not _ocr_worker.enable_vector_store:
+            return {'error': 'Vector store not enabled'}
+        if not _sync_clustering_scheduler_auth_gate(force=True):
+            return {'error': 'AUTH_REQUIRED: the CLIP export requires an unlocked session'}
+        export_id = req.get('export_id', '')
+        try:
+            if cmd == 'start_clip_vectors_export':
+                return {'status': 'success', **_ocr_worker.start_clip_vectors_export(export_id)}
+            if cmd == 'get_clip_vectors_export_status':
+                return {'status': 'success', **_ocr_worker.get_clip_vectors_export_status(export_id)}
+            if cmd == 'export_clip_vectors_page':
+                return {
+                    'status': 'success',
+                    **_ocr_worker.export_clip_vectors_page(
+                        export_id,
+                        cursor=req.get('cursor', 0),
+                        limit=req.get('limit', 128),
+                    ),
+                }
+            return {
+                'status': 'success',
+                'released': _ocr_worker.finish_clip_vectors_export(export_id),
+            }
+        except Exception as exc:
+            logger.exception('%s failed', cmd)
+            return {'error': str(exc)}
+
+    # ----- Rust-encoded CLIP vector mirror (M2.5 step 8) -----
+    #
+    # Rust owns CLIP inference on the capture path now; this is where the
+    # finished vector lands so the `clip_runtime = python` rollback keeps
+    # working. Same auth rule as the export: it writes derived user content.
+    if cmd == 'upsert_clip_vectors':
+        if not _ocr_worker or not _ocr_worker.enable_vector_store:
+            return {'error': 'Vector store not enabled'}
+        if not _sync_clustering_scheduler_auth_gate(force=True):
+            return {'error': 'AUTH_REQUIRED: the CLIP mirror requires an unlocked session'}
+        try:
+            written = _ocr_worker.upsert_clip_vectors(req.get('records') or [])
+            return {'status': 'success', 'written': written}
+        except Exception as exc:
+            logger.exception('upsert_clip_vectors failed')
+            return {'error': str(exc)}
+
     clustering_response = handle_clustering_command(
         req,
         scheduler=_clustering_scheduler,

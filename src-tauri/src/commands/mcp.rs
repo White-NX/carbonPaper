@@ -244,28 +244,43 @@ pub async fn mcp_get_status(
     monitor_state: tauri::State<'_, crate::monitor::MonitorState>,
     ml_state: tauri::State<'_, Arc<crate::ml_runtime::MlRuntimeState>>,
 ) -> Result<serde_json::Value, String> {
-    let policy = storage_state.load_policy()?;
-    let enabled = policy
-        .get("mcp_enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let port = mcp_server::get_port(&storage_state);
-    let running = mcp_state.is_running();
-    let last_error = mcp_state.get_last_error();
-    let privacy_acknowledged = mcp_privacy_acknowledged_from_policy_or_db(&storage_state, &policy);
     let python_running = monitor_state
         .process
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .is_some();
-    let ml_status = ml_state.status(storage_state.count_failed_ocr().unwrap_or(0));
-    let app_for_model_status = app.clone();
-    let ocr_model_status = tokio::task::spawn_blocking(move || {
-        crate::ml_runtime::ocr_model_status(&app_for_model_status)
+    let storage_for_status = storage_state.inner().clone();
+    let app_for_status = app.clone();
+    // Policy/model inspection and every database read stay off the async IPC
+    // dispatcher. The tool list itself is static; this is diagnostic status.
+    let status_reads = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let policy = storage_for_status.load_policy()?;
+        let port = mcp_server::port_from_policy(&policy);
+        let privacy_acknowledged =
+            mcp_privacy_acknowledged_from_policy_or_db(&storage_for_status, &policy);
+        let search_nl_backend = clip_search_backend(&storage_for_status, python_running);
+        let failed_ocr = storage_for_status.count_failed_ocr().unwrap_or(0);
+        let ocr_model_status = crate::ml_runtime::ocr_model_status(&app_for_status).ok();
+        Ok((
+            policy,
+            port,
+            privacy_acknowledged,
+            search_nl_backend,
+            failed_ocr,
+            ocr_model_status,
+        ))
     })
     .await
-    .ok()
-    .and_then(Result::ok);
+    .map_err(|error| format!("Failed to read MCP status: {error}"))?;
+    let (policy, port, privacy_acknowledged, search_nl_backend, failed_ocr, ocr_model_status) =
+        status_reads?;
+    let enabled = policy
+        .get("mcp_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let running = mcp_state.is_running();
+    let last_error = mcp_state.get_last_error();
+    let ml_status = ml_state.status(failed_ocr);
     let state = if !enabled {
         "disabled"
     } else if running {
@@ -304,8 +319,19 @@ pub async fn mcp_get_status(
             "ocr_model_source": ocr_model_status.as_ref().map(|status| status.source.as_str()),
             "ocr_model_verified": ocr_model_status.as_ref().map(|status| status.installed).unwrap_or(false),
             "search_ocr_text": true,
-            "search_nl": python_running,
-            "search_nl_disabled_reason": if python_running { serde_json::Value::Null } else { serde_json::json!("python_monitor_not_running") }
+            // M2.5 step 9: two backends can answer this now, so the capability
+            // flag stops being "is Python up". The reason string is what the
+            // skill shows a user, so it names the backend that is actually
+            // missing rather than the one that used to be the only option.
+            "search_nl": search_nl_backend.is_some(),
+            "search_nl_backend": search_nl_backend,
+            "search_nl_disabled_reason": if search_nl_backend.is_some() {
+                serde_json::Value::Null
+            } else if python_running {
+                serde_json::json!("clip_index_unavailable")
+            } else {
+                serde_json::json!("python_monitor_not_running")
+            }
         }
     }))
 }
@@ -455,4 +481,31 @@ pub async fn mcp_set_sensitive_filter_config(
         serde_json::to_value(&config).map_err(|e| format!("Failed to serialize config: {}", e))?;
     policy_as_object_mut(&mut policy)?.insert("sensitive_filter".into(), config_value);
     storage_state.save_policy(&policy)
+}
+
+/// Which backend can answer a natural-language image search right now, or
+/// `None` when neither can.
+///
+/// Deliberately a *readiness diagnostic* rather than a configuration one. The
+/// Rust path can be selected and still stand down — for an unfinished step-7
+/// migration or an empty index. The MCP tool table remains static; this check
+/// only reports which backend would serve a call now. It mirrors the refusals
+/// in `clip_query::try_rust_clip_query` without running a query. Callers must
+/// keep this synchronous read on a blocking thread.
+fn clip_search_backend(storage: &StorageState, python_running: bool) -> Option<&'static str> {
+    let rust_selected = crate::clip_query::clip_index_backend() == "rust"
+        && crate::clip_query::clip_runtime() == "rust";
+    let rust_ready = rust_selected
+        && !crate::maintenance::is_active()
+        && crate::clip_query::migration_settled(storage)
+        && storage
+            .has_query_visible_embeddings(crate::storage::DerivedIndexKind::ClipImage)
+            .unwrap_or(false);
+    if rust_ready {
+        return Some("rust");
+    }
+    if python_running {
+        return Some("python");
+    }
+    None
 }

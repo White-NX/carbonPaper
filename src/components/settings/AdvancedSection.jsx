@@ -4,7 +4,7 @@ import AdvancedWarning from './advanced/AdvancedWarning';
 import ClusteringTechnicalCard from './advanced/ClusteringTechnicalCard';
 import CpuLimitCard from './advanced/CpuLimitCard';
 import DatabaseMaintenanceCard from './advanced/DatabaseMaintenanceCard';
-import { DmlAccelerationCard, OcrEngineCard, OnnxRuntimeCard, SemanticBackendCard } from './advanced/InferenceCards';
+import { ClipBackendCard, DmlAccelerationCard, OcrEngineCard, OnnxRuntimeCard, SemanticBackendCard } from './advanced/InferenceCards';
 import NetworkAccessCard from './advanced/NetworkAccessCard';
 import OcrQueueCard from './advanced/OcrQueueCard';
 import { useAdvancedSectionController } from './useAdvancedSectionController';
@@ -48,6 +48,16 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     semanticStatusLoading,
     semanticIndexRunning,
     semanticIndexRun,
+    clipIndexRunning,
+    clipIndexRun,
+    clipIndexStopping,
+    clipIndexProgress,
+    clipBackfill,
+    clipBackfillBusy,
+    handleClipBackfillDecision,
+    handleToggleRustClipIndex,
+    handleRunClipIndexNow,
+    handleStopClipIndex,
     semanticIndexProgress,
     semanticIndexStopping,
     handleToggleRustSemanticIndex,
@@ -133,6 +143,23 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         indexStopping={semanticIndexStopping}
         indexProgress={semanticIndexProgress}
         indexRun={semanticIndexRun}
+      />
+
+      <ClipBackendCard
+        config={config}
+        status={semanticStatus}
+        statusLoading={semanticStatusLoading}
+        onToggleRustIndex={handleToggleRustClipIndex}
+        onRefresh={refreshSemanticStatus}
+        onRunIndexNow={handleRunClipIndexNow}
+        onStopIndexNow={handleStopClipIndex}
+        indexRunning={clipIndexRunning}
+        indexStopping={clipIndexStopping}
+        indexProgress={clipIndexProgress}
+        indexRun={clipIndexRun}
+        backfill={clipBackfill}
+        backfillBusy={clipBackfillBusy}
+        onBackfillDecision={handleClipBackfillDecision}
       />
 
       <ClusteringTechnicalCard

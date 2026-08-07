@@ -12,9 +12,16 @@ from typing import List, Dict, Any, Optional, Union
 from PIL import Image
 import numpy as np
 
+from collection_export import CollectionSnapshotExporter
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CLIP_MIN_SIMILARITY = 0.32
+
+#: Chinese-CLIP ViT-B/16 projects both modalities into 512 dimensions. The M2.5
+#: step-7 export rejects a stored row of any other width rather than importing
+#: it, so this constant is a contract and not a hint.
+CLIP_EMBEDDING_DIM = 512
 
 # Lazy import to avoid slow startup
 _clip_instance = None
@@ -688,6 +695,15 @@ class VectorStore:
         
         # Initialise vectoriser
         self.vectorizer = ImageVectorizer()
+        # M2.5 step 7: the same snapshot exporter the MiniLM hot layer uses.
+        # CLIP document ids are MD5 hex, so the default lexicographic order is
+        # both stable and as meaningful as any other.
+        self._snapshot_exporter = CollectionSnapshotExporter(
+            namespace="clip",
+            collection_getter=lambda: self.collection,
+            dimensions=CLIP_EMBEDDING_DIM,
+            thread_name_prefix="clip-vector-export",
+        )
         # Diagnostic: print collection basic info
         try:
             count = self.collection.count()
@@ -874,6 +890,99 @@ class VectorStore:
     def _compute_id(image_path: str) -> str:
         """Generate a unique ID from the image path."""
         return hashlib.md5(image_path.encode()).hexdigest()
+
+    # ---- screenshots snapshot export (M2.5 step 7 migration) --------------
+    #
+    # Four thin forwards to the shared exporter, mirroring the ones
+    # `HotColdManager` exposes for `task_vectors`. Rust drives the whole
+    # sequence: start, poll until ready, page through, finish.
+    #
+    # Note what is *not* exported: metadata and documents. The ids in this
+    # collection are `md5("memory://" + image_hash)`, and Rust recovers the
+    # image hash by hashing its own SQLite rows rather than by reading the
+    # stored `image_path` — which is encrypted here, so exporting it would mean
+    # decrypting user paths into an IPC payload to learn something Rust already
+    # knows. An id no SQLite hash reproduces is an orphan, and the importer
+    # counts it as one.
+
+    def start_snapshot_export(self, export_id: str) -> Dict[str, Any]:
+        """Start a persistent ID snapshot without blocking the IPC worker."""
+        return self._snapshot_exporter.start(export_id)
+
+    def get_snapshot_export_status(self, export_id: str) -> Dict[str, Any]:
+        return self._snapshot_exporter.status(export_id)
+
+    def export_snapshot_page(
+        self,
+        export_id: str,
+        cursor: int = 0,
+        limit: int = 128,
+    ) -> Dict[str, Any]:
+        return self._snapshot_exporter.page(export_id, cursor, limit)
+
+    def finish_snapshot_export(self, export_id: str) -> bool:
+        """Release memory and persistent artifacts after a completed migration."""
+        return self._snapshot_exporter.finish(export_id)
+
+    def upsert_clip_vectors(self, records: List[Dict[str, Any]]) -> int:
+        """Write Rust-generated CLIP image vectors into this collection.
+
+        M2.5 step 8 makes Rust the only CLIP encoder on the capture path, so
+        this is the M2.4 dual-write with its direction reversed: Rust owns the
+        inference and hands the finished row over for the Chroma write. What it
+        buys is that `clip_runtime = python` stays a real rollback for the one
+        release the flag rule requires, instead of a switch that serves a
+        collection frozen at the moment of the migration.
+
+        The full row is written, not just the vector, because
+        ``search_by_natural_language`` filters on ``process_name`` and renders
+        the title and OCR text — a row that arrived with only an embedding would
+        be findable but blank, and invisible to a process filter. Sensitive
+        fields are encrypted here exactly as ``add_image`` encrypted them when
+        Python built them itself.
+        """
+        if not isinstance(records, list) or not records:
+            return 0
+        if len(records) > 128:
+            raise ValueError("CLIP vector upsert batch exceeds 128 records")
+
+        ids, embeddings, metadatas, documents = [], [], [], []
+        for record in records:
+            image_hash = str(record.get("image_hash", "") or "")
+            if not image_hash:
+                raise ValueError("CLIP vector record is missing its image hash")
+            vector = np.asarray(record.get("embedding", []), dtype=np.float32)
+            if vector.shape != (CLIP_EMBEDDING_DIM,) or not np.isfinite(vector).all():
+                raise ValueError(f"invalid CLIP vector for image hash {image_hash}")
+            image_path = f"memory://{image_hash}"
+            timestamp = float(record.get("timestamp", 0) or 0)
+            if timestamp > 1e12:
+                timestamp /= 1000.0
+            process_name = str(record.get("process_name", "") or "")
+            window_title = str(record.get("window_title", "") or "")
+            document = str(record.get("document", "") or "")
+
+            ids.append(self._compute_id(image_path))
+            embeddings.append(vector.tolist())
+            metadatas.append({
+                # Same keys `add_image` wrote, so a rolled-back query cannot
+                # tell a mirrored row from one Python encoded itself.
+                "image_path": self._encrypt_text(image_path),
+                "added_at": str(np.datetime64("now")),
+                "process_name": self._encrypt_text(process_name) if process_name else "",
+                "window_title": self._encrypt_text(window_title) if window_title else "",
+                "timestamp": timestamp,
+            })
+            documents.append(self._encrypt_text(document) if document else "")
+
+        self.collection.upsert(
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            documents=documents,
+        )
+        logger.info("[vector_store] upsert_clip_vectors wrote %d row(s)", len(ids))
+        return len(ids)
     
     def add_image(
         self,

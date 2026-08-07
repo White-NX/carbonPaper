@@ -19,6 +19,10 @@ vi.mock('../lib/monitor_api', () => ({
   fetchThumbnailBatch: vi.fn(async () => ({})),
   fetchThumbnail: vi.fn(async () => null),
   fetchImage: vi.fn(async () => null),
+  getBackgroundIndexProgress: vi.fn(async () => ({
+    semantic: { running: false, processed: 0, indexed: 0, total: 0 },
+    clip: { running: false, processed: 0, indexed: 0, total: 0 },
+  })),
 }));
 
 import { SearchBox } from './SearchBox';

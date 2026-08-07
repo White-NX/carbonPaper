@@ -1251,7 +1251,11 @@ impl CngKeySession {
     pub fn unwrap_row_key(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
         use windows::Win32::Security::Cryptography::{NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG};
 
-        ncrypt_decrypt_with_key(self.key, ciphertext, NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG)
+        ncrypt_decrypt_with_key(
+            self.key,
+            ciphertext,
+            NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG,
+        )
     }
 }
 

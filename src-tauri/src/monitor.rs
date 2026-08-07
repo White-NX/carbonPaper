@@ -102,6 +102,12 @@ pub struct MonitorState {
     /// rather than directly; the flag alone says nothing about whether the
     /// process it describes is still alive.
     python_smart_cluster_worker: AtomicBool,
+    /// Whether the Python monitor was spawned with `clip_runtime = python`,
+    /// i.e. whether its post-OCR worker was told to encode captures with CLIP.
+    ///
+    /// Read this through [`MonitorState::python_owns_clip_encoding`] rather
+    /// than directly, for the reason that method records.
+    python_clip_encoder: AtomicBool,
     /// Prevents the monitor from restarting during migration tasks
     pub migration_lock: AtomicBool,
     recovery: Mutex<MonitorRecoveryState>,
@@ -129,6 +135,7 @@ impl MonitorState {
             game_mode_task: Mutex::new(None),
             stopping: AtomicBool::new(false),
             python_smart_cluster_worker: AtomicBool::new(false),
+            python_clip_encoder: AtomicBool::new(false),
             migration_lock: AtomicBool::new(false),
             recovery: Mutex::new(MonitorRecoveryState::default()),
             python_ipc_client: AsyncMutex::new(None),
@@ -163,6 +170,41 @@ impl MonitorState {
     /// forever.
     pub fn python_owns_smart_cluster_queue(&self) -> bool {
         if !self.python_smart_cluster_worker.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.process
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Record which CLIP encoder the monitor process just spawned was told to
+    /// run, taken from the `CARBONPAPER_CLIP_RUNTIME` value handed to it.
+    pub fn set_python_clip_encoder(&self, enabled: bool) {
+        self.python_clip_encoder.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Whether the Python worker is, right now, the CLIP encoder of the capture
+    /// path.
+    ///
+    /// The same split reading that
+    /// [`MonitorState::python_owns_smart_cluster_queue`] arbitrates, on the
+    /// capture path: `clip_index.rs` consults the registry on every pass, while
+    /// Python reads `CARBONPAPER_CLIP_RUNTIME` once at spawn
+    /// (`monitor/monitor/worker_process.py`). Deciding from the registry alone
+    /// would break in both directions. Setting the key to `python` under a
+    /// monitor started with `rust` would stand the Rust pass down while the
+    /// Python one is still skipping every job, and new captures would stop being
+    /// indexed by anyone — the silent gap this module's header calls the one
+    /// failure no user can detect. Setting it back to `rust` under a monitor
+    /// started with `python` would give one screenshot two encoders and two
+    /// conflicting writes into the single Chroma collection they share.
+    ///
+    /// So, as with the Smart Cluster queue, the value the live process was
+    /// actually given wins until that process restarts. The liveness check keeps
+    /// a flag left over from a crashed monitor from silencing Rust forever.
+    pub fn python_owns_clip_encoding(&self) -> bool {
+        if !self.python_clip_encoder.load(Ordering::SeqCst) {
             return false;
         }
         self.process
@@ -630,6 +672,7 @@ pub(crate) async fn authenticated_monitor_command(
 
 #[tauri::command]
 pub async fn monitor_search_nl(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, MonitorState>,
     query: String,
@@ -640,21 +683,58 @@ pub async fn monitor_search_nl(
     end_time: Option<f64>,
     fuzzy: Option<bool>,
 ) -> Result<Value, String> {
-    authenticated_monitor_command(
+    crate::commands::check_auth_required(&credential_state)?;
+    let limit = limit.unwrap_or(20).min(crate::clip_query::MAX_CLIP_RESULTS);
+    let offset = offset.unwrap_or(0);
+    let process_names = process_names.unwrap_or_default();
+
+    // M2.5 step 9: Rust answers this from the migrated CLIP image index when the
+    // configuration selects it and nothing refuses. `fuzzy` is not passed on —
+    // Python accepts and ignores it, and a text-to-image search has no fuzzy
+    // matching to switch off.
+    match crate::clip_query::try_rust_clip_query(
+        &app,
+        crate::clip_query::ClipQueryRequest {
+            query: &query,
+            limit,
+            offset,
+            process_names: &process_names,
+            start_time,
+            end_time,
+        },
+    )
+    .await
+    {
+        crate::clip_query::ClipQueryOutcome::Served(results) => {
+            return Ok(serde_json::json!({
+                "status": "success",
+                "results": results,
+                "backend": "rust",
+            }));
+        }
+        crate::clip_query::ClipQueryOutcome::NotSelected => {}
+        crate::clip_query::ClipQueryOutcome::FellBack(reason) => {
+            tracing::info!("[CLIP] search_nl fell back to Python: {reason}");
+        }
+    }
+
+    let response = authenticated_monitor_command(
         &credential_state,
         &state,
         serde_json::json!({
             "command": "search_nl",
             "query": query,
-            "limit": limit.unwrap_or(20).min(200),
-            "offset": offset.unwrap_or(0),
-            "process_names": process_names.unwrap_or_default(),
+            "limit": limit,
+            "offset": offset,
+            "process_names": process_names,
             "start_time": start_time,
             "end_time": end_time,
             "fuzzy": fuzzy.unwrap_or(true),
         }),
     )
-    .await
+    .await?;
+    crate::clip_query::observe_python_served();
+    Ok(crate::clip_query::tag_python_response(response))
 }
 
 #[tauri::command]
@@ -1561,6 +1641,11 @@ pub async fn start_monitor_impl(
         // owns the queue until this process exits.
         let python_rerank_runtime = crate::rerank::rerank_runtime();
         let python_drains_smart_clusters = python_rerank_runtime == "python";
+        // The same arbitration for the CLIP encoder, remembered for the same
+        // reason: from the moment this process starts, the value it was handed —
+        // not the registry key it came from — decides who encodes captures.
+        let python_clip_runtime = crate::clip_query::clip_runtime();
+        let python_encodes_clip = python_clip_runtime == "python";
         cmd_proc
             .env(
                 "CARBONPAPER_CLUSTERING_ENABLED",
@@ -1582,6 +1667,12 @@ pub async fn start_monitor_impl(
             )
             .env("CARBONPAPER_USE_ONNX", use_onnx.to_string())
             .env("CARBONPAPER_RERANK_RUNTIME", &python_rerank_runtime)
+            // M2.5 step 8: Rust is the only CLIP encoder on the capture path
+            // unless this says otherwise. Read once at spawn, like the reranker
+            // switch and for the same reason — two encoders on one screenshot
+            // would embed every image twice and write conflicting vectors into
+            // the collection they both target.
+            .env("CARBONPAPER_CLIP_RUNTIME", &python_clip_runtime)
             .env(
                 "CARBONPAPER_OCR_TIMEOUT_SECS",
                 crate::registry_config::get_u32("ocr_timeout_secs")
@@ -1756,6 +1847,7 @@ pub async fn start_monitor_impl(
         // until this process exits, the value Python was handed decides who
         // drains `smart_cluster_pending`, whatever the registry key says later.
         state.set_python_smart_cluster_worker(python_drains_smart_clusters);
+        state.set_python_clip_encoder(python_encodes_clip);
 
         (python_executable, python_exists)
     };

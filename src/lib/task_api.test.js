@@ -22,6 +22,8 @@ import {
   setClusteringInterval,
   getMinilmRebuildStatus,
   listMinilmRebuildErrors,
+  getClipRebuildStatus,
+  listClipRebuildErrors,
   getMaintenanceStatus,
 } from './task_api';
 
@@ -120,6 +122,22 @@ describe('task_api', () => {
       limit: 25,
     });
     expect(invoke).toHaveBeenNthCalledWith(3, 'get_maintenance_status');
+    expectWithAuth(1);
+  });
+
+  it('exposes the same pair for the CLIP migration', async () => {
+    invoke.mockResolvedValue({ running: true });
+
+    await getClipRebuildStatus();
+    await listClipRebuildErrors(0, 100);
+
+    // Status is unauthenticated so the overlay can poll it before unlock —
+    // `waiting_for_auth` is one of the phases it has to be able to render.
+    expect(invoke).toHaveBeenNthCalledWith(1, 'get_clip_rebuild_status');
+    expect(invoke).toHaveBeenNthCalledWith(2, 'list_clip_rebuild_errors', {
+      offset: 0,
+      limit: 100,
+    });
     expectWithAuth(1);
   });
 

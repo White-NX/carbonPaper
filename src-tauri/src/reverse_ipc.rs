@@ -2014,15 +2014,14 @@ pub async fn request_extension_capture_session(session: &NmhSession) -> Result<(
         }
     };
 
-    let result: Result<(), String> = match tokio::time::timeout(CMD_ROUNDTRIP_TIMEOUT, round_trip)
-        .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "NMH cmd pipe round-trip timed out after {:?}",
-            CMD_ROUNDTRIP_TIMEOUT
-        )),
-    };
+    let result: Result<(), String> =
+        match tokio::time::timeout(CMD_ROUNDTRIP_TIMEOUT, round_trip).await {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "NMH cmd pipe round-trip timed out after {:?}",
+                CMD_ROUNDTRIP_TIMEOUT
+            )),
+        };
 
     if result.is_err() {
         let mut sessions = NMH_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());

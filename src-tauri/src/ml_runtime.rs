@@ -1190,20 +1190,30 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
         let Some(record) = storage.get_screenshot_by_id(screenshot_id)? else {
             continue;
         };
-        let (image_bytes, _) = match storage.read_image_bytes_silent(&record.image_path) {
-            Ok(value) => value,
-            Err(crate::storage::BackgroundReadError::AuthRequired) => {
-                storage.set_ocr_postprocess_status(
-                    screenshot_id,
-                    "waiting_for_auth",
-                    Some("Waiting for user authentication"),
-                )?;
-                continue;
+        // The live monitor's spawn-time ownership is authoritative. When Rust
+        // owns CLIP, Python only classifies text and must not make this retry
+        // loop read and decrypt a full image just to leave it unused.
+        let python_needs_image = app
+            .state::<crate::monitor::MonitorState>()
+            .python_owns_clip_encoding();
+        let image_bytes = if python_needs_image {
+            match storage.read_image_bytes_silent(&record.image_path) {
+                Ok((bytes, _)) => Some(bytes),
+                Err(crate::storage::BackgroundReadError::AuthRequired) => {
+                    storage.set_ocr_postprocess_status(
+                        screenshot_id,
+                        "waiting_for_auth",
+                        Some("Waiting for user authentication"),
+                    )?;
+                    continue;
+                }
+                Err(error) => {
+                    let _ = storage.record_ocr_postprocess_retry(screenshot_id, &error.to_string());
+                    continue;
+                }
             }
-            Err(error) => {
-                let _ = storage.record_ocr_postprocess_retry(screenshot_id, &error.to_string());
-                continue;
-            }
+        } else {
+            None
         };
         let ocr_results = match storage.get_screenshot_ocr_results_silent(screenshot_id) {
             Ok(results) => results,
@@ -1227,7 +1237,7 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
             box_coords: result.box_coords,
         })
         .collect::<Vec<_>>();
-        {
+        if let Some(image_bytes) = image_bytes {
             let mut cache = capture
                 .ocr_image_cache
                 .lock()
@@ -1246,7 +1256,7 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
             &ocr_results,
         )
         .await;
-        {
+        if python_needs_image {
             let mut cache = capture
                 .ocr_image_cache
                 .lock()
@@ -1335,7 +1345,9 @@ mod tests {
         assert!(is_monitor_unavailable_error(
             "Read frame length error: connection reset"
         ));
-        assert!(is_monitor_unavailable_error("IPC response timed out after 30s"));
+        assert!(is_monitor_unavailable_error(
+            "IPC response timed out after 30s"
+        ));
 
         // Failures reported by Python (or unknown errors) consume the budget.
         assert!(!is_monitor_unavailable_error("postprocess worker crashed"));

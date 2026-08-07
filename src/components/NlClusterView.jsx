@@ -523,14 +523,6 @@ export default function NlClusterView({
               {t('nlCluster.enableReranker', '启用 reranker')}
             </label>
 
-            {/*
-              The ONNX variant dropdown is gone as of M2.5 step 6. Only
-              `model_uint8.onnx` is ever installed, and the Rust reranker pins
-              it, so the selector had been offering choices that could not load.
-              The loaded variant is still reported below, because "which
-              variant produced this score" stays a real question.
-            */}
-
             {rerankerStatus?.loaded && rerankerStatus.loaded_variant && (
               <span className="text-[10.5px] text-ide-muted">
                 {t('nlCluster.currentlyLoaded', '当前已加载: ')}<span className="text-ide-text">{rerankerStatus.loaded_variant}</span>
@@ -615,12 +607,6 @@ export default function NlClusterView({
                   </span>
                 )}
               </div>
-              {/*
-                Indeterminate until the first chunk lands. A bar pinned at zero
-                through a 544 MB model load is the thing this replaced; the
-                phase label above says what that wait is for, and the track
-                below stays plain rather than pretending to advance.
-              */}
               <div className="h-1 w-full rounded-full bg-ide-border/60 overflow-hidden">
                 {progressPercent !== null && (
                   <div

@@ -183,8 +183,10 @@ impl StorageState {
         //    regardless of how much space they occupy.
         let mut retention_freed_bytes = 0u64;
         if let Some(cutoff_dt) = parse_retention_cutoff(&policy) {
-            let (candidate_ids, freed_bytes) = self
-                .select_screenshots_created_before(&cutoff_dt, MAX_POLICY_DELETE_CANDIDATES_PER_RUN)?;
+            let (candidate_ids, freed_bytes) = self.select_screenshots_created_before(
+                &cutoff_dt,
+                MAX_POLICY_DELETE_CANDIDATES_PER_RUN,
+            )?;
             if !candidate_ids.is_empty() {
                 let result = self.soft_delete_screenshots(&candidate_ids)?;
                 if result.screenshots_marked > 0 {
@@ -365,7 +367,12 @@ mod tests {
 
     #[test]
     fn cutoff_matches_expected_day_offset() {
-        for (period, days) in [("1month", 30), ("6months", 180), ("1year", 365), ("2years", 730)] {
+        for (period, days) in [
+            ("1month", 30),
+            ("6months", 180),
+            ("1year", 365),
+            ("2years", 730),
+        ] {
             let cutoff = NaiveDateTime::parse_from_str(&cutoff_for(period), FORMAT).unwrap();
             let expected = (Utc::now() - Duration::days(days)).naive_utc();
             let skew = (expected - cutoff).num_seconds().abs();

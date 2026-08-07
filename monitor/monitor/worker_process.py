@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 WORKER_PROTOCOL_VERSION = 2
 
 
+def _python_owns_clip_encoding() -> bool:
+    """Return the CLIP capture owner latched into this worker at spawn."""
+    return os.environ.get("CARBONPAPER_CLIP_RUNTIME", "rust").strip().lower() == "python"
+
+
 class OcrPostprocessQueue:
     """Bounded best-effort OCR post-processing queue.
 
@@ -156,13 +161,24 @@ class OcrPostprocessQueue:
             self._vector_retry_backlog.pop(key, None)
 
     def _handle_vector_indexing(self, job: Dict[str, Any]) -> bool:
-        from PIL import Image
-
         screenshot_id = job.get("screenshot_id")
         image_hash = job.get("image_hash", "")
         ocr_text = job.get("ocr_text", "")
-        image_bytes = job.get("image_bytes") or b""
 
+        # M2.5 step 8: Rust owns CLIP encoding on the capture path. Running both
+        # would embed every screenshot twice — once here on DirectML, once in
+        # Rust on CPU — and write conflicting vectors into the one collection
+        # they both target. Rust reads its registry key on every pass while this
+        # is read once at spawn, so the value the running monitor was handed is
+        # what decides ownership until the process exits; that is the same
+        # arbitration `CARBONPAPER_RERANK_RUNTIME` uses for the Smart Cluster
+        # queue, and for the same reason.
+        if not _python_owns_clip_encoding():
+            return True
+
+        from PIL import Image
+
+        image_bytes = job.get("image_bytes") or b""
         if self.ocr_worker.enable_vector_store and self.ocr_worker.vector_store and ocr_text.strip():
             try:
                 image_pil = Image.open(io.BytesIO(image_bytes))
@@ -330,8 +346,9 @@ def _json_safe(obj):
 def _enqueue_ocr_postprocess(req: Dict[str, Any], postprocess_queue: Optional[OcrPostprocessQueue]) -> Dict[str, Any]:
     """Enqueue vector/classification work for OCR produced by Rust.
 
-    Image bytes are fetched through the existing authenticated reverse IPC so
-    the Rust caller never duplicates a potentially large binary payload.
+    Image bytes are fetched through authenticated reverse IPC only while the
+    legacy Python CLIP encoder owns the capture path. Rust-owned CLIP jobs still
+    enter this queue for text-only classification and persistent status updates.
     """
     from storage_client import get_storage_client
 
@@ -346,12 +363,14 @@ def _enqueue_ocr_postprocess(req: Dict[str, Any], postprocess_queue: Optional[Oc
     sc = get_storage_client()
     if not sc:
         return {"error": "Storage client not available"}
-    response = sc.get_temp_image_bytes(int(screenshot_id))
-    if response.get("status") != "success":
-        return {"error": f"Failed to fetch image: {response.get('error', 'unknown')}"}
-    image_bytes = response.get("data", {}).get("image_bytes")
-    if not image_bytes:
-        return {"error": "No image data returned from storage"}
+    image_bytes = b""
+    if _python_owns_clip_encoding():
+        response = sc.get_temp_image_bytes(int(screenshot_id))
+        if response.get("status") != "success":
+            return {"error": f"Failed to fetch image: {response.get('error', 'unknown')}"}
+        image_bytes = response.get("data", {}).get("image_bytes")
+        if not image_bytes:
+            return {"error": "No image data returned from storage"}
     enqueued = postprocess_queue.enqueue({
         "screenshot_id": int(screenshot_id),
         "image_hash": req.get("image_hash", ""),
@@ -367,6 +386,85 @@ def _enqueue_ocr_postprocess(req: Dict[str, Any], postprocess_queue: Optional[Oc
         "postprocess_enqueued": bool(enqueued),
         "worker_protocol": WORKER_PROTOCOL_VERSION,
     }
+
+
+#: The CLIP vector commands, which only the model worker process can answer.
+#:
+#: The `screenshots` collection lives inside this process, so every one of these
+#: has to be dispatched here rather than in the monitor's own handler. Naming the
+#: set once keeps the proxy, the dispatcher, and the contract test from drifting
+#: into three different opinions about what the set contains.
+CLIP_VECTOR_COMMANDS = (
+    "start_clip_vectors_export",
+    "get_clip_vectors_export_status",
+    "export_clip_vectors_page",
+    "finish_clip_vectors_export",
+    "upsert_clip_vectors",
+)
+
+#: Calls that may have to cold-start the model worker: the migration's first
+#: export, and the capture-path mirror whenever the child is not already up.
+#: The supervisor's own `ready_timeout` is 180s, so a smaller budget here would
+#: time the request out mid-startup and kill the child that was about to become
+#: ready. For the migration that matters twice over, because a failed run does
+#: not settle its sentinel — it retries under maintenance mode at every launch.
+CLIP_VECTOR_COLD_START_TIMEOUT = 180.0
+#: A page is 128 rows of 512 float32s read out of Chroma and Base64-encoded.
+CLIP_EXPORT_PAGE_TIMEOUT = 120.0
+#: Status polls and snapshot release, which always follow a start on a worker
+#: that is warm by then.
+CLIP_EXPORT_CONTROL_TIMEOUT = 60.0
+
+
+def _handle_clip_vector_command(command: str, msg: Dict[str, Any], ocr_worker) -> Dict[str, Any]:
+    """Answer one CLIP snapshot-export or vector-mirror command.
+
+    This is where "is the vector store enabled" can honestly be asked. The
+    monitor process holds a `RestartableModelWorker` proxy, not an `OCRService`,
+    so the store it would inspect there is always absent — the question is only
+    answerable in the process that owns the collection.
+
+    Results are nested under `result` instead of being merged into the response.
+    The worker protocol owns the top level (`status`, `error`, `_request_id`),
+    and `get_snapshot_export_status` already returns a `state` key; one future
+    exporter key named like a protocol field would silently corrupt the reply.
+    """
+    store = getattr(ocr_worker, "vector_store", None)
+    if not getattr(ocr_worker, "enable_vector_store", False) or not store:
+        return {"error": "Vector store not enabled"}
+
+    export_id = msg.get("export_id", "")
+    try:
+        if command == "start_clip_vectors_export":
+            return {"status": "success", "result": store.start_snapshot_export(export_id)}
+        if command == "get_clip_vectors_export_status":
+            return {"status": "success", "result": store.get_snapshot_export_status(export_id)}
+        if command == "export_clip_vectors_page":
+            return {
+                "status": "success",
+                "result": store.export_snapshot_page(
+                    export_id,
+                    cursor=msg.get("cursor", 0),
+                    limit=msg.get("limit", 128),
+                ),
+            }
+        if command == "finish_clip_vectors_export":
+            return {
+                "status": "success",
+                "result": {"released": bool(store.finish_snapshot_export(export_id))},
+            }
+        if command == "upsert_clip_vectors":
+            return {
+                "status": "success",
+                "result": {"written": int(store.upsert_clip_vectors(msg.get("records") or []))},
+            }
+        # Reached when a name is added to CLIP_VECTOR_COMMANDS without being
+        # handled here. Falling through to the last branch instead would run an
+        # unrelated command's body against the new one's arguments.
+        return {"error": f"Unknown CLIP vector command: {command}"}
+    except Exception as exc:
+        logger.exception("%s failed", command)
+        return {"error": str(exc)}
 
 
 def _worker_main(conn, storage_pipe: Optional[str], data_dir: str, env: Dict[str, str]):
@@ -475,6 +573,8 @@ def _worker_main(conn, storage_pipe: Optional[str], data_dir: str, env: Dict[str
                 if ocr_worker.vector_store:
                     ok = bool(ocr_worker.vector_store.delete_image(f"memory://{image_hash}"))
                 send_response({"status": "success", "ok": ok})
+            elif command in CLIP_VECTOR_COMMANDS:
+                send_response(_handle_clip_vector_command(command, msg, ocr_worker))
             elif command == "classify":
                 if not classifier:
                     send_response({"error": "Classification service not initialised"})
@@ -530,8 +630,15 @@ class RestartableModelWorker(WorkerSupervisor):
         self.env = env or {}
         self._stats = {"processed_count": 0, "failed_count": 0, "total_texts_found": 0, "start_time": None}
         self.stats = self._stats
+        # `enable_vector_store` says the store exists somewhere and is reachable
+        # through this proxy, which is true. There is deliberately no
+        # `vector_store` attribute to go with it: the object lives in the child
+        # process, and a `None` standing in for it here reads as "the store is
+        # disabled" to every caller that checks it. That is precisely how the
+        # CLIP export commands came to answer "Vector store not enabled" on
+        # every machine. Without the attribute, reaching for the store in this
+        # process raises instead of quietly degrading.
         self.enable_vector_store = True
-        self.vector_store = None
         super().__init__(
             name="CarbonModelWorker",
             target=_worker_main,
@@ -627,6 +734,69 @@ class RestartableModelWorker(WorkerSupervisor):
     def delete_vector_image(self, image_hash: str) -> bool:
         result = self.request("delete_vector_image", {"image_hash": image_hash}, timeout=30)
         return bool(result.get("ok"))
+
+    # ----- CLIP image-vector snapshot export and mirror -----
+    #
+    # Five forwards into the process that owns the `screenshots` collection.
+    # Each returns the payload the monitor's handler flattens into its reply, so
+    # the wire format Rust parses is unchanged by the hop through here.
+
+    def _clip_vector_request(
+        self,
+        command: str,
+        payload: Optional[Dict[str, Any]],
+        timeout: float,
+    ) -> Dict[str, Any]:
+        result = self.request(command, payload, timeout=timeout)
+        if result.get("status") == "success":
+            return result.get("result") or {}
+        # A refusal from the child — a disabled store, a snapshot the exporter
+        # has forgotten — arrives as an `error` field, and the monitor handler
+        # turns this exception back into one. The text survives the round trip
+        # because Rust matches on it.
+        raise RuntimeError(result.get("error") or f"Model worker {command} failed")
+
+    def start_clip_vectors_export(self, export_id: str) -> Dict[str, Any]:
+        return self._clip_vector_request(
+            "start_clip_vectors_export",
+            {"export_id": export_id},
+            timeout=CLIP_VECTOR_COLD_START_TIMEOUT,
+        )
+
+    def get_clip_vectors_export_status(self, export_id: str) -> Dict[str, Any]:
+        return self._clip_vector_request(
+            "get_clip_vectors_export_status",
+            {"export_id": export_id},
+            timeout=CLIP_EXPORT_CONTROL_TIMEOUT,
+        )
+
+    def export_clip_vectors_page(
+        self,
+        export_id: str,
+        cursor: int = 0,
+        limit: int = 128,
+    ) -> Dict[str, Any]:
+        return self._clip_vector_request(
+            "export_clip_vectors_page",
+            {"export_id": export_id, "cursor": cursor, "limit": limit},
+            timeout=CLIP_EXPORT_PAGE_TIMEOUT,
+        )
+
+    def finish_clip_vectors_export(self, export_id: str) -> bool:
+        result = self._clip_vector_request(
+            "finish_clip_vectors_export",
+            {"export_id": export_id},
+            timeout=CLIP_EXPORT_CONTROL_TIMEOUT,
+        )
+        return bool(result.get("released"))
+
+    def upsert_clip_vectors(self, records) -> int:
+        result = self._clip_vector_request(
+            "upsert_clip_vectors",
+            {"records": records},
+            timeout=CLIP_VECTOR_COLD_START_TIMEOUT,
+        )
+        return int(result.get("written", 0))
 
     def classify(self, title: str, ocr_text: str, process_name: str = ""):
         result = self.request(

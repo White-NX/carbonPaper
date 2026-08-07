@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import {
   searchScreenshots,
   fetchThumbnailBatch,
   getSoftDeleteQueueStatus,
   getSmartClusterWorkerStatus,
+  getBackgroundIndexProgress,
 } from '../lib/monitor_api';
 import { smartClusterStopDrain } from '../lib/task_api';
 import { useHmacMigrationStatus } from './useHmacMigrationStatus';
@@ -35,6 +37,34 @@ const EMPTY_CLUSTER_QUEUE_STATUS = {
   running: false,
 };
 
+// A manual index run that has not been observed yet. `total` of zero means "the
+// run has not finished counting its queue", not "there is nothing to do", which
+// is why the percentage below treats it as indeterminate.
+const EMPTY_INDEX_RUN = {
+  running: false,
+  processed: 0,
+  indexed: 0,
+  total: 0,
+};
+
+const EMPTY_BACKGROUND_INDEX_PROGRESS = {
+  semantic: EMPTY_INDEX_RUN,
+  clip: EMPTY_INDEX_RUN,
+};
+
+/**
+ * Percentage of one manual index run, or `null` while it is indeterminate.
+ *
+ * The backend reports the queue depth it started with, so this is a real ratio
+ * rather than the peak-tracking estimate the delete and cluster queues need —
+ * neither of those knows its own total. Clamped because a run that started while
+ * captures were still arriving can process more than it counted.
+ */
+function indexRunPercent(run) {
+  if (!run?.running || !run.total) return null;
+  return Math.max(0, Math.min(100, (run.processed / run.total) * 100));
+}
+
 export function useSearchBoxController({
   onSelectResult,
   onSubmit,
@@ -60,6 +90,7 @@ export function useSearchBoxController({
   const [smartClusterQueuePeak, setSmartClusterQueuePeak] = useState(0);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [isDownloadingModels, setIsDownloadingModels] = useState(false);
+  const [backgroundIndex, setBackgroundIndex] = useState(EMPTY_BACKGROUND_INDEX_PROGRESS);
 
   const debouncedQuery = useDebounce(query, 500);
   const wrapperRef = useRef(null);
@@ -219,6 +250,52 @@ export function useSearchBoxController({
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    const loadBackgroundIndex = async () => {
+      const progress = await getBackgroundIndexProgress();
+      if (!cancelled) setBackgroundIndex(progress);
+    };
+
+    loadBackgroundIndex();
+    const timer = setInterval(loadBackgroundIndex, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+
+  // The poll above decides whether a run is going; these keep the number moving
+  // between polls. A chunk of images takes long enough that a four-second bar
+  // sitting still reads as a stall, and the run already emits an event per
+  // chunk for the settings dialog. Only applied while the poll says the run is
+  // live, so a late event from a finished run cannot revive the display.
+  useEffect(() => {
+    const subscriptions = [
+      ['semantic-index-progress', 'semantic'],
+      ['clip-index-progress', 'clip'],
+    ].map(([event, key]) => {
+      let unlisten = null;
+      let cancelled = false;
+      listen(event, ({ payload }) => {
+        if (!payload) return;
+        setBackgroundIndex((prev) => (prev[key].running
+          ? { ...prev, [key]: { ...prev[key], ...payload } }
+          : prev));
+      }).then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      }).catch((err) => {
+        console.warn(`Failed to subscribe to ${event}:`, err);
+      });
+      return () => {
+        cancelled = true;
+        if (unlisten) unlisten();
+      };
+    });
+    return () => subscriptions.forEach((dispose) => dispose());
+  }, []);
+
   const pendingDeleteTotal = Number(deleteQueueStatus?.pending_ocr || 0)
     + Number(deleteQueueStatus?.pending_screenshots || 0);
   const hasDeleteTask = Boolean(deleteQueueStatus?.running) || pendingDeleteTotal > 120;
@@ -242,11 +319,33 @@ export function useSearchBoxController({
     return Math.max(0, Math.min(100, ratio));
   })();
 
-  const showProgressBar = hasDeleteTask || hasClusterTask || isDownloadingModels;
+  const hasSemanticIndexTask = backgroundIndex.semantic.running;
+  const semanticIndexPercent = indexRunPercent(backgroundIndex.semantic);
+
+  const hasClipIndexTask = backgroundIndex.clip.running;
+  const clipIndexPercent = indexRunPercent(backgroundIndex.clip);
+
+  const showProgressBar = hasDeleteTask || hasClusterTask || isDownloadingModels
+    || hasSemanticIndexTask || hasClipIndexTask;
   const progressFillPercent = (() => {
     if (hasDeleteTask) return deleteProgress <= 0 ? 8 : Math.min(100, deleteProgress);
     if (hasClusterTask) return clusterProgress <= 0 ? 8 : Math.min(100, clusterProgress);
     if (isDownloadingModels) return downloadProgress <= 0 ? 8 : Math.min(100, downloadProgress);
+    // The index runs come last so that this stays a pure addition to a chain
+    // that already worked. A backfill can run for hours, and letting it preempt
+    // the cleanup indicator for that long would trade one silent task for
+    // another. The dropdown cards are not ordered, so the reason a backfill
+    // stalls the rest of indexing stays visible either way.
+    if (hasClipIndexTask) {
+      return clipIndexPercent === null || clipIndexPercent <= 0
+        ? 8
+        : Math.min(100, clipIndexPercent);
+    }
+    if (hasSemanticIndexTask) {
+      return semanticIndexPercent === null || semanticIndexPercent <= 0
+        ? 8
+        : Math.min(100, semanticIndexPercent);
+    }
     return 0;
   })();
 
@@ -259,6 +358,14 @@ export function useSearchBoxController({
     }
     if (isDownloadingModels) {
       return t('search.task.modelDownloadSummaryPlaceholder', { progress: Math.round(downloadProgress) });
+    }
+    if (hasClipIndexTask) {
+      const progress = clipIndexPercent === null ? '…' : Math.round(clipIndexPercent);
+      return t('search.task.clipIndexSummaryPlaceholder', { progress });
+    }
+    if (hasSemanticIndexTask) {
+      const progress = semanticIndexPercent === null ? '…' : Math.round(semanticIndexPercent);
+      return t('search.task.semanticIndexSummaryPlaceholder', { progress });
     }
     return '';
   })();
@@ -387,6 +494,10 @@ export function useSearchBoxController({
     hasClusterTask,
     canCancelClusterTask,
     clusterProgress,
+    hasSemanticIndexTask,
+    semanticIndexPercent,
+    hasClipIndexTask,
+    clipIndexPercent,
     showProgressBar,
     progressFillPercent,
     taskSummaryPlaceholder,

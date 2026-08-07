@@ -21,6 +21,10 @@ vi.mock('../lib/monitor_api', () => ({
   fetchThumbnailBatch: vi.fn(async () => ({})),
   getSmartClusterWorkerStatus: vi.fn(async () => ({ pending_count: 0, running: false })),
   getSoftDeleteQueueStatus: vi.fn(async () => ({ pending_screenshots: 0, pending_ocr: 0, running: false })),
+  getBackgroundIndexProgress: vi.fn(async () => ({
+    semantic: { running: false, processed: 0, indexed: 0, total: 0 },
+    clip: { running: false, processed: 0, indexed: 0, total: 0 },
+  })),
   searchScreenshots: vi.fn(async () => []),
 }));
 

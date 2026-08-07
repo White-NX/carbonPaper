@@ -6,11 +6,11 @@
 //! 3. OCR data storage and search
 
 mod derived_index;
+mod derived_migration;
 mod encryption;
 mod image_io;
 mod link_scoring;
 pub mod migration;
-mod minilm_migration;
 mod policy;
 mod process;
 mod schema;
@@ -24,9 +24,9 @@ mod types;
 #[allow(unused_imports)]
 pub use derived_index::*;
 #[allow(unused_imports)]
-pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
+pub use derived_migration::*;
 #[allow(unused_imports)]
-pub use minilm_migration::*;
+pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
 pub use types::*;
@@ -91,11 +91,29 @@ pub struct StorageState {
     /// the data-directory/database lock ordering.
     derived_generation_publish_lock: Mutex<()>,
     /// Resident `semantic_text` vectors for the exact-scan read path. Loaded on
-    /// first query, kept current by the write path, released when idle.
+    /// first query, kept current by the write path, released when idle. The
+    /// per-kind budget may choose the paged exact fallback instead of retaining
+    /// this slot; that fallback still searches the complete durable index.
     /// Lock order: always acquired after the database mutex, never before.
     semantic_vector_cache: RwLock<Option<semantic_cache::SemanticVectorCache>>,
     /// Unix millis of the last resident-cache use; 0 when nothing is cached.
     semantic_cache_used_at: AtomicU64,
+    /// The same, for `clip_image`. A separate matrix rather than a second
+    /// entry in one: the two are different widths, are used by different
+    /// searches, and go idle independently, so sharing an eviction clock would
+    /// make one search pay for the other's silence.
+    clip_vector_cache: RwLock<Option<semantic_cache::SemanticVectorCache>>,
+    clip_cache_used_at: AtomicU64,
+    /// Serializes cold resident-cache loads per index kind. Without this, two
+    /// concurrent first queries can each materialize a full matrix before
+    /// either one publishes it, defeating the cache budget at the exact point
+    /// where memory is already under pressure.
+    semantic_cache_load_lock: Mutex<()>,
+    clip_cache_load_lock: Mutex<()>,
+    /// Incremented whenever the backing database is swapped and all resident
+    /// caches are reset. A scan that started against the old file must not
+    /// publish its result after that boundary.
+    semantic_cache_reset_generation: AtomicU64,
 }
 
 struct NamedConnectionGuard<'a> {
@@ -149,6 +167,11 @@ impl StorageState {
             derived_generation_publish_lock: Mutex::new(()),
             semantic_vector_cache: RwLock::new(None),
             semantic_cache_used_at: AtomicU64::new(0),
+            clip_vector_cache: RwLock::new(None),
+            clip_cache_used_at: AtomicU64::new(0),
+            semantic_cache_load_lock: Mutex::new(()),
+            clip_cache_load_lock: Mutex::new(()),
+            semantic_cache_reset_generation: AtomicU64::new(0),
         }
     }
 

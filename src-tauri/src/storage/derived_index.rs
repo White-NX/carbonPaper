@@ -39,6 +39,14 @@ impl DerivedIndexKind {
             Self::ClipImage => "clip_image",
         }
     }
+
+    pub fn from_db(value: &str) -> Result<Self, String> {
+        match value {
+            "semantic_text" => Ok(Self::SemanticText),
+            "clip_image" => Ok(Self::ClipImage),
+            other => Err(format!("Unknown derived index kind: {other}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +150,19 @@ pub struct DerivedIndexBacklog {
     /// Age of the oldest claimable row by ledger update time. `None` when the
     /// queue is empty.
     pub oldest_claimable_age_secs: Option<i64>,
+}
+
+/// What a full CLIP backfill would have to encode.
+///
+/// Two numbers rather than one because the cost is not per row: a CLIP encode
+/// is dominated by decode and resize, so a 4K screenshot costs roughly six
+/// times a 720p one. Reporting the megapixel sum alongside the count is what
+/// lets a caller turn a backlog into a duration honestly instead of multiplying
+/// by an average nobody measured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClipBackfillWork {
+    pub images: u64,
+    pub megapixels: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,11 +615,7 @@ impl StorageState {
         let conn = guard.as_mut().ok_or("Database not initialized")?;
         // Sampled before the write so the resident cache can tell "I was
         // current and this is my delta" from "I already missed something".
-        let epoch_before = if write.job.index_kind == DerivedIndexKind::SemanticText {
-            Some(read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?)
-        } else {
-            None
-        };
+        let epoch_before = Some(read_derived_data_epoch(conn, write.job.index_kind)?);
         let tx = conn
             .transaction()
             .map_err(|error| format!("Failed to start derived embedding transaction: {error}"))?;
@@ -668,8 +685,9 @@ impl StorageState {
             // on the connection already held and fold the row into the resident
             // matrix, so continuous dual-write capture does not invalidate the
             // whole cache every few seconds.
-            let epoch_after = read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?;
+            let epoch_after = read_derived_data_epoch(conn, write.job.index_kind)?;
             self.note_semantic_cache_write(
+                write.job.index_kind,
                 &write.job.subject_key,
                 &write.vector,
                 epoch_before,
@@ -755,8 +773,7 @@ impl StorageState {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql =
-                visible_embedding_sql(&format!("AND e.subject_key IN ({placeholders})"), "");
+            let sql = visible_embedding_sql(&format!("AND e.subject_key IN ({placeholders})"), "");
             let mut statement = conn
                 .prepare(&sql)
                 .map_err(|error| format!("Failed to prepare derived embedding batch: {error}"))?;
@@ -770,8 +787,8 @@ impl StorageState {
                 .query_map(params.as_slice(), map_embedding_row(index_kind))
                 .map_err(|error| format!("Failed to query derived embeddings: {error}"))?;
             for row in rows {
-                let row = row
-                    .map_err(|error| format!("Failed to read derived embedding row: {error}"))?;
+                let row =
+                    row.map_err(|error| format!("Failed to read derived embedding row: {error}"))?;
                 let record = decode_embedding_row(index_kind, row)?;
                 out.insert(record.job.subject_key.clone(), record.vector);
             }
@@ -798,6 +815,28 @@ impl StorageState {
         u64::try_from(count).map_err(|_| "Invalid query-visible embedding count".to_string())
     }
 
+    /// Whether at least one embedding is query-visible for an index kind.
+    ///
+    /// Capability checks only need existence, not an exact corpus size. Keep
+    /// this separate from [`Self::count_query_visible_embeddings`] so callers
+    /// do not pay for an unbounded aggregate when a single matching row is
+    /// enough to answer the question.
+    pub fn has_query_visible_embeddings(
+        &self,
+        index_kind: DerivedIndexKind,
+    ) -> Result<bool, String> {
+        let guard = self.get_connection_named("has_query_visible_embeddings")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        conn.query_row(
+            &visible_embedding_exists_sql(),
+            [index_kind.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(|error| format!("Failed to check query-visible embeddings: {error}"))
+    }
+
     /// Exact-scan cosine top-K over the query-visible `semantic_text`
     /// embeddings. Stored and query vectors are both L2-normalized, so cosine
     /// similarity equals the dot product. This is the production semantic read
@@ -821,7 +860,23 @@ impl StorageState {
         if k == 0 {
             return Ok(Vec::new());
         }
-        self.semantic_topk_resident(query, k)
+        self.semantic_topk_resident(DerivedIndexKind::SemanticText, query, k)
+    }
+
+    /// Cosine top-K over the migrated Chinese-CLIP image vectors.
+    ///
+    /// The image-side counterpart of [`Self::semantic_text_topk`], and the same
+    /// exact scan over the same resident-matrix machinery. What differs is only
+    /// the subject: a key here is an `image_hash`, so the caller resolves rows
+    /// to screenshots rather than parsing the key as one.
+    pub fn clip_image_topk(&self, query: &[f32], k: usize) -> Result<Vec<ScoredSubject>, String> {
+        if query.is_empty() {
+            return Err("CLIP query vector must not be empty".to_string());
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        self.semantic_topk_resident(DerivedIndexKind::ClipImage, query, k)
     }
 
     pub fn get_derived_index_job(
@@ -925,7 +980,8 @@ impl StorageState {
             )
             .map_err(|error| format!("Failed to query derived jobs: {error}"))?;
         rows.map(|row| {
-            let row = row.map_err(|db_error| format!("Failed to read derived job row: {db_error}"))?;
+            let row =
+                row.map_err(|db_error| format!("Failed to read derived job row: {db_error}"))?;
             job_record_from_row(index_kind, row)
         })
         .collect()
@@ -961,7 +1017,10 @@ impl StorageState {
             ))
             .map_err(|error| format!("Failed to prepare claimable job query: {error}"))?;
         let rows = statement
-            .query_map(params![index_kind.as_str(), max_attempts, limit], read_job_row)
+            .query_map(
+                params![index_kind.as_str(), max_attempts, limit],
+                read_job_row,
+            )
             .map_err(|error| format!("Failed to query claimable derived jobs: {error}"))?;
         rows.map(|row| {
             let row =
@@ -1061,7 +1120,9 @@ impl StorageState {
             )
             .map_err(|error| format!("Failed to prepare index candidate query: {error}"))?;
         let rows = statement
-            .query_map(params![retention_modifier, limit], |row| row.get::<_, i64>(0))
+            .query_map(params![retention_modifier, limit], |row| {
+                row.get::<_, i64>(0)
+            })
             .map_err(|error| format!("Failed to query index candidates: {error}"))?;
         rows.collect::<rusqlite::Result<Vec<i64>>>()
             .map_err(|error| format!("Failed to read index candidate row: {error}"))
@@ -1112,6 +1173,134 @@ impl StorageState {
             .map_err(|error| format!("Failed to read expired subject row: {error}"))
     }
 
+    /// Image hashes the CLIP index should hold but has no ledger row for.
+    ///
+    /// `created_after` is an optional SQLite datetime modifier (`-7 days`) to bound the scan.
+    pub fn list_clip_image_index_candidates(
+        &self,
+        created_after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, String> {
+        let limit = limit.clamp(1, 10_000);
+        let guard = self.get_connection_named("list_clip_image_index_candidates")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let mut statement = conn
+            .prepare(
+                r#"
+                SELECT s.image_hash
+                FROM screenshots s
+                WHERE s.is_deleted = 0
+                  AND (?1 IS NULL OR s.created_at >= datetime('now', ?1))
+                  AND EXISTS (
+                      SELECT 1 FROM ocr_results o
+                      WHERE o.screenshot_id = s.id AND o.is_deleted = 0
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM derived_index_jobs j
+                      WHERE j.index_kind = 'clip_image'
+                        AND j.subject_key = s.image_hash
+                  )
+                ORDER BY s.created_at DESC, s.id DESC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(|error| format!("Failed to prepare CLIP candidate query: {error}"))?;
+        let rows = statement
+            .query_map(params![created_after, limit], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("Failed to query CLIP candidates: {error}"))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(|error| format!("Failed to read CLIP candidate row: {error}"))
+    }
+
+    /// How much work a full CLIP backfill would be, over the whole history.
+    ///
+    /// The same population [`Self::list_clip_image_index_candidates`] returns
+    /// with no age bound, counted rather than listed, plus the one property that
+    /// decides what encoding it costs. Measured 2026-08-04, a CLIP encode is
+    /// dominated by decode and resize and is therefore very nearly linear in the
+    /// *source* pixel count rather than constant at the 224² the model sees — so
+    /// the megapixel sum, not the row count, is what turns a backlog into a
+    /// duration. The caller owns the coefficients; storage has no business
+    /// knowing how fast a vision transformer runs.
+    ///
+    /// `width` and `height` are nullable, and a row that predates them is
+    /// counted at `assumed_megapixels` rather than at zero: guessing 1080p is
+    /// wrong by at most a factor of four, while treating an unknown screenshot
+    /// as free would understate a whole-history estimate by however many old
+    /// rows the database has.
+    pub fn clip_image_backfill_work(
+        &self,
+        assumed_megapixels: f64,
+    ) -> Result<ClipBackfillWork, String> {
+        let guard = self.get_connection_named("clip_image_backfill_work")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        conn.query_row(
+            r#"
+            SELECT COUNT(*), COALESCE(SUM(
+                CASE WHEN s.width > 0 AND s.height > 0
+                     THEN (s.width * 1.0 * s.height) / 1000000.0
+                     ELSE ?1 END
+            ), 0.0)
+            FROM screenshots s
+            WHERE s.is_deleted = 0
+              AND EXISTS (
+                  SELECT 1 FROM ocr_results o
+                  WHERE o.screenshot_id = s.id AND o.is_deleted = 0
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM derived_index_jobs j
+                  WHERE j.index_kind = 'clip_image'
+                    AND j.subject_key = s.image_hash
+              )
+            "#,
+            params![assumed_megapixels],
+            |row| {
+                Ok(ClipBackfillWork {
+                    images: row.get::<_, i64>(0)?.max(0) as u64,
+                    megapixels: row.get::<_, f64>(1)?.max(0.0),
+                })
+            },
+        )
+        .map_err(|error| format!("Failed to size the CLIP backfill: {error}"))
+    }
+
+    /// CLIP subjects with no live screenshot behind them.
+    ///
+    /// Deliberately not an age query. The delete triggers already remove a row
+    /// when its screenshot goes, so this is the safety net for rows written
+    /// before those triggers existed — including every row the M2.5 step-7
+    /// migration imported for a screenshot deleted between the snapshot and the
+    /// commit.
+    pub fn list_orphaned_clip_image_subjects(&self, limit: u32) -> Result<Vec<String>, String> {
+        let limit = limit.clamp(1, 10_000);
+        let guard = self.get_connection_named("list_orphaned_clip_image_subjects")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let mut statement = conn
+            .prepare(
+                r#"
+                SELECT t.subject_key
+                FROM (
+                    SELECT subject_key FROM derived_index_jobs
+                    WHERE index_kind = 'clip_image'
+                    UNION
+                    SELECT subject_key FROM derived_embeddings
+                    WHERE index_kind = 'clip_image'
+                ) t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM screenshots s
+                     WHERE s.image_hash = t.subject_key AND s.is_deleted = 0
+                )
+                LIMIT ?1
+                "#,
+            )
+            .map_err(|error| format!("Failed to prepare orphaned CLIP subject query: {error}"))?;
+        let rows = statement
+            .query_map(params![limit], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("Failed to query orphaned CLIP subjects: {error}"))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(|error| format!("Failed to read orphaned CLIP subject row: {error}"))
+    }
+
     /// Records that a subject has nothing to index, so the repair scan stops
     /// selecting it.
     ///
@@ -1145,11 +1334,7 @@ impl StorageState {
         validate_required_text("error", error, MAX_METADATA_BYTES)?;
         let mut guard = self.get_connection_named("exclude_derived_index_subject")?;
         let conn = guard.as_mut().ok_or("Database not initialized")?;
-        let epoch_before = if spec.index_kind == DerivedIndexKind::SemanticText {
-            Some(read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?)
-        } else {
-            None
-        };
+        let epoch_before = Some(read_derived_data_epoch(conn, spec.index_kind)?);
         let tx = conn
             .transaction()
             .map_err(|error| format!("Failed to start derived exclusion transaction: {error}"))?;
@@ -1219,8 +1404,13 @@ impl StorageState {
         tx.commit()
             .map_err(|error| format!("Failed to commit a derived exclusion: {error}"))?;
         if let Some(epoch_before) = epoch_before {
-            let epoch_after = read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?;
-            self.note_semantic_cache_removal(&spec.subject_key, epoch_before, epoch_after);
+            let epoch_after = read_derived_data_epoch(conn, spec.index_kind)?;
+            self.note_semantic_cache_removal(
+                spec.index_kind,
+                &spec.subject_key,
+                epoch_before,
+                epoch_after,
+            );
         }
         Ok(true)
     }
@@ -1234,11 +1424,7 @@ impl StorageState {
         validate_required_text("subject_key", subject_key, MAX_SUBJECT_KEY_BYTES)?;
         let mut guard = self.get_connection_named("delete_derived_index_subject")?;
         let conn = guard.as_mut().ok_or("Database not initialized")?;
-        let epoch_before = if index_kind == DerivedIndexKind::SemanticText {
-            Some(read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?)
-        } else {
-            None
-        };
+        let epoch_before = Some(read_derived_data_epoch(conn, index_kind)?);
         let tx = conn
             .transaction()
             .map_err(|error| format!("Failed to start derived deletion transaction: {error}"))?;
@@ -1257,8 +1443,8 @@ impl StorageState {
         tx.commit()
             .map_err(|error| format!("Failed to commit derived deletion: {error}"))?;
         if let Some(epoch_before) = epoch_before {
-            let epoch_after = read_derived_data_epoch(conn, DerivedIndexKind::SemanticText)?;
-            self.note_semantic_cache_removal(subject_key, epoch_before, epoch_after);
+            let epoch_after = read_derived_data_epoch(conn, index_kind)?;
+            self.note_semantic_cache_removal(index_kind, subject_key, epoch_before, epoch_after);
         }
         Ok(vectors > 0 || jobs > 0)
     }
@@ -1395,22 +1581,19 @@ impl StorageState {
             &mut progress,
             &cancelled,
         ) {
-                Ok(checksum) => checksum,
-                Err(error) => {
-                    let _ = fs::remove_file(&temp_path);
-                    return Err(error);
-                }
-            };
+            Ok(checksum) => checksum,
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
         if cancelled() {
             let _ = fs::remove_file(&temp_path);
             return Err(DERIVED_GENERATION_CANCELLED.to_string());
         }
-        if let Err(error) = verify_sidecar_with_progress(
-            &temp_path,
-            &checksum_sha256,
-            &mut progress,
-            &cancelled,
-        ) {
+        if let Err(error) =
+            verify_sidecar_with_progress(&temp_path, &checksum_sha256, &mut progress, &cancelled)
+        {
             let _ = fs::remove_file(&temp_path);
             return Err(error);
         }
@@ -1904,14 +2087,58 @@ fn visible_embedding_sql(predicate: &str, suffix: &str) -> String {
     )
 }
 
-/// Column-minimal projection for the resident cache load. The scan needs only
-/// an identity and the vector; the four text columns the full projection
-/// carries are decoded and thrown away once per row.
-pub(super) fn visible_embedding_scan_sql() -> String {
+/// Column-minimal projection for the resident cache load, one page at a time.
+///
+/// The scan needs only an identity and the vector; the four text columns the
+/// full projection carries would be decoded and thrown away once per row.
+///
+/// Paginated rather than whole because the load is the one read here that no
+/// retention window bounds — `clip_image` covers the entire history — and a
+/// single statement holds a SQLite SHARED lock until it finishes, which in this
+/// database's rollback journal mode stalls every capture commit for that long.
+/// `semantic_cache.rs::SCAN_PAGE_ROWS` records the measurements behind the page
+/// size and the reasoning behind the cursor.
+///
+/// Bind parameters: `?1` index kind, `?2` the last subject key of the previous
+/// page (empty string to start), `?3` the page size. Ordering by `subject_key`
+/// walks the `(index_kind, subject_key)` primary-key index directly, so no page
+/// costs a temporary sort.
+pub(super) fn visible_embedding_page_sql() -> String {
     format!(
         r#"
         SELECT e.subject_key, e.dimensions, e.vector_f32
         {VISIBLE_EMBEDDING_SOURCE}
+          AND e.subject_key > ?2
+        ORDER BY e.subject_key
+        LIMIT ?3
+        "#
+    )
+}
+
+/// Allocation metadata for deciding whether a query-visible vector set may be
+/// admitted to the resident exact-scan cache.
+///
+/// This deliberately avoids reading `vector_f32`: the aggregate walks row and
+/// ledger metadata only, so it is much cheaper than materialising the matrix.
+/// It runs on the independent read connection used by the paged scan, and its
+/// statement is dropped before the vector pages are opened so a writer is not
+/// held behind one long read transaction.
+pub(super) fn visible_embedding_cache_stats_sql() -> String {
+    format!(
+        r#"
+        SELECT COUNT(*), MIN(e.dimensions), MAX(e.dimensions),
+               COALESCE(SUM(LENGTH(CAST(e.subject_key AS BLOB))), 0)
+        {VISIBLE_EMBEDDING_SOURCE}
+        "#
+    )
+}
+
+fn visible_embedding_exists_sql() -> String {
+    format!(
+        r#"
+        SELECT 1
+        {VISIBLE_EMBEDDING_SOURCE}
+        LIMIT 1
         "#
     )
 }
@@ -2242,10 +2469,7 @@ fn verify_sidecar_with_progress(
 ) -> Result<(), String> {
     let file = std::fs::File::open(path)
         .map_err(|error| format!("Failed to open derived index sidecar: {error}"))?;
-    let total = file
-        .metadata()
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    let total = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
     let mut reader = BufReader::new(file);
     let mut header = [0u8; SIDECAR_MAGIC.len()];
     reader
@@ -2704,6 +2928,206 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].vector, second.vector);
+    }
+
+    #[test]
+    fn clip_scan_ranks_by_cosine_and_hides_a_deleted_image() {
+        // The step-9 read path in miniature: a top-K over image vectors keyed by
+        // hash, and a hit whose last live screenshot is gone must not surface.
+        let (_temp, storage) = test_storage();
+        for (hash, vector) in [
+            ("hash-near", vec![1.0_f32, 0.0]),
+            ("hash-far", vec![0.0_f32, 1.0]),
+        ] {
+            commit_vector(&storage, job(DerivedIndexKind::ClipImage, hash), vector).unwrap();
+        }
+
+        let ranked = storage.clip_image_topk(&[1.0, 0.0], 2).unwrap();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].subject_key, "hash-near");
+        assert!(ranked[0].score > ranked[1].score);
+
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .as_ref()
+                .unwrap()
+                .execute(
+                    "UPDATE screenshots SET is_deleted = 1 WHERE image_hash = 'hash-near'",
+                    [],
+                )
+                .unwrap();
+        }
+        let ranked = storage.clip_image_topk(&[1.0, 0.0], 2).unwrap();
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].subject_key, "hash-far");
+    }
+
+    #[test]
+    fn clip_candidates_need_ocr_and_stop_once_a_ledger_row_exists() {
+        // The scan is the SQL half of Python's `ocr_text.strip()` gate: an image
+        // with no OCR row at all was never in this corpus, and an image that
+        // already has a ledger row is not offered again.
+        let (_temp, storage) = test_storage();
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().unwrap();
+            conn.execute(
+                "INSERT INTO screenshots (id, image_path, image_hash, width, height, created_at)
+                 VALUES (1, 'a', 'with-ocr', 1920, 1080, datetime('now'))",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO screenshots (id, image_path, image_hash, created_at)
+                 VALUES (2, 'b', 'no-ocr', datetime('now'))",
+                [],
+            )
+            .unwrap();
+            // Older than the repair window: only a full backfill reaches it.
+            conn.execute(
+                "INSERT INTO screenshots (id, image_path, image_hash, width, height, created_at)
+                 VALUES (3, 'c', 'old-with-ocr', 1920, 1080, datetime('now', '-30 days'))",
+                [],
+            )
+            .unwrap();
+            for id in [1, 3] {
+                conn.execute(
+                    "INSERT INTO ocr_results (screenshot_id, text, text_hash)
+                     VALUES (?1, 'hello', 'hash-of-hello-' || ?1)",
+                    params![id],
+                )
+                .unwrap();
+            }
+        }
+        let all = storage.list_clip_image_index_candidates(None, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.contains(&"with-ocr".to_string()));
+        assert!(all.contains(&"old-with-ocr".to_string()));
+
+        // The bounded scan is the one the automatic repair pass uses. Its whole
+        // purpose is to leave the old screenshot alone: before the step-7 copy
+        // settles, an image with no ledger row is one the copy has not reached,
+        // and re-encoding it costs hours to reproduce a vector Chroma holds.
+        let recent = storage
+            .list_clip_image_index_candidates(Some("-7 days"), 10)
+            .unwrap();
+        assert_eq!(recent, vec!["with-ocr".to_string()]);
+
+        storage
+            .upsert_derived_index_job(&job(DerivedIndexKind::ClipImage, "with-ocr"))
+            .unwrap();
+        assert!(storage
+            .list_clip_image_index_candidates(Some("-7 days"), 10)
+            .unwrap()
+            .is_empty());
+        // A ledger row removes a subject from the unbounded scan too, which is
+        // what stops a settled migration's own rows from being offered back.
+        assert_eq!(
+            storage.list_clip_image_index_candidates(None, 10).unwrap(),
+            vec!["old-with-ocr".to_string()]
+        );
+    }
+
+    #[test]
+    fn backfill_work_counts_megapixels_and_assumes_a_size_for_rows_without_one() {
+        let (_temp, storage) = test_storage();
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().unwrap();
+            conn.execute(
+                "INSERT INTO screenshots (id, image_path, image_hash, width, height)
+                 VALUES (1, 'a', 'uhd', 3840, 2160)",
+                [],
+            )
+            .unwrap();
+            // Written before the dimension columns existed.
+            conn.execute(
+                "INSERT INTO screenshots (id, image_path, image_hash) VALUES (2, 'b', 'unknown')",
+                [],
+            )
+            .unwrap();
+            for id in [1, 2] {
+                conn.execute(
+                    "INSERT INTO ocr_results (screenshot_id, text, text_hash)
+                     VALUES (?1, 'hello', 'hash-' || ?1)",
+                    params![id],
+                )
+                .unwrap();
+            }
+        }
+        let work = storage.clip_image_backfill_work(2.0736).unwrap();
+        assert_eq!(work.images, 2);
+        // 8.2944 for the 4K row plus the assumed 1080p for the unsized one. A
+        // count alone would have called these two images equal work; they are
+        // not, by a factor of four.
+        assert!((work.megapixels - (8.2944 + 2.0736)).abs() < 1e-6);
+
+        storage
+            .upsert_derived_index_job(&job(DerivedIndexKind::ClipImage, "uhd"))
+            .unwrap();
+        let work = storage.clip_image_backfill_work(2.0736).unwrap();
+        assert_eq!(work.images, 1);
+        assert!((work.megapixels - 2.0736).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clip_orphan_scan_reclaims_a_row_the_delete_triggers_never_saw() {
+        // `screenshots.image_hash` is UNIQUE and the capture path skips a hash
+        // it already holds, so an image maps to exactly one screenshot. When
+        // that screenshot is soft-deleted through the ordinary path the trigger
+        // removes the derived rows inside the deleting transaction and this
+        // scan finds nothing — which is what the middle assertion pins.
+        //
+        // The scan exists for rows that arrived some other way: a database
+        // written before those triggers, or a step-7 import that committed for a
+        // screenshot deleted after the snapshot was taken. Both are modelled
+        // here by writing the ledger row directly, after the delete, which is
+        // the one thing `upsert_derived_index_job` refuses to do.
+        let (_temp, storage) = test_storage();
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .as_ref()
+                .unwrap()
+                .execute(
+                    "INSERT INTO screenshots (id, image_path, image_hash) VALUES (1, 'a', 'only')",
+                    [],
+                )
+                .unwrap();
+        }
+        storage
+            .upsert_derived_index_job(&job(DerivedIndexKind::ClipImage, "only"))
+            .unwrap();
+        assert!(storage
+            .list_orphaned_clip_image_subjects(10)
+            .unwrap()
+            .is_empty());
+
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().unwrap();
+            conn.execute("UPDATE screenshots SET is_deleted = 1 WHERE id = 1", [])
+                .unwrap();
+            let remaining: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM derived_index_jobs WHERE index_kind = 'clip_image'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "the delete trigger owns the ordinary path");
+
+            conn.execute(
+                "INSERT INTO derived_index_jobs (index_kind, subject_key, status, model_id,                  model_revision, embedding_version, source_fingerprint)                  VALUES ('clip_image', 'only', 'completed', 'm', 'r', 1, 'f')",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            storage.list_orphaned_clip_image_subjects(10).unwrap(),
+            vec!["only".to_string()]
+        );
     }
 
     #[test]
@@ -3607,16 +4031,24 @@ mod tests {
     fn semantic_text_topk_ranks_visible_rows_by_cosine() {
         let (_temp, storage) = test_storage();
         // Three L2-normalized 2-D vectors at increasing angle from the query.
-        commit_vector(&storage, job(DerivedIndexKind::SemanticText, "1"), vec![1.0, 0.0])
-            .unwrap();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "1"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
         commit_vector(
             &storage,
             job(DerivedIndexKind::SemanticText, "2"),
             vec![0.8, 0.6],
         )
         .unwrap();
-        commit_vector(&storage, job(DerivedIndexKind::SemanticText, "3"), vec![0.0, 1.0])
-            .unwrap();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "3"),
+            vec![0.0, 1.0],
+        )
+        .unwrap();
 
         // A pending rebuild must hide its row from retrieval.
         let hidden = job(DerivedIndexKind::SemanticText, "4");
@@ -3639,13 +4071,48 @@ mod tests {
                 .unwrap(),
             3
         );
+        assert!(storage
+            .has_query_visible_embeddings(DerivedIndexKind::SemanticText)
+            .unwrap());
+        assert!(!storage
+            .has_query_visible_embeddings(DerivedIndexKind::ClipImage)
+            .unwrap());
+    }
+
+    #[test]
+    fn query_visible_embedding_existence_tracks_model_contract() {
+        let (_temp, storage) = test_storage();
+        let spec = job(DerivedIndexKind::SemanticText, "7");
+        assert!(!storage
+            .has_query_visible_embeddings(DerivedIndexKind::SemanticText)
+            .unwrap());
+
+        commit_vector(&storage, spec.clone(), vec![0.6, 0.8]).unwrap();
+        assert!(storage
+            .has_query_visible_embeddings(DerivedIndexKind::SemanticText)
+            .unwrap());
+
+        storage
+            .invalidate_derived_index_model(
+                DerivedIndexKind::SemanticText,
+                &spec.model_id,
+                "revision-2",
+                spec.embedding_version,
+            )
+            .unwrap();
+        assert!(!storage
+            .has_query_visible_embeddings(DerivedIndexKind::SemanticText)
+            .unwrap());
     }
 
     #[test]
     fn semantic_text_topk_rejects_empty_query_and_zero_k() {
         let (_temp, storage) = test_storage();
         assert!(storage.semantic_text_topk(&[], 5).is_err());
-        assert!(storage.semantic_text_topk(&[1.0, 0.0], 0).unwrap().is_empty());
+        assert!(storage
+            .semantic_text_topk(&[1.0, 0.0], 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -3681,9 +4148,18 @@ mod tests {
             .get_query_visible_embeddings_by_subjects(DerivedIndexKind::SemanticText, &subjects)
             .unwrap();
         assert_eq!(vectors.len(), 2);
-        assert_eq!(vectors.get("1").map(Vec::as_slice), Some([1.0, 0.0].as_slice()));
-        assert_eq!(vectors.get("2").map(Vec::as_slice), Some([0.0, 1.0].as_slice()));
-        assert!(!vectors.contains_key("3"), "a pending rebuild is not visible");
+        assert_eq!(
+            vectors.get("1").map(Vec::as_slice),
+            Some([1.0, 0.0].as_slice())
+        );
+        assert_eq!(
+            vectors.get("2").map(Vec::as_slice),
+            Some([0.0, 1.0].as_slice())
+        );
+        assert!(
+            !vectors.contains_key("3"),
+            "a pending rebuild is not visible"
+        );
         assert!(!vectors.contains_key("999"), "an unknown subject is absent");
 
         // And the empty batch is not a query at all.
@@ -3746,12 +4222,23 @@ mod tests {
     #[test]
     fn resident_cache_absorbs_write_path_updates() {
         let (_temp, storage) = test_storage();
-        commit_vector(&storage, job(DerivedIndexKind::SemanticText, "1"), vec![1.0, 0.0]).unwrap();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "1"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
         let query = vec![1.0f32, 0.0];
         // The first query loads the matrix; nothing is resident before it.
         assert_eq!(storage.semantic_vector_cache_bytes(), 0);
         assert_eq!(storage.semantic_text_topk(&query, 5).unwrap().len(), 1);
-        assert_eq!(storage.semantic_vector_cache_bytes(), 2 * VECTOR_BYTES);
+        assert_eq!(
+            storage.semantic_vector_cache_matrix_bytes(),
+            2 * VECTOR_BYTES
+        );
+        assert!(
+            storage.semantic_vector_cache_bytes() > storage.semantic_vector_cache_matrix_bytes()
+        );
 
         // A dual-write landing while the cache is resident must be visible to
         // the next query without a reload.
@@ -3765,7 +4252,10 @@ mod tests {
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].subject_key, "1");
         assert_eq!(ranked[1].subject_key, "2");
-        assert_eq!(storage.semantic_vector_cache_bytes(), 4 * VECTOR_BYTES);
+        assert_eq!(
+            storage.semantic_vector_cache_matrix_bytes(),
+            4 * VECTOR_BYTES
+        );
 
         // Re-encoding an existing subject replaces its row in place.
         commit_vector(
@@ -3777,7 +4267,10 @@ mod tests {
         let ranked = storage.semantic_text_topk(&[0.0, 1.0], 1).unwrap();
         assert_eq!(ranked[0].subject_key, "2");
         assert!((ranked[0].score - 1.0).abs() < 1e-6);
-        assert_eq!(storage.semantic_vector_cache_bytes(), 4 * VECTOR_BYTES);
+        assert_eq!(
+            storage.semantic_vector_cache_matrix_bytes(),
+            4 * VECTOR_BYTES
+        );
     }
 
     #[test]
@@ -3808,7 +4301,10 @@ mod tests {
         let ranked = storage.semantic_text_topk(&query, 5).unwrap();
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].subject_key, "2");
-        assert_eq!(storage.semantic_vector_cache_bytes(), 2 * VECTOR_BYTES);
+        assert_eq!(
+            storage.semantic_vector_cache_matrix_bytes(),
+            2 * VECTOR_BYTES
+        );
     }
 
     #[test]
@@ -3826,21 +4322,67 @@ mod tests {
         let ranked = storage.semantic_text_topk(&query, 5).unwrap();
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].subject_key, "2");
-        assert_eq!(storage.semantic_vector_cache_bytes(), 2 * VECTOR_BYTES);
+        assert_eq!(
+            storage.semantic_vector_cache_matrix_bytes(),
+            2 * VECTOR_BYTES
+        );
+    }
+
+    #[test]
+    fn tiny_resident_budget_keeps_the_full_clip_history_searchable() {
+        let (_temp, storage) = test_storage();
+        for (key, vector) in [
+            ("image-a", vec![1.0, 0.0]),
+            ("image-b", vec![0.8, 0.6]),
+            ("image-c", vec![0.0, 1.0]),
+        ] {
+            commit_vector(&storage, job(DerivedIndexKind::ClipImage, key), vector).unwrap();
+        }
+
+        // A budget this small cannot admit even one resident row. The exact
+        // fallback must still rank the complete durable index, and it must not
+        // leave the temporary scan matrix behind for the next query.
+        let ranked = storage
+            .semantic_topk_resident_with_budget(DerivedIndexKind::ClipImage, &[1.0, 0.0], 3, 1)
+            .unwrap();
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|row| row.subject_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["image-a", "image-b", "image-c"]
+        );
+        assert_eq!(storage.semantic_vector_cache_bytes(), 0);
+        assert_eq!(storage.semantic_vector_cache_matrix_bytes(), 0);
+
+        // A second query takes the same bounded-memory path rather than
+        // accidentally becoming a resident hit.
+        assert_eq!(
+            storage
+                .semantic_topk_resident_with_budget(DerivedIndexKind::ClipImage, &[0.0, 1.0], 1, 1,)
+                .unwrap()[0]
+                .subject_key,
+            "image-c"
+        );
+        assert_eq!(storage.semantic_vector_cache_bytes(), 0);
     }
 
     #[test]
     fn idle_eviction_releases_the_resident_matrix() {
         let (_temp, storage) = test_storage();
-        commit_vector(&storage, job(DerivedIndexKind::SemanticText, "1"), vec![1.0, 0.0]).unwrap();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "1"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
         // Nothing resident yet, so there is nothing to evict.
         assert!(!storage.evict_semantic_vector_cache_if_idle(std::time::Duration::ZERO));
 
         assert_eq!(storage.semantic_text_topk(&[1.0, 0.0], 1).unwrap().len(), 1);
         assert!(storage.semantic_vector_cache_bytes() > 0);
         // A live TTL keeps a just-used cache.
-        assert!(!storage
-            .evict_semantic_vector_cache_if_idle(super::super::SEMANTIC_CACHE_IDLE_TTL));
+        assert!(!storage.evict_semantic_vector_cache_if_idle(super::super::SEMANTIC_CACHE_IDLE_TTL));
         assert!(storage.semantic_vector_cache_bytes() > 0);
 
         assert!(storage.evict_semantic_vector_cache_if_idle(std::time::Duration::ZERO));

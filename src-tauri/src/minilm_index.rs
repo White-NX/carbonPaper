@@ -65,7 +65,6 @@
 //! silently cancelled would make that button unreliable. See
 //! [`stand_aside_for_foreground`].
 
-
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
 use crate::minilm_migration::{
@@ -73,7 +72,7 @@ use crate::minilm_migration::{
 };
 use crate::ml_protocol::MlSemanticModel;
 use crate::monitor::{authenticated_monitor_command, MonitorState};
-use crate::semantic_runtime::SemanticRuntimeState;
+use crate::semantic_runtime::{IndexRunProgress, SemanticRuntimeState};
 use crate::storage::{
     BackgroundReadError, BackgroundScreenshotSummary, DerivedEmbeddingWrite, DerivedIndexJobSpec,
     DerivedIndexKind, StorageState,
@@ -256,7 +255,8 @@ pub(crate) fn minilm_sources(
         });
     }
     let summaries = storage.get_screenshot_summaries_by_ids_silent(ids)?;
-    let ocr = storage.get_ocr_text_prefixes_by_screenshot_ids_silent(ids, MINILM_OCR_SNIPPET_CHARS)?;
+    let ocr =
+        storage.get_ocr_text_prefixes_by_screenshot_ids_silent(ids, MINILM_OCR_SNIPPET_CHARS)?;
     let mut indexable = HashMap::with_capacity(summaries.len());
     let mut excluded = HashMap::new();
     for summary in summaries {
@@ -407,6 +407,22 @@ impl SemanticIndexRunState {
 
     fn stopped_by_user(&self) -> bool {
         self.stop_requested.load(Ordering::SeqCst)
+    }
+
+    /// Counters as they stand, for a caller that polls rather than listens.
+    ///
+    /// The progress event is the primary channel and stays that way; this exists
+    /// for the search box, which can mount in the middle of a run that has been
+    /// going for minutes and would otherwise show nothing until the next chunk
+    /// lands. Reads four atomics and touches neither the worker nor the
+    /// database, which is what makes it safe on a poll loop.
+    pub fn progress(&self) -> IndexRunProgress {
+        IndexRunProgress {
+            running: self.running.load(Ordering::SeqCst),
+            processed: self.processed.load(Ordering::SeqCst),
+            indexed: self.indexed.load(Ordering::SeqCst),
+            total: self.total.load(Ordering::SeqCst),
+        }
     }
 
     /// Claim the run and reset its counters. The returned guard clears
@@ -998,11 +1014,7 @@ async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, Stri
                 // goes with it.
                 let recorded = match sources.excluded.get(&id) {
                     Some(spec) => storage
-                        .exclude_derived_index_subject(
-                            spec,
-                            EMPTY_SOURCE_CODE,
-                            EMPTY_SOURCE_REASON,
-                        )
+                        .exclude_derived_index_subject(spec, EMPTY_SOURCE_CODE, EMPTY_SOURCE_REASON)
                         .unwrap_or(false),
                     None => false,
                 };

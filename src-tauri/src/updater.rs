@@ -389,7 +389,10 @@ mod tests {
 
     #[test]
     fn powershell_literals_escape_embedded_single_quotes() {
-        assert_eq!(ps_single_quote(r"C:\Apps\CarbonPaper"), r"C:\Apps\CarbonPaper");
+        assert_eq!(
+            ps_single_quote(r"C:\Apps\CarbonPaper"),
+            r"C:\Apps\CarbonPaper"
+        );
         assert_eq!(
             ps_single_quote(r"C:\Users\O'Brien\AppData"),
             r"C:\Users\O''Brien\AppData"
