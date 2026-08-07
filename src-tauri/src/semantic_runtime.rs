@@ -17,7 +17,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -65,6 +65,19 @@ pub struct SemanticRuntimeStatus {
     /// one field could not tell which of the two it described.
     pub clip_backend: crate::clip_query::ClipBackendStatus,
 }
+
+const BACKEND_DIAGNOSTIC_CACHE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+struct CachedBackendDiagnostics {
+    loaded_at: Instant,
+    includes_vector_counts: bool,
+    semantic: crate::semantic_query::SemanticBackendStatus,
+    clip: crate::clip_query::ClipBackendStatus,
+}
+
+static BACKEND_DIAGNOSTIC_CACHE: OnceLock<tokio::sync::Mutex<Option<CachedBackendDiagnostics>>> =
+    OnceLock::new();
 
 #[derive(Debug)]
 pub struct SemanticEmbeddingResult {
@@ -1272,6 +1285,7 @@ pub async fn get_ml_semantic_status(
     storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
     index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
     clip_run: tauri::State<'_, Arc<crate::clip_index::ClipIndexRunState>>,
+    refresh_diagnostics: Option<bool>,
 ) -> Result<SemanticRuntimeStatus, String> {
     let mut status = state.status();
     // Read before the blocking call below, so a run that finishes while the
@@ -1288,18 +1302,45 @@ pub async fn get_ml_semantic_status(
     // command in this codebase that touches storage keeps that wait off the
     // thread dispatching IPC. A synchronous command here would freeze the UI
     // for as long as a vacuum or a migration page holds the lock.
+    let include_vector_counts = refresh_diagnostics.unwrap_or(false);
+    let requested_at = Instant::now();
+    let cache = BACKEND_DIAGNOSTIC_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut cache_guard = cache.lock().await;
+    if let Some(cached) = cache_guard.as_ref() {
+        let satisfies_request = cached.includes_vector_counts || !include_vector_counts;
+        let completed_after_request = cached.loaded_at >= requested_at;
+        let fresh = cached.loaded_at.elapsed() < BACKEND_DIAGNOSTIC_CACHE_TTL;
+        if satisfies_request && (completed_after_request || (!include_vector_counts && fresh)) {
+            status.backend = cached.semantic.clone();
+            status.backend.index_run_active = run_active;
+            status.clip_backend = cached.clip.clone();
+            status.clip_backend.index_run_active = clip_run_active;
+            return Ok(status);
+        }
+    }
+
     let storage = storage.inner().clone();
-    // One hop onto a blocking thread for both diagnostics rather than two: each
-    // takes the process-wide database mutex, and a settings dialog refreshing
-    // this every few seconds should not queue for it twice.
     let (semantic_backend, clip_backend) = tokio::task::spawn_blocking(move || {
-        (
-            crate::semantic_query::backend_status(Some(storage.as_ref())),
-            crate::clip_query::backend_status(Some(storage.as_ref())),
-        )
+        if include_vector_counts {
+            (
+                crate::semantic_query::backend_status(Some(storage.as_ref())),
+                crate::clip_query::backend_status(Some(storage.as_ref())),
+            )
+        } else {
+            (
+                crate::semantic_query::backend_status_without_vector_count(Some(storage.as_ref())),
+                crate::clip_query::backend_status_without_vector_count(Some(storage.as_ref())),
+            )
+        }
     })
     .await
     .map_err(|error| format!("Failed to read semantic backend status: {error}"))?;
+    *cache_guard = Some(CachedBackendDiagnostics {
+        loaded_at: Instant::now(),
+        includes_vector_counts: include_vector_counts,
+        semantic: semantic_backend.clone(),
+        clip: clip_backend.clone(),
+    });
     status.backend = semantic_backend;
     status.backend.index_run_active = run_active;
     status.clip_backend = clip_backend;

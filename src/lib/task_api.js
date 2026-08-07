@@ -175,10 +175,11 @@ export async function listClipRebuildErrors(offset = 0, limit = 100) {
  * the step-7 copy to settle. The counts it returns are deliberately separate:
  * `skipped_deleted` is the ordinary consequence of having deleted screenshots
  * and needs no action, while `never_indexed` is what a backfill would encode
- * and what `estimated_seconds` is an estimate for.
+ * and what `estimated_seconds` is an estimate for. The full-history census is
+ * deferred until system idle unless `allowExpensive` is an explicit refresh.
  */
-export async function getClipBackfillOffer() {
-  return invoke('get_clip_backfill_offer');
+export async function getClipBackfillOffer(allowExpensive = false) {
+  return invoke('get_clip_backfill_offer', { allowExpensive });
 }
 
 /**

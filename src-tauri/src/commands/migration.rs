@@ -67,12 +67,24 @@ pub async fn storage_get_startup_vacuum_status(
         });
     }
 
-    let needs_vacuum = state.check_startup_vacuum_needed()?;
+    let state = state.inner().clone();
+    let needs_vacuum = tokio::task::spawn_blocking(move || state.check_startup_vacuum_needed())
+        .await
+        .map_err(|error| format!("Startup VACUUM status task failed: {error}"))??;
 
     Ok(StartupVacuumStatus {
         needs_vacuum,
         in_progress,
     })
+}
+
+/// Reports only whether a startup or manual VACUUM currently owns the database.
+///
+/// This is the settings-page probe. It is an atomic read and deliberately does
+/// not inspect the startup sentinel or acquire the database mutex.
+#[tauri::command]
+pub fn storage_is_startup_vacuum_in_progress(state: tauri::State<'_, Arc<StorageState>>) -> bool {
+    state.is_startup_vacuum_in_progress()
 }
 
 /// Runs the one-time startup VACUUM when required.

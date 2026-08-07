@@ -20,8 +20,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// How often the worker asks whether the machine has gone idle.
@@ -1184,6 +1184,47 @@ pub struct ClipBackfillOffer {
     /// counts an unknown screenshot size as 1080p.
     pub estimated_seconds: u64,
     pub migration_status: Option<String>,
+    /// The migration is ready to inspect, but the full-history census was
+    /// deferred until the machine is idle or the user explicitly refreshes.
+    pub diagnostics_deferred: bool,
+}
+
+const BACKFILL_OFFER_CACHE_TTL: Duration = Duration::from_secs(30);
+
+struct CachedClipBackfillOffer {
+    loaded_at: Instant,
+    offer: ClipBackfillOffer,
+}
+
+static BACKFILL_OFFER_CACHE: OnceLock<tokio::sync::Mutex<Option<CachedClipBackfillOffer>>> =
+    OnceLock::new();
+
+fn terminal_backfill_offer(migration_settled: bool, decision: Option<String>) -> ClipBackfillOffer {
+    ClipBackfillOffer {
+        migration_settled,
+        decision,
+        should_ask: false,
+        never_indexed: 0,
+        stalled: 0,
+        skipped_deleted: 0,
+        failed_imports: 0,
+        estimated_seconds: 0,
+        migration_status: None,
+        diagnostics_deferred: false,
+    }
+}
+
+fn deferred_backfill_offer() -> ClipBackfillOffer {
+    ClipBackfillOffer {
+        diagnostics_deferred: true,
+        ..terminal_backfill_offer(true, None)
+    }
+}
+
+async fn invalidate_backfill_offer_cache() {
+    if let Some(cache) = BACKFILL_OFFER_CACHE.get() {
+        *cache.lock().await = None;
+    }
 }
 
 /// Encode cost, fitted to the 2026-08-04 measurements in the roadmap.
@@ -1213,13 +1254,46 @@ const RUN_LEVEL_CODE: &str = diagnostic_code::RUN_FAILED;
 
 /// What a backfill would cost and what it would fix, for the dialog that asks.
 #[tauri::command]
-pub async fn get_clip_backfill_offer(app: AppHandle) -> Result<ClipBackfillOffer, String> {
+pub async fn get_clip_backfill_offer(
+    app: AppHandle,
+    allow_expensive: Option<bool>,
+) -> Result<ClipBackfillOffer, String> {
+    let allow_expensive = allow_expensive.unwrap_or(false);
+    let requested_at = Instant::now();
+    let cache = BACKFILL_OFFER_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut cache_guard = cache.lock().await;
+    if let Some(cached) = cache_guard.as_ref() {
+        let cache_ttl = if cached.offer.diagnostics_deferred || !cached.offer.migration_settled {
+            Duration::from_secs(5)
+        } else {
+            BACKFILL_OFFER_CACHE_TTL
+        };
+        let satisfies_request = !allow_expensive || !cached.offer.diagnostics_deferred;
+        if satisfies_request
+            && (cached.loaded_at >= requested_at || cached.loaded_at.elapsed() < cache_ttl)
+        {
+            return Ok(cached.offer.clone());
+        }
+    }
+
+    let machine_is_idle = app
+        .state::<Arc<IdleState>>()
+        .is_idle
+        .load(Ordering::Relaxed);
+    let load_expensive_diagnostics = allow_expensive || machine_is_idle;
     let storage = app.state::<Arc<StorageState>>().inner().clone();
-    tokio::task::spawn_blocking(move || {
+    let offer = tokio::task::spawn_blocking(move || -> Result<ClipBackfillOffer, String> {
         let migration_settled = crate::clip_query::migration_settled(&storage);
         let decision = storage
             .get_backfill_decision(DerivedIndexKind::ClipImage)
             .unwrap_or(None);
+        if !migration_settled || decision.is_some() {
+            return Ok(terminal_backfill_offer(migration_settled, decision));
+        }
+        if !load_expensive_diagnostics {
+            return Ok(deferred_backfill_offer());
+        }
+
         let work = storage
             .clip_image_backfill_work(ASSUMED_MEGAPIXELS)
             .unwrap_or_default();
@@ -1267,10 +1341,16 @@ pub async fn get_clip_backfill_offer(app: AppHandle) -> Result<ClipBackfillOffer
             failed_imports,
             estimated_seconds,
             migration_status: run.map(|run| run.status),
+            diagnostics_deferred: false,
         })
     })
     .await
-    .map_err(|error| format!("backfill offer task failed: {error}"))?
+    .map_err(|error| format!("backfill offer task failed: {error}"))??;
+    *cache_guard = Some(CachedClipBackfillOffer {
+        loaded_at: Instant::now(),
+        offer: offer.clone(),
+    });
+    Ok(offer)
 }
 
 /// Record the user's answer to that offer.
@@ -1298,7 +1378,8 @@ pub async fn set_clip_backfill_decision(
     .await
     .map_err(|error| format!("backfill decision task failed: {error}"))??;
     tracing::info!("[CLIP:INDEX] backfill {decision} by the user");
-    get_clip_backfill_offer(app).await
+    invalidate_backfill_offer_cache().await;
+    get_clip_backfill_offer(app, Some(false)).await
 }
 
 #[cfg(test)]
@@ -1354,6 +1435,24 @@ mod tests {
                 "{width}x{height}: predicted {predicted:.3}s against {measured:.3}s measured"
             );
         }
+    }
+
+    #[test]
+    fn terminal_backfill_states_do_not_request_full_history_diagnostics() {
+        let migrating = terminal_backfill_offer(false, None);
+        assert!(!migrating.migration_settled);
+        assert!(!migrating.should_ask);
+        assert_eq!(migrating.never_indexed, 0);
+
+        let decided = terminal_backfill_offer(true, Some(BACKFILL_DECLINED.to_string()));
+        assert_eq!(decided.decision.as_deref(), Some(BACKFILL_DECLINED));
+        assert!(!decided.should_ask);
+        assert_eq!(decided.estimated_seconds, 0);
+
+        let deferred = deferred_backfill_offer();
+        assert!(deferred.migration_settled);
+        assert!(deferred.diagnostics_deferred);
+        assert!(!deferred.should_ask);
     }
 
     #[test]
