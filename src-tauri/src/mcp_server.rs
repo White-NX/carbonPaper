@@ -13,11 +13,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use tokio::sync::{oneshot, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use tower_http::cors::CorsLayer;
 
 use crate::credential_manager::CredentialManagerState;
+use crate::mcp_contract;
 use crate::mcp_token;
 use crate::monitor::{self, MonitorState};
 use crate::sensitive_filter::SensitiveFilterState;
@@ -29,17 +33,22 @@ use tauri::{Emitter, Manager};
 // ==================== Default config ====================
 
 const DEFAULT_MCP_PORT: u16 = 23816;
-const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
 // ==================== Runtime state ====================
 
 /// Tauri-managed state for the MCP server lifecycle.
 pub struct McpRuntimeState {
+    // All operations that can change the listener or the credential accepted by
+    // it must hold this lock. In particular, a smoke test keeps it while its
+    // bearer token is in use so it cannot race a restart or token rotation.
+    lifecycle_lock: AsyncMutex<()>,
     server_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    active_port: Mutex<Option<u16>>,
     token_hash: Mutex<Option<[u8; 32]>>,
     idle_check_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     last_error: Mutex<Option<String>>,
+    generation: AtomicU64,
 }
 
 impl Default for McpRuntimeState {
@@ -51,11 +60,14 @@ impl Default for McpRuntimeState {
 impl McpRuntimeState {
     pub fn new() -> Self {
         Self {
+            lifecycle_lock: AsyncMutex::new(()),
             server_handle: Mutex::new(None),
             shutdown_tx: Mutex::new(None),
+            active_port: Mutex::new(None),
             token_hash: Mutex::new(None),
             idle_check_handle: Mutex::new(None),
             last_error: Mutex::new(None),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -67,13 +79,50 @@ impl McpRuntimeState {
         }
     }
 
+    /// Serializes listener lifecycle, token-rotation, and smoke-test work.
+    pub async fn lock_lifecycle(&self) -> AsyncMutexGuard<'_, ()> {
+        self.lifecycle_lock.lock().await
+    }
+
+    /// Returns the port owned by the currently-live CarbonPaper listener.
+    /// A completed server task is deliberately treated as having no active port,
+    /// even if cleanup has not yet removed its bookkeeping.
+    pub fn active_port(&self) -> Option<u16> {
+        if !self.is_running() {
+            return None;
+        }
+        *self.active_port.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_active_port(&self, port: u16) {
+        let mut guard = self.active_port.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(port);
+    }
+
+    fn clear_active_port(&self) {
+        let mut guard = self.active_port.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+
     pub fn set_token_hash(&self, hash: [u8; 32]) {
         let mut guard = self.token_hash.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(hash);
+        self.bump_generation();
     }
 
     pub fn get_token_hash(&self) -> Option<[u8; 32]> {
         *self.token_hash.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Monotonically identifies a listener, port, or credential transition. It
+    /// is exposed only as diagnostic state so the settings page can invalidate
+    /// a report that no longer describes the current service.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     pub fn clear_last_error(&self) {
@@ -238,7 +287,7 @@ fn handle_initialize(id: Option<Value>) -> JsonRpcResponse {
     JsonRpcResponse::success(
         id,
         serde_json::json!({
-            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "protocolVersion": mcp_contract::MCP_PROTOCOL_VERSION,
             "capabilities": {
                 "tools": {}
             },
@@ -256,173 +305,7 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
     // Keep the tool table deterministic and independent of database/runtime
     // health. A backend may be temporarily unavailable when the tool is called;
     // that is a runtime result, not a change to the MCP tool contract.
-    let tools = serde_json::json!({
-        "tools": [
-            {
-                "name": "get_snapshots_by_time_range",
-                "description": "Get screenshot snapshots within a time range. Returns metadata only (no image data). Timestamps are in milliseconds since Unix epoch.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "start_time": { "type": "number", "description": "Start timestamp in milliseconds" },
-                        "end_time": { "type": "number", "description": "End timestamp in milliseconds" },
-                        "max_records": { "type": "integer", "description": "Maximum number of records to return (default 500)" }
-                    },
-                    "required": ["start_time", "end_time"]
-                }
-            },
-            {
-                "name": "get_snapshot_details",
-                "description": "Get full details of a specific snapshot including metadata, OCR text, and the task cluster it belongs to (if any). By default OCR bounding box coordinates are omitted to save tokens; set include_coords=true to include them.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "integer", "description": "Screenshot ID" },
-                        "include_coords": { "type": "boolean", "description": "Include OCR bounding box coordinates (default false)" }
-                    },
-                    "required": ["id"]
-                }
-            },
-            {
-                "name": "search_ocr_text",
-                "description": "Search screenshot OCR text using full-text search. Supports CJK and English text.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string", "description": "Search query text" },
-                        "limit": { "type": "integer", "description": "Max results (default 20)" },
-                        "offset": { "type": "integer", "description": "Pagination offset (default 0)" },
-                        "fuzzy": { "type": "boolean", "description": "Enable fuzzy matching (default true)" },
-                        "process_names": { "type": "array", "items": { "type": "string" }, "description": "Filter by process names" },
-                        "start_time": { "type": "number", "description": "Filter start time (ms)" },
-                        "end_time": { "type": "number", "description": "Filter end time (ms)" },
-                        "categories": { "type": "array", "items": { "type": "string" }, "description": "Filter by categories" }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "search_nl",
-                "description": "Natural language visual search over screenshots: a text query matched against what each screenshot looks like, using Chinese-CLIP image embeddings. Complements search_ocr_text, which matches the literal text on screen.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string", "description": "Natural language search query" },
-                        "limit": { "type": "integer", "description": "Max results (default 20)" },
-                        "offset": { "type": "integer", "description": "Pagination offset (default 0)" },
-                        "process_names": { "type": "array", "items": { "type": "string" }, "description": "Filter by process names" },
-                        "start_time": { "type": "number", "description": "Filter start time (ms)" },
-                        "end_time": { "type": "number", "description": "Filter end time (ms)" }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "get_task_clusters",
-                "description": "Get task clustering results. Tasks are groups of related screenshots identified by activity patterns.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "layer": { "type": "string", "description": "Clustering layer (e.g. 'hot', 'cold')" },
-                        "start_time": { "type": "number", "description": "Filter start time (ms)" },
-                        "end_time": { "type": "number", "description": "Filter end time (ms)" },
-                        "hide_inactive": { "type": "boolean", "description": "Hide inactive tasks" }
-                    }
-                }
-            },
-            {
-                "name": "get_task_screenshots",
-                "description": "Get screenshots belonging to a specific task cluster, with pagination.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": { "type": "integer", "description": "Task cluster ID" },
-                        "page": { "type": "integer", "description": "Page number (0-based, default 0)" },
-                        "page_size": { "type": "integer", "description": "Page size (default 50)" }
-                    },
-                    "required": ["task_id"]
-                }
-            },
-            {
-                "name": "rename_task",
-                "description": "Rename a task cluster.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": { "type": "integer", "description": "Task cluster ID" },
-                        "label": { "type": "string", "description": "New label for the task" }
-                    },
-                    "required": ["task_id", "label"]
-                }
-            },
-            {
-                "name": "get_smart_clusters",
-                "description": "List smart clusters with assignment counts and any stored AI-generated summary.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "get_smart_cluster_ocr_corpus",
-                "description": "Get assigned snapshots for a smart cluster with joined OCR text, for AI summarization. Results are paginated and ordered by rerank score.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "cluster_id": { "type": "integer", "description": "Smart cluster ID" },
-                        "page": { "type": "integer", "description": "Page number (0-based, default 0)" },
-                        "page_size": { "type": "integer", "description": "Page size (default 50, max 200)" },
-                        "include_empty_ocr": { "type": "boolean", "description": "Include snapshots that have no OCR text (default false)" }
-                    },
-                    "required": ["cluster_id"]
-                }
-            },
-            {
-                "name": "get_smart_cluster_summary",
-                "description": "Get the stored AI-generated summary for a smart cluster, if one exists.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "cluster_id": { "type": "integer", "description": "Smart cluster ID" }
-                    },
-                    "required": ["cluster_id"]
-                }
-            },
-            {
-                "name": "upsert_smart_cluster_summary",
-                "description": "Create or replace the stored AI-generated title, cluster overview, OCR summary, key points, evidence, and model metadata for a smart cluster.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "cluster_id": { "type": "integer", "description": "Smart cluster ID" },
-                        "title": { "type": "string", "description": "Short AI-generated title" },
-                        "summary": { "type": "string", "description": "Cluster-level introduction or overview" },
-                        "ocr_summary": { "type": "string", "description": "Integrated summary of OCR information across assigned snapshots" },
-                        "key_points": { "description": "Optional JSON array/object of key points" },
-                        "evidence": { "description": "Optional JSON array/object describing source snapshot evidence" },
-                        "source_snapshot_count": { "type": "integer", "description": "Number of source snapshots used" },
-                        "source_hash": { "type": "string", "description": "Optional hash/fingerprint of the source corpus" },
-                        "model_provider": { "type": "string", "description": "Model provider name" },
-                        "model_name": { "type": "string", "description": "Model name" },
-                        "prompt_version": { "type": "string", "description": "Prompt/template version" }
-                    },
-                    "required": ["cluster_id"]
-                }
-            },
-            {
-                "name": "delete_smart_cluster_summary",
-                "description": "Delete the stored AI-generated summary for a smart cluster. The smart cluster and its assigned snapshots are preserved.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "cluster_id": { "type": "integer", "description": "Smart cluster ID" }
-                    },
-                    "required": ["cluster_id"]
-                }
-            }
-        ]
-    });
-    JsonRpcResponse::success(id, tools)
+    JsonRpcResponse::success(id, mcp_contract::tools_list_result())
 }
 
 #[cfg(test)]
@@ -430,7 +313,7 @@ mod tool_list_tests {
     use super::*;
 
     #[test]
-    fn tools_list_always_advertises_search_nl() {
+    fn tools_list_matches_the_versioned_contract_and_dispatch_table() {
         let response = handle_tools_list(Some(serde_json::json!(1)));
         let tools = response
             .result
@@ -440,6 +323,11 @@ mod tool_list_tests {
             .and_then(Value::as_array)
             .expect("tools/list result should contain a tools array");
 
+        assert_eq!(
+            Value::Array(tools.clone()),
+            mcp_contract::tool_definitions()
+        );
+        assert_eq!(DISPATCHED_TOOL_NAMES, mcp_contract::TOOL_NAMES);
         assert!(tools
             .iter()
             .any(|tool| { tool.get("name").and_then(Value::as_str) == Some("search_nl") }));
@@ -447,6 +335,39 @@ mod tool_list_tests {
 }
 
 // ==================== Tool dispatch ====================
+
+macro_rules! define_mcp_tool_dispatch {
+    ($($name:literal => $handler:ident),+ $(,)?) => {
+        #[cfg(test)]
+        const DISPATCHED_TOOL_NAMES: &[&str] = &[$($name),+];
+
+        async fn dispatch_mcp_tool(
+            state: &McpServerInner,
+            tool_name: &str,
+            args: Value,
+        ) -> Result<Value, String> {
+            match tool_name {
+                $($name => $handler(state, args).await,)+
+                _ => Err(format!("Unknown tool: {}", tool_name)),
+            }
+        }
+    };
+}
+
+define_mcp_tool_dispatch!(
+    "get_snapshots_by_time_range" => tool_get_snapshots,
+    "get_snapshot_details" => tool_get_snapshot_details,
+    "search_ocr_text" => tool_search_ocr,
+    "search_nl" => tool_search_nl,
+    "get_task_clusters" => tool_get_task_clusters,
+    "get_task_screenshots" => tool_get_task_screenshots,
+    "rename_task" => tool_rename_task,
+    "get_smart_clusters" => tool_get_smart_clusters,
+    "get_smart_cluster_ocr_corpus" => tool_get_smart_cluster_ocr_corpus,
+    "get_smart_cluster_summary" => tool_get_smart_cluster_summary,
+    "upsert_smart_cluster_summary" => tool_upsert_smart_cluster_summary,
+    "delete_smart_cluster_summary" => tool_delete_smart_cluster_summary,
+);
 
 async fn handle_tools_call(
     state: &McpServerInner,
@@ -474,21 +395,7 @@ async fn handle_tools_call(
 
     tracing::info!("MCP tools/call: tool={}", tool_name);
 
-    let result = match tool_name {
-        "get_snapshots_by_time_range" => tool_get_snapshots(state, args).await,
-        "get_snapshot_details" => tool_get_snapshot_details(state, args).await,
-        "search_ocr_text" => tool_search_ocr(state, args).await,
-        "search_nl" => tool_search_nl(state, args).await,
-        "get_task_clusters" => tool_get_task_clusters(state, args).await,
-        "get_task_screenshots" => tool_get_task_screenshots(state, args).await,
-        "rename_task" => tool_rename_task(state, args).await,
-        "get_smart_clusters" => tool_get_smart_clusters(state, args).await,
-        "get_smart_cluster_ocr_corpus" => tool_get_smart_cluster_ocr_corpus(state, args).await,
-        "get_smart_cluster_summary" => tool_get_smart_cluster_summary(state, args).await,
-        "upsert_smart_cluster_summary" => tool_upsert_smart_cluster_summary(state, args).await,
-        "delete_smart_cluster_summary" => tool_delete_smart_cluster_summary(state, args).await,
-        _ => Err(format!("Unknown tool: {}", tool_name)),
-    };
+    let result = dispatch_mcp_tool(state, tool_name, args).await;
 
     match result {
         Ok(content) => {
@@ -2123,7 +2030,8 @@ async fn presidio_check_idle(app_handle: &tauri::AppHandle) {
 // ==================== Server lifecycle ====================
 
 /// Start the MCP HTTP server.
-/// Automatically stops any existing server before starting.
+/// Automatically stops any existing server before starting. The caller must hold
+/// [`McpRuntimeState::lock_lifecycle`] for the complete operation.
 pub async fn start_server(
     app_handle: tauri::AppHandle,
     port: u16,
@@ -2153,13 +2061,11 @@ pub async fn start_server(
 
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
 
-    // Use TcpSocket with SO_REUSEADDR so we can always rebind the port,
-    // even if a previous listener wasn't fully released by the OS yet.
+    // Keep the default exclusive bind behavior. On Windows, enabling
+    // SO_REUSEADDR can allow another local process to share a listener port,
+    // which would undermine the smoke test's ownership check.
     let socket =
         tokio::net::TcpSocket::new_v4().map_err(|e| format!("Failed to create socket: {}", e))?;
-    socket
-        .set_reuseaddr(true)
-        .map_err(|e| format!("Failed to set SO_REUSEADDR: {}", e))?;
     socket
         .bind(addr)
         .map_err(|e| format!("Failed to bind port {}: {}", port, e))?;
@@ -2203,6 +2109,8 @@ pub async fn start_server(
             .unwrap_or_else(|e| e.into_inner());
         *guard = Some(shutdown_tx);
     }
+    mcp_runtime.set_active_port(port);
+    mcp_runtime.bump_generation();
 
     // Start periodic idle check for Presidio model (every 60s)
     {
@@ -2225,8 +2133,14 @@ pub async fn start_server(
     Ok(())
 }
 
-/// Stop the MCP HTTP server.
+/// Stop the MCP HTTP server. The caller must hold
+/// [`McpRuntimeState::lock_lifecycle`] for the complete operation.
 pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
+    // Clear this before tearing down the task so no status or probe can mistake
+    // a listener that is in the process of stopping for an active endpoint.
+    mcp_runtime.clear_active_port();
+    mcp_runtime.bump_generation();
+
     // Abort the idle check timer
     let idle_handle = {
         let mut guard = mcp_runtime
@@ -2280,13 +2194,19 @@ pub async fn auto_start(
     storage_state: &StorageState,
     mcp_runtime: &McpRuntimeState,
 ) -> Result<(), String> {
+    let _lifecycle_guard = mcp_runtime.lock_lifecycle().await;
+    auto_start_locked(app_handle, credential_state, storage_state, mcp_runtime).await
+}
+
+async fn auto_start_locked(
+    app_handle: tauri::AppHandle,
+    credential_state: &CredentialManagerState,
+    storage_state: &StorageState,
+    mcp_runtime: &McpRuntimeState,
+) -> Result<(), String> {
     let policy = storage_state.load_policy()?;
 
-    let port = policy
-        .get("mcp_port")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u16)
-        .unwrap_or(DEFAULT_MCP_PORT);
+    let port = port_from_policy(&policy);
 
     let encrypted_b64 = policy
         .get("mcp_token_encrypted")
@@ -2332,6 +2252,7 @@ pub async fn restore_if_enabled(
     storage_state: &StorageState,
     mcp_runtime: &McpRuntimeState,
 ) -> Result<bool, String> {
+    let _lifecycle_guard = mcp_runtime.lock_lifecycle().await;
     let policy = storage_state.load_policy()?;
     let enabled = policy
         .get("mcp_enabled")
@@ -2342,7 +2263,7 @@ pub async fn restore_if_enabled(
         return Ok(false);
     }
 
-    match auto_start(
+    match auto_start_locked(
         app_handle.clone(),
         credential_state,
         storage_state,
@@ -2366,7 +2287,8 @@ pub(crate) fn port_from_policy(policy: &Value) -> u16 {
     policy
         .get("mcp_port")
         .and_then(|v| v.as_u64())
-        .map(|v| v as u16)
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|port| *port != 0)
         .unwrap_or(DEFAULT_MCP_PORT)
 }
 
@@ -2376,4 +2298,26 @@ pub fn get_port(storage_state: &StorageState) -> u16 {
         .ok()
         .map(|policy| port_from_policy(&policy))
         .unwrap_or(DEFAULT_MCP_PORT)
+}
+
+#[cfg(test)]
+mod runtime_state_tests {
+    use super::*;
+
+    #[test]
+    fn policy_port_rejects_zero_and_values_outside_u16() {
+        assert_eq!(port_from_policy(&serde_json::json!({ "mcp_port": 1 })), 1);
+        assert_eq!(
+            port_from_policy(&serde_json::json!({ "mcp_port": 65535 })),
+            65535
+        );
+        assert_eq!(
+            port_from_policy(&serde_json::json!({ "mcp_port": 0 })),
+            DEFAULT_MCP_PORT
+        );
+        assert_eq!(
+            port_from_policy(&serde_json::json!({ "mcp_port": 65536 })),
+            DEFAULT_MCP_PORT
+        );
+    }
 }

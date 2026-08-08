@@ -61,7 +61,7 @@ again.
 | M5 — Classification and PII resolution | post-M4 | **PLANNED** | M2-M4 |
 | M6 — Python-free default build | later 0.8.x | **PLANNED** | M1-M5 default and stable for a release |
 | M7 — Infrastructure deletion and simplification | final 0.8.x | **PLANNED** | M6 |
-| Parallel track — Agent skill and MCP | ongoing | **MOSTLY DONE** | settings-page MCP smoke test; per-agent setup variants |
+| Parallel track — Agent skill and MCP | v0.8.4 | **DONE** | joint app/Skill release validation |
 
 ---
 
@@ -1970,38 +1970,49 @@ surface.
 
 ## 7. Parallel track: AI agent skill and MCP onboarding
 
-**Status.** Reached the original 0.8.3 target. The standalone package
-`carbonpaper-memory` (repo `carbonPaperSkill`) is the committed distribution
-shape (`components/settings/agent-access/agentAccessConstants.js`).
+**Status.** Complete for v0.8.4. The standalone package `carbonpaper-memory`
+(repo `carbonPaperSkill`) remains the committed distribution shape
+(`src/components/settings/agent-access/agentAccessConstants.js`).
 
 **Done.**
 
 - A full agent-setup area: endpoint and connection state, one-click copy of the
   setup prompt, separate token copy, and copy-diagnostics
-  (`components/settings/agent-access/`).
+  (`src/components/settings/agent-access/`).
 - `mcp_get_status` returns `server_version`, `skill.tool_schema_version`, and
-  `capabilities`, including `search_nl` availability and the
-  `python_monitor_not_running` disabled reason (`commands/mcp.rs`).
+  `capabilities`. `search_nl` reports the backend that can answer now and
+  distinguishes maintenance, an unavailable Rust CLIP index, and an unavailable
+  Python rollback backend (`src-tauri/src/commands/mcp.rs`).
 - 12 MCP tools exposed. The tool list is a static protocol contract, including
   `search_nl`; backend readiness remains available through `mcp_get_status` and
-  call-time errors rather than changing `tools/list` (`mcp_server.rs`).
+  call-time errors rather than changing `tools/list`
+  (`src-tauri/src/mcp_server.rs`).
+- `mcp_run_smoke_test` performs four deadline-bounded loopback checks entirely
+  in Rust: protocol initialization, authenticated ping, exact `tools/list`
+  comparison, and a one-record read-only metadata query. It returns stable port,
+  authentication, protocol, catalog, session, privacy-filter, maintenance, and
+  timeout failure kinds without returning the token or queried metadata
+  (`src-tauri/src/mcp_smoke.rs`).
+- The settings page provides Codex, Claude, Cursor, and generic Streamable HTTP
+  setup variants. Prompts use `127.0.0.1`, contain only a token placeholder, and
+  read Skill id, source repository, and schema version from backend status with
+  a static fallback (`src/components/settings/agent-access/`).
+- `src-tauri/src/mcp_contract.rs` is the source of truth for MCP protocol
+  metadata and the 12-tool schema. The v2 JSON contract is exported to
+  `docs/mcp-tool-contract-v2.json`; `carbonPaperSkill` checks in the same JSON
+  and mechanically generates its tool table. Schema v2 pins `search_nl` as
+  Chinese-CLIP text-to-image visual retrieval, independent of whether Rust or
+  the Python rollback backend serves a call.
 
-**Remaining.**
+**Joint release gate.** Run `npm run test:mcp-contract` and
+`npm run test:mcp-skill-contract` in this repository, then `npm test` in
+`carbonPaperSkill`. Before publishing the paired release, run the settings-page
+connection test once against a live, unlocked CarbonPaper instance and confirm
+all four stages pass. Milestones 6-7 should only remove obsolete Python wording;
+they must not change the retained tool identity.
 
-- The original 0.8.4 items: a **settings-page MCP smoke test** (authenticated
-  ping, list tools, harmless metadata query, with auth, port, and privacy-filter
-  failures reported separately) and per-agent guided setup variants. No such
-  command exists today.
-- Capability-drift control. As Milestones 2 and 3 move embedding, reranker, and
-  Smart Cluster work to Rust, update the skill's capability flags and the
-  `search_nl` wording to track its backend — CLIP text-to-image, moving from
-  Python to Rust at M2.5 steps 7-9 — so it never advertises a Python-only path as
-  stable, while keeping it advertised, since the capability is retained rather
-  than removed. Prefer generating and validating the skill's tool table from the
-  Rust MCP command definitions.
-
-Do not defer this track to Milestones 6-7. The agent story is already stable;
-those milestones should only remove obsolete Python wording.
+**Boundary.** This track does not add unattended Agent grants. Protected Tauri
+commands and MCP data access retain the existing session-authentication checks.
 
 ---
 
@@ -2240,3 +2251,4 @@ milestone bodies; this is an index so a reversal is not silently re-reversed.
 | 2026-08-04 | MCP `search_nl` availability stops meaning **"is Python running"**. Two backends can answer it now, so the capability flag reports which one would. `tools/list` remains a static contract and always advertises the tool; temporary backend unavailability is reported by status and at call time instead of changing the schema. |
 | 2026-08-06 | The existing `.cpdvec` file is recorded as a **generation-safe flat snapshot, not an ANN reader already in production**. M2.6 adds the ANN payload and query integration for the no-retention CLIP corpus, while SQLite stays authoritative and the bounded paged exact scan remains the complete fallback. |
 | 2026-08-07 | Step 10 changed from BGE shadow-only to a **direct Rust-default inference bridge** at the maintainer's direction. Python still owns classification orchestration and stays available through `classification_runtime=python`; ordinary Rust failures fall back per request, while `foreground_busy` does not load Python and compete with foreground semantic work. The selected value is latched at monitor spawn, so the Settings change takes effect only after monitor restart. |
+| 2026-08-08 | The Agent/MCP parallel track is complete for v0.8.4. A Rust-owned schema-v2 contract now drives `tools/list`, checked-in JSON, and the `carbonPaperSkill` tool table; the settings page adds a four-stage authenticated smoke test and Codex, Claude, Cursor, and generic setup variants. The app and Skill are validated as one release unit, while unattended Agent grants remain out of scope. |

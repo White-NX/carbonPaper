@@ -10,11 +10,11 @@ export default function ConnectionInfoRow({ port }) {
       <div className="space-y-1.5 mt-2">
         <div>
           <p className="text-xs text-ide-muted">{t('settings.ai_embedding.connection_info.endpoint')}</p>
-          <code className="text-xs text-ide-text font-mono">POST http://localhost:{port}/mcp</code>
+          <code className="text-xs text-ide-text font-mono">POST http://127.0.0.1:{port}/mcp</code>
         </div>
         <div>
           <p className="text-xs text-ide-muted">{t('settings.ai_embedding.connection_info.auth_header')}</p>
-          <code className="text-xs text-ide-text font-mono">Authorization: Bearer &lt;your-token&gt;</code>
+          <code className="text-xs text-ide-text font-mono">Authorization: Bearer &lt;CarbonPaper token&gt;</code>
         </div>
       </div>
     </div>

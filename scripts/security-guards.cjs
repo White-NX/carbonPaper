@@ -80,6 +80,7 @@ const COMMAND_TIERS = {
   'analysis::get_analysis_overview': 'session_required',
   'commands::mcp::mcp_set_enabled': 'session_required',
   'commands::mcp::mcp_get_status': 'public',
+  'commands::mcp::mcp_run_smoke_test': 'session_required',
   'commands::mcp::mcp_ack_privacy_warning': 'public',
   'commands::mcp::mcp_reset_token': 'session_required',
   'commands::mcp::mcp_copy_token_to_clipboard': 'session_required',

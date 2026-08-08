@@ -11,6 +11,9 @@
     "test:frontend:watch": "vitest",
     "test:frontend:coverage": "vitest run --coverage",
     "test:frontend:ci": "vitest run --coverage --reporter=dot",
+    "generate:mcp-contract": "node scripts/mcp-contract.mjs --update",
+    "test:mcp-contract": "node scripts/mcp-contract.mjs",
+    "test:mcp-skill-contract": "node scripts/mcp-contract.mjs --skill-root ../carbonPaperSkill",
     "test:python": "python -m pytest monitor/tests -q --timeout=15",
     "test:python:regression": "python -m pytest monitor/tests/test_storage_client_ipc.py monitor/tests/test_storage_client_error_paths.py monitor/tests/test_task_clustering_concurrency.py monitor/tests/test_task_clustering_scheduler_paths.py monitor/tests/test_monitor_command_dispatch.py monitor/tests/test_monitor_worker_contracts.py monitor/tests/test_storage_client_contracts.py monitor/tests/test_presidio_worker_contracts.py monitor/tests/test_ipc_pipe_request_integrity.py monitor/tests/test_ipc_pipe_auth_guard.py -q --timeout=15",
     "test:python:prebundle-sync": "python -m pytest monitor/tests/test_prebundle_sync.py -q --timeout=15",
@@ -45,7 +48,6 @@
   "dependencies": {
     "@tauri-apps/api": "~2.9.0",
     "@tauri-apps/plugin-dialog": "^2.6.0",
-    "@tauri-apps/plugin-notification": "^2.3.3",
     "@tauri-apps/plugin-opener": "^2",
     "clsx": "^2.1.1",
     "i18next": "^25.8.12",

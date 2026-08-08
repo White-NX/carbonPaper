@@ -291,9 +291,9 @@
       },
       "semantic_backend": {
         "title": "Screenshot text retrieval",
-        "label": "Use Rust to search screenshot text",
-        "description": "This is the search that matches the text on your screenshots by meaning, using the MiniLM text model. It covers the natural-language grouping view and Smart Cluster calibration. Natural-language search in the main search box is served by Chinese-CLIP and is not affected by this setting.",
-        "rollback_note": "When off, retrieval is handed back to Python and ChromaDB. Vector data is unchanged and background indexing continues either way, so you can switch back at any time.",
+        "label": "Run MiniLM using Rust runtime (Beta)",
+        "description": "The optimized yet experimental Rust runtime offers better memory and CPU performance in most cases, but may cause unexpected consequences.",
+        "rollback_note": "When off, retrieval is handed back to Python and ChromaDB.",
         "diagnostic": "Local diagnostic",
         "refresh": "Refresh diagnostic",
         "last_query": "Last query served by",
@@ -319,9 +319,9 @@
       },
       "clip_backend": {
         "title": "Screenshot image search",
-        "label": "Use Rust for text-to-image search",
-        "description": "The main search box's natural-language mode: describe what a screenshot looked like and find it, matched by the Chinese-CLIP image model against the screenshot's visual content. It is a different search from the one above, which matches recognised text by meaning.",
-        "rollback_note": "When off, this search is handed back to Python and ChromaDB. Vector data is unchanged and background indexing continues either way, so you can switch back at any time.",
+        "label": "Run CLIP using Rust runtime (Beta)",
+        "description": "The optimized yet experimental Rust runtime offers better memory and CPU performance in most cases, but may cause unexpected consequences.",
+        "rollback_note": "When off, this search is handed back to Python and ChromaDB.",
         "diagnostic": "Local diagnostic",
         "refresh": "Refresh diagnostic",
         "last_query": "Last query served by",
@@ -348,8 +348,8 @@
       "classification_backend": {
         "title": "Automatic screenshot classification",
         "label": "Use Rust for BGE classification inference",
-        "description": "BGE-small-zh matches window titles and, when needed, OCR text against classification anchors. The result is stored on the screenshot and used by category filters and task summaries.",
-        "rollback_note": "When off, BGE runs in the local Python runtime again. Classification rules, existing categories, and learned anchors are unchanged.",
+        "description": "Classify screenshots using the BGE-small-zh model supported by the Rust runtime.",
+        "rollback_note": "When off, classification reverts to execution by the local Python runtime.",
         "selected": "Selected runtime",
         "active": "Active monitor runtime",
         "runtime_rust": "Rust (default)",
@@ -628,14 +628,67 @@
       },
       "agent_setup": {
         "title": "Agent Setup",
-        "description": "Copy setup instructions so an Agent can fetch the Skill and connect to the local MCP server.",
+        "description": "Choose an Agent, then copy setup instructions tailored to its Skill and MCP configuration flow.",
         "skill": "Skill",
         "source": "Source",
         "endpoint": "Endpoint",
+        "schema_version": "tool contract v{{version}}",
         "copy": "Copy setup prompt",
         "copy_diagnostics": "Copy diagnostics",
         "copied": "Setup prompt copied",
-        "prompt": "Configure CarbonPaper MCP access.\n\n1. Fetch the Skill from the {{skillName}} directory in GitHub repository {{repo}}, then install it into your Agent/Skill environment.\n2. Use that Skill for CarbonPaper screenshot history, OCR, task cluster, and smart-cluster summary workflows.\n3. MCP endpoint: {{endpoint}}, using Streamable HTTP/HTTP POST.\n4. Authorization header: Authorization: Bearer <CarbonPaper token>. Do not ask me to paste the token into this long setup prompt; ask me to click Copy token in CarbonPaper and configure it separately in your MCP client.\n5. If a tool returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello before retrying.\n6. This MCP server may expose local screenshot history, OCR text, window titles, URLs, task clusters, and smart-cluster data. Read only the content needed for my explicit request."
+        "variants": {
+          "codex": {
+            "label": "Codex",
+            "description": "Install the native Skill and configure Codex's Streamable HTTP MCP connection.",
+            "prompt": "Configure CarbonPaper local-memory access in Codex.\n\n1. Fetch the {{skillName}} directory from {{repo}} and install it as a Codex Skill. It targets tool contract v{{toolSchemaVersion}}.\n2. Add a Streamable HTTP MCP server named carbonpaper with URL {{endpoint}}.\n3. Configure the header Authorization: Bearer <CarbonPaper token>. Do not put the token in prompts or logs; ask me to use Copy token in CarbonPaper and store it in Codex's local secret configuration.\n4. Use the Skill for screenshot history, OCR, task-cluster, and smart-cluster summary requests. search_nl is Chinese-CLIP text-to-image visual retrieval, not a Python-only feature.\n5. tools/list is a stable contract; temporary readiness comes from CarbonPaper diagnostics and call results. If a call returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Read only local data needed for my explicit request. When finished, report the configuration location and connection-test result."
+          },
+          "claude": {
+            "label": "Claude",
+            "description": "Configure Claude Desktop or Claude Code and use the Skill documents as project guidance.",
+            "prompt": "Configure CarbonPaper local-memory access for Claude Desktop or Claude Code.\n\n1. Add a Streamable HTTP MCP server named carbonpaper with URL {{endpoint}}.\n2. Configure Authorization: Bearer <CarbonPaper token>. Do not put the token in chat, project instructions, or logs; ask me to copy it separately from CarbonPaper and store it in the client's local secret configuration.\n3. Read {{skillName}}/SKILL.md and its references from {{repo}} as the CarbonPaper workflow guide. The current tool contract is v{{toolSchemaVersion}}.\n4. search_nl is Chinese-CLIP text-to-image visual retrieval and must not be described as Python-dependent. tools/list always exposes the static contract; temporary readiness is reported when a tool is called.\n5. If a call returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Read only data needed for my explicit request. Report the configuration location and connection-test result when done."
+          },
+          "cursor": {
+            "label": "Cursor",
+            "description": "Configure Cursor MCP and add the Skill workflow to local project rules or Agent context.",
+            "prompt": "Configure CarbonPaper local-memory access in Cursor.\n\n1. Add a Streamable HTTP MCP server named carbonpaper with URL {{endpoint}}.\n2. Configure Authorization: Bearer <CarbonPaper token>. Do not put the token in chat, repository files, or committed rules; ask me to copy it separately from CarbonPaper and store it in Cursor's private local configuration.\n3. Read {{skillName}}/SKILL.md and its references from {{repo}}, then add the applicable workflow to local Agent context. The tool contract is v{{toolSchemaVersion}}.\n4. search_nl is Chinese-CLIP visual retrieval, not a Python-only path. tools/list is static and temporary backend unavailability is a call-time result.\n5. On AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Report the configuration location and MCP connection-test result without printing the token."
+          },
+          "generic": {
+            "label": "Generic",
+            "description": "For other Agents that support Streamable HTTP MCP.",
+            "prompt": "Configure local CarbonPaper MCP access.\n\n1. Add a Streamable HTTP MCP server named carbonpaper at {{endpoint}}.\n2. Use Authorization: Bearer <CarbonPaper token>. Do not place the token in prompts, logs, or repositories; ask me to copy it separately from CarbonPaper and store it in the client's local secret configuration.\n3. Read the workflow in the {{skillName}} directory at {{repo}}. The current tool contract is v{{toolSchemaVersion}}.\n4. search_nl is Chinese-CLIP text-to-image visual retrieval. tools/list is a static contract; live readiness is a call-time result.\n5. If a call returns AUTH_REQUIRED, tell me to unlock CarbonPaper with Windows Hello.\n6. Read only data needed for explicit requests, then validate the setup with ping, tools/list, and a read-only query."
+          }
+        }
+      },
+      "smoke_test": {
+        "title": "MCP Connection Test",
+        "description": "Check the loopback port, authentication, tool contract, and read-only metadata path.",
+        "run": "Run test",
+        "running": "Testing",
+        "success": "Passed: tool contract v{{version}} with {{count}} tools.",
+        "duration": "{{duration}} ms",
+        "skipped": "Not run",
+        "stages": {
+          "initialize": "Protocol",
+          "ping": "Authentication",
+          "tools_list": "Tool contract",
+          "metadata_query": "Privacy filter"
+        },
+        "errors": {
+          "server_not_running": "The CarbonPaper MCP server is not running.",
+          "port_unavailable": "The configured port cannot be bound. Check for a port conflict.",
+          "port_mismatch": "The configured port does not match CarbonPaper's active listener. Restart the MCP service before testing.",
+          "port_unreachable": "The configured port could not be reached.",
+          "request_timeout": "The MCP request timed out.",
+          "auth_failed": "The server rejected the current token. Reset and configure the token again.",
+          "http_error": "The MCP server returned an invalid HTTP status.",
+          "protocol_error": "The MCP response was malformed.",
+          "protocol_mismatch": "The MCP protocol version does not match.",
+          "tool_catalog_mismatch": "The server tool list does not match the app's tool contract.",
+          "session_locked": "CarbonPaper is locked. Complete Windows Hello authentication first.",
+          "privacy_filter_error": "The privacy filter rejected or could not process the read-only probe.",
+          "maintenance_in_progress": "CarbonPaper is maintaining data. Retry later.",
+          "metadata_query_failed": "The read-only metadata query failed."
+        }
       },
       "content_filter": {
         "title": "Content Filter",
@@ -1382,13 +1435,13 @@
     "skippedDeleted": "A further {{count}} vectors were skipped because their screenshots have been deleted. That is expected and needs no action.",
     "failedImports": "{{count}} vectors could not be read. See the migration diagnostics for details.",
     "whenItRuns": "The backfill only runs while the computer is idle and on mains power, so it will not interrupt what you are doing. You can speed it up or stop it under Settings → Advanced at any time, and you can change your mind later.",
-    "approve": "Start the backfill",
-    "decline": "Not now",
+    "approve": "Allow automatic backfill",
+    "decline": "Disallow automatic backfill",
     "cardPending": "{{count}} screenshots have no image index. A backfill would take {{estimate}}.",
     "cardApproved": "Backfill allowed; it will finish gradually while the computer is idle.",
-    "cardDeclined": "Backfill declined. These screenshots will not appear in text-to-image results.",
-    "cardApprove": "Start the backfill",
-    "cardDecline": "Cancel the backfill"
+    "cardDeclined": "Backfill declined. Missing vectors will not be automatically recalculated.",
+    "cardApprove": "Allow automatic backfill",
+    "cardDecline": "Cancel automatic backfill"
   },
   "vectorMigration": {
     "kinds": {
