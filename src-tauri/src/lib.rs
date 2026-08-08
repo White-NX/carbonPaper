@@ -99,8 +99,6 @@ struct TrayTexts {
     lightweight_active: &'static str,
     quit: &'static str,
     open_error: &'static str,
-    switched_lightweight: &'static str,
-    auto_switched_lightweight: &'static str,
 }
 
 const TRAY_TEXTS_ZH: TrayTexts = TrayTexts {
@@ -113,8 +111,6 @@ const TRAY_TEXTS_ZH: TrayTexts = TrayTexts {
     lightweight_active: "轻量模式已开启",
     quit: "彻底退出",
     open_error: "无法打开界面",
-    switched_lightweight: "已切换到轻量模式，通过托盘菜单可重新打开界面",
-    auto_switched_lightweight: "已自动切换到轻量模式以节省内存",
 };
 
 const TRAY_TEXTS_EN: TrayTexts = TrayTexts {
@@ -127,8 +123,6 @@ const TRAY_TEXTS_EN: TrayTexts = TrayTexts {
     lightweight_active: "Lightweight Mode On",
     quit: "Quit Completely",
     open_error: "Failed to open window",
-    switched_lightweight: "Switched to lightweight mode. Reopen the window from the tray menu.",
-    auto_switched_lightweight: "Automatically switched to lightweight mode to save memory.",
 };
 
 fn normalize_app_language(language: &str) -> String {
@@ -141,14 +135,6 @@ fn tray_texts() -> &'static TrayTexts {
         "en" => &TRAY_TEXTS_EN,
         _ => &TRAY_TEXTS_ZH,
     }
-}
-
-pub(crate) fn tray_text_lightweight_switched() -> &'static str {
-    tray_texts().switched_lightweight
-}
-
-fn tray_text_auto_lightweight_switched() -> &'static str {
-    tray_texts().auto_switched_lightweight
 }
 
 pub(crate) fn set_app_language(app: &tauri::AppHandle, language: &str) -> Result<(), String> {
@@ -745,14 +731,6 @@ fn start_auto_lightweight_timer(app: tauri::AppHandle) {
                 let lightweight_state = app_clone.state::<Arc<LightweightModeState>>();
                 *lightweight_state.is_lightweight.lock().unwrap() = true;
                 refresh_tray_menu(&app_clone);
-
-                // 发送通知
-                let _ = app_clone
-                    .notification()
-                    .builder()
-                    .title("CarbonPaper")
-                    .body(tray_text_auto_lightweight_switched())
-                    .show();
 
                 tracing::info!("Successfully switched to lightweight mode");
             } else {
