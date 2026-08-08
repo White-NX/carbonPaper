@@ -291,9 +291,9 @@
       },
       "semantic_backend": {
         "title": "Screenshot text retrieval",
-        "label": "Use Rust to search screenshot text",
-        "description": "This is the search that matches the text on your screenshots by meaning, using the MiniLM text model. It covers the natural-language grouping view and Smart Cluster calibration. Natural-language search in the main search box is served by Chinese-CLIP and is not affected by this setting.",
-        "rollback_note": "When off, retrieval is handed back to Python and ChromaDB. Vector data is unchanged and background indexing continues either way, so you can switch back at any time.",
+        "label": "Run MiniLM using Rust runtime (Beta)",
+        "description": "The optimized yet experimental Rust runtime offers better memory and CPU performance in most cases, but may cause unexpected consequences.",
+        "rollback_note": "When off, retrieval is handed back to Python and ChromaDB.",
         "diagnostic": "Local diagnostic",
         "refresh": "Refresh diagnostic",
         "last_query": "Last query served by",
@@ -319,9 +319,9 @@
       },
       "clip_backend": {
         "title": "Screenshot image search",
-        "label": "Use Rust for text-to-image search",
-        "description": "The main search box's natural-language mode: describe what a screenshot looked like and find it, matched by the Chinese-CLIP image model against the screenshot's visual content. It is a different search from the one above, which matches recognised text by meaning.",
-        "rollback_note": "When off, this search is handed back to Python and ChromaDB. Vector data is unchanged and background indexing continues either way, so you can switch back at any time.",
+        "label": "Run CLIP using Rust runtime (Beta)",
+        "description": "The optimized yet experimental Rust runtime offers better memory and CPU performance in most cases, but may cause unexpected consequences.",
+        "rollback_note": "When off, this search is handed back to Python and ChromaDB.",
         "diagnostic": "Local diagnostic",
         "refresh": "Refresh diagnostic",
         "last_query": "Last query served by",
@@ -348,8 +348,8 @@
       "classification_backend": {
         "title": "Automatic screenshot classification",
         "label": "Use Rust for BGE classification inference",
-        "description": "BGE-small-zh matches window titles and, when needed, OCR text against classification anchors. The result is stored on the screenshot and used by category filters and task summaries.",
-        "rollback_note": "When off, BGE runs in the local Python runtime again. Classification rules, existing categories, and learned anchors are unchanged.",
+        "description": "Classify screenshots using the BGE-small-zh model supported by the Rust runtime.",
+        "rollback_note": "When off, classification reverts to execution by the local Python runtime.",
         "selected": "Selected runtime",
         "active": "Active monitor runtime",
         "runtime_rust": "Rust (default)",
@@ -1382,13 +1382,13 @@
     "skippedDeleted": "A further {{count}} vectors were skipped because their screenshots have been deleted. That is expected and needs no action.",
     "failedImports": "{{count}} vectors could not be read. See the migration diagnostics for details.",
     "whenItRuns": "The backfill only runs while the computer is idle and on mains power, so it will not interrupt what you are doing. You can speed it up or stop it under Settings → Advanced at any time, and you can change your mind later.",
-    "approve": "Start the backfill",
-    "decline": "Not now",
+    "approve": "Allow automatic backfill",
+    "decline": "Disallow automatic backfill",
     "cardPending": "{{count}} screenshots have no image index. A backfill would take {{estimate}}.",
     "cardApproved": "Backfill allowed; it will finish gradually while the computer is idle.",
-    "cardDeclined": "Backfill declined. These screenshots will not appear in text-to-image results.",
-    "cardApprove": "Start the backfill",
-    "cardDecline": "Cancel the backfill"
+    "cardDeclined": "Backfill declined. Missing vectors will not be automatically recalculated.",
+    "cardApprove": "Allow automatic backfill",
+    "cardDecline": "Cancel automatic backfill"
   },
   "vectorMigration": {
     "kinds": {
