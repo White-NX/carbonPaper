@@ -18,7 +18,9 @@ mod i18n;
 mod idle;
 mod logging;
 mod maintenance;
+pub mod mcp_contract;
 mod mcp_server;
+mod mcp_smoke;
 mod mcp_token;
 mod migration_support;
 mod minilm_index;
@@ -1221,6 +1223,7 @@ pub fn run() {
             // MCP 服务命令
             commands::mcp::mcp_set_enabled,
             commands::mcp::mcp_get_status,
+            commands::mcp::mcp_run_smoke_test,
             commands::mcp::mcp_ack_privacy_warning,
             commands::mcp::mcp_reset_token,
             commands::mcp::mcp_copy_token_to_clipboard,

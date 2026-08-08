@@ -3,7 +3,6 @@ import { useTranslation } from 'react-i18next';
 import { useAiEmbeddingController } from '../useAiEmbeddingController';
 import AgentAccessDialogs from './AgentAccessDialogs';
 import AgentAccessHeader from './AgentAccessHeader';
-import { AGENT_SKILL_NAME, AGENT_SKILL_REPO } from './agentAccessConstants';
 import McpServiceCard from './McpServiceCard';
 
 export default function AgentAccessSection() {
@@ -23,6 +22,11 @@ export default function AgentAccessSection() {
     tokenCopied,
     agentPromptCopied,
     diagnosticsCopied,
+    agentVariant,
+    agentSkill,
+    smokeTestLoading,
+    smokeTestReport,
+    mcpOperationLoading,
     showResetConfirm,
     setShowResetConfirm,
     filterEnabled,
@@ -51,16 +55,14 @@ export default function AgentAccessSection() {
     handleDownloadModel,
     handleForceRecheck,
     handleCopyCurrentToken,
+    handleAgentVariantChange,
     handleCopyAgentSetupPrompt,
     handleCopyAgentDiagnostics,
+    handleRunMcpSmokeTest,
     shouldShowStartButton,
     statusBadge,
     statusMessage,
-  } = useAiEmbeddingController({
-    t,
-    agentSkillName: AGENT_SKILL_NAME,
-    agentSkillRepo: AGENT_SKILL_REPO,
-  });
+  } = useAiEmbeddingController({ t });
 
   if (loading) {
     return (
@@ -84,6 +86,11 @@ export default function AgentAccessSection() {
         tokenCopied={tokenCopied}
         agentPromptCopied={agentPromptCopied}
         diagnosticsCopied={diagnosticsCopied}
+        agentVariant={agentVariant}
+        agentSkill={agentSkill}
+        smokeTestLoading={smokeTestLoading}
+        smokeTestReport={smokeTestReport}
+        mcpOperationLoading={mcpOperationLoading}
         filterEnabled={filterEnabled}
         filterCategories={filterCategories}
         filterMode={filterMode}
@@ -111,8 +118,10 @@ export default function AgentAccessSection() {
         onForceRecheck={handleForceRecheck}
         onTogglePiiAdvanced={() => setShowPiiAdvanced(!showPiiAdvanced)}
         onCopyCurrentToken={handleCopyCurrentToken}
+        onAgentVariantChange={handleAgentVariantChange}
         onCopyAgentSetupPrompt={handleCopyAgentSetupPrompt}
         onCopyAgentDiagnostics={handleCopyAgentDiagnostics}
+        onRunSmokeTest={handleRunMcpSmokeTest}
       />
 
       <AgentAccessDialogs

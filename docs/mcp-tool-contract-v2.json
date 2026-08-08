@@ -1,0 +1,336 @@
+{
+  "mcp_protocol_version": "2025-03-26",
+  "skill": {
+    "id": "carbonpaper-memory",
+    "source_repository": "https://github.com/White-NX/carbonPaperSkill"
+  },
+  "tool_schema_version": 2,
+  "tools": [
+    {
+      "description": "Get screenshot snapshots within a time range. Returns metadata only (no image data). Timestamps are in milliseconds since Unix epoch.",
+      "inputSchema": {
+        "properties": {
+          "end_time": {
+            "description": "End timestamp in milliseconds",
+            "type": "number"
+          },
+          "max_records": {
+            "description": "Maximum number of records to return (default 500)",
+            "type": "integer"
+          },
+          "start_time": {
+            "description": "Start timestamp in milliseconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "start_time",
+          "end_time"
+        ],
+        "type": "object"
+      },
+      "name": "get_snapshots_by_time_range"
+    },
+    {
+      "description": "Get full details of a specific snapshot including metadata, OCR text, and the task cluster it belongs to (if any). By default OCR bounding box coordinates are omitted to save tokens; set include_coords=true to include them.",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "description": "Screenshot ID",
+            "type": "integer"
+          },
+          "include_coords": {
+            "description": "Include OCR bounding box coordinates (default false)",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "get_snapshot_details"
+    },
+    {
+      "description": "Search screenshot OCR text using full-text search. Supports CJK and English text.",
+      "inputSchema": {
+        "properties": {
+          "categories": {
+            "description": "Filter by categories",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "end_time": {
+            "description": "Filter end time (ms)",
+            "type": "number"
+          },
+          "fuzzy": {
+            "description": "Enable fuzzy matching (default true)",
+            "type": "boolean"
+          },
+          "limit": {
+            "description": "Max results (default 20)",
+            "type": "integer"
+          },
+          "offset": {
+            "description": "Pagination offset (default 0)",
+            "type": "integer"
+          },
+          "process_names": {
+            "description": "Filter by process names",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "query": {
+            "description": "Search query text",
+            "type": "string"
+          },
+          "start_time": {
+            "description": "Filter start time (ms)",
+            "type": "number"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search_ocr_text"
+    },
+    {
+      "description": "Natural language visual search over screenshots: a text query matched against what each screenshot looks like, using Chinese-CLIP image embeddings. Complements search_ocr_text, which matches the literal text on screen.",
+      "inputSchema": {
+        "properties": {
+          "end_time": {
+            "description": "Filter end time (ms)",
+            "type": "number"
+          },
+          "limit": {
+            "description": "Max results (default 20)",
+            "type": "integer"
+          },
+          "offset": {
+            "description": "Pagination offset (default 0)",
+            "type": "integer"
+          },
+          "process_names": {
+            "description": "Filter by process names",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "query": {
+            "description": "Natural language search query",
+            "type": "string"
+          },
+          "start_time": {
+            "description": "Filter start time (ms)",
+            "type": "number"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search_nl"
+    },
+    {
+      "description": "Get task clustering results. Tasks are groups of related screenshots identified by activity patterns.",
+      "inputSchema": {
+        "properties": {
+          "end_time": {
+            "description": "Filter end time (ms)",
+            "type": "number"
+          },
+          "hide_inactive": {
+            "description": "Hide inactive tasks",
+            "type": "boolean"
+          },
+          "layer": {
+            "description": "Clustering layer (e.g. 'hot', 'cold')",
+            "type": "string"
+          },
+          "start_time": {
+            "description": "Filter start time (ms)",
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "name": "get_task_clusters"
+    },
+    {
+      "description": "Get screenshots belonging to a specific task cluster, with pagination.",
+      "inputSchema": {
+        "properties": {
+          "page": {
+            "description": "Page number (0-based, default 0)",
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "Page size (default 50)",
+            "type": "integer"
+          },
+          "task_id": {
+            "description": "Task cluster ID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "task_id"
+        ],
+        "type": "object"
+      },
+      "name": "get_task_screenshots"
+    },
+    {
+      "description": "Rename a task cluster.",
+      "inputSchema": {
+        "properties": {
+          "label": {
+            "description": "New label for the task",
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Task cluster ID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "task_id",
+          "label"
+        ],
+        "type": "object"
+      },
+      "name": "rename_task"
+    },
+    {
+      "description": "List smart clusters with assignment counts and any stored AI-generated summary.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "get_smart_clusters"
+    },
+    {
+      "description": "Get assigned smart-cluster snapshots with joined OCR text for AI summarization. Results are paginated and ordered by rerank score.",
+      "inputSchema": {
+        "properties": {
+          "cluster_id": {
+            "description": "Smart cluster ID",
+            "type": "integer"
+          },
+          "include_empty_ocr": {
+            "description": "Include snapshots that have no OCR text (default false)",
+            "type": "boolean"
+          },
+          "page": {
+            "description": "Page number (0-based, default 0)",
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "Page size (default 50, max 200)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cluster_id"
+        ],
+        "type": "object"
+      },
+      "name": "get_smart_cluster_ocr_corpus"
+    },
+    {
+      "description": "Get the stored AI-generated summary for a smart cluster, if one exists.",
+      "inputSchema": {
+        "properties": {
+          "cluster_id": {
+            "description": "Smart cluster ID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cluster_id"
+        ],
+        "type": "object"
+      },
+      "name": "get_smart_cluster_summary"
+    },
+    {
+      "description": "Create or replace the stored AI-generated title, cluster overview, OCR summary, key points, evidence, and model metadata for a smart cluster.",
+      "inputSchema": {
+        "properties": {
+          "cluster_id": {
+            "description": "Smart cluster ID",
+            "type": "integer"
+          },
+          "evidence": {
+            "description": "Optional JSON array/object describing source snapshot evidence"
+          },
+          "key_points": {
+            "description": "Optional JSON array/object of key points"
+          },
+          "model_name": {
+            "description": "Model name",
+            "type": "string"
+          },
+          "model_provider": {
+            "description": "Model provider name",
+            "type": "string"
+          },
+          "ocr_summary": {
+            "description": "Integrated summary of OCR information across assigned snapshots",
+            "type": "string"
+          },
+          "prompt_version": {
+            "description": "Prompt/template version",
+            "type": "string"
+          },
+          "source_hash": {
+            "description": "Optional hash/fingerprint of the source corpus",
+            "type": "string"
+          },
+          "source_snapshot_count": {
+            "description": "Number of source snapshots used",
+            "type": "integer"
+          },
+          "summary": {
+            "description": "Cluster-level introduction or overview",
+            "type": "string"
+          },
+          "title": {
+            "description": "Short AI-generated title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cluster_id"
+        ],
+        "type": "object"
+      },
+      "name": "upsert_smart_cluster_summary"
+    },
+    {
+      "description": "Delete the stored AI-generated summary for a smart cluster. The smart cluster and its assigned snapshots are preserved.",
+      "inputSchema": {
+        "properties": {
+          "cluster_id": {
+            "description": "Smart cluster ID",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cluster_id"
+        ],
+        "type": "object"
+      },
+      "name": "delete_smart_cluster_summary"
+    }
+  ]
+}
