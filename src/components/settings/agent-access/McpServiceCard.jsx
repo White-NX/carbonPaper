@@ -7,6 +7,7 @@ import AgentSetupRow from './AgentSetupRow';
 import ConnectionInfoRow from './ConnectionInfoRow';
 import ContentFilterSection from './ContentFilterSection';
 import FilterModeSection from './FilterModeSection';
+import McpSmokeTestRow from './McpSmokeTestRow';
 import PiiDetectionSection from './PiiDetectionSection';
 
 function RowDivider() {
@@ -23,6 +24,11 @@ export default function McpServiceCard({
   tokenCopied,
   agentPromptCopied,
   diagnosticsCopied,
+  agentVariant,
+  agentSkill,
+  smokeTestLoading,
+  smokeTestReport,
+  mcpOperationLoading,
   filterEnabled,
   filterCategories,
   filterMode,
@@ -50,8 +56,10 @@ export default function McpServiceCard({
   onForceRecheck,
   onTogglePiiAdvanced,
   onCopyCurrentToken,
+  onAgentVariantChange,
   onCopyAgentSetupPrompt,
   onCopyAgentDiagnostics,
+  onRunSmokeTest,
 }) {
   const { t } = useTranslation();
 
@@ -75,7 +83,7 @@ export default function McpServiceCard({
           {shouldShowStartButton && (
             <button
               onClick={() => onStartService({ auto: false })}
-              disabled={actionLoading || restoreLoading}
+              disabled={mcpOperationLoading}
               className="px-3 py-1.5 text-xs text-ide-text hover:bg-ide-hover border border-ide-border rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50"
             >
               {restoreLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
@@ -85,7 +93,7 @@ export default function McpServiceCard({
           <SettingsSwitch
             checked={enabled}
             onChange={onToggle}
-            disabled={actionLoading || restoreLoading}
+            disabled={mcpOperationLoading}
           />
         </div>
       </div>
@@ -101,7 +109,7 @@ export default function McpServiceCard({
           <RowDivider />
           <AccessTokenRow
             tokenCopied={tokenCopied}
-            actionLoading={actionLoading}
+            actionLoading={mcpOperationLoading}
             onCopyCurrentToken={onCopyCurrentToken}
             onRequestResetToken={onRequestResetToken}
           />
@@ -111,10 +119,25 @@ export default function McpServiceCard({
       {enabled && (
         <>
           <RowDivider />
+          <McpSmokeTestRow
+            loading={smokeTestLoading}
+            disabled={mcpOperationLoading}
+            report={smokeTestReport}
+            onRun={onRunSmokeTest}
+          />
+        </>
+      )}
+
+      {enabled && (
+        <>
+          <RowDivider />
           <AgentSetupRow
             port={port}
+            agentSkill={agentSkill}
+            agentVariant={agentVariant}
             agentPromptCopied={agentPromptCopied}
             diagnosticsCopied={diagnosticsCopied}
+            onAgentVariantChange={onAgentVariantChange}
             onCopyAgentSetupPrompt={onCopyAgentSetupPrompt}
             onCopyDiagnostics={onCopyAgentDiagnostics}
           />

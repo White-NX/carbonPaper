@@ -291,15 +291,15 @@
       },
       "semantic_backend": {
         "title": "截图文本语义检索",
-        "label": "使用 Rust 检索截图文本",
-        "description": "这里指按含义搜索截图上的文字，使用的是 MiniLM 文本模型，影响自然语言分组视图和智能聚类的标定查询。主搜索框里的自然语言搜索由 Chinese-CLIP 负责，不受这一项影响。",
-        "rollback_note": "关闭后检索交回 Python 与 ChromaDB 处理。向量数据保持不变，后台索引也照常进行，可以随时切换回来。",
+        "label": "使用 Rust 运行时运行 MiniLM（Beta）",
+        "description": "经过优化，但是仍然具有测试性质的 Rust 运行时在大多数情况下具有更好的内存和 CPU 性能。但是可能会造成某些未知后果。",
+        "rollback_note": "关闭后检索交回 Python 与 ChromaDB 处理。",
         "diagnostic": "本地诊断",
         "refresh": "刷新诊断",
         "last_query": "上次检索由谁完成",
         "served_rust": "Rust",
         "served_python": "Python",
-        "served_unknown": "本次启动后尚未检索",
+        "served_unknown": "启动以来尚无检索",
         "indexed": "本地已索引向量",
         "backlog": "等待索引的截图",
         "stalled": "索引失败的截图",
@@ -319,9 +319,9 @@
       },
       "clip_backend": {
         "title": "截图画面检索（文搜图）",
-        "label": "使用 Rust 进行文搜图",
-        "description": "主搜索框的自然语言模式：用一句话描述画面内容来找截图，由 Chinese-CLIP 图像模型匹配截图“看起来像什么”。它与上面按文字含义检索的那一项是两种不同的搜索。",
-        "rollback_note": "关闭后，这项检索交回 Python 与 ChromaDB。向量数据保持不变，后台索引也照常运行，因此可随时切换回来。",
+        "label": "使用 Rust 运行时运行 CLIP（Beta）",
+        "description": "经过优化，但是仍然具有测试性质的 Rust 运行时在大多数情况下具有更好的内存和 CPU 性能。但是可能会造成某些未知后果。",
+        "rollback_note": "关闭后，这项检索交回 Python 与 ChromaDB 处理。",
         "diagnostic": "本地诊断",
         "refresh": "刷新诊断",
         "last_query": "上次检索由谁完成",
@@ -348,8 +348,8 @@
       "classification_backend": {
         "title": "截图内容自动分类",
         "label": "使用 Rust 运行 BGE 分类推理",
-        "description": "使用 BGE-small-zh 将窗口标题和必要的 OCR 文本与分类锚点进行匹配。分类结果会写入截图，并用于分类筛选和任务摘要。",
-        "rollback_note": "关闭后恢复由 Python 本地运行时执行 BGE。分类规则、已有类别和学习锚点不会改变。",
+        "description": "使用 Rust 运行时支持的 BGE-small-zh 模型将快照进行分类。",
+        "rollback_note": "关闭后恢复由 Python 本地运行时执行分类。",
         "selected": "选择的运行时",
         "active": "当前监控进程",
         "runtime_rust": "Rust（默认）",
@@ -628,14 +628,67 @@
       },
       "agent_setup": {
         "title": "Agent 配置",
-        "description": "复制一段配置提示词，让 Agent 自行获取 Skill 并连接本地 MCP 服务。",
+        "description": "选择目标 Agent，再复制与其安装方式匹配的 Skill 和 MCP 配置提示词。",
         "skill": "Skill",
         "source": "来源",
         "endpoint": "端点",
+        "schema_version": "工具契约 v{{version}}",
         "copy": "复制配置提示词",
         "copy_diagnostics": "复制诊断",
         "copied": "配置提示词已复制",
-        "prompt": "请配置 CarbonPaper MCP 访问。\n\n1. 从 GitHub 仓库 {{repo}} 的 {{skillName}} 目录获取 Skill，并安装到你的 Agent/Skill 环境中。\n2. 使用该 Skill 处理 CarbonPaper 截图历史、OCR、任务聚类和智能聚类摘要相关请求。\n3. MCP endpoint：{{endpoint}}，使用 Streamable HTTP/HTTP POST。\n4. 认证头：Authorization: Bearer <CarbonPaper token>。不要让我把 token 写进长提示词；请让我在 CarbonPaper 中单独点击“复制令牌”，然后将其配置到你的 MCP 客户端。\n5. 如果工具返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 应用中完成 Windows Hello 解锁。\n6. 该 MCP 可能暴露本机截图历史、OCR 文本、窗口标题、URL、任务聚类和智能聚类数据；只在我明确要求时读取相关内容。"
+        "variants": {
+          "codex": {
+            "label": "Codex",
+            "description": "安装原生 Skill，并配置 Codex 的 Streamable HTTP MCP 连接。",
+            "prompt": "请在 Codex 中配置 CarbonPaper 本地记忆访问。\n\n1. 从 {{repo}} 获取 {{skillName}} 目录，安装为 Codex Skill；它对应工具契约 v{{toolSchemaVersion}}。\n2. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n3. 配置请求头 Authorization: Bearer <CarbonPaper token>。不要让我把令牌写入提示词或日志；请让我在 CarbonPaper 中单独点击“复制令牌”，再将它存入 Codex 的本地安全配置。\n4. 使用该 Skill 处理截图历史、OCR、任务聚类和智能聚类摘要请求。search_nl 是 Chinese-CLIP 文本到图像的视觉检索，不是 Python-only 功能。\n5. tools/list 是稳定契约；临时可用性以 CarbonPaper 诊断和调用结果为准。如果返回 AUTH_REQUIRED，请提示我先在应用中完成 Windows Hello 解锁。\n6. 只读取完成我明确请求所需的本机数据。完成后告诉我配置文件位置和连接验证结果。"
+          },
+          "claude": {
+            "label": "Claude",
+            "description": "配置 Claude Desktop 或 Claude Code，并将 Skill 文档作为项目说明使用。",
+            "prompt": "请为 Claude Desktop 或 Claude Code 配置 CarbonPaper 本地记忆访问。\n\n1. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n2. 配置请求头 Authorization: Bearer <CarbonPaper token>。不要把令牌写入聊天、项目说明或日志；请让我从 CarbonPaper 单独复制后，存入 Claude 客户端支持的本地安全配置。\n3. 从 {{repo}} 读取 {{skillName}}/SKILL.md 及其 references，作为 CarbonPaper 工作流说明；当前工具契约为 v{{toolSchemaVersion}}。\n4. search_nl 是 Chinese-CLIP 文本到图像的视觉检索，不应描述为依赖 Python。tools/list 始终静态暴露工具，临时可用性由调用结果决定。\n5. 如果返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 中完成 Windows Hello 解锁。\n6. 只读取完成我明确请求所需的数据。完成后报告配置位置和连接测试结果。"
+          },
+          "cursor": {
+            "label": "Cursor",
+            "description": "配置 Cursor MCP，并将 Skill 工作流加入项目规则或 Agent 上下文。",
+            "prompt": "请在 Cursor 中配置 CarbonPaper 本地记忆访问。\n\n1. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n2. 配置 Authorization: Bearer <CarbonPaper token>。不要把令牌写入聊天、仓库文件或可提交的规则；请让我从 CarbonPaper 单独复制，并存入 Cursor 的本地私密配置。\n3. 从 {{repo}} 读取 {{skillName}}/SKILL.md 和 references，将适用工作流加入本地 Agent 上下文；工具契约为 v{{toolSchemaVersion}}。\n4. search_nl 是 Chinese-CLIP 视觉检索，不是 Python-only 路径。tools/list 为静态契约，后端临时不可用应在调用时报告。\n5. 收到 AUTH_REQUIRED 时，提示我先在 CarbonPaper 中完成 Windows Hello 解锁。\n6. 完成后报告配置位置和 MCP 连接验证结果，不要输出令牌。"
+          },
+          "generic": {
+            "label": "通用",
+            "description": "适用于支持 Streamable HTTP MCP 的其他 Agent。",
+            "prompt": "请配置 CarbonPaper 本地 MCP 访问。\n\n1. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器：{{endpoint}}。\n2. 认证头为 Authorization: Bearer <CarbonPaper token>。不要把令牌写入提示词、日志或仓库；请让我从 CarbonPaper 单独复制并存入客户端的本地安全配置。\n3. 从 {{repo}} 的 {{skillName}} 目录读取工作流说明；当前工具契约为 v{{toolSchemaVersion}}。\n4. search_nl 是 Chinese-CLIP 文本到图像的视觉检索；tools/list 是静态契约，实时可用性由调用结果决定。\n5. 如果返回 AUTH_REQUIRED，请提示我先在 CarbonPaper 中完成 Windows Hello 解锁。\n6. 只读取完成明确请求所需的数据，并在配置后执行 ping、tools/list 和只读查询验证。"
+          }
+        }
+      },
+      "smoke_test": {
+        "title": "MCP 连接自检",
+        "description": "检查本机端口、认证、工具契约和只读元数据链路。",
+        "run": "运行自检",
+        "running": "检查中",
+        "success": "自检通过：工具契约 v{{version}}，共 {{count}} 个工具。",
+        "duration": "{{duration}} ms",
+        "skipped": "未运行",
+        "stages": {
+          "initialize": "协议初始化",
+          "ping": "令牌认证",
+          "tools_list": "工具契约",
+          "metadata_query": "隐私过滤器"
+        },
+        "errors": {
+          "server_not_running": "CarbonPaper MCP 服务未运行。",
+          "port_unavailable": "配置端口无法绑定，请检查端口占用。",
+          "port_mismatch": "配置端口与 CarbonPaper 实际监听端口不一致，请重启 MCP 服务后再自检。",
+          "port_unreachable": "无法连接配置端口。",
+          "request_timeout": "MCP 请求超时。",
+          "auth_failed": "服务拒绝了当前令牌，请重置并重新配置令牌。",
+          "http_error": "MCP 服务返回了无效的 HTTP 状态。",
+          "protocol_error": "MCP 响应格式无效。",
+          "protocol_mismatch": "MCP 协议版本不匹配。",
+          "tool_catalog_mismatch": "服务工具表与应用内工具契约不一致。",
+          "session_locked": "CarbonPaper 已锁定，请先完成 Windows Hello 解锁。",
+          "privacy_filter_error": "隐私过滤器拒绝或无法处理只读测试。",
+          "maintenance_in_progress": "CarbonPaper 正在维护数据，请稍后重试。",
+          "metadata_query_failed": "只读元数据查询失败。"
+        }
       },
       "content_filter": {
         "title": "内容过滤",
@@ -1382,13 +1435,13 @@
     "skippedDeleted": "另有 {{count}} 条向量因对应截图已被删除而跳过，这是正常的，无需处理。",
     "failedImports": "有 {{count}} 条向量无法读取，详情见迁移诊断。",
     "whenItRuns": "补算只在电脑空闲且接入电源时进行，不会打扰你正在做的事。可以随时在“设置 → 高级”里手动加速或停止，也可以之后再改变主意。",
-    "approve": "开始补算",
-    "decline": "暂不补算",
+    "approve": "允许自动补算",
+    "decline": "不允许自动补算",
     "cardPending": "还有 {{count}} 张截图没有画面索引，补算预计需要{{estimate}}。",
     "cardApproved": "已允许补算，将在空闲时逐步完成。",
-    "cardDeclined": "已选择不补算，这些截图不会出现在文搜图结果里。",
-    "cardApprove": "开始补算",
-    "cardDecline": "取消补算"
+    "cardDeclined": "已选择不补算，缺失的向量不会被自动重新计算。",
+    "cardApprove": "允许自动补算",
+    "cardDecline": "取消自动补算"
   },
   "vectorMigration": {
     "kinds": {

@@ -10,7 +10,6 @@ use crate::{
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Manager;
-use tauri_plugin_notification::NotificationExt;
 
 /// Forwards a frontend log message into the Rust tracing pipeline.
 ///
@@ -567,14 +566,6 @@ pub async fn switch_to_lightweight_mode(
 
     // Publish the new mode to shared state.
     *lightweight_state.is_lightweight.lock().unwrap() = true;
-
-    // Notify the user because the main window is no longer visible.
-    app.notification()
-        .builder()
-        .title("CarbonPaper")
-        .body(crate::tray_text_lightweight_switched())
-        .show()
-        .ok();
 
     crate::refresh_tray_menu(&app);
 

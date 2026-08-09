@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification';
 import { useTauriEventListener } from './useTauriEventListener';
 
 export function usePowerSavingState() {
@@ -118,21 +117,7 @@ export function useAppWindowActions() {
   const minimize = () => getCurrentWindow().minimize();
   const toggleMaximize = () => getCurrentWindow().toggleMaximize();
 
-  const hideToTray = async () => {
-    await invoke('hide_to_tray');
-
-    let permissionGranted = await isPermissionGranted();
-    if (!permissionGranted) {
-      const permission = await requestPermission();
-      permissionGranted = permission === 'granted';
-    }
-    if (permissionGranted) {
-      sendNotification({
-        title: 'Carbonpaper',
-        body: '程序已最小化到系统托盘，点击托盘图标可恢复窗口',
-      });
-    }
-  };
+  const hideToTray = () => invoke('hide_to_tray');
 
   const restartApp = () => invoke('restart_app').catch(() => {});
   const exitApp = () => invoke('exit_app').catch(() => {});

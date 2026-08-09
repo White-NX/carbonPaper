@@ -9,10 +9,6 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "notification:default",
-    "notification:allow-is-permission-granted",
-    "notification:allow-request-permission",
-    "notification:allow-notify",
     "core:window:allow-minimize",
     "core:window:allow-maximize",
     "core:window:allow-toggle-maximize",
