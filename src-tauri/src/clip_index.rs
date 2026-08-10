@@ -17,10 +17,11 @@ use crate::storage::{
     DerivedIndexKind, StorageState,
 };
 use chrono::{Duration as ChronoDuration, Utc};
+use image::RgbImage;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -79,35 +80,209 @@ const EMPTY_SOURCE_CODE: &str = "empty_source";
 const EMPTY_SOURCE_REASON: &str =
     "no screenshot sharing this image hash has any OCR text, so Python would not have indexed it";
 
+/// Memory ceiling for capture-prepared CLIP pixels.
+///
+/// One entry is the CLIP input itself — 224x224x3, about 147 KB — so this
+/// admits roughly 445 screenshots. At one capture a minute that is about seven
+/// hours of backlog, deliberately the same order as [`CAPTURE_PIXEL_TTL`] so
+/// neither bound is the one that always fires first.
+const CAPTURE_PIXEL_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long prepared pixels may wait for an idle window.
+///
+/// These are plaintext thumbnails of the user's screen held in process memory,
+/// and they are the one place this path relaxes the storage model — everything
+/// else is encrypted the moment it leaves the capture path. The TTL bounds that
+/// exposure. Expiry loses no work permanently: the ledger row survives, and the
+/// ordinary decrypt path re-encodes the image once the user unlocks.
+const CAPTURE_PIXEL_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// A screenshot already resized to the CLIP input, waiting for an idle window.
+struct PreparedCapture {
+    /// Recorded at capture time, when corpus membership was decided from OCR
+    /// text that had not been encrypted yet. A locked pass cannot re-derive it.
+    screenshot_id: i64,
+    width: u32,
+    height: u32,
+    rgb: Arc<[u8]>,
+    prepared_at: Instant,
+}
+
+static PREPARED_CAPTURES: OnceLock<Mutex<HashMap<String, PreparedCapture>>> = OnceLock::new();
+
+fn prepared_captures() -> &'static Mutex<HashMap<String, PreparedCapture>> {
+    PREPARED_CAPTURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static CLIP_TARGET_SIZE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+
+/// The CLIP input size, read once from the pinned preprocessor config.
+///
+/// This deliberately does not go through
+/// `semantic_models.rs::resolve_semantic_model`: that verifies every pinned
+/// file, which means a SHA-256 pass over a 177 MB model, and nothing on the
+/// capture path can afford it. Skipping the check is safe here because a
+/// tampered config cannot produce a wrong vector — the worker verifies the same
+/// file before it loads the model and refuses rather than encoding against it,
+/// so the worst case is a pre-resize nobody uses.
+///
+/// `None` — no config yet, because the model has not been downloaded — means
+/// captures are not prepared at all, and the pipeline behaves exactly as it did
+/// before this path existed.
+fn clip_target_size() -> Option<(u32, u32)> {
+    *CLIP_TARGET_SIZE.get_or_init(|| {
+        let descriptor = crate::semantic_models::descriptor(MlSemanticModel::ChineseClip);
+        let relative = descriptor.preprocessor_file?;
+        let appdata = crate::resource_utils::file_in_local_appdata()?;
+        // The same two roots, in the same order, that model resolution searches.
+        ["models-onnx", "models"]
+            .into_iter()
+            .find_map(|root| {
+                let bytes = std::fs::read(appdata.join(root).join(relative)).ok()?;
+                crate::clip_preprocess::target_size_from_config(&bytes)
+            })
+    })
+}
+
+/// Resize a freshly captured screenshot to the CLIP input and hold it for the
+/// idle worker.
+///
+/// This is what lets capture-side CLIP indexing run with the session locked.
+/// The pixels are already decrypted and already in memory here; resizing them
+/// now means the encode never reads the encrypted file back, and that read is
+/// the only step in the whole pipeline that needs Windows Hello.
+///
+/// The resize is not free — roughly 0.25 s per source megapixel — but it is
+/// work the idle worker would have paid anyway, moved to where the plaintext
+/// already is. What is deliberately *not* done here is the model inference:
+/// that is the part that must wait for an idle window.
+///
+/// Call this only for a screenshot that carries OCR text, since only those are
+/// in the corpus.
+pub fn remember_captured_pixels(screenshot_id: i64, image_hash: &str, image: &RgbImage) {
+    if image_hash.is_empty() {
+        return;
+    }
+    let Some((width, height)) = clip_target_size() else {
+        return;
+    };
+    let resized = crate::clip_preprocess::pillow_bicubic_resize_rgb(image, width, height);
+    let entry = PreparedCapture {
+        screenshot_id,
+        width,
+        height,
+        rgb: Arc::from(resized.into_raw().into_boxed_slice()),
+        prepared_at: Instant::now(),
+    };
+    let mut cache = prepared_captures()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    drop_expired(&mut cache);
+    make_room(&mut cache, entry.rgb.len());
+    cache.insert(image_hash.to_string(), entry);
+}
+
+fn drop_expired(cache: &mut HashMap<String, PreparedCapture>) {
+    cache.retain(|_, entry| entry.prepared_at.elapsed() < CAPTURE_PIXEL_TTL);
+}
+
+/// Drop the oldest entries until `incoming` bytes fit inside the budget.
+///
+/// Oldest first, rather than refusing the newcomer: the capture that has waited
+/// longest is the one most likely to have been overtaken by an unlock, after
+/// which the ordinary decrypt path can encode it at no extra cost.
+fn make_room(cache: &mut HashMap<String, PreparedCapture>, incoming: usize) {
+    if incoming > CAPTURE_PIXEL_BUDGET_BYTES {
+        cache.clear();
+        return;
+    }
+    let mut used: usize = cache.values().map(|entry| entry.rgb.len()).sum();
+    while used + incoming > CAPTURE_PIXEL_BUDGET_BYTES {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.prepared_at)
+            .map(|(hash, _)| hash.clone())
+        else {
+            return;
+        };
+        match cache.remove(&oldest) {
+            Some(removed) => used = used.saturating_sub(removed.rgb.len()),
+            None => return,
+        }
+    }
+}
+
+/// The screenshot a prepared capture was recorded against, if it is still held.
+fn prepared_screenshot_id(image_hash: &str) -> Option<i64> {
+    let mut cache = prepared_captures()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    drop_expired(&mut cache);
+    cache.get(image_hash).map(|entry| entry.screenshot_id)
+}
+
+/// The prepared pixels for one image, as the decoded shape the encoder wants.
+fn prepared_image(image_hash: &str) -> Option<DecodedImage> {
+    let cache = prepared_captures()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let entry = cache.get(image_hash)?;
+    if entry.prepared_at.elapsed() >= CAPTURE_PIXEL_TTL {
+        return None;
+    }
+    Some(DecodedImage {
+        width: entry.width,
+        height: entry.height,
+        rgb: entry.rgb.to_vec(),
+    })
+}
+
+/// Release prepared pixels once they are no longer owed an encode.
+fn forget_prepared(image_hash: &str) {
+    let mut cache = prepared_captures()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cache.remove(image_hash);
+}
+
+/// Whether any capture is currently holding prepared pixels.
+///
+/// A locked pass has nothing else it can encode, so this is what decides
+/// between narrowing the pass and refusing it outright.
+fn has_prepared_captures() -> bool {
+    let mut cache = prepared_captures()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    drop_expired(&mut cache);
+    !cache.is_empty()
+}
+
 /// Queue one freshly captured screenshot's image for CLIP indexing.
 ///
 /// Called from the OCR commit path, next to the MiniLM enqueue. A failure here
 /// is recoverable and not worth failing the capture over: the worker's repair
 /// scan finds any eligible image with no ledger row, which is exactly what a
 /// missed enqueue leaves behind.
+///
+/// `has_text` is the same `ocr_text.strip()` rule Python applied, answered by
+/// the caller from the OCR results it is holding rather than read back out of
+/// the database. That matters beyond saving a query: the stored text is
+/// encrypted, so deriving this here would make the enqueue itself require an
+/// unlocked session, and a capture taken while the app is locked would never
+/// get a ledger row.
 pub fn enqueue_captured_screenshot(
     storage: &StorageState,
-    screenshot_id: i64,
     image_hash: &str,
+    has_text: bool,
 ) -> Result<(), String> {
     if image_hash.is_empty() {
         return Ok(());
     }
     let spec = clip_job_spec(image_hash);
-    // The same `ocr_text.strip()` rule Python applied, asked of the screenshot
-    // that just committed. A later duplicate of the same pixels that *does*
-    // carry text clears the exclusion through `ensure_derived_index_job`,
-    // because the exclusion is fingerprinted and the repair scan re-offers the
-    // subject once the ledger row no longer matches.
-    let has_text = storage
-        .get_ocr_text_prefixes_by_screenshot_ids_silent(&[screenshot_id], 1)
-        .map(|texts| {
-            texts
-                .get(&screenshot_id)
-                .map(|text| !text.trim().is_empty())
-                .unwrap_or(false)
-        })
-        .map_err(|error| error.to_string())?;
+    // A later duplicate of the same pixels that *does* carry text clears the
+    // exclusion through `ensure_derived_index_job`, because the exclusion is
+    // fingerprinted and the repair scan re-offers the subject once the ledger
+    // row no longer matches.
     if has_text {
         storage.ensure_derived_index_job(&spec)?;
         return Ok(());
@@ -388,25 +563,39 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
     }
 
     let storage = app.state::<Arc<StorageState>>().inner().clone();
-    // Reading an image decrypts its content key through CNG, so a locked
-    // session can do nothing but wait. Bailing here keeps the ledger untouched
-    // rather than marking a batch `waiting_for_auth` on every tick.
-    if !storage.is_session_valid() {
+    // Reading an image out of the store decrypts its content key through CNG,
+    // so a locked session cannot reach the encrypted history at all. It can
+    // still encode captures whose pixels were resized into memory at capture
+    // time, which is what `remember_captured_pixels` exists for. So a lock
+    // narrows the pass to those rather than refusing it — and refuses only when
+    // there are none, which keeps the ledger untouched rather than marking a
+    // batch `waiting_for_auth` on every tick.
+    let locked = !storage.is_session_valid();
+    if locked && !has_prepared_captures() {
         return Ok(PassOutcome::refused("session_locked"));
     }
 
-    reap_orphans(storage.clone()).await?;
-    let scope_storage = storage.clone();
-    let scope = tokio::task::spawn_blocking(move || repair_scope(&scope_storage))
-        .await
-        .unwrap_or(RepairScope::Suspended);
-
     match mode {
         PassMode::Idle => {
-            reconcile_missing(storage.clone(), scope).await?;
-            drain_queue(app, storage, mode).await
+            // Both of these read the encrypted store, so a locked pass skips
+            // them and does nothing but drain what is already prepared. They
+            // run on the next unlocked tick.
+            if !locked {
+                reap_orphans(storage.clone()).await?;
+                let scope_storage = storage.clone();
+                let scope = tokio::task::spawn_blocking(move || repair_scope(&scope_storage))
+                    .await
+                    .unwrap_or(RepairScope::Suspended);
+                reconcile_missing(storage.clone(), scope).await?;
+            }
+            drain_queue(app, storage, mode, locked).await
         }
         PassMode::Manual => {
+            reap_orphans(storage.clone()).await?;
+            let scope_storage = storage.clone();
+            let scope = tokio::task::spawn_blocking(move || repair_scope(&scope_storage))
+                .await
+                .unwrap_or(RepairScope::Suspended);
             // Queue everything in scope before draining, so the progress total
             // is the whole job rather than one scan's worth of it. A user who
             // approved a backfill and was quoted a duration for it should not
@@ -479,7 +668,9 @@ async fn drain_until_done(
 ) -> Result<PassOutcome, String> {
     let mut total = PassOutcome::default();
     loop {
-        let outcome = drain_queue(app, storage.clone(), PassMode::Manual).await?;
+        // Manual runs hold an authenticated session by construction:
+        // `clip_index_run_now` checks it before anything else.
+        let outcome = drain_queue(app, storage.clone(), PassMode::Manual, false).await?;
         total.indexed += outcome.indexed;
         total.failed += outcome.failed;
         match outcome.stopped_because {
@@ -527,8 +718,9 @@ async fn drain_queue(
     app: &AppHandle,
     storage: Arc<StorageState>,
     mode: PassMode,
+    locked: bool,
 ) -> Result<PassOutcome, String> {
-    let claimed = claim_batch(storage.clone()).await?;
+    let claimed = claim_batch(storage.clone(), locked).await?;
     if claimed.is_empty() {
         return Ok(PassOutcome::default());
     }
@@ -626,7 +818,7 @@ async fn encode_chunk(
 ) -> Result<Vec<IndexedImage>, String> {
     let read_storage = storage.clone();
     let hashes: Vec<String> = claimed.iter().map(|job| job.image_hash.clone()).collect();
-    let decoded = tokio::task::spawn_blocking(move || decode_images(&read_storage, &hashes))
+    let decoded = tokio::task::spawn_blocking(move || load_images(&read_storage, &hashes))
         .await
         .map_err(|error| format!("image read task failed: {error}"))?;
 
@@ -647,6 +839,7 @@ async fn encode_chunk(
             "image_unreadable",
             &error,
         );
+        forget_prepared(&job.image_hash);
         tracing::warn!("[CLIP:INDEX] discarded {}: {error}", job.spec.subject_key);
     }
     if encodable.is_empty() {
@@ -710,14 +903,24 @@ struct DecodedImage {
 
 /// Read and decode each image, keeping per-image failures per-image.
 ///
+/// Prepared capture pixels win over the stored file. They are the same pixels
+/// resized by the same function to the same target, so the vector is identical
+/// either way — but this branch needs no decryption, which is what lets the
+/// pass run with the session locked, and it skips the decode and resize that
+/// dominate the per-image cost (roughly 0.25 s per source megapixel against a
+/// constant ~0.15 s of inference).
+///
 /// `read_image_bytes_silent` accepts the same `memory://{hash}` path the Chroma
 /// collection was keyed under, so the subject key needs no translation to reach
 /// the bytes. "Silent" matters: this runs unattended, and CNG must not raise a
 /// consent dialog behind an idle worker.
-fn decode_images(storage: &StorageState, hashes: &[String]) -> Vec<Result<DecodedImage, String>> {
+fn load_images(storage: &StorageState, hashes: &[String]) -> Vec<Result<DecodedImage, String>> {
     hashes
         .iter()
         .map(|hash| {
+            if let Some(prepared) = prepared_image(hash) {
+                return Ok(prepared);
+            }
             let (bytes, _format) = storage
                 .read_image_bytes_silent(&clip_memory_uri(hash))
                 .map_err(|error| format!("failed to read the image: {error}"))?;
@@ -746,7 +949,14 @@ fn decode_images(storage: &StorageState, hashes: &[String]) -> Vec<Result<Decode
 /// reason MiniLM rebuilds its source text: a job queued at capture time may
 /// have been overtaken — here by the deletion of the only screenshot that
 /// carried text for those pixels.
-async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, String> {
+///
+/// A locked pass cannot re-derive it, because the OCR text it is derived from
+/// is encrypted. So a locked pass claims only subjects that still hold prepared
+/// pixels, whose membership was settled at capture time against a specific
+/// screenshot, and it confirms that screenshot is still live — a check that
+/// reads `is_deleted` and decrypts nothing. Everything else stays queued rather
+/// than being excluded on a guess.
+async fn claim_batch(storage: Arc<StorageState>, locked: bool) -> Result<Vec<ClaimedJob>, String> {
     tokio::task::spawn_blocking(move || -> Result<Vec<ClaimedJob>, String> {
         let jobs = storage.claimable_derived_index_jobs(
             DerivedIndexKind::ClipImage,
@@ -760,10 +970,52 @@ async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, Stri
             .iter()
             .map(|job| job.spec.subject_key.clone())
             .collect();
-        let indexable = indexable_hashes(&storage, &hashes).map_err(|error| error.to_string())?;
+        let (indexable, live_ids) = if locked {
+            (
+                HashMap::new(),
+                storage.map_image_hashes_to_screenshot_ids(&hashes)?,
+            )
+        } else {
+            (
+                indexable_hashes(&storage, &hashes).map_err(|error| error.to_string())?,
+                HashMap::new(),
+            )
+        };
 
         let mut claimed = Vec::with_capacity(jobs.len());
         for job in jobs {
+            if locked {
+                // No prepared pixels means nothing this pass can do with the
+                // subject. Leave it queued; an unlocked pass will decide.
+                let Some(screenshot_id) = prepared_screenshot_id(&job.spec.subject_key) else {
+                    continue;
+                };
+                // The capture-time answer holds only as long as the screenshot
+                // it was given for. If that row is gone, another screenshot may
+                // still share these pixels while carrying no text at all, and
+                // the corpus rule would exclude it — a call this pass cannot
+                // make. Drop the pixels and let an unlocked pass decide.
+                let still_live = live_ids
+                    .get(&job.spec.subject_key)
+                    .is_some_and(|ids| ids.contains(&screenshot_id));
+                if !still_live {
+                    forget_prepared(&job.spec.subject_key);
+                    continue;
+                }
+                match storage.mark_derived_index_job_processing(&job.spec) {
+                    Ok(lease_token) => claimed.push(ClaimedJob {
+                        image_hash: job.spec.subject_key.clone(),
+                        screenshot_id,
+                        spec: job.spec,
+                        lease_token,
+                    }),
+                    Err(error) => tracing::debug!(
+                        "[CLIP:INDEX] could not claim {}: {error}",
+                        job.spec.subject_key
+                    ),
+                }
+                continue;
+            }
             let Some(screenshot_id) = indexable.get(&job.spec.subject_key).copied() else {
                 // Nothing to index. Record the exclusion, or the repair scan
                 // hands the subject straight back; if even that fails the
@@ -781,6 +1033,8 @@ async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, Stri
                         &job.spec.subject_key,
                     );
                 }
+                // The pixels are no longer owed an encode either way.
+                forget_prepared(&job.spec.subject_key);
                 continue;
             };
             match storage.mark_derived_index_job_processing(&job.spec) {
@@ -820,6 +1074,7 @@ async fn commit_batch(
                     "invalid_vector",
                     &error,
                 );
+                forget_prepared(&job.image_hash);
                 tracing::warn!("[CLIP:INDEX] discarded {}: {error}", job.spec.subject_key);
                 continue;
             }
@@ -829,11 +1084,15 @@ async fn commit_batch(
                 vector: vector.clone(),
             };
             match storage.commit_derived_embedding(&write) {
-                Ok(()) => indexed.push(IndexedImage {
-                    image_hash: job.image_hash,
-                    screenshot_id: job.screenshot_id,
-                    vector,
-                }),
+                Ok(()) => {
+                    // The encode this capture was held for is done.
+                    forget_prepared(&job.image_hash);
+                    indexed.push(IndexedImage {
+                        image_hash: job.image_hash,
+                        screenshot_id: job.screenshot_id,
+                        vector,
+                    })
+                }
                 Err(error) => tracing::warn!(
                     "[CLIP:INDEX] commit failed for {}: {error}",
                     job.spec.subject_key
@@ -1385,6 +1644,76 @@ pub async fn set_clip_backfill_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared(bytes: usize, age: Duration) -> PreparedCapture {
+        PreparedCapture {
+            screenshot_id: 1,
+            width: 1,
+            height: 1,
+            rgb: Arc::from(vec![0u8; bytes].into_boxed_slice()),
+            prepared_at: Instant::now()
+                .checked_sub(age)
+                .expect("test ages fit inside the monotonic clock"),
+        }
+    }
+
+    #[test]
+    fn prepared_pixels_below_the_budget_are_all_kept() {
+        let mut cache = HashMap::new();
+        cache.insert("a".to_string(), prepared(1024, Duration::ZERO));
+        cache.insert("b".to_string(), prepared(1024, Duration::ZERO));
+        make_room(&mut cache, 1024);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn the_oldest_prepared_capture_is_evicted_first() {
+        // Oldest first is the deliberate choice: the capture that has waited
+        // longest is the likeliest to have been overtaken by an unlock, after
+        // which the ordinary decrypt path can encode it for free.
+        let half = CAPTURE_PIXEL_BUDGET_BYTES / 2;
+        let mut cache = HashMap::new();
+        cache.insert("old".to_string(), prepared(half, Duration::from_secs(600)));
+        cache.insert("new".to_string(), prepared(half, Duration::from_secs(1)));
+        make_room(&mut cache, half);
+        assert!(!cache.contains_key("old"));
+        assert!(cache.contains_key("new"));
+    }
+
+    #[test]
+    fn an_entry_larger_than_the_whole_budget_does_not_spin_the_eviction_loop() {
+        // Guards the loop's termination: without the early return, an incoming
+        // entry that can never fit would evict everything and then keep looking
+        // for something else to drop.
+        let mut cache = HashMap::new();
+        cache.insert("a".to_string(), prepared(1024, Duration::ZERO));
+        make_room(&mut cache, CAPTURE_PIXEL_BUDGET_BYTES + 1);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn expired_prepared_pixels_are_dropped() {
+        // The TTL is what bounds how long plaintext screen thumbnails live in
+        // process memory, so it has to actually fire.
+        let mut cache = HashMap::new();
+        cache.insert(
+            "stale".to_string(),
+            prepared(16, CAPTURE_PIXEL_TTL + Duration::from_secs(1)),
+        );
+        cache.insert("fresh".to_string(), prepared(16, Duration::from_secs(5)));
+        drop_expired(&mut cache);
+        assert!(!cache.contains_key("stale"));
+        assert!(cache.contains_key("fresh"));
+    }
+
+    #[test]
+    fn the_pixel_budget_holds_a_meaningful_number_of_captures() {
+        // The budget is stated in bytes but reasoned about in screenshots; if
+        // the CLIP input ever grew, this is what would catch the budget
+        // silently becoming a handful of images.
+        let entry = 224 * 224 * 3;
+        assert!(CAPTURE_PIXEL_BUDGET_BYTES / entry >= 400);
+    }
 
     #[test]
     fn one_image_per_chunk_bounds_the_foreground_wait() {

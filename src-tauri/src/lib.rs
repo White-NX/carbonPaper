@@ -9,6 +9,7 @@ mod capture;
 mod classification_runtime;
 mod clip_index;
 mod clip_migration;
+mod clip_preprocess;
 mod clip_query;
 pub mod commands;
 mod credential_manager;

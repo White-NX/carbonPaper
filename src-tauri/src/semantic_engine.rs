@@ -863,18 +863,10 @@ fn load_clip_preprocessor(path: &Path) -> Result<ClipPreprocessor, String> {
             format!("model_missing: failed to read {}: {error}", path.display())
         })?)
         .map_err(|error| format!("model_mismatch: invalid {}: {error}", path.display()))?;
-    let height = config
-        .size
-        .get("height")
-        .or_else(|| config.size.get("shortest_edge"))
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| "model_mismatch: CLIP image height is missing".to_string())?
-        as u32;
-    let width = config
-        .size
-        .get("width")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(u64::from(height)) as u32;
+    // Shared with the capture path so the two cannot disagree about the size
+    // they resize to; see `clip_preprocess.rs`.
+    let (width, height) = crate::clip_preprocess::target_size_from_size_value(&config.size)
+        .ok_or_else(|| "model_mismatch: CLIP image size is missing".to_string())?;
     let mean: [f32; 3] = config
         .image_mean
         .try_into()
@@ -914,7 +906,11 @@ fn preprocess_clip_images(
                     input.width, input.height
                 )
             })?;
-        let resized = pillow_bicubic_resize_rgb(&image, config.width, config.height);
+        // Shared with the capture path, which pre-resizes a screenshot to this
+        // same size while its plaintext is still in memory. A pre-resized image
+        // arrives here already at the target and passes through unchanged.
+        let resized =
+            crate::clip_preprocess::pillow_bicubic_resize_rgb(&image, config.width, config.height);
         for channel in 0..3usize {
             for pixel in resized.pixels() {
                 let value = f32::from(pixel[channel]) * config.rescale_factor;
@@ -923,114 +919,6 @@ fn preprocess_clip_images(
         }
     }
     Ok(output)
-}
-
-const PILLOW_PRECISION_BITS: i32 = 22;
-
-struct PillowCoefficients {
-    ksize: usize,
-    bounds: Vec<(usize, usize)>,
-    coefficients: Vec<i32>,
-}
-
-fn pillow_bicubic_resize_rgb(image: &RgbImage, width: u32, height: u32) -> RgbImage {
-    if image.width() == width && image.height() == height {
-        return image.clone();
-    }
-    let horizontal = pillow_coefficients(image.width() as usize, width as usize);
-    let vertical = pillow_coefficients(image.height() as usize, height as usize);
-    let mut temporary = RgbImage::new(width, image.height());
-    for y in 0..image.height() as usize {
-        for out_x in 0..width as usize {
-            let (start, count) = horizontal.bounds[out_x];
-            let weights = &horizontal.coefficients
-                [out_x * horizontal.ksize..out_x * horizontal.ksize + count];
-            let mut sums = [1 << (PILLOW_PRECISION_BITS - 1); 3];
-            for (offset, weight) in weights.iter().enumerate() {
-                let pixel = image.get_pixel((start + offset) as u32, y as u32);
-                for channel in 0..3 {
-                    sums[channel] += i32::from(pixel[channel]) * *weight;
-                }
-            }
-            temporary.put_pixel(out_x as u32, y as u32, image::Rgb(sums.map(pillow_clip8)));
-        }
-    }
-
-    let mut output = RgbImage::new(width, height);
-    for out_y in 0..height as usize {
-        let (start, count) = vertical.bounds[out_y];
-        let weights =
-            &vertical.coefficients[out_y * vertical.ksize..out_y * vertical.ksize + count];
-        for x in 0..width as usize {
-            let mut sums = [1 << (PILLOW_PRECISION_BITS - 1); 3];
-            for (offset, weight) in weights.iter().enumerate() {
-                let pixel = temporary.get_pixel(x as u32, (start + offset) as u32);
-                for channel in 0..3 {
-                    sums[channel] += i32::from(pixel[channel]) * *weight;
-                }
-            }
-            output.put_pixel(x as u32, out_y as u32, image::Rgb(sums.map(pillow_clip8)));
-        }
-    }
-    output
-}
-
-fn pillow_coefficients(input_size: usize, output_size: usize) -> PillowCoefficients {
-    let scale = input_size as f64 / output_size as f64;
-    let filter_scale = scale.max(1.0);
-    let support = 2.0 * filter_scale;
-    let ksize = support.ceil() as usize * 2 + 1;
-    let mut bounds = Vec::with_capacity(output_size);
-    let mut coefficients = vec![0i32; output_size * ksize];
-    let coefficient_scale = (1u64 << PILLOW_PRECISION_BITS) as f64;
-
-    for output in 0..output_size {
-        let center = (output as f64 + 0.5) * scale;
-        let mut minimum = (center - support + 0.5) as isize;
-        minimum = minimum.max(0);
-        let mut maximum = (center + support + 0.5) as isize;
-        maximum = maximum.min(input_size as isize);
-        let count = (maximum - minimum).max(0) as usize;
-        let inverse_filter_scale = 1.0 / filter_scale;
-        let mut weights = Vec::with_capacity(count);
-        let mut weight_sum = 0.0f64;
-        for offset in 0..count {
-            let distance = (offset as f64 + minimum as f64 - center + 0.5) * inverse_filter_scale;
-            let weight = pillow_bicubic_kernel(distance);
-            weights.push(weight);
-            weight_sum += weight;
-        }
-        for (offset, weight) in weights.into_iter().enumerate() {
-            let normalized = if weight_sum == 0.0 {
-                weight
-            } else {
-                weight / weight_sum
-            };
-            coefficients[output * ksize + offset] = (normalized * coefficient_scale).round() as i32;
-        }
-        bounds.push((minimum as usize, count));
-    }
-    PillowCoefficients {
-        ksize,
-        bounds,
-        coefficients,
-    }
-}
-
-fn pillow_bicubic_kernel(mut value: f64) -> f64 {
-    const A: f64 = -0.5;
-    value = value.abs();
-    if value < 1.0 {
-        return ((A + 2.0) * value - (A + 3.0)) * value * value + 1.0;
-    }
-    if value < 2.0 {
-        return (((value - 5.0) * value + 8.0) * value - 4.0) * A;
-    }
-    0.0
-}
-
-fn pillow_clip8(value: i32) -> u8 {
-    (value >> PILLOW_PRECISION_BITS).clamp(0, 255) as u8
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -1125,12 +1013,5 @@ mod tests {
         }];
         let output = preprocess_clip_images(&config, &images, &[255, 128, 0]).unwrap();
         assert_eq!(output, vec![1.0, 128.0 / 255.0, 0.0]);
-    }
-
-    #[test]
-    fn pillow_bicubic_keeps_constant_rgb_images_constant() {
-        let image = RgbImage::from_pixel(3, 5, image::Rgb([24, 92, 180]));
-        let resized = pillow_bicubic_resize_rgb(&image, 17, 11);
-        assert!(resized.pixels().all(|pixel| pixel.0 == [24, 92, 180]));
     }
 }

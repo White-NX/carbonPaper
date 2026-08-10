@@ -14,7 +14,9 @@ so the missing live comparisons remain open gate items rather than implied
 evidence.
 
 **Source snapshot.** Updated on 2026-08-07 against commit `f96c56a` plus the
-uncommitted M2.5 step-10 working tree described below.
+uncommitted M2.5 step-10 working tree described below. M2.6 was revised on
+2026-08-09 to record its offline ANN measurements; that revision changed no code
+and no other milestone.
 
 ---
 
@@ -373,7 +375,7 @@ Python classification orchestration stays until Milestone 5.
 | M2.3 | Rust-owned derived embedding storage and ledger | **DONE** 2026-07-21 |
 | M2.4 | Sentinel-triggered MiniLM migration | **DONE** 2026-07-24 |
 | M2.5 | Dual-write, shadow-query, then cut over by capability | **IN PROGRESS** — 5 of 10 steps merged, steps 6-10 soaking |
-| M2.6 | Bounded-memory ANN reads from the `.cpdvec` sidecar | **PLANNED** — the persistence shell exists; no query path consumes ANN data yet |
+| M2.6 | Bounded-memory ANN reads from the `.cpdvec` sidecar | **PLANNED** — the persistence shell exists and no query path consumes ANN data yet; the implementation choice and its parameters are now settled by offline measurement (2026-08-09) |
 
 #### M2.1 — Freeze the Python behavior contract — DONE
 
@@ -1454,6 +1456,61 @@ launch resumed its snapshot. The run start is deliberately conservative: the
 actual snapshot begins later, and older snapshot-external rows are the only ones
 the cleanup is meant to remove.
 
+##### Step 8 — the capture path pre-resizes, and the session dependency goes — 2026-08-10
+
+Capture-side CLIP indexing could not run while the app was locked, at four
+independent points: `clip_index_run_now` (`session_required` in
+`scripts/security-guards.cjs`), the idle pass's own `is_session_valid` bail, the
+enqueue's read of OCR text to decide corpus membership, and — underneath all of
+them — `read_image_bytes_silent`, which unwraps a row key with the CNG private
+key. That key carries `NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG`, so the encrypted
+history genuinely cannot be read without an unlock. Writes never needed one:
+row keys are wrapped with the *exported public* key, which is why capture keeps
+working while locked.
+
+The way past that is not to weaken the key policy but to notice where the
+plaintext already is. At capture time the decoded frame is in memory, and the
+only preprocessing CLIP applies is a bicubic resize to 224² — no aspect-ratio
+preservation and no center crop. `pillow_bicubic_resize_rgb` returns its input
+unchanged when it is already at the target, so a capture resized on the way in
+passes through the worker's preprocessing untouched and embeds to the same
+vector, bit for bit. The resize now happens on the capture path, and the pixels
+wait in memory for the idle worker.
+
+**The split is deliberate: preprocessing moves forward, inference does not.**
+The measurements above put per-image cost at a constant ~0.15 s of inference
+plus ~0.25 s per source megapixel of decode and resize. Only the second half
+moves, and on the capture path its decode component is already paid. What stays
+idle-gated is the vision transformer, which is what the no-foreground-intrusion
+rule is actually about. The idle pass gets faster as a side effect — about
+0.15 s for a prepared 1080p capture against 0.67 s for the same image read back
+and decoded from disk.
+
+A locked pass is narrowed rather than refused: it claims only subjects that
+still hold prepared pixels, and it confirms the screenshot those pixels were
+prepared for is still live, which reads `is_deleted` and decrypts nothing. It
+skips the orphan reaper and the repair scan entirely, since both read the
+encrypted store. Corpus membership is now answered by the caller from the OCR
+results it is already holding, so the enqueue no longer decrypts either.
+
+**The cost is a new plaintext residency, and it is bounded twice.** Prepared
+pixels are 147 KB thumbnails of the user's screen living in process memory,
+which is the one place this path relaxes a model where everything is encrypted
+the moment it leaves capture. A 64 MB ceiling (roughly 445 captures, oldest
+evicted first) and a six-hour TTL bound it. Neither loses work permanently: the
+ledger row survives, and the ordinary decrypt path re-encodes after an unlock.
+Captures are not prepared at all until the CLIP preprocessor config exists on
+disk, so a machine that has never downloaded the model behaves exactly as before.
+
+**What this does not fix.** MiniLM's capture indexing keeps the same session
+dependency — its source is OCR text, which is encrypted, so the same trick does
+not transfer. And the gating arithmetic behind both remains open: the default
+session timeout is 15 minutes and expires immediately on losing foreground,
+while the idle gate needs 30 minutes without input, so under default settings
+those two windows cannot overlap. Removing CLIP's session requirement lets its
+idle gate stand on its own, which is why CLIP indexing now progresses where it
+previously could not; MiniLM still waits on that arithmetic being revisited.
+
 ##### Step 10 — Rust-default BGE classification inference — IMPLEMENTED, SOAKING
 
 Step 10 skipped the planned shadow-only phase at the maintainer's direction. It
@@ -1692,6 +1749,87 @@ corpus already has about 101 MiB of f32 matrix data before keys and allocator
 overhead; larger histories therefore take the streaming path by policy. M2.6
 replaces that scaling path; it does not replace the exact fallback.
 
+##### Measured offline (2026-08-09)
+
+Run in a separate host outside this repository, against synthetic anonymous
+corpora in the production `.cpdvec` layout. No database was opened and no user
+content was decrypted. The candidate is USearch 2.26.0 (HNSW, inner product over
+L2-normalized vectors), with the graph built from a streamed copy and every
+final score recomputed from the mapped f32 payload.
+
+The query mode is cross-modal text-to-image, which is the regime `search_nl`
+actually runs in: the text tower's output scores against image vectors across
+the modality gap, so absolute scores are low and compressed and the ranking is
+harder than same-modality retrieval.
+
+| Scale | Rows | ef_search | Candidates | Quantization | Recall@10 | Full top-10 | Query p50 | Exact p50 | Speedup |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1x | 51,931 | 96 | 42 | f32 | 0.9969 | 96.9% | 1.20 ms | 16.8 ms | 14.0x |
+| 3x | 155,793 | 96 | 42 | f32 | 0.9312 | 79.7% | 1.60 ms | 53.9 ms | 33.7x |
+| 3x | 155,793 | 256 | 64 | f32 | 0.9953 | 95.3% | 2.49 ms | 55.0 ms | 22.1x |
+| 10x | 519,310 | 256 | 128 | i8 | 0.9333 | 89.6% | 3.30 ms | 142.9 ms | 43.2x |
+| 10x | 519,310 | 768 | 256 | i8 | 0.9979 | 97.9% | 5.69 ms | 135.3 ms | 23.8x |
+
+**`ef_search` has to scale with row count, and it is affordable.** Held at 96 it
+falls to 0.931 at 3x; 256 restores 0.995 there and then falls to 0.933 at 10x,
+where 768 reaches 0.998. Across all three scales the value needed for 0.99 is
+close to `rows / 600`. Even at 10x with `ef_search = 768` the query is 5.69 ms
+p50 and 11.37 ms p95 against a 135 ms exact scan.
+
+**Graph-internal quantization is what brings build memory inside budget.** At 3x
+with `ef_search = 256`, changing only the scalar kind:
+
+| Quantization | Recall@10 | Query p50 | Build | Build private bytes | Index file | Index/flat |
+| --- | --- | --- | --- | --- | --- | --- |
+| f32 | 0.9953 | 2.49 ms | 80.5 s | 562 MB | 326 MB | 1.073 |
+| f16 | 0.9953 | 4.71 ms | 376 s | 305 MB | 174 MB | 0.573 |
+| i8 | 0.9812 | 1.82 ms | 82.2 s | 177 MB | 98 MB | 0.323 |
+
+The flat snapshot is 304 MB at that scale. `i8` is the only one of the three
+that satisfies work item 2: f32 needs 1.85x the flat payload in private heap,
+which is the second complete matrix that item forbids, while `i8` needs 0.58x
+and produces an index *smaller* than the flat snapshot rather than 7% larger.
+The recall it gives up is recoverable by over-fetching, because the graph only
+proposes candidates and never scores the answer. `f16` is unusable here for a
+toolchain reason rather than an algorithmic one: USearch's SIMD dependency does
+not compile under the local MSVC configuration, so half-precision conversion
+falls back to software and build time is 4.8x f32.
+
+**The reader is already bounded; the builder is what is not.** After
+`restore_view`, process private bytes grow by 0.39 MB at 3x and by zero at 10x;
+working set grows 23.4 MB and 76.8 MB. The first query takes 4336 page faults —
+roughly 17 MB — against a 327 MB index, so demand paging genuinely holds. Against
+that, a 10x build costs 626 MB of private bytes and 300 s even with `i8`, which
+is a real idle-window budget rather than a rounding error.
+
+**Sparse filters deepen rather than fall back.** At 10x, keeping 50% of the
+corpus returns Recall@10 of 1.000, 10% returns 0.992, and 1% returns 0.952.
+Only the sparsest bucket triggered candidate deepening at all, and the complete
+exact fallback fired in none of them. The work item 3 strategy — deepen inside a
+request budget, then fall back — is sound, and its fallback branch is rare.
+
+**The corpus distribution is load-bearing, and getting it wrong inverts the
+conclusion.** An earlier pass of this measurement generated uniformly random
+512-dimensional unit vectors and concluded that HNSW could not reach the recall
+target without giving up all of its speed. That corpus is the adversarial floor
+for any graph index: distance concentration puts every pairwise cosine within
+about `1/√512` of zero, intrinsic dimensionality equals the nominal 512, and
+there is no cluster or near-duplicate structure to navigate. At 1x, connectivity
+16 and `ef_search` 96, with in-distribution queries on both sides, changing only
+the distribution moves Recall@10 from 0.158 to 1.000 and build time from 66.3 s
+to 20.6 s.
+
+A real CLIP screenshot corpus has none of that corpus's properties: it is
+strongly anisotropic (mean pairwise cosine 0.32, not 0.00), its local intrinsic
+dimensionality is roughly 12 rather than 512, and periodic capture of one window
+leaves long runs of near-identical frames (top-1 neighbour cosine 0.97). The
+figures above are measured on a corpus carrying those three properties, and the
+validation host asserts them as a regression test so a future run cannot quietly
+drift back. It also reports the oracle's own score separation per run and marks
+Recall@K as meaningless when the K-th and boundary candidates are within 0.01 —
+the check that would have caught the earlier pass, whose recall *rose* as its
+filters tightened.
+
 **Work.**
 
 1. **Freeze an ANN payload contract inside `.cpdvec`.** Select and pin a mature
@@ -1704,6 +1842,12 @@ replaces that scaling path; it does not replace the exact fallback.
    unusable, not "close enough". Keep the payload limited to derived vectors and
    compact subject keys; do not add decrypted OCR, file paths, or screenshot
    metadata to the sidecar.
+
+   The measurement above settles the selection: USearch 2.26.0 with `i8`
+   graph-internal quantization, connectivity 16, and `expansion_add` 160.
+   `ef_search` is **not** a compile-time constant — a persisted index does not
+   carry it (see below), and it has to track row count, so it belongs in the
+   header as a value computed at publication time and re-applied on every open.
 2. **Build without moving the memory spike into maintenance.** Construct a new
    generation from a stable, query-visible SQLite snapshot using paged input and
    an explicit build-memory budget. Building must not require a second complete
@@ -1712,6 +1856,10 @@ replaces that scaling path; it does not replace the exact fallback.
    the existing temporary-file, sync, verify, rename, and epoch-recheck sequence.
    If the data epoch changes before publication, discard the build and leave the
    current reader on exact scan until a fresh generation is ready.
+
+   `i8` quantization is the measured means of satisfying the private-heap rule;
+   f32 violates it by 1.85x at 3x scale. The absolute build cost still needs an
+   idle budget of its own: 300 s and 626 MB at 10x.
 3. **Use ANN only for candidate generation.** A query opens the current valid
    generation, asks ANN for an over-fetched candidate set, exact-scores those
    candidate vectors from the mapped payload or bounded SQLite reads, then
@@ -1720,6 +1868,9 @@ replaces that scaling path; it does not replace the exact fallback.
    deepen the ANN search within a fixed request budget; if it still cannot fill
    the requested page, fall back to the current paged exact scan rather than
    returning a silently shortened result.
+
+   This separation is also what licenses `i8`: the graph's precision bounds
+   candidate quality, not answer quality.
 4. **Keep failure semantics boring.** A missing, stale, partial, corrupt, or
    model-incompatible sidecar, an unsupported CPU, an ANN reader failure, or a
    database/data-directory generation change all select exact scan for that
@@ -1727,6 +1878,9 @@ replaces that scaling path; it does not replace the exact fallback.
    search surface unavailable. Readers pin one immutable generation for the
    query lifetime; runtime cleanup must not delete a file that may still be
    mapped or open.
+
+   The last clause is not merely prudent on Windows: deleting a file whose view
+   is live *fails*, which the validation host confirmed and pinned as a test.
 5. **Bound the reader, not just the Rust containers.** Prefer memory mapping or
    page-backed access for vector payloads and keep candidate ids, exact-score
    vectors, and graph scratch space under recorded limits. Virtual mapping size
@@ -1735,6 +1889,12 @@ replaces that scaling path; it does not replace the exact fallback.
    hash maps beside the ANN graph; use compact integer ids plus a bounded or
    mapped subject table. The existing 32/128 MiB resident-cache budgets remain
    the fallback ceilings until measurements justify changing them.
+
+   Measured: the mapped reader adds essentially nothing to private bytes at
+   either scale. **A persisted index does not carry its search parameters** —
+   after `restore_view` the expansion falls back to 64 regardless of what the
+   build used, so an implementation that trusts the file will silently serve
+   worse recall than its own validation measured.
 6. **Roll out behind an internal accelerator flag and read-only diagnostic.**
    Exact scan remains the oracle during shadow measurement. The diagnostic must
    name `ann`, `resident_exact`, or `streaming_exact`, the generation and epoch
@@ -1762,6 +1922,31 @@ and 10x histories:
 - an exact-scan kill switch that remains usable for one released version after
   ANN becomes default.
 
+The 2026-08-09 pass covers the first two bullets on the **synthetic** histories
+only. Four gate items remain untouched and none of them is implied by the
+numbers above:
+
+- **No real collection has been measured.** `derived-indexes` is empty on the
+  development machine and no `.cpdvec` generation has ever been published, so
+  every figure here comes from synthetic corpora. Their statistics are asserted
+  to sit inside the published range for CLIP image embeddings, which is what
+  makes them a credible stand-in — but where this machine's actual corpus falls
+  on that curve is unverified. Deferred to implementation, when the writer path
+  runs anyway.
+- **Capture-write latency during a build is unmeasured.** Only the build's own
+  duration and memory were recorded, not its interference with concurrent
+  foreground work. Given the section-4 rule, this needs its own measurement.
+- **Failure semantics are untested.** Missing, stale, corrupt, checksum-failing,
+  model-incompatible, epoch-changed, and concurrently-queried generations were
+  not exercised. Implementation-phase test scope.
+- **All figures are from a build with SIMD disabled.** USearch's `numkong`
+  dependency does not compile under the local MSVC configuration. The effect is
+  asymmetric rather than neutral: the exact scan's dot product is a hand-written
+  four-way accumulation that a release build very likely auto-vectorizes, while
+  USearch falls back to scalar code. The measured speedups are therefore more
+  likely understated than overstated, and `f16` is penalised heavily.
+
+
 **Non-goals.** This work does not introduce a CLIP retention window, make the
 sidecar authoritative, remove `derived_embeddings`, or turn an approximate
 index into a claim of exact ranking. "Full history" continues to mean every
@@ -1771,6 +1956,13 @@ recall gate above.
 
 **Depends on.** M2.3 generation safety, the M2.5 CLIP migration and read-path
 soak, and the bounded-memory exact fallback in `semantic_cache.rs`.
+
+**Where the measurements live.** The validation host is deliberately outside this
+repository, at `../ann-validation-host`, because it holds a Windows Hello unlock
+for long unattended runs and must never become a repository-shipped capability.
+It has no listener, no SQL input, and no key-export path, and the benchmark
+subcommand needs neither the data directory nor a key. `FINDINGS.md` there
+records the full result set; the numbers above are its summary.
 
 ---
 
@@ -2252,3 +2444,5 @@ milestone bodies; this is an index so a reversal is not silently re-reversed.
 | 2026-08-06 | The existing `.cpdvec` file is recorded as a **generation-safe flat snapshot, not an ANN reader already in production**. M2.6 adds the ANN payload and query integration for the no-retention CLIP corpus, while SQLite stays authoritative and the bounded paged exact scan remains the complete fallback. |
 | 2026-08-07 | Step 10 changed from BGE shadow-only to a **direct Rust-default inference bridge** at the maintainer's direction. Python still owns classification orchestration and stays available through `classification_runtime=python`; ordinary Rust failures fall back per request, while `foreground_busy` does not load Python and compete with foreground semantic work. The selected value is latched at monitor spawn, so the Settings change takes effect only after monitor restart. |
 | 2026-08-08 | The Agent/MCP parallel track is complete for v0.8.4. A Rust-owned schema-v2 contract now drives `tools/list`, checked-in JSON, and the `carbonPaperSkill` tool table; the settings page adds a four-stage authenticated smoke test and Codex, Claude, Cursor, and generic setup variants. The app and Skill are validated as one release unit, while unattended Agent grants remain out of scope. |
+| 2026-08-09 | **M2.6's implementation choice is settled by offline measurement: USearch 2.26.0 HNSW with `i8` graph-internal quantization.** `i8` is not a tuning preference but the means of satisfying work item 2 — f32 needs 1.85x the flat payload in private heap, which is the second complete matrix that item forbids, while `i8` needs 0.58x and yields an index smaller than the flat snapshot. It is safe precisely because work item 3 already confines the graph to candidate generation, so its precision bounds candidate quality rather than answer quality. `ef_search` moves into the header as a published, row-count-dependent value, because a persisted index does not carry it and an implementation trusting the file would serve worse recall than its validation measured. |
+| 2026-08-09 | **An earlier ANN pass concluded the opposite, and its corpus is why.** It sampled uniformly random 512-dimensional unit vectors — the adversarial floor for any graph index, where distance concentration leaves every pairwise cosine within `1/√512` of zero and intrinsic dimensionality equals the nominal width. Holding scale, parameters, and query mode fixed and changing only the distribution moves Recall@10 from 0.158 to 1.000. The retracted conclusion was also self-refuting on its own numbers: recall *rose* as its filters tightened, which is impossible unless the oracle's ranking past position K is a float-noise tie. Synthetic corpora for this milestone now assert anisotropy, low intrinsic dimensionality, and near-duplicate structure as a regression test, and every run reports the oracle's score separation and flags Recall@K as meaningless below 0.01. |

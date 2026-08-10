@@ -3,6 +3,9 @@
 #[allow(dead_code)]
 #[path = "../../src/ml_protocol.rs"]
 mod ml_protocol;
+#[allow(dead_code)]
+#[path = "../../src/clip_preprocess.rs"]
+mod clip_preprocess;
 #[path = "../../src/semantic_engine.rs"]
 mod semantic_engine;
 #[allow(dead_code)]

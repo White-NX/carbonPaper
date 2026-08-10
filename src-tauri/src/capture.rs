@@ -1812,6 +1812,10 @@ pub(crate) async fn process_ocr_inner(
         .state::<Arc<crate::ml_runtime::MlRuntimeState>>()
         .inner()
         .clone();
+    // Kept past the OCR call for the CLIP pre-resize below, which needs the
+    // decrypted pixels and is the reason capture-side CLIP indexing works with
+    // the session locked. Cloning an `Arc` here costs a refcount, not a frame.
+    let clip_pixels = rgb_image.clone();
     let output = ml_state
         .run_ocr(
             app.clone(),
@@ -1866,8 +1870,35 @@ pub(crate) async fn process_ocr_inner(
     // M2.5 step 8: the same debt for the CLIP image index. Keyed by image hash
     // rather than screenshot id, because that is what the Chroma collection this
     // replaces was keyed by and what the migrated rows already carry.
+    //
+    // Corpus membership is the `ocr_text.strip()` rule, answered from the
+    // results still in hand. Reading it back would decrypt, and a capture taken
+    // while the app is locked would then never get a ledger row at all.
+    let has_ocr_text = ocr_results
+        .iter()
+        .any(|result| !result.text.trim().is_empty());
+    if has_ocr_text {
+        // Resize to the CLIP input while the plaintext is still here, so the
+        // encode never has to read the encrypted file back. Blocking because
+        // the resize is real CPU work — roughly 0.25 s per source megapixel —
+        // and awaited so the prepared pixels are in place before the ledger row
+        // that advertises them. The model inference stays idle-gated in
+        // `clip_index`; this is only the preprocessing it would have paid.
+        let hash = image_hash.to_string();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            crate::clip_index::remember_captured_pixels(screenshot_id, &hash, &clip_pixels);
+        })
+        .await
+        {
+            tracing::warn!(
+                "[CLIP:INDEX] pre-resize failed screenshot_id={}: {}",
+                screenshot_id,
+                error
+            );
+        }
+    }
     if let Err(error) =
-        crate::clip_index::enqueue_captured_screenshot(storage, screenshot_id, image_hash)
+        crate::clip_index::enqueue_captured_screenshot(storage, image_hash, has_ocr_text)
     {
         tracing::warn!(
             "[CLIP:INDEX] enqueue failed screenshot_id={}: {}",
