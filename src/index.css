@@ -35,6 +35,18 @@
   --ide-warning-border: #fcd34d;
   --ide-info-success: #047857;
   --ide-timeline-bg: #f0f2f5;
+  --ide-accent-rgb: 37 99 235;
+
+  /* Timeline app colors */
+  --tl-app-1: #3a5fb0;
+  --tl-app-2: #5b4ba0;
+  --tl-app-3: #2e7a6d;
+  --tl-app-4: #a0662e;
+  --tl-app-5: #963e50;
+  --tl-app-6: #4a6b8a;
+  --tl-app-7: #6b7c3a;
+  --tl-app-8: #6b5b7e;
+  --tl-app-muted: #8a8f9a;
 }
 
 .dark {
@@ -56,6 +68,18 @@
   --ide-warning-border: rgba(245, 158, 11, 0.2);
   --ide-info-success: #34d399;
   --ide-timeline-bg: #141414;
+  --ide-accent-rgb: 0 122 204;
+
+  /* Timeline app colors (dark theme) */
+  --tl-app-1: #5b7fd4;
+  --tl-app-2: #7c6bc4;
+  --tl-app-3: #4a9b8e;
+  --tl-app-4: #c4874a;
+  --tl-app-5: #b85c6e;
+  --tl-app-6: #6b8cad;
+  --tl-app-7: #8fa05c;
+  --tl-app-8: #8b7b9e;
+  --tl-app-muted: #6f7480;
 }
 
 html:not([data-page="error"]),
@@ -149,6 +173,19 @@ body {
 .dark .preview-action-bar {
   background-color: rgba(37, 37, 38, 0.92);
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+/* Timeline session block inset shadow */
+.tl-session {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.75),
+    inset 0 -1.5px 2px rgba(31, 36, 48, 0.10);
+}
+
+.dark .tl-session {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    inset 0 -1.5px 2px rgba(0, 0, 0, 0.28);
 }
 
 /* 主预览区背景装饰 */

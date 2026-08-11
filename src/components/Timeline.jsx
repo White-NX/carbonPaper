@@ -1,947 +1,674 @@
-import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { getTimeline, getTimelineDensity, fetchThumbnailBatch, clearTimelineImageQueue } from '../lib/monitor_api';
-import { Locate, Play, ChevronLeft, ChevronRight } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { CATEGORY_COLORS } from '../lib/categories';
+import { Play } from 'lucide-react';
+import { getTimeline, getTimelineDensity, fetchThumbnailBatch, clearTimelineImageQueue } from '../lib/monitor_api';
+import {
+  aggregateAppDistribution,
+  buildSessions,
+  collapseSessions,
+  estimateSampleInterval,
+  mergeSortedEvents,
+  pruneEvents,
+} from '../lib/timeline_sessions';
+import { accentWithAlpha } from '../lib/timeline_palette';
+import OverviewBand from './timeline/OverviewBand';
+import SessionBand from './timeline/SessionBand';
+import DetailTrack from './timeline/DetailTrack';
 
-// Simple debounce
-function simpleDebounce(func, wait) {
-    let timeout;
-    return function(...args) {
-        const context = this;
-        clearTimeout(timeout);
-        timeout = setTimeout(() => func.apply(context, args), wait);
-    };
+const MINUTE = 60000;
+const HOUR = 3600000;
+const DAY = 86400000;
+
+/** Track heights. */
+const OVERVIEW_HEIGHT = 20;
+const SESSION_HEIGHT = 30;
+const DETAIL_HEIGHT = 58;
+const AXIS_HEIGHT = 18;
+const TIMELINE_HEIGHT = OVERVIEW_HEIGHT + SESSION_HEIGHT + DETAIL_HEIGHT + AXIS_HEIGHT;
+
+/** Tier threshold boundaries for detail track. */
+const FRAME_TIER_MAX_SPAN = 30 * MINUTE;
+const SESSION_TIER_MAX_SPAN = 8 * HOUR;
+
+/** Minimum pixel width target before collapsing session blocks. */
+const SESSION_MIN_BLOCK_PX = 32;
+
+/** Overview band span configuration factor. */
+const OVERVIEW_SPAN_FACTOR = 10;
+const OVERVIEW_MIN_SPAN = 2 * HOUR;
+const OVERVIEW_MAX_SPAN = 90 * DAY;
+/** Recenter threshold ratio for overview band. */
+const OVERVIEW_RECENTER_RATIO = 0.3;
+
+/** Drag slop threshold in pixels. */
+const DRAG_SLOP_PX = 4;
+
+/** Local timezone offset relative to UTC in milliseconds. */
+function localBucketOffsetMs() {
+  return -new Date().getTimezoneOffset() * MINUTE;
 }
-
-// Simple throttle (leading edge only, good for continuous updates like follow mode)
-function simpleThrottle(func, limit) {
-    let lastRun = 0;
-    return function(...args) {
-        const now = Date.now();
-        if (now - lastRun >= limit) {
-            func.apply(this, args);
-            lastRun = now;
-        }
-    };
-}
-
-// Generate a unique key for an activity segment (combines process + window)
-const getActivityKey = (appName, windowTitle) => {
-    return `${appName || ''}::${windowTitle || ''}`;
-};
-
-const getProcessColor = (processName, windowTitle = '', prevProcessName = null, prevWindowTitle = null) => {
-    if (!processName) return '#888';
-    
-    // Use both process name and window title for color generation
-    // This ensures different windows of the same app get different colors
-    const colorKey = `${processName}::${windowTitle || ''}`;
-    let hash = 0;
-    for (let i = 0; i < colorKey.length; i++) {
-        hash = colorKey.charCodeAt(i) + ((hash << 5) - hash);
-    }
-    let hue = Math.abs(hash % 360);
-    
-    // Ensure adjacent activities have different colors
-    if (prevProcessName !== null) {
-        const prevColorKey = `${prevProcessName || ''}::${prevWindowTitle || ''}`;
-        if (prevColorKey !== colorKey) {
-            let prevHash = 0;
-            for (let i = 0; i < prevColorKey.length; i++) {
-                prevHash = prevColorKey.charCodeAt(i) + ((prevHash << 5) - prevHash);
-            }
-            const prevHue = Math.abs(prevHash % 360);
-            // If hues are too similar (within 40 degrees), offset by 60 degrees
-            const hueDiff = Math.abs(hue - prevHue);
-            if (hueDiff < 40 || hueDiff > 320) {
-                hue = (prevHue + 60 + Math.abs(hash % 120)) % 360;
-            }
-        }
-    }
-    
-    return `hsl(${hue}, 65%, 40%)`; 
-};
 
 const TIMELINE_IMAGE_CACHE_LIMIT = 800;
 const timelineImageCache = new Map();
 
-const getTimelineImageCacheKey = (event) => {
-    if (!event) return null;
-    return event.id ?? event.imagePath ?? null;
-};
+function setTimelineImageCache(key, dataUrl) {
+  if (key === null || key === undefined || !dataUrl) return;
+  if (!timelineImageCache.has(key) && timelineImageCache.size >= TIMELINE_IMAGE_CACHE_LIMIT) {
+    const oldestKey = timelineImageCache.keys().next().value;
+    timelineImageCache.delete(oldestKey);
+  }
+  timelineImageCache.set(key, dataUrl);
+}
 
-const setTimelineImageCache = (key, dataUrl) => {
-    if (key === null || key === undefined || !dataUrl) return;
-    if (!timelineImageCache.has(key) && timelineImageCache.size >= TIMELINE_IMAGE_CACHE_LIMIT) {
-        const oldestKey = timelineImageCache.keys().next().value;
-        timelineImageCache.delete(oldestKey);
+function simpleDebounce(func, wait) {
+  let timeout;
+  return function debounced(...args) {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func.apply(this, args), wait);
+  };
+}
+
+function simpleThrottle(func, limit) {
+  let lastRun = 0;
+  return function throttled(...args) {
+    const now = Date.now();
+    if (now - lastRun >= limit) {
+      func.apply(this, args);
+      lastRun = now;
     }
-    timelineImageCache.set(key, dataUrl);
-};
+  };
+}
 
-// Sub-component for individual events to handle lazy loading
-const TimelineEvent = React.memo(({ event, x, width, visible, showImage, showText, showLabel, isSameActivityAsNext, isSameActivityAsPrev, prevAppName, prevWindowTitle, onClick, isHighlighted, imageEpoch }) => {
-    const [imageUrl, setImageUrl] = useState(null);
+/** Snap raw bucket width to standardized step. */
+function snapBucketMs(raw) {
+  const steps = [
+    1000, 5000, 15000, 30000,
+    MINUTE, 5 * MINUTE, 15 * MINUTE, 30 * MINUTE,
+    HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR,
+    DAY, 7 * DAY, 30 * DAY,
+  ];
+  return steps.find((step) => step >= raw) || steps[steps.length - 1];
+}
 
-    // Only read from cache — batch loading in parent handles fetching
-    useEffect(() => {
-        if (!visible || !showImage) return;
-        const cacheKey = getTimelineImageCacheKey(event);
-        const cached = cacheKey ? timelineImageCache.get(cacheKey) : null;
-        if (cached && cached !== imageUrl) {
-            setImageUrl(cached);
-        }
-    }, [visible, showImage, event.id, event.imagePath, imageEpoch]);
+function getTickStep(zoom) {
+  const minSpacing = 120;
+  const target = minSpacing / zoom;
+  const steps = [
+    1000, 2000, 5000, 10000, 15000, 30000,
+    MINUTE, 2 * MINUTE, 5 * MINUTE, 15 * MINUTE, 30 * MINUTE,
+    HOUR, 2 * HOUR, 6 * HOUR, 12 * HOUR,
+    DAY, 2 * DAY, 7 * DAY, 30 * DAY, 90 * DAY, 180 * DAY,
+    365 * DAY, 2 * 365 * DAY, 5 * 365 * DAY, 10 * 365 * DAY,
+  ];
+  return steps.find((step) => step >= target) || steps[steps.length - 1];
+}
 
-    const iconSrc = useMemo(() => {
-        if (!event.processIcon) return null;
-        return event.processIcon.startsWith('data:') ? event.processIcon : `data:image/png;base64,${event.processIcon}`;
-    }, [event.processIcon]);
+function formatTick(date, stepMs) {
+  if (stepMs >= 365 * DAY) return `${date.getFullYear()}`;
+  if (stepMs >= 28 * DAY) return date.toLocaleString('default', { month: 'short', year: 'numeric' });
+  if (stepMs >= DAY) return date.toLocaleString('default', { month: 'short', day: 'numeric' });
 
-    // Cleanup object URL if we were using blobs (but we are using base64 strings)
-    
-    // Determine width of the "process bar segment"
-    let segmentWidth = 100; // Default
-    // Logic moved from parent: parent passes calculated params? 
-    // Actually the parent loop logic was better for segment width. 
-    // Let's rely on the passed `width` prop which is the segment width.
+  const hours = date.getHours();
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
 
-    const processColor = getProcessColor(event.appName, event.windowTitle, prevAppName, prevWindowTitle);
-    // barStyle removed - rendered via Canvas
-
-    return (
-        <>
-            {/* Process Info Bar Segment - REMOVED, using Canvas in parent */}
-
-            {/* Process Label/Icon - Only on start of sequence and when density allows */}
-            {(showLabel && !isSameActivityAsPrev) && (
-                <div 
-                    className="absolute top-0 flex items-center gap-1.5 text-xs z-20 pl-1 -translate-y-0.5"
-                    style={{ left: x, color: processColor }}
-                >
-                    {iconSrc ? (
-                        <img
-                            src={iconSrc}
-                            alt={event.appName || 'app'}
-                            className="w-4 h-4 rounded-sm shadow-sm object-cover"
-                        />
-                    ) : (
-                        <span className="text-sm bg-ide-panel rounded-full w-5 h-5 flex items-center justify-center shadow-sm border border-current text-[10px] overflow-hidden">
-                            {event.appName ? event.appName[0].toUpperCase() : '?'}
-                        </span>
-                    )}
-                    {showText && (
-                        <>
-                            <span className="font-bold drop-shadow-sm whitespace-nowrap">{event.appName}</span>
-                            <span className="opacity-70 text-[10px] whitespace-nowrap overflow-hidden max-w-[150px] text-ellipsis hidden sm:block">
-                                {event.windowTitle}
-                            </span>
-                        </>
-                    )}
-                </div>
-            )}
-
-            {/* Screenshot Node */}
-            {showImage && (
-                <div 
-                    className={`absolute top-4 flex flex-col items-center group hover:z-30 cursor-pointer ${isHighlighted ? 'z-40' : ''}`}
-                    style={{ left: x, transform: 'translateX(-50%)' }}
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        if (onClick) onClick(event);
-                    }}
-                >
-                    <div 
-                        className="w-0.5 mt-1.5 mb-1 group-hover:h-8 transition-all shadow-sm opacity-80"
-                        style={{ 
-                            height: '12px', 
-                            backgroundColor: processColor 
-                        }}
-                    ></div>
-                    
-                    <div className={`bg-ide-panel border p-1 rounded hover:scale-125 transition-transform shadow-lg z-0 relative ${isHighlighted ? 'border-yellow-400 ring-2 ring-yellow-400 ring-opacity-50 scale-125' : 'border-ide-border'}`}>
-                        <div className="w-12 h-12 bg-ide-active overflow-hidden rounded-sm relative flex items-center justify-center">
-                            {imageUrl ? (
-                                <img src={imageUrl} alt={event.title} className="w-full h-full object-cover pointer-events-none" />
-                            ) : (
-                                <div className="text-ide-muted text-[8px]">...</div>
-                            )}
-                            {event.category && event.category !== '未分类' && (
-                                <div
-                                    className="absolute bottom-0 left-0 right-0 h-1.5 opacity-80"
-                                    style={{ backgroundColor: CATEGORY_COLORS[event.category] || '#6b7280' }}
-                                    title={event.category}
-                                />
-                            )}
-                        </div>
-                    </div>
-                    
-                    <div className={`opacity-0 group-hover:opacity-100 absolute top-full mt-1 bg-ide-panel text-xs text-ide-text px-2 py-1 rounded shadow border border-ide-border whitespace-nowrap z-20 pointer-events-none ${isHighlighted ? 'opacity-100' : ''}`}>
-                        {event.category && event.category !== '未分类' && (
-                            <span className="mr-1 px-1 py-0.5 rounded text-[10px] text-white" style={{ backgroundColor: CATEGORY_COLORS[event.category] || '#6b7280' }}>
-                                {event.category}
-                            </span>
-                        )}
-                        {new Date(event.timestamp).toLocaleString()}
-                    </div>
-                </div>
-            )}
-        </>
-    );
-});
+  if (stepMs >= HOUR) return `${date.getMonth() + 1}/${date.getDate()} ${hours}:00`;
+  if (stepMs >= MINUTE) return `${hours}:${minutes}`;
+  return `${hours}:${minutes}:${seconds}`;
+}
 
 const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedEventId, refreshKey, sqlPaused }) => {
-    const { t } = useTranslation();
-    const containerRef = useRef(null);
-    const canvasRef = useRef(null);
-    const wheelIdleTimerRef = useRef(null);
-    const [width, setWidth] = useState(0);
-    const [events, setEvents] = useState([]);
-    const [imageEpoch, setImageEpoch] = useState(0);
-    
-    // View State
-    const [centerTime, setCenterTime] = useState(Date.now());
-    
-    // Zoom levels (pixels per millisecond)
-    const MIN_ZOOM = 100 / (365 * 24 * 3600000); // 100px per Year
-    // Target: 10px per Second = 10/1000 = 0.01
-    const MAX_ZOOM = 20 / 1000; 
-    
-    // Initialize with a reasonable zoom level (Visible range ~30 minutes)
-    // 30 min = 1800000 ms. If width is 1000px, Zoom = 1000 / 1800000 = 0.00055
-    const [zoom, setZoom] = useState(0.001); 
+  const { t } = useTranslation();
+  const containerRef = useRef(null);
 
-    const [isDragging, setIsDragging] = useState(false);
-    const lastMouseXRef = useRef(0);
-    const isDraggingRef = useRef(false);
-    const [isFollowingNow, setIsFollowingNow] = useState(false);
-    const fetchEpochRef = useRef(0);
-    const [toolbarExpanded, setToolbarExpanded] = useState(false);
-    const [densityBuckets, setDensityBuckets] = useState([]);
-    const densityEpochRef = useRef(0);
+  const [width, setWidth] = useState(0);
+  const [events, setEvents] = useState([]);
+  const [densityBuckets, setDensityBuckets] = useState([]);
+  const [overviewBuckets, setOverviewBuckets] = useState([]);
+  const [imageEpoch, setImageEpoch] = useState(0);
 
-    // Initial width detection
-    useEffect(() => {
-        if (!containerRef.current) return;
-        setWidth(containerRef.current.clientWidth);
-        const observer = new ResizeObserver(entries => {
-            for (let entry of entries) {
-                setWidth(entry.contentRect.width);
+  const [centerTime, setCenterTime] = useState(Date.now());
+  const [zoom, setZoom] = useState(0.001);
+  const [isFollowingNow, setIsFollowingNow] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [overviewAnchor, setOverviewAnchor] = useState(() => Date.now());
+  const [overviewInteracting, setOverviewInteracting] = useState(false);
+
+  const MIN_ZOOM = 100 / (365 * DAY);
+  const MAX_ZOOM = 20 / 1000;
+
+  const lastMouseXRef = useRef(0);
+  const isDraggingRef = useRef(false);
+  const dragMovedRef = useRef(0);
+  const fetchEpochRef = useRef(0);
+  const densityEpochRef = useRef(0);
+  const overviewEpochRef = useRef(0);
+  const wheelIdleTimerRef = useRef(null);
+  const pendingImageIdsRef = useRef([]);
+  const batchTimerRef = useRef(null);
+
+  const visibleSpan = width > 0 ? width / zoom : HOUR;
+  const viewStart = centerTime - visibleSpan / 2;
+  const viewEnd = centerTime + visibleSpan / 2;
+
+  const tier = visibleSpan <= FRAME_TIER_MAX_SPAN
+    ? 'frame'
+    : visibleSpan <= SESSION_TIER_MAX_SPAN
+      ? 'session'
+      : 'day';
+
+  const overviewSpan = Math.min(
+    OVERVIEW_MAX_SPAN,
+    Math.max(OVERVIEW_MIN_SPAN, visibleSpan * OVERVIEW_SPAN_FACTOR),
+  );
+  const overviewStart = overviewAnchor - overviewSpan / 2;
+  const overviewEnd = overviewAnchor + overviewSpan / 2;
+
+  // Recenter overview band anchor when viewport drifts too far
+  useEffect(() => {
+    if (overviewInteracting) return;
+    if (Math.abs(centerTime - overviewAnchor) > overviewSpan * OVERVIEW_RECENTER_RATIO) {
+      setOverviewAnchor(centerTime);
+    }
+  }, [centerTime, overviewAnchor, overviewSpan, overviewInteracting]);
+
+  const timeToX = useCallback(
+    (time) => width / 2 + (time - centerTime) * zoom,
+    [width, centerTime, zoom],
+  );
+
+  const tickStepMs = useMemo(() => getTickStep(zoom), [zoom]);
+
+  useEffect(() => {
+    if (!containerRef.current) return undefined;
+    setWidth(containerRef.current.clientWidth);
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) setWidth(entry.contentRect.width);
+    });
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  // ── Data Fetching ──────────────────────────────────────────
+
+  const fetchEventsRaw = useCallback(async (center, currentZoom, containerWidth) => {
+    if (!containerWidth) return;
+
+    const epoch = ++fetchEpochRef.current;
+    const span = containerWidth / currentZoom;
+    const start = center - span;
+    const end = center + span;
+
+    try {
+      const records = await getTimeline(start, end);
+      if (fetchEpochRef.current !== epoch) return;
+
+      const mapped = (records || [])
+        .filter((record) => record.timestamp != null)
+        .map((record) => {
+          let meta = null;
+          if (record?.metadata) {
+            try {
+              meta = typeof record.metadata === 'string' ? JSON.parse(record.metadata) : record.metadata;
+            } catch {
+              meta = null;
             }
-        });
-        observer.observe(containerRef.current);
-        return () => observer.disconnect();
-    }, []);
+          }
+          return {
+            id: record.id,
+            timestamp: record.timestamp
+              ? record.timestamp * 1000
+              : (record.created_at ? new Date(record.created_at).getTime() : 0),
+            imagePath: record.image_path,
+            appName: record.process_name,
+            windowTitle: record.window_title,
+            processIcon: record.process_icon || meta?.process_icon || record.page_icon || null,
+            processPath: record.process_path || meta?.process_path || null,
+            category: record.category || null,
+          };
+        })
+        .filter((event) => !Number.isNaN(event.timestamp));
 
-    // Handle jump request
-    useEffect(() => {
-        if (jumpTimestamp?.time) {
-            setIsFollowingNow(false);
-            setCenterTime(jumpTimestamp.time);
-            // Auto-zoom to a clear level if we are too zoomed out
-            setZoom(prev => Math.max(prev, 0.005)); 
-            clearTimelineImageQueue();
-            setImageEpoch(prev => prev + 1);
-        }
-    }, [jumpTimestamp]);
+      setEvents((prev) => pruneEvents(mergeSortedEvents(prev, mapped), center - span * 1.5, center + span * 1.5));
+    } catch (error) {
+      console.error('[Timeline] Fetch error:', error);
+    }
+  }, []);
 
-    // Follow "Now" logic
-    useEffect(() => {
-        let animationFrameId;
-        
-        const tick = () => {
-            if (isFollowingNow) {
-                setCenterTime(Date.now());
-                animationFrameId = requestAnimationFrame(tick);
+  const fetchDensityRaw = useCallback(async (center, currentZoom, containerWidth) => {
+    if (!containerWidth) return;
+
+    const epoch = ++densityEpochRef.current;
+    const span = containerWidth / currentZoom;
+    const start = center - span;
+    const end = center + span;
+
+    // Ensure bucket width is at least one day for day tier
+    const raw = (span * 2) / 220;
+    const bucketMs = span > SESSION_TIER_MAX_SPAN
+      ? Math.max(DAY, snapBucketMs(raw))
+      : snapBucketMs(raw);
+
+    try {
+      const buckets = await getTimelineDensity(start, end, bucketMs, localBucketOffsetMs());
+      if (densityEpochRef.current !== epoch) return;
+      setDensityBuckets((buckets || []).map((bucket) => ({
+        timestamp: bucket.timestamp * 1000,
+        count: bucket.count,
+        bucketMs,
+      })));
+    } catch (error) {
+      console.error('[Timeline] Density fetch error:', error);
+    }
+  }, []);
+
+  const fetchOverviewRaw = useCallback(async (start, end) => {
+    const epoch = ++overviewEpochRef.current;
+    const bucketMs = snapBucketMs((end - start) / 160);
+
+    try {
+      const buckets = await getTimelineDensity(start, end, bucketMs, localBucketOffsetMs());
+      if (overviewEpochRef.current !== epoch) return;
+      setOverviewBuckets((buckets || []).map((bucket) => ({
+        timestamp: bucket.timestamp * 1000,
+        count: bucket.count,
+        bucketMs,
+      })));
+    } catch (error) {
+      console.error('[Timeline] Overview fetch error:', error);
+    }
+  }, []);
+
+  const fetchEventsDebounced = useMemo(() => simpleDebounce(fetchEventsRaw, 500), [fetchEventsRaw]);
+  const fetchEventsThrottled = useMemo(() => simpleThrottle(fetchEventsRaw, 1000), [fetchEventsRaw]);
+  const fetchDensityDebounced = useMemo(() => simpleDebounce(fetchDensityRaw, 600), [fetchDensityRaw]);
+  const fetchOverviewDebounced = useMemo(() => simpleDebounce(fetchOverviewRaw, 900), [fetchOverviewRaw]);
+
+  useEffect(() => {
+    if (sqlPaused || !width) return;
+    if (isFollowingNow) fetchEventsThrottled(centerTime, zoom, width);
+    else fetchEventsDebounced(centerTime, zoom, width);
+    fetchDensityDebounced(centerTime, zoom, width);
+    fetchOverviewDebounced(overviewStart, overviewEnd);
+  }, [
+    centerTime, zoom, width, isFollowingNow, sqlPaused,
+    overviewStart, overviewEnd,
+    fetchEventsThrottled, fetchEventsDebounced, fetchDensityDebounced, fetchOverviewDebounced,
+  ]);
+
+  useEffect(() => {
+    if (refreshKey === undefined) return;
+    setEvents([]);
+    clearTimelineImageQueue();
+    setImageEpoch((prev) => prev + 1);
+    fetchEventsRaw(centerTime, zoom, width);
+    // Refresh only when refreshKey changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
+
+  useEffect(() => {
+    if (sqlPaused) return undefined;
+    const interval = setInterval(() => {
+      if (!isFollowingNow && !isDragging) fetchEventsDebounced(centerTime, zoom, width);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [isFollowingNow, isDragging, centerTime, zoom, width, fetchEventsDebounced, sqlPaused]);
+
+  // ── Thumbnail Loading ──────────────────────────────────────
+
+  const handleVisibleFramesChange = useCallback((ids) => {
+    pendingImageIdsRef.current = ids;
+  }, []);
+
+  useEffect(() => {
+    if (sqlPaused || tier !== 'frame') return undefined;
+    if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
+
+    batchTimerRef.current = setTimeout(() => {
+      const ids = pendingImageIdsRef.current;
+      if (!ids || ids.length === 0) return;
+      const uncached = ids.filter((id) => !timelineImageCache.has(id));
+      if (uncached.length === 0) return;
+
+      fetchThumbnailBatch(uncached)
+        .then((batch) => {
+          if (!batch) return;
+          let added = 0;
+          for (const [id, dataUrl] of Object.entries(batch)) {
+            if (dataUrl) {
+              setTimelineImageCache(Number(id), dataUrl);
+              added += 1;
             }
-        };
+          }
+          if (added > 0) setImageEpoch((prev) => prev + 1);
+        })
+        .catch((error) => console.error('[Timeline] Batch thumbnail load error:', error));
+    }, 300);
 
-        if (isFollowingNow) {
-            tick();
-        }
-
-        return () => {
-             if (animationFrameId) cancelAnimationFrame(animationFrameId);
-        };
-    }, [isFollowingNow]);
-
-    const handleNowClick = () => {
-        setCenterTime(Date.now());
-        setZoom(MAX_ZOOM); // Zoom to max (seconds view)
-        setIsFollowingNow(true);
-        clearTimelineImageQueue();
-        setImageEpoch(prev => prev + 1);
+    return () => {
+      if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
     };
+  }, [centerTime, zoom, width, events, sqlPaused, tier]);
 
-    const handleQuickZoom = (spanMs) => {
-        setIsFollowingNow(false);
-        setCenterTime(Date.now());
-        setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, width / spanMs)));
-        clearTimelineImageQueue();
-        setImageEpoch(prev => prev + 1);
-    };
+  // ── Derived Data ───────────────────────────────────────────
 
-    // Raw fetch function
-    const getEventKey = useCallback((event) => {
-        if (!event) return null;
-        if (event.id !== null && event.id !== undefined) return event.id;
-        if (event.imagePath) return event.imagePath;
-        const ts = event.timestamp ?? 0;
-        return `${ts}-${event.appName || ''}-${event.windowTitle || ''}`;
-    }, []);
+  const sampleInterval = useMemo(() => estimateSampleInterval(events), [events]);
+  const activities = useMemo(
+    () => buildSessions(events, { tailMs: sampleInterval }),
+    [events, sampleInterval],
+  );
+  const sessionBlocks = useMemo(
+    () => collapseSessions(activities, {
+      minBlockMs: zoom > 0 ? SESSION_MIN_BLOCK_PX / zoom : 0,
+    }),
+    [activities, zoom],
+  );
+  const distribution = useMemo(
+    () => (tier === 'day' ? aggregateAppDistribution(events, densityBuckets, 4) : []),
+    [tier, events, densityBuckets],
+  );
 
-    const fetchEventsRaw = async (center, currentZoom, containerWidth) => {
-        if (!containerWidth) return;
-
-        const epoch = ++fetchEpochRef.current;
-        const timeSpan = containerWidth / currentZoom;
-        const startTime = center - (timeSpan / 2) - (timeSpan * 0.5);
-        const endTime = center + (timeSpan / 2) + (timeSpan * 0.5);
-
-        try {
-            const records = await getTimeline(startTime, endTime);
-            if (fetchEpochRef.current !== epoch) return; // stale response, discard
-            const mapped = (records || [])
-                .filter(r => r.timestamp != null) // Filter out records without timestamp
-                .map(r => {
-                    let meta = null;
-                    if (r?.metadata) {
-                        try {
-                            meta = typeof r.metadata === 'string' ? JSON.parse(r.metadata) : r.metadata;
-                        } catch (e) {
-                            meta = null;
-                        }
-                    }
-
-                    return {
-                        id: r.id,
-                        timestamp: r.timestamp ? r.timestamp * 1000 : (r.created_at ? new Date(r.created_at).getTime() : 0),
-                        imagePath: r.image_path,
-                        appName: r.process_name,
-                        windowTitle: r.window_title,
-                        processIcon: r.process_icon || meta?.process_icon || r.page_icon || null,
-                        processPath: r.process_path || meta?.process_path || null,
-                        category: r.category || null,
-                    };
-                })
-                .filter(e => !isNaN(e.timestamp)); // Filter out invalid timestamps
-            
-            setEvents(prev => {
-                const combined = [...mapped, ...prev];
-                const seen = new Set();
-                const unique = [];
-                for (const e of combined) {
-                    const key = getEventKey(e);
-                    if (!seen.has(key)) {
-                        seen.add(key);
-                        unique.push(e);
-                    }
-                }
-                const sorted = unique.sort((a, b) => a.timestamp - b.timestamp);
-                return sorted;
-            });
-        } catch (err) {
-            console.error('[Timeline] Fetch error:', err);
-        }
-    };
-
-    // Create memoized debounced and throttled versions
-    const fetchEventsDebounced = useMemo(() => simpleDebounce(fetchEventsRaw, 500), []);
-    const fetchEventsThrottled = useMemo(() => simpleThrottle(fetchEventsRaw, 1000), []);
-
-    // Snap bucket size to nice intervals
-    const snapBucketMs = (raw) => {
-        const nice = [
-            60000, 300000, 900000, 1800000, 3600000,   // 1m, 5m, 15m, 30m, 1h
-            10800000, 21600000, 43200000, 86400000,     // 3h, 6h, 12h, 1d
-            604800000, 2592000000                       // 7d, 30d
-        ];
-        return nice.find(s => s >= raw) || nice[nice.length - 1];
-    };
-
-    // Density fetch (only at macro scale)
-    const fetchDensityRaw = async (center, currentZoom, containerWidth) => {
-        if (!containerWidth) return;
-        const currentTickStep = getTickStep(currentZoom);
-        if (currentTickStep <= 120000) {
-            // Fine zoom — no density needed
-            setDensityBuckets([]);
-            return;
-        }
-
-        const epoch = ++densityEpochRef.current;
-        const timeSpan = containerWidth / currentZoom;
-        const startTime = center - (timeSpan / 2) - (timeSpan * 0.5);
-        const endTime = center + (timeSpan / 2) + (timeSpan * 0.5);
-        const bucketMs = snapBucketMs(timeSpan / 150);
-
-        try {
-            const buckets = await getTimelineDensity(startTime, endTime, bucketMs);
-            if (densityEpochRef.current !== epoch) return;
-            setDensityBuckets(buckets.map(b => ({
-                timestamp: b.timestamp * 1000, // convert seconds to ms
-                count: b.count,
-                bucketMs,
-            })));
-        } catch (err) {
-            console.error('[Timeline] Density fetch error:', err);
-        }
-    };
-
-    const fetchDensityDebounced = useMemo(() => simpleDebounce(fetchDensityRaw, 600), []);
-
-    // One-shot refresh (e.g., after delete)
-    useEffect(() => {
-        if (refreshKey === undefined) return;
-        setEvents([]);
-        clearTimelineImageQueue();
-        setImageEpoch(prev => prev + 1);
-        fetchEventsRaw(centerTime, zoom, width);
-    }, [refreshKey]);
-
-    // Main interaction effect
-    useEffect(() => {
-        if (sqlPaused) return;
-        if (isFollowingNow) {
-            fetchEventsThrottled(centerTime, zoom, width);
-        } else {
-            fetchEventsDebounced(centerTime, zoom, width);
-        }
-        fetchDensityDebounced(centerTime, zoom, width);
-    }, [centerTime, zoom, width, isFollowingNow, fetchEventsDebounced, fetchEventsThrottled, fetchDensityDebounced, sqlPaused]);
-
-    // Periodic refresh for static view (every 5s)
-    useEffect(() => {
-        if (sqlPaused) return;
-        const interval = setInterval(() => {
-            // Only refresh if NOT following now (following handles itself)
-            // and NOT currently dragging (avoid jank)
-            if (!isFollowingNow && !isDragging) {
-                // Use debounce version to avoid conflict
-                fetchEventsDebounced(centerTime, zoom, width);
-            }
-        }, 5000);
-        return () => clearInterval(interval);
-    }, [isFollowingNow, isDragging, centerTime, zoom, width, fetchEventsDebounced, sqlPaused]);
-
-    // Track visible event IDs that need images for batch loading
-    const pendingImageIdsRef = useRef([]);
-    const batchTimerRef = useRef(null);
-
-    // Batch load thumbnails for visible events (debounced after render)
-    useEffect(() => {
-        if (sqlPaused) return;
-        if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
-        batchTimerRef.current = setTimeout(() => {
-            const ids = pendingImageIdsRef.current;
-            if (!ids || ids.length === 0) return;
-
-            const uncachedIds = ids.filter(id => typeof id === 'number' && id > 0 && !timelineImageCache.has(id));
-            if (uncachedIds.length === 0) return;
-
-            fetchThumbnailBatch(uncachedIds)
-                .then(batch => {
-                    if (batch) {
-                        let added = 0;
-                        for (const [id, dataUrl] of Object.entries(batch)) {
-                            if (dataUrl) {
-                                setTimelineImageCache(Number(id), dataUrl);
-                                added++;
-                            }
-                        }
-                        if (added > 0) {
-                            setImageEpoch(prev => prev + 1);
-                        }
-                    }
-                })
-                .catch(err => {
-                    console.error('[Timeline] Batch thumbnail load error:', err);
-                });
-        }, 300);
-        return () => {
-            if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
-        };
-    }, [centerTime, zoom, width, events, sqlPaused]);
-
-
-    // Interaction Handlers
-    const handleMouseDown = (e) => {
-        setIsFollowingNow(false);
-        setIsDragging(true);
-        isDraggingRef.current = true;
-        lastMouseXRef.current = e.clientX;
-        clearTimelineImageQueue();
-    };
-
-    const handleMouseMove = (e) => {
-        if (!isDraggingRef.current) return;
-        const deltaX = e.clientX - lastMouseXRef.current;
-        lastMouseXRef.current = e.clientX;
-        const deltaTime = deltaX / zoom; 
-        setCenterTime(prev => prev - deltaTime);
-    };
-
-    const handleMouseUp = () => {
-        setIsDragging(false);
-        isDraggingRef.current = false;
-        setImageEpoch(prev => prev + 1);
-    };
-
-    const handleMouseLeave = () => {
-        setIsDragging(false);
-        isDraggingRef.current = false;
-        setImageEpoch(prev => prev + 1);
-    };
-
-    const handleBackgroundClick = useCallback((e) => {
-        // Only clear highlight when clicking on the empty canvas (not dragging and not on child nodes)
-        if (isDragging) return;
-        if (e.target !== e.currentTarget) return;
-        setIsFollowingNow(false);
-        if (onClearHighlight) onClearHighlight();
-    }, [isDragging, onClearHighlight]);
-
-    const handleWheel = (e) => {
-        try { e.preventDefault(); } catch(err){} 
-        setIsFollowingNow(false);
-        clearTimelineImageQueue();
-
-        if (wheelIdleTimerRef.current) {
-            clearTimeout(wheelIdleTimerRef.current);
-        }
-        wheelIdleTimerRef.current = setTimeout(() => {
-            setImageEpoch(prev => prev + 1);
-        }, 160);
-
-        const rect = containerRef.current.getBoundingClientRect();
-        const cursorX = e.clientX - rect.left;
-        // Calculate the time at the mouse cursor BEFORE zooming
-        const timeAtCursor = centerTime + (cursorX - width / 2) / zoom;
-        
-        const zoomFactor = 1.2; 
-        let newZoom = zoom;
-        if (e.deltaY < 0) newZoom *= zoomFactor;
-        else newZoom /= zoomFactor;
-        
-        // Clamp zoom
-        newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
-        
-        // Calculate new center time so that timeAtCursor remains at cursorX
-        // cursorX = width/2 + (timeAtCursor - newCenterTime) * newZoom
-        // => (cursorX - width/2) / newZoom = timeAtCursor - newCenterTime
-        // => newCenterTime = timeAtCursor - (cursorX - width/2) / newZoom
-        const newCenterTime = timeAtCursor - (cursorX - width / 2) / newZoom;
-
-        setZoom(newZoom);
-        setCenterTime(newCenterTime);
-    };
-
-    const getXPosition = (timestamp) => {
-        const timeDiff = timestamp - centerTime;
-        return (width / 2) + (timeDiff * zoom);
-    };
-
-    // Ticks Rendering (Smart scale)
-    const formatTick = (date, stepMs) => {
-        const day = 86400000;
-        // Year-level ticks
-        if (stepMs >= day * 365) return `${date.getFullYear()}`;
-        // Month-level ticks (show month + year to avoid month-only repetition)
-        if (stepMs >= day * 28) return date.toLocaleString('default', { month: 'short', year: 'numeric' });
-        // Day-level ticks
-        if (stepMs >= day) return date.toLocaleString('default', { month: 'short', day: 'numeric' });
-        
-        const h = date.getHours();
-        const m = String(date.getMinutes()).padStart(2, '0');
-        const s = String(date.getSeconds()).padStart(2, '0');
-        const ms = String(date.getMilliseconds()).padStart(3, '0');
-
-        if (stepMs >= 3600000) {
-            const m2 = date.getMonth() + 1;
-            const d2 = date.getDate();
-            return `${m2}/${d2} ${h}:00`;
-        }
-        if (stepMs >= 60000) return `${h}:${m}`;
-        if (stepMs >= 1000) return `${h}:${m}:${s}`;
-        return `${h}:${m}:${s}.${ms}`;
-    };
-
-    const getTickStep = (currentZoom) => {
-        const minSpacing = 120; // px
-        const targetMs = minSpacing / currentZoom;
-        const day = 86400000;
-
-        // Nice intervals from milliseconds up to multi-year spans
-        const steps = [
-            10, 20, 50, 100, 200, 500, // ms
-            1000, 2000, 5000, 10000, 15000, 30000, // seconds
-            60000, 120000, 300000, 900000, 1800000, // minutes
-            3600000, 7200000, 21600000, 43200000, // hours
-            day, day * 2, day * 7, day * 30, day * 90, day * 180, // days to months
-            day * 365, day * 365 * 2, day * 365 * 5, day * 365 * 10, // years
-            day * 365 * 25, day * 365 * 50, day * 365 * 100, day * 365 * 250, day * 365 * 500, day * 365 * 1000, day * 365 * 2500
-        ];
-
-        return steps.find(s => s >= targetMs) || steps[steps.length - 1];
-    };
-
-    const tickStepMs = useMemo(() => getTickStep(zoom), [zoom]);
-    const showProcessText = tickStepMs < 900000; // Show names only when finer than 15 minutes to avoid text stacking
-
-    // Canvas drawing for the timeline activity bars
-    useEffect(() => {
-        const canvas = canvasRef.current;
-        if (!canvas || !width) return;
-        
-        const dpr = window.devicePixelRatio || 1;
-        const rect = containerRef.current.getBoundingClientRect();
-        // Keep CSS size in layout pixels to avoid visual scaling mismatch
-        if (canvas.style.width !== `${rect.width}px`) {
-            canvas.style.width = `${rect.width}px`;
-            canvas.style.height = `${rect.height}px`;
-        }
-        
-        // Ensure accurate scaling
-        if (canvas.width !== rect.width * dpr || canvas.height !== rect.height * dpr) {
-            canvas.width = rect.width * dpr;
-            canvas.height = rect.height * dpr;
-        }
-
-        const ctx = canvas.getContext('2d');
-        ctx.resetTransform(); // clear previous transforms
-        ctx.scale(dpr, dpr);
-        ctx.clearRect(0, 0, rect.width, rect.height);
-
-        // Draw density histogram behind everything else
-        if (densityBuckets.length > 0) {
-            const startTime = centerTime - (width / 2) / zoom;
-            const getLocalX = (ts) => (width / 2) + ((ts - centerTime) * zoom);
-            const maxCount = Math.max(...densityBuckets.map(b => b.count));
-            if (maxCount > 0) {
-                const densityBarMaxHeight = 25;
-                const densityBarTop = rect.height - densityBarMaxHeight;
-                // Get the accent color from CSS custom property
-                const accentColor = getComputedStyle(containerRef.current).getPropertyValue('--ide-accent').trim() || '#4f8cff';
-                for (const bucket of densityBuckets) {
-                    const x = getLocalX(bucket.timestamp);
-                    const bucketWidth = Math.max(1, bucket.bucketMs * zoom);
-                    // Cull offscreen
-                    if (x + bucketWidth < 0 || x > rect.width) continue;
-                    const ratio = bucket.count / maxCount;
-                    const barH = Math.max(5, ratio * densityBarMaxHeight);
-                    ctx.fillStyle = accentColor;
-                    ctx.globalAlpha = 0.15 + ratio * 0.30; // 12%-30% opacity
-                    ctx.fillRect(x, densityBarTop + densityBarMaxHeight - barH, bucketWidth - 1, barH);
-                }
-                ctx.globalAlpha = 1.0;
-            }
-        }
-
-        if (events.length === 0) return;
-
-        const startTime = centerTime - (width / 2) / zoom;
-        const endTime = centerTime + (width / 2) / zoom;
-
-        // Binary search for visible range
-        // Find index where event.timestamp >= startTime
-        let startIndex = 0;
-        let low = 0, high = events.length - 1;
-        while (low <= high) {
-            const mid = Math.floor((low + high) / 2);
-            if (events[mid].timestamp < startTime) low = mid + 1;
-            else high = mid - 1;
-        }
-        startIndex = Math.max(0, low - 1); 
-
-        // Find index where event.timestamp > endTime
-        let endIndex = events.length;
-        low = 0; high = events.length - 1;
-        while (low <= high) {
-            const mid = Math.floor((low + high) / 2);
-            if (events[mid].timestamp <= endTime) low = mid + 1;
-            else high = mid - 1;
-        }
-        endIndex = Math.min(events.length, low + 1);
-
-        const getLocalX = (ts) => (width / 2) + ((ts - centerTime) * zoom);
-
-        for (let i = startIndex; i < endIndex; i++) {
-             const event = events[i];
-             const nextEvent = events[i+1]; // events[endIndex] might be undefined, handled safe
-             
-             const x = getLocalX(event.timestamp);
-             let segmentWidth = 100;
-             let nextX = x + 100;
-
-             if (nextEvent) {
-                  nextX = getLocalX(nextEvent.timestamp);
-                  segmentWidth = Math.max(0, nextX - x);
-             } else {
-                 // Last event: Arbitrary width or based on duration if known? 
-                 // Current logic assumes 100 or till next
-             }
-             
-             // Culling (extra check)
-             if (x > width || x + segmentWidth < 0) continue;
-
-             const currentActivityKey = getActivityKey(event.appName, event.windowTitle);
-             const nextActivityKey = nextEvent ? getActivityKey(nextEvent.appName, nextEvent.windowTitle) : null;
-             const isSameActivityAsNext = nextEvent && nextActivityKey === currentActivityKey;
-             
-             // Only calculate color for visible bars
-             const prevEvent = i > 0 ? events[i-1] : null;
-             const prevAppName = prevEvent?.appName;
-             const prevWindowTitle = prevEvent?.windowTitle;
-             
-             ctx.fillStyle = getProcessColor(event.appName, event.windowTitle, prevAppName, prevWindowTitle);
-             
-             const barTop = 16; 
-             const barHeight = 6; 
-             const arrowDepth = 8;
-             
-             if (isSameActivityAsNext) {
-                 ctx.fillRect(x, barTop, segmentWidth + 1, barHeight);
-             } else {
-                 ctx.beginPath();
-                 ctx.moveTo(x, barTop);
-                 ctx.lineTo(x + segmentWidth - arrowDepth, barTop);
-                 ctx.lineTo(x + segmentWidth, barTop + barHeight / 2);
-                 ctx.lineTo(x + segmentWidth - arrowDepth, barTop + barHeight);
-                 ctx.lineTo(x, barTop + barHeight);
-                 ctx.closePath();
-                 ctx.fill();
-             }
-        }
-    }, [events, centerTime, zoom, width, densityBuckets]);
-
-    const renderTicks = () => {
-        if (!width) return null;
-        
-        const stepMs = tickStepMs;
-        const startTime = centerTime - (width / 2) / zoom;
-        const endTime = centerTime + (width / 2) / zoom;
-        
-        // Align to step
-        let currentTime = Math.floor(startTime / stepMs) * stepMs;
-        
-        const ticks = [];
-        let count = 0;
-        
-        while (currentTime < endTime && count < 100) {
-            const x = getXPosition(currentTime);
-            // Only render if within reasonable bounds (add slight buffer)
-            if (x > -50 && x < width + 50) {
-                const date = new Date(currentTime);
-                ticks.push(
-                    <div key={currentTime} className="absolute bottom-0 border-l border-ide-muted h-4 opacity-50 flex flex-col items-start pointer-events-none" style={{ left: x }}>
-                         <span className="text-xs text-ide-muted ml-1 whitespace-nowrap select-none -translate-x-1/2 font-mono">
-                            {formatTick(date, stepMs)}
-                        </span>
-                    </div>
-                );
-            }
-            currentTime += stepMs;
-            count++;
-        }
-        return ticks;
-    };
-    
-    return (
-        <div 
-            ref={containerRef}
-            className="w-full h-32 border-b border-ide-border relative overflow-hidden cursor-move select-none shadow-inner"
-            style={{ backgroundColor: 'var(--ide-timeline-bg)' }}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseLeave}
-            onWheel={handleWheel}
-            onClick={handleBackgroundClick}
-            data-keep-selection="true"
-        >
-            {renderTicks()}
-            <canvas ref={canvasRef} className="absolute inset-0 z-0 pointer-events-none" />
-
-            {width > 0 && (() => {
-                const startTime = centerTime - (width / 2) / zoom;
-                const endTime = centerTime + (width / 2) / zoom;
-                
-                // Binary Search for Visible Range Logic (Same as Canvas)
-                // Find index where event.timestamp >= startTime
-                let startIndex = 0;
-                let low = 0, high = events.length - 1;
-                while (low <= high) {
-                    const mid = Math.floor((low + high) / 2);
-                    if (events[mid].timestamp < startTime) low = mid + 1;
-                    else high = mid - 1;
-                }
-                startIndex = Math.max(0, low - 1); 
-
-                // Find index where event.timestamp > endTime
-                let endIndex = events.length;
-                low = 0; high = events.length - 1;
-                while (low <= high) {
-                    const mid = Math.floor((low + high) / 2);
-                    if (events[mid].timestamp <= endTime) low = mid + 1;
-                    else high = mid - 1;
-                }
-                endIndex = Math.min(events.length, low + 1);
-                let lastImageX = -9999;
-                let lastLabelX = -9999;
-                const MIN_IMAGE_GAP = 20;
-                const isFineZoom = tickStepMs < 30000;
-                const MIN_LABEL_GAP = showProcessText ? 180 : (isFineZoom ? 0 : 30);
-
-                // Sparse sampling on macro scales without changing the visual placement rules.
-                const visibleSpanMs = Math.max(1, endTime - startTime);
-                const macroScale = tickStepMs > 120000; // coarser than 2 min/tick
-                const maxImagesPerView = macroScale
-                    ? Math.max(14, Math.min(60, Math.floor(width / 60)))
-                    : null;
-                const sampleIntervalMs = macroScale && maxImagesPerView
-                    ? Math.max(tickStepMs * 1.5, Math.floor(visibleSpanMs / maxImagesPerView))
-                    : null;
-                const seenSampleBuckets = macroScale ? new Set() : null;
-                
-                const visibleNodes = [];
-                const batchImageIds = [];
-
-                for (let index = startIndex; index < endIndex; index++) {
-                    const event = events[index];
-                    // We access original events array for neighbors to maintain continuity
-                    const nextEvent = events[index + 1];
-                    const prevEvent = index > 0 ? events[index - 1] : null;
-                    const x = getXPosition(event.timestamp);
-                    
-                    let segmentWidth = 100;
-                    if (nextEvent) {
-                        const nextX = getXPosition(nextEvent.timestamp);
-                        segmentWidth = Math.max(0, nextX - x);
-                    }
-
-                    // Strict Culling (should be duplicate of binary search mostly, but good for safety)
-                    if (x > width + 50) break; 
-                    if (x + segmentWidth < -50) continue;
-
-                    const currentActivityKey = getActivityKey(event.appName, event.windowTitle);
-                    const nextActivityKey = nextEvent ? getActivityKey(nextEvent.appName, nextEvent.windowTitle) : null;
-                    const prevActivityKey = prevEvent ? getActivityKey(prevEvent.appName, prevEvent.windowTitle) : null;
-                    
-                    const isSameActivityAsNext = nextEvent && nextActivityKey === currentActivityKey;
-                    const isSameActivityAsPrev = prevEvent && prevActivityKey === currentActivityKey;
-                    // Density check for images
-                    let showImage = false;
-                    const isZoomedEnough = zoom > 0.00001;
-                    let isSampled = true;
-                    let sampleBucket = null;
-                    if (macroScale && sampleIntervalMs) {
-                        sampleBucket = Math.floor(event.timestamp / sampleIntervalMs);
-                        if (seenSampleBuckets.has(sampleBucket)) {
-                            isSampled = false;
-                        }
-                    }
-                    if (isZoomedEnough && isSampled) {
-                        if (x - lastImageX >= MIN_IMAGE_GAP) {
-                            showImage = true;
-                            lastImageX = x;
-                            if (sampleBucket !== null) {
-                                seenSampleBuckets.add(sampleBucket);
-                            }
-                        }
-                    }
-                    // Density check for labels
-                    let showLabel = false;
-                    if (!isSameActivityAsPrev) {
-                        if (x - lastLabelX >= MIN_LABEL_GAP) {
-                            showLabel = true;
-                            lastLabelX = x;
-                        }
-                    }
-
-                    const isHighlighted = highlightedEventId === event.id;
-                    if (isHighlighted) {
-                        showImage = true;
-                    }
-
-                    // Optimization: If nothing to render (no image, no label, bar is on canvas), skip component entirely
-                    if (!showImage && !(showLabel && !isSameActivityAsPrev)) {
-                        continue;
-                    }
-
-                    if (showImage && typeof event.id === 'number' && event.id > 0) {
-                        batchImageIds.push(event.id);
-                    }
-
-                    const eventKey = getEventKey(event) ?? `${event.timestamp}-${index}`;
-                    visibleNodes.push(
-                        <TimelineEvent 
-                            key={eventKey}
-                            event={event}
-                            x={x}
-                            width={segmentWidth}
-                            visible={true} 
-                            showImage={showImage}
-                            showText={showProcessText}
-                            showLabel={showLabel}
-                            isSameActivityAsNext={isSameActivityAsNext}
-                            isSameActivityAsPrev={isSameActivityAsPrev}
-                            prevAppName={prevEvent?.appName}
-                            prevWindowTitle={prevEvent?.windowTitle}
-                            onClick={onSelectEvent}
-                            isHighlighted={isHighlighted}
-                            imageEpoch={imageEpoch}
-                        />
-                    );
-                }
-                pendingImageIdsRef.current = batchImageIds;
-                return visibleNodes;
-            })()}
-            
-            <div className="absolute top-0 bottom-0 left-1/2 w-px bg-ide-accent opacity-50 pointer-events-none z-0"></div>
-
-             {/* Timeline Toolbar */}
-            <div className="absolute bottom-2 right-2 flex items-center gap-1 z-50">
-                {toolbarExpanded && (
-                    <>
-                        <button
-                            className="px-2 py-1 text-xs rounded shadow border bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active transition-colors"
-                            onClick={(e) => { e.stopPropagation(); handleQuickZoom(30 * 86400000); }}
-                            title={t('timeline.zoomMonth')}
-                        >{t('timeline.month')}</button>
-                        <button
-                            className="px-2 py-1 text-xs rounded shadow border bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active transition-colors"
-                            onClick={(e) => { e.stopPropagation(); handleQuickZoom(7 * 86400000); }}
-                            title={t('timeline.zoomWeek')}
-                        >{t('timeline.week')}</button>
-                        <button
-                            className="px-2 py-1 text-xs rounded shadow border bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active transition-colors"
-                            onClick={(e) => { e.stopPropagation(); handleQuickZoom(86400000); }}
-                            title={t('timeline.zoomToday')}
-                        >{t('timeline.today')}</button>
-                    </>
-                )}
-                <button
-                    className="p-1 rounded shadow border bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active transition-colors"
-                    onClick={(e) => { e.stopPropagation(); setToolbarExpanded(prev => !prev); }}
-                    title={toolbarExpanded ? t('timeline.collapse') : t('timeline.expandQuickZoom')}
-                >
-                    {toolbarExpanded ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
-                </button>
-                <button
-                    className={`p-1.5 rounded-full shadow-lg border transition-all
-                        ${isFollowingNow
-                            ? 'bg-ide-accent text-white border-ide-accent'
-                            : 'bg-ide-panel text-ide-text border-ide-border hover:bg-ide-active'
-                        }`}
-                    onClick={(e) => { e.stopPropagation(); handleNowClick(); }}
-                    title={t('timeline.jumpToNow')}
-                >
-                    <Play size={16} fill={isFollowingNow ? "currentColor" : "none"} className={isFollowingNow ? "" : "ml-0.5"} />
-                </button>
-            </div>
-        </div>
+  /** Find session block matching the highlighted screenshot event. */
+  const activeSessionId = useMemo(() => {
+    if (highlightedEventId === null || highlightedEventId === undefined) return null;
+    const event = events.find((item) => item.id === highlightedEventId);
+    if (!event) return null;
+    const block = sessionBlocks.find(
+      (item) => event.timestamp >= item.start && event.timestamp < item.end,
     );
+    return block ? block.id : null;
+  }, [events, sessionBlocks, highlightedEventId]);
+
+  // ── Navigation ───────────────────────────────────────────────
+
+  const resetImagePipeline = useCallback(() => {
+    clearTimelineImageQueue();
+    setImageEpoch((prev) => prev + 1);
+  }, []);
+
+  const seekTo = useCallback((time) => {
+    setIsFollowingNow(false);
+    setCenterTime(time);
+  }, []);
+
+  const seekRange = useCallback((from, to) => {
+    if (!width || to <= from) return;
+    setIsFollowingNow(false);
+    setCenterTime((from + to) / 2);
+    setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, width / (to - from))));
+    resetImagePipeline();
+  }, [width, MIN_ZOOM, MAX_ZOOM, resetImagePipeline]);
+
+  const zoomToSpan = useCallback((spanMs) => {
+    if (!width) return;
+    setIsFollowingNow(false);
+    setCenterTime(Date.now());
+    setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, width / spanMs)));
+    resetImagePipeline();
+  }, [width, MIN_ZOOM, MAX_ZOOM, resetImagePipeline]);
+
+  const jumpToNow = useCallback(() => {
+    setCenterTime(Date.now());
+    setZoom(MAX_ZOOM);
+    setIsFollowingNow(true);
+    resetImagePipeline();
+  }, [MAX_ZOOM, resetImagePipeline]);
+
+  useEffect(() => {
+    if (!jumpTimestamp?.time) return;
+    setIsFollowingNow(false);
+    setCenterTime(jumpTimestamp.time);
+    setZoom((prev) => Math.max(prev, 0.005));
+    resetImagePipeline();
+  }, [jumpTimestamp, resetImagePipeline]);
+
+  useEffect(() => {
+    if (!isFollowingNow) return undefined;
+    let frameId;
+    const tick = () => {
+      setCenterTime(Date.now());
+      frameId = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => {
+      if (frameId) cancelAnimationFrame(frameId);
+    };
+  }, [isFollowingNow]);
+
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (event.ctrlKey || event.altKey || event.metaKey) return;
+      const target = event.target;
+      if (target?.closest?.('input, textarea, select, [contenteditable="true"]')) return;
+
+      switch (event.key) {
+        case '1': zoomToSpan(DAY); break;
+        case '2': zoomToSpan(7 * DAY); break;
+        case '3': zoomToSpan(30 * DAY); break;
+        case '0': jumpToNow(); break;
+        default: return;
+      }
+      event.preventDefault();
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [zoomToSpan, jumpToNow]);
+
+  // ── Pointer Interaction ─────────────────────────────────────
+
+  const handleMouseDown = useCallback((event) => {
+    setIsFollowingNow(false);
+    setIsDragging(true);
+    isDraggingRef.current = true;
+    dragMovedRef.current = 0;
+    lastMouseXRef.current = event.clientX;
+    clearTimelineImageQueue();
+  }, []);
+
+  const handleMouseMove = useCallback((event) => {
+    if (!isDraggingRef.current) return;
+    const deltaX = event.clientX - lastMouseXRef.current;
+    lastMouseXRef.current = event.clientX;
+    dragMovedRef.current += Math.abs(deltaX);
+    setCenterTime((prev) => prev - deltaX / zoom);
+  }, [zoom]);
+
+  const endDrag = useCallback(() => {
+    if (!isDraggingRef.current) return;
+    setIsDragging(false);
+    isDraggingRef.current = false;
+    setImageEpoch((prev) => prev + 1);
+  }, []);
+
+  const handleWheel = useCallback((event) => {
+    try { event.preventDefault(); } catch { /* passive listener */ }
+    setIsFollowingNow(false);
+    clearTimelineImageQueue();
+
+    if (wheelIdleTimerRef.current) clearTimeout(wheelIdleTimerRef.current);
+    wheelIdleTimerRef.current = setTimeout(() => setImageEpoch((prev) => prev + 1), 160);
+
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const cursorX = event.clientX - rect.left;
+    const timeAtCursor = centerTime + (cursorX - width / 2) / zoom;
+
+    const nextZoom = Math.max(
+      MIN_ZOOM,
+      Math.min(MAX_ZOOM, event.deltaY < 0 ? zoom * 1.2 : zoom / 1.2),
+    );
+
+    setZoom(nextZoom);
+    setCenterTime(timeAtCursor - (cursorX - width / 2) / nextZoom);
+  }, [centerTime, width, zoom, MIN_ZOOM, MAX_ZOOM]);
+
+  const handleBackgroundClick = useCallback((event) => {
+    if (dragMovedRef.current > DRAG_SLOP_PX) return;
+    // Ignore background click if clicking an interactive item
+    if (event.target?.closest?.('[data-timeline-item]')) return;
+    setIsFollowingNow(false);
+    onClearHighlight?.();
+  }, [onClearHighlight]);
+
+  /** Filter out clicks caused by drag mouseup. */
+  const guardedSelect = useCallback((handler) => (payload) => {
+    if (dragMovedRef.current > DRAG_SLOP_PX) return;
+    handler(payload);
+  }, []);
+
+  const handleSelectSession = useMemo(
+    () => guardedSelect((session) => {
+      if (session.firstEvent) onSelectEvent?.(session.firstEvent);
+    }),
+    [guardedSelect, onSelectEvent],
+  );
+
+  const handleZoomToSession = useCallback((session) => {
+    const padding = Math.max(MINUTE, (session.end - session.start) * 0.15);
+    seekRange(session.start - padding, session.end + padding);
+  }, [seekRange]);
+
+  const handleSelectFrame = useMemo(
+    () => guardedSelect((event) => onSelectEvent?.(event)),
+    [guardedSelect, onSelectEvent],
+  );
+
+  // ── Axis Ticks ──────────────────────────────────────────────
+
+  const ticks = useMemo(() => {
+    if (!width) return [];
+    const result = [];
+    let current = Math.floor(viewStart / tickStepMs) * tickStepMs;
+    let guard = 0;
+
+    while (current < viewEnd && guard < 100) {
+      const x = timeToX(current);
+      if (x > -60 && x < width + 60) {
+        result.push({ time: current, x, label: formatTick(new Date(current), tickStepMs) });
+      }
+      current += tickStepMs;
+      guard += 1;
+    }
+    return result;
+  }, [width, viewStart, viewEnd, tickStepMs, timeToX]);
+
+  const quickZooms = [
+    { key: 'today', span: DAY, label: t('timeline.today'), title: t('timeline.zoomToday'), shortcut: '1' },
+    { key: 'week', span: 7 * DAY, label: t('timeline.week'), title: t('timeline.zoomWeek'), shortcut: '2' },
+    { key: 'month', span: 30 * DAY, label: t('timeline.month'), title: t('timeline.zoomMonth'), shortcut: '3' },
+  ];
+
+  return (
+    <div
+      ref={containerRef}
+      className="relative w-full shrink-0 select-none overflow-hidden border-b border-ide-border"
+      style={{ height: TIMELINE_HEIGHT, backgroundColor: 'var(--ide-timeline-bg)' }}
+      data-keep-selection="true"
+    >
+      <OverviewBand
+        width={width}
+        height={OVERVIEW_HEIGHT}
+        buckets={overviewBuckets}
+        rangeStart={overviewStart}
+        rangeEnd={overviewEnd}
+        viewStart={viewStart}
+        viewEnd={viewEnd}
+        onSeek={seekTo}
+        onSeekRange={seekRange}
+        onInteractingChange={setOverviewInteracting}
+      />
+
+      <div
+        className={`relative ${isDragging ? 'cursor-grabbing' : 'cursor-grab'}`}
+        style={{ height: SESSION_HEIGHT + DETAIL_HEIGHT + AXIS_HEIGHT }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={endDrag}
+        onMouseLeave={endDrag}
+        onWheel={handleWheel}
+        onClick={handleBackgroundClick}
+      >
+        <SessionBand
+          blocks={sessionBlocks}
+          timeToX={timeToX}
+          width={width}
+          height={SESSION_HEIGHT}
+          activeId={activeSessionId}
+          onSelect={handleSelectSession}
+          onZoomTo={handleZoomToSession}
+        />
+
+        <DetailTrack
+          tier={tier}
+          events={events}
+          buckets={densityBuckets}
+          distribution={distribution}
+          timeToX={timeToX}
+          width={width}
+          height={DETAIL_HEIGHT}
+          highlightedEventId={highlightedEventId}
+          imageCache={timelineImageCache}
+          imageEpoch={imageEpoch}
+          onSelectEvent={handleSelectFrame}
+          onSeek={seekTo}
+          onVisibleFramesChange={handleVisibleFramesChange}
+        />
+
+        <div className="relative" style={{ height: AXIS_HEIGHT }}>
+          {ticks.map((tick) => (
+            <div
+              key={tick.time}
+              className="pointer-events-none absolute top-0 flex -translate-x-1/2 flex-col items-center"
+              style={{ left: tick.x }}
+            >
+              <span className="h-1 w-px bg-ide-border" />
+              <span className="mt-0.5 whitespace-nowrap font-mono text-[10px] leading-none text-ide-muted">
+                {tick.label}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        <div
+          className="pointer-events-none absolute inset-y-0 left-1/2 z-30 w-px"
+          style={{ backgroundColor: accentWithAlpha(0.75) }}
+        />
+      </div>
+
+      <div className="absolute bottom-1.5 right-2 z-40 flex items-center gap-1">
+        {quickZooms.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            className="rounded border border-ide-border bg-ide-panel px-2 py-0.5 text-[11px] text-ide-text shadow-sm transition-colors hover:bg-ide-active"
+            onClick={(event) => {
+              event.stopPropagation();
+              zoomToSpan(item.span);
+            }}
+            title={`${item.title} (${item.shortcut})`}
+          >
+            {item.label}
+          </button>
+        ))}
+        <button
+          type="button"
+          className={`rounded-full border p-1 shadow transition-colors ${
+            isFollowingNow
+              ? 'border-ide-accent bg-ide-accent text-white'
+              : 'border-ide-border bg-ide-panel text-ide-text hover:bg-ide-active'
+          }`}
+          onClick={(event) => {
+            event.stopPropagation();
+            jumpToNow();
+          }}
+          title={`${t('timeline.jumpToNow')} (0)`}
+        >
+          <Play size={14} fill={isFollowingNow ? 'currentColor' : 'none'} className={isFollowingNow ? '' : 'ml-0.5'} />
+        </button>
+      </div>
+    </div>
+  );
 };
 
 export default Timeline;

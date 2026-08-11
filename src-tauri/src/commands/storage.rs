@@ -332,8 +332,8 @@ mod tests {
 
 /// Returns timeline records between millisecond timestamps `start_time` and `end_time`.
 ///
-/// Authentication: required. `max_records` caps the result; returns an array of
-/// `ScreenshotRecord` objects. Frontend: `lib/monitor_api.js`.
+/// Authentication: required. `max_records` caps the result (sampling evenly across range).
+/// Returns an array of `ScreenshotRecord` objects. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_timeline(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -357,7 +357,7 @@ pub async fn storage_get_timeline(
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        state.get_screenshots_by_time_range_limited(start_ts, end_ts, max_records.or(Some(500)))
+        state.get_screenshots_by_time_range_sampled(start_ts, end_ts, max_records.or(Some(500)))
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))?
@@ -365,8 +365,8 @@ pub async fn storage_get_timeline(
 
 /// Aggregates screenshot counts into `bucket_ms` timeline buckets.
 ///
-/// Authentication: required. Returns an array of `DensityBucket` objects for the
-/// requested millisecond range. Frontend: `lib/monitor_api.js`.
+/// Authentication: required. Optional `bucket_offset_ms` shifts bucket boundaries to align
+/// with local timezone dates. Returns an array of `DensityBucket` objects. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_timeline_density(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -374,6 +374,7 @@ pub async fn storage_get_timeline_density(
     start_time: f64,
     end_time: f64,
     bucket_ms: i64,
+    bucket_offset_ms: Option<i64>,
 ) -> Result<Vec<storage::DensityBucket>, String> {
     check_auth_required(&credential_state)?;
 
@@ -389,10 +390,11 @@ pub async fn storage_get_timeline_density(
     };
 
     let bucket_seconds = (bucket_ms / 1000).max(1);
+    let offset_seconds = bucket_offset_ms.unwrap_or(0) / 1000;
 
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
-        state.get_screenshot_density(start_ts, end_ts, bucket_seconds)
+        state.get_screenshot_density(start_ts, end_ts, bucket_seconds, offset_seconds)
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))?

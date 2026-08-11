@@ -1521,8 +1521,16 @@
     "zoomMonth": "缩放到1个月",
     "zoomWeek": "缩放到1周",
     "zoomToday": "缩放到当日",
-    "collapse": "收起",
-    "expandQuickZoom": "展开快速缩放",
-    "jumpToNow": "跳转到现在"
+    "jumpToNow": "跳转到现在",
+    "duration": {
+      "seconds": "{{seconds}}秒",
+      "minutes": "{{minutes}}分",
+      "hours": "{{hours}}时{{minutes}}分"
+    },
+    "session": {
+      "windows": "{{windowCount}} 个窗口",
+      "switches": "切换 {{switchCount}} 次",
+      "interruptions": "中断 {{interruptionCount}} 次"
+    }
   }
 }
