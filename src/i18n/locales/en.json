@@ -1521,8 +1521,16 @@
     "zoomMonth": "Zoom to 1 month",
     "zoomWeek": "Zoom to 1 week",
     "zoomToday": "Zoom to today",
-    "collapse": "Collapse",
-    "expandQuickZoom": "Expand quick zoom",
-    "jumpToNow": "Jump to Now"
+    "jumpToNow": "Jump to Now",
+    "duration": {
+      "seconds": "{{seconds}}s",
+      "minutes": "{{minutes}}m",
+      "hours": "{{hours}}h {{minutes}}m"
+    },
+    "session": {
+      "windows": "{{windowCount}} windows",
+      "switches": "{{switchCount}} switches",
+      "interruptions": "{{interruptionCount}} interruptions"
+    }
   }
 }

@@ -1276,6 +1276,18 @@ impl StorageState {
         Ok(aborted)
     }
 
+    /// Columns both time-range queries select. Their order must stay in sync
+    /// with `RawScreenshotRow::from_row`, so they live in one place.
+    const TIME_RANGE_COLUMNS: &str = "s.id, s.image_path, s.image_hash, s.width, s.height,
+                        s.window_title, s.process_name, s.metadata,
+                        s.window_title_enc, s.process_name_enc, s.metadata_enc,
+                        s.content_key_encrypted,
+                        strftime('%s', s.created_at) as timestamp, s.created_at,
+                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
+                        pi.icon_enc, pi.icon_key_encrypted,
+                        ls.links_enc, ls.links_key_encrypted,
+                        s.category, s.category_confidence";
+
     /// Get screenshots within a time range.
     pub fn get_screenshots_by_time_range(
         &self,
@@ -1285,13 +1297,68 @@ impl StorageState {
         self.get_screenshots_by_time_range_limited(start_ts, end_ts, None)
     }
 
+    /// Returns at most `max_records` rows, taking the earliest ones when the
+    /// range holds more.
+    ///
+    /// Callers that need coverage of the whole range rather than its beginning
+    /// want [`Self::get_screenshots_by_time_range_sampled`] instead.
     pub fn get_screenshots_by_time_range_limited(
         &self,
         start_ts: f64,
         end_ts: f64,
         max_records: Option<i64>,
     ) -> Result<Vec<ScreenshotRecord>, String> {
+        self.query_time_range(start_ts, end_ts, max_records, false)
+    }
+
+    /// Returns rows spread evenly across the range by picking one row per time bucket.
+    pub fn get_screenshots_by_time_range_sampled(
+        &self,
+        start_ts: f64,
+        end_ts: f64,
+        max_records: Option<i64>,
+    ) -> Result<Vec<ScreenshotRecord>, String> {
+        self.query_time_range(start_ts, end_ts, max_records, true)
+    }
+
+    /// Rounds a raw bucket width in seconds up to the next standardized step.
+    fn snap_bucket_seconds(raw_seconds: f64) -> i64 {
+        const NICE_SECONDS: [i64; 21] = [
+            1, 2, 5, 10, 15, 30, // seconds
+            60, 120, 300, 600, 900, 1800, // minutes
+            3600, 7200, 10800, 21600, 43200, // hours
+            86400, 172800, 604800, 2592000, // days and up
+        ];
+        let raw = raw_seconds.ceil().max(1.0) as i64;
+        NICE_SECONDS
+            .iter()
+            .copied()
+            .find(|&step| step >= raw)
+            .unwrap_or(NICE_SECONDS[NICE_SECONDS.len() - 1])
+    }
+
+    fn query_time_range(
+        &self,
+        start_ts: f64,
+        end_ts: f64,
+        max_records: Option<i64>,
+        uniform_sampling: bool,
+    ) -> Result<Vec<ScreenshotRecord>, String> {
         let diag_start = std::time::Instant::now();
+
+        // Calculate sampling bucket before acquiring connection guard
+        let bucket_seconds = match (uniform_sampling, max_records) {
+            (true, Some(limit)) if limit > 0 => {
+                let total = self.count_screenshots_by_time_range(start_ts, end_ts)?;
+                if total > limit {
+                    let span = (end_ts - start_ts).max(1.0);
+                    Some(Self::snap_bucket_seconds(span / limit as f64))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
 
         // Phase 1: Hold mutex only for SQL query, extract raw data without decryption
         let raw_rows = {
@@ -1310,23 +1377,38 @@ impl StorageState {
                 None => String::new(),
             };
 
-            let sql = format!(
-                "SELECT s.id, s.image_path, s.image_hash, s.width, s.height,
-                        s.window_title, s.process_name, s.metadata,
-                        s.window_title_enc, s.process_name_enc, s.metadata_enc,
-                        s.content_key_encrypted,
-                        strftime('%s', s.created_at) as timestamp, s.created_at,
-                        s.source, s.page_url_enc, s.page_icon_enc, s.visible_links_enc,
-                        pi.icon_enc, pi.icon_key_encrypted,
-                        ls.links_enc, ls.links_key_encrypted,
-                        s.category, s.category_confidence
+            let sql = match bucket_seconds {
+                // One row per bucket: the earliest id in each slice of time.
+                Some(bucket) => format!(
+                    "SELECT {columns}
+                 FROM screenshots s
+                 JOIN (SELECT MIN(id) AS picked_id
+                         FROM screenshots
+                        WHERE is_deleted = 0 AND created_at BETWEEN '{start}' AND '{end}'
+                        GROUP BY CAST(strftime('%s', created_at) AS INTEGER) / {bucket}
+                      ) picks ON picks.picked_id = s.id
+                 LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
+                 LEFT JOIN link_sets ls ON s.link_set_id = ls.id
+                 ORDER BY s.created_at ASC{limit}",
+                    columns = Self::TIME_RANGE_COLUMNS,
+                    start = start_dt,
+                    end = end_dt,
+                    bucket = bucket,
+                    limit = limit_clause
+                ),
+                None => format!(
+                    "SELECT {columns}
                  FROM screenshots s
                  LEFT JOIN page_icons pi ON s.page_icon_id = pi.id
                  LEFT JOIN link_sets ls ON s.link_set_id = ls.id
-                 WHERE s.is_deleted = 0 AND s.created_at BETWEEN '{}' AND '{}'
-                 ORDER BY s.created_at ASC{}",
-                start_dt, end_dt, limit_clause
-            );
+                 WHERE s.is_deleted = 0 AND s.created_at BETWEEN '{start}' AND '{end}'
+                 ORDER BY s.created_at ASC{limit}",
+                    columns = Self::TIME_RANGE_COLUMNS,
+                    start = start_dt,
+                    end = end_dt,
+                    limit = limit_clause
+                ),
+            };
 
             let mut stmt = conn
                 .prepare(&sql)
@@ -1521,11 +1603,14 @@ impl StorageState {
 
     /// Get screenshot density (counts per time bucket) within a time range.
     /// No decryption or joins - extremely fast index-only scan.
+    ///
+    /// `bucket_offset_seconds` shifts bucket boundaries to align with caller's timezone offset.
     pub fn get_screenshot_density(
         &self,
         start_ts: f64,
         end_ts: f64,
         bucket_seconds: i64,
+        bucket_offset_seconds: i64,
     ) -> Result<Vec<DensityBucket>, String> {
         let guard = self.get_connection_named("get_screenshot_density")?;
         let conn = guard.as_ref().unwrap();
@@ -1537,14 +1622,18 @@ impl StorageState {
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
 
+        // Normalize offset within bucket duration
+        let offset = bucket_offset_seconds.rem_euclid(bucket_seconds.max(1));
+
         let sql = format!(
-            "SELECT (CAST(strftime('%s', created_at) AS INTEGER) / {bs}) * {bs} AS bucket, \
+            "SELECT ((CAST(strftime('%s', created_at) AS INTEGER) + {off}) / {bs}) * {bs} - {off} AS bucket, \
                     COUNT(*) AS cnt \
              FROM screenshots \
              WHERE is_deleted = 0 AND created_at BETWEEN '{start}' AND '{end}' \
              GROUP BY bucket \
              ORDER BY bucket",
             bs = bucket_seconds,
+            off = offset,
             start = start_dt,
             end = end_dt
         );
