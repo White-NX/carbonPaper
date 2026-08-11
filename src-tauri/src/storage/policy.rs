@@ -83,7 +83,10 @@ fn strip_windows_verbatim(path: std::path::PathBuf) -> std::path::PathBuf {
     path
 }
 
-pub(super) fn disk_totals_for_path(path: &Path) -> Option<(u64, u64)> {
+/// Resolve the disk hosting `path` and return its `(total_bytes,
+/// available_bytes)`. Returns `None` when no mount point matches, which
+/// callers must treat as "unknown" rather than "zero free space".
+pub(crate) fn disk_totals_for_path(path: &Path) -> Option<(u64, u64)> {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let canonical = strip_windows_verbatim(canonical);
     let disks = Disks::new_with_refreshed_list();

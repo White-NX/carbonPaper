@@ -2,6 +2,7 @@
 
 use crate::monitor::MonitorState;
 use crate::resource_utils::file_in_local_appdata;
+use crate::storage::disk_totals_for_path;
 use crate::storage::StorageState;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -24,6 +25,11 @@ pub struct MemoryPoint {
 }
 
 /// Database and disk storage statistics (images, models, database sizes).
+///
+/// `disk_total_bytes` / `disk_available_bytes` describe the volume hosting the
+/// data directory, not CarbonPaper's own footprint. They are `None` when the
+/// hosting disk cannot be resolved, which the UI renders as "unknown" — a zero
+/// would otherwise be drawn as a full or empty disk.
 #[derive(Debug, Clone, Serialize)]
 pub struct StorageStats {
     pub root_path: String,
@@ -32,6 +38,8 @@ pub struct StorageStats {
     pub images_bytes: u64,
     pub database_bytes: u64,
     pub other_bytes: u64,
+    pub disk_total_bytes: Option<u64>,
+    pub disk_available_bytes: Option<u64>,
     pub cached_at_ms: u64,
 }
 
@@ -146,8 +154,29 @@ fn compute_storage_stats(data_dir: PathBuf) -> Result<StorageStats, String> {
         images_bytes,
         database_bytes,
         other_bytes,
+        // Filled in by `attach_disk_totals` on every request so the figure
+        // never ages with the directory-scan cache.
+        disk_total_bytes: None,
+        disk_available_bytes: None,
         cached_at_ms: now_ms(),
     })
+}
+
+/// Overwrite the disk fields of `stats` with a fresh reading for the volume
+/// hosting `data_dir`.
+///
+/// Directory sizes are cached for `STORAGE_CACHE_TTL` because scanning them
+/// walks the whole tree, but querying the volume is cheap and its result goes
+/// stale as soon as anything else on the machine writes a file. So this runs on
+/// every request, including cache hits. A failed lookup degrades to `None`
+/// rather than failing the whole overview, since the figure is informational.
+async fn attach_disk_totals(stats: &mut StorageStats, data_dir: PathBuf) {
+    let totals = tokio::task::spawn_blocking(move || disk_totals_for_path(&data_dir))
+        .await
+        .unwrap_or(None);
+
+    stats.disk_total_bytes = totals.map(|(total, _)| total);
+    stats.disk_available_bytes = totals.map(|(_, available)| available);
 }
 
 fn get_cached_storage_stats(state: &AnalysisState) -> Option<StorageStats> {
@@ -239,16 +268,6 @@ pub async fn get_analysis_overview(
         history.iter().cloned().collect::<Vec<_>>()
     };
 
-    // If not forcing, try to return cached stats quickly.
-    if !force_storage {
-        if let Some(stats) = get_cached_storage_stats(&state) {
-            return Ok(AnalysisOverview {
-                memory,
-                storage: stats,
-            });
-        }
-    }
-
     // 从 StorageState 获取实际的 data_dir
     let data_dir = storage_state
         .data_dir
@@ -256,10 +275,24 @@ pub async fn get_analysis_overview(
         .unwrap_or_else(|e| e.into_inner())
         .clone();
 
+    // If not forcing, try to return cached stats quickly.
+    if !force_storage {
+        if let Some(mut stats) = get_cached_storage_stats(&state) {
+            attach_disk_totals(&mut stats, data_dir).await;
+            return Ok(AnalysisOverview {
+                memory,
+                storage: stats,
+            });
+        }
+    }
+
     // Perform expensive storage computation on a blocking thread.
-    let stats = tokio::task::spawn_blocking(move || compute_storage_stats(data_dir))
-        .await
-        .map_err(|e| format!("Storage task join error: {}", e))??;
+    let mut stats = tokio::task::spawn_blocking({
+        let data_dir = data_dir.clone();
+        move || compute_storage_stats(data_dir)
+    })
+    .await
+    .map_err(|e| format!("Storage task join error: {}", e))??;
 
     // Update cache under lock.
     {
@@ -272,6 +305,8 @@ pub async fn get_analysis_overview(
             stats: stats.clone(),
         });
     }
+
+    attach_disk_totals(&mut stats, data_dir).await;
 
     Ok(AnalysisOverview {
         memory,

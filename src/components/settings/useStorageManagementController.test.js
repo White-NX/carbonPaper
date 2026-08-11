@@ -147,4 +147,56 @@ describe('useStorageManagementController', () => {
       policy: { storage_limit: 'unlimited', retention_period: '6months' },
     });
   });
+
+  describe('diskInfo', () => {
+    const GIB = 1024 * 1024 * 1024;
+
+    const renderWithStorage = (storage) => renderHook(() => useStorageManagementController({
+      storage,
+      onRefresh: vi.fn(),
+      t,
+      monitorStatus: 'stopped',
+    }));
+
+    it('derives disk figures from the overview payload instead of a fixed placeholder', () => {
+      const { result } = renderWithStorage({
+        root_path: 'D:/CarbonPaper',
+        disk_total_bytes: 931 * GIB,
+        disk_available_bytes: 412 * GIB,
+      });
+
+      expect(result.current.diskInfo.totalSize).toBe(931 * GIB);
+      expect(result.current.diskInfo.usedSize).toBe(519 * GIB);
+      expect(result.current.diskInfo.driveLetter).toBe('D');
+    });
+
+    it('reports unknown rather than zero when the hosting volume cannot be resolved', () => {
+      const { result } = renderWithStorage({
+        root_path: 'C:/CarbonPaper',
+        disk_total_bytes: null,
+        disk_available_bytes: null,
+      });
+
+      expect(result.current.diskInfo.totalSize).toBeNull();
+      expect(result.current.diskInfo.usedSize).toBeNull();
+    });
+
+    it('shows no capacity before the first overview payload arrives', () => {
+      const { result } = renderWithStorage(null);
+
+      expect(result.current.diskInfo.totalSize).toBeNull();
+      expect(result.current.diskInfo.usedSize).toBeNull();
+      expect(result.current.diskInfo.driveLetter).toBe('C');
+    });
+
+    it('clamps used space to zero when available exceeds total', () => {
+      const { result } = renderWithStorage({
+        root_path: 'C:/CarbonPaper',
+        disk_total_bytes: 100 * GIB,
+        disk_available_bytes: 120 * GIB,
+      });
+
+      expect(result.current.diskInfo.usedSize).toBe(0);
+    });
+  });
 });
