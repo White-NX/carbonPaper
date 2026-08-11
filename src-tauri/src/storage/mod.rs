@@ -27,6 +27,7 @@ pub use derived_index::*;
 pub use derived_migration::*;
 #[allow(unused_imports)]
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
+pub(crate) use policy::disk_totals_for_path;
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
 pub use types::*;
