@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { deleteTask, getTaskScreenshots, removeTaskScreenshot, updateTaskLabel } from '../lib/task_api';
 import { fetchThumbnailBatch } from '../lib/monitor_api';
 import { getHostname } from '../lib/activity_context';
+import { parseCreatedAt } from '../lib/search_grouping';
 import { ConfirmDialog } from './ConfirmDialog';
 
 const PAGE_SIZE = 24;
@@ -25,11 +26,8 @@ function formatTimestamp(ts, fallback) {
     const d = new Date(ts * 1000);
     if (!Number.isNaN(d.getTime())) return d.toLocaleString();
   }
-  if (fallback) {
-    const d = new Date(fallback);
-    if (!Number.isNaN(d.getTime())) return d.toLocaleString();
-  }
-  return '';
+  const parsed = parseCreatedAt(fallback);
+  return parsed ? parsed.toLocaleString() : '';
 }
 
 function ActivitySnapshotCard({ item, thumbnailSrc, onSelect, onOpenFloatingPreview, onRemove, removing }) {

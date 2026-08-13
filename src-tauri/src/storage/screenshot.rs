@@ -9,12 +9,12 @@ use roaring::RoaringBitmap;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::atomic::Ordering;
 
-use super::types::RawScreenshotRow;
+use super::types::{RawRecentCaptureRow, RawScreenshotRow};
 use super::{
-    BackgroundReadError, BackgroundScreenshotSummary, DeleteQueueStatus, DensityBucket,
-    IndexStorageStats, OcrResultInput, QueueScreenshotCandidate, SaveScreenshotRequest,
-    SaveScreenshotResponse, ScreenshotRecord, SoftDeleteResult, SoftDeleteScreenshotsResult,
-    StorageState,
+    wire_time, BackgroundReadError, BackgroundScreenshotSummary, DeleteQueueStatus, DensityBucket,
+    IndexStorageStats, OcrResultInput, QueueScreenshotCandidate, RecentCapture,
+    SaveScreenshotRequest, SaveScreenshotResponse, ScreenshotRecord, SoftDeleteResult,
+    SoftDeleteScreenshotsResult, StorageState,
 };
 
 const MAX_OCR_POSTPROCESS_ATTEMPTS: i64 = 5;
@@ -1101,6 +1101,14 @@ impl StorageState {
     }
 
     /// Get distinct categories from the screenshots table (does not require Python).
+    ///
+    /// Depends on `idx_screenshots_deleted_category` to stay cheap. Without an
+    /// index carrying `category` the planner walks
+    /// `idx_screenshots_deleted_created_at` and fetches every matching row out
+    /// of a multi-gigabyte table just to read one short column, then sorts
+    /// through a temp B-tree — 2.8 s against a 54k-screenshot corpus, all of it
+    /// under the DB mutex, to return eleven strings. With the index the whole
+    /// statement is one covering scan.
     pub fn get_categories_from_db(&self) -> Result<Vec<String>, String> {
         let guard = self.get_connection_named("get_categories_from_db")?;
         let conn = guard.as_ref().unwrap();
@@ -1309,6 +1317,79 @@ impl StorageState {
         max_records: Option<i64>,
     ) -> Result<Vec<ScreenshotRecord>, String> {
         self.query_time_range(start_ts, end_ts, max_records, false)
+    }
+
+    /// Lists the most recent captures, newest first.
+    ///
+    /// The search landing area used to reach this data through the empty-query
+    /// branch of `search.rs::search_text`, which was the wrong shape twice over.
+    /// That branch joins `ocr_results`, so its unit is a text block rather than
+    /// a screenshot: one capture carrying twelve OCR boxes filled a twelve-tile
+    /// grid with twelve copies of itself. And its `ORDER BY s.created_at,
+    /// r.id` spans both tables, which no index can satisfy, so SQLite sorted
+    /// every non-deleted OCR row through a temp B-tree before `LIMIT` applied —
+    /// 5.3 s against a 2.5M-row corpus, holding a SHARED lock the whole time.
+    /// This database runs `journal_mode = delete` (see
+    /// `semantic_cache.rs::SCAN_PAGE_ROWS`), where a writer cannot commit until
+    /// every SHARED lock clears, so that scan stalled capture commits until they
+    /// failed with `database is locked`.
+    ///
+    /// Reading `screenshots` alone lets `idx_screenshots_deleted_created_at`
+    /// supply the ordering, so `LIMIT` actually stops the scan.
+    ///
+    /// Aborted captures are excluded because their thumbnail file is deleted
+    /// when they are marked (see [`Self::abort_screenshot`]), so they would
+    /// render as empty tiles. The old join hid them by accident: an aborted
+    /// capture has no OCR rows to join against.
+    pub fn list_recent_screenshots(&self, limit: i64) -> Result<Vec<RecentCapture>, String> {
+        let limit = limit.clamp(1, 500);
+
+        // Phase 1: hold the mutex only for the row read. CNG decryption below
+        // must not run under the lock.
+        let raw_rows = {
+            let guard = self.get_connection_named("list_recent_screenshots")?;
+            let conn = guard.as_ref().unwrap();
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, image_path, window_title, process_name,
+                            window_title_enc, process_name_enc, content_key_encrypted,
+                            category, created_at
+                       FROM screenshots
+                      WHERE is_deleted = 0
+                        AND (status IS NULL OR status != 'aborted')
+                      ORDER BY created_at DESC, id DESC
+                      LIMIT ?",
+                )
+                .map_err(|e| format!("Failed to prepare recent captures query: {}", e))?;
+
+            let rows: Vec<RawRecentCaptureRow> = stmt
+                .query_map(params![limit], |row| {
+                    Ok(RawRecentCaptureRow {
+                        id: row.get(0)?,
+                        image_path: row.get(1)?,
+                        window_title_plain: row.get(2)?,
+                        process_name_plain: row.get(3)?,
+                        window_title_enc: row.get(4)?,
+                        process_name_enc: row.get(5)?,
+                        content_key_enc: row.get(6)?,
+                        category: row.get(7)?,
+                        created_at: row.get(8)?,
+                    })
+                })
+                .map_err(|e| format!("Failed to execute recent captures query: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            rows
+            // guard is dropped here, mutex released
+        };
+
+        // Phase 2: decrypt outside the mutex.
+        Ok(raw_rows
+            .into_iter()
+            .map(RawRecentCaptureRow::into_capture)
+            .collect())
     }
 
     /// Returns rows spread evenly across the range by picking one row per time bucket.
@@ -2159,7 +2240,7 @@ impl StorageState {
                         vec![row.get::<_, f64>(9)?, row.get::<_, f64>(10)?],
                         vec![row.get::<_, f64>(11)?, row.get::<_, f64>(12)?],
                     ],
-                    created_at: row.get(13)?,
+                    created_at: wire_time::from_sqlite_utc(&row.get::<_, String>(13)?),
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -2239,7 +2320,7 @@ impl StorageState {
                     text,
                     confidence: row.confidence,
                     box_coords: row.box_coords,
-                    created_at: row.created_at,
+                    created_at: wire_time::from_sqlite_utc(&row.created_at),
                 })
             })
             .collect()

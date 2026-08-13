@@ -1268,6 +1268,7 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
                 "category": r.category,
                 "created_at": r.created_at,
                 "screenshot_created_at": r.screenshot_created_at,
+                "timestamp": r.timestamp,
             })
         })
         .collect();

@@ -1174,6 +1174,7 @@ pub fn run() {
             commands::storage::storage_get_timeline,
             commands::storage::storage_get_timeline_density,
             commands::storage::storage_search,
+            commands::storage::storage_list_recent_screenshots,
             commands::storage::storage_get_image,
             commands::storage::storage_get_thumbnail,
             commands::storage::storage_batch_get_thumbnails,

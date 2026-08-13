@@ -135,12 +135,10 @@ fn clip_target_size() -> Option<(u32, u32)> {
         let relative = descriptor.preprocessor_file?;
         let appdata = crate::resource_utils::file_in_local_appdata()?;
         // The same two roots, in the same order, that model resolution searches.
-        ["models-onnx", "models"]
-            .into_iter()
-            .find_map(|root| {
-                let bytes = std::fs::read(appdata.join(root).join(relative)).ok()?;
-                crate::clip_preprocess::target_size_from_config(&bytes)
-            })
+        ["models-onnx", "models"].into_iter().find_map(|root| {
+            let bytes = std::fs::read(appdata.join(root).join(relative)).ok()?;
+            crate::clip_preprocess::target_size_from_config(&bytes)
+        })
     })
 }
 

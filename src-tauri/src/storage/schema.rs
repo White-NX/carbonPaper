@@ -1108,6 +1108,7 @@ impl StorageState {
             CREATE INDEX IF NOT EXISTS idx_screenshots_deleted_created_at ON screenshots(is_deleted, created_at);
             CREATE INDEX IF NOT EXISTS idx_screenshots_process_deleted_created_at ON screenshots(process_name, is_deleted, created_at);
             CREATE INDEX IF NOT EXISTS idx_ocr_deleted_screenshot ON ocr_results(is_deleted, screenshot_id);
+            CREATE INDEX IF NOT EXISTS idx_screenshots_deleted_category ON screenshots(is_deleted, category);
             "#,
         )
         .map_err(|e| format!("Failed to create soft-delete indexes: {}", e))?;

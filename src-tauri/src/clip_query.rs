@@ -524,15 +524,16 @@ fn created_seconds(timestamp: Option<i64>) -> Option<f64> {
         .map(|seconds| seconds as f64)
 }
 
+/// Render a hit's capture time the way every other backend path renders one:
+/// RFC 3339 in UTC, per `storage/wire_time.rs`.
+///
+/// This used to convert to the machine's local time and drop the zone marker,
+/// which happened to display correctly only because JavaScript reads an
+/// offset-less date-time as local. The OCR path forwarded UTC through the same
+/// field name, so the two search modes disagreed about what the string meant
+/// and no reader could tell them apart — issue #166.
 fn format_created_at(seconds: f64) -> String {
-    chrono::DateTime::from_timestamp(seconds as i64, 0)
-        .map(|value| {
-            value
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        })
-        .unwrap_or_default()
+    crate::storage::wire_time::from_unix_seconds(seconds as i64)
 }
 
 /// Process and time filtering, in Python's order and with Python's tolerance

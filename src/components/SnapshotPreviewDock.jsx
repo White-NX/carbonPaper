@@ -8,6 +8,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { InspectorImage } from './InspectorImage';
 import { CategoryBadge } from './ThumbnailCard';
 import { extractUrlsFromOcr } from '../lib/ocr_url_detector';
+import { parseCreatedAt } from '../lib/search_grouping';
 import { fetchImage, getScreenshotDetails } from '../lib/monitor_api';
 
 const IMAGE_CACHE_LIMIT = 3;
@@ -54,16 +55,13 @@ function getTargetPath(item) {
 function formatTimestamp(value) {
   if (!value) return '—';
   if (typeof value === 'number') {
+    // 这里的数字既可能是毫秒也可能是秒，取决于调用方；parseCreatedAt 只认秒。
     const ms = value > 1e12 ? value : value * 1000;
     const parsed = new Date(ms);
     return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString();
   }
-  const candidate = typeof value === 'string' && !value.includes('T')
-    ? value.replace(' ', 'T')
-    : value;
-  const parsed = new Date(candidate);
-  if (!Number.isNaN(parsed.getTime())) return parsed.toLocaleString();
-  return String(value);
+  const parsed = parseCreatedAt(value);
+  return parsed ? parsed.toLocaleString() : String(value);
 }
 
 function makeOcrBoxes(ocrResults) {
@@ -471,7 +469,13 @@ export default function SnapshotPreviewDock({
   const windowTitle = rawWindowTitle || '—';
   const displayTitle = rawWindowTitle || processName;
   const category = record.category || activeTab.category || activeTab.metadata?.category || null;
-  const timestamp = record.created_at || activeTab.created_at || activeTab.metadata?.created_at || activeTab.screenshot_created_at;
+  // record 是按 id 拉回来的截图本身，最可靠；退回到标签页自带的字段时，同样先看
+  // screenshot_created_at，因为搜索结果的 created_at 记的是 OCR 完成时间。
+  const timestamp = record.created_at
+    || activeTab.screenshot_created_at
+    || activeTab.metadata?.screenshot_created_at
+    || activeTab.created_at
+    || activeTab.metadata?.created_at;
   const screenshotId = getTargetId(activeTab);
   const score = activeTab.rerank_score;
   const assignedAt = activeTab.assigned_at;

@@ -372,6 +372,28 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
     });
 };
 
+/**
+ * 着陆区的最近截图。
+ *
+ * 与 searchScreenshots('') 分开是有原因的：空查询会落进搜索的回退路径，
+ * 那条路径连接 ocr_results，数的是文本块而不是截图，而且排序键跨两张表用不上
+ * 索引。详见 storage/screenshot.rs::list_recent_screenshots。
+ *
+ * @param {number} [limit] 取多少条，交给调用方折叠采样后再展示
+ * @returns {Promise<object[]>} 按时间倒序的截图列表，失败时返回空数组
+ */
+export const listRecentScreenshots = async (limit = 60) => {
+    try {
+        return await withAuth(async () => {
+            const records = await invoke('storage_list_recent_screenshots', { limit });
+            return records || [];
+        });
+    } catch (e) {
+        console.error('Failed to list recent screenshots', e);
+        return [];
+    }
+};
+
 export const listProcesses = async () => {
     try {
         return await withAuth(async () => {

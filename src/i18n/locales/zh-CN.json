@@ -985,25 +985,25 @@
   },
   "search": {
     "searchError": "搜索出错：{{message}}",
-    "switchToNL": "切换到自然语言搜索",
-    "switchToOCR": "切换到 OCR 搜索",
+    "switchToNL": "切换到画面搜索",
+    "switchToOCR": "切换到文字搜索",
     "selectMode": "选择搜索模式",
     "nl": {
       "disabled_hint": "需要 Python 服务运行中"
     },
     "mode": {
       "ocr": {
-        "title": "OCR 关键词搜索模式",
-        "description": "通过识别屏幕截图中的文字进行精确匹配搜索"
+        "title": "文字搜索",
+        "description": "在识别出的截图文字里查找关键词"
       },
       "nl": {
-        "title": "自然语言搜索模式",
-        "description": "描述图片画面内容、场景或物体进行语义模糊搜索"
+        "title": "画面搜索",
+        "description": "用一句描述匹配截图的画面内容、场景或物体"
       }
     },
     "placeholder": {
-      "ocr": "在截图中搜索文本...",
-      "nl": "描述图片内容..."
+      "ocr": "搜索截图里出现过的文字",
+      "nl": "描述你想找的画面"
     },
     "loading": "加载中...",
     "noContents": "无内容",
@@ -1239,22 +1239,31 @@
     }
   },
   "advancedSearch": {
-    "title": "ADVANCED",
+    "title": "高级搜索",
     "search": {
       "error": "搜索出错：{{message}}",
-      "placeholder_ocr": "在截图中搜索文本...",
-      "placeholder_nl": "描述图片内容...",
+      "placeholder_ocr": "搜索截图里出现过的文字",
+      "placeholder_nl": "描述你想找的画面，比如「深色的代码编辑器」",
       "go": "搜索",
       "searching": "搜索中...",
       "enter_keyword": "输入关键词或选择筛选器开始。",
       "press_enter": "在顶部搜索框按回车可快速跳转到此处。",
       "did_you_know": "你知道吗：{{msg}}",
       "no_results": "未找到匹配结果",
-      "adjust": "调整筛选或尝试其他关键词。"
+      "adjust": "调整筛选或尝试其他关键词。",
+      "no_results_for": "没有找到包含「{{query}}」的截图",
+      "no_results_filtered": "当前筛选条件下没有任何截图。",
+      "no_results_hint": "尝试使用其他关键词或清除筛选条件。",
+      "try_visual": "改用画面搜索",
+      "clear_filters": "清除筛选条件"
     },
     "modes": {
-      "ocr": "OCR 模式",
-      "nl": "自然语言"
+      "ocr": "文字",
+      "nl": "画面",
+      "ocr_full": "文字搜索",
+      "nl_full": "画面搜索",
+      "ocr_hint": "在识别出的文字里找关键词",
+      "nl_hint": "用一句描述匹配画面内容"
     },
     "processes": {
       "all": "所有进程",
@@ -1274,13 +1283,43 @@
     "filters": {
       "reset": "重置"
     },
+    "range": {
+      "label": "时间范围",
+      "any": "不限时间",
+      "today": "当日",
+      "week": "近 7 天",
+      "month": "近 30 天",
+      "custom": "自定义",
+      "custom_active": "自定义范围",
+      "start": "开始",
+      "end": "结束"
+    },
+    "stats": {
+      "loaded": "已加载 {{count}} 条结果",
+      "elapsed": "用时 {{ms}} 毫秒",
+      "has_more": "向下滚动还有更多",
+      "sort_time": "按时间倒序",
+      "sort_similarity": "按相似度"
+    },
+    "group": {
+      "expand": "同一窗口另有 {{count}} 条",
+      "collapse": "收起"
+    },
+    "landing": {
+      "recent_queries": "最近搜索",
+      "recent_queries_hint": "点一下直接重新搜",
+      "clear_recent": "清除记录",
+      "top_apps": "常用来源",
+      "top_apps_hint": "点一下作为筛选条件",
+      "latest": "最近捕获的截图",
+      "latest_hint": "共 {{count}} 张"
+    },
     "nl_notice": "使用自然语言图像搜索得到的结果可能并不准确。",
     "no_image": "无图像",
     "unknown": "未知",
     "no_ocr_text": "无 OCR 文本",
     "similarity": "相似度：{{score}}",
     "loading_more": "加载更多结果...",
-    "scroll_load": "滚动以加载更多…",
     "no_more": "没有更多结果",
     "rotating": [
       "此程序目前只是一个玩具！",

@@ -20,6 +20,7 @@ mod semantic_cache;
 pub mod smart_cluster;
 pub mod task;
 mod types;
+pub(crate) mod wire_time;
 
 #[allow(unused_imports)]
 pub use derived_index::*;
