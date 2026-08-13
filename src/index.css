@@ -36,6 +36,7 @@
   --ide-info-success: #047857;
   --ide-timeline-bg: #f0f2f5;
   --ide-accent-rgb: 37 99 235;
+  --tl-search: #d97706;
 
   /* Timeline app colors */
   --tl-app-1: #3a5fb0;
@@ -69,6 +70,7 @@
   --ide-info-success: #34d399;
   --ide-timeline-bg: #141414;
   --ide-accent-rgb: 0 122 204;
+  --tl-search: #f59e0b;
 
   /* Timeline app colors (dark theme) */
   --tl-app-1: #5b7fd4;

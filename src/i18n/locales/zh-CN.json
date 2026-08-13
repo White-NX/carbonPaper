@@ -1561,6 +1561,7 @@
     "zoomWeek": "缩放到1周",
     "zoomToday": "缩放到当日",
     "jumpToNow": "跳转到现在",
+    "fitSearchResults": "缩放到已加载的搜索结果",
     "duration": {
       "seconds": "{{seconds}}秒",
       "minutes": "{{minutes}}分",

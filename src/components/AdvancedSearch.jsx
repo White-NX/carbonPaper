@@ -9,6 +9,7 @@ import { SearchResultRow } from './search/SearchResultRow';
 import { SearchLanding, SearchNoResults } from './search/SearchLanding';
 import { useAdvancedSearchController } from '../hooks/useAdvancedSearchController';
 import { useHmacMigrationStatus } from '../hooks/useHmacMigrationStatus';
+import { buildSearchTimelineMarkers, searchResultMarkerId } from '../lib/timeline_search';
 
 export function AdvancedSearch({
   active,
@@ -18,6 +19,7 @@ export function AdvancedSearch({
   searchMode,
   onSearchModeChange,
   backendOnline,
+  onTimelineSearchChange,
 }) {
   const { t } = useTranslation();
   const {
@@ -56,6 +58,7 @@ export function AdvancedSearch({
     handleSubmit,
     clearFilters,
     searchSourceDetail,
+    resultSetKey,
   } = useAdvancedSearchController({
     active,
     searchParams,
@@ -65,9 +68,39 @@ export function AdvancedSearch({
     t,
   });
   const isMigrating = useHmacMigrationStatus();
+  const [hoveredMarkerIds, setHoveredMarkerIds] = React.useState([]);
 
   const hasResults = results.length > 0;
   const showStats = hasResults && !loading;
+  const timelineMarkers = React.useMemo(
+    () => (mode === 'ocr' && query.trim() ? buildSearchTimelineMarkers(results) : []),
+    [mode, query, results],
+  );
+
+  React.useEffect(() => {
+    setHoveredMarkerIds([]);
+  }, [resultSetKey, mode]);
+
+  React.useEffect(() => {
+    const shouldShow = active
+      && mode === 'ocr'
+      && Boolean(query.trim())
+      && !loading
+      && !error
+      && timelineMarkers.length > 0;
+
+    onTimelineSearchChange?.(shouldShow ? {
+      markers: timelineMarkers,
+      hoveredIds: hoveredMarkerIds,
+      fitKey: `ocr:${resultSetKey}`,
+    } : null);
+  }, [active, mode, query, loading, error, timelineMarkers, hoveredMarkerIds, resultSetKey, onTimelineSearchChange]);
+
+  React.useEffect(() => () => onTimelineSearchChange?.(null), [onTimelineSearchChange]);
+
+  const handleHoverResults = React.useCallback((items) => {
+    setHoveredMarkerIds(items ? [...new Set(items.map((item, index) => searchResultMarkerId(item, index)))] : []);
+  }, []);
 
   /** 把结果条目交给主预览区或独立预览窗，两处都要带上来源信息。 */
   const openFloatingPreview = onOpenSnapshotPreview
@@ -148,6 +181,7 @@ export function AdvancedSearch({
             thumbnailCache={thumbnailCache}
             onSelect={(payload) => onSelectResult?.(payload)}
             onOpenFloatingPreview={openFloatingPreview}
+            onHoverResults={handleHoverResults}
           />
         ))}
       </div>

@@ -132,6 +132,7 @@ export default function MainArea({
   onCopyText,
   backendOnline,
   isAuthenticated,
+  onTimelineSearchChange,
 }) {
   const { t } = useTranslation();
   const [showOcrPanel, setShowOcrPanel] = useState(false);
@@ -397,6 +398,7 @@ export default function MainArea({
             searchMode={searchMode}
             onSearchModeChange={onSearchModeChange}
             backendOnline={backendOnline}
+            onTimelineSearchChange={onTimelineSearchChange}
           />
         </div>
 

@@ -49,6 +49,7 @@ const makeOcrResult = (id) => ({
   process_name: 'code.exe',
   text: `text-${id}`,
   window_title: `window-${id}`,
+  timestamp: 1_754_900_000 - id,
 });
 
 describe('AdvancedSearch', () => {
@@ -257,6 +258,65 @@ describe('AdvancedSearch', () => {
     });
 
     expect(screen.getByText('text-41')).toBeInTheDocument();
+  });
+
+  it('publishes loaded OCR markers and highlights a hovered result', async () => {
+    searchScreenshots.mockResolvedValueOnce([makeOcrResult(11), makeOcrResult(12)]);
+    const onTimelineSearchChange = vi.fn();
+
+    render(
+      <AdvancedSearch
+        active
+        searchParams={{ query: 'page', mode: 'ocr' }}
+        onSelectResult={vi.fn()}
+        onTimelineSearchChange={onTimelineSearchChange}
+        backendOnline
+      />
+    );
+
+    await waitFor(() => {
+      expect(onTimelineSearchChange).toHaveBeenCalledWith(expect.objectContaining({
+        markers: expect.arrayContaining([
+          expect.objectContaining({ id: 'screenshot:11' }),
+          expect.objectContaining({ id: 'screenshot:12' }),
+        ]),
+        hoveredIds: [],
+      }));
+    });
+
+    fireEvent.mouseEnter(screen.getByText('text-11').closest('.group'));
+
+    await waitFor(() => {
+      expect(onTimelineSearchChange).toHaveBeenLastCalledWith(expect.objectContaining({
+        hoveredIds: ['screenshot:11'],
+      }));
+    });
+
+    fireEvent.mouseLeave(screen.getByText('text-11').closest('.group'));
+    await waitFor(() => {
+      expect(onTimelineSearchChange).toHaveBeenLastCalledWith(expect.objectContaining({
+        hoveredIds: [],
+      }));
+    });
+  });
+
+  it('does not publish markers for visual search', async () => {
+    searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(21), similarity: 0.8 }]);
+    const onTimelineSearchChange = vi.fn();
+
+    render(
+      <AdvancedSearch
+        active
+        searchParams={{ query: 'page', mode: 'nl' }}
+        searchMode="nl"
+        onSelectResult={vi.fn()}
+        onTimelineSearchChange={onTimelineSearchChange}
+        backendOnline
+      />
+    );
+
+    await waitFor(() => expect(searchScreenshots).toHaveBeenCalled());
+    await waitFor(() => expect(onTimelineSearchChange).toHaveBeenLastCalledWith(null));
   });
 
   it('displays search error banner when search fails', async () => {

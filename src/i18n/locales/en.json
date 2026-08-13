@@ -1562,6 +1562,7 @@
     "zoomWeek": "Zoom to 1 week",
     "zoomToday": "Zoom to today",
     "jumpToNow": "Jump to Now",
+    "fitSearchResults": "Fit loaded search results",
     "duration": {
       "seconds": "{{seconds}}s",
       "minutes": "{{minutes}}m",

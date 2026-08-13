@@ -102,8 +102,17 @@ export function HitThumbnail({ item, preloadedSrc, className = 'h-[75px] w-[120p
  * @param {Record<number, string>} props.thumbnailCache 批量预取的缩略图
  * @param {(item: object) => void} props.onSelect 在主预览区打开
  * @param {(item: object) => void} [props.onOpenFloatingPreview] 在独立窗口打开
+ * @param {(items: object[] | null) => void} [props.onHoverResults] 高亮时间线命中
  */
-export function SearchResultRow({ group, mode, queryTokens, thumbnailCache, onSelect, onOpenFloatingPreview }) {
+export function SearchResultRow({
+  group,
+  mode,
+  queryTokens,
+  thumbnailCache,
+  onSelect,
+  onOpenFloatingPreview,
+  onHoverResults,
+}) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const { primary, duplicates } = group;
@@ -142,7 +151,11 @@ export function SearchResultRow({ group, mode, queryTokens, thumbnailCache, onSe
   const thumbnailFor = (item) => thumbnailCache[item.screenshot_id ?? item.metadata?.screenshot_id] || null;
 
   return (
-    <div className="group rounded-lg px-2.5 py-2.5 transition-colors hover:bg-ide-hover">
+    <div
+      className="group rounded-lg px-2.5 py-2.5 transition-colors hover:bg-ide-hover"
+      onMouseEnter={() => onHoverResults?.([primary, ...duplicates])}
+      onMouseLeave={() => onHoverResults?.(null)}
+    >
       <div className="flex gap-3.5">
         <div className="relative shrink-0">
           <button
@@ -235,6 +248,8 @@ export function SearchResultRow({ group, mode, queryTokens, thumbnailCache, onSe
                     <button
                       type="button"
                       onClick={() => handleSelect(item)}
+                      onMouseEnter={() => onHoverResults?.([item])}
+                      onMouseLeave={() => onHoverResults?.([primary, ...duplicates])}
                       className="flex w-full items-baseline gap-2.5 rounded px-2 py-1 text-left text-xs text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ide-accent/70"
                     >
                       <time className="shrink-0 font-mono text-[11px] tabular-nums" title={itemTime.full}>

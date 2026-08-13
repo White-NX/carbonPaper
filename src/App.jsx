@@ -54,6 +54,7 @@ function App() {
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
   const [searchMode, setSearchMode] = useState('ocr');
   const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
+  const [timelineSearch, setTimelineSearch] = useState(null);
 
   const openOcrModelRepair = useCallback(() => {
     setShowSettings(false);
@@ -327,6 +328,8 @@ function App() {
           highlightedEventId={highlightedEventId}
           refreshKey={timelineRefreshKey}
           sqlPaused={!windowFocused}
+          searchState={activeTab === 'advanced-search' ? timelineSearch : null}
+          onSelectSearchResult={selectSearchResult}
         />
 
         <main className="flex-1 flex flex-col md:flex-row overflow-hidden relative bg-ide-bg">
@@ -351,6 +354,7 @@ function App() {
             onSearchModeChange={setSearchMode}
             backendOnline={backendStatus === 'online'}
             isAuthenticated={isAuthenticated}
+            onTimelineSearchChange={setTimelineSearch}
             onAdvancedSelect={selectSearchResult}
             onInspectorBoxClick={(box) => handleCopyText(box.label)}
             onDeleteRecord={async (id) => {

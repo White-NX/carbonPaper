@@ -55,6 +55,7 @@ export function useAdvancedSearchController({
   const [endDate, setEndDate] = useState('');
   const [rangePreset, setRangePreset] = useState('any');
   const [elapsedMs, setElapsedMs] = useState(null);
+  const [resultSetKey, setResultSetKey] = useState(0);
   const [recentQueries, setRecentQueries] = useState(() => loadRecentSearches());
   const [landingCaptures, setLandingCaptures] = useState([]);
   const offsetRef = useRef(0);
@@ -226,6 +227,7 @@ export function useAdvancedSearchController({
 
       if (searchIdRef.current !== currentSearchId) return;
       setResults(fetched);
+      setResultSetKey(currentSearchId);
       setHasMore(fetched.length === pageSize);
       setElapsedMs(performance.now() - startedAt);
       offsetRef.current = fetched.length;
@@ -446,5 +448,6 @@ export function useAdvancedSearchController({
     handleSubmit,
     clearFilters,
     searchSourceDetail,
+    resultSetKey,
   };
 }
