@@ -157,4 +157,37 @@ describe('useAdvancedSectionController', () => {
     expect(hook.result.current.config.classification_runtime).toBe('python');
     expect(hook.result.current.classificationRuntimeChanged).toBe(true);
   });
+
+  it('runs an authenticated manual ANN retry and refreshes diagnostics', async () => {
+    clipRunActive = false;
+    invoke.mockImplementation(async (command) => {
+      if (command === 'get_advanced_config') return {};
+      if (command === 'storage_is_startup_vacuum_in_progress') return false;
+      if (command === 'get_rust_ocr_model_status') return {};
+      if (command === 'get_ml_ocr_status') return {};
+      if (command === 'clip_ann_retry_now') return true;
+      if (command === 'get_ml_semantic_status') {
+        return {
+          backend: { index_run_active: false },
+          clip_backend: { index_run_active: false, ann_build_state: 'healthy' },
+        };
+      }
+      return undefined;
+    });
+    const hook = renderHook(() => useAdvancedSectionController({
+      monitorStatus: 'stopped',
+      t,
+    }));
+
+    await waitFor(() => expect(hook.result.current.config).toEqual({}));
+    await act(async () => {
+      await hook.result.current.handleRetryClipAnn();
+    });
+
+    expect(invoke).toHaveBeenCalledWith('clip_ann_retry_now');
+    expect(invoke).toHaveBeenCalledWith('get_ml_semantic_status', {
+      refreshDiagnostics: true,
+    });
+    expect(hook.result.current.clipAnnRetrying).toBe(false);
+  });
 });

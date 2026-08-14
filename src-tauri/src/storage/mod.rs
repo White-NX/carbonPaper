@@ -92,6 +92,11 @@ pub struct StorageState {
     /// Serializes derived-index sidecar publication without participating in
     /// the data-directory/database lock ordering.
     derived_generation_publish_lock: Mutex<()>,
+    /// Foreground read activity versus database compaction. Queries hold a
+    /// shared guard across vector selection and hydration; opportunistic
+    /// incremental VACUUM only runs when it can acquire the exclusive side
+    /// without waiting.
+    foreground_db_activity: RwLock<()>,
     /// Resident `semantic_text` vectors for the exact-scan read path. Loaded on
     /// first query, kept current by the write path, released when idle. The
     /// per-kind budget may choose the paged exact fallback instead of retaining
@@ -177,6 +182,7 @@ impl StorageState {
             thumbnail_warmup_done: AtomicBool::new(false),
             startup_vacuum_in_progress: AtomicBool::new(false),
             derived_generation_publish_lock: Mutex::new(()),
+            foreground_db_activity: RwLock::new(()),
             semantic_vector_cache: RwLock::new(None),
             semantic_cache_used_at: AtomicU64::new(0),
             clip_vector_cache: RwLock::new(None),
@@ -247,6 +253,28 @@ impl StorageState {
 
     pub fn is_startup_vacuum_in_progress(&self) -> bool {
         self.startup_vacuum_in_progress.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn foreground_db_read(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.foreground_db_activity
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn foreground_db_write(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.foreground_db_activity
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn try_foreground_db_write(&self) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
+        self.foreground_db_activity.try_write().ok()
+    }
+
+    pub(crate) fn derived_generation_publish_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.derived_generation_publish_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     /// Acquire DB connection with caller identification for diagnostic logging.

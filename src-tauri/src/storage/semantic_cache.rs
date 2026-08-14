@@ -90,13 +90,13 @@ fn elapsed_ms(started: Instant) -> f64 {
 /// scratch bound `O(k)` and works for both resident and paged scans.
 struct HeapCandidate<T> {
     score: f32,
-    ordinal: u64,
+    tie_key: String,
     value: T,
 }
 
 impl<T> PartialEq for HeapCandidate<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.score.to_bits() == other.score.to_bits() && self.ordinal == other.ordinal
+        self.score.to_bits() == other.score.to_bits() && self.tie_key == other.tie_key
     }
 }
 
@@ -110,17 +110,14 @@ impl<T> PartialOrd for HeapCandidate<T> {
 
 impl<T> Ord for HeapCandidate<T> {
     fn cmp(&self, other: &Self) -> CmpOrdering {
-        // Earlier rows win exact ties. Reversing the ordinal comparison makes
-        // a later tied row the worse item at the top of the min-heap.
         self.score
             .total_cmp(&other.score)
-            .then_with(|| other.ordinal.cmp(&self.ordinal))
+            .then_with(|| other.tie_key.cmp(&self.tie_key))
     }
 }
 
 struct TopK<T> {
     want: usize,
-    next_ordinal: u64,
     heap: BinaryHeap<Reverse<HeapCandidate<T>>>,
 }
 
@@ -128,25 +125,18 @@ impl<T> TopK<T> {
     fn new(want: usize) -> Self {
         Self {
             want,
-            next_ordinal: 0,
             heap: BinaryHeap::with_capacity(want),
         }
     }
 
-    fn push(&mut self, score: f32, value: T) {
-        self.push_with(score, || value);
-    }
-
-    fn push_with(&mut self, score: f32, value: impl FnOnce() -> T) {
+    fn push_with_key(&mut self, score: f32, tie_key: &str, value: impl FnOnce() -> T) {
         if self.want == 0 {
             return;
         }
-        let ordinal = self.next_ordinal;
-        self.next_ordinal = self.next_ordinal.saturating_add(1);
         if self.heap.len() < self.want {
             self.heap.push(Reverse(HeapCandidate {
                 score,
-                ordinal,
+                tie_key: tie_key.to_string(),
                 value: value(),
             }));
             return;
@@ -157,7 +147,7 @@ impl<T> TopK<T> {
             .map(|worst| {
                 score
                     .total_cmp(&worst.0.score)
-                    .then_with(|| worst.0.ordinal.cmp(&ordinal))
+                    .then_with(|| worst.0.tie_key.as_str().cmp(tie_key))
                     .is_gt()
             })
             .unwrap_or(true);
@@ -165,7 +155,7 @@ impl<T> TopK<T> {
             let _ = self.heap.pop();
             self.heap.push(Reverse(HeapCandidate {
                 score,
-                ordinal,
+                tie_key: tie_key.to_string(),
                 value: value(),
             }));
         }
@@ -431,7 +421,9 @@ impl SemanticVectorCache {
         }
         let mut top = TopK::new(want);
         for (index, row) in self.matrix.chunks_exact(self.dimensions).enumerate() {
-            top.push(dot_product_wide(query, row), index as u32);
+            top.push_with_key(dot_product_wide(query, row), &self.subjects[index], || {
+                index as u32
+            });
         }
         top.into_sorted()
             .into_iter()
@@ -586,6 +578,7 @@ const SCAN_PAGE_ROWS: i64 = 4096;
 fn scan_visible_embedding_pages<F>(
     conn: &Connection,
     index_kind: DerivedIndexKind,
+    deadline: Option<Instant>,
     mut on_row: F,
 ) -> Result<(u32, usize), String>
 where
@@ -598,6 +591,9 @@ where
     let mut pages = 0u32;
     let mut total_rows = 0usize;
     loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err("query_deadline_exceeded_during_exact_scan".to_string());
+        }
         let mut page_rows = 0usize;
         {
             let mut rows = statement
@@ -665,7 +661,7 @@ impl StorageState {
     /// Production scans use an independent SQLCipher read connection. Unit
     /// tests use an in-memory database attached only to the process-wide
     /// connection, so they deliberately take that connection instead.
-    fn with_vector_scan_connection<T>(
+    pub(super) fn with_vector_scan_connection<T>(
         &self,
         caller: &'static str,
         operation: impl FnOnce(&Connection) -> Result<T, String>,
@@ -690,7 +686,23 @@ impl StorageState {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<ScoredSubject>, String> {
-        self.semantic_topk_resident_with_budget(index_kind, query, k, cache_budget(index_kind))
+        self.semantic_topk_resident_with_deadline(index_kind, query, k, None)
+    }
+
+    pub(super) fn semantic_topk_resident_with_deadline(
+        &self,
+        index_kind: DerivedIndexKind,
+        query: &[f32],
+        k: usize,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<ScoredSubject>, String> {
+        self.semantic_topk_resident_with_budget_and_deadline(
+            index_kind,
+            query,
+            k,
+            cache_budget(index_kind),
+            deadline,
+        )
     }
 
     /// Same query path with an explicit budget for focused regression tests.
@@ -702,6 +714,23 @@ impl StorageState {
         query: &[f32],
         k: usize,
         resident_budget: usize,
+    ) -> Result<Vec<ScoredSubject>, String> {
+        self.semantic_topk_resident_with_budget_and_deadline(
+            index_kind,
+            query,
+            k,
+            resident_budget,
+            None,
+        )
+    }
+
+    fn semantic_topk_resident_with_budget_and_deadline(
+        &self,
+        index_kind: DerivedIndexKind,
+        query: &[f32],
+        k: usize,
+        resident_budget: usize,
+        deadline: Option<Instant>,
     ) -> Result<Vec<ScoredSubject>, String> {
         if k == 0 {
             return Ok(Vec::new());
@@ -780,6 +809,7 @@ impl StorageState {
                     query,
                     want,
                     resident_budget,
+                    deadline,
                 )?;
                 if self.semantic_cache_reset_generation.load(Ordering::Acquire) != reset_generation
                 {
@@ -943,6 +973,7 @@ impl StorageState {
         query: &[f32],
         want: usize,
         resident_budget: usize,
+        deadline: Option<Instant>,
     ) -> Result<CacheQueryMode, String> {
         self.with_vector_scan_connection("load_semantic_vector_cache", |conn| {
             let stats = read_visible_cache_stats(conn, index_kind)?;
@@ -991,7 +1022,7 @@ impl StorageState {
             let top_want = want.min(stats.rows);
             let mut top = TopK::new(top_want);
             let mut skipped = 0u64;
-            let (pages, rows) = scan_visible_embedding_pages(conn, index_kind, |subject, vector| {
+            let (pages, rows) = scan_visible_embedding_pages(conn, index_kind, deadline, |subject, vector| {
                 if vector.len() != query.len() {
                     skipped = skipped.saturating_add(1);
                     return Ok(());
@@ -999,7 +1030,7 @@ impl StorageState {
                 let score = dot_product_wide(query, &vector);
                 if let Some(resident) = cache.as_ref() {
                     peak_cache_bytes = peak_cache_bytes.max(resident.allocated_bytes());
-                    top.push_with(score, || subject.clone());
+                    top.push_with_key(score, &subject, || subject.clone());
                     let fits = resident.can_push_within_budget(
                         &subject,
                         subject.capacity(),
@@ -1033,7 +1064,8 @@ impl StorageState {
                         cache = None;
                     }
                 } else {
-                    top.push(score, subject);
+                    let tie_key = subject.clone();
+                    top.push_with_key(score, &tie_key, || subject);
                 }
                 Ok(())
             })?;
@@ -1318,6 +1350,83 @@ mod tests {
         assert_eq!(ranked[0].subject_key, "1");
         assert_eq!(ranked[1].subject_key, "2");
         assert!(ranked[0].score >= ranked[1].score);
+    }
+
+    #[test]
+    fn bounded_topk_matches_full_sort_including_tied_subject_keys() {
+        let rows = [
+            (0.5, "z"),
+            (0.9, "b"),
+            (0.9, "a"),
+            (0.4, "c"),
+            (0.9, "d"),
+            (0.9, "c"),
+            (-0.1, "aa"),
+        ];
+        let mut full: Vec<ScoredSubject> = rows
+            .iter()
+            .map(|(score, subject_key)| ScoredSubject {
+                subject_key: (*subject_key).to_string(),
+                score: *score,
+            })
+            .collect();
+        full.sort_unstable_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.subject_key.cmp(&b.subject_key))
+        });
+        full.truncate(4);
+
+        let mut bounded = TopK::new(4);
+        for (score, subject_key) in rows {
+            bounded.push_with_key(score, subject_key, || subject_key.to_string());
+        }
+        let bounded: Vec<ScoredSubject> = bounded
+            .into_sorted()
+            .into_iter()
+            .map(|candidate| ScoredSubject {
+                subject_key: candidate.value,
+                score: candidate.score,
+            })
+            .collect();
+        assert_eq!(bounded, full);
+    }
+
+    #[test]
+    fn expired_deadline_stops_streaming_exact_before_scoring_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE derived_index_jobs (
+                index_kind TEXT NOT NULL,
+                subject_key TEXT NOT NULL,
+                status TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                embedding_version INTEGER NOT NULL,
+                source_fingerprint TEXT NOT NULL
+            );
+            CREATE TABLE derived_embeddings (
+                index_kind TEXT NOT NULL,
+                subject_key TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                embedding_version INTEGER NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                vector_f32 BLOB NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        let error = scan_visible_embedding_pages(
+            &conn,
+            DerivedIndexKind::ClipImage,
+            Some(Instant::now()),
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "query_deadline_exceeded_during_exact_scan");
     }
 
     #[test]

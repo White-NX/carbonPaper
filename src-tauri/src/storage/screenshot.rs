@@ -1647,29 +1647,30 @@ impl StorageState {
         if image_hashes.is_empty() {
             return Ok(HashMap::new());
         }
-        let guard = self.get_connection_named("map_image_hashes_to_screenshot_ids")?;
-        let conn = guard
-            .as_ref()
-            .ok_or_else(|| "Database connection is None".to_string())?;
-        let placeholders = vec!["?"; image_hashes.len()].join(",");
-        let mut statement = conn
-            .prepare(&format!(
-                "SELECT image_hash, id FROM screenshots
-                 WHERE is_deleted = 0 AND image_hash IN ({placeholders})
-                 ORDER BY created_at DESC, id DESC"
-            ))
-            .map_err(|e| format!("Failed to prepare the image hash mapping: {}", e))?;
-        let rows = statement
-            .query_map(rusqlite::params_from_iter(image_hashes.iter()), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(|e| format!("Failed to map image hashes: {}", e))?;
-        let mut mapped: HashMap<String, Vec<i64>> = HashMap::new();
-        for row in rows {
-            let (hash, id) = row.map_err(|e| format!("Failed to read a mapped row: {}", e))?;
-            mapped.entry(hash).or_default().push(id);
-        }
-        Ok(mapped)
+        self.with_vector_scan_connection("map_image_hashes_to_screenshot_ids", |conn| {
+            let mut mapped: HashMap<String, Vec<i64>> = HashMap::new();
+            for chunk in image_hashes.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let mut statement = conn
+                    .prepare(&format!(
+                        "SELECT image_hash, id FROM screenshots
+                         WHERE is_deleted = 0 AND image_hash IN ({placeholders})
+                         ORDER BY created_at DESC, id DESC"
+                    ))
+                    .map_err(|e| format!("Failed to prepare the image hash mapping: {}", e))?;
+                let rows = statement
+                    .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(|e| format!("Failed to map image hashes: {}", e))?;
+                for row in rows {
+                    let (hash, id) =
+                        row.map_err(|e| format!("Failed to read a mapped row: {}", e))?;
+                    mapped.entry(hash).or_default().push(id);
+                }
+            }
+            Ok(mapped)
+        })
     }
 
     pub fn get_index_storage_stats(&self) -> Result<IndexStorageStats, String> {
@@ -3305,6 +3306,9 @@ impl StorageState {
         freelist_threshold: i64,
         vacuum_pages: i64,
     ) -> Result<bool, String> {
+        let Some(_foreground_gate) = self.try_foreground_db_write() else {
+            return Ok(false);
+        };
         let guard = self.get_connection_named("run_incremental_vacuum_if_idle")?;
         let conn = guard.as_ref().unwrap();
 

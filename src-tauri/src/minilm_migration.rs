@@ -740,7 +740,22 @@ async fn run_auto_migration(app: AppHandle) -> Result<(), String> {
         tokio::time::sleep(AUTH_POLL_INTERVAL).await;
     }
     tracing::info!("[MINILM] starting the automatic Chroma copy migration");
-    try_start_minilm_migration(&app, &migration).map(|_| ())
+    loop {
+        if migration.running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if crate::maintenance::is_active() {
+            tokio::time::sleep(AUTH_POLL_INTERVAL).await;
+            continue;
+        }
+        match try_start_minilm_migration(&app, &migration) {
+            Ok(_) => return Ok(()),
+            Err(error) if error == crate::maintenance::MAINTENANCE_IN_PROGRESS => {
+                tokio::time::sleep(AUTH_POLL_INTERVAL).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn start_minilm_migration_inner(

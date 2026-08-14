@@ -1289,7 +1289,11 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
         .and_then(Value::as_u64)
         .unwrap_or(20)
         .min(u64::from(crate::clip_query::MAX_CLIP_RESULTS)) as u32;
-    let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let offset = args
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(u64::from(crate::clip_query::MAX_CLIP_OFFSET)) as u32;
     let process_names: Vec<String> = args
         .get("process_names")
         .and_then(Value::as_array)

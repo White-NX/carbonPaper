@@ -34,6 +34,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [clipIndexRun, setClipIndexRun] = useState(null);
   const [clipIndexStopping, setClipIndexStopping] = useState(false);
   const [clipIndexProgress, setClipIndexProgress] = useState(null);
+  const [clipAnnRetrying, setClipAnnRetrying] = useState(false);
   // Whether a backfill of everything the step-7 migration could not deliver has
   // been offered, and what the user said. The dialog asks once; this is where
   // the answer stays changeable, which is the whole reason declining is safe to
@@ -398,6 +399,18 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     }
   };
 
+  const handleRetryClipAnn = async () => {
+    setClipAnnRetrying(true);
+    try {
+      await withAuth(() => invoke('clip_ann_retry_now'), { autoPrompt: true });
+    } catch (err) {
+      console.warn('Manual ANN rebuild retry failed:', err);
+    } finally {
+      setClipAnnRetrying(false);
+      await refreshSemanticStatus();
+    }
+  };
+
   const refreshClipBackfill = async (allowExpensive = false) => {
     try {
       setClipBackfill(await getClipBackfillOffer(allowExpensive));
@@ -553,6 +566,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     clipIndexRun,
     clipIndexStopping,
     clipIndexProgress,
+    clipAnnRetrying,
     clipBackfill,
     clipBackfillBusy,
     handleClipBackfillDecision,
@@ -581,6 +595,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     handleToggleRustClassification,
     handleRunClipIndexNow,
     handleStopClipIndex,
+    handleRetryClipAnn,
     refreshSemanticStatus,
   };
 }

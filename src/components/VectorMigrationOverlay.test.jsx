@@ -82,6 +82,17 @@ describe('VectorMigrationOverlay', () => {
     expect(getMinilmRebuildStatus).not.toHaveBeenCalled();
   });
 
+  it('shows the image-index box for an ANN-only bootstrap without a migration run', async () => {
+    getMaintenanceStatus.mockResolvedValue({ active: true, reason: 'clip_ann_bootstrap' });
+    render(<VectorMigrationOverlay />);
+    await pollTick();
+
+    expect(screen.getByText('vectorMigration.kinds.clip.title')).toBeInTheDocument();
+    expect(screen.getByText('vectorMigration.phases.building_ann')).toBeInTheDocument();
+    expect(getClipRebuildStatus).not.toHaveBeenCalled();
+    expect(getMinilmRebuildStatus).not.toHaveBeenCalled();
+  });
+
   it('stays hidden when the app is not in maintenance mode', async () => {
     getMaintenanceStatus.mockResolvedValue({ active: false, reason: null });
     render(<VectorMigrationOverlay />);

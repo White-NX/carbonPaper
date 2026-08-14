@@ -252,6 +252,65 @@ impl StorageState {
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- Persistent ANN generations deliberately have independent
+            -- lifecycle semantics from `derived_index_generations`: a new
+            -- capture advances the visible epoch but does not invalidate the
+            -- immutable ANN base. `derived_ann_changes` is the latest changed
+            -- epoch per subject, allowing queries to overlay a bounded exact
+            -- tail and tombstones on any older base generation.
+            CREATE TABLE IF NOT EXISTS derived_ann_generations (
+                index_kind TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL CHECK (generation > 0),
+                covered_epoch INTEGER NOT NULL CHECK (covered_epoch >= 0),
+                flat_file_name TEXT NOT NULL,
+                flat_checksum_sha256 TEXT NOT NULL,
+                ann_file_name TEXT NOT NULL,
+                ann_checksum_sha256 TEXT NOT NULL,
+                row_count INTEGER NOT NULL CHECK (row_count >= 0),
+                dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                embedding_version INTEGER NOT NULL CHECK (embedding_version > 0),
+                sidecar_format_version INTEGER NOT NULL CHECK (sidecar_format_version > 0),
+                ann_format_version INTEGER NOT NULL CHECK (ann_format_version > 0),
+                algorithm TEXT NOT NULL,
+                implementation_version TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                quantization TEXT NOT NULL,
+                connectivity INTEGER NOT NULL CHECK (connectivity > 0),
+                expansion_add INTEGER NOT NULL CHECK (expansion_add > 0),
+                expansion_search INTEGER NOT NULL CHECK (expansion_search > 0),
+                status TEXT NOT NULL DEFAULT 'ready',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS derived_ann_changes (
+                index_kind TEXT NOT NULL,
+                subject_key TEXT NOT NULL,
+                change_epoch INTEGER NOT NULL CHECK (change_epoch >= 0),
+                PRIMARY KEY (index_kind, subject_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_derived_ann_changes_epoch
+                ON derived_ann_changes(index_kind, change_epoch, subject_key);
+
+            -- ANN construction is expensive and can fail before a generation
+            -- row exists. Keep its retry/circuit state independently so a
+            -- restart cannot turn a permanent packaging or resource failure
+            -- back into one full bootstrap per idle-worker tick.
+            CREATE TABLE IF NOT EXISTS derived_ann_build_state (
+                index_kind TEXT PRIMARY KEY,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+                last_failure_at TEXT NOT NULL,
+                next_retry_at TEXT NOT NULL,
+                last_error_code TEXT NOT NULL,
+                last_error TEXT NOT NULL,
+                circuit_open INTEGER NOT NULL DEFAULT 0,
+                -- 0 = none, 1 = pending Toast delivery/ack, 2 = delivered.
+                notification_sent INTEGER NOT NULL DEFAULT 0 CHECK (notification_sent IN (0, 1, 2)),
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             -- Durable orchestration state for a foreground derived-index
             -- migration. The vector cache and sidecar remain rebuildable; these
             -- rows only make a long-running upgrade resumable and diagnosable.
@@ -338,6 +397,14 @@ impl StorageState {
                 ON CONFLICT(index_kind) DO UPDATE SET
                     data_epoch = data_epoch + 1,
                     updated_at = CURRENT_TIMESTAMP;
+                INSERT INTO derived_ann_changes (index_kind, subject_key, change_epoch)
+                SELECT
+                    'clip_image',
+                    NEW.subject_key,
+                    (SELECT data_epoch FROM derived_index_state WHERE index_kind = NEW.index_kind)
+                WHERE NEW.index_kind = 'clip_image'
+                ON CONFLICT(index_kind, subject_key) DO UPDATE SET
+                    change_epoch = excluded.change_epoch;
                 DELETE FROM derived_index_generations WHERE index_kind = NEW.index_kind;
             END;
 
@@ -369,6 +436,14 @@ impl StorageState {
                 ON CONFLICT(index_kind) DO UPDATE SET
                     data_epoch = data_epoch + 1,
                     updated_at = CURRENT_TIMESTAMP;
+                INSERT INTO derived_ann_changes (index_kind, subject_key, change_epoch)
+                SELECT
+                    'clip_image',
+                    NEW.subject_key,
+                    (SELECT data_epoch FROM derived_index_state WHERE index_kind = NEW.index_kind)
+                WHERE NEW.index_kind = 'clip_image'
+                ON CONFLICT(index_kind, subject_key) DO UPDATE SET
+                    change_epoch = excluded.change_epoch;
                 DELETE FROM derived_index_generations WHERE index_kind = NEW.index_kind;
             END;
 
@@ -391,6 +466,14 @@ impl StorageState {
                 ON CONFLICT(index_kind) DO UPDATE SET
                     data_epoch = data_epoch + 1,
                     updated_at = CURRENT_TIMESTAMP;
+                INSERT INTO derived_ann_changes (index_kind, subject_key, change_epoch)
+                SELECT
+                    'clip_image',
+                    OLD.subject_key,
+                    (SELECT data_epoch FROM derived_index_state WHERE index_kind = OLD.index_kind)
+                WHERE OLD.index_kind = 'clip_image'
+                ON CONFLICT(index_kind, subject_key) DO UPDATE SET
+                    change_epoch = excluded.change_epoch;
                 DELETE FROM derived_index_generations WHERE index_kind = OLD.index_kind;
             END;
 
@@ -412,6 +495,14 @@ impl StorageState {
                 ON CONFLICT(index_kind) DO UPDATE SET
                     data_epoch = data_epoch + 1,
                     updated_at = CURRENT_TIMESTAMP;
+                INSERT INTO derived_ann_changes (index_kind, subject_key, change_epoch)
+                SELECT
+                    'clip_image',
+                    NEW.subject_key,
+                    (SELECT data_epoch FROM derived_index_state WHERE index_kind = NEW.index_kind)
+                WHERE NEW.index_kind = 'clip_image'
+                ON CONFLICT(index_kind, subject_key) DO UPDATE SET
+                    change_epoch = excluded.change_epoch;
                 DELETE FROM derived_index_generations WHERE index_kind = NEW.index_kind;
             END;
 
@@ -441,6 +532,14 @@ impl StorageState {
                 ON CONFLICT(index_kind) DO UPDATE SET
                     data_epoch = data_epoch + 1,
                     updated_at = CURRENT_TIMESTAMP;
+                INSERT INTO derived_ann_changes (index_kind, subject_key, change_epoch)
+                SELECT
+                    'clip_image',
+                    NEW.subject_key,
+                    (SELECT data_epoch FROM derived_index_state WHERE index_kind = NEW.index_kind)
+                WHERE NEW.index_kind = 'clip_image'
+                ON CONFLICT(index_kind, subject_key) DO UPDATE SET
+                    change_epoch = excluded.change_epoch;
                 DELETE FROM derived_index_generations WHERE index_kind = NEW.index_kind;
             END;
 
@@ -462,6 +561,14 @@ impl StorageState {
                 ON CONFLICT(index_kind) DO UPDATE SET
                     data_epoch = data_epoch + 1,
                     updated_at = CURRENT_TIMESTAMP;
+                INSERT INTO derived_ann_changes (index_kind, subject_key, change_epoch)
+                SELECT
+                    'clip_image',
+                    OLD.subject_key,
+                    (SELECT data_epoch FROM derived_index_state WHERE index_kind = OLD.index_kind)
+                WHERE OLD.index_kind = 'clip_image'
+                ON CONFLICT(index_kind, subject_key) DO UPDATE SET
+                    change_epoch = excluded.change_epoch;
                 DELETE FROM derived_index_generations WHERE index_kind = OLD.index_kind;
             END;
 
@@ -573,6 +680,16 @@ impl StorageState {
             "#,
         )
         .map_err(|e| format!("Failed to initialize tables: {}", e))?;
+
+        // Early development triggers briefly recorded non-CLIP subjects in
+        // the ANN change table. They are not part of this accelerator's
+        // corpus and would otherwise inflate tail diagnostics forever on an
+        // upgraded developer database.
+        conn.execute(
+            "DELETE FROM derived_ann_changes WHERE index_kind <> 'clip_image'",
+            [],
+        )
+        .map_err(|e| format!("Failed to clean legacy ANN changes: {e}"))?;
 
         // If this is a fresh install (ocr_results is empty), mark HMAC v2 migration as done.
         // This prevents the lazy indexer from blocking on a fresh install.
@@ -1441,5 +1558,118 @@ mod tests {
             "index",
             "idx_derived_migration_runs_updated"
         ));
+    }
+
+    #[test]
+    fn init_tables_installs_ann_manifest_changes_and_epoch_triggers() {
+        let (_temp, storage) = test_storage();
+        let conn = Connection::open_in_memory().unwrap();
+        storage.init_tables(&conn).unwrap();
+
+        assert!(object_exists(&conn, "table", "derived_ann_generations"));
+        assert!(object_exists(&conn, "table", "derived_ann_changes"));
+        assert!(object_exists(&conn, "table", "derived_ann_build_state"));
+        assert!(object_exists(
+            &conn,
+            "trigger",
+            "derived_embeddings_epoch_after_insert"
+        ));
+        let trigger_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'derived_index_jobs_epoch_after_update'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(trigger_sql.contains("derived_ann_changes"));
+        assert!(trigger_sql.contains("WHERE NEW.index_kind = 'clip_image'"));
+    }
+
+    #[test]
+    fn ann_changes_track_clip_only() {
+        let (_temp, storage) = test_storage();
+        let conn = Connection::open_in_memory().unwrap();
+        storage.init_tables(&conn).unwrap();
+        for (id, kind, subject) in [(1_i64, "semantic_text", "1"), (2, "clip_image", "hash-2")] {
+            conn.execute(
+                "INSERT INTO screenshots (id, image_path, image_hash) VALUES (?1, ?2, ?3)",
+                params![id, format!("{id}.enc"), format!("hash-{id}")],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO derived_index_jobs (
+                    index_kind, subject_key, status, model_id, model_revision,
+                    embedding_version, source_fingerprint
+                ) VALUES (?1, ?2, 'completed', 'model', 'revision', 1, 'source')
+                "#,
+                params![kind, subject],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                INSERT INTO derived_embeddings (
+                    index_kind, subject_key, model_id, model_revision,
+                    embedding_version, source_fingerprint, dimensions, vector_f32
+                ) VALUES (?1, ?2, 'model', 'revision', 1, 'source', 1, X'0000803F')
+                "#,
+                params![kind, subject],
+            )
+            .unwrap();
+        }
+
+        let semantic_changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM derived_ann_changes WHERE index_kind = 'semantic_text'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let clip_changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM derived_ann_changes WHERE index_kind = 'clip_image'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(semantic_changes, 0);
+        assert_eq!(clip_changes, 1);
+    }
+
+    #[test]
+    fn init_tables_removes_legacy_non_clip_ann_changes_idempotently() {
+        let (_temp, storage) = test_storage();
+        let conn = Connection::open_in_memory().unwrap();
+        storage.init_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO derived_ann_changes (index_kind, subject_key, change_epoch) VALUES ('semantic_text', '1', 7)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO derived_ann_changes (index_kind, subject_key, change_epoch) VALUES ('clip_image', 'hash-a', 8)",
+            [],
+        )
+        .unwrap();
+
+        storage.init_tables(&conn).unwrap();
+        storage.init_tables(&conn).unwrap();
+
+        let semantic_changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM derived_ann_changes WHERE index_kind = 'semantic_text'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let clip_changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM derived_ann_changes WHERE index_kind = 'clip_image'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(semantic_changes, 0);
+        assert_eq!(clip_changes, 1);
     }
 }

@@ -54,6 +54,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     clipIndexRun,
     clipIndexStopping,
     clipIndexProgress,
+    clipAnnRetrying,
     clipBackfill,
     clipBackfillBusy,
     handleClipBackfillDecision,
@@ -61,6 +62,7 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     handleToggleRustClassification,
     handleRunClipIndexNow,
     handleStopClipIndex,
+    handleRetryClipAnn,
     semanticIndexProgress,
     semanticIndexStopping,
     handleToggleRustSemanticIndex,
@@ -166,6 +168,8 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         onRefresh={refreshSemanticStatus}
         onRunIndexNow={handleRunClipIndexNow}
         onStopIndexNow={handleStopClipIndex}
+        onRetryAnn={handleRetryClipAnn}
+        annRetrying={clipAnnRetrying}
         indexRunning={clipIndexRunning}
         indexStopping={clipIndexStopping}
         indexProgress={clipIndexProgress}

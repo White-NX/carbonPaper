@@ -179,6 +179,69 @@ pub struct DerivedIndexGeneration {
     pub embedding_version: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedAnnGeneration {
+    pub index_kind: DerivedIndexKind,
+    pub generation: u64,
+    pub covered_epoch: u64,
+    pub flat_file_name: String,
+    pub flat_checksum_sha256: String,
+    pub ann_file_name: String,
+    pub ann_checksum_sha256: String,
+    pub row_count: u64,
+    pub dimensions: u32,
+    pub model_id: String,
+    pub model_revision: String,
+    pub embedding_version: u32,
+    pub sidecar_format_version: u32,
+    pub ann_format_version: u32,
+    pub algorithm: String,
+    pub implementation_version: String,
+    pub metric: String,
+    pub quantization: String,
+    pub connectivity: u32,
+    pub expansion_add: u32,
+    pub expansion_search: u32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedAnnBuildState {
+    pub index_kind: DerivedIndexKind,
+    pub consecutive_failures: u32,
+    pub last_failure_at: String,
+    pub next_retry_at: String,
+    pub last_error_code: String,
+    pub last_error: String,
+    pub circuit_open: bool,
+    /// True once the UI has atomically consumed or acknowledged the Toast.
+    /// A pending startup Toast is deliberately reported as false.
+    pub notification_sent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedAnnBuildFailureUpdate {
+    pub state: DerivedAnnBuildState,
+    pub should_notify: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DerivedAnnTailRow {
+    pub subject_key: String,
+    pub vector: Option<Vec<f32>>,
+}
+
+/// Column-minimal row used while freezing an ANN base. `vector_f32` is already
+/// the little-endian byte representation required by CPDVEC04, so the
+/// bootstrap can copy it directly instead of decoding and re-encoding every
+/// scalar in a large corpus.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DerivedAnnSnapshotRow {
+    pub subject_key: String,
+    pub dimensions: u32,
+    pub vector_f32: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DerivedModelContract {
     model_id: String,
@@ -190,6 +253,7 @@ struct DerivedModelContract {
 struct DerivedIndexSnapshotMetadata {
     data_epoch: u64,
     row_count: u64,
+    subject_key_bytes: u64,
     dimensions: Option<u32>,
     model_contract: Option<DerivedModelContract>,
 }
@@ -879,6 +943,26 @@ impl StorageState {
         self.semantic_topk_resident(DerivedIndexKind::ClipImage, query, k)
     }
 
+    pub(crate) fn clip_image_topk_with_deadline(
+        &self,
+        query: &[f32],
+        k: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<ScoredSubject>, String> {
+        if query.is_empty() {
+            return Err("CLIP query vector must not be empty".to_string());
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        self.semantic_topk_resident_with_deadline(
+            DerivedIndexKind::ClipImage,
+            query,
+            k,
+            Some(deadline),
+        )
+    }
+
     pub fn get_derived_index_job(
         &self,
         index_kind: DerivedIndexKind,
@@ -1546,10 +1630,7 @@ impl StorageState {
         if self.is_migration_in_progress() {
             return Err("Cannot publish a derived index during data migration".to_string());
         }
-        let _publish_guard = self
-            .derived_generation_publish_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _publish_guard = self.derived_generation_publish_guard();
         // Recheck after acquiring the shared publication/migration boundary so
         // a migration that won the race cannot overlap filesystem publication.
         if self.is_migration_in_progress() {
@@ -1652,10 +1733,11 @@ impl StorageState {
         let mut statement = conn
             .prepare(
                 r#"
-                SELECT g.file_name
-                FROM derived_index_generations g
-                LEFT JOIN derived_index_state s ON s.index_kind = g.index_kind
-                WHERE g.data_epoch = COALESCE(s.data_epoch, 0)
+                SELECT file_name FROM derived_index_generations
+                UNION ALL
+                SELECT flat_file_name FROM derived_ann_generations WHERE status = 'ready'
+                UNION ALL
+                SELECT ann_file_name FROM derived_ann_generations WHERE status = 'ready'
                 "#,
             )
             .map_err(|error| format!("Failed to prepare derived sidecar cleanup: {error}"))?;
@@ -1689,9 +1771,10 @@ impl StorageState {
                 .iter()
                 .any(|kind| {
                     file_name.starts_with(&format!("{}-", kind.as_str()))
-                        && file_name.ends_with(".cpdvec")
+                        && (file_name.ends_with(".cpdvec") || file_name.ends_with(".cpdann"))
                 });
-            let is_temp = file_name.starts_with('.') && file_name.ends_with(".cpdvec.tmp");
+            let is_temp = file_name.starts_with('.')
+                && (file_name.ends_with(".cpdvec.tmp") || file_name.ends_with(".cpdann.tmp"));
             if (!is_finalized || referenced.contains(&file_name)) && !is_temp {
                 continue;
             }
@@ -1742,6 +1825,577 @@ impl StorageState {
         )
         .optional()
         .map_err(|error| format!("Failed to read derived index generation: {error}"))
+    }
+
+    pub fn get_derived_ann_generation(
+        &self,
+        index_kind: DerivedIndexKind,
+    ) -> Result<Option<DerivedAnnGeneration>, String> {
+        let guard = self.get_connection_named("get_derived_ann_generation")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        conn.query_row(
+            r#"
+            SELECT generation, covered_epoch, flat_file_name, flat_checksum_sha256,
+                   ann_file_name, ann_checksum_sha256, row_count, dimensions,
+                   model_id, model_revision, embedding_version,
+                   sidecar_format_version, ann_format_version, algorithm,
+                   implementation_version, metric, quantization, connectivity,
+                   expansion_add, expansion_search, created_at
+            FROM derived_ann_generations
+            WHERE index_kind = ?1 AND status = 'ready'
+            "#,
+            [index_kind.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, i64>(17)?,
+                    row.get::<_, i64>(18)?,
+                    row.get::<_, i64>(19)?,
+                    row.get::<_, String>(20)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Failed to read ANN generation: {error}"))?
+        .map(|raw| decode_ann_generation(index_kind, raw))
+        .transpose()
+    }
+
+    pub fn get_derived_ann_build_state(
+        &self,
+        index_kind: DerivedIndexKind,
+    ) -> Result<Option<DerivedAnnBuildState>, String> {
+        let guard = self.get_connection_named("get_derived_ann_build_state")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        conn.query_row(
+            r#"
+            SELECT consecutive_failures, last_failure_at, next_retry_at,
+                   last_error_code, last_error, circuit_open, notification_sent
+            FROM derived_ann_build_state
+            WHERE index_kind = ?1
+            "#,
+            [index_kind.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Failed to read ANN build state: {error}"))?
+        .map(
+            |(
+                consecutive_failures,
+                last_failure_at,
+                next_retry_at,
+                last_error_code,
+                last_error,
+                circuit_open,
+                notification_sent,
+            )| {
+                Ok(DerivedAnnBuildState {
+                    index_kind,
+                    consecutive_failures: u32::try_from(consecutive_failures).map_err(|_| {
+                        format!("Invalid ANN consecutive failure count: {consecutive_failures}")
+                    })?,
+                    last_failure_at,
+                    next_retry_at,
+                    last_error_code,
+                    last_error,
+                    circuit_open: circuit_open != 0,
+                    notification_sent: notification_sent >= 2,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn record_derived_ann_build_failure(
+        &self,
+        index_kind: DerivedIndexKind,
+        consecutive_failures: u32,
+        failed_at: &str,
+        next_retry_at: &str,
+        error_code: &str,
+        error: &str,
+        circuit_open: bool,
+        notify: bool,
+    ) -> Result<DerivedAnnBuildFailureUpdate, String> {
+        validate_required_text("failed_at", failed_at, MAX_METADATA_BYTES)?;
+        validate_required_text("next_retry_at", next_retry_at, MAX_METADATA_BYTES)?;
+        validate_required_text("ANN error_code", error_code, MAX_METADATA_BYTES)?;
+        validate_required_text("ANN error", error, MAX_METADATA_BYTES)?;
+        let mut guard = self.get_connection_named("record_derived_ann_build_failure")?;
+        let conn = guard.as_mut().ok_or("Database not initialized")?;
+        let tx = conn
+            .transaction()
+            .map_err(|db_error| format!("Failed to start ANN failure transaction: {db_error}"))?;
+        // 0 = no notification, 1 = pending delivery/ack, 2 = delivered. The
+        // pending state prevents a second failure from emitting again while
+        // still allowing the frontend to recover a startup event it missed.
+        let notification_status = tx
+            .query_row(
+                r#"
+                SELECT notification_sent
+                FROM derived_ann_build_state
+                WHERE index_kind = ?1
+                "#,
+                [index_kind.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|db_error| format!("Failed to read previous ANN failure: {db_error}"))?;
+        let notification_status = notification_status.unwrap_or(0);
+        let should_notify = notify && notification_status == 0;
+        let next_notification_status = if should_notify {
+            1
+        } else {
+            notification_status
+        };
+        tx.execute(
+            r#"
+            INSERT INTO derived_ann_build_state (
+                index_kind, consecutive_failures, last_failure_at,
+                next_retry_at, last_error_code, last_error,
+                circuit_open, notification_sent, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)
+            ON CONFLICT(index_kind) DO UPDATE SET
+                consecutive_failures = excluded.consecutive_failures,
+                last_failure_at = excluded.last_failure_at,
+                next_retry_at = excluded.next_retry_at,
+                last_error_code = excluded.last_error_code,
+                last_error = excluded.last_error,
+                circuit_open = excluded.circuit_open,
+                notification_sent = excluded.notification_sent,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+            params![
+                index_kind.as_str(),
+                i64::from(consecutive_failures),
+                failed_at,
+                next_retry_at,
+                error_code,
+                error,
+                circuit_open,
+                next_notification_status,
+            ],
+        )
+        .map_err(|db_error| format!("Failed to record ANN build failure: {db_error}"))?;
+        tx.commit()
+            .map_err(|db_error| format!("Failed to commit ANN build failure: {db_error}"))?;
+        Ok(DerivedAnnBuildFailureUpdate {
+            state: DerivedAnnBuildState {
+                index_kind,
+                consecutive_failures,
+                last_failure_at: failed_at.to_string(),
+                next_retry_at: next_retry_at.to_string(),
+                last_error_code: error_code.to_string(),
+                last_error: error.to_string(),
+                circuit_open,
+                notification_sent: next_notification_status >= 2,
+            },
+            should_notify,
+        })
+    }
+
+    pub fn mark_derived_ann_build_notification_sent(
+        &self,
+        index_kind: DerivedIndexKind,
+    ) -> Result<(), String> {
+        let mut guard = self.get_connection_named("mark_derived_ann_build_notification_sent")?;
+        let conn = guard.as_mut().ok_or("Database not initialized")?;
+        conn.execute(
+            r#"
+            UPDATE derived_ann_build_state
+            SET notification_sent = 2, updated_at = CURRENT_TIMESTAMP
+            WHERE index_kind = ?1 AND notification_sent = 1
+            "#,
+            [index_kind.as_str()],
+        )
+        .map_err(|error| format!("Failed to acknowledge ANN build notification: {error}"))?;
+        Ok(())
+    }
+
+    pub fn take_derived_ann_build_notification(
+        &self,
+        index_kind: DerivedIndexKind,
+    ) -> Result<Option<DerivedAnnBuildState>, String> {
+        let mut guard = self.get_connection_named("take_derived_ann_build_notification")?;
+        let conn = guard.as_mut().ok_or("Database not initialized")?;
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Failed to start ANN notification transaction: {error}"))?;
+        let raw = tx
+            .query_row(
+                r#"
+                SELECT consecutive_failures, last_failure_at, next_retry_at,
+                       last_error_code, last_error, circuit_open
+                FROM derived_ann_build_state
+                WHERE index_kind = ?1 AND notification_sent = 1 AND circuit_open != 0
+                "#,
+                [index_kind.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Failed to take ANN build notification: {error}"))?;
+        let Some((
+            consecutive_failures,
+            last_failure_at,
+            next_retry_at,
+            last_error_code,
+            last_error,
+            circuit_open,
+        )) = raw
+        else {
+            tx.commit().map_err(|error| {
+                format!("Failed to finish empty ANN notification transaction: {error}")
+            })?;
+            return Ok(None);
+        };
+        tx.execute(
+            r#"
+            UPDATE derived_ann_build_state
+            SET notification_sent = 2, updated_at = CURRENT_TIMESTAMP
+            WHERE index_kind = ?1 AND notification_sent = 1
+            "#,
+            [index_kind.as_str()],
+        )
+        .map_err(|error| format!("Failed to mark ANN build notification taken: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("Failed to commit ANN notification transaction: {error}"))?;
+        Ok(Some(DerivedAnnBuildState {
+            index_kind,
+            consecutive_failures: u32::try_from(consecutive_failures).map_err(|_| {
+                format!("Invalid ANN consecutive failure count: {consecutive_failures}")
+            })?,
+            last_failure_at,
+            next_retry_at,
+            last_error_code,
+            last_error,
+            circuit_open: circuit_open != 0,
+            notification_sent: true,
+        }))
+    }
+
+    /// Record a ready ANN generation and prune the changes covered by it.
+    /// Callers replacing a live reader must hold that reader slot's publication
+    /// write boundary through this transaction and the in-memory replacement.
+    pub fn record_derived_ann_generation(
+        &self,
+        generation: &DerivedAnnGeneration,
+    ) -> Result<(), String> {
+        let mut guard = self.get_connection_named("record_derived_ann_generation")?;
+        let conn = guard.as_mut().ok_or("Database not initialized")?;
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Failed to start ANN manifest transaction: {error}"))?;
+        let current_epoch: i64 = tx
+            .query_row(
+                "SELECT COALESCE((SELECT data_epoch FROM derived_index_state WHERE index_kind = ?1), 0)",
+                [generation.index_kind.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to read ANN publication epoch: {error}"))?;
+        let current_epoch = u64::try_from(current_epoch)
+            .map_err(|_| format!("Invalid ANN publication epoch: {current_epoch}"))?;
+        if current_epoch < generation.covered_epoch {
+            return Err("ANN generation covers an epoch newer than SQLite".to_string());
+        }
+        tx.execute(
+            r#"
+            INSERT INTO derived_ann_generations (
+                index_kind, generation, covered_epoch, flat_file_name,
+                flat_checksum_sha256, ann_file_name, ann_checksum_sha256,
+                row_count, dimensions, model_id, model_revision,
+                embedding_version, sidecar_format_version, ann_format_version,
+                algorithm, implementation_version, metric, quantization,
+                connectivity, expansion_add, expansion_search, status, created_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'ready', CURRENT_TIMESTAMP
+            )
+            ON CONFLICT(index_kind) DO UPDATE SET
+                generation = excluded.generation,
+                covered_epoch = excluded.covered_epoch,
+                flat_file_name = excluded.flat_file_name,
+                flat_checksum_sha256 = excluded.flat_checksum_sha256,
+                ann_file_name = excluded.ann_file_name,
+                ann_checksum_sha256 = excluded.ann_checksum_sha256,
+                row_count = excluded.row_count,
+                dimensions = excluded.dimensions,
+                model_id = excluded.model_id,
+                model_revision = excluded.model_revision,
+                embedding_version = excluded.embedding_version,
+                sidecar_format_version = excluded.sidecar_format_version,
+                ann_format_version = excluded.ann_format_version,
+                algorithm = excluded.algorithm,
+                implementation_version = excluded.implementation_version,
+                metric = excluded.metric,
+                quantization = excluded.quantization,
+                connectivity = excluded.connectivity,
+                expansion_add = excluded.expansion_add,
+                expansion_search = excluded.expansion_search,
+                status = 'ready',
+                created_at = CURRENT_TIMESTAMP
+            "#,
+            params![
+                generation.index_kind.as_str(),
+                generation.generation,
+                generation.covered_epoch,
+                generation.flat_file_name,
+                generation.flat_checksum_sha256,
+                generation.ann_file_name,
+                generation.ann_checksum_sha256,
+                generation.row_count,
+                generation.dimensions,
+                generation.model_id,
+                generation.model_revision,
+                generation.embedding_version,
+                generation.sidecar_format_version,
+                generation.ann_format_version,
+                generation.algorithm,
+                generation.implementation_version,
+                generation.metric,
+                generation.quantization,
+                generation.connectivity,
+                generation.expansion_add,
+                generation.expansion_search,
+            ],
+        )
+        .map_err(|error| format!("Failed to record ANN generation: {error}"))?;
+        tx.execute(
+            r#"
+            DELETE FROM derived_ann_changes
+            WHERE index_kind = ?1 AND change_epoch <= ?2
+            "#,
+            params![generation.index_kind.as_str(), generation.covered_epoch],
+        )
+        .map_err(|error| format!("Failed to prune covered ANN changes: {error}"))?;
+        tx.execute(
+            "DELETE FROM derived_ann_build_state WHERE index_kind = ?1",
+            [generation.index_kind.as_str()],
+        )
+        .map_err(|error| format!("Failed to clear ANN build failure state: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("Failed to commit ANN manifest: {error}"))?;
+        Ok(())
+    }
+
+    pub fn derived_ann_tail_count(
+        &self,
+        index_kind: DerivedIndexKind,
+        covered_epoch: u64,
+    ) -> Result<u64, String> {
+        let guard = self.get_connection_named("derived_ann_tail_count")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let count: i64 = conn
+            .query_row(
+                r#"
+                SELECT COUNT(*) FROM derived_ann_changes
+                WHERE index_kind = ?1 AND change_epoch > ?2
+                "#,
+                params![index_kind.as_str(), covered_epoch],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to count ANN tail: {error}"))?;
+        u64::try_from(count).map_err(|_| "Invalid ANN tail count".to_string())
+    }
+
+    /// Latest visible vectors and tombstones after an immutable ANN base.
+    /// `None` vectors are deliberate: the subject changed after the base and
+    /// no longer belongs to the current visible set, so base candidates bearing
+    /// that key must be suppressed.
+    pub fn list_derived_ann_tail(
+        &self,
+        index_kind: DerivedIndexKind,
+        covered_epoch: u64,
+        hard_limit: u64,
+    ) -> Result<Vec<DerivedAnnTailRow>, String> {
+        let count = self.derived_ann_tail_count(index_kind, covered_epoch)?;
+        if count > hard_limit {
+            return Err(format!("ann_tail_too_large:{count}"));
+        }
+        self.with_vector_scan_connection("list_derived_ann_tail", |conn| {
+            let mut statement = conn
+                .prepare(
+                    r#"
+                    SELECT
+                        c.subject_key,
+                        CASE WHEN
+                               j.status = 'completed'
+                           AND j.model_id = e.model_id
+                           AND j.model_revision = e.model_revision
+                           AND j.embedding_version = e.embedding_version
+                           AND j.source_fingerprint = e.source_fingerprint
+                        THEN e.dimensions END,
+                        CASE WHEN
+                               j.status = 'completed'
+                           AND j.model_id = e.model_id
+                           AND j.model_revision = e.model_revision
+                           AND j.embedding_version = e.embedding_version
+                           AND j.source_fingerprint = e.source_fingerprint
+                        THEN e.vector_f32 END
+                    FROM derived_ann_changes c
+                    LEFT JOIN derived_embeddings e
+                      ON e.index_kind = c.index_kind AND e.subject_key = c.subject_key
+                    LEFT JOIN derived_index_jobs j
+                      ON j.index_kind = c.index_kind AND j.subject_key = c.subject_key
+                    WHERE c.index_kind = ?1 AND c.change_epoch > ?2
+                    ORDER BY c.subject_key
+                    "#,
+                )
+                .map_err(|error| format!("Failed to prepare ANN tail query: {error}"))?;
+            let rows = statement
+                .query_map(params![index_kind.as_str(), covered_epoch], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                })
+                .map_err(|error| format!("Failed to query ANN tail: {error}"))?;
+            let mut out = Vec::with_capacity(count as usize);
+            for row in rows {
+                let (subject_key, dimensions, blob) =
+                    row.map_err(|error| format!("Failed to read ANN tail: {error}"))?;
+                let vector = match (dimensions, blob) {
+                    (Some(dimensions), Some(blob)) => {
+                        let dimensions = usize::try_from(dimensions)
+                            .map_err(|_| "Invalid ANN tail dimensions".to_string())?;
+                        Some(decode_vector(&blob, dimensions)?)
+                    }
+                    _ => None,
+                };
+                out.push(DerivedAnnTailRow {
+                    subject_key,
+                    vector,
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    pub(crate) fn derived_index_snapshot_for_ann(
+        &self,
+        index_kind: DerivedIndexKind,
+    ) -> Result<(u64, u64, u64, u32, String, String, u32), String> {
+        self.with_vector_scan_connection("derived_index_snapshot_for_ann", |conn| {
+            let snapshot = derived_index_snapshot_metadata_from_conn(conn, index_kind)?;
+            let contract = snapshot
+                .model_contract
+                .ok_or_else(|| "Cannot build ANN from an empty derived index".to_string())?;
+            Ok((
+                snapshot.data_epoch,
+                snapshot.row_count,
+                snapshot.subject_key_bytes,
+                snapshot.dimensions.ok_or("ANN dimensions are missing")?,
+                contract.model_id,
+                contract.model_revision,
+                contract.embedding_version,
+            ))
+        })
+    }
+
+    /// Read one raw-vector page using a short-lived independent connection.
+    /// Background ANN rebuilds use this form so the rollback-journal SHARED
+    /// lock is released between pages; maintenance bootstrap uses the
+    /// single-connection stream below because capture and derived writes are
+    /// paused for that window.
+    pub(crate) fn list_query_visible_ann_snapshot_page_for_ann(
+        &self,
+        index_kind: DerivedIndexKind,
+        after_subject_key: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<DerivedAnnSnapshotRow>, String> {
+        self.with_vector_scan_connection("list_query_visible_ann_snapshot_page_for_ann", |conn| {
+            list_query_visible_ann_snapshot_page_from_conn(
+                conn,
+                index_kind,
+                after_subject_key,
+                limit,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_query_visible_embedding_page_for_ann(
+        &self,
+        index_kind: DerivedIndexKind,
+        after_subject_key: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<DerivedEmbeddingRecord>, String> {
+        self.with_vector_scan_connection("list_query_visible_embedding_page_for_ann", |conn| {
+            list_query_visible_embedding_page_from_conn(conn, index_kind, after_subject_key, limit)
+        })
+    }
+
+    /// Stream the query-visible embedding snapshot through one independent
+    /// read connection. The callback is invoked once per keyset-paginated
+    /// page, so callers can write/process a page before the next one is
+    /// materialized without repeatedly opening and keying SQLCipher.
+    ///
+    /// SQLite remains authoritative; this streams the same query-visible set
+    /// used by the exact scorer. Callers that need a
+    /// stable point-in-time view must hold their own maintenance boundary (the
+    /// ANN bootstrap does); ordinary background rebuilds still verify the row
+    /// count and publication epoch before committing the generation.
+    pub(crate) fn for_each_query_visible_embedding_page_for_ann(
+        &self,
+        index_kind: DerivedIndexKind,
+        limit: u32,
+        mut on_page: impl FnMut(Vec<DerivedAnnSnapshotRow>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if limit == 0 {
+            return Err("ANN snapshot page limit must be greater than zero".to_string());
+        }
+        self.with_vector_scan_connection("for_each_query_visible_embedding_page_for_ann", |conn| {
+            let mut after_subject_key: Option<String> = None;
+            loop {
+                let page = list_query_visible_ann_snapshot_page_from_conn(
+                    conn,
+                    index_kind,
+                    after_subject_key.as_deref(),
+                    limit,
+                )?;
+                if page.is_empty() {
+                    break;
+                }
+                after_subject_key = page.last().map(|row| row.subject_key.clone());
+                on_page(page)?;
+            }
+            Ok(())
+        })
     }
 
     fn record_derived_index_generation(
@@ -1808,30 +2462,7 @@ impl StorageState {
     ) -> Result<DerivedIndexSnapshotMetadata, String> {
         let guard = self.get_connection_named("get_derived_index_snapshot_metadata")?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
-        let data_epoch: i64 = conn
-            .query_row(
-                "SELECT COALESCE((SELECT data_epoch FROM derived_index_state WHERE index_kind = ?1), 0)",
-                [index_kind.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("Failed to read derived index epoch: {error}"))?;
-        let aggregate_sql = visible_embedding_aggregate_sql();
-        let raw = conn
-            .query_row(&aggregate_sql, [index_kind.as_str()], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                ))
-            })
-            .map_err(|error| format!("Failed to inspect derived generation rows: {error}"))?;
-        decode_snapshot_metadata(data_epoch, raw)
+        derived_index_snapshot_metadata_from_conn(conn, index_kind)
     }
 
     fn list_query_visible_embedding_page(
@@ -1842,24 +2473,7 @@ impl StorageState {
     ) -> Result<Vec<DerivedEmbeddingRecord>, String> {
         let guard = self.get_connection_named("list_query_visible_embedding_page")?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
-        let sql = visible_embedding_sql(
-            "AND (?2 IS NULL OR e.subject_key > ?2)",
-            "ORDER BY e.subject_key LIMIT ?3",
-        );
-        let mut statement = conn
-            .prepare(&sql)
-            .map_err(|error| format!("Failed to prepare derived generation page: {error}"))?;
-        let rows = statement
-            .query_map(
-                params![index_kind.as_str(), after_subject_key, limit],
-                map_embedding_row(index_kind),
-            )
-            .map_err(|error| format!("Failed to query derived generation page: {error}"))?;
-        rows.map(|row| {
-            row.map_err(|error| format!("Failed to read derived generation row: {error}"))
-                .and_then(|row| decode_embedding_row(index_kind, row))
-        })
-        .collect()
+        list_query_visible_embedding_page_from_conn(conn, index_kind, after_subject_key, limit)
     }
 
     fn write_sidecar_streaming(
@@ -1932,6 +2546,7 @@ impl StorageState {
 type RawEmbeddingRow = (String, i64, Vec<u8>, String, String, i64, String, String);
 type RawSnapshotMetadata = (
     i64,
+    i64,
     Option<i64>,
     Option<i64>,
     Option<String>,
@@ -1941,6 +2556,191 @@ type RawSnapshotMetadata = (
     Option<i64>,
     Option<i64>,
 );
+type RawAnnGeneration = (
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    String,
+);
+
+fn derived_index_snapshot_metadata_from_conn(
+    conn: &rusqlite::Connection,
+    index_kind: DerivedIndexKind,
+) -> Result<DerivedIndexSnapshotMetadata, String> {
+    let data_epoch: i64 = conn
+        .query_row(
+            "SELECT COALESCE((SELECT data_epoch FROM derived_index_state WHERE index_kind = ?1), 0)",
+            [index_kind.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Failed to read derived index epoch: {error}"))?;
+    let aggregate_sql = visible_embedding_aggregate_sql();
+    let raw = conn
+        .query_row(&aggregate_sql, [index_kind.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        })
+        .map_err(|error| format!("Failed to inspect derived generation rows: {error}"))?;
+    decode_snapshot_metadata(data_epoch, raw)
+}
+
+fn list_query_visible_embedding_page_from_conn(
+    conn: &rusqlite::Connection,
+    index_kind: DerivedIndexKind,
+    after_subject_key: Option<&str>,
+    limit: u32,
+) -> Result<Vec<DerivedEmbeddingRecord>, String> {
+    let sql = visible_embedding_sql(
+        "AND (?2 IS NULL OR e.subject_key > ?2)",
+        "ORDER BY e.subject_key LIMIT ?3",
+    );
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|error| format!("Failed to prepare derived generation page: {error}"))?;
+    let rows = statement
+        .query_map(
+            params![index_kind.as_str(), after_subject_key, limit],
+            map_embedding_row(index_kind),
+        )
+        .map_err(|error| format!("Failed to query derived generation page: {error}"))?;
+    rows.map(|row| {
+        row.map_err(|error| format!("Failed to read derived generation row: {error}"))
+            .and_then(|row| decode_embedding_row(index_kind, row))
+    })
+    .collect()
+}
+
+fn list_query_visible_ann_snapshot_page_from_conn(
+    conn: &rusqlite::Connection,
+    index_kind: DerivedIndexKind,
+    after_subject_key: Option<&str>,
+    limit: u32,
+) -> Result<Vec<DerivedAnnSnapshotRow>, String> {
+    let sql = visible_embedding_page_sql();
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|error| format!("Failed to prepare ANN snapshot page: {error}"))?;
+    let rows = statement
+        .query_map(
+            params![index_kind.as_str(), after_subject_key.unwrap_or(""), limit],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("Failed to query ANN snapshot page: {error}"))?;
+    rows.map(|row| {
+        let (subject_key, dimensions, vector_f32) =
+            row.map_err(|error| format!("Failed to read ANN snapshot row: {error}"))?;
+        let dimensions = u32::try_from(dimensions)
+            .map_err(|_| format!("Invalid ANN snapshot dimensions: {dimensions}"))?;
+        let expected_bytes = usize::try_from(dimensions)
+            .ok()
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| "ANN snapshot vector byte length overflow".to_string())?;
+        if vector_f32.len() != expected_bytes {
+            return Err(format!(
+                "ANN snapshot vector length mismatch: expected {expected_bytes}, got {}",
+                vector_f32.len()
+            ));
+        }
+        Ok(DerivedAnnSnapshotRow {
+            subject_key,
+            dimensions,
+            vector_f32,
+        })
+    })
+    .collect()
+}
+
+fn decode_ann_generation(
+    index_kind: DerivedIndexKind,
+    raw: RawAnnGeneration,
+) -> Result<DerivedAnnGeneration, String> {
+    let (
+        generation,
+        covered_epoch,
+        flat_file_name,
+        flat_checksum_sha256,
+        ann_file_name,
+        ann_checksum_sha256,
+        row_count,
+        dimensions,
+        model_id,
+        model_revision,
+        embedding_version,
+        sidecar_format_version,
+        ann_format_version,
+        algorithm,
+        implementation_version,
+        metric,
+        quantization,
+        connectivity,
+        expansion_add,
+        expansion_search,
+        created_at,
+    ) = raw;
+    let positive_u64 = |name: &str, value: i64| {
+        u64::try_from(value).map_err(|_| format!("Invalid ANN {name}: {value}"))
+    };
+    let positive_u32 = |name: &str, value: i64| {
+        u32::try_from(value).map_err(|_| format!("Invalid ANN {name}: {value}"))
+    };
+    Ok(DerivedAnnGeneration {
+        index_kind,
+        generation: positive_u64("generation", generation)?,
+        covered_epoch: positive_u64("covered epoch", covered_epoch)?,
+        flat_file_name,
+        flat_checksum_sha256,
+        ann_file_name,
+        ann_checksum_sha256,
+        row_count: positive_u64("row count", row_count)?,
+        dimensions: positive_u32("dimensions", dimensions)?,
+        model_id,
+        model_revision,
+        embedding_version: positive_u32("embedding version", embedding_version)?,
+        sidecar_format_version: positive_u32("sidecar format", sidecar_format_version)?,
+        ann_format_version: positive_u32("ANN format", ann_format_version)?,
+        algorithm,
+        implementation_version,
+        metric,
+        quantization,
+        connectivity: positive_u32("connectivity", connectivity)?,
+        expansion_add: positive_u32("expansion add", expansion_add)?,
+        expansion_search: positive_u32("expansion search", expansion_search)?,
+        created_at,
+    })
+}
 
 /// The `derived_index_jobs` projection shared by every ledger read, so the
 /// column list and [`read_job_row`] cannot drift apart.
@@ -2155,7 +2955,9 @@ fn visible_embedding_count_sql() -> String {
 fn visible_embedding_aggregate_sql() -> String {
     format!(
         r#"
-        SELECT COUNT(*), MIN(e.dimensions), MAX(e.dimensions),
+        SELECT COUNT(*),
+               COALESCE(SUM(length(CAST(e.subject_key AS BLOB))), 0),
+               MIN(e.dimensions), MAX(e.dimensions),
                MIN(e.model_id), MAX(e.model_id),
                MIN(e.model_revision), MAX(e.model_revision),
                MIN(e.embedding_version), MAX(e.embedding_version)
@@ -2168,6 +2970,7 @@ fn decode_snapshot_metadata(
     data_epoch: i64,
     (
         row_count,
+        subject_key_bytes,
         min_dimensions,
         max_dimensions,
         min_model_id,
@@ -2182,10 +2985,13 @@ fn decode_snapshot_metadata(
         .map_err(|_| format!("Invalid derived index epoch: {data_epoch}"))?;
     let row_count = u64::try_from(row_count)
         .map_err(|_| format!("Invalid derived generation row count: {row_count}"))?;
+    let subject_key_bytes = u64::try_from(subject_key_bytes)
+        .map_err(|_| format!("Invalid derived generation key byte count: {subject_key_bytes}"))?;
     if row_count == 0 {
         return Ok(DerivedIndexSnapshotMetadata {
             data_epoch,
             row_count,
+            subject_key_bytes,
             dimensions: None,
             model_contract: None,
         });
@@ -2213,6 +3019,7 @@ fn decode_snapshot_metadata(
     Ok(DerivedIndexSnapshotMetadata {
         data_epoch,
         row_count,
+        subject_key_bytes,
         dimensions: Some(dimensions),
         model_contract: Some(DerivedModelContract {
             model_id: min_model_id
@@ -2383,7 +3190,7 @@ pub(super) fn decode_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>,
     Ok(vector)
 }
 
-fn next_generation_id() -> Result<u64, String> {
+pub(crate) fn next_generation_id() -> Result<u64, String> {
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("System clock is before UNIX epoch: {error}"))?
@@ -2595,6 +3402,14 @@ mod tests {
         vector: Vec<f32>,
     ) -> Result<(), String> {
         storage.commit_derived_embedding(&claimed_write(storage, spec, vector))
+    }
+
+    fn current_epoch(storage: &StorageState) -> u64 {
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        u64::try_from(
+            read_derived_data_epoch(guard.as_ref().unwrap(), DerivedIndexKind::ClipImage).unwrap(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3882,6 +4697,352 @@ mod tests {
             .get_derived_index_generation(DerivedIndexKind::SemanticText)
             .unwrap()
             .is_none());
+    }
+
+    fn ann_manifest(covered_epoch: u64) -> DerivedAnnGeneration {
+        DerivedAnnGeneration {
+            index_kind: DerivedIndexKind::ClipImage,
+            generation: 1,
+            covered_epoch,
+            flat_file_name: "clip_image-1.cpdvec".to_string(),
+            flat_checksum_sha256: "00".repeat(32),
+            ann_file_name: "clip_image-1.cpdann".to_string(),
+            ann_checksum_sha256: "11".repeat(32),
+            row_count: 1,
+            dimensions: 2,
+            model_id: "model-a".to_string(),
+            model_revision: "revision-1".to_string(),
+            embedding_version: 1,
+            sidecar_format_version: 4,
+            ann_format_version: 1,
+            algorithm: "hnsw".to_string(),
+            implementation_version: "usearch-2.26.0".to_string(),
+            metric: "ip".to_string(),
+            quantization: "i8".to_string(),
+            connectivity: 16,
+            expansion_add: 160,
+            expansion_search: 256,
+            created_at: "2026-08-13T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn ann_build_failure_state_persists_deduplicates_notification_and_clears_on_publish() {
+        let (_temp, storage) = test_storage();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "hash-base"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        let covered_epoch = current_epoch(&storage);
+
+        let first = storage
+            .record_derived_ann_build_failure(
+                DerivedIndexKind::ClipImage,
+                1,
+                "2026-08-14T00:00:00Z",
+                "2026-08-14T00:15:00Z",
+                "builder_missing",
+                "builder missing",
+                true,
+                true,
+            )
+            .unwrap();
+        assert!(first.should_notify);
+        assert!(!first.state.notification_sent);
+
+        let taken = storage
+            .take_derived_ann_build_notification(DerivedIndexKind::ClipImage)
+            .unwrap()
+            .unwrap();
+        assert!(taken.notification_sent);
+        assert!(storage
+            .take_derived_ann_build_notification(DerivedIndexKind::ClipImage)
+            .unwrap()
+            .is_none());
+
+        let second = storage
+            .record_derived_ann_build_failure(
+                DerivedIndexKind::ClipImage,
+                2,
+                "2026-08-14T00:01:00Z",
+                "2026-08-15T00:01:00Z",
+                "builder_missing",
+                "builder still missing",
+                true,
+                true,
+            )
+            .unwrap();
+        assert!(!second.should_notify);
+        assert_eq!(second.state.consecutive_failures, 2);
+        assert_eq!(
+            storage
+                .get_derived_ann_build_state(DerivedIndexKind::ClipImage)
+                .unwrap()
+                .unwrap(),
+            second.state
+        );
+
+        storage
+            .record_derived_ann_generation(&ann_manifest(covered_epoch))
+            .unwrap();
+        assert!(storage
+            .get_derived_ann_build_state(DerivedIndexKind::ClipImage)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn ann_generation_survives_new_capture_and_tail_tracks_latest_value() {
+        let (_temp, storage) = test_storage();
+        let first = job(DerivedIndexKind::ClipImage, "hash-a");
+        commit_vector(&storage, first.clone(), vec![1.0, 0.0]).unwrap();
+        let covered_epoch = current_epoch(&storage);
+        storage
+            .record_derived_ann_generation(&ann_manifest(covered_epoch))
+            .unwrap();
+
+        let second = job(DerivedIndexKind::ClipImage, "hash-b");
+        commit_vector(&storage, second, vec![0.0, 1.0]).unwrap();
+        assert!(storage
+            .get_derived_ann_generation(DerivedIndexKind::ClipImage)
+            .unwrap()
+            .is_some());
+        let tail = storage
+            .list_derived_ann_tail(DerivedIndexKind::ClipImage, covered_epoch, 100)
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].subject_key, "hash-b");
+        assert_eq!(tail[0].vector.as_deref(), Some(&[0.0, 1.0][..]));
+
+        let mut changed = first;
+        changed.source_fingerprint = "changed-hash-a".to_string();
+        let lease = queue_and_claim(&storage, &changed);
+        storage
+            .commit_derived_embedding(&DerivedEmbeddingWrite {
+                job: changed,
+                lease_token: lease,
+                vector: vec![0.5, 0.5],
+            })
+            .unwrap();
+        let tail = storage
+            .list_derived_ann_tail(DerivedIndexKind::ClipImage, covered_epoch, 100)
+            .unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(
+            tail.iter()
+                .find(|row| row.subject_key == "hash-a")
+                .and_then(|row| row.vector.as_deref()),
+            Some(&[0.5, 0.5][..])
+        );
+    }
+
+    #[test]
+    fn ann_tail_returns_tombstone_after_subject_deletion() {
+        let (_temp, storage) = test_storage();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "hash-delete"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        let covered_epoch = current_epoch(&storage);
+        storage
+            .delete_derived_index_subject(DerivedIndexKind::ClipImage, "hash-delete")
+            .unwrap();
+        let tail = storage
+            .list_derived_ann_tail(DerivedIndexKind::ClipImage, covered_epoch, 100)
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].subject_key, "hash-delete");
+        assert!(tail[0].vector.is_none());
+    }
+
+    #[test]
+    fn ann_tail_returns_tombstone_while_existing_embedding_is_not_query_visible() {
+        let (_temp, storage) = test_storage();
+        let original = job(DerivedIndexKind::ClipImage, "hash-pending");
+        commit_vector(&storage, original.clone(), vec![1.0, 0.0]).unwrap();
+        let covered_epoch = current_epoch(&storage);
+
+        let mut replacement = original;
+        replacement.source_fingerprint = "replacement-source".to_string();
+        storage.upsert_derived_index_job(&replacement).unwrap();
+
+        let tail = storage
+            .list_derived_ann_tail(DerivedIndexKind::ClipImage, covered_epoch, 100)
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].subject_key, "hash-pending");
+        assert!(tail[0].vector.is_none());
+    }
+
+    #[test]
+    fn ann_tail_keeps_only_the_latest_epoch_for_repeated_subject_changes() {
+        let (_temp, storage) = test_storage();
+        let mut spec = job(DerivedIndexKind::ClipImage, "hash-repeat");
+        commit_vector(&storage, spec.clone(), vec![1.0, 0.0]).unwrap();
+        let covered_epoch = current_epoch(&storage);
+
+        spec.source_fingerprint = "second".to_string();
+        let lease = queue_and_claim(&storage, &spec);
+        storage
+            .commit_derived_embedding(&DerivedEmbeddingWrite {
+                job: spec.clone(),
+                lease_token: lease,
+                vector: vec![0.5, 0.5],
+            })
+            .unwrap();
+        let epoch_after_second = current_epoch(&storage);
+
+        spec.source_fingerprint = "third".to_string();
+        let lease = queue_and_claim(&storage, &spec);
+        storage
+            .commit_derived_embedding(&DerivedEmbeddingWrite {
+                job: spec,
+                lease_token: lease,
+                vector: vec![0.0, 1.0],
+            })
+            .unwrap();
+        let epoch_after_third = current_epoch(&storage);
+        assert!(epoch_after_third > epoch_after_second);
+
+        let tail = storage
+            .list_derived_ann_tail(DerivedIndexKind::ClipImage, covered_epoch, 100)
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].subject_key, "hash-repeat");
+        assert_eq!(tail[0].vector.as_deref(), Some(&[0.0, 1.0][..]));
+
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        let conn = guard.as_ref().unwrap();
+        let stored_epoch: i64 = conn
+            .query_row(
+                "SELECT change_epoch FROM derived_ann_changes WHERE index_kind = 'clip_image' AND subject_key = 'hash-repeat'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_epoch as u64, epoch_after_third);
+    }
+
+    #[test]
+    fn recording_new_ann_generation_preserves_changes_that_landed_during_build() {
+        let (_temp, storage) = test_storage();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "hash-base"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        let covered_epoch = current_epoch(&storage);
+
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "hash-during-build"),
+            vec![0.0, 1.0],
+        )
+        .unwrap();
+        let current = current_epoch(&storage);
+        assert!(current > covered_epoch);
+
+        storage
+            .record_derived_ann_generation(&ann_manifest(covered_epoch))
+            .unwrap();
+        let tail = storage
+            .list_derived_ann_tail(DerivedIndexKind::ClipImage, covered_epoch, 100)
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].subject_key, "hash-during-build");
+        assert_eq!(tail[0].vector.as_deref(), Some(&[0.0, 1.0][..]));
+    }
+
+    #[test]
+    fn ann_manifest_cannot_claim_an_epoch_newer_than_sqlite() {
+        let (_temp, storage) = test_storage();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "hash-base"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        let future_epoch = current_epoch(&storage) + 1;
+        assert!(storage
+            .record_derived_ann_generation(&ann_manifest(future_epoch))
+            .is_err());
+        assert!(storage
+            .get_derived_ann_generation(DerivedIndexKind::ClipImage)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn oversized_ann_tail_refuses_partial_overlay() {
+        let (_temp, storage) = test_storage();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "hash-base"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        let covered_epoch = current_epoch(&storage);
+        for key in ["hash-tail-a", "hash-tail-b"] {
+            commit_vector(
+                &storage,
+                job(DerivedIndexKind::ClipImage, key),
+                vec![0.0, 1.0],
+            )
+            .unwrap();
+        }
+        let error = storage
+            .list_derived_ann_tail(DerivedIndexKind::ClipImage, covered_epoch, 1)
+            .unwrap_err();
+        assert_eq!(error, "ann_tail_too_large:2");
+    }
+
+    #[test]
+    fn ann_page_stream_keeps_pending_jobs_out_without_waiting_for_them() {
+        let (_temp, storage) = test_storage();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "hash-a"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "hash-c"),
+            vec![0.0, 1.0],
+        )
+        .unwrap();
+        let pending = job(DerivedIndexKind::ClipImage, "hash-b");
+        ensure_active_subject(&storage, &pending);
+        storage.ensure_derived_index_job(&pending).unwrap();
+
+        let mut pages = Vec::new();
+        storage
+            .for_each_query_visible_embedding_page_for_ann(DerivedIndexKind::ClipImage, 1, |page| {
+                pages.push(
+                    page.into_iter()
+                        .map(|row| row.subject_key)
+                        .collect::<Vec<_>>(),
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            pages,
+            vec![vec!["hash-a".to_string()], vec!["hash-c".to_string()]]
+        );
+        assert_eq!(
+            storage
+                .derived_index_backlog(DerivedIndexKind::ClipImage, 3)
+                .unwrap()
+                .claimable,
+            1
+        );
     }
 
     #[test]

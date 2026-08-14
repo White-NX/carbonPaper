@@ -4,9 +4,11 @@
 //! commands, tray behavior, and application lifecycle into the desktop runtime.
 
 mod analysis;
+mod ann_format;
 mod autostart;
 mod capture;
 mod classification_runtime;
+mod clip_ann;
 mod clip_index;
 mod clip_migration;
 mod clip_preprocess;
@@ -799,6 +801,7 @@ pub fn run() {
         .manage(Arc::new(minilm_migration::MinilmMigrationState::new()))
         .manage(Arc::new(clip_migration::ClipMigrationState::new()))
         .manage(Arc::new(clip_index::ClipIndexRunState::default()))
+        .manage(Arc::new(clip_ann::ClipAnnState::default()))
         .manage(Arc::new(CaptureState::default()))
         .manage(AnalysisState::default())
         .manage(updater::UpdaterState::new())
@@ -948,6 +951,7 @@ pub fn run() {
                         // two never pause and restore capture at the same time.
                         minilm_migration::spawn_minilm_auto_migration(app.handle().clone());
                         clip_migration::spawn_clip_auto_migration(app.handle().clone());
+                        clip_ann::spawn_startup_arm(app.handle().clone());
 
                         let app_handle_cleanup = app.handle().clone();
                         tauri::async_runtime::spawn(async move {
@@ -1161,6 +1165,9 @@ pub fn run() {
             clip_index::clip_index_stop_now,
             clip_index::get_clip_backfill_offer,
             clip_index::set_clip_backfill_decision,
+            clip_ann::clip_ann_retry_now,
+            clip_ann::clip_ann_take_failure_notification,
+            clip_ann::clip_ann_ack_failure_notification,
             rerank::nl_rerank_stop_now,
             minilm_migration::get_minilm_rebuild_status,
             minilm_migration::list_minilm_rebuild_errors,

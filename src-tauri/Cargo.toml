@@ -72,6 +72,8 @@ flate2 = "1"
 window-vibrancy = "0.5"
 open = "5"
 rapidocr-core = { version = "=0.2.2", default-features = false, features = ["tokio", "directml"] }
+memmap2 = "0.9"
+usearch = { version = "=2.26.0", default-features = false }
 
 axum = "0.8"
 tower = "0.5"

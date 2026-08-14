@@ -296,6 +296,29 @@ pub async fn prepare_monitor_for_migration(app: &AppHandle) -> Result<MonitorRes
     })
 }
 
+/// Pause capture for a maintenance task that does not need Python to be
+/// started. ANN bootstrap reads SQLite and launches the Rust ML sidecar only;
+/// starting a stopped monitor just to pause it would add avoidable work and
+/// briefly change a user's explicit stopped state.
+pub async fn pause_capture_for_maintenance(app: &AppHandle) -> Result<MonitorRestore, String> {
+    let monitor = app.state::<MonitorState>();
+    let capture = app.state::<Arc<crate::capture::CaptureState>>();
+    let was_running = monitor
+        .process
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    let was_paused = capture.paused.load(Ordering::SeqCst);
+    if was_running && !was_paused {
+        let _ = crate::monitor::pause_monitor_impl(monitor, capture, app.clone()).await;
+    }
+    Ok(MonitorRestore {
+        was_running,
+        was_paused,
+        started_by_migration: false,
+    })
+}
+
 pub async fn restore_monitor_after_migration(app: &AppHandle, restore: &MonitorRestore) {
     if restore.started_by_migration && !restore.was_running {
         let _ = crate::monitor::stop_monitor_impl(
@@ -306,7 +329,7 @@ pub async fn restore_monitor_after_migration(app: &AppHandle, restore: &MonitorR
         .await;
         return;
     }
-    if !restore.was_paused {
+    if !restore.was_paused && (restore.was_running || restore.started_by_migration) {
         let _ = crate::monitor::resume_monitor_impl(
             app.state::<MonitorState>(),
             app.state::<Arc<crate::capture::CaptureState>>(),

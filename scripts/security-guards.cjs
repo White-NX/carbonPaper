@@ -30,6 +30,7 @@ const COMMAND_TIERS = {
   'monitor::monitor_remove_local_anchors_by_process': 'session_required',
   'script_integrity::debug_trigger_security_alert': 'session_required',
   'commands::storage::storage_get_timeline': 'session_required',
+  'commands::storage::storage_list_recent_screenshots': 'session_required',
   'commands::storage::storage_get_timeline_density': 'session_required',
   'commands::storage::storage_search': 'session_required',
   'commands::storage::storage_get_image': 'session_required',
@@ -187,6 +188,9 @@ const COMMAND_TIERS = {
   'minilm_migration::list_minilm_rebuild_errors': 'session_required',
   'clip_migration::get_clip_rebuild_status': 'public',
   'clip_migration::list_clip_rebuild_errors': 'session_required',
+  'clip_ann::clip_ann_retry_now': 'session_required',
+  'clip_ann::clip_ann_take_failure_notification': 'public',
+  'clip_ann::clip_ann_ack_failure_notification': 'public',
   'maintenance::get_maintenance_status': 'public',
 };
 
