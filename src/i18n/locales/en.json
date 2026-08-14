@@ -1590,7 +1590,8 @@
     "session": {
       "windows": "{{windowCount}} windows",
       "switches": "{{switchCount}} switches",
-      "interruptions": "{{interruptionCount}} interruptions"
+      "interruptions": "{{interruptionCount}} interruptions",
+      "segments": "Folds {{segmentCount}} activities, zoom in to expand"
     }
   }
 }

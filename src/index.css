@@ -269,3 +269,63 @@ body {
 .error-rainbow-text {
   animation: rainbow-shift 3s linear infinite;
 }
+
+/*
+ * A session block that a zoom has just split apart.
+ *
+ * Block identity survives folding, so the block already on screen keeps its
+ * element and stays put while the pieces it was standing in for fade in around
+ * it. Without this the split reads as everything jumping at once.
+ */
+@keyframes tl-fold-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.tl-fold-in {
+  animation: tl-fold-in 140ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tl-fold-in {
+    animation: none;
+  }
+}
+
+/*
+ * Content that must keep its own proportions while the camera stretches the
+ * band it sits on.
+ *
+ * A band is drawn once and then moved by a single horizontal scale, which is
+ * what makes a pan or a zoom cost one composited layer instead of a full
+ * redraw. That scale is right for anything standing for a stretch of time, and
+ * wrong for everything else: an icon, a label and a thumbnail all mean the same
+ * thing however wide the minute under them has become, so a track stretched
+ * even a few per cent shows them visibly squashed or drawn out.
+ *
+ * The camera publishes its scale as `--tl-cam-scale` on each stage, and these
+ * classes divide it back out. The value arrives by inheritance, so a whole
+ * band's worth of labels is corrected by the one property the camera already
+ * writes per frame. Outside a stage the variable is absent and the fallback
+ * leaves the element alone.
+ *
+ * Which origin to use follows from where the element is anchored, because only
+ * the origin is left where it was: pick the edge the layout has pinned, so the
+ * correction is invisible rather than a small sideways jump.
+ */
+.tl-steady {
+  transform: scaleX(calc(1 / var(--tl-cam-scale, 1)));
+  transform-origin: 50% 50%;
+}
+
+/* Anchored to its left edge: the first thing in a row, or a marker sitting on
+   the moment given by its own `left`. */
+.tl-steady-left {
+  transform-origin: 0 50%;
+}
+
+/* Anchored to its right edge: pushed there by `ml-auto` or `right-*`, so the
+   layout still hands it to the stage at the far edge of the block. */
+.tl-steady-right {
+  transform-origin: 100% 50%;
+}

@@ -248,6 +248,37 @@ describe('collapseSessions', () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  it('gives a folded block the same id as its first child', () => {
+    const specs = [['Code', 'a.js', 5000], ['wt', 'x', 100], ['msedge', 'y', 100]];
+
+    const expanded = collapseSessions(activities(specs), { minBlockMs: 1000 });
+    const folded = collapseSessions(activities(specs), { minBlockMs: 20000 });
+
+    expect(expanded).toHaveLength(2);
+    expect(folded).toHaveLength(1);
+    // Identity survives the fold, so zooming does not remount the block
+    expect(folded[0].id).toBe(expanded[0].id);
+  });
+
+  it('breaks ties when two blocks claim the same start', () => {
+    const instant = (appName) => ({
+      key: getActivityKey(appName, ''),
+      appName,
+      windowTitle: '',
+      processIcon: null,
+      category: null,
+      start: 0,
+      end: 0,
+      count: 1,
+      firstEvent: { id: 0, timestamp: 0, appName, windowTitle: '' },
+    });
+
+    const blocks = collapseSessions([instant('a'), instant('b')], { minBlockMs: 0 });
+
+    expect(blocks).toHaveLength(2);
+    expect(new Set(blocks.map((block) => block.id)).size).toBe(2);
+  });
+
   it('returns nothing for an empty input', () => {
     expect(collapseSessions([])).toEqual([]);
     expect(collapseSessions(null)).toEqual([]);
