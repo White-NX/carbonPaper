@@ -688,7 +688,7 @@ impl SemanticRuntimeState {
             last_elapsed_ms: inner.last_elapsed_ms,
             directml_disabled_for_session: inner.directml_disabled_for_session,
             backend: crate::semantic_query::backend_status(None),
-            clip_backend: crate::clip_query::backend_status(None),
+            clip_backend: crate::clip_query::backend_status(None, None),
             classification_backend: crate::classification_runtime::backend_status(None),
         }
     }
@@ -1351,6 +1351,7 @@ pub async fn get_ml_semantic_status(
     storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
     index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
     clip_run: tauri::State<'_, Arc<crate::clip_index::ClipIndexRunState>>,
+    clip_ann: tauri::State<'_, Arc<crate::clip_ann::ClipAnnState>>,
     refresh_diagnostics: Option<bool>,
 ) -> Result<SemanticRuntimeStatus, String> {
     let mut status = state.status();
@@ -1388,16 +1389,20 @@ pub async fn get_ml_semantic_status(
     }
 
     let storage = storage.inner().clone();
+    let clip_ann = clip_ann.inner().clone();
     let (semantic_backend, clip_backend) = tokio::task::spawn_blocking(move || {
         if include_vector_counts {
             (
                 crate::semantic_query::backend_status(Some(storage.as_ref())),
-                crate::clip_query::backend_status(Some(storage.as_ref())),
+                crate::clip_query::backend_status(Some(storage.as_ref()), Some(clip_ann.as_ref())),
             )
         } else {
             (
                 crate::semantic_query::backend_status_without_vector_count(Some(storage.as_ref())),
-                crate::clip_query::backend_status_without_vector_count(Some(storage.as_ref())),
+                crate::clip_query::backend_status_without_vector_count(
+                    Some(storage.as_ref()),
+                    Some(clip_ann.as_ref()),
+                ),
             )
         }
     })

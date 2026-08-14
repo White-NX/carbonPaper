@@ -21,10 +21,12 @@ export function normalizeSnapshotPreviewItem(item, options = {}) {
 
   const screenshotId = item?.screenshot_id ?? item?.id ?? item?.metadata?.screenshot_id;
   const imagePath = item?.image_path || item?.path || item?.metadata?.image_path;
-  const createdAt = item?.created_at
-    || item?.screenshot_created_at
-    || item?.metadata?.created_at
+  // screenshot_created_at 排在前面：搜索结果的 created_at 是 OCR 行的写入时间，
+  // 晚于截图本身，拿它当截图时刻会偏。其他来源没有这个字段，自然落到 created_at。
+  const createdAt = item?.screenshot_created_at
     || item?.metadata?.screenshot_created_at
+    || item?.created_at
+    || item?.metadata?.created_at
     || null;
 
   return {
@@ -49,10 +51,10 @@ export function sanitizeSnapshotPreviewItem(item) {
   const screenshotId = pickFirst(item.screenshot_id, item.id, item.metadata?.screenshot_id);
   const imagePath = pickFirst(item.image_path, item.path, item.metadata?.image_path);
   const createdAt = pickFirst(
-    item.created_at,
     item.screenshot_created_at,
-    item.metadata?.created_at,
     item.metadata?.screenshot_created_at,
+    item.created_at,
+    item.metadata?.created_at,
   );
 
   const metadata = {};

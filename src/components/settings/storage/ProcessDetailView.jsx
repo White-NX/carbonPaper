@@ -3,6 +3,18 @@ import { useTranslation } from 'react-i18next';
 import { ArrowLeft, ChevronLeft, ChevronRight, RefreshCw, Trash2 } from 'lucide-react';
 import { ThumbnailCard } from '../../ThumbnailCard';
 import { SettingsCard } from '../SettingsPrimitives';
+import { captureDateOf } from '../../../lib/search_grouping';
+
+/**
+ * 缩略图上的拍摄时间。
+ *
+ * 以前这里直接把后端给的字符串当文本贴出来，而那是数据库里的世界协调时，
+ * 于是设置页显示的时间和时间线对不上（Issue #166）。
+ */
+function formatCapturedAt(item) {
+  const parsed = captureDateOf(item);
+  return parsed ? parsed.toLocaleString() : '';
+}
 
 export default function ProcessDetailView({
   selectedProcess,
@@ -93,22 +105,24 @@ export default function ProcessDetailView({
               {items.map((item) => {
                 const selected = selectedScreenshotIds.has(item.screenshot_id);
                 const thumbSrc = processThumbMap?.[String(item.screenshot_id)] || null;
+                const capturedAt = formatCapturedAt(item);
                 return (
                   <div
                     key={item.screenshot_id}
                     className={`relative rounded ${selected ? 'ring-2 ring-ide-accent/80' : ''}`}
-                    title={item.created_at}
+                    title={capturedAt}
                   >
                     <ThumbnailCard
                       item={{
                         screenshot_id: item.screenshot_id,
                         image_path: item.image_path,
                         process_name: selectedProcess,
-                        window_title: item.created_at,
+                        window_title: capturedAt,
                         created_at: item.created_at,
+                        timestamp: item.timestamp,
                       }}
                       preloadedSrc={thumbSrc}
-                      footerText={item.created_at}
+                      footerText={capturedAt}
                       footerPersistent
                       onSelect={(payload) => {
                         const id = payload?.screenshot_id ?? payload?.id;

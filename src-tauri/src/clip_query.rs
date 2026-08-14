@@ -23,10 +23,21 @@ pub const CLIP_MIN_SIMILARITY: f32 = 0.32;
 
 /// Timeout budget for text encoding, covering model load and worker wait.
 const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(15);
+/// End-to-end Rust query budget. This covers model encoding, ANN/exact
+/// selection, SQL hydration, decryption, filtering, and pagination.
+const QUERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// A persisted generation is already being checksummed and mmap-opened at
+/// startup. Let that single-flight finish instead of racing it with the exact
+/// scan this feature exists to remove.
+const QUERY_ANN_ARM_WAIT: Duration = Duration::from_secs(10);
 
 /// Python's own bound on `limit`, preserved so the two backends cannot be told
 /// apart by a caller that asks for too much.
 pub const MAX_CLIP_RESULTS: u32 = 200;
+/// Preserve the existing IPC/MCP deep-pagination contract. Requests whose
+/// exact over-fetch exceeds the ANN envelope explicitly use one full exact
+/// scan rather than being silently clamped to a shallower page.
+pub const MAX_CLIP_OFFSET: u32 = 10_000;
 
 const CLIP_RUNTIMES: &[&str] = &["python", "rust"];
 const CLIP_INDEXES: &[&str] = &["chroma", "dual", "rust"];
@@ -95,6 +106,19 @@ pub struct ClipBackendStatus {
     pub index_backlog_age_secs: Option<i64>,
     /// A manual CLIP indexing run is executing right now.
     pub index_run_active: bool,
+    /// Persistent HNSW readiness. `armed` serves ANN candidates; otherwise
+    /// queries remain correct through exact fallback.
+    pub ann_state: String,
+    pub ann_generation: Option<u64>,
+    pub ann_tail_rows: Option<u64>,
+    pub ann_last_error: Option<String>,
+    /// Build health is independent from readiness: a live generation can keep
+    /// serving while its refresh is in backoff.
+    pub ann_build_state: String,
+    pub ann_build_failure_count: u32,
+    pub ann_build_last_failure_at: Option<String>,
+    pub ann_build_next_retry_at: Option<String>,
+    pub ann_build_error_code: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -164,18 +188,23 @@ pub fn observe_python_served() {
     observe_served("python");
 }
 
-pub fn backend_status(storage: Option<&StorageState>) -> ClipBackendStatus {
-    backend_status_impl(storage, true)
+pub fn backend_status(
+    storage: Option<&StorageState>,
+    ann: Option<&crate::clip_ann::ClipAnnState>,
+) -> ClipBackendStatus {
+    backend_status_impl(storage, ann, true)
 }
 
 pub(crate) fn backend_status_without_vector_count(
     storage: Option<&StorageState>,
+    ann: Option<&crate::clip_ann::ClipAnnState>,
 ) -> ClipBackendStatus {
-    backend_status_impl(storage, false)
+    backend_status_impl(storage, ann, false)
 }
 
 fn backend_status_impl(
     storage: Option<&StorageState>,
+    ann: Option<&crate::clip_ann::ClipAnnState>,
     include_vector_count: bool,
 ) -> ClipBackendStatus {
     let guard = OBSERVATIONS
@@ -194,6 +223,37 @@ fn backend_status_impl(
             .derived_index_backlog(DerivedIndexKind::ClipImage, crate::clip_index::MAX_ATTEMPTS)
             .ok()
     });
+    let (ann_state, ann_generation, ann_last_error) = ann
+        .map(crate::clip_ann::ClipAnnState::status)
+        .unwrap_or(("unavailable", None, None));
+    let ann_tail_rows = storage.and_then(|storage| {
+        storage
+            .get_derived_ann_generation(DerivedIndexKind::ClipImage)
+            .ok()
+            .flatten()
+            .and_then(|generation| {
+                storage
+                    .derived_ann_tail_count(DerivedIndexKind::ClipImage, generation.covered_epoch)
+                    .ok()
+            })
+    });
+    let ann_build = storage.and_then(|storage| {
+        storage
+            .get_derived_ann_build_state(DerivedIndexKind::ClipImage)
+            .ok()
+            .flatten()
+    });
+    let ann_build_state = ann_build
+        .as_ref()
+        .map(|state| {
+            if state.circuit_open {
+                "circuit_open"
+            } else {
+                "backoff"
+            }
+        })
+        .unwrap_or("healthy");
+    let persisted_ann_error = ann_build.as_ref().map(|state| state.last_error.clone());
     ClipBackendStatus {
         clip_index: clip_index_backend(),
         clip_runtime: clip_runtime(),
@@ -214,6 +274,22 @@ fn backend_status_impl(
         index_backlog_age_secs: backlog.and_then(|backlog| backlog.oldest_claimable_age_secs),
         // Overwritten by the command, which can reach the run state.
         index_run_active: false,
+        ann_state: ann_state.to_string(),
+        ann_generation,
+        ann_tail_rows,
+        ann_last_error: ann_last_error.or(persisted_ann_error),
+        ann_build_state: ann_build_state.to_string(),
+        ann_build_failure_count: ann_build
+            .as_ref()
+            .map(|state| state.consecutive_failures)
+            .unwrap_or(0),
+        ann_build_last_failure_at: ann_build
+            .as_ref()
+            .map(|state| state.last_failure_at.clone()),
+        ann_build_next_retry_at: ann_build.as_ref().map(|state| state.next_retry_at.clone()),
+        ann_build_error_code: ann_build
+            .as_ref()
+            .map(|state| state.last_error_code.clone()),
     }
 }
 
@@ -338,8 +414,13 @@ async fn run_rust_clip_query(
 ) -> Result<Vec<serde_json::Value>, String> {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    let ann_state = app
+        .state::<Arc<crate::clip_ann::ClipAnnState>>()
+        .inner()
+        .clone();
 
     let started = Instant::now();
+    let deadline = started + QUERY_TOTAL_TIMEOUT;
     let embedding = semantic
         .embed_text(
             app.clone(),
@@ -364,10 +445,17 @@ async fn run_rust_clip_query(
         ));
     }
 
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        let _ = ann_state
+            .wait_for_startup_arm(QUERY_ANN_ARM_WAIT.min(remaining))
+            .await;
+    }
+
     // Python's over-fetch, preserved exactly: enough candidates that the
     // post-scan process and time filters still have a full page to paginate.
     let limit = request.limit.max(1) as usize;
-    let offset = request.offset as usize;
+    let offset = bounded_clip_offset(request.offset);
     let target = limit.saturating_add(offset).max(limit);
     let fetch = target.saturating_mul(2).max(target.saturating_add(20));
 
@@ -386,31 +474,190 @@ async fn run_rust_clip_query(
     // per-row CNG decryption; hopping back onto the async runtime between them
     // would park a tokio worker mid-sequence on the lock the reverse-IPC bridge
     // also needs.
-    let (results, scan_ms) = tokio::task::spawn_blocking(move || {
+    let scan_task = tokio::task::spawn_blocking(move || {
+        if Instant::now() >= deadline {
+            return Err("query_deadline_exceeded_before_scan".to_string());
+        }
         let scan_started = Instant::now();
-        let scored = scan_storage.clip_image_topk(&query_vec, fetch)?;
-        // The floor is applied before hydration so a rejected hit costs no
-        // decryption. Python applies it inside `search_by_text`, at the same
-        // point relative to everything else.
-        let above_floor: Vec<crate::storage::ScoredSubject> = scored
-            .into_iter()
-            .filter(|subject| subject.score >= CLIP_MIN_SIMILARITY)
-            .collect();
-        let rows = hydrate(&scan_storage, &above_floor)?;
-        let filtered = apply_filters(rows, &process_names, start_time, end_time);
+        let _foreground_db = scan_storage.foreground_db_read();
+        let filtered = search_candidates(
+            fetch,
+            target,
+            deadline,
+            |requested| app_ann_query(&ann_state, &scan_storage, &query_vec, requested, deadline),
+            |scored| {
+                filter_scored(
+                    &scan_storage,
+                    scored,
+                    &process_names,
+                    start_time,
+                    end_time,
+                    deadline,
+                )
+            },
+            || app_exact_query(&ann_state, &scan_storage, &query_vec, fetch, deadline),
+        )?;
+        if Instant::now() >= deadline {
+            return Err("query_deadline_exceeded_after_hydrate".to_string());
+        }
         Ok::<_, String>((
             paginate(filtered, offset, limit),
             scan_started.elapsed().as_secs_f64() * 1000.0,
         ))
-    })
-    .await
-    .map_err(|error| format!("scan_task_failed: {error}"))??;
+    });
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let (results, scan_ms) = tokio::time::timeout(remaining, scan_task)
+        .await
+        .map_err(|_| "query_deadline_exceeded".to_string())?
+        .map_err(|error| format!("scan_task_failed: {error}"))??;
 
     tracing::debug!(
         "[CLIP] rust nl query embed={embed_ms:.1}ms scan={scan_ms:.1}ms returned={}",
         results.len()
     );
     Ok(results)
+}
+
+fn app_ann_query(
+    state: &crate::clip_ann::ClipAnnState,
+    storage: &StorageState,
+    query: &[f32],
+    fetch: usize,
+    deadline: Instant,
+) -> Result<CandidateSource, String> {
+    match state.query(storage, query, fetch) {
+        Ok(Some(result)) => {
+            tracing::debug!(
+                "[CLIP:ANN] query mode={} tail={} candidates={}",
+                result.mode,
+                result.tail_rows,
+                result.candidates.len()
+            );
+            Ok(CandidateSource::Ann(result.candidates))
+        }
+        Ok(None) => Ok(CandidateSource::Unavailable),
+        Err(error) => {
+            tracing::warn!("[CLIP:ANN] query failed, using exact fallback: {error}");
+            let fallback = app_exact_query(state, storage, query, fetch, deadline);
+            state.disarm();
+            fallback.map(CandidateSource::ExactFallback)
+        }
+    }
+}
+
+fn app_exact_query(
+    state: &crate::clip_ann::ClipAnnState,
+    storage: &StorageState,
+    query: &[f32],
+    fetch: usize,
+    deadline: Instant,
+) -> Result<Vec<crate::storage::ScoredSubject>, String> {
+    match state.exact_from_generation(storage, query, fetch, Some(deadline))? {
+        Some(result) => {
+            tracing::debug!(
+                "[CLIP:ANN] query mode={} tail={} candidates={}",
+                result.mode,
+                result.tail_rows,
+                result.candidates.len()
+            );
+            Ok(result.candidates)
+        }
+        None => storage.clip_image_topk_with_deadline(query, fetch, deadline),
+    }
+}
+
+enum CandidateSource {
+    Ann(Vec<crate::storage::ScoredSubject>),
+    ExactFallback(Vec<crate::storage::ScoredSubject>),
+    Unavailable,
+}
+
+fn ann_candidate_attempts(fetch: usize) -> Vec<usize> {
+    [1usize, 2, 4]
+        .into_iter()
+        .map(|multiplier| {
+            fetch
+                .saturating_mul(multiplier)
+                .min(crate::clip_ann::ANN_MAX_CANDIDATES)
+        })
+        .fold(Vec::new(), |mut attempts, requested| {
+            if attempts.last().copied() != Some(requested) {
+                attempts.push(requested);
+            }
+            attempts
+        })
+}
+
+fn bounded_clip_offset(offset: u32) -> usize {
+    offset.min(MAX_CLIP_OFFSET) as usize
+}
+
+fn search_candidates(
+    fetch: usize,
+    target: usize,
+    deadline: Instant,
+    mut ann_query: impl FnMut(usize) -> Result<CandidateSource, String>,
+    mut filter: impl FnMut(Vec<crate::storage::ScoredSubject>) -> Result<Vec<serde_json::Value>, String>,
+    exact_scan: impl FnOnce() -> Result<Vec<crate::storage::ScoredSubject>, String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    if fetch > crate::clip_ann::ANN_MAX_CANDIDATES {
+        tracing::debug!(
+            "[CLIP:ANN] fetch={fetch} exceeds candidate envelope; using exact for deep pagination"
+        );
+        return filter(exact_scan()?);
+    }
+
+    let mut best = Vec::new();
+    for requested in ann_candidate_attempts(fetch) {
+        if Instant::now() >= deadline {
+            return Err("query_deadline_exceeded_during_ann_deepening".to_string());
+        }
+        match ann_query(requested)? {
+            CandidateSource::Ann(scored) => {
+                let current = filter(scored)?;
+                if current.len() > best.len() {
+                    best = current;
+                }
+                if best.len() >= target {
+                    return Ok(best);
+                }
+                if requested < crate::clip_ann::ANN_MAX_CANDIDATES {
+                    tracing::debug!(
+                        "[CLIP:ANN] filtered candidates insufficient; deepening after {requested}"
+                    );
+                }
+            }
+            CandidateSource::ExactFallback(scored) => return filter(scored),
+            CandidateSource::Unavailable => return filter(exact_scan()?),
+        }
+    }
+
+    if best.len() >= target || Instant::now() >= deadline {
+        return Ok(best);
+    }
+    filter(exact_scan()?)
+}
+
+fn filter_scored(
+    storage: &StorageState,
+    scored: Vec<crate::storage::ScoredSubject>,
+    process_names: &[String],
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    deadline: Instant,
+) -> Result<Vec<serde_json::Value>, String> {
+    if Instant::now() >= deadline {
+        return Err("query_deadline_exceeded_after_scan".to_string());
+    }
+    // The floor is applied before hydration so a rejected hit costs no
+    // decryption. Python applies it inside `search_by_text`, at the same point
+    // relative to everything else.
+    let above_floor: Vec<crate::storage::ScoredSubject> = scored
+        .into_iter()
+        .filter(|subject| subject.score >= CLIP_MIN_SIMILARITY)
+        .collect();
+    let rows = hydrate_with_deadline(storage, &above_floor, deadline)?;
+    Ok(apply_filters(rows, process_names, start_time, end_time))
 }
 
 /// One scored image resolved to the screenshot that represents it.
@@ -422,18 +669,25 @@ struct ClipHit {
 }
 
 /// Turn scored image hashes into the Python response rows.
-fn hydrate(
+fn hydrate_with_deadline(
     storage: &StorageState,
     scored: &[crate::storage::ScoredSubject],
+    deadline: Instant,
 ) -> Result<Vec<ClipHit>, String> {
     if scored.is_empty() {
         return Ok(Vec::new());
+    }
+    if Instant::now() >= deadline {
+        return Err("query_deadline_exceeded_before_hydrate".to_string());
     }
     let hashes: Vec<String> = scored
         .iter()
         .map(|subject| subject.subject_key.clone())
         .collect();
     let mapped = storage.map_image_hashes_to_screenshot_ids(&hashes)?;
+    if Instant::now() >= deadline {
+        return Err("query_deadline_exceeded_during_hydrate".to_string());
+    }
     // Newest capture of each image, which is what `map_image_hashes_to_screenshot_ids`
     // orders for.
     let representative: HashMap<&String, i64> = mapped
@@ -448,9 +702,15 @@ fn hydrate(
         .into_iter()
         .map(|summary| (summary.id, summary))
         .collect();
+    if Instant::now() >= deadline {
+        return Err("query_deadline_exceeded_during_hydrate".to_string());
+    }
     let texts = storage
         .get_ocr_text_prefixes_by_screenshot_ids_silent(&ids, CLIP_OCR_SNIPPET_CHARS)
         .map_err(|error| format!("hydrate_failed: {error}"))?;
+    if Instant::now() >= deadline {
+        return Err("query_deadline_exceeded_during_hydrate".to_string());
+    }
 
     let mut hits = Vec::with_capacity(scored.len());
     for subject in scored {
@@ -524,15 +784,16 @@ fn created_seconds(timestamp: Option<i64>) -> Option<f64> {
         .map(|seconds| seconds as f64)
 }
 
+/// Render a hit's capture time the way every other backend path renders one:
+/// RFC 3339 in UTC, per `storage/wire_time.rs`.
+///
+/// This used to convert to the machine's local time and drop the zone marker,
+/// which happened to display correctly only because JavaScript reads an
+/// offset-less date-time as local. The OCR path forwarded UTC through the same
+/// field name, so the two search modes disagreed about what the string meant
+/// and no reader could tell them apart — issue #166.
 fn format_created_at(seconds: f64) -> String {
-    chrono::DateTime::from_timestamp(seconds as i64, 0)
-        .map(|value| {
-            value
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        })
-        .unwrap_or_default()
+    crate::storage::wire_time::from_unix_seconds(seconds as i64)
 }
 
 /// Process and time filtering, in Python's order and with Python's tolerance
@@ -580,6 +841,7 @@ fn paginate(rows: Vec<serde_json::Value>, offset: usize, limit: usize) -> Vec<se
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
     fn hit(process: &str, created_secs: Option<f64>) -> ClipHit {
         ClipHit {
@@ -587,6 +849,19 @@ mod tests {
             process_name: process.to_string(),
             created_secs,
         }
+    }
+
+    fn scored(count: usize) -> Vec<crate::storage::ScoredSubject> {
+        (0..count)
+            .map(|index| crate::storage::ScoredSubject {
+                subject_key: format!("subject-{index}"),
+                score: 1.0,
+            })
+            .collect()
+    }
+
+    fn json_rows(count: usize) -> Vec<serde_json::Value> {
+        (0..count).map(|index| serde_json::json!(index)).collect()
     }
 
     #[test]
@@ -686,5 +961,89 @@ mod tests {
         );
         assert_eq!(paginate(rows.clone(), 8, 5).len(), 2);
         assert_eq!(paginate(rows, 20, 5).len(), 0);
+    }
+
+    #[test]
+    fn ann_candidate_search_uses_only_fetch_double_and_quadruple() {
+        assert_eq!(ann_candidate_attempts(100), vec![100, 200, 400]);
+        assert_eq!(ann_candidate_attempts(2_000), vec![2_000, 4_000, 4_096]);
+        assert_eq!(ann_candidate_attempts(4_096), vec![4_096]);
+
+        let calls = RefCell::new(Vec::new());
+        let exact_calls = Cell::new(0);
+        let result = search_candidates(
+            100,
+            10,
+            Instant::now() + Duration::from_secs(1),
+            |requested| {
+                calls.borrow_mut().push(requested);
+                Ok(CandidateSource::Ann(scored(requested)))
+            },
+            |_| Ok(Vec::new()),
+            || {
+                exact_calls.set(exact_calls.get() + 1);
+                Ok(scored(100))
+            },
+        )
+        .unwrap();
+        assert!(result.is_empty());
+        assert_eq!(*calls.borrow(), vec![100, 200, 400]);
+        assert_eq!(exact_calls.get(), 1);
+    }
+
+    #[test]
+    fn exact_fallback_is_not_deepened_or_scanned_again() {
+        let ann_calls = Cell::new(0);
+        let exact_calls = Cell::new(0);
+        let result = search_candidates(
+            100,
+            10,
+            Instant::now() + Duration::from_secs(1),
+            |_| {
+                ann_calls.set(ann_calls.get() + 1);
+                Ok(CandidateSource::ExactFallback(scored(100)))
+            },
+            |_| Ok(json_rows(3)),
+            || {
+                exact_calls.set(exact_calls.get() + 1);
+                Ok(scored(100))
+            },
+        )
+        .unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(ann_calls.get(), 1);
+        assert_eq!(exact_calls.get(), 0);
+    }
+
+    #[test]
+    fn deep_pagination_skips_ann_and_uses_one_exact_scan() {
+        let ann_calls = Cell::new(0);
+        let exact_calls = Cell::new(0);
+        let result = search_candidates(
+            crate::clip_ann::ANN_MAX_CANDIDATES + 1,
+            2_200,
+            Instant::now() + Duration::from_secs(1),
+            |_| {
+                ann_calls.set(ann_calls.get() + 1);
+                Ok(CandidateSource::Ann(Vec::new()))
+            },
+            |_| Ok(json_rows(5)),
+            || {
+                exact_calls.set(exact_calls.get() + 1);
+                Ok(scored(5))
+            },
+        )
+        .unwrap();
+        assert_eq!(result.len(), 5);
+        assert_eq!(ann_calls.get(), 0);
+        assert_eq!(exact_calls.get(), 1);
+    }
+
+    #[test]
+    fn offset_contract_keeps_ten_thousand_and_clamps_above_it() {
+        assert_eq!(MAX_CLIP_OFFSET, 10_000);
+        assert_eq!(bounded_clip_offset(9_999), 9_999);
+        assert_eq!(bounded_clip_offset(10_000), 10_000);
+        assert_eq!(bounded_clip_offset(10_001), 10_000);
     }
 }

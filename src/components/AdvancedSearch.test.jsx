@@ -1,5 +1,5 @@
 import React from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 
@@ -28,20 +28,28 @@ vi.mock('./ThumbnailCard', () => ({
 vi.mock('../lib/monitor_api', () => ({
   searchScreenshots: vi.fn(async () => []),
   fetchImage: vi.fn(async () => null),
+  fetchThumbnail: vi.fn(async () => null),
   fetchThumbnailBatch: vi.fn(async () => ({})),
   listProcesses: vi.fn(async () => [{ process_name: 'code.exe', count: 2 }]),
+  listRecentScreenshots: vi.fn(async () => []),
   getCategoriesFromDb: vi.fn(async () => ['编程开发']),
   batchGetCategories: vi.fn(async () => ({})),
 }));
 
 import { AdvancedSearch } from './AdvancedSearch';
-import { searchScreenshots, listProcesses, getCategoriesFromDb } from '../lib/monitor_api';
+import {
+  searchScreenshots,
+  listProcesses,
+  listRecentScreenshots,
+  getCategoriesFromDb,
+} from '../lib/monitor_api';
 
 const makeOcrResult = (id) => ({
   screenshot_id: id,
   process_name: 'code.exe',
   text: `text-${id}`,
   window_title: `window-${id}`,
+  timestamp: 1_754_900_000 - id,
 });
 
 describe('AdvancedSearch', () => {
@@ -83,6 +91,29 @@ describe('AdvancedSearch', () => {
       expect(listProcesses).toHaveBeenCalledTimes(1);
       expect(getCategoriesFromDb).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it('fills the landing grid from recent captures, not from an empty search', async () => {
+    // 空查询会落进搜索的 OCR 回退路径，那条路径数的是文本块而不是截图。
+    listRecentScreenshots.mockResolvedValueOnce([
+      { screenshot_id: 91, process_name: 'terminal.exe', created_at: 1_754_900_000 },
+      { screenshot_id: 92, process_name: 'terminal.exe', created_at: 1_754_899_970 },
+      { screenshot_id: 93, process_name: 'msedge.exe', created_at: 1_754_899_940 },
+    ]);
+
+    render(
+      <AdvancedSearch
+        active
+        searchParams={{ query: '', mode: 'ocr' }}
+        onSelectResult={vi.fn()}
+        backendOnline
+      />
+    );
+
+    await waitFor(() => {
+      expect(listRecentScreenshots).toHaveBeenCalled();
+    });
+    expect(searchScreenshots).not.toHaveBeenCalledWith('', 'ocr', expect.anything());
   });
 
   it('runs OCR search with debounced query from searchParams', async () => {
@@ -137,7 +168,7 @@ describe('AdvancedSearch', () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText('advancedSearch.search.no_results')).toBeInTheDocument();
+      expect(screen.getByText('advancedSearch.search.no_results_for')).toBeInTheDocument();
     });
   });
 
@@ -157,19 +188,32 @@ describe('AdvancedSearch', () => {
       expect(listProcesses).toHaveBeenCalledTimes(1);
     });
 
+    // 筛选器收在药丸的下拉面板里，逐个展开操作，操作完点开外部把面板收起来。
     fireEvent.click(screen.getByText('advancedSearch.processes.all'));
-    const processCheckbox = screen.getByText('code.exe').closest('label')?.querySelector('input[type="checkbox"]');
+    const processCheckbox = within(screen.getByTestId('filter-panel'))
+      .getByText('code.exe')
+      .closest('label')
+      ?.querySelector('input[type="checkbox"]');
     expect(processCheckbox).not.toBeNull();
     fireEvent.click(processCheckbox);
+    fireEvent.mouseDown(document.body);
 
     fireEvent.click(screen.getByText('advancedSearch.categories.all'));
-    const categoryCheckbox = screen.getByText('编程开发').closest('label')?.querySelector('input[type="checkbox"]');
+    const categoryCheckbox = within(screen.getByTestId('filter-panel'))
+      .getByText('编程开发')
+      .closest('label')
+      ?.querySelector('input[type="checkbox"]');
     expect(categoryCheckbox).not.toBeNull();
     fireEvent.click(categoryCheckbox);
+    fireEvent.mouseDown(document.body);
 
-    const [startInput, endInput] = document.querySelectorAll('input[type="datetime-local"]');
-    fireEvent.change(startInput, { target: { value: '2026-01-02T03:04' } });
-    fireEvent.change(endInput, { target: { value: '2026-01-02T04:05' } });
+    fireEvent.click(screen.getByText('advancedSearch.range.label'));
+    fireEvent.change(document.querySelectorAll('input[type="datetime-local"]')[0], {
+      target: { value: '2026-01-02T03:04' },
+    });
+    fireEvent.change(document.querySelectorAll('input[type="datetime-local"]')[1], {
+      target: { value: '2026-01-02T04:05' },
+    });
 
     await waitFor(() => {
       expect(searchScreenshots).toHaveBeenCalledWith('', 'ocr', expect.objectContaining({
@@ -214,6 +258,65 @@ describe('AdvancedSearch', () => {
     });
 
     expect(screen.getByText('text-41')).toBeInTheDocument();
+  });
+
+  it('publishes loaded OCR markers and highlights a hovered result', async () => {
+    searchScreenshots.mockResolvedValueOnce([makeOcrResult(11), makeOcrResult(12)]);
+    const onTimelineSearchChange = vi.fn();
+
+    render(
+      <AdvancedSearch
+        active
+        searchParams={{ query: 'page', mode: 'ocr' }}
+        onSelectResult={vi.fn()}
+        onTimelineSearchChange={onTimelineSearchChange}
+        backendOnline
+      />
+    );
+
+    await waitFor(() => {
+      expect(onTimelineSearchChange).toHaveBeenCalledWith(expect.objectContaining({
+        markers: expect.arrayContaining([
+          expect.objectContaining({ id: 'screenshot:11' }),
+          expect.objectContaining({ id: 'screenshot:12' }),
+        ]),
+        hoveredIds: [],
+      }));
+    });
+
+    fireEvent.mouseEnter(screen.getByText('text-11').closest('.group'));
+
+    await waitFor(() => {
+      expect(onTimelineSearchChange).toHaveBeenLastCalledWith(expect.objectContaining({
+        hoveredIds: ['screenshot:11'],
+      }));
+    });
+
+    fireEvent.mouseLeave(screen.getByText('text-11').closest('.group'));
+    await waitFor(() => {
+      expect(onTimelineSearchChange).toHaveBeenLastCalledWith(expect.objectContaining({
+        hoveredIds: [],
+      }));
+    });
+  });
+
+  it('does not publish markers for visual search', async () => {
+    searchScreenshots.mockResolvedValueOnce([{ ...makeOcrResult(21), similarity: 0.8 }]);
+    const onTimelineSearchChange = vi.fn();
+
+    render(
+      <AdvancedSearch
+        active
+        searchParams={{ query: 'page', mode: 'nl' }}
+        searchMode="nl"
+        onSelectResult={vi.fn()}
+        onTimelineSearchChange={onTimelineSearchChange}
+        backendOnline
+      />
+    );
+
+    await waitFor(() => expect(searchScreenshots).toHaveBeenCalled());
+    await waitFor(() => expect(onTimelineSearchChange).toHaveBeenLastCalledWith(null));
   });
 
   it('displays search error banner when search fails', async () => {

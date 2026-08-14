@@ -1,8 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { fetchImage, getScreenshotDetails } from '../lib/monitor_api';
 
-export function normalizeTimestampToMs(value, options = {}) {
-  const { assumeUtc = false } = options;
+/**
+ * 把后端给的时间统一换算成毫秒。
+ *
+ * 数字大于 1e10 视为已经是毫秒，否则按 Unix 秒放大一千倍。
+ *
+ * 字符串如果不带时区标记，一律按世界协调时（UTC）解释：数据库里的时间列都由
+ * SQLite 的 `CURRENT_TIMESTAMP` 写入，存的就是 UTC。原先这里由调用方通过
+ * assumeUtc 选项决定，因为 OCR 检索返回 UTC 而自然语言检索返回本地时间；两条
+ * 路径的格式统一之后（见 `storage/wire_time.rs`），这个区分就没有意义了。
+ */
+export function normalizeTimestampToMs(value) {
   if (value === null || value === undefined || value === '') return null;
 
   if (typeof value === 'number' && !Number.isNaN(value)) {
@@ -25,7 +34,7 @@ export function normalizeTimestampToMs(value, options = {}) {
   if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)) {
     iso = raw.replace(' ', 'T');
   }
-  if (assumeUtc && !/[zZ]|[+\-]\d{2}:\d{2}$/.test(iso)) {
+  if (!/[zZ]|[+-]\d{2}:\d{2}$/.test(iso)) {
     iso = `${iso}Z`;
   }
   const parsed = new Date(iso);
@@ -80,7 +89,7 @@ export function useSelectedSnapshot() {
         if (selectedEvent._fromNlSearch) {
           const recordCreatedAt = det?.record?.created_at;
           if (recordCreatedAt) {
-            const dbTimestampMs = normalizeTimestampToMs(recordCreatedAt, { assumeUtc: true });
+            const dbTimestampMs = normalizeTimestampToMs(recordCreatedAt);
             if (dbTimestampMs && Math.abs((selectedEvent.timestamp || 0) - dbTimestampMs) > 5000) {
               setTimelineJump({ time: dbTimestampMs, ts: Date.now() });
             }

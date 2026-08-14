@@ -135,12 +135,10 @@ fn clip_target_size() -> Option<(u32, u32)> {
         let relative = descriptor.preprocessor_file?;
         let appdata = crate::resource_utils::file_in_local_appdata()?;
         // The same two roots, in the same order, that model resolution searches.
-        ["models-onnx", "models"]
-            .into_iter()
-            .find_map(|root| {
-                let bytes = std::fs::read(appdata.join(root).join(relative)).ok()?;
-                crate::clip_preprocess::target_size_from_config(&bytes)
-            })
+        ["models-onnx", "models"].into_iter().find_map(|root| {
+            let bytes = std::fs::read(appdata.join(root).join(relative)).ok()?;
+            crate::clip_preprocess::target_size_from_config(&bytes)
+        })
     })
 }
 
@@ -343,8 +341,17 @@ pub async fn run_clip_index_worker(app: AppHandle) {
         let Ok(_guard) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
             continue;
         };
-        if let Err(error) = run_pass(&app, PassMode::Idle).await {
-            tracing::warn!("[CLIP:INDEX] idle pass failed: {error}");
+        match run_pass(&app, PassMode::Idle).await {
+            Ok(outcome) if outcome.refused.is_none() && outcome.stopped_because.is_none() => {
+                // A first base generation is useful as soon as *any* migrated
+                // vectors exist. Pending captures become the exact tail and
+                // must not postpone acceleration of the existing corpus.
+                if let Err(error) = crate::clip_ann::maybe_rebuild(&app, false).await {
+                    tracing::warn!("[CLIP:ANN] idle rebuild failed: {error}");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("[CLIP:INDEX] idle pass failed: {error}"),
         }
     }
 }
@@ -1354,6 +1361,11 @@ pub async fn clip_index_run_now(
     let _active = run.begin();
 
     let outcome = run_pass(&app, PassMode::Manual).await?;
+    if outcome.refused.is_none() && outcome.stopped_because.is_none() {
+        if let Err(error) = crate::clip_ann::maybe_rebuild(&app, false).await {
+            tracing::warn!("[CLIP:ANN] manual rebuild failed: {error}");
+        }
+    }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let backlog = tokio::task::spawn_blocking(move || {
         storage

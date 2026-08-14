@@ -400,6 +400,31 @@ pub async fn storage_get_timeline_density(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
+/// Returns the most recent captures, newest first, for the search landing area.
+///
+/// Authentication: required. `limit` defaults to 60 and is clamped to 500 by the
+/// storage layer. Returns an array of `RecentCapture` objects.
+/// Frontend: `lib/monitor_api.js`.
+///
+/// Separate from [`storage_search`] on purpose: an empty search query reaches a
+/// fallback that joins `ocr_results`, which counts text blocks rather than
+/// screenshots and cannot use an index for its ordering. See
+/// `storage/screenshot.rs::list_recent_screenshots`.
+#[tauri::command]
+pub async fn storage_list_recent_screenshots(
+    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
+    state: tauri::State<'_, Arc<StorageState>>,
+    limit: Option<i64>,
+) -> Result<Vec<storage::RecentCapture>, String> {
+    check_auth_required(&credential_state)?;
+
+    let state = state.inner().clone();
+    let limit = limit.unwrap_or(60);
+    tokio::task::spawn_blocking(move || state.list_recent_screenshots(limit))
+        .await
+        .map_err(|e| format!("Task join error: {:?}", e))?
+}
+
 /// Searches OCR records with pagination, fuzzy matching, process, time, and category filters.
 ///
 /// Authentication: required. Returns an array of `SearchResult` objects; optional
@@ -891,7 +916,10 @@ pub async fn storage_list_processes(
 ) -> Result<Vec<serde_json::Value>, String> {
     check_auth_required(&credential_state)?;
 
-    let processes = state.list_distinct_processes()?;
+    let state = state.inner().clone();
+    let processes = tokio::task::spawn_blocking(move || state.list_distinct_processes())
+        .await
+        .map_err(|e| format!("Task join error: {:?}", e))??;
     Ok(processes
         .into_iter()
         .map(|(name, count)| {
@@ -1251,7 +1279,10 @@ pub async fn storage_get_categories_from_db(
 ) -> Result<Vec<String>, String> {
     check_auth_required(&credential_state)?;
 
-    state.get_categories_from_db()
+    let state = state.inner().clone();
+    tokio::task::spawn_blocking(move || state.get_categories_from_db())
+        .await
+        .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
 /// Looks up categories for multiple image hashes.

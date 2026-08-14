@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { invoke } from '@tauri-apps/api/core';
 import { useTauriEventListener } from './useTauriEventListener';
 
 export function useAppNotifications() {
+  const { t } = useTranslation();
   const [showNotifications, setShowNotifications] = useState(false);
   const [notifications, setNotifications] = useState([]);
   const [hiddenToastIds, setHiddenToastIds] = useState(() => new Set());
@@ -17,8 +20,21 @@ export function useAppNotifications() {
         return next;
       });
     }
-    setNotifications((prev) => [notification, ...prev].slice(0, 200));
+    setNotifications((prev) => [
+      notification,
+      ...prev.filter((existing) => existing.id !== notification.id),
+    ].slice(0, 200));
   }, []);
+
+  const normalizeToastPayload = useCallback((payload = {}) => ({
+    id: payload.id || `toast-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    type: payload.type || 'info',
+    title: payload.titleKey ? t(payload.titleKey) : (payload.title || 'CarbonPaper'),
+    message: payload.messageKey ? t(payload.messageKey) : (payload.message || ''),
+    details: payload.details || '',
+    timestamp: payload.timestamp || Date.now(),
+    toastDuration: payload.toastDuration,
+  }), [t]);
 
   useTauriEventListener('security-alert', (event) => {
     const payload = event.payload || {};
@@ -31,15 +47,36 @@ export function useAppNotifications() {
 
   useTauriEventListener('app-toast', (event) => {
     const payload = event.payload || {};
-    pushNotification({
-      id: payload.id || `toast-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      type: payload.type || 'info',
-      title: payload.title || 'CarbonPaper',
-      message: payload.message || '',
-      details: payload.details || '',
-      timestamp: payload.timestamp || Date.now(),
-    });
-  }, [pushNotification]);
+    pushNotification(normalizeToastPayload(payload));
+    if (payload.ackCommand) {
+      invoke(payload.ackCommand).catch((error) => {
+        console.warn(`Failed to acknowledge ${payload.ackCommand}`, error);
+      });
+    }
+  }, [normalizeToastPayload, pushNotification]);
+
+  useEffect(() => {
+    let active = true;
+    let retryTimer = null;
+    let warned = false;
+    const takePending = async () => {
+      try {
+        const payload = await invoke('clip_ann_take_failure_notification');
+        if (active && payload) pushNotification(normalizeToastPayload(payload));
+      } catch (error) {
+        if (!warned) {
+          warned = true;
+          console.warn('Failed to restore pending ANN notification', error);
+        }
+        if (active) retryTimer = window.setTimeout(takePending, 5000);
+      }
+    };
+    takePending();
+    return () => {
+      active = false;
+      if (retryTimer) window.clearTimeout(retryTimer);
+    };
+  }, [normalizeToastPayload, pushNotification]);
 
   const dismissNotification = useCallback((id) => {
     setNotifications((prev) => prev.filter((n) => n.id !== id));

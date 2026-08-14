@@ -3,6 +3,7 @@
 use crate::credential_manager::{decrypt_row_key_with_cng, decrypt_with_master_key};
 use serde::{Deserialize, Serialize};
 
+use super::wire_time;
 use super::StorageState;
 
 /// Screenshot record representing a row in the screenshots table, with decrypted fields.
@@ -16,6 +17,9 @@ pub struct ScreenshotRecord {
     pub height: Option<i32>,
     pub window_title: Option<String>,
     pub process_name: Option<String>,
+    /// Capture time as RFC 3339 in UTC; see `storage/wire_time.rs`. The same
+    /// instant is available as Unix seconds in
+    /// [`ScreenshotRecord::timestamp`], which display code should prefer.
     pub created_at: String,
     pub metadata: Option<String>,
     pub timestamp: Option<i64>,
@@ -86,8 +90,90 @@ pub struct SearchResult {
     pub window_title: Option<String>,
     pub process_name: Option<String>,
     pub category: Option<String>,
+    /// When the OCR row was written, which is when recognition finished rather
+    /// than when the capture happened — `commit_screenshot` inserts these after
+    /// the screenshot row, and a backlog can push them much later. Callers that
+    /// want the moment the user saw the screen want
+    /// [`SearchResult::screenshot_created_at`].
+    ///
+    /// RFC 3339 in UTC; see `storage/wire_time.rs`.
     pub created_at: String,
+    /// When the screenshot was captured. RFC 3339 in UTC.
     pub screenshot_created_at: String,
+    /// The same instant as [`SearchResult::screenshot_created_at`] in Unix
+    /// seconds, matching [`ScreenshotRecord::timestamp`] and the `timestamp`
+    /// CLIP hits carry. Present so display code never has to interpret a
+    /// string, and `None` only when the row has no usable time at all.
+    pub timestamp: Option<i64>,
+}
+
+/// One recent capture as shown in the search landing area.
+///
+/// Deliberately narrower than [`ScreenshotRecord`]: the landing grid needs a
+/// thumbnail, a source label and a timestamp, so decrypting page icons, links
+/// and metadata would be wasted CNG work on every panel open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentCapture {
+    /// Named `screenshot_id` rather than `id` so the landing grid and the
+    /// search result rows can share one thumbnail component.
+    pub screenshot_id: i64,
+    pub image_path: String,
+    pub window_title: Option<String>,
+    pub process_name: Option<String>,
+    pub category: Option<String>,
+    pub created_at: String,
+}
+
+/// Raw `screenshots` row backing [`RecentCapture`], read without decryption so
+/// the DB mutex is released before any CNG call — the same two-phase shape
+/// `screenshot.rs::query_time_range` uses.
+pub(super) struct RawRecentCaptureRow {
+    pub(super) id: i64,
+    pub(super) image_path: String,
+    pub(super) window_title_plain: Option<String>,
+    pub(super) process_name_plain: Option<String>,
+    pub(super) window_title_enc: Option<Vec<u8>>,
+    pub(super) process_name_enc: Option<Vec<u8>>,
+    pub(super) content_key_enc: Option<Vec<u8>>,
+    pub(super) category: Option<String>,
+    pub(super) created_at: String,
+}
+
+impl RawRecentCaptureRow {
+    /// Decrypt the two label fields and produce a [`RecentCapture`].
+    /// Runs outside the DB mutex.
+    pub(super) fn into_capture(self) -> RecentCapture {
+        let mut row_key = self
+            .content_key_enc
+            .as_ref()
+            .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+
+        let window_title = match (self.window_title_enc.as_ref(), row_key.as_ref()) {
+            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                .ok()
+                .and_then(|v| String::from_utf8(v).ok()),
+            _ => self.window_title_plain,
+        };
+        let process_name = match (self.process_name_enc.as_ref(), row_key.as_ref()) {
+            (Some(data), Some(key)) => decrypt_with_master_key(key, data)
+                .ok()
+                .and_then(|v| String::from_utf8(v).ok()),
+            _ => self.process_name_plain,
+        };
+
+        if let Some(ref mut key) = row_key {
+            StorageState::zeroize_bytes(key);
+        }
+
+        RecentCapture {
+            screenshot_id: self.id,
+            image_path: self.image_path,
+            window_title,
+            process_name,
+            category: self.category,
+            created_at: wire_time::from_sqlite_utc(&self.created_at),
+        }
+    }
 }
 
 /// The input for saving a screenshot, containing all necessary data and metadata.
@@ -258,7 +344,7 @@ impl RawScreenshotRow {
             process_name,
             timestamp: self.timestamp,
             metadata,
-            created_at: self.created_at,
+            created_at: wire_time::from_sqlite_utc(&self.created_at),
             source: self.source,
             page_url,
             page_icon,

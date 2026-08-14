@@ -172,11 +172,7 @@ mod tests {
 
     fn gradient(width: u32, height: u32) -> RgbImage {
         RgbImage::from_fn(width, height, |x, y| {
-            image::Rgb([
-                (x % 256) as u8,
-                (y % 256) as u8,
-                ((x + y) % 256) as u8,
-            ])
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
         })
     }
 

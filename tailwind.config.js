@@ -13,7 +13,7 @@ export default {
         'ide-border': 'rgb(var(--ide-border-rgb) / <alpha-value>)',
         'ide-text': 'var(--ide-text)',
         'ide-muted': 'var(--ide-muted)',
-        'ide-accent': 'var(--ide-accent)',
+        'ide-accent': 'rgb(var(--ide-accent-rgb) / <alpha-value>)',
         'ide-active': 'var(--ide-active)',
         'ide-hover': 'var(--ide-hover)',
         'ide-error': 'var(--ide-error)',

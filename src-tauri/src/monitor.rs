@@ -732,7 +732,7 @@ pub async fn monitor_search_nl(
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let limit = limit.unwrap_or(20).min(crate::clip_query::MAX_CLIP_RESULTS);
-    let offset = offset.unwrap_or(0);
+    let offset = offset.unwrap_or(0).min(crate::clip_query::MAX_CLIP_OFFSET);
     let process_names = process_names.unwrap_or_default();
 
     // M2.5 step 9: Rust answers this from the migrated CLIP image index when the

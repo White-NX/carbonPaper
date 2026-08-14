@@ -30,6 +30,7 @@ const PROGRESS_SOURCES = {
 const MIGRATION_KINDS = {
   minilm_migration: { id: 'minilm', icon: Database, read: getMinilmRebuildStatus },
   clip_migration: { id: 'clip', icon: ImageIcon, read: getClipRebuildStatus },
+  clip_ann_bootstrap: { id: 'clip', icon: ImageIcon, read: null, phase: 'building_ann' },
 };
 
 function formatEta(seconds) {
@@ -73,8 +74,8 @@ export default function VectorMigrationOverlay() {
       const kind = MIGRATION_KINDS[maintenance.reason];
       // A detailed read that fails costs the box its progress bar, not its
       // presence: the app is demonstrably in maintenance mode either way.
-      let next = null;
-      if (kind) {
+      let next = kind?.phase ? { running: true, phase: kind.phase } : null;
+      if (kind?.read) {
         try {
           next = await kind.read();
         } catch {

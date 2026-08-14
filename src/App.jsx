@@ -54,6 +54,7 @@ function App() {
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
   const [searchMode, setSearchMode] = useState('ocr');
   const [advancedSearchParams, setAdvancedSearchParams] = useState({ query: '', mode: 'ocr', refreshKey: Date.now() });
+  const [timelineSearch, setTimelineSearch] = useState(null);
 
   const openOcrModelRepair = useCallback(() => {
     setShowSettings(false);
@@ -191,9 +192,19 @@ function App() {
   const selectSearchResult = useCallback((res) => {
     const screenshotId = res.screenshot_id !== undefined ? res.screenshot_id : (res.metadata?.screenshot_id);
     const imagePath = res.image_path || res.metadata?.image_path;
-    const timestamp = res.screenshot_created_at || res.metadata?.screenshot_created_at || res.metadata?.created_at || res.created_at || new Date().toISOString();
+    // screenshot_created_at 才是拍摄时刻；OCR 检索结果里的 created_at 是识别完成
+    // 的时间，晚于拍摄，只能当最后的退路。时间未知的向量命中会把 timestamp 写成
+    // 0，那要跳过而不是当成 1970 年。
+    const seconds = [res.timestamp, res.metadata?.timestamp]
+      .find((value) => typeof value === 'number' && value > 0);
+    const timestamp = seconds
+      ?? res.screenshot_created_at
+      ?? res.metadata?.screenshot_created_at
+      ?? res.created_at
+      ?? res.metadata?.created_at
+      ?? new Date().toISOString();
     const isNl = res.similarity !== undefined || res.distance !== undefined || (res.metadata?.screenshot_id !== undefined && res.screenshot_id === undefined);
-    const timestampMs = normalizeTimestampToMs(timestamp, { assumeUtc: !isNl });
+    const timestampMs = normalizeTimestampToMs(timestamp);
 
     if (screenshotId !== undefined || imagePath) {
       setSelectedEvent({
@@ -317,6 +328,8 @@ function App() {
           highlightedEventId={highlightedEventId}
           refreshKey={timelineRefreshKey}
           sqlPaused={!windowFocused}
+          searchState={activeTab === 'advanced-search' ? timelineSearch : null}
+          onSelectSearchResult={selectSearchResult}
         />
 
         <main className="flex-1 flex flex-col md:flex-row overflow-hidden relative bg-ide-bg">
@@ -341,6 +354,7 @@ function App() {
             onSearchModeChange={setSearchMode}
             backendOnline={backendStatus === 'online'}
             isAuthenticated={isAuthenticated}
+            onTimelineSearchChange={setTimelineSearch}
             onAdvancedSelect={selectSearchResult}
             onInspectorBoxClick={(box) => handleCopyText(box.label)}
             onDeleteRecord={async (id) => {

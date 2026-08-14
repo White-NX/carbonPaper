@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use tauri::AppHandle;
 use tauri::Emitter;
+use tauri::Manager;
 use walkdir::WalkDir;
 
 use super::{super::StorageState, MigrationRunGuard};
@@ -52,6 +53,8 @@ impl StorageState {
             return Err(msg);
         }
 
+        crate::clip_ann::spawn_startup_arm(app_handle.clone());
+
         let _ = app_handle.emit(
             "storage-migration-error",
             json!({ "message": message.clone(), "recoverable": true, "cancelled": cancelled }),
@@ -87,10 +90,21 @@ impl StorageState {
         // Wait for an in-flight sidecar publication to finish before closing,
         // copying, or removing the current data directory. New publishers see
         // migration_in_progress and fail before entering this boundary.
-        let _derived_publish_guard = self
-            .derived_generation_publish_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _derived_publish_guard = self.derived_generation_publish_guard();
+
+        // Searches pin the currently armed generation through an Arc while
+        // scanning its mmap files. Wait for all such foreground work to
+        // finish, and prevent new searches from opening the old database,
+        // before disarming or moving the directory.
+        let _foreground_gate = self.foreground_db_write();
+
+        // The reader holds mmap views into the current data directory. Drop
+        // them before files are copied or removed; Windows will not unlink a
+        // mapped generation, and carrying it across reinitialization could
+        // serve candidates from the old database.
+        app_handle
+            .state::<std::sync::Arc<crate::clip_ann::ClipAnnState>>()
+            .disarm();
 
         let src = self
             .data_dir
@@ -342,6 +356,8 @@ impl StorageState {
             );
             return Err(msg);
         }
+
+        crate::clip_ann::spawn_startup_arm(app_handle.clone());
 
         let _ = app_handle.emit(
             "storage-migration-done",

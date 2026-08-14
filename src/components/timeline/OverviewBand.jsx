@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { accentWithAlpha, inkAlpha } from '../../lib/timeline_palette';
+import SearchMarkerLayer from './SearchMarkerLayer';
 
 /** Minimum draggable viewport width in pixels. */
 const MIN_VIEWPORT_PX = 10;
@@ -18,6 +19,8 @@ export default function OverviewBand({
   onSeek,
   onSeekRange,
   onInteractingChange,
+  searchMarkers,
+  hoveredSearchMarkerIds,
 }) {
   const canvasRef = useRef(null);
   const rootRef = useRef(null);
@@ -147,6 +150,15 @@ export default function OverviewBand({
       data-keep-selection="true"
     >
       <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none" />
+
+      <SearchMarkerLayer
+        compact
+        markers={searchMarkers}
+        hoveredIds={hoveredSearchMarkerIds}
+        timeToX={timeToX}
+        width={width}
+        height={height}
+      />
 
       <div
         className="absolute top-0 bottom-0 rounded-sm border border-ide-accent pointer-events-none"

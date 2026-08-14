@@ -537,7 +537,7 @@ async fn run_clip_migration(
         run.monitor_was_running = restore.was_running();
         run.monitor_was_paused = restore.was_paused();
 
-        let phase_result = async {
+        let phase_result: Result<(), String> = async {
             // Everything after prepare_monitor_for_migration must flow through
             // phase_result: an early `?` here would skip the monitor restore
             // below and leave capture silently paused.
@@ -560,7 +560,22 @@ async fn run_clip_migration(
             run.removed_extra = removed;
             persist_run(&storage, &state, &mut run)?;
 
-            publish_generation(&app, &state, &mut run).await
+            publish_generation(&app, &state, &mut run).await?;
+
+            // Reuse the maintenance/capture-pause window for the initial ANN
+            // generation. This reads the vectors just copied into SQLite; it
+            // does not revisit Chroma and it leaves pending Rust backfill rows
+            // as the bounded exact tail.
+            run.phase = "building_ann".to_string();
+            persist_run(&storage, &state, &mut run)?;
+            if let Err(error) = crate::clip_ann::bootstrap_in_maintenance(&app).await {
+                // ANN is rebuildable acceleration. A failure must not turn a
+                // successful authoritative Chroma -> SQLite migration into an
+                // endlessly repeated data copy; startup will retry bootstrap
+                // from SQLite after the migration sentinel settles.
+                tracing::warn!("[CLIP:ANN] migration-window bootstrap failed: {error}");
+            }
+            Ok(())
         }
         .await;
 
@@ -734,7 +749,22 @@ async fn run_auto_migration(app: AppHandle) -> Result<(), String> {
         tokio::time::sleep(AUTH_POLL_INTERVAL).await;
     }
     tracing::info!("[CLIP] starting the automatic Chroma copy migration");
-    try_start_clip_migration(&app, &migration).map(|_| ())
+    loop {
+        if migration.running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if crate::maintenance::is_active() {
+            tokio::time::sleep(AUTH_POLL_INTERVAL).await;
+            continue;
+        }
+        match try_start_clip_migration(&app, &migration) {
+            Ok(_) => return Ok(()),
+            Err(error) if error == crate::maintenance::MAINTENANCE_IN_PROGRESS => {
+                tokio::time::sleep(AUTH_POLL_INTERVAL).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn start_clip_migration_inner(

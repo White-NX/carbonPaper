@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Play } from 'lucide-react';
+import { Focus, Play } from 'lucide-react';
 import { getTimeline, getTimelineDensity, fetchThumbnailBatch, clearTimelineImageQueue } from '../lib/monitor_api';
 import {
   aggregateAppDistribution,
@@ -14,6 +14,8 @@ import { accentWithAlpha } from '../lib/timeline_palette';
 import OverviewBand from './timeline/OverviewBand';
 import SessionBand from './timeline/SessionBand';
 import DetailTrack from './timeline/DetailTrack';
+import SearchMarkerLayer from './timeline/SearchMarkerLayer';
+import { getSearchMarkerFitRange } from '../lib/timeline_search';
 
 const MINUTE = 60000;
 const HOUR = 3600000;
@@ -117,7 +119,16 @@ function formatTick(date, stepMs) {
   return `${hours}:${minutes}:${seconds}`;
 }
 
-const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedEventId, refreshKey, sqlPaused }) => {
+const Timeline = ({
+  onSelectEvent,
+  onClearHighlight,
+  jumpTimestamp,
+  highlightedEventId,
+  refreshKey,
+  sqlPaused,
+  searchState,
+  onSelectSearchResult,
+}) => {
   const { t } = useTranslation();
   const containerRef = useRef(null);
 
@@ -146,6 +157,8 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
   const wheelIdleTimerRef = useRef(null);
   const pendingImageIdsRef = useRef([]);
   const batchTimerRef = useRef(null);
+  const searchFitKeyRef = useRef(null);
+  const searchFitSuspendedRef = useRef(false);
 
   const visibleSpan = width > 0 ? width / zoom : HOUR;
   const viewStart = centerTime - visibleSpan / 2;
@@ -157,9 +170,12 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
       ? 'session'
       : 'day';
 
-  const overviewSpan = Math.min(
-    OVERVIEW_MAX_SPAN,
-    Math.max(OVERVIEW_MIN_SPAN, visibleSpan * OVERVIEW_SPAN_FACTOR),
+  const overviewSpan = Math.max(
+    visibleSpan,
+    Math.min(
+      OVERVIEW_MAX_SPAN,
+      Math.max(OVERVIEW_MIN_SPAN, visibleSpan * OVERVIEW_SPAN_FACTOR),
+    ),
   );
   const overviewStart = overviewAnchor - overviewSpan / 2;
   const overviewEnd = overviewAnchor + overviewSpan / 2;
@@ -386,33 +402,67 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
     setImageEpoch((prev) => prev + 1);
   }, []);
 
+  const suspendSearchFit = useCallback(() => {
+    if (searchState?.markers?.length) searchFitSuspendedRef.current = true;
+  }, [searchState]);
+
   const seekTo = useCallback((time) => {
+    suspendSearchFit();
     setIsFollowingNow(false);
     setCenterTime(time);
-  }, []);
+  }, [suspendSearchFit]);
 
   const seekRange = useCallback((from, to) => {
     if (!width || to <= from) return;
+    suspendSearchFit();
     setIsFollowingNow(false);
     setCenterTime((from + to) / 2);
     setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, width / (to - from))));
     resetImagePipeline();
-  }, [width, MIN_ZOOM, MAX_ZOOM, resetImagePipeline]);
+  }, [width, MIN_ZOOM, MAX_ZOOM, resetImagePipeline, suspendSearchFit]);
+
+  const fitSearchMarkers = useCallback(() => {
+    const range = getSearchMarkerFitRange(searchState?.markers);
+    if (!range || !width) return;
+    setIsFollowingNow(false);
+    setCenterTime((range.from + range.to) / 2);
+    setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, width / (range.to - range.from))));
+    resetImagePipeline();
+  }, [searchState?.markers, width, MIN_ZOOM, MAX_ZOOM, resetImagePipeline]);
+
+  useEffect(() => {
+    if (!searchState?.fitKey || !searchState.markers?.length) {
+      searchFitKeyRef.current = null;
+      searchFitSuspendedRef.current = false;
+      return;
+    }
+    if (!width) return;
+
+    const isNewSearch = searchFitKeyRef.current !== searchState.fitKey;
+    if (isNewSearch) {
+      searchFitKeyRef.current = searchState.fitKey;
+      searchFitSuspendedRef.current = false;
+    }
+
+    if (isNewSearch && !searchFitSuspendedRef.current) fitSearchMarkers();
+  }, [searchState?.fitKey, searchState?.markers, width, fitSearchMarkers]);
 
   const zoomToSpan = useCallback((spanMs) => {
     if (!width) return;
+    suspendSearchFit();
     setIsFollowingNow(false);
     setCenterTime(Date.now());
     setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, width / spanMs)));
     resetImagePipeline();
-  }, [width, MIN_ZOOM, MAX_ZOOM, resetImagePipeline]);
+  }, [width, MIN_ZOOM, MAX_ZOOM, resetImagePipeline, suspendSearchFit]);
 
   const jumpToNow = useCallback(() => {
+    suspendSearchFit();
     setCenterTime(Date.now());
     setZoom(MAX_ZOOM);
     setIsFollowingNow(true);
     resetImagePipeline();
-  }, [MAX_ZOOM, resetImagePipeline]);
+  }, [MAX_ZOOM, resetImagePipeline, suspendSearchFit]);
 
   useEffect(() => {
     if (!jumpTimestamp?.time) return;
@@ -458,13 +508,14 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
   // ── Pointer Interaction ─────────────────────────────────────
 
   const handleMouseDown = useCallback((event) => {
+    suspendSearchFit();
     setIsFollowingNow(false);
     setIsDragging(true);
     isDraggingRef.current = true;
     dragMovedRef.current = 0;
     lastMouseXRef.current = event.clientX;
     clearTimelineImageQueue();
-  }, []);
+  }, [suspendSearchFit]);
 
   const handleMouseMove = useCallback((event) => {
     if (!isDraggingRef.current) return;
@@ -484,6 +535,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
   const handleWheel = useCallback((event) => {
     try { event.preventDefault(); } catch { /* passive listener */ }
     setIsFollowingNow(false);
+    suspendSearchFit();
     clearTimelineImageQueue();
 
     if (wheelIdleTimerRef.current) clearTimeout(wheelIdleTimerRef.current);
@@ -501,7 +553,7 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
 
     setZoom(nextZoom);
     setCenterTime(timeAtCursor - (cursorX - width / 2) / nextZoom);
-  }, [centerTime, width, zoom, MIN_ZOOM, MAX_ZOOM]);
+  }, [centerTime, width, zoom, MIN_ZOOM, MAX_ZOOM, suspendSearchFit]);
 
   const handleBackgroundClick = useCallback((event) => {
     if (dragMovedRef.current > DRAG_SLOP_PX) return;
@@ -577,6 +629,8 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
         onSeek={seekTo}
         onSeekRange={seekRange}
         onInteractingChange={setOverviewInteracting}
+        searchMarkers={searchState?.markers || []}
+        hoveredSearchMarkerIds={searchState?.hoveredIds || []}
       />
 
       <div
@@ -615,6 +669,19 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
           onVisibleFramesChange={handleVisibleFramesChange}
         />
 
+        <div className="pointer-events-none absolute inset-x-0" style={{ top: SESSION_HEIGHT, height: DETAIL_HEIGHT }}>
+          <SearchMarkerLayer
+            markers={searchState?.markers || []}
+            hoveredIds={searchState?.hoveredIds || []}
+            timeToX={timeToX}
+            width={width}
+            height={DETAIL_HEIGHT}
+            onSelectMarker={(marker) => {
+              if (marker?.result) onSelectSearchResult?.(marker.result);
+            }}
+          />
+        </div>
+
         <div className="relative" style={{ height: AXIS_HEIGHT }}>
           {ticks.map((tick) => (
             <div
@@ -637,6 +704,21 @@ const Timeline = ({ onSelectEvent, onClearHighlight, jumpTimestamp, highlightedE
       </div>
 
       <div className="absolute bottom-1.5 right-2 z-40 flex items-center gap-1">
+        {searchState?.markers?.length > 0 && (
+          <button
+            type="button"
+            className="rounded border border-ide-border bg-ide-panel p-1 text-ide-warning shadow-sm transition-colors hover:bg-ide-active"
+            onClick={(event) => {
+              event.stopPropagation();
+              searchFitSuspendedRef.current = false;
+              fitSearchMarkers();
+            }}
+            title={t('timeline.fitSearchResults')}
+            aria-label={t('timeline.fitSearchResults')}
+          >
+            <Focus size={14} />
+          </button>
+        )}
         {quickZooms.map((item) => (
           <button
             key={item.key}

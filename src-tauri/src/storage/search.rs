@@ -5,10 +5,208 @@ use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use jieba_rs::Jieba;
 use once_cell::sync::Lazy;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use std::collections::{HashMap, HashSet};
 
-use super::{SearchResult, StorageState};
+use super::{wire_time, SearchResult, StorageState};
+
+type SearchSqlParam = Box<dyn ToSql>;
+
+/// Whether a hit falls inside the requested window.
+///
+/// The bounds arrive as Unix seconds and so does [`SearchResult::timestamp`],
+/// so nothing here re-parses a formatted date. The earlier version did, against
+/// a hard-coded `%Y-%m-%d %H:%M:%S`, which tied the filter to the exact text
+/// layout of the column.
+///
+/// A row whose capture time is unknown is kept rather than dropped, matching
+/// both the previous behaviour here (an unparseable string simply skipped the
+/// comparison) and `clip_query.rs::apply_filters` on the vector path.
+fn within_time_bounds(
+    result: &SearchResult,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+) -> bool {
+    let Some(seconds) = result.timestamp.map(|value| value as f64) else {
+        return true;
+    };
+    if start_time.is_some_and(|start| seconds < start) {
+        return false;
+    }
+    if end_time.is_some_and(|end| seconds > end) {
+        return false;
+    }
+    true
+}
+
+fn load_process_screenshot_ids(
+    conn: &Connection,
+    process_names: Option<&[String]>,
+) -> Result<Option<HashSet<i64>>, String> {
+    let Some(process_names) = process_names.filter(|names| !names.is_empty()) else {
+        return Ok(None);
+    };
+
+    let placeholders = process_names
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id FROM screenshots INDEXED BY idx_screenshots_process_deleted_created_at
+          WHERE is_deleted = 0 AND process_name IN ({placeholders})"
+    );
+    let params: Vec<&dyn ToSql> = process_names
+        .iter()
+        .map(|name| name as &dyn ToSql)
+        .collect();
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| format!("Failed to prepare process filter: {error}"))?;
+    let ids = stmt
+        .query_map(params.as_slice(), |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("Failed to execute process filter: {error}"))?
+        .filter_map(Result::ok)
+        .collect();
+
+    Ok(Some(ids))
+}
+
+fn screenshot_matches_filters(
+    screenshot_id: i64,
+    category_screenshot_ids: Option<&HashSet<i64>>,
+    process_screenshot_ids: Option<&HashSet<i64>>,
+) -> bool {
+    category_screenshot_ids.is_none_or(|ids| ids.contains(&screenshot_id))
+        && process_screenshot_ids.is_none_or(|ids| ids.contains(&screenshot_id))
+}
+
+fn filter_ocr_ids_by_screenshot(
+    conn: &Connection,
+    ids: &[i64],
+    needed: usize,
+    category_screenshot_ids: Option<&HashSet<i64>>,
+    process_screenshot_ids: Option<&HashSet<i64>>,
+) -> Result<Vec<i64>, String> {
+    if category_screenshot_ids.is_none() && process_screenshot_ids.is_none() {
+        return Ok(ids.to_vec());
+    }
+
+    let mut filtered_ids = Vec::with_capacity(needed.min(ids.len()));
+    for chunk in ids.chunks(500) {
+        if filtered_ids.len() >= needed {
+            break;
+        }
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, screenshot_id FROM ocr_results
+              WHERE id IN ({placeholders}) AND is_deleted = 0"
+        );
+        let params: Vec<&dyn ToSql> = chunk.iter().map(|id| id as &dyn ToSql).collect();
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|error| format!("Failed to prepare screenshot filter: {error}"))?;
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| format!("Failed to execute screenshot filter: {error}"))?;
+        let id_to_screenshot: HashMap<i64, i64> = rows.filter_map(Result::ok).collect();
+
+        for id in chunk {
+            if let Some(screenshot_id) = id_to_screenshot.get(id) {
+                if screenshot_matches_filters(
+                    *screenshot_id,
+                    category_screenshot_ids,
+                    process_screenshot_ids,
+                ) {
+                    filtered_ids.push(*id);
+                }
+            }
+        }
+    }
+
+    Ok(filtered_ids)
+}
+
+fn build_empty_search_sql(
+    process_names: Option<&[String]>,
+    start_time: Option<f64>,
+    end_time: Option<f64>,
+    categories: Option<&[String]>,
+    limit: i32,
+    offset: i32,
+) -> (String, Vec<SearchSqlParam>) {
+    let has_process_filter = process_names.is_some_and(|names| !names.is_empty());
+    let from_clause = if has_process_filter {
+        // CROSS JOIN fixes screenshots as the outer loop, so the process/time
+        // index narrows candidates before OCR rows are visited and sorted.
+        "FROM screenshots s INDEXED BY idx_screenshots_process_deleted_created_at
+         CROSS JOIN ocr_results r INDEXED BY idx_ocr_deleted_screenshot
+                    ON r.screenshot_id = s.id"
+    } else {
+        "FROM ocr_results r JOIN screenshots s ON r.screenshot_id = s.id"
+    };
+    let mut sql = format!(
+        "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
+                r.box_x1, r.box_y1, r.box_x2, r.box_y2,
+                r.box_x3, r.box_y3, r.box_x4, r.box_y4,
+                s.image_path, s.window_title_enc, s.process_name,
+                s.content_key_encrypted,
+                CAST(strftime('%s', r.created_at) AS INTEGER) AS created_ts,
+                CAST(strftime('%s', s.created_at) AS INTEGER) AS screenshot_created_ts,
+                s.category
+           {from_clause}"
+    );
+    let mut where_clauses = vec![
+        "s.is_deleted = 0".to_string(),
+        "r.is_deleted = 0".to_string(),
+    ];
+    let mut params: Vec<SearchSqlParam> = Vec::new();
+
+    if let Some(names) = process_names.filter(|names| !names.is_empty()) {
+        let placeholders = names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        where_clauses.push(format!("s.process_name IN ({placeholders})"));
+        params.extend(
+            names
+                .iter()
+                .cloned()
+                .map(|name| Box::new(name) as SearchSqlParam),
+        );
+    }
+    if let Some(start) = start_time {
+        let start_dt = DateTime::<Utc>::from_timestamp(start as i64, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+        where_clauses.push("s.created_at >= ?".to_string());
+        params.push(Box::new(start_dt));
+    }
+    if let Some(end) = end_time {
+        let end_dt = DateTime::<Utc>::from_timestamp(end as i64, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default();
+        where_clauses.push("s.created_at <= ?".to_string());
+        params.push(Box::new(end_dt));
+    }
+    if let Some(categories) = categories.filter(|categories| !categories.is_empty()) {
+        let placeholders = categories.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        where_clauses.push(format!("s.category IN ({placeholders})"));
+        params.extend(
+            categories
+                .iter()
+                .cloned()
+                .map(|category| Box::new(category) as SearchSqlParam),
+        );
+    }
+
+    sql.push_str(" WHERE ");
+    sql.push_str(&where_clauses.join(" AND "));
+    sql.push_str(" ORDER BY s.created_at DESC, r.id DESC LIMIT ? OFFSET ?");
+    params.push(Box::new(limit));
+    params.push(Box::new(offset));
+
+    (sql, params)
+}
 
 impl StorageState {
     /// Compute HMAC hash for blind index.
@@ -138,6 +336,16 @@ impl StorageState {
             _ => None,
         };
 
+        // Text searches start from OCR bitmap IDs, so resolve the plaintext
+        // process filter to screenshot IDs once and intersect it before any
+        // branch applies offset/limit. Empty searches push the same predicate
+        // directly into their SQL below instead of materializing this set.
+        let process_screenshot_ids = if query.trim().is_empty() {
+            None
+        } else {
+            load_process_screenshot_ids(&conn, process_names.as_deref())?
+        };
+
         // Split keywords by whitespace, compute bigrams for each keyword independently
         // to avoid generating invalid cross-keyword bigrams containing spaces
         let keywords: Vec<&str> = query.split_whitespace().collect();
@@ -240,10 +448,14 @@ impl StorageState {
                             matching.retain(|id| s.contains(id));
                         }
 
-                        // Pre-filter by category before pagination
-                        if let Some(ref cat_ids) = category_screenshot_ids {
-                            matching.retain(|id| cat_ids.contains(id));
-                        }
+                        // Pre-filter screenshot-level predicates before pagination.
+                        matching.retain(|id| {
+                            screenshot_matches_filters(
+                                *id,
+                                category_screenshot_ids.as_ref(),
+                                process_screenshot_ids.as_ref(),
+                            )
+                        });
 
                         if matching.is_empty() {
                             return Ok(vec![]);
@@ -267,46 +479,16 @@ impl StorageState {
                     let mut ids: Vec<i64> = intersection.into_iter().map(|v| v as i64).collect();
                     ids.sort_unstable_by(|a, b| b.cmp(a));
 
-                    // For single-keyword path (OCR-level IDs), pre-filter by category
+                    // For single-keyword paths, resolve OCR IDs to screenshots and
+                    // apply screenshot-level predicates before pagination.
                     if !is_multi_keyword {
-                        if let Some(ref cat_ids) = category_screenshot_ids {
-                            let needed = (offset + limit) as usize;
-                            let mut filtered_ids = Vec::with_capacity(needed);
-                            for chunk in ids.chunks(500) {
-                                if filtered_ids.len() >= needed {
-                                    break;
-                                }
-                                let placeholders =
-                                    chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
-                                let sql = format!(
-                                    "SELECT id, screenshot_id FROM ocr_results WHERE id IN ({}) AND is_deleted = 0",
-                                    placeholders
-                                );
-                                let params: Vec<&dyn rusqlite::ToSql> =
-                                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-                                let mut stmt = conn
-                                    .prepare(&sql)
-                                    .map_err(|e| format!("Failed to filter by category: {}", e))?;
-                                let mut chunk_map: std::collections::HashMap<i64, i64> =
-                                    std::collections::HashMap::new();
-                                let rows = stmt
-                                    .query_map(params.as_slice(), |row| {
-                                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                                    })
-                                    .map_err(|e| format!("Failed to filter by category: {}", e))?;
-                                for row in rows.filter_map(|r| r.ok()) {
-                                    chunk_map.insert(row.0, row.1);
-                                }
-                                for &id in chunk {
-                                    if let Some(&sid) = chunk_map.get(&id) {
-                                        if cat_ids.contains(&sid) {
-                                            filtered_ids.push(id);
-                                        }
-                                    }
-                                }
-                            }
-                            ids = filtered_ids;
-                        }
+                        ids = filter_ocr_ids_by_screenshot(
+                            &conn,
+                            &ids,
+                            (offset + limit).max(0) as usize,
+                            category_screenshot_ids.as_ref(),
+                            process_screenshot_ids.as_ref(),
+                        )?;
                     }
 
                     // Pagination
@@ -330,8 +512,10 @@ impl StorageState {
                             "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
                                     r.box_x1, r.box_y1, r.box_x2, r.box_y2,
                                     r.box_x3, r.box_y3, r.box_x4, r.box_y4,
-                                    s.image_path, s.window_title_enc, s.process_name_enc,
-                                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at,
+                                    s.image_path, s.window_title_enc, s.process_name,
+                                    s.content_key_encrypted,
+                                    CAST(strftime('%s', r.created_at) AS INTEGER) AS created_ts,
+                                    CAST(strftime('%s', s.created_at) AS INTEGER) AS screenshot_created_ts,
                                     s.category
                              FROM ocr_results r
                              JOIN screenshots s ON r.screenshot_id = s.id
@@ -348,8 +532,10 @@ impl StorageState {
                             "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
                                     r.box_x1, r.box_y1, r.box_x2, r.box_y2,
                                     r.box_x3, r.box_y3, r.box_x4, r.box_y4,
-                                    s.image_path, s.window_title_enc, s.process_name_enc,
-                                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at,
+                                    s.image_path, s.window_title_enc, s.process_name,
+                                    s.content_key_encrypted,
+                                    CAST(strftime('%s', r.created_at) AS INTEGER) AS created_ts,
+                                    CAST(strftime('%s', s.created_at) AS INTEGER) AS screenshot_created_ts,
                                     s.category
                              FROM ocr_results r
                              JOIN screenshots s ON r.screenshot_id = s.id
@@ -378,7 +564,7 @@ impl StorageState {
                             let text_enc: Option<Vec<u8>> = row.get(2)?;
                             let text_key_enc: Option<Vec<u8>> = row.get(3)?;
                             let window_title_enc: Option<Vec<u8>> = row.get(14)?;
-                            let process_name_enc: Option<Vec<u8>> = row.get(15)?;
+                            let process_name: Option<String> = row.get(15)?;
                             let screenshot_key_enc: Option<Vec<u8>> = row.get(16)?;
 
                             Ok((
@@ -395,10 +581,10 @@ impl StorageState {
                                 ],
                                 row.get::<_, String>(13)?,
                                 window_title_enc,
-                                process_name_enc,
+                                process_name,
                                 screenshot_key_enc,
-                                row.get::<_, String>(17)?,
-                                row.get::<_, String>(18)?,
+                                row.get::<_, Option<i64>>(17)?,
+                                row.get::<_, Option<i64>>(18)?,
                                 row.get::<_, Option<String>>(19)?,
                             ))
                         })
@@ -414,10 +600,10 @@ impl StorageState {
                                 box_coords,
                                 image_path,
                                 window_title_enc,
-                                process_name_enc,
+                                process_name,
                                 screenshot_key_enc,
-                                created_at,
-                                screenshot_created_at,
+                                created_ts,
+                                screenshot_created_ts,
                                 category,
                             )| {
                                 let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
@@ -453,16 +639,6 @@ impl StorageState {
                                         }
                                         _ => None,
                                     };
-                                let process_name =
-                                    match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
-                                        (Some(data), Some(key)) => {
-                                            decrypt_with_master_key(key, data)
-                                                .ok()
-                                                .and_then(|v| String::from_utf8(v).ok())
-                                        }
-                                        _ => None,
-                                    };
-
                                 SearchResult {
                                     id,
                                     screenshot_id,
@@ -473,8 +649,11 @@ impl StorageState {
                                     window_title,
                                     process_name,
                                     category,
-                                    created_at,
-                                    screenshot_created_at,
+                                    created_at: wire_time::from_optional_seconds(created_ts),
+                                    screenshot_created_at: wire_time::from_optional_seconds(
+                                        screenshot_created_ts,
+                                    ),
+                                    timestamp: screenshot_created_ts,
                                 }
                             },
                         )
@@ -484,104 +663,28 @@ impl StorageState {
                         Self::zeroize_bytes(&mut key);
                     }
 
-                    // Post-processing: filter by process name and time range
-                    // (category is already pre-filtered at bitmap level)
+                    // Time is checked after decryption because this path pages
+                    // on the bitmap rather than in SQL.
                     let filtered: Vec<SearchResult> = results
                         .into_iter()
-                        .filter(|r| {
-                            if let Some(ref names) = process_names {
-                                if !names.is_empty() {
-                                    if let Some(p) = &r.process_name {
-                                        if !names.contains(p) {
-                                            return false;
-                                        }
-                                    } else {
-                                        return false;
-                                    }
-                                }
-                            }
-
-                            if let Some(start) = start_time {
-                                if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(
-                                    &r.screenshot_created_at,
-                                    "%Y-%m-%d %H:%M:%S",
-                                ) {
-                                    if (nd.and_utc().timestamp() as f64) < start {
-                                        return false;
-                                    }
-                                }
-                            }
-                            if let Some(end) = end_time {
-                                if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(
-                                    &r.screenshot_created_at,
-                                    "%Y-%m-%d %H:%M:%S",
-                                ) {
-                                    if (nd.and_utc().timestamp() as f64) > end {
-                                        return false;
-                                    }
-                                }
-                            }
-
-                            true
-                        })
+                        .filter(|r| within_time_bounds(r, start_time, end_time))
                         .collect();
 
                     return Ok(filtered);
                 }
             }
-            // Fall back to simple SQL query (no text query, ordered by time with filters)
-            let mut sql = String::from(
-                "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
-                        r.box_x1, r.box_y1, r.box_x2, r.box_y2,
-                        r.box_x3, r.box_y3, r.box_x4, r.box_y4,
-                        s.image_path, s.window_title_enc, s.process_name_enc,
-                        s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at,
-                        s.category
-                 FROM ocr_results r
-                 JOIN screenshots s ON r.screenshot_id = s.id",
+            // Empty searches can push every filter into SQL. In particular,
+            // process_name must constrain screenshots before LIMIT/OFFSET;
+            // filtering decrypted rows afterward made the first OCR page look
+            // like the complete result set for almost every process.
+            let (sql, params) = build_empty_search_sql(
+                process_names.as_deref(),
+                start_time,
+                end_time,
+                categories.as_deref(),
+                limit,
+                offset,
             );
-
-            let mut where_clauses: Vec<String> = vec![
-                "s.is_deleted = 0".to_string(),
-                "r.is_deleted = 0".to_string(),
-            ];
-            let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-            if let Some(start) = start_time {
-                let start_dt = DateTime::<Utc>::from_timestamp(start as i64, 0)
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_default();
-                where_clauses.push("s.created_at >= ?".to_string());
-                params.push(Box::new(start_dt));
-            }
-
-            if let Some(end) = end_time {
-                let end_dt = DateTime::<Utc>::from_timestamp(end as i64, 0)
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_default();
-                where_clauses.push("s.created_at <= ?".to_string());
-                params.push(Box::new(end_dt));
-            }
-
-            if let Some(ref cats) = categories {
-                if !cats.is_empty() {
-                    let cat_placeholders =
-                        cats.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
-                    where_clauses.push(format!("s.category IN ({})", cat_placeholders));
-                    for cat in cats {
-                        params.push(Box::new(cat.clone()));
-                    }
-                }
-            }
-
-            if !where_clauses.is_empty() {
-                sql.push_str(" WHERE ");
-                sql.push_str(&where_clauses.join(" AND "));
-            }
-
-            sql.push_str(" ORDER BY s.created_at DESC, r.id DESC LIMIT ? OFFSET ?");
-            params.push(Box::new(limit));
-            params.push(Box::new(offset));
 
             let mut stmt = conn
                 .prepare(&sql)
@@ -597,7 +700,7 @@ impl StorageState {
                     let text_enc: Option<Vec<u8>> = row.get(2)?;
                     let text_key_enc: Option<Vec<u8>> = row.get(3)?;
                     let window_title_enc: Option<Vec<u8>> = row.get(14)?;
-                    let process_name_enc: Option<Vec<u8>> = row.get(15)?;
+                    let process_name: Option<String> = row.get(15)?;
                     let screenshot_key_enc: Option<Vec<u8>> = row.get(16)?;
 
                     Ok((
@@ -614,10 +717,10 @@ impl StorageState {
                         ],
                         row.get::<_, String>(13)?,
                         window_title_enc,
-                        process_name_enc,
+                        process_name,
                         screenshot_key_enc,
-                        row.get::<_, String>(17)?,
-                        row.get::<_, String>(18)?,
+                        row.get::<_, Option<i64>>(17)?,
+                        row.get::<_, Option<i64>>(18)?,
                         row.get::<_, Option<String>>(19)?,
                     ))
                 })
@@ -633,10 +736,10 @@ impl StorageState {
                         box_coords,
                         image_path,
                         window_title_enc,
-                        process_name_enc,
+                        process_name,
                         screenshot_key_enc,
-                        created_at,
-                        screenshot_created_at,
+                        created_ts,
+                        screenshot_created_ts,
                         category,
                     )| {
                         let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
@@ -668,14 +771,6 @@ impl StorageState {
                                     .and_then(|v| String::from_utf8(v).ok()),
                                 _ => None,
                             };
-                        let process_name =
-                            match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
-                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                    .ok()
-                                    .and_then(|v| String::from_utf8(v).ok()),
-                                _ => None,
-                            };
-
                         SearchResult {
                             id,
                             screenshot_id,
@@ -686,8 +781,11 @@ impl StorageState {
                             window_title,
                             process_name,
                             category,
-                            created_at,
-                            screenshot_created_at,
+                            created_at: wire_time::from_optional_seconds(created_ts),
+                            screenshot_created_at: wire_time::from_optional_seconds(
+                                screenshot_created_ts,
+                            ),
+                            timestamp: screenshot_created_ts,
                         }
                     },
                 )
@@ -697,27 +795,7 @@ impl StorageState {
                 Self::zeroize_bytes(&mut key);
             }
 
-            // Post-processing: filter by process name only
-            // (category and time range already handled in SQL)
-            let filtered: Vec<SearchResult> = results
-                .into_iter()
-                .filter(|r| {
-                    if let Some(ref names) = process_names {
-                        if !names.is_empty() {
-                            if let Some(p) = &r.process_name {
-                                if !names.contains(p) {
-                                    return false;
-                                }
-                            } else {
-                                return false;
-                            }
-                        }
-                    }
-                    true
-                })
-                .collect();
-
-            return Ok(filtered);
+            return Ok(results);
         }
 
         // Has bigram tokens: load bitmaps per keyword
@@ -820,10 +898,14 @@ impl StorageState {
                 matching_screenshots.retain(|id| s.contains(id));
             }
 
-            // Pre-filter by category before pagination
-            if let Some(ref cat_ids) = category_screenshot_ids {
-                matching_screenshots.retain(|id| cat_ids.contains(id));
-            }
+            // Pre-filter screenshot-level predicates before pagination.
+            matching_screenshots.retain(|id| {
+                screenshot_matches_filters(
+                    *id,
+                    category_screenshot_ids.as_ref(),
+                    process_screenshot_ids.as_ref(),
+                )
+            });
 
             if matching_screenshots.is_empty() {
                 return Ok(vec![]);
@@ -855,8 +937,10 @@ impl StorageState {
                 "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
                         r.box_x1, r.box_y1, r.box_x2, r.box_y2,
                         r.box_x3, r.box_y3, r.box_x4, r.box_y4,
-                        s.image_path, s.window_title_enc, s.process_name_enc,
-                        s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at,
+                        s.image_path, s.window_title_enc, s.process_name,
+                        s.content_key_encrypted,
+                        CAST(strftime('%s', r.created_at) AS INTEGER) AS created_ts,
+                        CAST(strftime('%s', s.created_at) AS INTEGER) AS screenshot_created_ts,
                         s.category
                  FROM ocr_results r
                  JOIN screenshots s ON r.screenshot_id = s.id
@@ -886,7 +970,7 @@ impl StorageState {
                     let text_enc: Option<Vec<u8>> = row.get(2)?;
                     let text_key_enc: Option<Vec<u8>> = row.get(3)?;
                     let window_title_enc: Option<Vec<u8>> = row.get(14)?;
-                    let process_name_enc: Option<Vec<u8>> = row.get(15)?;
+                    let process_name: Option<String> = row.get(15)?;
                     let screenshot_key_enc: Option<Vec<u8>> = row.get(16)?;
 
                     Ok((
@@ -903,10 +987,10 @@ impl StorageState {
                         ],
                         row.get::<_, String>(13)?,
                         window_title_enc,
-                        process_name_enc,
+                        process_name,
                         screenshot_key_enc,
-                        row.get::<_, String>(17)?,
-                        row.get::<_, String>(18)?,
+                        row.get::<_, Option<i64>>(17)?,
+                        row.get::<_, Option<i64>>(18)?,
                         row.get::<_, Option<String>>(19)?,
                     ))
                 })
@@ -922,10 +1006,10 @@ impl StorageState {
                         box_coords,
                         image_path,
                         window_title_enc,
-                        process_name_enc,
+                        process_name,
                         screenshot_key_enc,
-                        created_at,
-                        screenshot_created_at,
+                        created_ts,
+                        screenshot_created_ts,
                         category,
                     )| {
                         let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
@@ -957,14 +1041,6 @@ impl StorageState {
                                     .and_then(|v| String::from_utf8(v).ok()),
                                 _ => None,
                             };
-                        let process_name =
-                            match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
-                                (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                                    .ok()
-                                    .and_then(|v| String::from_utf8(v).ok()),
-                                _ => None,
-                            };
-
                         SearchResult {
                             id,
                             screenshot_id,
@@ -975,8 +1051,11 @@ impl StorageState {
                             window_title,
                             process_name,
                             category,
-                            created_at,
-                            screenshot_created_at,
+                            created_at: wire_time::from_optional_seconds(created_ts),
+                            screenshot_created_at: wire_time::from_optional_seconds(
+                                screenshot_created_ts,
+                            ),
+                            timestamp: screenshot_created_ts,
                         }
                     },
                 )
@@ -986,44 +1065,11 @@ impl StorageState {
                 Self::zeroize_bytes(&mut key);
             }
 
-            // Post-processing: filter by process name and time range
-            // (category is already pre-filtered at bitmap level)
+            // Time is checked after decryption because this path pages on the
+            // bitmap rather than in SQL.
             let filtered: Vec<SearchResult> = results
                 .into_iter()
-                .filter(|r| {
-                    if let Some(ref names) = process_names {
-                        if !names.is_empty() {
-                            if let Some(p) = &r.process_name {
-                                if !names.contains(p) {
-                                    return false;
-                                }
-                            } else {
-                                return false;
-                            }
-                        }
-                    }
-                    if let Some(s) = start_time {
-                        if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(
-                            &r.screenshot_created_at,
-                            "%Y-%m-%d %H:%M:%S",
-                        ) {
-                            if (nd.and_utc().timestamp() as f64) < s {
-                                return false;
-                            }
-                        }
-                    }
-                    if let Some(e) = end_time {
-                        if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(
-                            &r.screenshot_created_at,
-                            "%Y-%m-%d %H:%M:%S",
-                        ) {
-                            if (nd.and_utc().timestamp() as f64) > e {
-                                return false;
-                            }
-                        }
-                    }
-                    true
-                })
+                .filter(|r| within_time_bounds(r, start_time, end_time))
                 .collect();
 
             return Ok(filtered);
@@ -1056,44 +1102,15 @@ impl StorageState {
             ids.sort_unstable_by(|a, b| b.cmp(a));
         }
 
-        // Pre-filter OCR IDs by category before pagination
-        if let Some(ref cat_ids) = category_screenshot_ids {
-            let needed = (offset + limit) as usize;
-            let mut filtered_ids = Vec::with_capacity(needed);
-            for chunk in ids.chunks(500) {
-                if filtered_ids.len() >= needed {
-                    break;
-                }
-                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<&str>>().join(",");
-                let sql = format!(
-                    "SELECT id, screenshot_id FROM ocr_results WHERE id IN ({}) AND is_deleted = 0",
-                    placeholders
-                );
-                let params: Vec<&dyn rusqlite::ToSql> =
-                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-                let mut stmt = conn
-                    .prepare(&sql)
-                    .map_err(|e| format!("Failed to filter by category: {}", e))?;
-                let mut chunk_map: std::collections::HashMap<i64, i64> =
-                    std::collections::HashMap::new();
-                let rows = stmt
-                    .query_map(params.as_slice(), |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                    })
-                    .map_err(|e| format!("Failed to filter by category: {}", e))?;
-                for row in rows.filter_map(|r| r.ok()) {
-                    chunk_map.insert(row.0, row.1);
-                }
-                for &id in chunk {
-                    if let Some(&sid) = chunk_map.get(&id) {
-                        if cat_ids.contains(&sid) {
-                            filtered_ids.push(id);
-                        }
-                    }
-                }
-            }
-            ids = filtered_ids;
-        }
+        // Apply screenshot-level predicates to the ordered OCR candidates
+        // before slicing out the requested page.
+        ids = filter_ocr_ids_by_screenshot(
+            &conn,
+            &ids,
+            (offset + limit).max(0) as usize,
+            category_screenshot_ids.as_ref(),
+            process_screenshot_ids.as_ref(),
+        )?;
 
         // Pagination
         let start = offset as usize;
@@ -1114,8 +1131,10 @@ impl StorageState {
             "SELECT r.id, r.screenshot_id, r.text_enc, r.text_key_encrypted, r.confidence,
                     r.box_x1, r.box_y1, r.box_x2, r.box_y2,
                     r.box_x3, r.box_y3, r.box_x4, r.box_y4,
-                    s.image_path, s.window_title_enc, s.process_name_enc,
-                    s.content_key_encrypted, r.created_at, s.created_at as screenshot_created_at,
+                    s.image_path, s.window_title_enc, s.process_name,
+                    s.content_key_encrypted,
+                    CAST(strftime('%s', r.created_at) AS INTEGER) AS created_ts,
+                    CAST(strftime('%s', s.created_at) AS INTEGER) AS screenshot_created_ts,
                     s.category
              FROM ocr_results r
              JOIN screenshots s ON r.screenshot_id = s.id
@@ -1144,7 +1163,7 @@ impl StorageState {
                 let text_enc: Option<Vec<u8>> = row.get(2)?;
                 let text_key_enc: Option<Vec<u8>> = row.get(3)?;
                 let window_title_enc: Option<Vec<u8>> = row.get(14)?;
-                let process_name_enc: Option<Vec<u8>> = row.get(15)?;
+                let process_name: Option<String> = row.get(15)?;
                 let screenshot_key_enc: Option<Vec<u8>> = row.get(16)?;
 
                 Ok((
@@ -1161,10 +1180,10 @@ impl StorageState {
                     ],
                     row.get::<_, String>(13)?,
                     window_title_enc,
-                    process_name_enc,
+                    process_name,
                     screenshot_key_enc,
-                    row.get::<_, String>(17)?,
-                    row.get::<_, String>(18)?,
+                    row.get::<_, Option<i64>>(17)?,
+                    row.get::<_, Option<i64>>(18)?,
                     row.get::<_, Option<String>>(19)?,
                 ))
             })
@@ -1180,10 +1199,10 @@ impl StorageState {
                     box_coords,
                     image_path,
                     window_title_enc,
-                    process_name_enc,
+                    process_name,
                     screenshot_key_enc,
-                    created_at,
-                    screenshot_created_at,
+                    created_ts,
+                    screenshot_created_ts,
                     category,
                 )| {
                     let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
@@ -1214,13 +1233,6 @@ impl StorageState {
                             .and_then(|v| String::from_utf8(v).ok()),
                         _ => None,
                     };
-                    let process_name = match (process_name_enc.as_ref(), screenshot_key.as_ref()) {
-                        (Some(data), Some(key)) => decrypt_with_master_key(key, data)
-                            .ok()
-                            .and_then(|v| String::from_utf8(v).ok()),
-                        _ => None,
-                    };
-
                     Some(SearchResult {
                         id,
                         screenshot_id,
@@ -1231,8 +1243,11 @@ impl StorageState {
                         window_title,
                         process_name,
                         category,
-                        created_at,
-                        screenshot_created_at,
+                        created_at: wire_time::from_optional_seconds(created_ts),
+                        screenshot_created_at: wire_time::from_optional_seconds(
+                            screenshot_created_ts,
+                        ),
+                        timestamp: screenshot_created_ts,
                     })
                 },
             )
@@ -1254,48 +1269,215 @@ impl StorageState {
             Self::zeroize_bytes(&mut key);
         }
 
-        // Post-processing: filter by process name and time range
-        // (category is already pre-filtered at bitmap level)
+        // Time is checked after decryption because this path pages on the
+        // bitmap rather than in SQL.
         let filtered: Vec<SearchResult> = results
             .into_iter()
-            .filter(|r| {
-                if let Some(ref names) = process_names {
-                    if !names.is_empty() {
-                        if let Some(p) = &r.process_name {
-                            if !names.contains(p) {
-                                return false;
-                            }
-                        } else {
-                            return false;
-                        }
-                    }
-                }
-
-                if let Some(start) = start_time {
-                    if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(
-                        &r.screenshot_created_at,
-                        "%Y-%m-%d %H:%M:%S",
-                    ) {
-                        if (nd.and_utc().timestamp() as f64) < start {
-                            return false;
-                        }
-                    }
-                }
-                if let Some(end) = end_time {
-                    if let Ok(nd) = chrono::NaiveDateTime::parse_from_str(
-                        &r.screenshot_created_at,
-                        "%Y-%m-%d %H:%M:%S",
-                    ) {
-                        if (nd.and_utc().timestamp() as f64) > end {
-                            return false;
-                        }
-                    }
-                }
-
-                true
-            })
+            .filter(|r| within_time_bounds(r, start_time, end_time))
             .collect();
 
         Ok(filtered)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn search_fixture() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory search database");
+        conn.execute_batch(
+            "CREATE TABLE screenshots (
+                 id INTEGER PRIMARY KEY,
+                 image_path TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 is_deleted INTEGER NOT NULL DEFAULT 0,
+                 process_name TEXT,
+                 window_title_enc BLOB,
+                 content_key_encrypted BLOB,
+                 category TEXT
+             );
+             CREATE TABLE ocr_results (
+                 id INTEGER PRIMARY KEY,
+                 screenshot_id INTEGER NOT NULL,
+                 text_enc BLOB,
+                 text_key_encrypted BLOB,
+                 confidence REAL NOT NULL DEFAULT 1,
+                 box_x1 REAL NOT NULL DEFAULT 0,
+                 box_y1 REAL NOT NULL DEFAULT 0,
+                 box_x2 REAL NOT NULL DEFAULT 0,
+                 box_y2 REAL NOT NULL DEFAULT 0,
+                 box_x3 REAL NOT NULL DEFAULT 0,
+                 box_y3 REAL NOT NULL DEFAULT 0,
+                 box_x4 REAL NOT NULL DEFAULT 0,
+                 box_y4 REAL NOT NULL DEFAULT 0,
+                 created_at TEXT NOT NULL,
+                 is_deleted INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX idx_screenshots_process_deleted_created_at
+                 ON screenshots(process_name, is_deleted, created_at);
+             CREATE INDEX idx_ocr_deleted_screenshot
+                 ON ocr_results(is_deleted, screenshot_id);",
+        )
+        .expect("search fixture schema");
+        conn
+    }
+
+    #[test]
+    fn empty_search_applies_process_filter_before_limit() {
+        let conn = search_fixture();
+        conn.execute_batch(
+            "INSERT INTO screenshots
+                 (id, image_path, created_at, process_name)
+             VALUES
+                 (1, 'newest.enc', '2026-08-12 12:00:00', 'newest.exe'),
+                 (2, 'target.enc', '2026-08-12 11:00:00', 'target.exe');
+             INSERT INTO ocr_results (id, screenshot_id, created_at) VALUES
+                 (101, 1, '2026-08-12 12:00:01'),
+                 (102, 1, '2026-08-12 12:00:02'),
+                 (103, 1, '2026-08-12 12:00:03'),
+                 (104, 1, '2026-08-12 12:00:04'),
+                 (201, 2, '2026-08-12 11:00:01'),
+                 (202, 2, '2026-08-12 11:00:02');",
+        )
+        .expect("search fixture rows");
+
+        let processes = vec!["target.exe".to_string()];
+        let (sql, params) = build_empty_search_sql(Some(&processes), None, None, None, 2, 0);
+        let param_refs: Vec<&dyn ToSql> = params.iter().map(|param| param.as_ref()).collect();
+        let query_plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare empty process search plan")
+            .query_map(param_refs.as_slice(), |row| row.get(3))
+            .expect("explain empty process search")
+            .map(Result::unwrap)
+            .collect();
+        assert!(query_plan
+            .iter()
+            .any(|detail| detail.contains("idx_screenshots_process_deleted_created_at")));
+        assert!(query_plan
+            .iter()
+            .any(|detail| detail.contains("idx_ocr_deleted_screenshot")));
+
+        let mut stmt = conn.prepare(&sql).expect("empty process search");
+        let rows: Vec<(i64, i64, Option<String>)> = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(15)?))
+            })
+            .expect("execute empty process search")
+            .map(Result::unwrap)
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                (202, 2, Some("target.exe".to_string())),
+                (201, 2, Some("target.exe".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_projection_returns_capture_time_as_unix_seconds() {
+        // Issue #166: this query used to hand `screenshots.created_at` through
+        // exactly as SQLite wrote it — UTC wall clock with no zone marker — and
+        // the frontend read that as local time, so every hit was displayed one
+        // UTC offset behind the timeline. Selecting seconds leaves nothing to
+        // interpret, and `wire_time` renders the string the frontend sees.
+        let conn = search_fixture();
+        conn.execute_batch(
+            "INSERT INTO screenshots (id, image_path, created_at, process_name)
+             VALUES (1, 'shot.enc', '2026-08-11 06:07:40', 'code.exe');
+             INSERT INTO ocr_results (id, screenshot_id, created_at) VALUES
+                 (11, 1, '2026-08-11 06:09:12');",
+        )
+        .expect("wire format fixture rows");
+
+        let (sql, params) = build_empty_search_sql(None, None, None, None, 10, 0);
+        let param_refs: Vec<&dyn ToSql> = params.iter().map(|param| param.as_ref()).collect();
+        let (created_ts, screenshot_created_ts): (Option<i64>, Option<i64>) = conn
+            .prepare(&sql)
+            .expect("prepare projection query")
+            .query_row(param_refs.as_slice(), |row| {
+                Ok((row.get(17)?, row.get(18)?))
+            })
+            .expect("read projection row");
+
+        assert_eq!(screenshot_created_ts, Some(1_786_428_460));
+        assert_eq!(
+            wire_time::from_optional_seconds(screenshot_created_ts),
+            "2026-08-11T06:07:40Z"
+        );
+        // The OCR row is written when recognition finishes, so it trails the
+        // capture — which is why the two are reported separately.
+        assert!(created_ts > screenshot_created_ts);
+    }
+
+    fn result_at(timestamp: Option<i64>) -> SearchResult {
+        SearchResult {
+            id: 1,
+            screenshot_id: 1,
+            text: String::new(),
+            confidence: 1.0,
+            box_coords: Vec::new(),
+            image_path: "shot.enc".to_string(),
+            window_title: None,
+            process_name: None,
+            category: None,
+            created_at: String::new(),
+            screenshot_created_at: wire_time::from_optional_seconds(timestamp),
+            timestamp,
+        }
+    }
+
+    #[test]
+    fn time_bounds_compare_seconds_and_keep_unknown_times() {
+        let inside = result_at(Some(1_786_428_460));
+        assert!(within_time_bounds(&inside, None, None));
+        assert!(within_time_bounds(
+            &inside,
+            Some(1_786_428_000.0),
+            Some(1_786_429_000.0)
+        ));
+        assert!(!within_time_bounds(&inside, Some(1_786_429_000.0), None));
+        assert!(!within_time_bounds(&inside, None, Some(1_786_428_000.0)));
+
+        // A row with no usable capture time is kept rather than dropped, which
+        // is what the vector path does too.
+        let unknown = result_at(None);
+        assert!(within_time_bounds(
+            &unknown,
+            Some(1_786_429_000.0),
+            Some(1_786_429_100.0)
+        ));
+    }
+
+    #[test]
+    fn bitmap_candidates_apply_process_filter_before_pagination() {
+        let conn = search_fixture();
+        conn.execute_batch(
+            "INSERT INTO screenshots
+                 (id, image_path, created_at, process_name)
+             VALUES
+                 (1, 'other.enc', '2026-08-12 12:00:00', 'other.exe'),
+                 (2, 'target.enc', '2026-08-12 11:00:00', 'target.exe');
+             INSERT INTO ocr_results (id, screenshot_id, created_at) VALUES
+                 (6, 1, '2026-08-12 12:00:06'),
+                 (5, 1, '2026-08-12 12:00:05'),
+                 (4, 1, '2026-08-12 12:00:04'),
+                 (3, 1, '2026-08-12 12:00:03'),
+                 (2, 2, '2026-08-12 11:00:02'),
+                 (1, 2, '2026-08-12 11:00:01');",
+        )
+        .expect("bitmap fixture rows");
+
+        let processes = vec!["target.exe".to_string()];
+        let process_ids =
+            load_process_screenshot_ids(&conn, Some(&processes)).expect("load process screenshots");
+        let filtered =
+            filter_ocr_ids_by_screenshot(&conn, &[6, 5, 4, 3, 2, 1], 2, None, process_ids.as_ref())
+                .expect("filter bitmap candidates");
+
+        assert_eq!(filtered, vec![2, 1]);
     }
 }

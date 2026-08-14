@@ -4,6 +4,10 @@
       "title": "CarbonPaper OCR model needs repair",
       "body": "Screenshots will still be saved, but OCR text is unavailable until the model is repaired.",
       "action": "Repair model"
+    },
+    "ann_build": {
+      "title": "Image-search acceleration build failed",
+      "body": "Image search remains available, but may be slower. CarbonPaper has paused frequent retries; see Settings > Advanced for details or retry manually."
     }
   },
   "settings": {
@@ -304,6 +308,20 @@
         "backlog": "Screenshots awaiting indexing",
         "stalled": "Screenshots that failed indexing",
         "fallbacks": "Fallbacks",
+        "ann_status": "Search acceleration",
+        "ann_ready": "Ready",
+        "ann_building": "Loading",
+        "ann_exact": "Exact search (slower)",
+        "ann_failed": "Build failed; using exact search",
+        "ann_disabled": "Disabled",
+        "ann_unavailable": "Unavailable",
+        "ann_generation": "Acceleration generation",
+        "ann_backoff": "Search-acceleration build is backing off",
+        "ann_circuit_open": "Automatic search-acceleration retries are paused",
+        "ann_search_still_available": "Image search remains available. An existing acceleration generation keeps serving; otherwise CarbonPaper uses slower exact search.",
+        "ann_failure_detail": "{{count}} consecutive failure(s) · {{code}} · next automatic attempt: {{retryAt}}",
+        "ann_retry_now": "Retry now",
+        "ann_retrying": "Retrying…",
         "last_reason": "Last fallback reason",
         "backlog_hint": "Semantic indexing runs only while the computer is idle and on mains power, so screenshots captured during active use become searchable by natural language after the next idle period.",
         "stalled_hint": "These screenshots exhausted their indexing retries and will not be picked up again on their own. They stay out of natural-language search until indexing is rebuilt.",
@@ -985,25 +1003,25 @@
   },
   "search": {
     "searchError": "Search failed: {{message}}",
-    "switchToNL": "Switch to Natural Language Search",
-    "switchToOCR": "Switch to OCR Search",
+    "switchToNL": "Switch to picture search",
+    "switchToOCR": "Switch to text search",
     "selectMode": "Select Search Mode",
     "nl": {
       "disabled_hint": "Requires Python service to be running"
     },
     "mode": {
       "ocr": {
-        "title": "OCR Keyword Search",
-        "description": "Search by matching text recognized in screenshots"
+        "title": "Text search",
+        "description": "Look for keywords in text recognized from screenshots"
       },
       "nl": {
-        "title": "Natural Language Search",
-        "description": "Describe the image content, scene or objects for semantic fuzzy search"
+        "title": "Picture search",
+        "description": "Match screen content, scenes or objects with a description"
       }
     },
     "placeholder": {
-      "ocr": "Search text in screenshots...",
-      "nl": "Describe image content..."
+      "ocr": "Search text that appeared on screen",
+      "nl": "Describe the screen you are looking for"
     },
     "loading": "Loading...",
     "noContents": "No Contents",
@@ -1239,22 +1257,31 @@
     }
   },
   "advancedSearch": {
-    "title": "Advanced",
+    "title": "Advanced search",
     "search": {
       "error": "Search failed: {{message}}",
-      "placeholder_ocr": "Search OCR text...",
-      "placeholder_nl": "Describe image content...",
-      "go": "Go",
+      "placeholder_ocr": "Search text that appeared on screen",
+      "placeholder_nl": "Describe the screen you are looking for",
+      "go": "Search",
       "searching": "Searching...",
       "enter_keyword": "Enter a keyword or choose filters to begin.",
       "press_enter": "Press Enter in the top search bar to jump here quickly.",
       "did_you_know": "Did you know: {{msg}}",
       "no_results": "No matching results",
-      "adjust": "Adjust filters or try different keywords."
+      "adjust": "Adjust filters or try different keywords.",
+      "no_results_for": "No screenshots contain \"{{query}}\"",
+      "no_results_filtered": "No screenshots match the current filters.",
+      "no_results_hint": "Widening the time range or dropping a filter often helps.",
+      "try_visual": "Search by picture instead",
+      "clear_filters": "Clear filters"
     },
     "modes": {
-      "ocr": "OCR Mode",
-      "nl": "Natural Language"
+      "ocr": "Text",
+      "nl": "Picture",
+      "ocr_full": "Text search",
+      "nl_full": "Picture search",
+      "ocr_hint": "Match keywords in recognized text",
+      "nl_hint": "Match screen content with a description"
     },
     "processes": {
       "all": "All Processes",
@@ -1274,13 +1301,44 @@
     "filters": {
       "reset": "Reset"
     },
+    "range": {
+      "label": "Time range",
+      "any": "Any time",
+      "today": "Today",
+      "week": "Last 7 days",
+      "month": "Last 30 days",
+      "custom": "Custom",
+      "custom_active": "Custom range",
+      "start": "Start",
+      "end": "End"
+    },
+    "stats": {
+      "loaded": "{{count}} results loaded",
+      "elapsed": "took {{ms}} ms",
+      "elapsed_other": "took {{ms}} ms",
+      "has_more": "scroll for more",
+      "sort_time": "Newest first",
+      "sort_similarity": "By similarity"
+    },
+    "group": {
+      "expand": "{{count}} more from this window",
+      "collapse": "Collapse"
+    },
+    "landing": {
+      "recent_queries": "Recent searches",
+      "recent_queries_hint": "click to run again",
+      "clear_recent": "Clear history",
+      "top_apps": "Frequent sources",
+      "top_apps_hint": "click to filter by it",
+      "latest": "Latest captures",
+      "latest_hint": "{{count}} in total"
+    },
     "nl_notice": "Results obtained using natural language image search may not be accurate.",
     "no_image": "No Image",
     "unknown": "Unknown",
     "no_ocr_text": "No OCR text",
     "similarity": "Similarity: {{score}}",
     "loading_more": "Loading more results...",
-    "scroll_load": "Scroll to load more…",
     "no_more": "No more results",
     "rotating": [
       "This app is currently a toy!",
@@ -1474,6 +1532,7 @@
       "publishing_sync": "Publishing the index…",
       "publishing_verify": "Verifying the index file…",
       "publishing_commit": "Committing the index…",
+      "building_ann": "Building the accelerated image-search index…",
       "waiting_for_auth": "Waiting for authentication…",
       "working": "Working…"
     }
@@ -1522,6 +1581,7 @@
     "zoomWeek": "Zoom to 1 week",
     "zoomToday": "Zoom to today",
     "jumpToNow": "Jump to Now",
+    "fitSearchResults": "Fit loaded search results",
     "duration": {
       "seconds": "{{seconds}}s",
       "minutes": "{{minutes}}m",

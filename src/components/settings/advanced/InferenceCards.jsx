@@ -439,12 +439,26 @@ export function ClipBackendCard({
   backfill,
   backfillBusy,
   onBackfillDecision,
+  onRetryAnn,
+  annRetrying,
 }) {
   const { t } = useTranslation();
   const backend = status?.clip_backend;
   const usesRustIndex = (config.clip_index || 'rust') === 'rust';
   const backlog = backend?.index_backlog ?? 0;
   const stalled = backend?.index_stalled ?? 0;
+  const annBuildUnhealthy = backend?.ann_build_state && backend.ann_build_state !== 'healthy';
+  const annRetryAt = backend?.ann_build_next_retry_at
+    ? new Date(backend.ann_build_next_retry_at).toLocaleString()
+    : null;
+  const annStateLabel = {
+    armed: t('settings.advanced.clip_backend.ann_ready'),
+    arming: t('settings.advanced.clip_backend.ann_building'),
+    exact_fallback: t('settings.advanced.clip_backend.ann_exact'),
+    failed: t('settings.advanced.clip_backend.ann_failed'),
+    disabled: t('settings.advanced.clip_backend.ann_disabled'),
+    unavailable: t('settings.advanced.clip_backend.ann_unavailable'),
+  }[backend?.ann_state] || backend?.ann_state || '—';
 
   const servedLabel = {
     rust: t('settings.advanced.clip_backend.served_rust'),
@@ -536,7 +550,54 @@ export function ClipBackendCard({
             )}
             <span className="text-ide-muted">{t('settings.advanced.clip_backend.fallbacks')}</span>
             <span className="text-ide-text text-right">{backend?.fallback_count ?? 0}</span>
+            <span className="text-ide-muted">{t('settings.advanced.clip_backend.ann_status')}</span>
+            <span className="text-ide-text text-right">{annStateLabel}</span>
+            {backend?.ann_generation != null && (
+              <>
+                <span className="text-ide-muted">{t('settings.advanced.clip_backend.ann_generation')}</span>
+                <span className="text-ide-text text-right">{backend.ann_generation}</span>
+              </>
+            )}
           </div>
+
+          {annBuildUnhealthy && (
+            <div className="rounded-lg border border-ide-warning-border bg-ide-warning-bg p-3 space-y-2">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-ide-warning shrink-0 mt-0.5" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-medium text-ide-warning">
+                    {backend.ann_build_state === 'circuit_open'
+                      ? t('settings.advanced.clip_backend.ann_circuit_open')
+                      : t('settings.advanced.clip_backend.ann_backoff')}
+                  </p>
+                  <p className="text-[11px] text-ide-warning-muted mt-1 leading-snug">
+                    {t('settings.advanced.clip_backend.ann_search_still_available')}
+                  </p>
+                  <p className="text-[11px] text-ide-warning-muted mt-1 break-words">
+                    {t('settings.advanced.clip_backend.ann_failure_detail', {
+                      count: backend.ann_build_failure_count ?? 0,
+                      code: backend.ann_build_error_code || 'unknown',
+                      retryAt: annRetryAt || '—',
+                    })}
+                  </p>
+                  {backend.ann_last_error && (
+                    <p className="text-[11px] text-ide-warning-muted/80 mt-1 break-words">
+                      {backend.ann_last_error}
+                    </p>
+                  )}
+                </div>
+                <button
+                  onClick={onRetryAnn}
+                  disabled={annRetrying}
+                  className="shrink-0 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors disabled:opacity-50"
+                >
+                  {annRetrying
+                    ? t('settings.advanced.clip_backend.ann_retrying')
+                    : t('settings.advanced.clip_backend.ann_retry_now')}
+                </button>
+              </div>
+            </div>
+          )}
 
           {backend?.last_fallback_reason && (
             <p className="text-[11px] text-ide-warning-muted leading-snug">

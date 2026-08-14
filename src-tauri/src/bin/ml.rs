@@ -3,9 +3,12 @@
 //! Requests and responses use the bounded protocol in `ml_protocol`; model loading and
 //! image inference stay outside the Tauri UI process to contain failures and memory use.
 
+#[path = "../ann_format.rs"]
+mod ann_format;
 #[path = "../ml_protocol.rs"]
 mod ml_protocol;
 
+use memmap2::MmapOptions;
 use ml_protocol::{
     read_request, write_response, MlOcrBlock, MlOcrTimings, MlProvider, MlRequest, MlResponse,
     ML_PROTOCOL_VERSION,
@@ -19,8 +22,10 @@ use std::io::{self, BufReader, BufWriter};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 const MODEL_ID: &str = "ppocrv5-ch-mobile";
+const ANN_BUILD_THREADS: usize = 2;
 
 fn main() {
     if let Err(error) = run() {
@@ -30,6 +35,9 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("--build-ann") {
+        return run_ann_builder();
+    }
     let args = Args::parse()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -217,6 +225,122 @@ fn run() -> Result<(), String> {
         .block_on(engine.shutdown())
         .map_err(|error| format!("failed to shut down OCR engine: {error}"))?;
     eprintln!("[ML] worker stopped");
+    Ok(())
+}
+
+fn run_ann_builder() -> Result<(), String> {
+    let mut flat_path = None;
+    let mut output_path = None;
+    let mut args = std::env::args().skip(2);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--flat" => {
+                flat_path = Some(PathBuf::from(args.next().ok_or("--flat requires a path")?))
+            }
+            "--output" => {
+                output_path = Some(PathBuf::from(
+                    args.next().ok_or("--output requires a path")?,
+                ))
+            }
+            other => return Err(format!("unknown ANN builder argument: {other}")),
+        }
+    }
+    let flat_path = flat_path.ok_or("--flat is required")?;
+    let output_path = output_path.ok_or("--output is required")?;
+    let mapped = ann_format::MappedFlatIndex::open(&flat_path)?;
+    if mapped.header.index_kind != "clip_image" {
+        return Err("ANN builder only accepts clip_image sidecars".to_string());
+    }
+    let mut options = IndexOptions::default();
+    options.dimensions = mapped.header.dimensions as usize;
+    options.metric = MetricKind::IP;
+    options.quantization = ScalarKind::I8;
+    options.connectivity = mapped.header.connectivity as usize;
+    options.expansion_add = mapped.header.expansion_add as usize;
+    options.expansion_search = mapped.header.expansion_search as usize;
+    let index = Index::new(&options).map_err(|error| format!("usearch init failed: {error}"))?;
+    index
+        .reserve_capacity_and_threads(mapped.rows(), ANN_BUILD_THREADS)
+        .map_err(|error| format!("usearch reserve failed: {error}"))?;
+    for ordinal in 0..mapped.rows() {
+        index
+            .add(ordinal as u64 + 1, mapped.vector(ordinal)?)
+            .map_err(|error| format!("usearch add failed at ordinal {ordinal}: {error}"))?;
+        if ordinal > 0 && ordinal % 10_000 == 0 {
+            eprintln!("[ANN] built {ordinal}/{}", mapped.rows());
+        }
+    }
+    let serialized_len = index.serialized_length();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
+        .map_err(|error| format!("failed to create ANN output: {error}"))?;
+    file.set_len(
+        u64::try_from(serialized_len).map_err(|_| "ANN output size exceeds u64".to_string())?,
+    )
+    .map_err(|error| format!("failed to size ANN output: {error}"))?;
+    let mut output_map = unsafe { MmapOptions::new().map_mut(&file) }
+        .map_err(|error| format!("failed to mmap ANN output: {error}"))?;
+    index
+        .save_to_buffer(&mut output_map)
+        .map_err(|error| format!("usearch buffer save failed: {error}"))?;
+    output_map
+        .flush()
+        .map_err(|error| format!("failed to flush ANN output: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("failed to sync ANN output: {error}"))?;
+    drop(index);
+    let output_map = output_map
+        .make_read_only()
+        .map_err(|error| format!("failed to protect ANN output mapping: {error}"))?;
+    let metadata = Index::metadata_from_buffer(&output_map)
+        .map_err(|error| format!("failed to read saved ANN metadata: {error}"))?;
+    let restored_options: IndexOptions = metadata.into();
+    let restored = Index::new(&restored_options)
+        .map_err(|error| format!("failed to initialize saved ANN view: {error}"))?;
+    unsafe { restored.view_from_buffer(&output_map) }
+        .map_err(|error| format!("failed to view saved ANN output: {error}"))?;
+    restored.change_expansion_search(mapped.header.expansion_search as usize);
+    if restored.expansion_search() != mapped.header.expansion_search as usize
+        || restored.dimensions() != mapped.header.dimensions as usize
+        || restored.size() != mapped.rows()
+        || restored.connectivity() != mapped.header.connectivity as usize
+        || restored.metric_kind() != MetricKind::IP
+        || restored.scalar_kind() != ScalarKind::I8
+    {
+        return Err("saved ANN output does not match the requested contract".to_string());
+    }
+    if mapped.rows() > 0 {
+        let probe = mapped.vector(0)?;
+        if !restored.contains(1) {
+            return Err("saved ANN self-test is missing the probe ordinal".to_string());
+        }
+        let mut recovered = vec![0.0f32; mapped.header.dimensions as usize];
+        let vectors_found = restored
+            .get(1, &mut recovered)
+            .map_err(|error| format!("saved ANN probe recovery failed: {error}"))?;
+        let recovered_cosine =
+            ann_format::validate_ann_recovered_probe(probe, &recovered, vectors_found)?;
+        let matches = restored
+            .search(probe, 1)
+            .map_err(|error| format!("saved ANN self-test failed: {error}"))?;
+        ann_format::validate_ann_search_result(
+            &matches.keys,
+            &matches.distances,
+            mapped.rows() as u64,
+        )?;
+        eprintln!(
+            "[ANN] self-test probe_key=1 returned_key={} distance={:.6} recovered_cosine={:.6}",
+            matches.keys[0], matches.distances[0], recovered_cosine
+        );
+    }
+    println!(
+        "{{\"status\":\"ok\",\"rows\":{},\"dimensions\":{}}}",
+        mapped.rows(),
+        mapped.header.dimensions
+    );
     Ok(())
 }
 
