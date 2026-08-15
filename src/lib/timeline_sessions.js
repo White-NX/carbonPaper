@@ -75,6 +75,18 @@ export function buildSessions(events, { tailMs = 0 } = {}) {
   return sessions;
 }
 
+/**
+ * Identify a display block by where it starts rather than by what it holds.
+ *
+ * A folded block always starts where its first child starts, so the same id
+ * survives folding and unfolding. React then keeps the element across zoom
+ * levels instead of tearing it down and building a new one, which is both what
+ * stops icons from flashing and what makes an expand transition possible at all.
+ */
+function blockId(start) {
+  return `blk-${start}`;
+}
+
 /** Default ratio for an app to dominate a run of short activities. */
 const DEFAULT_DOMINANT_RATIO = 0.65;
 
@@ -103,7 +115,7 @@ function refreshAppBlockStats(block) {
 function toActivityBlock(activity) {
   return {
     kind: 'activity',
-    id: `activity-${activity.key}-${activity.start}`,
+    id: blockId(activity.start),
     appName: activity.appName,
     windowTitle: activity.windowTitle,
     processIcon: activity.processIcon,
@@ -164,7 +176,7 @@ function foldRun(items, dominantRatio) {
     const block = {
       ...base,
       kind: 'app',
-      id: `app-${leader.appName || ''}-${start}`,
+      id: blockId(start),
       appName: leader.appName,
       windowTitle: null,
       processIcon: leader.processIcon,
@@ -177,7 +189,7 @@ function foldRun(items, dominantRatio) {
   return {
     ...base,
     kind: 'mixed',
-    id: `mixed-${start}`,
+    id: blockId(start),
     appName: null,
     windowTitle: null,
     processIcon: null,
@@ -237,6 +249,22 @@ export function collapseSessions(
     } else {
       merged.push(block);
     }
+  }
+
+  // Two events sharing a timestamp can leave two blocks claiming the same start.
+  // A duplicate React key would make one of them disappear, so break ties here
+  // rather than weakening the identity every other block relies on.
+  const usedIds = new Set();
+  for (const block of merged) {
+    const base = block.id;
+    let candidate = base;
+    let suffix = 1;
+    while (usedIds.has(candidate)) {
+      candidate = `${base}#${suffix}`;
+      suffix += 1;
+    }
+    usedIds.add(candidate);
+    block.id = candidate;
   }
 
   return merged;

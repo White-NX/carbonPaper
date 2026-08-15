@@ -1261,7 +1261,7 @@
     "search": {
       "error": "搜索出错：{{message}}",
       "placeholder_ocr": "搜索截图里出现过的文字",
-      "placeholder_nl": "描述你想找的画面，比如「深色的代码编辑器」",
+      "placeholder_nl": "描述你想找的画面，比如「月亮」",
       "go": "搜索",
       "searching": "搜索中...",
       "enter_keyword": "输入关键词或选择筛选器开始。",
@@ -1589,7 +1589,8 @@
     "session": {
       "windows": "{{windowCount}} 个窗口",
       "switches": "切换 {{switchCount}} 次",
-      "interruptions": "中断 {{interruptionCount}} 次"
+      "interruptions": "中断 {{interruptionCount}} 次",
+      "segments": "折叠了 {{segmentCount}} 段活动，放大可展开"
     }
   }
 }

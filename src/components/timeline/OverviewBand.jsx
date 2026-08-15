@@ -16,6 +16,7 @@ export default function OverviewBand({
   rangeEnd,
   viewStart,
   viewEnd,
+  onScrub,
   onSeek,
   onSeekRange,
   onInteractingChange,
@@ -107,7 +108,9 @@ export default function OverviewBand({
       if (drag.mode === 'pan') {
         const nextLeft = x - drag.grabOffset;
         const nextCenter = xToTime(nextLeft + viewWidth / 2);
-        onSeek?.(nextCenter);
+        // Dragging the viewport is continuous input, so it moves the timeline at
+        // once. A click on the band is a chosen destination and travels instead.
+        onScrub?.(nextCenter);
       }
     };
 
@@ -136,7 +139,7 @@ export default function OverviewBand({
       window.removeEventListener('mousemove', handleMove);
       window.removeEventListener('mouseup', handleUp);
     };
-  }, [drag, width, xToTime, viewWidth, onSeek, onSeekRange, onInteractingChange]);
+  }, [drag, width, xToTime, viewWidth, onScrub, onSeek, onSeekRange, onInteractingChange]);
 
   const selectionLeft = drag?.mode === 'select' ? Math.min(drag.originX, drag.currentX) : 0;
   const selectionWidth = drag?.mode === 'select' ? Math.abs(drag.currentX - drag.originX) : 0;

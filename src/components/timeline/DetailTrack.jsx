@@ -13,6 +13,7 @@ function FrameStrip({
   timeToX,
   width,
   height,
+  overscanPx,
   highlightedEventId,
   imageCache,
   imageEpoch,
@@ -25,8 +26,8 @@ function FrameStrip({
 
     for (const event of events) {
       const x = timeToX(event.timestamp);
-      if (x < -THUMB_SIZE) continue;
-      if (x > width + THUMB_SIZE) break;
+      if (x < -THUMB_SIZE - overscanPx) continue;
+      if (x > width + THUMB_SIZE + overscanPx) break;
 
       const isHighlighted = highlightedEventId === event.id;
       if (!isHighlighted && x - lastX < MIN_FRAME_GAP) continue;
@@ -35,7 +36,7 @@ function FrameStrip({
       lastX = x;
     }
     return picked;
-  }, [events, timeToX, width, highlightedEventId]);
+  }, [events, timeToX, width, overscanPx, highlightedEventId]);
 
   useEffect(() => {
     const ids = visibleFrames
@@ -56,41 +57,49 @@ function FrameStrip({
         const isHighlighted = highlightedEventId === event.id;
 
         return (
+          // Two elements because two transforms are in play and each wants its
+          // own: the outer one undoes the camera's horizontal scale, so a square
+          // thumbnail stays square, while the inner one is free to keep the
+          // growth on hover and on the highlighted frame.
           <div
             key={event.id ?? `${event.timestamp}-${x}`}
-            data-timeline-item="frame"
-            className={`absolute cursor-pointer overflow-hidden rounded-sm border transition-transform hover:scale-110 ${
-              isHighlighted
-                ? 'z-20 scale-110 border-ide-accent ring-1 ring-ide-accent'
-                : 'z-10 border-ide-border'
-            }`}
+            className={`tl-steady absolute ${isHighlighted ? 'z-20' : 'z-10'}`}
             style={{
               left: x - THUMB_SIZE / 2,
               top,
               width: THUMB_SIZE,
               height: THUMB_SIZE,
             }}
-            onClick={(clickEvent) => {
-              clickEvent.stopPropagation();
-              onSelectEvent?.(event);
-            }}
-            title={new Date(event.timestamp).toLocaleString()}
           >
-            <div className="relative h-full w-full bg-ide-active">
-              {imageUrl && (
-                <img
-                  src={imageUrl}
-                  alt=""
-                  className="pointer-events-none h-full w-full object-cover"
-                  data-epoch={imageEpoch}
-                />
-              )}
-              {event.category && event.category !== '未分类' && (
-                <span
-                  className="absolute inset-x-0 bottom-0 h-1"
-                  style={{ backgroundColor: CATEGORY_COLORS[event.category] || '#6b7280' }}
-                />
-              )}
+            <div
+              data-timeline-item="frame"
+              className={`h-full w-full cursor-pointer overflow-hidden rounded-sm border transition-transform hover:scale-110 ${
+                isHighlighted
+                  ? 'scale-110 border-ide-accent ring-1 ring-ide-accent'
+                  : 'border-ide-border'
+              }`}
+              onClick={(clickEvent) => {
+                clickEvent.stopPropagation();
+                onSelectEvent?.(event);
+              }}
+              title={new Date(event.timestamp).toLocaleString()}
+            >
+              <div className="relative h-full w-full bg-ide-active">
+                {imageUrl && (
+                  <img
+                    src={imageUrl}
+                    alt=""
+                    className="pointer-events-none h-full w-full object-cover"
+                    data-epoch={imageEpoch}
+                  />
+                )}
+                {event.category && event.category !== '未分类' && (
+                  <span
+                    className="absolute inset-x-0 bottom-0 h-1"
+                    style={{ backgroundColor: CATEGORY_COLORS[event.category] || '#6b7280' }}
+                  />
+                )}
+              </div>
             </div>
           </div>
         );
@@ -100,27 +109,30 @@ function FrameStrip({
 }
 
 /** Density notch strip for medium zoom span (30 min - 8 hours). */
-function NotchStrip({ buckets, timeToX, width, height }) {
+function NotchStrip({ buckets, timeToX, width, height, overscanPx }) {
   const canvasRef = useRef(null);
+  // Widened past both edges, because the camera slides this canvas around
+  // between redraws and a screen-sized one would run out of paint at the edge.
+  const canvasWidth = width + overscanPx * 2;
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !width || !height) return;
+    if (!canvas || !canvasWidth || !height) return;
 
     const dpr = window.devicePixelRatio || 1;
-    if (canvas.style.width !== `${width}px`) {
-      canvas.style.width = `${width}px`;
+    if (canvas.style.width !== `${canvasWidth}px`) {
+      canvas.style.width = `${canvasWidth}px`;
       canvas.style.height = `${height}px`;
     }
-    if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
-      canvas.width = width * dpr;
+    if (canvas.width !== canvasWidth * dpr || canvas.height !== height * dpr) {
+      canvas.width = canvasWidth * dpr;
       canvas.height = height * dpr;
     }
 
     const ctx = canvas.getContext('2d');
     ctx.resetTransform();
     ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, width, height);
+    ctx.clearRect(0, 0, canvasWidth, height);
 
     if (!buckets || buckets.length === 0) return;
 
@@ -131,23 +143,29 @@ function NotchStrip({ buckets, timeToX, width, height }) {
     const baseline = height - 4;
 
     for (const bucket of buckets) {
-      const x = timeToX(bucket.timestamp);
-      const nextX = timeToX(bucket.timestamp + bucketMs);
+      const x = timeToX(bucket.timestamp) + overscanPx;
+      const nextX = timeToX(bucket.timestamp + bucketMs) + overscanPx;
       const barWidth = Math.max(1, nextX - x - 0.5);
-      if (x + barWidth < 0 || x > width) continue;
+      if (x + barWidth < 0 || x > canvasWidth) continue;
 
       const ratio = bucket.count / maxCount;
       const barHeight = Math.max(3, ratio * (height - 10));
       ctx.fillStyle = accentWithAlpha(inkAlpha(ratio));
       ctx.fillRect(x, baseline - barHeight, barWidth, barHeight);
     }
-  }, [buckets, timeToX, width, height]);
+  }, [buckets, timeToX, canvasWidth, overscanPx, height]);
 
-  return <canvas ref={canvasRef} className="pointer-events-none absolute inset-0" />;
+  return (
+    <canvas
+      ref={canvasRef}
+      className="pointer-events-none absolute top-0"
+      style={{ left: -overscanPx, width: canvasWidth, height }}
+    />
+  );
 }
 
 /** Stacked app distribution bars for wide zoom span (> 8 hours). */
-function StackedBars({ distribution, timeToX, width, height, onSeek }) {
+function StackedBars({ distribution, timeToX, width, height, overscanPx, onSeek }) {
   if (!distribution || distribution.length === 0) return null;
 
   const maxCount = distribution.reduce((max, bucket) => Math.max(max, bucket.count), 0);
@@ -162,7 +180,7 @@ function StackedBars({ distribution, timeToX, width, height, onSeek }) {
         const x = timeToX(bucket.timestamp);
         const nextX = timeToX(bucket.timestamp + bucketMs);
         const barWidth = Math.max(1, nextX - x - 2);
-        if (x + barWidth < 0 || x > width) return null;
+        if (x + barWidth < -overscanPx || x > width + overscanPx) return null;
 
         const barHeight = Math.max(2, (bucket.count / maxCount) * usableHeight);
 
@@ -210,6 +228,8 @@ export default function DetailTrack({
   timeToX,
   width,
   height,
+  overscanPx = 0,
+  stageRef,
   highlightedEventId,
   imageCache,
   imageEpoch,
@@ -223,38 +243,43 @@ export default function DetailTrack({
       style={{ height }}
       data-keep-selection="true"
     >
-      {tier === 'frame' && (
-        <FrameStrip
-          events={events}
-          timeToX={timeToX}
-          width={width}
-          height={height}
-          highlightedEventId={highlightedEventId}
-          imageCache={imageCache}
-          imageEpoch={imageEpoch}
-          onSelectEvent={onSelectEvent}
-          onVisibleFramesChange={onVisibleFramesChange}
-        />
-      )}
+      <div ref={stageRef} className="absolute inset-0" style={{ willChange: 'transform' }}>
+        {tier === 'frame' && (
+          <FrameStrip
+            events={events}
+            timeToX={timeToX}
+            width={width}
+            height={height}
+            overscanPx={overscanPx}
+            highlightedEventId={highlightedEventId}
+            imageCache={imageCache}
+            imageEpoch={imageEpoch}
+            onSelectEvent={onSelectEvent}
+            onVisibleFramesChange={onVisibleFramesChange}
+          />
+        )}
 
-      {tier === 'session' && (
-        <NotchStrip
-          buckets={buckets}
-          timeToX={timeToX}
-          width={width}
-          height={height}
-        />
-      )}
+        {tier === 'session' && (
+          <NotchStrip
+            buckets={buckets}
+            timeToX={timeToX}
+            width={width}
+            height={height}
+            overscanPx={overscanPx}
+          />
+        )}
 
-      {tier === 'day' && (
-        <StackedBars
-          distribution={distribution}
-          timeToX={timeToX}
-          width={width}
-          height={height}
-          onSeek={onSeek}
-        />
-      )}
+        {tier === 'day' && (
+          <StackedBars
+            distribution={distribution}
+            timeToX={timeToX}
+            width={width}
+            height={height}
+            overscanPx={overscanPx}
+            onSeek={onSeek}
+          />
+        )}
+      </div>
     </div>
   );
 }

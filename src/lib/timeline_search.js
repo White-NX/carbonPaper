@@ -56,6 +56,9 @@ export function getSearchMarkerFitRange(markers) {
  * Collapse nearby on-screen hits into a bounded number of visual markers.
  * Clusters are intentionally based on a fixed starting x so a dense chain does
  * not merge into one marker spanning the whole timeline.
+ *
+ * @param {number} overscanPx How far past each edge markers are still wanted,
+ *   so the camera can slide the layer without exposing a bare strip
  */
 export function clusterSearchTimelineMarkers(
   markers,
@@ -63,13 +66,15 @@ export function clusterSearchTimelineMarkers(
   width,
   hoveredIds = [],
   clusterWidthPx = 7,
+  overscanPx = 0,
 ) {
   if (!markers?.length || !width) return [];
 
+  const reach = clusterWidthPx + overscanPx;
   const hovered = hoveredIds instanceof Set ? hoveredIds : new Set(hoveredIds || []);
   const visible = markers
     .map((marker) => ({ marker, x: timeToX(marker.time) }))
-    .filter(({ x }) => Number.isFinite(x) && x >= -clusterWidthPx && x <= width + clusterWidthPx)
+    .filter(({ x }) => Number.isFinite(x) && x >= -reach && x <= width + reach)
     .sort((a, b) => a.x - b.x);
 
   const clusters = [];

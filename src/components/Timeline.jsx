@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Focus, Play } from 'lucide-react';
-import { getTimeline, getTimelineDensity, fetchThumbnailBatch, clearTimelineImageQueue } from '../lib/monitor_api';
+import { getTimeline, getTimelineDensity, fetchThumbnailBatch } from '../lib/monitor_api';
 import {
   aggregateAppDistribution,
   buildSessions,
@@ -10,6 +10,15 @@ import {
   mergeSortedEvents,
   pruneEvents,
 } from '../lib/timeline_sessions';
+import {
+  SPAN_LADDER_MS,
+  createThrottle,
+  isRangeCovered,
+  resolveZoomLevel,
+  snapSpanUpMs,
+} from '../lib/timeline_viewport';
+import { RENDER_OVERSCAN_RATIO } from '../lib/timeline_camera';
+import useTimelineCamera from '../hooks/useTimelineCamera';
 import { accentWithAlpha } from '../lib/timeline_palette';
 import OverviewBand from './timeline/OverviewBand';
 import SessionBand from './timeline/SessionBand';
@@ -35,6 +44,38 @@ const SESSION_TIER_MAX_SPAN = 8 * HOUR;
 /** Minimum pixel width target before collapsing session blocks. */
 const SESSION_MIN_BLOCK_PX = 32;
 
+/**
+ * Records one timeline fetch may return. Mirrors the default applied by
+ * `storage_get_timeline` in `src-tauri/src/commands/storage.rs`, which samples
+ * evenly across the requested range once the range holds more rows than this.
+ * Stated here as well because the sampling width it implies is what decides
+ * whether two fetches may be merged.
+ */
+const TIMELINE_SAMPLE_LIMIT = 500;
+
+/** How much wider than the viewport each kind of fetch reaches. */
+const EVENT_PREFETCH_FACTOR = 2.5;
+const DENSITY_PREFETCH_FACTOR = 2.5;
+const OVERVIEW_PREFETCH_FACTOR = 2;
+
+/** Refetch once the viewport comes this close to the edge of loaded data. */
+const REFETCH_MARGIN_RATIO = 0.35;
+const OVERVIEW_REFETCH_MARGIN_RATIO = 0.1;
+
+/** Shortest gap between two fetches of the same kind while the user is dragging. */
+const EVENT_FETCH_INTERVAL_MS = 300;
+const DENSITY_FETCH_INTERVAL_MS = 350;
+const OVERVIEW_FETCH_INTERVAL_MS = 500;
+const THUMBNAIL_BATCH_INTERVAL_MS = 250;
+
+/** Density bars aimed for across one screen width, and across the overview band. */
+const DENSITY_BUCKETS_PER_SCREEN = 120;
+const OVERVIEW_BUCKET_COUNT = 160;
+
+/** How often loaded data is read again so newly captured screenshots appear. */
+const FOLLOW_REFRESH_MS = 1000;
+const IDLE_REFRESH_MS = 5000;
+
 /** Overview band span configuration factor. */
 const OVERVIEW_SPAN_FACTOR = 10;
 const OVERVIEW_MIN_SPAN = 2 * HOUR;
@@ -45,6 +86,13 @@ const OVERVIEW_RECENTER_RATIO = 0.3;
 /** Drag slop threshold in pixels. */
 const DRAG_SLOP_PX = 4;
 
+/** Zoom bounds in pixels per millisecond: a year across, down to 20 px a second. */
+const MIN_ZOOM = 100 / (365 * DAY);
+const MAX_ZOOM = 20 / 1000;
+
+/** Multiplier applied to the zoom by one wheel notch. */
+const WHEEL_ZOOM_STEP = 1.2;
+
 /** Local timezone offset relative to UTC in milliseconds. */
 function localBucketOffsetMs() {
   return -new Date().getTimezoneOffset() * MINUTE;
@@ -52,6 +100,8 @@ function localBucketOffsetMs() {
 
 const TIMELINE_IMAGE_CACHE_LIMIT = 800;
 const timelineImageCache = new Map();
+/** Ids the backend holds no thumbnail for, so a batch is not asked for them forever. */
+const timelineImageMissing = new Set();
 
 function setTimelineImageCache(key, dataUrl) {
   if (key === null || key === undefined || !dataUrl) return;
@@ -62,34 +112,12 @@ function setTimelineImageCache(key, dataUrl) {
   timelineImageCache.set(key, dataUrl);
 }
 
-function simpleDebounce(func, wait) {
-  let timeout;
-  return function debounced(...args) {
-    clearTimeout(timeout);
-    timeout = setTimeout(() => func.apply(this, args), wait);
-  };
-}
-
-function simpleThrottle(func, limit) {
-  let lastRun = 0;
-  return function throttled(...args) {
-    const now = Date.now();
-    if (now - lastRun >= limit) {
-      func.apply(this, args);
-      lastRun = now;
-    }
-  };
-}
-
-/** Snap raw bucket width to standardized step. */
-function snapBucketMs(raw) {
-  const steps = [
-    1000, 5000, 15000, 30000,
-    MINUTE, 5 * MINUTE, 15 * MINUTE, 30 * MINUTE,
-    HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR,
-    DAY, 7 * DAY, 30 * DAY,
-  ];
-  return steps.find((step) => step >= raw) || steps[steps.length - 1];
+/** Record a missing thumbnail, evicting the oldest so the set stays bounded. */
+function markTimelineImageMissing(key) {
+  if (!timelineImageMissing.has(key) && timelineImageMissing.size >= TIMELINE_IMAGE_CACHE_LIMIT) {
+    timelineImageMissing.delete(timelineImageMissing.values().next().value);
+  }
+  timelineImageMissing.add(key);
 }
 
 function getTickStep(zoom) {
@@ -145,9 +173,6 @@ const Timeline = ({
   const [overviewAnchor, setOverviewAnchor] = useState(() => Date.now());
   const [overviewInteracting, setOverviewInteracting] = useState(false);
 
-  const MIN_ZOOM = 100 / (365 * DAY);
-  const MAX_ZOOM = 20 / 1000;
-
   const lastMouseXRef = useRef(0);
   const isDraggingRef = useRef(false);
   const dragMovedRef = useRef(0);
@@ -156,13 +181,43 @@ const Timeline = ({
   const overviewEpochRef = useRef(0);
   const wheelIdleTimerRef = useRef(null);
   const pendingImageIdsRef = useRef([]);
-  const batchTimerRef = useRef(null);
   const searchFitKeyRef = useRef(null);
   const searchFitSuspendedRef = useRef(false);
+  const jumpTokenRef = useRef(null);
+
+  /** Ranges already asked for, so a pan only refetches near their edges. */
+  const requestedEventsRef = useRef(null);
+  const requestedDensityRef = useRef(null);
+  const requestedOverviewRef = useRef(null);
+  /** Sampling width behind the events currently held, used to decide merge or replace. */
+  const loadedSampleMsRef = useRef(null);
+  /**
+   * Live viewport, written on every camera frame.
+   *
+   * Timers read the view from here rather than through their own dependencies,
+   * because depending on it directly rebuilt them on every frame of a movement,
+   * which is why the periodic refresh never fired during a drag.
+   */
+  const liveViewRef = useRef({ center: 0, span: 0 });
+  const overviewViewRef = useRef({ anchor: 0, span: 0 });
+  const zoomLevelRef = useRef(null);
+  const thumbnailInFlightRef = useRef(false);
+  const loadThumbnailsRef = useRef(null);
+
+  /** Elements the camera moves, and the axis it repositions label by label. */
+  const sessionStageRef = useRef(null);
+  const detailStageRef = useRef(null);
+  const markerStageRef = useRef(null);
+  const axisRef = useRef(null);
+  const stages = useMemo(
+    () => [sessionStageRef, detailStageRef, markerStageRef],
+    [],
+  );
 
   const visibleSpan = width > 0 ? width / zoom : HOUR;
   const viewStart = centerTime - visibleSpan / 2;
   const viewEnd = centerTime + visibleSpan / 2;
+  const overscanPx = width * RENDER_OVERSCAN_RATIO;
 
   const tier = visibleSpan <= FRAME_TIER_MAX_SPAN
     ? 'frame'
@@ -170,23 +225,16 @@ const Timeline = ({
       ? 'session'
       : 'day';
 
+  // Snapped so the band, and the fetch behind it, hold still inside a zoom level
   const overviewSpan = Math.max(
-    visibleSpan,
+    snapSpanUpMs(visibleSpan),
     Math.min(
       OVERVIEW_MAX_SPAN,
-      Math.max(OVERVIEW_MIN_SPAN, visibleSpan * OVERVIEW_SPAN_FACTOR),
+      snapSpanUpMs(Math.max(OVERVIEW_MIN_SPAN, visibleSpan * OVERVIEW_SPAN_FACTOR)),
     ),
   );
   const overviewStart = overviewAnchor - overviewSpan / 2;
   const overviewEnd = overviewAnchor + overviewSpan / 2;
-
-  // Recenter overview band anchor when viewport drifts too far
-  useEffect(() => {
-    if (overviewInteracting) return;
-    if (Math.abs(centerTime - overviewAnchor) > overviewSpan * OVERVIEW_RECENTER_RATIO) {
-      setOverviewAnchor(centerTime);
-    }
-  }, [centerTime, overviewAnchor, overviewSpan, overviewInteracting]);
 
   const timeToX = useCallback(
     (time) => width / 2 + (time - centerTime) * zoom,
@@ -205,18 +253,69 @@ const Timeline = ({
     return () => observer.disconnect();
   }, []);
 
+  // ── Camera ─────────────────────────────────────────────────
+
+  /**
+   * Adopt the viewport the camera has drifted to as the one the bands are drawn
+   * for.
+   *
+   * Everything downstream still reads `centerTime` and `zoom`; the only change
+   * is that they now move a few times a second instead of once per frame.
+   */
+  const handleCameraCommit = useCallback((view) => {
+    setCenterTime(view.center);
+    setZoom(view.zoom);
+  }, []);
+
+  /**
+   * Called after every transform write, both during movement and after a redraw.
+   *
+   * It keeps the live viewport within reach of the timers, and moves the axis
+   * label by label. The axis is deliberately left outside the transform: it
+   * carries text, and a scaled stage would stretch it.
+   */
+  const handleCameraFrame = useCallback((frame) => {
+    liveViewRef.current = { center: frame.center, span: frame.span };
+
+    const node = axisRef.current;
+    if (!node) return;
+
+    for (const child of node.children) {
+      const base = Number(child.dataset.x);
+      if (!Number.isFinite(base)) continue;
+      const shift = (frame.scale - 1) * base + frame.translate;
+      child.style.transform = `translate3d(${shift}px, 0, 0) translateX(-50%)`;
+    }
+  }, []);
+
+  const camera = useTimelineCamera({
+    width,
+    center: centerTime,
+    zoom,
+    minZoom: MIN_ZOOM,
+    maxZoom: MAX_ZOOM,
+    stages,
+    onCommit: handleCameraCommit,
+    onFrame: handleCameraFrame,
+  });
+
+  // Recenter the overview band once the viewport has drifted too far across it.
+  // Suspended mid-flight, where the centre is passing through values nobody is
+  // meant to read.
+  useEffect(() => {
+    if (overviewInteracting || camera.isFlying()) return;
+    if (Math.abs(centerTime - overviewAnchor) > overviewSpan * OVERVIEW_RECENTER_RATIO) {
+      setOverviewAnchor(centerTime);
+    }
+  }, [centerTime, overviewAnchor, overviewSpan, overviewInteracting, camera]);
+
   // ── Data Fetching ──────────────────────────────────────────
 
-  const fetchEventsRaw = useCallback(async (center, currentZoom, containerWidth) => {
-    if (!containerWidth) return;
-
+  const fetchEventsRange = useCallback(async (start, end, sampleMs) => {
     const epoch = ++fetchEpochRef.current;
-    const span = containerWidth / currentZoom;
-    const start = center - span;
-    const end = center + span;
 
     try {
-      const records = await getTimeline(start, end);
+      const records = await getTimeline(start, end, TIMELINE_SAMPLE_LIMIT);
       if (fetchEpochRef.current !== epoch) return;
 
       const mapped = (records || [])
@@ -245,25 +344,27 @@ const Timeline = ({
         })
         .filter((event) => !Number.isNaN(event.timestamp));
 
-      setEvents((prev) => pruneEvents(mergeSortedEvents(prev, mapped), center - span * 1.5, center + span * 1.5));
+      // Two fetches taken at different sampling widths describe the same hours at
+      // different fidelity. Merging them would leave the session band showing a
+      // dense island inside a sparse surround, so that one zoom level looks
+      // different depending on the route the user took to reach it. Only samples
+      // of matching width are merged; a change of width replaces outright.
+      const sameFidelity = loadedSampleMsRef.current === sampleMs;
+      loadedSampleMsRef.current = sampleMs;
+
+      setEvents((prev) => (sameFidelity
+        ? pruneEvents(mergeSortedEvents(prev, mapped), start, end)
+        : mapped));
     } catch (error) {
       console.error('[Timeline] Fetch error:', error);
+      // Forget the request so the range guard tries again rather than believing
+      // this range is covered. A newer request has already replaced it.
+      if (fetchEpochRef.current === epoch) requestedEventsRef.current = null;
     }
   }, []);
 
-  const fetchDensityRaw = useCallback(async (center, currentZoom, containerWidth) => {
-    if (!containerWidth) return;
-
+  const fetchDensityRange = useCallback(async (start, end, bucketMs) => {
     const epoch = ++densityEpochRef.current;
-    const span = containerWidth / currentZoom;
-    const start = center - span;
-    const end = center + span;
-
-    // Ensure bucket width is at least one day for day tier
-    const raw = (span * 2) / 220;
-    const bucketMs = span > SESSION_TIER_MAX_SPAN
-      ? Math.max(DAY, snapBucketMs(raw))
-      : snapBucketMs(raw);
 
     try {
       const buckets = await getTimelineDensity(start, end, bucketMs, localBucketOffsetMs());
@@ -275,12 +376,12 @@ const Timeline = ({
       })));
     } catch (error) {
       console.error('[Timeline] Density fetch error:', error);
+      if (densityEpochRef.current === epoch) requestedDensityRef.current = null;
     }
   }, []);
 
-  const fetchOverviewRaw = useCallback(async (start, end) => {
+  const fetchOverviewRange = useCallback(async (start, end, bucketMs) => {
     const epoch = ++overviewEpochRef.current;
-    const bucketMs = snapBucketMs((end - start) / 160);
 
     try {
       const buckets = await getTimelineDensity(start, end, bucketMs, localBucketOffsetMs());
@@ -292,43 +393,158 @@ const Timeline = ({
       })));
     } catch (error) {
       console.error('[Timeline] Overview fetch error:', error);
+      if (overviewEpochRef.current === epoch) requestedOverviewRef.current = null;
     }
   }, []);
 
-  const fetchEventsDebounced = useMemo(() => simpleDebounce(fetchEventsRaw, 500), [fetchEventsRaw]);
-  const fetchEventsThrottled = useMemo(() => simpleThrottle(fetchEventsRaw, 1000), [fetchEventsRaw]);
-  const fetchDensityDebounced = useMemo(() => simpleDebounce(fetchDensityRaw, 600), [fetchDensityRaw]);
-  const fetchOverviewDebounced = useMemo(() => simpleDebounce(fetchOverviewRaw, 900), [fetchOverviewRaw]);
+  const requestEvents = useMemo(
+    () => createThrottle(fetchEventsRange, EVENT_FETCH_INTERVAL_MS),
+    [fetchEventsRange],
+  );
+  const requestDensity = useMemo(
+    () => createThrottle(fetchDensityRange, DENSITY_FETCH_INTERVAL_MS),
+    [fetchDensityRange],
+  );
+  const requestOverview = useMemo(
+    () => createThrottle(fetchOverviewRange, OVERVIEW_FETCH_INTERVAL_MS),
+    [fetchOverviewRange],
+  );
+
+  /**
+   * Fetch screenshots only once the viewport is running out of loaded data.
+   *
+   * Panning used to reset a debounce timer on every frame, so nothing arrived
+   * until the pointer was released. Deciding on coverage instead lets a drag keep
+   * loading while still costing a few requests rather than one per frame, because
+   * each fetch reaches well past both edges of the screen.
+   */
+  const ensureEvents = useCallback((center, span, force = false) => {
+    if (!span) return;
+
+    const requestSpan = span * EVENT_PREFETCH_FACTOR;
+    const sampleMs = snapSpanUpMs(requestSpan / TIMELINE_SAMPLE_LIMIT);
+    const requested = requestedEventsRef.current;
+
+    const covered = requested?.sampleMs === sampleMs
+      && isRangeCovered(
+        requested,
+        center - span / 2,
+        center + span / 2,
+        span * REFETCH_MARGIN_RATIO,
+      );
+    if (covered && !force) return;
+
+    const start = center - requestSpan / 2;
+    const end = center + requestSpan / 2;
+    requestedEventsRef.current = { start, end, sampleMs };
+    requestEvents(start, end, sampleMs);
+  }, [requestEvents]);
+
+  const ensureDensity = useCallback((center, span, force = false) => {
+    if (!span) return;
+
+    const requestSpan = span * DENSITY_PREFETCH_FACTOR;
+    const rawBucket = span / DENSITY_BUCKETS_PER_SCREEN;
+    // Ensure bucket width is at least one day for day tier
+    const bucketMs = span > SESSION_TIER_MAX_SPAN
+      ? Math.max(DAY, snapSpanUpMs(rawBucket))
+      : snapSpanUpMs(rawBucket);
+    const requested = requestedDensityRef.current;
+
+    const covered = requested?.bucketMs === bucketMs
+      && isRangeCovered(
+        requested,
+        center - span / 2,
+        center + span / 2,
+        span * REFETCH_MARGIN_RATIO,
+      );
+    if (covered && !force) return;
+
+    const start = center - requestSpan / 2;
+    const end = center + requestSpan / 2;
+    requestedDensityRef.current = { start, end, bucketMs };
+    requestDensity(start, end, bucketMs);
+  }, [requestDensity]);
+
+  const ensureOverview = useCallback((anchor, span, force = false) => {
+    if (!span) return;
+
+    const requestSpan = span * OVERVIEW_PREFETCH_FACTOR;
+    const bucketMs = snapSpanUpMs(span / OVERVIEW_BUCKET_COUNT);
+    const requested = requestedOverviewRef.current;
+
+    const covered = requested?.bucketMs === bucketMs
+      && isRangeCovered(
+        requested,
+        anchor - span / 2,
+        anchor + span / 2,
+        span * OVERVIEW_REFETCH_MARGIN_RATIO,
+      );
+    if (covered && !force) return;
+
+    const start = anchor - requestSpan / 2;
+    const end = anchor + requestSpan / 2;
+    requestedOverviewRef.current = { start, end, bucketMs };
+    requestOverview(start, end, bucketMs);
+  }, [requestOverview]);
 
   useEffect(() => {
-    if (sqlPaused || !width) return;
-    if (isFollowingNow) fetchEventsThrottled(centerTime, zoom, width);
-    else fetchEventsDebounced(centerTime, zoom, width);
-    fetchDensityDebounced(centerTime, zoom, width);
-    fetchOverviewDebounced(overviewStart, overviewEnd);
-  }, [
-    centerTime, zoom, width, isFollowingNow, sqlPaused,
-    overviewStart, overviewEnd,
-    fetchEventsThrottled, fetchEventsDebounced, fetchDensityDebounced, fetchOverviewDebounced,
-  ]);
+    overviewViewRef.current = { anchor: overviewAnchor, span: overviewSpan };
+  }, [overviewAnchor, overviewSpan]);
+
+  // A flight asks for its destination once when it sets off, so nothing is
+  // requested for the viewports it passes over on the way. Each of those is on
+  // screen for a couple of frames and would never arrive in time to be seen.
+  useEffect(() => {
+    if (sqlPaused || !width || camera.isFlying()) return;
+    ensureEvents(centerTime, visibleSpan);
+    ensureDensity(centerTime, visibleSpan);
+  }, [centerTime, visibleSpan, width, sqlPaused, camera, ensureEvents, ensureDensity]);
 
   useEffect(() => {
-    if (refreshKey === undefined) return;
+    if (sqlPaused || !width || camera.isFlying()) return;
+    ensureOverview(overviewAnchor, overviewSpan);
+  }, [overviewAnchor, overviewSpan, width, sqlPaused, camera, ensureOverview]);
+
+  useEffect(() => {
+    if (refreshKey === undefined || !width) return;
     setEvents([]);
-    clearTimelineImageQueue();
+    timelineImageMissing.clear();
+    requestedEventsRef.current = null;
+    requestedDensityRef.current = null;
+    requestedOverviewRef.current = null;
+    loadedSampleMsRef.current = null;
     setImageEpoch((prev) => prev + 1);
-    fetchEventsRaw(centerTime, zoom, width);
+    ensureEvents(centerTime, visibleSpan, true);
+    ensureDensity(centerTime, visibleSpan, true);
     // Refresh only when refreshKey changes
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshKey]);
 
+  // Read the loaded range again on a timer so newly captured screenshots appear.
+  // The interval deliberately reads the viewport from a ref: depending on it
+  // directly rebuilt the timer on every pan frame, which is why it never fired
+  // during a drag.
   useEffect(() => {
-    if (sqlPaused) return undefined;
+    if (sqlPaused || !width) return undefined;
+
+    const period = isFollowingNow ? FOLLOW_REFRESH_MS : IDLE_REFRESH_MS;
     const interval = setInterval(() => {
-      if (!isFollowingNow && !isDragging) fetchEventsDebounced(centerTime, zoom, width);
-    }, 5000);
+      const view = liveViewRef.current;
+      const overview = overviewViewRef.current;
+      ensureEvents(view.center, view.span, true);
+      ensureDensity(view.center, view.span, true);
+      ensureOverview(overview.anchor, overview.span, true);
+    }, period);
+
     return () => clearInterval(interval);
-  }, [isFollowingNow, isDragging, centerTime, zoom, width, fetchEventsDebounced, sqlPaused]);
+  }, [sqlPaused, width, isFollowingNow, ensureEvents, ensureDensity, ensureOverview]);
+
+  useEffect(() => () => {
+    requestEvents.cancel();
+    requestDensity.cancel();
+    requestOverview.cancel();
+  }, [requestEvents, requestDensity, requestOverview]);
 
   // ── Thumbnail Loading ──────────────────────────────────────
 
@@ -336,35 +552,67 @@ const Timeline = ({
     pendingImageIdsRef.current = ids;
   }, []);
 
-  useEffect(() => {
-    if (sqlPaused || tier !== 'frame') return undefined;
-    if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
+  /**
+   * Load thumbnails for whatever is on screen right now.
+   *
+   * Only one batch is in flight at a time, and a successful batch immediately
+   * asks for another round, so a drag keeps filling in frames instead of waiting
+   * for the pointer to be released.
+   */
+  const loadVisibleThumbnails = useCallback(() => {
+    if (thumbnailInFlightRef.current) return;
 
-    batchTimerRef.current = setTimeout(() => {
-      const ids = pendingImageIdsRef.current;
-      if (!ids || ids.length === 0) return;
-      const uncached = ids.filter((id) => !timelineImageCache.has(id));
-      if (uncached.length === 0) return;
+    const ids = pendingImageIdsRef.current;
+    if (!ids || ids.length === 0) return;
 
-      fetchThumbnailBatch(uncached)
-        .then((batch) => {
-          if (!batch) return;
-          let added = 0;
-          for (const [id, dataUrl] of Object.entries(batch)) {
-            if (dataUrl) {
-              setTimelineImageCache(Number(id), dataUrl);
-              added += 1;
-            }
+    const wanted = ids.filter(
+      (id) => !timelineImageCache.has(id) && !timelineImageMissing.has(id),
+    );
+    if (wanted.length === 0) return;
+
+    thumbnailInFlightRef.current = true;
+    fetchThumbnailBatch(wanted)
+      .then((batch) => {
+        let added = 0;
+        for (const id of wanted) {
+          const dataUrl = batch?.[id];
+          if (dataUrl) {
+            setTimelineImageCache(id, dataUrl);
+            added += 1;
+          } else {
+            // Remember the gap, otherwise these ids are asked for on every round
+            markTimelineImageMissing(id);
           }
-          if (added > 0) setImageEpoch((prev) => prev + 1);
-        })
-        .catch((error) => console.error('[Timeline] Batch thumbnail load error:', error));
-    }, 300);
+        }
+        if (added > 0) setImageEpoch((prev) => prev + 1);
 
+        thumbnailInFlightRef.current = false;
+        // A round may have been skipped while this batch was in flight
+        loadThumbnailsRef.current?.();
+      })
+      .catch((error) => {
+        thumbnailInFlightRef.current = false;
+        console.error('[Timeline] Batch thumbnail load error:', error);
+      });
+  }, []);
+
+  const requestThumbnails = useMemo(
+    () => createThrottle(loadVisibleThumbnails, THUMBNAIL_BATCH_INTERVAL_MS),
+    [loadVisibleThumbnails],
+  );
+
+  useEffect(() => {
+    loadThumbnailsRef.current = requestThumbnails;
     return () => {
-      if (batchTimerRef.current) clearTimeout(batchTimerRef.current);
+      loadThumbnailsRef.current = null;
+      requestThumbnails.cancel();
     };
-  }, [centerTime, zoom, width, events, sqlPaused, tier]);
+  }, [requestThumbnails]);
+
+  useEffect(() => {
+    if (sqlPaused || tier !== 'frame') return;
+    requestThumbnails();
+  }, [centerTime, zoom, width, events, sqlPaused, tier, requestThumbnails]);
 
   // ── Derived Data ───────────────────────────────────────────
 
@@ -373,11 +621,25 @@ const Timeline = ({
     () => buildSessions(events, { tailMs: sampleInterval }),
     [events, sampleInterval],
   );
+  /**
+   * Fold threshold for the session band, snapped so it holds still while the user
+   * scrolls inside one zoom level.
+   *
+   * Derived straight from `zoom` it drifts with every pixel of scroll, so blocks
+   * flip between folded and expanded one at a time at moments nobody can predict,
+   * and every block is rebuilt on every frame of a zoom. Snapped, the band changes
+   * only at a handful of boundaries, and `collapseSessions` runs only there.
+   */
+  const fold = useMemo(() => {
+    if (!width || visibleSpan <= 0) return { level: -1, minBlockMs: 0 };
+    const level = resolveZoomLevel(visibleSpan, zoomLevelRef.current);
+    zoomLevelRef.current = level;
+    return { level, minBlockMs: (SPAN_LADDER_MS[level] * SESSION_MIN_BLOCK_PX) / width };
+  }, [visibleSpan, width]);
+
   const sessionBlocks = useMemo(
-    () => collapseSessions(activities, {
-      minBlockMs: zoom > 0 ? SESSION_MIN_BLOCK_PX / zoom : 0,
-    }),
-    [activities, zoom],
+    () => collapseSessions(activities, { minBlockMs: fold.minBlockMs }),
+    [activities, fold.minBlockMs],
   );
   const distribution = useMemo(
     () => (tier === 'day' ? aggregateAppDistribution(events, densityBuckets, 4) : []),
@@ -398,7 +660,6 @@ const Timeline = ({
   // ── Navigation ───────────────────────────────────────────────
 
   const resetImagePipeline = useCallback(() => {
-    clearTimelineImageQueue();
     setImageEpoch((prev) => prev + 1);
   }, []);
 
@@ -406,29 +667,61 @@ const Timeline = ({
     if (searchState?.markers?.length) searchFitSuspendedRef.current = true;
   }, [searchState]);
 
+  /**
+   * Send the camera to a viewport, and start loading the destination while it is
+   * still on its way.
+   *
+   * Every deliberate move goes through here: the quick zoom buttons, the search
+   * fit, a double click on a session, a click in the overview band. Continuous
+   * input does not, because a path only makes sense between two places the user
+   * has actually chosen.
+   */
+  const flyTo = useCallback((nextCenter, nextZoom, options) => {
+    const target = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, nextZoom));
+    camera.flyTo(nextCenter, target, options);
+
+    if (!sqlPaused && width) {
+      const span = width / target;
+      ensureEvents(nextCenter, span, true);
+      ensureDensity(nextCenter, span, true);
+    }
+  }, [camera, ensureDensity, ensureEvents, sqlPaused, width]);
+
   const seekTo = useCallback((time) => {
     suspendSearchFit();
     setIsFollowingNow(false);
-    setCenterTime(time);
-  }, [suspendSearchFit]);
+    flyTo(time, camera.read().zoom);
+  }, [camera, flyTo, suspendSearchFit]);
+
+  /**
+   * Continuous drag of the overview viewport.
+   *
+   * Unlike the main track this one redraws on every move rather than riding the
+   * transform, because the rectangle the user has hold of is drawn from the
+   * committed viewport. Letting it drift would leave the very handle being
+   * dragged trailing behind the cursor.
+   */
+  const scrubTo = useCallback((time) => {
+    suspendSearchFit();
+    setIsFollowingNow(false);
+    camera.jumpTo(time, camera.read().zoom);
+  }, [camera, suspendSearchFit]);
 
   const seekRange = useCallback((from, to) => {
     if (!width || to <= from) return;
     suspendSearchFit();
     setIsFollowingNow(false);
-    setCenterTime((from + to) / 2);
-    setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, width / (to - from))));
+    flyTo((from + to) / 2, width / (to - from));
     resetImagePipeline();
-  }, [width, MIN_ZOOM, MAX_ZOOM, resetImagePipeline, suspendSearchFit]);
+  }, [width, flyTo, resetImagePipeline, suspendSearchFit]);
 
   const fitSearchMarkers = useCallback(() => {
     const range = getSearchMarkerFitRange(searchState?.markers);
     if (!range || !width) return;
     setIsFollowingNow(false);
-    setCenterTime((range.from + range.to) / 2);
-    setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, width / (range.to - range.from))));
+    flyTo((range.from + range.to) / 2, width / (range.to - range.from));
     resetImagePipeline();
-  }, [searchState?.markers, width, MIN_ZOOM, MAX_ZOOM, resetImagePipeline]);
+  }, [searchState?.markers, width, flyTo, resetImagePipeline]);
 
   useEffect(() => {
     if (!searchState?.fitKey || !searchState.markers?.length) {
@@ -451,39 +744,32 @@ const Timeline = ({
     if (!width) return;
     suspendSearchFit();
     setIsFollowingNow(false);
-    setCenterTime(Date.now());
-    setZoom(Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, width / spanMs)));
+    flyTo(Date.now(), width / spanMs);
     resetImagePipeline();
-  }, [width, MIN_ZOOM, MAX_ZOOM, resetImagePipeline, suspendSearchFit]);
+  }, [width, flyTo, resetImagePipeline, suspendSearchFit]);
 
   const jumpToNow = useCallback(() => {
     suspendSearchFit();
-    setCenterTime(Date.now());
-    setZoom(MAX_ZOOM);
-    setIsFollowingNow(true);
-    resetImagePipeline();
-  }, [MAX_ZOOM, resetImagePipeline, suspendSearchFit]);
-
-  useEffect(() => {
-    if (!jumpTimestamp?.time) return;
     setIsFollowingNow(false);
-    setCenterTime(jumpTimestamp.time);
-    setZoom((prev) => Math.max(prev, 0.005));
+    // Following starts once the camera has landed, so the flight itself is not
+    // fighting a centre that keeps moving forward underneath it.
+    flyTo(Date.now(), MAX_ZOOM, { onDone: () => setIsFollowingNow(true) });
     resetImagePipeline();
-  }, [jumpTimestamp, resetImagePipeline]);
+  }, [flyTo, resetImagePipeline, suspendSearchFit]);
+
+  // Guarded by the token rather than by the dependency list, because `flyTo`
+  // changes identity whenever the track is resized and must not replay a jump.
+  useEffect(() => {
+    if (!jumpTimestamp?.time || jumpTokenRef.current === jumpTimestamp) return;
+    jumpTokenRef.current = jumpTimestamp;
+    setIsFollowingNow(false);
+    flyTo(jumpTimestamp.time, Math.max(camera.read().zoom, 0.005));
+    resetImagePipeline();
+  }, [jumpTimestamp, camera, flyTo, resetImagePipeline]);
 
   useEffect(() => {
-    if (!isFollowingNow) return undefined;
-    let frameId;
-    const tick = () => {
-      setCenterTime(Date.now());
-      frameId = requestAnimationFrame(tick);
-    };
-    tick();
-    return () => {
-      if (frameId) cancelAnimationFrame(frameId);
-    };
-  }, [isFollowingNow]);
+    camera.setLive(isFollowingNow);
+  }, [camera, isFollowingNow]);
 
   useEffect(() => {
     const handleKeyDown = (event) => {
@@ -514,7 +800,6 @@ const Timeline = ({
     isDraggingRef.current = true;
     dragMovedRef.current = 0;
     lastMouseXRef.current = event.clientX;
-    clearTimelineImageQueue();
   }, [suspendSearchFit]);
 
   const handleMouseMove = useCallback((event) => {
@@ -522,8 +807,10 @@ const Timeline = ({
     const deltaX = event.clientX - lastMouseXRef.current;
     lastMouseXRef.current = event.clientX;
     dragMovedRef.current += Math.abs(deltaX);
-    setCenterTime((prev) => prev - deltaX / zoom);
-  }, [zoom]);
+    // Straight to the camera, with no smoothing: content that trails the cursor
+    // during a drag reads as lag rather than as polish.
+    camera.panBy(deltaX);
+  }, [camera]);
 
   const endDrag = useCallback(() => {
     if (!isDraggingRef.current) return;
@@ -536,24 +823,18 @@ const Timeline = ({
     try { event.preventDefault(); } catch { /* passive listener */ }
     setIsFollowingNow(false);
     suspendSearchFit();
-    clearTimelineImageQueue();
 
     if (wheelIdleTimerRef.current) clearTimeout(wheelIdleTimerRef.current);
     wheelIdleTimerRef.current = setTimeout(() => setImageEpoch((prev) => prev + 1), 160);
 
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const cursorX = event.clientX - rect.left;
-    const timeAtCursor = centerTime + (cursorX - width / 2) / zoom;
 
-    const nextZoom = Math.max(
-      MIN_ZOOM,
-      Math.min(MAX_ZOOM, event.deltaY < 0 ? zoom * 1.2 : zoom / 1.2),
+    camera.zoomAt(
+      event.clientX - rect.left,
+      event.deltaY < 0 ? WHEEL_ZOOM_STEP : 1 / WHEEL_ZOOM_STEP,
     );
-
-    setZoom(nextZoom);
-    setCenterTime(timeAtCursor - (cursorX - width / 2) / nextZoom);
-  }, [centerTime, width, zoom, MIN_ZOOM, MAX_ZOOM, suspendSearchFit]);
+  }, [camera, suspendSearchFit]);
 
   const handleBackgroundClick = useCallback((event) => {
     if (dragMovedRef.current > DRAG_SLOP_PX) return;
@@ -588,22 +869,30 @@ const Timeline = ({
 
   // ── Axis Ticks ──────────────────────────────────────────────
 
+  // Generated past both edges by the same margin the bands use, because the
+  // camera slides the axis around between redraws and a short tick list would
+  // leave a bare strip trailing behind the movement.
   const ticks = useMemo(() => {
     if (!width) return [];
+
+    const margin = overscanPx + 60;
+    const from = viewStart - margin / zoom;
+    const to = viewEnd + margin / zoom;
+
     const result = [];
-    let current = Math.floor(viewStart / tickStepMs) * tickStepMs;
+    let current = Math.floor(from / tickStepMs) * tickStepMs;
     let guard = 0;
 
-    while (current < viewEnd && guard < 100) {
+    while (current < to && guard < 200) {
       const x = timeToX(current);
-      if (x > -60 && x < width + 60) {
+      if (x > -margin && x < width + margin) {
         result.push({ time: current, x, label: formatTick(new Date(current), tickStepMs) });
       }
       current += tickStepMs;
       guard += 1;
     }
     return result;
-  }, [width, viewStart, viewEnd, tickStepMs, timeToX]);
+  }, [width, overscanPx, zoom, viewStart, viewEnd, tickStepMs, timeToX]);
 
   const quickZooms = [
     { key: 'today', span: DAY, label: t('timeline.today'), title: t('timeline.zoomToday'), shortcut: '1' },
@@ -626,6 +915,7 @@ const Timeline = ({
         rangeEnd={overviewEnd}
         viewStart={viewStart}
         viewEnd={viewEnd}
+        onScrub={scrubTo}
         onSeek={seekTo}
         onSeekRange={seekRange}
         onInteractingChange={setOverviewInteracting}
@@ -648,6 +938,9 @@ const Timeline = ({
           timeToX={timeToX}
           width={width}
           height={SESSION_HEIGHT}
+          overscanPx={overscanPx}
+          foldLevel={fold.level}
+          stageRef={sessionStageRef}
           activeId={activeSessionId}
           onSelect={handleSelectSession}
           onZoomTo={handleZoomToSession}
@@ -661,6 +954,8 @@ const Timeline = ({
           timeToX={timeToX}
           width={width}
           height={DETAIL_HEIGHT}
+          overscanPx={overscanPx}
+          stageRef={detailStageRef}
           highlightedEventId={highlightedEventId}
           imageCache={timelineImageCache}
           imageEpoch={imageEpoch}
@@ -676,6 +971,8 @@ const Timeline = ({
             timeToX={timeToX}
             width={width}
             height={DETAIL_HEIGHT}
+            overscanPx={overscanPx}
+            stageRef={markerStageRef}
             onSelectMarker={(marker) => {
               if (marker?.result) onSelectSearchResult?.(marker.result);
             }}
@@ -683,18 +980,21 @@ const Timeline = ({
         </div>
 
         <div className="relative" style={{ height: AXIS_HEIGHT }}>
-          {ticks.map((tick) => (
-            <div
-              key={tick.time}
-              className="pointer-events-none absolute top-0 flex -translate-x-1/2 flex-col items-center"
-              style={{ left: tick.x }}
-            >
-              <span className="h-1 w-px bg-ide-border" />
-              <span className="mt-0.5 whitespace-nowrap font-mono text-[10px] leading-none text-ide-muted">
-                {tick.label}
-              </span>
-            </div>
-          ))}
+          <div ref={axisRef} className="absolute inset-0">
+            {ticks.map((tick) => (
+              <div
+                key={tick.time}
+                data-x={tick.x}
+                className="pointer-events-none absolute top-0 flex -translate-x-1/2 flex-col items-center"
+                style={{ left: tick.x }}
+              >
+                <span className="h-1 w-px bg-ide-border" />
+                <span className="mt-0.5 whitespace-nowrap font-mono text-[10px] leading-none text-ide-muted">
+                  {tick.label}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
 
         <div
