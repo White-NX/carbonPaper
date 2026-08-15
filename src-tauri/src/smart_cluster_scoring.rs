@@ -88,7 +88,7 @@ use crate::rerank::{
 };
 use crate::semantic_runtime::{SemanticRuntimeState, FOREGROUND_POLL_INTERVAL};
 use crate::storage::smart_cluster::{
-    anchor_text_hash, CachedAnchorVector, SmartClusterScorer, SmartClusterScoringTarget,
+    anchor_text_hash, SmartClusterScorer, SmartClusterScoringTarget,
 };
 use crate::storage::{DerivedIndexKind, StorageState};
 use serde::Serialize;
@@ -1457,6 +1457,7 @@ pub fn status_value(state: &Arc<SmartClusterWorkerState>, pending_count: i64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::smart_cluster::CachedAnchorVector;
 
     #[test]
     fn the_status_payload_keeps_the_two_fields_the_ui_reads() {

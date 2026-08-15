@@ -708,6 +708,7 @@ impl StorageState {
     /// Same query path with an explicit budget for focused regression tests.
     /// Production callers use [`cache_budget`] through
     /// [`Self::semantic_topk_resident`].
+    #[cfg(test)]
     pub(super) fn semantic_topk_resident_with_budget(
         &self,
         index_kind: DerivedIndexKind,
@@ -1228,6 +1229,9 @@ impl StorageState {
                 .unwrap_or_else(|error| error.into_inner()) = None;
             used_at.store(0, Ordering::Relaxed);
         }
+        // The text search's cached result order is a list of row ids from the
+        // file that just went away, so it is keyed to the same boundary.
+        self.clear_search_order_cache();
     }
 
     /// Releases each matrix no query has touched for `ttl`.

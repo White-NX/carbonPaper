@@ -2348,18 +2348,6 @@ impl StorageState {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn list_query_visible_embedding_page_for_ann(
-        &self,
-        index_kind: DerivedIndexKind,
-        after_subject_key: Option<&str>,
-        limit: u32,
-    ) -> Result<Vec<DerivedEmbeddingRecord>, String> {
-        self.with_vector_scan_connection("list_query_visible_embedding_page_for_ann", |conn| {
-            list_query_visible_embedding_page_from_conn(conn, index_kind, after_subject_key, limit)
-        })
-    }
-
     /// Stream the query-visible embedding snapshot through one independent
     /// read connection. The callback is invoked once per keyset-paginated
     /// page, so callers can write/process a page before the next one is
@@ -3268,6 +3256,7 @@ fn write_hashed(writer: &mut impl Write, hasher: &mut Sha256, bytes: &[u8]) -> R
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_sidecar(path: &Path, expected_checksum: &str) -> Result<(), String> {
     verify_sidecar_with_progress(
         path,

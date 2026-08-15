@@ -3,8 +3,12 @@
 //! Requests and responses use the bounded protocol in `ml_protocol`; model loading and
 //! image inference stay outside the Tauri UI process to contain failures and memory use.
 
+// This worker only reads flat sidecars; the Tauri library owns the writer half.
+#[allow(dead_code)]
 #[path = "../ann_format.rs"]
 mod ann_format;
+// This worker uses the server half of the shared bidirectional protocol.
+#[allow(dead_code)]
 #[path = "../ml_protocol.rs"]
 mod ml_protocol;
 
