@@ -561,11 +561,14 @@ fn intersect_groups(
 /// `search_rank.rs`.
 ///
 /// Returns the surviving rows with the number of groups each matched, or
-/// `None` when the query is too short for a tolerance to mean anything or the
-/// superset would be too large to check.
+/// `None` when the query's edit budget is exhausted by missing groups or the
+/// superset would be too large to check. `max_destroyed` comes from the same
+/// plaintext edit budget used by the reranker; a character substitution can
+/// consume two adjacent bigram groups.
 fn fuzzy_candidates(
     store: &mut PostingStore<'_>,
     groups: &[&HashedGroup],
+    max_destroyed: usize,
     allowed: Option<&RoaringBitmap>,
     counts: &mut SearchCounts,
 ) -> Result<Option<FuzzyRecall>, String> {
@@ -587,12 +590,18 @@ fn fuzzy_candidates(
                 || (group.bytes() <= MAX_POSTING_BYTES && group.bytes() as u64 <= FUZZY_LOAD_BYTES)
         })
         .collect();
-    let mut tolerance = (ordered.len() / 4)
-        .min(MAX_FUZZY_TOLERANCE)
-        .min(affordable.len().saturating_sub(1));
-    if tolerance == 0 {
+    // A missing posting is evidence that the query's spelling is absent from
+    // the corpus, not evidence that the candidate matched fewer groups. Keep
+    // those misses in the edit budget. One character substitution can destroy
+    // two adjacent bigrams.
+    let missing = groups.len().saturating_sub(ordered.len());
+    if max_destroyed == 0 || missing > max_destroyed || affordable.is_empty() {
         return Ok(None);
     }
+    let mut tolerance = max_destroyed
+        .saturating_sub(missing)
+        .min(MAX_FUZZY_TOLERANCE)
+        .min(affordable.len().saturating_sub(1));
 
     // Keep one budget for both the seed union and the later counting pass.
     // Groups loaded by the seed are cached, so their second use costs zero.
@@ -630,10 +639,10 @@ fn fuzzy_candidates(
         if filtered.len() <= FUZZY_UNION_CAP {
             break filtered;
         }
-        tolerance -= 1;
         if tolerance == 0 {
             return Ok(None);
         }
+        tolerance -= 1;
     };
 
     let mut hits: HashMap<u32, u32> = HashMap::with_capacity(superset.len() as usize);
@@ -1865,9 +1874,15 @@ impl StorageState {
                 reached = Tier::Fuzzy;
             }
             let before = candidates.len();
-            if let Some((hits, checked)) =
-                fuzzy_candidates(&mut store, &flat, allowed, &mut telemetry.counts)?
-            {
+            if let Some((hits, checked)) = fuzzy_candidates(
+                &mut store,
+                &flat,
+                search_rank::edit_budget(plan.phrase.len())
+                    .saturating_mul(2)
+                    .min(MAX_FUZZY_TOLERANCE),
+                allowed,
+                &mut telemetry.counts,
+            )? {
                 push_candidates(
                     &mut candidates,
                     &mut seen,
@@ -2451,7 +2466,7 @@ mod tests {
         let groups = store.resolve(&planned);
         let refs: Vec<&HashedGroup> = groups.iter().collect();
 
-        let (mut kept, checked) = fuzzy_candidates(&mut store, &refs, None, &mut counts)
+        let (mut kept, checked) = fuzzy_candidates(&mut store, &refs, 1, None, &mut counts)
             .expect("fuzzy pass")
             .expect("tolerance is meaningful for six groups");
         kept.sort_unstable();
@@ -2470,7 +2485,7 @@ mod tests {
         }]);
         let refs: Vec<&HashedGroup> = groups.iter().collect();
         assert!(
-            fuzzy_candidates(&mut store, &refs, None, &mut SearchCounts::default())
+            fuzzy_candidates(&mut store, &refs, 0, None, &mut SearchCounts::default(),)
                 .expect("fuzzy pass")
                 .is_none()
         );
@@ -2492,7 +2507,7 @@ mod tests {
         let refs: Vec<&HashedGroup> = groups.iter().collect();
         let mut counts = SearchCounts::default();
 
-        assert!(fuzzy_candidates(&mut store, &refs, None, &mut counts)
+        assert!(fuzzy_candidates(&mut store, &refs, 2, None, &mut counts)
             .expect("fuzzy pass")
             .is_none());
         assert_eq!(counts.loaded, 0);
@@ -2513,7 +2528,7 @@ mod tests {
             .collect();
         let refs: Vec<&HashedGroup> = groups.iter().collect();
 
-        let _ = fuzzy_candidates(&mut store, &refs, None, &mut SearchCounts::default())
+        let _ = fuzzy_candidates(&mut store, &refs, 2, None, &mut SearchCounts::default())
             .expect("fuzzy pass");
         // Loading a second list would cross the 2 MiB ceiling. It must not be
         // admitted later merely because the counting phase reset its counter.
@@ -2553,7 +2568,7 @@ mod tests {
         );
 
         let (kept, checked) =
-            fuzzy_candidates(&mut store, &refs, None, &mut SearchCounts::default())
+            fuzzy_candidates(&mut store, &refs, 2, None, &mut SearchCounts::default())
                 .expect("fuzzy pass")
                 .expect("nine characters tolerate a typo");
         assert_eq!(checked, 8);
@@ -2565,6 +2580,30 @@ mod tests {
         // The row that only supplied the destroyed bigram matched one group of
         // eight and stays out.
         assert!(!recalled.contains(&99));
+    }
+
+    #[test]
+    fn a_four_character_query_recalls_one_ocr_substitution() {
+        let conn = search_fixture();
+        let hmac_key = b"unit-test-hmac-key-for-search-ok!";
+        index_text(&conn, hmac_key, &[11], "卫成协议");
+
+        let groups = hashed(&conn, "卫戍协议", hmac_key);
+        assert_eq!(
+            groups.iter().filter(|group| group.is_present()).count(),
+            1,
+            "only the unaffected bigram should exist in the fixture"
+        );
+
+        let refs: Vec<&HashedGroup> = groups.iter().collect();
+        let mut store = PostingStore::new(&conn);
+        let (kept, checked) =
+            fuzzy_candidates(&mut store, &refs, 2, None, &mut SearchCounts::default())
+                .expect("fuzzy pass")
+                .expect("one substitution is meaningful for four characters");
+
+        assert_eq!(checked, 1);
+        assert!(kept.iter().any(|(id, _)| *id == 11));
     }
 
     #[test]

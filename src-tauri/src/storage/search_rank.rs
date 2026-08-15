@@ -76,7 +76,7 @@ const NEAR_QUALITY_CEILING: f64 = 0.55;
 const APPROX_CELL_BUDGET: usize = 1 << 20;
 
 /// How many edits a needle of this length is allowed to absorb.
-fn edit_budget(len: usize) -> usize {
+pub(super) fn edit_budget(len: usize) -> usize {
     (len / CHARS_PER_EDIT).min(MAX_EDITS)
 }
 
@@ -419,6 +419,12 @@ mod tests {
         assert!(score("中华人共和国", text) > 0.0);
         // A phrase that merely shares characters is not a misspelling of it.
         assert_eq!(score("中华人共和国", "华人共同体的国民"), 0.0);
+    }
+
+    #[test]
+    fn one_ocr_substitution_still_finds_a_four_character_phrase() {
+        assert!(matched("卫戍协议", "卫成协议"));
+        assert!(score("卫戍协议", "卫成协议") > 0.0);
     }
 
     #[test]
