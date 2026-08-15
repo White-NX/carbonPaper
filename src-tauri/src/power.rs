@@ -168,17 +168,6 @@ pub fn start_power_monitor(app: AppHandle) {
     *guard = Some(handle);
 }
 
-/// Stop the power monitoring loop
-pub fn stop_power_monitor(app: &AppHandle) {
-    let power_state = app.state::<Arc<PowerState>>();
-
-    let mut guard = power_state.monitor_task.lock().unwrap();
-    if let Some(handle) = guard.take() {
-        handle.abort();
-        tracing::info!("Power monitor stopped");
-    }
-}
-
 // ==================== Tauri Commands ====================
 
 #[tauri::command]

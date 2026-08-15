@@ -16,6 +16,8 @@ mod process;
 mod schema;
 mod screenshot;
 mod search;
+mod search_plan;
+mod search_rank;
 mod semantic_cache;
 pub mod smart_cluster;
 pub mod task;
@@ -121,6 +123,11 @@ pub struct StorageState {
     /// caches are reset. A scan that started against the old file must not
     /// publish its result after that boundary.
     semantic_cache_reset_generation: AtomicU64,
+    /// Ordered ids of the most recent text search, so paging through one
+    /// result set does not re-run recall and reranking for every page. The
+    /// order itself holds no plaintext and expires on its own; see
+    /// `search.rs::CachedSearchOrder`.
+    search_order_cache: Mutex<Option<search::CachedSearchOrder>>,
 }
 
 struct NamedConnectionGuard<'a> {
@@ -190,6 +197,7 @@ impl StorageState {
             semantic_cache_load_lock: Mutex::new(()),
             clip_cache_load_lock: Mutex::new(()),
             semantic_cache_reset_generation: AtomicU64::new(0),
+            search_order_cache: Mutex::new(None),
         }
     }
 

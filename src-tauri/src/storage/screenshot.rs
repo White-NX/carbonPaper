@@ -76,7 +76,10 @@ fn open_cng_session() -> Result<CngKeySession, BackgroundReadError> {
 /// once per row and no NCrypt handle receives concurrent calls. Input order
 /// is preserved. Any `AuthRequired` fails the whole batch with `AuthRequired`
 /// so callers keep their wait-for-unlock semantics.
-fn unwrap_batch_parallel<T, R, F>(items: Vec<T>, process: F) -> Result<Vec<R>, BackgroundReadError>
+pub(super) fn unwrap_batch_parallel<T, R, F>(
+    items: Vec<T>,
+    process: F,
+) -> Result<Vec<R>, BackgroundReadError>
 where
     T: Send,
     R: Send,
