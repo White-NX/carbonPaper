@@ -765,7 +765,9 @@ pub fn storage_cancel_thumbnail_warmup(
 /// Returns a screenshot record and all associated OCR rows selected by `id` or `path`.
 ///
 /// Authentication: required. Returns `{ "status": "success" | "not_found",
-/// "record", "ocr_results" }`. Frontend: `lib/monitor_api.js`.
+/// "record", "ocr_results", "document_ref" }`. The document view deliberately
+/// omits the encrypted locator; only the authenticated resume command reads it.
+/// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_screenshot_details(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -788,16 +790,29 @@ pub async fn storage_get_screenshot_details(
         match &record {
             Some(r) => {
                 let ocr_results = state.get_screenshot_ocr_results(r.id)?;
+                let document_ref = match state.get_screenshot_document_ref(r.id) {
+                    Ok(reference) => reference.map(|reference| reference.public_view()),
+                    Err(error) => {
+                        tracing::warn!(
+                            "[OFFICE:STORAGE] ignoring unreadable document reference for screenshot {}: {}",
+                            r.id,
+                            error
+                        );
+                        None
+                    }
+                };
                 Ok(serde_json::json!({
                     "status": "success",
                     "record": record,
-                    "ocr_results": ocr_results
+                    "ocr_results": ocr_results,
+                    "document_ref": document_ref
                 }))
             }
             None => Ok(serde_json::json!({
                 "status": "not_found",
                 "record": null,
-                "ocr_results": []
+                "ocr_results": [],
+                "document_ref": null
             })),
         }
     })

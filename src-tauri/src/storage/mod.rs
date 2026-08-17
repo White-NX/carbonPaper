@@ -7,6 +7,7 @@
 
 mod derived_index;
 mod derived_migration;
+mod document_ref;
 mod encryption;
 mod image_io;
 mod link_scoring;
@@ -28,6 +29,7 @@ pub(crate) mod wire_time;
 pub use derived_index::*;
 #[allow(unused_imports)]
 pub use derived_migration::*;
+pub use document_ref::STALE_DOCUMENT_REF_GENERATION;
 #[allow(unused_imports)]
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
 pub(crate) use policy::disk_totals_for_path;
@@ -128,6 +130,14 @@ pub struct StorageState {
     /// order itself holds no plaintext and expires on its own; see
     /// `search.rs::CachedSearchOrder`.
     search_order_cache: Mutex<Option<search::CachedSearchOrder>>,
+    /// Incremented on every close and every open of the backing database file,
+    /// always while the `db` mutex is held. A background writer that captured
+    /// this value before being scheduled can tell whether it is still facing
+    /// the same database; row ids are only meaningful within one generation,
+    /// so a write that crosses a backup restore or a data-directory switch
+    /// would otherwise land on an unrelated screenshot that happens to share
+    /// the id. See `document_ref.rs::save_screenshot_document_ref_for_generation`.
+    db_generation: AtomicU64,
 }
 
 struct NamedConnectionGuard<'a> {
@@ -198,6 +208,7 @@ impl StorageState {
             clip_cache_load_lock: Mutex::new(()),
             semantic_cache_reset_generation: AtomicU64::new(0),
             search_order_cache: Mutex::new(None),
+            db_generation: AtomicU64::new(0),
         }
     }
 
@@ -361,5 +372,24 @@ impl StorageState {
     /// Returns whether the current credential session is unlocked/valid.
     pub fn is_session_valid(&self) -> bool {
         self.credential_state.is_session_valid()
+    }
+
+    /// The identity of the currently open database file.
+    ///
+    /// Capture this before handing work to a background task, then pass it back
+    /// to the write call. The value changes whenever the database is closed or
+    /// reopened, which is exactly when previously collected row ids stop being
+    /// meaningful.
+    pub fn db_generation(&self) -> u64 {
+        self.db_generation.load(Ordering::Acquire)
+    }
+
+    /// Records that the backing database file is being swapped.
+    ///
+    /// Callers must already hold the `db` mutex, so that a writer which passed
+    /// the generation check under that same lock cannot be overtaken by a swap
+    /// before its statement runs.
+    pub(super) fn bump_db_generation(&self) {
+        self.db_generation.fetch_add(1, Ordering::Release);
     }
 }

@@ -30,9 +30,13 @@
     "build:nmh:release": "node scripts/build-nmh.mjs --release",
     "build:ml": "node scripts/build-ml.mjs",
     "build:ml:release": "node scripts/build-ml.mjs --release",
+    "build:office": "node scripts/build-office.mjs",
+    "build:office:release": "node scripts/build-office.mjs --release",
+    "test:office-nativeom": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-office-nativeom.ps1",
     "build:semantic-ml": "node scripts/build-semantic-ml.mjs",
     "build:semantic-ml:release": "node scripts/build-semantic-ml.mjs --release",
     "verify:ml-runtime": "src-tauri\\target\\release\\carbonpaper-ml.exe --verify-models --model-dir src-tauri\\pre-bundle\\ocr-models\\ppocrv5-ch-mobile-r1",
+    "verify:office-runtime": "src-tauri\\target\\release\\carbonpaper-office.exe --probe",
     "verify:semantic-runtime": "node scripts/verify-semantic-runtime.mjs",
     "validate:semantic-runtime": "python tools/validate_rust_semantic.py",
     "prepare:release-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1",
@@ -43,7 +47,7 @@
     "verify:release-bundles": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release-bundles.ps1",
     "pack:portable": "node scripts/pack-portable.mjs",
     "generate:update-signing-key": "node scripts/generate-update-signing-key.mjs",
-    "tauri:build": "npm run prepare:release-assets && node scripts/build-nmh.mjs --release && npm run build:ml:release && npm run build:semantic-ml:release && npm run verify:ml-runtime && npm run verify:semantic-runtime && tauri build && node scripts/pack-portable.mjs && npm run verify:release-bundles"
+    "tauri:build": "npm run prepare:release-assets && node scripts/build-nmh.mjs --release && npm run build:ml:release && npm run build:office:release && npm run build:semantic-ml:release && npm run verify:ml-runtime && npm run verify:office-runtime && npm run verify:semantic-runtime && tauri build && node scripts/pack-portable.mjs && npm run verify:release-bundles"
   },
   "dependencies": {
     "@tauri-apps/api": "~2.9.0",

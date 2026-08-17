@@ -917,14 +917,39 @@
     "moreDeleteOptions": "More delete options",
     "deleteThisRecord": "Delete this record",
     "deleteNearby5min": "Delete records within 5 minutes",
-    "openUrlTitle": "Open URL: {{url}}",
-    "noUrlDetected": "No URL detected",
     "more": "More",
     "showOcr": "Show OCR content",
     "openFloatingPreview": "View in separate window",
     "openMainPreview": "View in main window/preview",
     "float": "Separate Preview",
     "alpha": "alpha"
+  },
+  "snapshotSource": {
+    "open": "Open related content",
+    "opening": "Opening...",
+    "openTitle": "Open the page or file associated with this snapshot",
+    "chooseTitle": "Choose related content to open",
+    "openFailed": "Could not open related content: {{error}}"
+  },
+  "documentSource": {
+    "title": "Edited file",
+    "unknownFile": "Office document",
+    "openTitle": "Open {{name}}",
+    "unsavedTitle": "This file had not been saved and cannot be resumed",
+    "unavailableTitle": "This file cannot be resumed",
+    "openFailed": "Could not open the file: {{error}}",
+    "applications": {
+      "word": "Word",
+      "excel": "Excel",
+      "powerPoint": "PowerPoint",
+      "office": "Office"
+    },
+    "kinds": {
+      "local": "Local file",
+      "cloud": "Cloud document",
+      "unsaved": "Not saved",
+      "office": "Office document"
+    }
   },
   "snapshotPreview": {
     "windowTitle": "Snapshot Preview",

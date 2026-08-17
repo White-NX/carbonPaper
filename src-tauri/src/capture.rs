@@ -4,6 +4,8 @@
 //! applies exclusion and activity policy, and commits encoded frames to storage.
 
 use crate::monitor::MonitorState;
+use crate::office_protocol::OfficeApplication;
+use crate::office_runtime::{OfficeCaptureContext, OfficeRuntimeState};
 use crate::storage::{OcrResultInput, SaveScreenshotRequest, StorageState};
 use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
@@ -377,6 +379,102 @@ pub struct ActiveWindowInfo {
     title: String,
     rect: RECT,
     pid: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveWindowFingerprint {
+    hwnd_raw: isize,
+    pid: u32,
+    title: String,
+    office_document_hwnd: Option<i64>,
+}
+
+impl ActiveWindowFingerprint {
+    fn new(info: &ActiveWindowInfo, office_document_hwnd: Option<i64>) -> Self {
+        Self {
+            hwnd_raw: info.hwnd_raw,
+            pid: info.pid,
+            // Window titles are part of the Office identity because a reused
+            // Office root HWND can switch documents without changing handles.
+            // Keep non-Office fingerprints title-free so dynamic browser,
+            // terminal, or media titles do not create artificial focus scans.
+            title: office_document_hwnd
+                .is_some()
+                .then(|| info.title.clone())
+                .unwrap_or_default(),
+            office_document_hwnd,
+        }
+    }
+
+    fn matches_window_info(&self, info: &ActiveWindowInfo) -> bool {
+        self.hwnd_raw == info.hwnd_raw
+            && self.pid == info.pid
+            && (self.office_document_hwnd.is_none() || self.title == info.title)
+    }
+
+    fn storage_image_hash(&self, image_bytes: &[u8]) -> String {
+        let content_hash = md5_hash(image_bytes);
+        let Some(document_hwnd) = self.office_document_hwnd else {
+            return content_hash;
+        };
+
+        // `screenshots.image_hash` is globally unique for historical storage
+        // and vector-index contracts. Scope identical Office frames to the
+        // native document window so two documents with the same pixels still
+        // remain separate timeline records without changing that schema.
+        let scope = format!(
+            "office\0{}\0{}\0{}\0{}\0{}",
+            self.hwnd_raw, document_hwnd, self.pid, self.title, content_hash,
+        );
+        md5_hash(scope.as_bytes())
+    }
+}
+
+struct ProcessIdentity {
+    pid: u32,
+    hwnd_raw: isize,
+    path: String,
+    name: String,
+    refreshed_at: std::time::Instant,
+}
+
+const PROCESS_IDENTITY_FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl ProcessIdentity {
+    fn should_refresh(&self, info: &ActiveWindowInfo) -> bool {
+        self.pid != info.pid
+            || self.hwnd_raw != info.hwnd_raw
+            || (self.path.is_empty() && self.refreshed_at.elapsed() >= PROCESS_IDENTITY_FAILURE_TTL)
+    }
+}
+
+fn process_identity_for_window(
+    info: &ActiveWindowInfo,
+    cache: &mut Option<ProcessIdentity>,
+) -> (String, String) {
+    if cache
+        .as_ref()
+        .is_none_or(|identity| identity.should_refresh(info))
+    {
+        let path = get_process_path_from_pid(info.pid).unwrap_or_default();
+        let name = if path.is_empty() {
+            String::new()
+        } else {
+            get_process_name_from_path(&path)
+        };
+        *cache = Some(ProcessIdentity {
+            pid: info.pid,
+            hwnd_raw: info.hwnd_raw,
+            path,
+            name,
+            refreshed_at: std::time::Instant::now(),
+        });
+    }
+
+    let identity = cache
+        .as_ref()
+        .expect("process identity cache is populated for the requested PID");
+    (identity.path.clone(), identity.name.clone())
 }
 
 /// Retrieves information about the currently focused foreground window,
@@ -1309,7 +1407,7 @@ pub async fn run_capture_loop(
 ) {
     tracing::info!("Rust capture loop started");
 
-    let mut last_hwnd_raw: isize = 0;
+    let mut last_window_fingerprint: Option<ActiveWindowFingerprint> = None;
     // Use checked_sub to avoid panic when system uptime < 999s (Instant can't go before boot)
     let mut last_capture_time = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(999))
@@ -1317,6 +1415,8 @@ pub async fn run_capture_loop(
     let mut force_first_capture = true;
     let mut history_hashes: Vec<DHash> = Vec::new();
     let mut icon_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut current_process_identity: Option<ProcessIdentity> = None;
+    let office_runtime = app.state::<Arc<OfficeRuntimeState>>().inner().clone();
 
     // Load config
     let (
@@ -1366,12 +1466,11 @@ pub async fn run_capture_loop(
         }
 
         // Get active window
-        let window_info = match get_active_window_info() {
+        let mut window_info = match get_active_window_info() {
             Some(info) => info,
             None => continue,
         };
-
-        let current_hwnd_raw = window_info.hwnd_raw;
+        let base_window_fingerprint = ActiveWindowFingerprint::new(&window_info, None);
 
         // Exclusion check
         {
@@ -1380,10 +1479,31 @@ pub async fn run_capture_loop(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if is_excluded(&window_info, &settings) {
-                last_hwnd_raw = current_hwnd_raw;
+                last_window_fingerprint = Some(base_window_fingerprint);
                 continue;
             }
         }
+
+        // Process lookup and native child-window fingerprinting are cheap Win32
+        // operations. They happen before OCR/dHash early exits so Office document
+        // switches are observed even when no screenshot is written.
+        let (mut process_path, mut process_name) =
+            process_identity_for_window(&window_info, &mut current_process_identity);
+        let mut office_context: Option<OfficeCaptureContext> =
+            OfficeApplication::from_process_name(&process_name).and_then(|application| {
+                office_runtime.observe_window(
+                    application,
+                    window_info.hwnd_raw as i64,
+                    window_info.pid,
+                    &window_info.title,
+                )
+            });
+        let mut current_window_fingerprint = ActiveWindowFingerprint::new(
+            &window_info,
+            office_context
+                .as_ref()
+                .map(OfficeCaptureContext::document_hwnd),
+        );
 
         // Raw RGB frames are never queued. Keep capture and OCR strictly single-flight.
         let in_flight = capture_state.in_flight_ocr_count.load(Ordering::SeqCst);
@@ -1395,7 +1515,7 @@ pub async fn run_capture_loop(
         let mut scan_reason = "";
 
         // Focus change detection
-        if current_hwnd_raw != last_hwnd_raw {
+        if last_window_fingerprint.as_ref() != Some(&current_window_fingerprint) {
             should_capture = true;
             scan_reason = "focus_change";
         }
@@ -1406,7 +1526,7 @@ pub async fn run_capture_loop(
         }
 
         if !should_capture {
-            last_hwnd_raw = current_hwnd_raw;
+            last_window_fingerprint = Some(current_window_fingerprint);
             continue;
         }
 
@@ -1429,11 +1549,54 @@ pub async fn run_capture_loop(
             {
                 continue;
             }
+
+            // Never capture with the pre-sleep HWND/title. If focus or document
+            // title changed during stabilization, let the next poll establish a
+            // fresh 500 ms stable interval and observation generation.
+            let stabilized = match get_active_window_info() {
+                Some(info) => info,
+                None => continue,
+            };
+            if !current_window_fingerprint.matches_window_info(&stabilized) {
+                continue;
+            }
+            let settings = capture_state
+                .exclusion_settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if is_excluded(&stabilized, &settings) {
+                last_window_fingerprint = Some(current_window_fingerprint);
+                continue;
+            }
+            drop(settings);
+            window_info = stabilized;
+            (process_path, process_name) =
+                process_identity_for_window(&window_info, &mut current_process_identity);
+            let stabilized_office_context = OfficeApplication::from_process_name(&process_name)
+                .and_then(|application| {
+                    office_runtime.observe_window(
+                        application,
+                        window_info.hwnd_raw as i64,
+                        window_info.pid,
+                        &window_info.title,
+                    )
+                });
+            let stabilized_window_fingerprint = ActiveWindowFingerprint::new(
+                &window_info,
+                stabilized_office_context
+                    .as_ref()
+                    .map(OfficeCaptureContext::document_hwnd),
+            );
+            if stabilized_window_fingerprint != current_window_fingerprint {
+                continue;
+            }
+            office_context = stabilized_office_context;
+            current_window_fingerprint = stabilized_window_fingerprint;
         }
 
         // Capture screenshot
         let captured = match capture_foreground_window(
-            current_hwnd_raw,
+            window_info.hwnd_raw,
             &window_info.rect,
             max_side,
             jpeg_quality,
@@ -1441,16 +1604,19 @@ pub async fn run_capture_loop(
         ) {
             Some(c) => c,
             None => {
-                last_hwnd_raw = current_hwnd_raw;
+                last_window_fingerprint = Some(current_window_fingerprint);
                 continue;
             }
         };
 
         // dHash dedup
         let current_hash = compute_dhash(&captured.rgb_image, 16);
-        if is_redundant(&current_hash, &history_hashes, dhash_threshold) {
+        let preserve_office_context = scan_reason == "focus_change"
+            && current_window_fingerprint.office_document_hwnd.is_some();
+        if !preserve_office_context && is_redundant(&current_hash, &history_hashes, dhash_threshold)
+        {
             last_capture_time = std::time::Instant::now();
-            last_hwnd_raw = current_hwnd_raw;
+            last_window_fingerprint = Some(current_window_fingerprint);
             continue;
         }
 
@@ -1459,14 +1625,6 @@ pub async fn run_capture_loop(
         if history_hashes.len() > dhash_history_size {
             history_hashes.remove(0);
         }
-
-        // Get process metadata
-        let process_path = get_process_path_from_pid(window_info.pid).unwrap_or_default();
-        let process_name = if !process_path.is_empty() {
-            get_process_name_from_path(&process_path)
-        } else {
-            String::new()
-        };
 
         // Route to a registered browser-extension session (matched by the
         // foreground window's PID) when extension enhancement is enabled.
@@ -1486,7 +1644,7 @@ pub async fn run_capture_loop(
                     // Extension confirmed it received the capture request;
                     // skip normal capture for this frame.
                     last_capture_time = std::time::Instant::now();
-                    last_hwnd_raw = current_hwnd_raw;
+                    last_window_fingerprint = Some(current_window_fingerprint);
                     continue;
                 }
                 Err(e) => {
@@ -1515,7 +1673,7 @@ pub async fn run_capture_loop(
         };
 
         // Compute image hash (MD5)
-        let image_hash = md5_hash(&captured.jpeg_bytes);
+        let image_hash = current_window_fingerprint.storage_image_hash(&captured.jpeg_bytes);
 
         let ts_str = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
 
@@ -1557,7 +1715,7 @@ pub async fn run_capture_loop(
                 "OCR slot was claimed while capture was being prepared; dropping frame"
             );
             last_capture_time = std::time::Instant::now();
-            last_hwnd_raw = current_hwnd_raw;
+            last_window_fingerprint = Some(current_window_fingerprint);
             continue;
         };
 
@@ -1577,13 +1735,18 @@ pub async fn run_capture_loop(
             visible_links: None,
         };
 
+        // Read before the row is written, and again in `associate_screenshot`
+        // after it. Two equal readings mean no database swap happened around
+        // the insert, which is what makes the returned id attributable to the
+        // database that is open now.
+        let db_generation_before_save = storage.db_generation();
         let screenshot_id =
             match storage.save_screenshot_temp_bytes(&save_request, &captured.jpeg_bytes) {
                 Ok(resp) => {
                     if resp.status == "duplicate" {
                         tracing::debug!("Duplicate screenshot, skipping OCR");
                         last_capture_time = std::time::Instant::now();
-                        last_hwnd_raw = current_hwnd_raw;
+                        last_window_fingerprint = Some(current_window_fingerprint);
                         continue;
                     }
                     match resp.screenshot_id {
@@ -1591,7 +1754,7 @@ pub async fn run_capture_loop(
                         None => {
                             tracing::error!("save_screenshot_temp returned no ID");
                             last_capture_time = std::time::Instant::now();
-                            last_hwnd_raw = current_hwnd_raw;
+                            last_window_fingerprint = Some(current_window_fingerprint);
                             continue;
                         }
                     }
@@ -1599,10 +1762,19 @@ pub async fn run_capture_loop(
                 Err(e) => {
                     tracing::error!("save_screenshot_temp failed: {}", e);
                     last_capture_time = std::time::Instant::now();
-                    last_hwnd_raw = current_hwnd_raw;
+                    last_window_fingerprint = Some(current_window_fingerprint);
                     continue;
                 }
             };
+        if let Some(context) = office_context {
+            office_runtime.associate_screenshot(
+                app.clone(),
+                storage.clone(),
+                screenshot_id,
+                context,
+                db_generation_before_save,
+            );
+        }
         capture_state
             .startup_pending_cleanup_cancelled
             .store(true, Ordering::SeqCst);
@@ -1637,7 +1809,7 @@ pub async fn run_capture_loop(
         });
 
         last_capture_time = std::time::Instant::now();
-        last_hwnd_raw = current_hwnd_raw;
+        last_window_fingerprint = Some(current_window_fingerprint);
     }
 
     capture_state.clear_wgc_session("capture_loop_ended");
@@ -2032,6 +2204,104 @@ pub(crate) fn md5_hash(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn office_document_hwnd_participates_in_focus_fingerprint() {
+        let window = ActiveWindowInfo {
+            hwnd_raw: 100,
+            title: "Roadmap - PowerPoint".to_string(),
+            rect: RECT::default(),
+            pid: 200,
+        };
+        let first = ActiveWindowFingerprint::new(&window, Some(300));
+        let second = ActiveWindowFingerprint::new(&window, Some(301));
+
+        assert!(first.matches_window_info(&window));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn office_storage_hash_scopes_identical_frames_to_document_windows() {
+        let window = ActiveWindowInfo {
+            hwnd_raw: 100,
+            title: "Roadmap - PowerPoint".to_string(),
+            rect: RECT::default(),
+            pid: 200,
+        };
+        let first = ActiveWindowFingerprint::new(&window, Some(300));
+        let same = ActiveWindowFingerprint::new(&window, Some(300));
+        let other = ActiveWindowFingerprint::new(&window, Some(301));
+        let bytes = b"same pixels";
+
+        assert_eq!(
+            first.storage_image_hash(bytes),
+            same.storage_image_hash(bytes)
+        );
+        assert_ne!(
+            first.storage_image_hash(bytes),
+            other.storage_image_hash(bytes)
+        );
+        assert_eq!(
+            ActiveWindowFingerprint::new(&window, None).storage_image_hash(bytes),
+            md5_hash(bytes)
+        );
+    }
+
+    #[test]
+    fn non_office_title_changes_do_not_trigger_focus_identity_changes() {
+        let first_window = ActiveWindowInfo {
+            hwnd_raw: 100,
+            title: "Terminal - bash".to_string(),
+            rect: RECT::default(),
+            pid: 200,
+        };
+        let second_window = ActiveWindowInfo {
+            hwnd_raw: first_window.hwnd_raw,
+            title: "Terminal - cargo test".to_string(),
+            rect: RECT::default(),
+            pid: first_window.pid,
+        };
+
+        assert_eq!(
+            ActiveWindowFingerprint::new(&first_window, None),
+            ActiveWindowFingerprint::new(&second_window, None)
+        );
+        assert!(
+            ActiveWindowFingerprint::new(&first_window, None).matches_window_info(&second_window)
+        );
+    }
+
+    #[test]
+    fn failed_process_identity_lookup_retries_and_window_changes_invalidate() {
+        let window = ActiveWindowInfo {
+            hwnd_raw: 100,
+            title: "Document1 - Word".to_string(),
+            rect: RECT::default(),
+            pid: 200,
+        };
+        let recent_failure = ProcessIdentity {
+            pid: window.pid,
+            hwnd_raw: window.hwnd_raw,
+            path: String::new(),
+            name: String::new(),
+            refreshed_at: std::time::Instant::now(),
+        };
+        assert!(!recent_failure.should_refresh(&window));
+
+        let expired_failure = ProcessIdentity {
+            refreshed_at: std::time::Instant::now()
+                .checked_sub(PROCESS_IDENTITY_FAILURE_TTL)
+                .unwrap(),
+            ..recent_failure
+        };
+        assert!(expired_failure.should_refresh(&window));
+
+        let replacement_window = ActiveWindowInfo {
+            hwnd_raw: 101,
+            ..window
+        };
+        assert!(expired_failure.should_refresh(&replacement_window));
+    }
 
     #[test]
     fn test_hamming_distance_identical() {

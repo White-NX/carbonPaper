@@ -5,8 +5,11 @@ import {
   Maximize2, Minimize2, Monitor, Tag, X,
 } from 'lucide-react';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { listen } from '@tauri-apps/api/event';
 import { InspectorImage } from './InspectorImage';
 import { CategoryBadge } from './ThumbnailCard';
+import OfficeDocumentEntry from './OfficeDocumentEntry';
+import SnapshotSourceAction from './SnapshotSourceAction';
 import { extractUrlsFromOcr } from '../lib/ocr_url_detector';
 import { parseCreatedAt } from '../lib/search_grouping';
 import { fetchImage, getScreenshotDetails } from '../lib/monitor_api';
@@ -176,6 +179,8 @@ export default function SnapshotPreviewDock({
   const isLoading = loadingKey === resolvedActiveKey && (!activeImage || !activeDetails);
   const record = activeDetails?.record || {};
   const ocrResults = activeDetails?.ocr_results || [];
+  const documentRef = activeDetails?.document_ref || null;
+  const screenshotId = getTargetId(activeTab);
 
   const ocrText = useMemo(() => (
     ocrResults.map((result) => result.text).filter(Boolean).join('\n')
@@ -389,6 +394,26 @@ export default function SnapshotPreviewDock({
   }, [activeKey]);
 
   useEffect(() => {
+    if (!screenshotId || !resolvedActiveKey) return undefined;
+    let disposed = false;
+    let unlisten;
+    listen('office-document-ref-updated', async (event) => {
+      if (event.payload?.screenshot_id !== screenshotId) return;
+      const details = await getScreenshotDetails(screenshotId, getTargetPath(activeTab));
+      if (!disposed && details && !details.error) {
+        storeLimited(setDetailsCache, detailsOrderRef, resolvedActiveKey, details, DETAILS_CACHE_LIMIT);
+      }
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else unlisten = dispose;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [activeTab, resolvedActiveKey, screenshotId]);
+
+  useEffect(() => {
     setOcrPanelHeight((prev) => clampOcrHeight(prev));
   }, [clampOcrHeight]);
 
@@ -476,7 +501,6 @@ export default function SnapshotPreviewDock({
     || activeTab.metadata?.screenshot_created_at
     || activeTab.created_at
     || activeTab.metadata?.created_at;
-  const screenshotId = getTargetId(activeTab);
   const score = activeTab.rerank_score;
   const assignedAt = activeTab.assigned_at;
   const sourceLabel = getLocalizedSourceLabel(activeTab, t);
@@ -683,6 +707,14 @@ export default function SnapshotPreviewDock({
               </button>
             )}
 
+            <SnapshotSourceAction
+              documentRef={documentRef}
+              screenshotId={screenshotId}
+              pageUrl={record.page_url}
+              ocrResults={ocrResults}
+              onOpenUrl={handleOpenUrl}
+            />
+
             <div className="min-w-0">
               <div className="truncate text-sm font-semibold text-ide-text" title={displayTitle}>
                 {displayTitle}
@@ -738,6 +770,19 @@ export default function SnapshotPreviewDock({
                     <span className="truncate">{url}</span>
                   </button>
                 ))}
+              </div>
+            )}
+
+            {documentRef && (
+              <div className="space-y-1">
+                <div className="text-[10px] font-semibold uppercase text-ide-muted">
+                  {t('documentSource.title')}
+                </div>
+                <OfficeDocumentEntry
+                  documentRef={documentRef}
+                  screenshotId={screenshotId}
+                  compact
+                />
               </div>
             )}
           </div>

@@ -77,6 +77,28 @@ function Assert-UpdatedRustOcrRuntime {
     }
 }
 
+function Assert-UpdatedOfficeRuntime {
+    param([Parameter(Mandatory = $true)][string]$InstallDir)
+
+    $worker = Join-Path $InstallDir "carbonpaper-office.exe"
+    if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) {
+        throw "Updated installation is missing carbonpaper-office.exe: $worker"
+    }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $probeOutput = & $worker --probe 2>&1
+        $workerExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    $probeText = $probeOutput -join "`n"
+    if ($workerExitCode -ne 0 -or $probeText -notmatch '"status"\s*:\s*"ready"' -or $probeText -notmatch '"apartment"\s*:\s*"sta"') {
+        throw "Updated Office worker failed STA probe (exit $workerExitCode): $probeText"
+    }
+}
+
 function Compare-SemVerCore {
     param(
         [Parameter(Mandatory = $true)][string]$Left,
@@ -548,6 +570,7 @@ try {
                     throw "Updated app reported version $($result.current_version), expected $ExpectedAppVersion."
                 }
                 Assert-UpdatedRustOcrRuntime -RepoRoot $repoRoot -InstallDir (Split-Path -Parent $oldExe)
+                Assert-UpdatedOfficeRuntime -InstallDir (Split-Path -Parent $oldExe)
                 if (Test-Path -LiteralPath $updateErrorLog) {
                     $updateError = Get-Content -LiteralPath $updateErrorLog -Raw
                     throw "Update script wrote update_error.log: $updateError"

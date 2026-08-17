@@ -952,14 +952,39 @@
     "moreDeleteOptions": "更多删除选项",
     "deleteThisRecord": "删除此记录",
     "deleteNearby5min": "删除附近5分钟内的记录",
-    "openUrlTitle": "打开 URL: {{url}}",
-    "noUrlDetected": "未检测到 URL",
     "more": "更多",
     "showOcr": "显示OCR内容",
     "openFloatingPreview": "在独立窗口中查看",
     "openMainPreview": "在主窗口/预览中查看",
     "float": "独立预览",
     "alpha": "alpha"
+  },
+  "snapshotSource": {
+    "open": "打开关联内容",
+    "opening": "正在打开……",
+    "openTitle": "打开此快照对应的页面或文件",
+    "chooseTitle": "选择要打开的关联内容",
+    "openFailed": "无法打开关联内容：{{error}}"
+  },
+  "documentSource": {
+    "title": "编辑中的文件",
+    "unknownFile": "Office 文档",
+    "openTitle": "打开 {{name}}",
+    "unsavedTitle": "此文件当时尚未保存，无法恢复",
+    "unavailableTitle": "此文件当前无法恢复",
+    "openFailed": "无法打开文件：{{error}}",
+    "applications": {
+      "word": "Word",
+      "excel": "Excel",
+      "powerPoint": "PowerPoint",
+      "office": "Office"
+    },
+    "kinds": {
+      "local": "本地文件",
+      "cloud": "云端文档",
+      "unsaved": "未保存",
+      "office": "Office 文档"
+    }
   },
   "snapshotPreview": {
     "windowTitle": "快照预览",

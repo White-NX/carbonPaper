@@ -57,11 +57,17 @@ jobs:
       - name: Build Rust OCR worker
         run: npm run build:ml:release
 
+      - name: Build Office document worker
+        run: npm run build:office:release
+
       - name: Build Rust semantic worker
         run: npm run build:semantic-ml:release
 
       - name: Smoke test bundled Rust OCR runtime
         run: npm run verify:ml-runtime
+
+      - name: Smoke test Office document worker
+        run: npm run verify:office-runtime
 
       - name: Smoke test bundled Rust semantic runtime
         run: npm run verify:semantic-runtime
@@ -140,6 +146,8 @@ jobs:
           node scripts/bump-version.mjs $futureVersion --label ""
           npm run build:ml:release
           npm run verify:ml-runtime
+          npm run build:office:release
+          npm run verify:office-runtime
           npm run build:semantic-ml:release
           npm run verify:semantic-runtime
           npm run tauri -- build --no-bundle

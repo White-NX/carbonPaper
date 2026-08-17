@@ -2087,6 +2087,10 @@ fn spawn_capture_loop(app: &AppHandle) {
     capture_state
         .startup_pending_cleanup_cancelled
         .store(false, Ordering::SeqCst);
+    // Office observation follows capture; `stop_monitor_impl` and the storage
+    // migrations close this gate.
+    app.state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
+        .resume();
 
     // Load exclusion settings from disk
     {
@@ -2210,6 +2214,15 @@ pub async fn stop_monitor_impl(
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
+
+    // Office association writes carry screenshot ids that only mean something
+    // in the current database, and stopping the monitor is what backup and
+    // data-directory switches do before they replace it. Drain before those
+    // writes can outlive the database they were collected from, and release
+    // the worker so it stops talking to Office once capture has stopped.
+    app.state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
+        .quiesce(tokio::time::Duration::from_secs(5))
+        .await;
 
     // 2. Best-effort stop signal to Python. Do not let a broken worker or pipe
     // handler hold the UI in LOADING during an intentional terminate/restart.

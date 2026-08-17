@@ -1,7 +1,8 @@
-import React, { useState, useCallback, useMemo } from 'react';
-import { Trash2, ExternalLink, MoreHorizontal, ChevronUp, Clock, Maximize2 } from 'lucide-react';
-import { extractUrlsFromOcr } from '../lib/ocr_url_detector';
+import React, { useState, useCallback } from 'react';
+import { Trash2, MoreHorizontal, ChevronUp, Clock, Maximize2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { getSnapshotSourceOptions } from '../lib/snapshot_sources';
+import SnapshotSourceAction from './SnapshotSourceAction';
 
 export default function PreviewActionBar({
   selectedEvent,
@@ -18,12 +19,14 @@ export default function PreviewActionBar({
   const [isDeleting, setIsDeleting] = useState(false);
 
   const pageUrl = selectedDetails?.record?.page_url || null;
-  const extractedUrls = useMemo(() => {
-    if (pageUrl) return [pageUrl]; // Prioritize page URL if available
-    return extractUrlsFromOcr(selectedDetails?.ocr_results || []).slice(0, 5); // Limit to top 5 URLs
-  }, [selectedDetails?.ocr_results]);
-
-  const hasUrls = extractedUrls.length > 0;
+  const documentRef = selectedDetails?.document_ref || null;
+  const screenshotId = selectedDetails?.record?.id || selectedEvent?.id;
+  const sourceOptions = getSnapshotSourceOptions({
+    documentRef,
+    screenshotId,
+    pageUrl,
+    ocrResults: selectedDetails?.ocr_results,
+  });
 
   const handleDeleteRecord = useCallback(async () => {
     if (!selectedEvent?.id) return;
@@ -47,12 +50,6 @@ export default function PreviewActionBar({
     }
   }, [selectedEvent?.timestamp, onDeleteNearbyRecords]);
 
-  const handleOpenFirstUrl = useCallback(() => {
-    if (extractedUrls.length > 0) {
-      onOpenUrl?.(extractedUrls[0]);
-    }
-  }, [extractedUrls, onOpenUrl]);
-
   if (!selectedEvent) return null;
 
   return (
@@ -64,7 +61,7 @@ export default function PreviewActionBar({
         />
       )}
       <div
-        className={`absolute bottom-0 left-1/2 -translate-x-1/2 z-30 flex items-end justify-center transition-all duration-300 w-[540px] ${
+        className={`absolute bottom-0 left-1/2 -translate-x-1/2 z-30 flex w-[760px] max-w-[calc(100vw-1rem)] items-end justify-center transition-all duration-300 ${
           showDeleteMenu
             ? 'h-24 pb-6'
             : 'h-12 pb-2 hover:h-24 hover:pb-6 group/actionbar'
@@ -138,24 +135,22 @@ export default function PreviewActionBar({
             )}
           </div>
 
-          <div className="w-px h-5 bg-ide-border/50" />
+          {sourceOptions.length > 0 && (
+            <>
+              <div className="w-px h-5 bg-ide-border/50" />
+              <SnapshotSourceAction
+                documentRef={documentRef}
+                screenshotId={screenshotId}
+                pageUrl={pageUrl}
+                ocrResults={selectedDetails?.ocr_results}
+                onOpenUrl={onOpenUrl}
+                compact
+              />
+              <div className="w-px h-5 bg-ide-border/50" />
+            </>
+          )}
 
-          {/* Callback Button (Beta) */}
-          <button
-            onClick={handleOpenFirstUrl}
-            disabled={!hasUrls}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs transition-colors ${hasUrls
-                ? 'hover:bg-ide-hover text-ide-text'
-                : 'text-ide-muted cursor-not-allowed opacity-50'
-              }`}
-            title={hasUrls ? t('previewAction.openUrlTitle', { url: extractedUrls[0] }) : t('previewAction.noUrlDetected')}
-          >
-            <ExternalLink className="w-3.5 h-3.5" />
-            <span>Callback</span>
-            <span className="px-1 py-0.5 bg-amber-500/20 text-amber-400 text-[10px] rounded">beta</span>
-          </button>
-
-          <div className="w-px h-5 bg-ide-border/50" />
+          {sourceOptions.length === 0 && <div className="w-px h-5 bg-ide-border/50" />}
 
           <button
             onClick={onOpenFloatingPreview}

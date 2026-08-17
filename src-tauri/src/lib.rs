@@ -37,6 +37,9 @@ mod model_management;
 mod monitor;
 mod monitor_ipc;
 mod native_messaging;
+mod office_protocol;
+mod office_runtime;
+mod office_window;
 mod power;
 mod python;
 mod python_launcher;
@@ -797,6 +800,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
+        .manage(Arc::new(office_runtime::OfficeRuntimeState::new()))
         .manage(Arc::new(semantic_runtime::SemanticRuntimeState::new()))
         .manage(Arc::new(minilm_migration::MinilmMigrationState::new()))
         .manage(Arc::new(clip_migration::ClipMigrationState::new()))
@@ -869,6 +873,13 @@ pub fn run() {
 
                 analysis::start_memory_sampler(app.handle().clone());
                 logging::spawn_maintenance_task(data_dir.clone());
+
+                let office_runtime = app
+                    .state::<Arc<office_runtime::OfficeRuntimeState>>()
+                    .inner()
+                    .clone();
+                let office_storage = app.state::<Arc<StorageState>>().inner().clone();
+                office_runtime.start(app.handle().clone(), office_storage);
 
                 tracing::info!(
                     r#"
@@ -1156,6 +1167,7 @@ pub fn run() {
             ml_runtime::download_rust_ocr_model,
             ml_runtime::take_ocr_model_repair_request,
             ml_runtime::debug_trigger_ocr_model_repair_notification,
+            office_runtime::office_resume_document,
             semantic_runtime::get_ml_semantic_status,
             semantic_runtime::get_background_index_progress,
             semantic_runtime::restart_ml_semantic_worker,

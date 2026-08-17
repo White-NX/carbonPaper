@@ -478,6 +478,11 @@ export const getScreenshotDetails = async (id, path = null) => {
     }
 };
 
+export const resumeOfficeDocument = async (screenshotId) => {
+    if (!screenshotId) throw new Error('A screenshot id is required');
+    return withAuth(() => invoke('office_resume_document', { screenshotId }));
+};
+
 export const updateMonitorFilters = async (filters) => {
     return withAuth(async () => {
         try {
