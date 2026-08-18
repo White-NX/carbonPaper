@@ -18,6 +18,7 @@ import {
   searchScreenshots,
   listProcesses,
   getScreenshotDetails,
+  resumeOfficeDocument,
   updateMonitorFilters,
 } from './monitor_api';
 
@@ -112,6 +113,14 @@ describe('monitor_api command wrappers', () => {
     invoke.mockRejectedValue(new Error('boom'));
 
     await expect(getScreenshotDetails(1)).resolves.toEqual({ error: 'Error: boom' });
+    expectWithAuth(1);
+  });
+
+  it('resumes an Office document through the authenticated command', async () => {
+    invoke.mockResolvedValue({ status: 'opened' });
+
+    await expect(resumeOfficeDocument(42)).resolves.toEqual({ status: 'opened' });
+    expect(invoke).toHaveBeenCalledWith('office_resume_document', { screenshotId: 42 });
     expectWithAuth(1);
   });
 

@@ -40,6 +40,7 @@ const COMMAND_TIERS = {
   'commands::storage::storage_get_thumbnail_warmup_status': 'session_required',
   'commands::storage::storage_cancel_thumbnail_warmup': 'session_required',
   'commands::storage::storage_get_screenshot_details': 'session_required',
+  'office_runtime::office_resume_document': 'session_required',
   'commands::storage::storage_delete_screenshot': 'session_required',
   'commands::storage::storage_delete_by_time_range': 'session_required',
   'commands::storage::storage_list_processes': 'session_required',

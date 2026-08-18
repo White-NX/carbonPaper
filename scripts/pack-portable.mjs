@@ -30,7 +30,7 @@ if (!existsSync(mainExe)) {
 }
 filesToPack.push({ src: mainExe, dest: `${productName}.exe` });
 
-for (const binaryName of ['carbonpaper-ml.exe', 'carbonpaper-nmh.exe']) {
+for (const binaryName of ['carbonpaper-ml.exe', 'carbonpaper-office.exe', 'carbonpaper-nmh.exe']) {
   const binaryPath = path.join(releaseDir, binaryName);
   if (!existsSync(binaryPath)) {
     console.error(`Required portable binary not found: ${binaryPath}`);
@@ -59,6 +59,7 @@ if (existsSync(preBundleDir)) {
 
 const requiredPortableEntries = [
   'carbonpaper-ml.exe',
+  'carbonpaper-office.exe',
   'carbonpaper-nmh.exe',
   'carbonpaper-semantic-worker.exe',
   'onnxruntime/1.24.2/onnxruntime.dll',

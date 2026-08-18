@@ -7,6 +7,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { CATEGORY_LIST, CATEGORY_COLORS } from '../lib/categories';
 import { buildActivityContext, getHostname } from '../lib/activity_context';
 import ActivityContextDrawer from './ActivityContextDrawer';
+import OfficeDocumentEntry from './OfficeDocumentEntry';
 
 export default function DetailCard({ selectedEvent, selectedDetails, onCategoryChange, onSelectRelated, onOpenFloatingPreview }) {
   const { t } = useTranslation();
@@ -50,6 +51,8 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
   }, [selectedDetails?.record?.visible_links]);
 
   const pageUrl = selectedDetails?.record?.page_url;
+  const documentRef = selectedDetails?.document_ref || null;
+  const screenshotId = selectedDetails?.record?.id || selectedEvent?.id;
   const activityContext = useMemo(() => buildActivityContext({
     selectedEvent,
     selectedRecord: selectedDetails?.record,
@@ -415,6 +418,20 @@ export default function DetailCard({ selectedEvent, selectedDetails, onCategoryC
                     </div>
                   </div>
                 ))}
+              </div>
+            </div>
+          )}
+
+          {documentRef && (
+            <div>
+              <label className="text-xs text-ide-muted uppercase font-bold">
+                {t('documentSource.title')}
+              </label>
+              <div className="mt-1">
+                <OfficeDocumentEntry
+                  documentRef={documentRef}
+                  screenshotId={screenshotId}
+                />
               </div>
             </div>
           )}

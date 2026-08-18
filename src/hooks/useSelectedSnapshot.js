@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { fetchImage, getScreenshotDetails } from '../lib/monitor_api';
 
 /**
@@ -114,6 +115,28 @@ export function useSelectedSnapshot() {
 
     return () => {
       cancelled = true;
+    };
+  }, [selectedEvent]);
+
+  useEffect(() => {
+    if (!selectedEvent) return undefined;
+    const targetId = selectedEvent.id === -1 ? null : selectedEvent.id;
+    if (!targetId) return undefined;
+    let disposed = false;
+    let unlisten;
+    listen('office-document-ref-updated', async (event) => {
+      if (event.payload?.screenshot_id !== targetId) return;
+      const details = await getScreenshotDetails(targetId, selectedEvent.path || selectedEvent.image_path);
+      if (!disposed && details && !details.error) {
+        setSelectedDetails(details);
+      }
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else unlisten = dispose;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
     };
   }, [selectedEvent]);
 

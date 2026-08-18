@@ -121,11 +121,17 @@ assertIncludes(buildRs, 'cargo:rerun-if-changed=../aria2c.exe', 'build.rs aria2 
 const tauriConf = JSON.parse(readText(path.join('src-tauri', 'tauri.conf.json')));
 assertEqual(tauriConf.bundle?.resources?.['pre-bundle'], '.', 'Tauri pre-bundle resource mapping');
 assertIncludes(tauriConf.build?.beforeBuildCommand ?? '', 'npm run test:release-assets', 'Tauri release asset build gate');
+assertIncludes(tauriConf.build?.beforeDevCommand ?? '', 'npm run build:office', 'Tauri development Office worker build');
 
 const mlBuild = readText(path.join('scripts', 'build-ml.mjs'));
 assertIncludes(mlBuild, "'carbonpaper-ml.exe'", 'ML worker build output');
 assertIncludes(mlBuild, "path.join(tauriDir, 'target', profile", 'ML worker target destination');
 assertIncludes(mlBuild, "rmSync(path.join(tauriDir, 'pre-bundle', 'carbonpaper-ml.exe')", 'ML worker stale pre-bundle cleanup');
+
+const officeBuild = readText(path.join('scripts', 'build-office.mjs'));
+assertIncludes(officeBuild, "'carbonpaper-office.exe'", 'Office worker build output');
+assertIncludes(officeBuild, "path.join(tauriDir, 'target', profile", 'Office worker target destination');
+assertIncludes(officeBuild, "rmSync(path.join(tauriDir, 'pre-bundle', 'carbonpaper-office.exe')", 'Office worker stale pre-bundle cleanup');
 
 const nmhBuild = readText(path.join('scripts', 'build-nmh.mjs'));
 assertIncludes(nmhBuild, "path.join(tauriDir, 'target', profile", 'NMH target destination');
@@ -139,6 +145,7 @@ const packPortable = readText(path.join('scripts', 'pack-portable.mjs'));
 assertIncludes(packPortable, "const preBundleDir = path.join(tauriDir, 'pre-bundle');", 'portable pre-bundle input');
 assertIncludes(packPortable, 'await walkDir(preBundleDir, \'\');', 'portable recursive pre-bundle packaging');
 assertIncludes(packPortable, "'carbonpaper-ml.exe'", 'portable required ML worker');
+assertIncludes(packPortable, "'carbonpaper-office.exe'", 'portable required Office worker');
 assertIncludes(packPortable, "'carbonpaper-semantic-worker.exe'", 'portable required semantic worker');
 assertIncludes(packPortable, 'onnxruntime/1.24.2/onnxruntime.dll', 'portable semantic ONNX runtime');
 assertIncludes(packPortable, 'ocr-models/ppocrv5-ch-mobile-r1', 'portable required OCR model directory');
@@ -146,20 +153,28 @@ assertIncludes(packPortable, 'ocr-models/ppocrv5-ch-mobile-r1', 'portable requir
 const releaseWorkflow = readText(path.join('.github', 'workflows', 'release.yml'));
 assertIncludes(releaseWorkflow, 'npm run prepare:release-assets', 'release workflow asset preparation');
 assertIncludes(releaseWorkflow, 'npm run build:ml:release', 'release workflow ML worker build');
+assertIncludes(releaseWorkflow, 'npm run build:office:release', 'release workflow Office worker build');
+assertIncludes(releaseWorkflow, 'npm run verify:office-runtime', 'release workflow Office worker smoke test');
 assertIncludes(releaseWorkflow, 'npm run build:semantic-ml:release', 'release workflow semantic worker build');
 assertIncludes(releaseWorkflow, 'npm run verify:semantic-runtime', 'release workflow semantic smoke test');
 assertIncludes(releaseWorkflow, 'npm run test:release-assets', 'release workflow asset verification');
 assertBefore(releaseWorkflow, 'npm run prepare:release-assets', 'Build Tauri draft release', 'release workflow order');
 assertBefore(releaseWorkflow, 'npm run build:ml:release', 'Build Tauri draft release', 'release workflow ML order');
+assertBefore(releaseWorkflow, 'npm run build:office:release', 'Build Tauri draft release', 'release workflow Office order');
 assertBefore(releaseWorkflow, 'npm run build:semantic-ml:release', 'Build Tauri draft release', 'release workflow semantic ML order');
 assertBefore(releaseWorkflow, 'npm run test:release-assets', 'Build Tauri draft release', 'release workflow verification order');
 
 const packageJson = JSON.parse(readText('package.json'));
 assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run prepare:release-assets', 'local tauri:build asset preparation');
 assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run build:ml:release', 'local tauri:build ML worker preparation');
+assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run build:office:release', 'local tauri:build Office worker preparation');
 assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run build:semantic-ml:release', 'local tauri:build semantic worker preparation');
 assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run verify:semantic-runtime', 'local tauri:build semantic smoke test');
 assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run verify:ml-runtime', 'local tauri:build ML worker smoke test');
+assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run verify:office-runtime', 'local tauri:build Office worker smoke test');
+assertIncludes(packageJson.scripts?.['build:office'] ?? '', 'scripts/build-office.mjs', 'Office worker development build command');
+assertIncludes(packageJson.scripts?.['build:office:release'] ?? '', 'scripts/build-office.mjs --release', 'Office worker release build command');
+assertIncludes(packageJson.scripts?.['verify:office-runtime'] ?? '', 'carbonpaper-office.exe --probe', 'Office worker verification command');
 assertIncludes(packageJson.scripts?.['verify:ml-runtime'] ?? '', '--verify-models', 'ML worker verification command');
 assertIncludes(packageJson.scripts?.['verify:release-bundles'] ?? '', 'verify-release-bundles.ps1', 'release bundle verification command');
 assertIncludes(packageJson.scripts?.['tauri:build'] ?? '', 'npm run verify:release-bundles', 'local bundle verification gate');

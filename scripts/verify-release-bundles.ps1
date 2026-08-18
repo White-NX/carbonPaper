@@ -49,7 +49,7 @@ try {
     if ($duplicates) {
         throw "Portable bundle contains duplicate entries: $($duplicates.Name -join ', ')"
     }
-    foreach ($required in @("carbonpaper.exe", "carbonpaper-ml.exe", "carbonpaper-nmh.exe", "carbonpaper-semantic-worker.exe")) {
+    foreach ($required in @("carbonpaper.exe", "carbonpaper-ml.exe", "carbonpaper-office.exe", "carbonpaper-nmh.exe", "carbonpaper-semantic-worker.exe")) {
         if (-not $archive.GetEntry($required)) {
             throw "Portable bundle is missing $required"
         }
@@ -110,7 +110,7 @@ if (-not $sevenZip) {
 }
 
 $listing = @(& $sevenZip.Source l $installer)
-foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-nmh.exe", "carbonpaper-semantic-worker.exe")) {
+foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-office.exe", "carbonpaper-nmh.exe", "carbonpaper-semantic-worker.exe")) {
     $count = @($listing | Where-Object { $_ -match ("\s" + [regex]::Escape($required) + "$") }).Count
     if ($count -ne 1) {
         throw "NSIS installer must contain exactly one $required entry; found $count"
@@ -173,6 +173,11 @@ try {
     if ($workerExitCode -ne 0 -or ($output -join "`n") -notmatch '"model_id":"ppocrv5-ch-mobile"') {
         throw "Extracted NSIS Rust OCR runtime verification failed: $($output -join "`n")"
     }
+    $officeWorker = Join-Path $extractDir "carbonpaper-office.exe"
+    $officeOutput = & $officeWorker --probe 2>&1
+    if ($LASTEXITCODE -ne 0 -or ($officeOutput -join "`n") -notmatch '"status"\s*:\s*"ready"' -or ($officeOutput -join "`n") -notmatch '"apartment"\s*:\s*"sta"') {
+        throw "Extracted NSIS Office worker failed STA probe: $($officeOutput -join "`n")"
+    }
 } finally {
     $resolvedExtractDir = [System.IO.Path]::GetFullPath($extractDir)
     if ((Test-Path -LiteralPath $resolvedExtractDir) -and $resolvedExtractDir.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -180,4 +185,4 @@ try {
     }
 }
 
-Write-Host "Portable and NSIS Rust OCR/semantic runtime bundles verified."
+Write-Host "Portable and NSIS Rust OCR/Office/semantic runtime bundles verified."

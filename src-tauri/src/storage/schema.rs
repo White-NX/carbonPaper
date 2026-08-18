@@ -21,6 +21,10 @@ impl StorageState {
         // Belt-and-braces against a stale resident matrix from a previous
         // connection; `shutdown` already clears it on the normal path.
         self.reset_semantic_vector_cache();
+        // `shutdown` parks the lazy indexer; without this the thread would stay
+        // parked for the rest of the process after any backup or data-directory
+        // switch, and its backlog would never be worked off again.
+        self.lazy_indexer_shutdown.store(false, Ordering::SeqCst);
 
         // Create directories
         let data_dir = self
@@ -72,7 +76,13 @@ impl StorageState {
         Self::set_auto_vacuum_incremental(&conn)?;
         let tables_dur = t3.elapsed();
 
-        *self.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn);
+        {
+            let mut db_guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
+            // Under the same lock the write path checks, so a task holding the
+            // previous generation can never slip a statement into this file.
+            self.bump_db_generation();
+            *db_guard = Some(conn);
+        }
 
         // Initialize approximate OCR row count using MAX(id) — O(log N) via primary key index.
         // AUTOINCREMENT ids only increase, so MAX(id) >= actual row count; acceptable for IDF.
@@ -111,6 +121,10 @@ impl StorageState {
         // connection comes next can silently score against the old file.
         self.reset_semantic_vector_cache();
         let mut db_guard = self.db.lock().map_err(|e| format!("lock error: {}", e))?;
+        // Every id collected against this connection stops being meaningful the
+        // moment it closes, whether the next `initialize` reopens the same file
+        // or a restored backup.
+        self.bump_db_generation();
         if db_guard.is_some() {
             *db_guard = None;
         }
@@ -185,6 +199,16 @@ impl StorageState {
                 postprocess_attempts INTEGER NOT NULL DEFAULT 0,
                 postprocess_next_retry_at TIMESTAMP,
                 attempted_at TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
+            );
+
+            -- Document references use their own row key so delayed native
+            -- discovery never has to unwrap or rewrite screenshot metadata.
+            CREATE TABLE IF NOT EXISTS screenshot_document_refs (
+                screenshot_id INTEGER PRIMARY KEY,
+                ref_enc BLOB NOT NULL,
+                content_key_encrypted BLOB NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
             );
@@ -979,6 +1003,20 @@ impl StorageState {
         )
         .map_err(|e| format!("Failed to create OCR lifecycle indexes: {}", e))?;
 
+        Self::create_table_if_missing(
+            conn,
+            "screenshot_document_refs",
+            r#"
+            CREATE TABLE IF NOT EXISTS screenshot_document_refs (
+                screenshot_id INTEGER PRIMARY KEY,
+                ref_enc BLOB NOT NULL,
+                content_key_encrypted BLOB NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE
+            )
+            "#,
+        )?;
+
         // Task clustering tables
         Self::create_table_if_missing(
             conn,
@@ -1558,6 +1596,7 @@ mod tests {
             "index",
             "idx_derived_migration_runs_updated"
         ));
+        assert!(object_exists(&conn, "table", "screenshot_document_refs"));
     }
 
     #[test]

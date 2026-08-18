@@ -254,12 +254,33 @@ pub async fn storage_migrate_data_dir(
 ) -> Result<serde_json::Value, String> {
     super::check_auth_required(&credential_state)?;
 
+    // Unlike backup export/import, this path never stops the monitor: capture,
+    // Office observation and resolution all keep running while the database is
+    // closed, the files are moved, and a database at the new location is
+    // opened — possibly a different one, when only the configuration moves.
+    let office_runtime = app_handle
+        .state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
+        .inner()
+        .clone();
+    let was_active = office_runtime.is_active();
+    office_runtime
+        .quiesce(std::time::Duration::from_secs(5))
+        .await;
+
     let state = state.inner().clone();
-    tokio::task::spawn_blocking(move || {
+    let outcome = tokio::task::spawn_blocking(move || {
         state.migrate_data_dir_blocking(app_handle, target, migrate_data_files)
     })
     .await
-    .map_err(|e| format!("Task join error: {:?}", e))?
+    .map_err(|e| format!("Task join error: {:?}", e));
+
+    // Capture was never stopped, so observation resumes with the migration —
+    // against the database that is now open.
+    if was_active {
+        office_runtime.resume();
+    }
+
+    outcome?
 }
 
 /// Requests cancellation of an active data-directory migration.
@@ -338,6 +359,13 @@ pub async fn storage_export_backup(
             app_handle.clone(),
         )
         .await;
+        // `stop_monitor_impl` already drains Office, but its result is
+        // discarded above; do not let a failure there leave association
+        // writes in flight across the close below.
+        app_handle
+            .state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
+            .quiesce(std::time::Duration::from_secs(5))
+            .await;
         state.shutdown()?;
 
         // 2. Get Master Key
@@ -540,6 +568,13 @@ pub async fn storage_import_backup(
             app_handle.clone(),
         )
         .await;
+        // The restored database numbers its screenshots independently, so an
+        // association write that survived this point would attach a document
+        // to whichever unrelated screenshot reuses the id.
+        app_handle
+            .state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
+            .quiesce(std::time::Duration::from_secs(5))
+            .await;
         state.shutdown()?;
 
         // 2. Open ZIP
