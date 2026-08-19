@@ -11,11 +11,6 @@ vi.mock('../lib/task_api', () => ({
 describe('useDelayedClusteringSetupRunner', () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    Object.defineProperty(window, 'confirm', {
-      configurable: true,
-      writable: true,
-      value: vi.fn(() => true),
-    });
   });
 
   afterEach(() => {
@@ -25,6 +20,7 @@ describe('useDelayedClusteringSetupRunner', () => {
   it('prompts for resource mode and reports degraded saved results', async () => {
     const pushNotification = vi.fn();
     const onClose = vi.fn();
+    const onResourceChoice = vi.fn(async () => true);
     runClustering
       .mockResolvedValueOnce({
         status: 'needs_user_choice',
@@ -55,6 +51,7 @@ describe('useDelayedClusteringSetupRunner', () => {
       delayMs: 10,
       onClose,
       pushNotification,
+      onResourceChoice,
     }));
 
     act(() => {
@@ -67,7 +64,9 @@ describe('useDelayedClusteringSetupRunner', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(saveClusteringResults).toHaveBeenCalledTimes(1);
     expect(runClustering).toHaveBeenNthCalledWith(1, { manual: true });
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('降级分批模式'));
+    expect(onResourceChoice).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining('降级分批模式'),
+    }));
     expect(runClustering).toHaveBeenNthCalledWith(2, {
       manual: true,
       clusteringMode: 'batched',
@@ -82,5 +81,34 @@ describe('useDelayedClusteringSetupRunner', () => {
       title: '任务聚类完成',
       message: expect.stringContaining('降级分批模式'),
     }));
+  });
+
+  it('maps a cancelled resource choice to full clustering', async () => {
+    const onResourceChoice = vi.fn(async () => false);
+    runClustering
+      .mockResolvedValueOnce({
+        status: 'needs_user_choice',
+        n_total: 2,
+        estimate: { count: 2, memory: {} },
+      })
+      .mockResolvedValueOnce({ status: 'empty' });
+
+    const { result } = renderHook(() => useDelayedClusteringSetupRunner({
+      delayMs: 10,
+      onResourceChoice,
+      onClose: vi.fn(),
+      pushNotification: vi.fn(),
+    }));
+
+    act(() => result.current(true));
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    expect(onResourceChoice).toHaveBeenCalledTimes(1);
+    expect(runClustering).toHaveBeenNthCalledWith(2, {
+      manual: true,
+      clusteringMode: 'full',
+    });
   });
 });

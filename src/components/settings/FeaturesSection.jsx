@@ -7,6 +7,7 @@ import { FEATURE_MODE_OPTIONS, getFeatureMode } from './organize/featureModes';
 import ModelInventoryTable from './organize/ModelInventoryTable';
 import SmartClusterCard from './organize/SmartClusterCard';
 import { useFeaturesController } from './useFeaturesController';
+import { ConfirmDialog } from '../ConfirmDialog';
 
 export default function FeaturesSection({ monitorStatus }) {
   const { t } = useTranslation();
@@ -26,6 +27,8 @@ export default function FeaturesSection({ monitorStatus }) {
     setRangeStart,
     rangeEnd,
     setRangeEnd,
+    clusteringResourceChoice,
+    resolveClusteringResourceChoice,
     customControlsOpen,
     setCustomControlsOpen,
     scModelAvailable,
@@ -126,6 +129,16 @@ export default function FeaturesSection({ monitorStatus }) {
         onRefresh={loadModels}
         onOpenLocation={handleOpenLocation}
         formatSize={formatSize}
+      />
+
+      <ConfirmDialog
+        isOpen={Boolean(clusteringResourceChoice)}
+        title={t('tasks.clusteringDegradeTitle', '选择聚类资源模式')}
+        message={clusteringResourceChoice?.prompt || ''}
+        confirmLabel={t('tasks.clusteringDegradeConfirm', '使用降级分批模式')}
+        cancelLabel={t('tasks.clusteringDegradeCancel', '使用全量模式')}
+        onConfirm={() => resolveClusteringResourceChoice(true)}
+        onCancel={() => resolveClusteringResourceChoice(false)}
       />
     </div>
   );

@@ -541,6 +541,7 @@
         },
         "button": "{{label}} within",
         "confirmTitle": "Confirm?",
+        "confirmMessage": "This deletes snapshots and OCR records in the selected range and cannot be undone. Continue?",
         "yes": "YES",
         "no": "NO"
       }
@@ -897,9 +898,11 @@
   },
   "common": {
     "cancel": "Cancel",
+    "confirm": "Confirm",
     "close": "Close",
     "retry": "Retry",
-    "save": "Save"
+    "save": "Save",
+    "processing": "Processing…"
   },
   "topbar": {
     "settings": "Settings",
@@ -1182,7 +1185,7 @@
     "stoppingHint": "Stopping after the current batch…",
     "progressStarting": "Starting…",
     "progressRetrieving": "Retrieving candidate snapshots…",
-    "progressLoadingModel": "Loading the reranker (about 570 MB). Every reranked search starts here…",
+    "progressLoadingModel": "Loading the reranker…",
     "progressReranking": "Reranking candidates {{scored}}/{{total}}",
     "progressExternalBackend": "Reranking on the Python backend, which reports no progress…",
     "cancelledNotice": "Search stopped, no results yet",
@@ -1234,6 +1237,7 @@
   "smartClusters": {
     "title": "Smart Clusters",
     "beta": "beta",
+    "confirmDeleteTitle": "Delete smart cluster?",
     "confirmDelete": "Delete this smart cluster? Assigned snapshots will not be deleted.",
     "newCluster": "New Smart Cluster",
     "processNowTooltip": "Process the pending queue now",
@@ -1351,10 +1355,8 @@
     },
     "landing": {
       "recent_queries": "Recent searches",
-      "recent_queries_hint": "click to run again",
       "clear_recent": "Clear history",
       "top_apps": "Frequent sources",
-      "top_apps_hint": "click to filter by it",
       "latest": "Latest captures",
       "latest_hint": "{{count}} in total"
     },
@@ -1487,6 +1489,9 @@
     "clusteringAllScope": "All clusterable snapshots",
     "clusteringLargeRangeReason": "the clustering input contains many snapshots",
     "clusteringLowMemoryReason": "available memory is low, so full clustering may slow down or fail",
+    "clusteringDegradeTitle": "Choose clustering resource mode",
+    "clusteringDegradeConfirm": "Use batched mode",
+    "clusteringDegradeCancel": "Use full mode",
     "clusteringDegradePrompt": "{{scope}} has about {{count}} snapshots; {{reason}}. Batched degraded mode is recommended. It clusters a sample first, then assigns the remaining snapshots in batches. Estimated peak memory is about {{estimatedGb}} GB.\n\nChoose OK to use batched degraded mode. Choose Cancel to continue with full clustering.",
     "clusteringDegradedNotice": "Used batched degraded mode: sampled {{sampleSize}} snapshots and batch-assigned {{assignedCount}} snapshots.",
     "showInactive": "Show inactive tasks",

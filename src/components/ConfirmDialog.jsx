@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useId } from 'react';
 import PropTypes from 'prop-types';
 import { cn } from '../lib/utils';
 
@@ -12,7 +12,11 @@ export function ConfirmDialog({
   onCancel = undefined,
   confirmVariant = 'default',
   loading = false,
+  loadingLabel = 'Processing…',
 }) {
+  const titleId = useId();
+  const messageId = useId();
+
   if (!isOpen) return null;
 
   return (
@@ -20,16 +24,21 @@ export function ConfirmDialog({
       className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm px-4 py-6"
       onClick={(event) => {
         event.stopPropagation();
-        if (onCancel) onCancel();
+        if (!loading && onCancel) onCancel();
       }}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={message ? messageId : undefined}
+        aria-busy={loading}
         className="w-full max-w-xs rounded border border-ide-border bg-ide-panel p-4 shadow-2xl transform scale-100 animate-in fade-in zoom-in duration-200"
         onClick={(event) => event.stopPropagation()}
       >
-        <h3 className="text-sm font-bold text-ide-text mb-2">{title}</h3>
+        <h3 id={titleId} className="text-sm font-bold text-ide-text mb-2">{title}</h3>
         {message && (
-          <p className="text-xs text-ide-muted mb-4 leading-relaxed">
+          <p id={messageId} className="text-xs text-ide-muted mb-4 leading-relaxed">
             {message}
           </p>
         )}
@@ -37,6 +46,7 @@ export function ConfirmDialog({
           <button
             type="button"
             onClick={onCancel}
+            disabled={loading}
             className="px-3 py-1.5 text-xs font-medium rounded border border-ide-border text-ide-text hover:bg-ide-hover transition-colors"
           >
             {cancelLabel}
@@ -53,7 +63,7 @@ export function ConfirmDialog({
               loading && 'cursor-not-allowed opacity-70'
             )}
           >
-            {loading ? 'Processing…' : confirmLabel}
+            {loading ? loadingLabel : confirmLabel}
           </button>
         </div>
       </div>
@@ -71,6 +81,7 @@ ConfirmDialog.propTypes = {
   onCancel: PropTypes.func,
   confirmVariant: PropTypes.oneOf(['default', 'danger']),
   loading: PropTypes.bool,
+  loadingLabel: PropTypes.string,
 };
 
 export default ConfirmDialog;

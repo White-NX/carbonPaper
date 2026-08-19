@@ -14,6 +14,7 @@ import { fetchThumbnailBatch, getSmartClusterWorkerStatus } from '../lib/monitor
 import { ThumbnailCard } from './ThumbnailCard';
 import ClusterCard from './ClusterCard';
 import NlClusterView from './NlClusterView';
+import { ConfirmDialog } from './ConfirmDialog';
 
 function formatTimestamp(ts) {
   if (!ts) return '—';
@@ -358,6 +359,8 @@ export default function SmartClustersView({
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState(null);
   const [thumbnailCache, setThumbnailCache] = useState({});
+  const [pendingDeleteId, setPendingDeleteId] = useState(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   const selected = clusters.find(c => c.id === selectedId) || null;
   const selectedSummary = selected?.summary || null;
@@ -436,6 +439,8 @@ export default function SmartClustersView({
     if (!active || !isAuthenticated) {
       setLoading(false);
       setError(null);
+      setPendingDeleteId(null);
+      setDeleteLoading(false);
       return undefined;
     }
     loadClusters();
@@ -479,21 +484,35 @@ export default function SmartClustersView({
     }
   };
 
-  const handleDelete = async (id) => {
-    if (!confirm(t('smartClusters.confirmDelete', '确定要删除这个智能聚类吗？已分配的快照不会被删除。'))) return;
+  const handleDelete = (id) => {
+    if (!deleteLoading) setPendingDeleteId(id);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!pendingDeleteId || deleteLoading) return;
+    const id = pendingDeleteId;
+    setDeleteLoading(true);
     try {
       await deleteSmartCluster(id);
       if (selectedId === id) setSelectedId(null);
       await loadClusters();
+      setPendingDeleteId(null);
     } catch (err) {
       if (isAuthRequiredError(err)) {
+        setPendingDeleteId(null);
         setError(null);
         emitAuthRequired();
         return;
       }
       console.error('Delete failed:', err);
       setError(err?.message || String(err));
+    } finally {
+      setDeleteLoading(false);
     }
+  };
+
+  const handleCancelDelete = () => {
+    if (!deleteLoading) setPendingDeleteId(null);
   };
 
   const handleTogglePause = async (id) => {
@@ -928,6 +947,18 @@ export default function SmartClustersView({
 
         </div>
       </div>
+      <ConfirmDialog
+        isOpen={Boolean(pendingDeleteId)}
+        onCancel={handleCancelDelete}
+        onConfirm={handleConfirmDelete}
+        title={t('smartClusters.confirmDeleteTitle', '删除智能聚类？')}
+        message={t('smartClusters.confirmDelete', '确定要删除这个智能聚类吗？已分配的快照不会被删除。')}
+        confirmLabel={t('common.confirm', '删除')}
+        cancelLabel={t('common.cancel', '取消')}
+        confirmVariant="danger"
+        loading={deleteLoading}
+        loadingLabel={t('common.processing', '处理中…')}
+      />
     </div>
   );
 }
