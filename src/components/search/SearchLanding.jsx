@@ -62,7 +62,6 @@ export function SearchLanding({
         <section className="flex flex-col gap-2.5">
           <BlockHeading
             title={t('advancedSearch.landing.recent_queries')}
-            hint={t('advancedSearch.landing.recent_queries_hint')}
             action={(
               <button
                 type="button"
@@ -90,7 +89,6 @@ export function SearchLanding({
         <section className="flex flex-col gap-2.5">
           <BlockHeading
             title={t('advancedSearch.landing.top_apps')}
-            hint={t('advancedSearch.landing.top_apps_hint')}
           />
           <div className="flex flex-wrap gap-2">
             {topProcesses.map((entry) => (

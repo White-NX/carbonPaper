@@ -19,6 +19,7 @@ import ClipBackfillDialog from './components/ClipBackfillDialog';
 import StartupVacuumDialog from './components/StartupVacuumDialog';
 import VectorMigrationOverlay from './components/VectorMigrationOverlay';
 import OcrModelRepairCard from './components/OcrModelRepairCard';
+import { ConfirmDialog } from './components/ConfirmDialog';
 import { deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 import { UpdateModal } from './components/UpdateModal';
 import { useAppTheme } from './hooks/useAppTheme';
@@ -139,9 +140,11 @@ function App() {
     showExtensionSetup,
     showClusteringSetup,
     showSmartClusterSetup,
+    clusteringResourceChoice,
     handleExtensionSetupComplete,
     handleClusteringSetupComplete,
     handleSmartClusterSetupComplete,
+    resolveClusteringResourceChoice,
   } = useStartupWizards({
     backendStatus,
     isAuthenticated,
@@ -311,6 +314,16 @@ function App() {
         <ClusteringSetupWizard
           isVisible={backendStatus === 'online' && isAuthenticated && !showExtensionSetup && showClusteringSetup}
           onComplete={handleClusteringSetupComplete}
+        />
+
+        <ConfirmDialog
+          isOpen={Boolean(clusteringResourceChoice) && isAuthenticated}
+          title={t('tasks.clusteringDegradeTitle', 'Choose clustering resource mode')}
+          message={clusteringResourceChoice?.prompt || ''}
+          confirmLabel={t('tasks.clusteringDegradeConfirm', 'Use batched mode')}
+          cancelLabel={t('tasks.clusteringDegradeCancel', 'Use full mode')}
+          onConfirm={() => resolveClusteringResourceChoice(true)}
+          onCancel={() => resolveClusteringResourceChoice(false)}
         />
 
         <SmartClusterSetupWizard

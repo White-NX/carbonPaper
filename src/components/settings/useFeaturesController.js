@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../../lib/auth_api';
 import { getClusteringStatus, runClustering, saveClusteringResults } from '../../lib/task_api';
@@ -21,6 +21,8 @@ export function useFeaturesController({
   const [clusteringStatus, setClusteringStatus] = useState(null);
   const [rangeStart, setRangeStart] = useState('');
   const [rangeEnd, setRangeEnd] = useState('');
+  const [clusteringResourceChoice, setClusteringResourceChoice] = useState(null);
+  const clusteringResourceChoiceResolver = useRef(null);
   const [customControlsOpen, setCustomControlsOpen] = useState(false);
   const modelInventory = useModelInventory();
   const smartCluster = useSmartClusterControls();
@@ -66,6 +68,24 @@ export function useFeaturesController({
       return () => document.removeEventListener('click', handler);
     }
   }, [clusteringDropdownOpen]);
+
+  const requestClusteringResourceChoice = useCallback((choice) => new Promise((resolve) => {
+    clusteringResourceChoiceResolver.current?.(false);
+    clusteringResourceChoiceResolver.current = resolve;
+    setClusteringResourceChoice(choice);
+  }), []);
+
+  const resolveClusteringResourceChoice = useCallback((useBatched) => {
+    const resolve = clusteringResourceChoiceResolver.current;
+    clusteringResourceChoiceResolver.current = null;
+    setClusteringResourceChoice(null);
+    resolve?.(useBatched);
+  }, []);
+
+  useEffect(() => () => {
+    clusteringResourceChoiceResolver.current?.(false);
+    clusteringResourceChoiceResolver.current = null;
+  }, []);
 
   const saveConfig = async (newConfig) => {
     setConfig(newConfig);
@@ -136,14 +156,16 @@ export function useFeaturesController({
         const reason = result.reason === 'low_memory'
           ? t('tasks.clusteringLowMemoryReason')
           : t('tasks.clusteringLargeRangeReason');
-        const useBatched = window.confirm(t('tasks.clusteringDegradePrompt', {
-          scope,
-          count,
-          reason,
-          estimatedGb: memory.estimated_peak_bytes
-            ? (memory.estimated_peak_bytes / (1024 ** 3)).toFixed(1)
-            : '-',
-        }));
+        const useBatched = await requestClusteringResourceChoice({
+          prompt: t('tasks.clusteringDegradePrompt', {
+            scope,
+            count,
+            reason,
+            estimatedGb: memory.estimated_peak_bytes
+              ? (memory.estimated_peak_bytes / (1024 ** 3)).toFixed(1)
+              : '-',
+          }),
+        });
         result = await runClustering({
           ...options,
           clusteringMode: useBatched ? 'batched' : 'full',
@@ -229,6 +251,8 @@ export function useFeaturesController({
     setRangeStart,
     rangeEnd,
     setRangeEnd,
+    clusteringResourceChoice,
+    resolveClusteringResourceChoice,
     customControlsOpen,
     setCustomControlsOpen,
     scModelAvailable,

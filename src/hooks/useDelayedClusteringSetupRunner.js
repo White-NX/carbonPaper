@@ -9,7 +9,7 @@ function formatEstimatedGb(memory = {}) {
     : '—';
 }
 
-function buildResourceChoicePrompt(result = {}) {
+export function buildResourceChoicePrompt(result = {}) {
   const count = result?.estimate?.count ?? result?.n_total ?? 0;
   const memory = result?.estimate?.memory || {};
   const reason = result.reason === 'low_memory'
@@ -43,6 +43,7 @@ export function useDelayedClusteringSetupRunner({
   delayMs = DEFAULT_DELAY_MS,
   onClose,
   pushNotification,
+  onResourceChoice,
 }) {
   const timerRef = useRef(null);
 
@@ -75,8 +76,11 @@ export function useDelayedClusteringSetupRunner({
         let result = await runClustering({ manual: true });
 
         if (result?.status === 'needs_user_choice') {
-          const useBatched = typeof window !== 'undefined' && typeof window.confirm === 'function'
-            ? window.confirm(buildResourceChoicePrompt(result))
+          const useBatched = onResourceChoice
+            ? await onResourceChoice({
+              ...result,
+              prompt: buildResourceChoicePrompt(result),
+            })
             : true;
           result = await runClustering({
             manual: true,
@@ -129,5 +133,5 @@ export function useDelayedClusteringSetupRunner({
         });
       }
     }, delayMs);
-  }, [delayMs, onClose, pushNotification]);
+  }, [delayMs, onClose, onResourceChoice, pushNotification]);
 }

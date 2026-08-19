@@ -367,8 +367,24 @@ function checkDomSinks() {
   }
 }
 
+function checkBrowserDialogs() {
+  const dialogPattern = /\bwindow\.(?:confirm|alert|prompt)\b|\b(?:confirm|alert|prompt)\s*\(/;
+  const offenders = walk(path.join(ROOT, 'src'))
+    .filter((file) => /\.(js|jsx|ts|tsx)$/.test(file))
+    .flatMap((file) => {
+      const rel = path.relative(ROOT, file);
+      return fs.readFileSync(file, 'utf8').split(/\r?\n/).flatMap((line, idx) => (
+        dialogPattern.test(line) ? [`${rel}:${idx + 1}: ${line.trim()}`] : []
+      ));
+    });
+  if (offenders.length) {
+    throw new Error(`Browser-native dialogs are forbidden; use project-managed ConfirmDialog flows:\n${offenders.join('\n')}`);
+  }
+}
+
 checkCommandPolicies();
 checkCommandGuardImplementations();
 checkRuntimeControlInvariants();
 checkDomSinks();
+checkBrowserDialogs();
 console.log('Security guards passed');

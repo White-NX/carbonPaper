@@ -410,7 +410,7 @@ export default function NlClusterView({
       case 'retrieving':
         return t('nlCluster.progressRetrieving', '正在召回候选快照…');
       case 'loading_model':
-        return t('nlCluster.progressLoadingModel', '正在加载重排模型（约 570 MB），每次重排检索都要先做这一步…');
+        return t('nlCluster.progressLoadingModel', '正在加载重排模型…');
       case 'reranking':
         return t('nlCluster.progressReranking', '正在重排候选 {{scored}}/{{total}}', {
           scored: Number(progress.scored) || 0,

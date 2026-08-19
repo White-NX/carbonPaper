@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { X, Loader2, Trash2, AlertTriangle, Clock } from 'lucide-react';
+import { X, Loader2, Trash2 } from 'lucide-react';
 import { SettingsSwitch } from './SettingsControls';
+import { ConfirmDialog } from '../ConfirmDialog';
 
 export default function CaptureFiltersSection({
   filterSettings,
@@ -158,7 +159,7 @@ export default function CaptureFiltersSection({
 // Quick Delete Section Component
 function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
   const { t } = useTranslation();
-  const [showConfirm, setShowConfirm] = useState(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState(null);
   const [deletingRange, setDeletingRange] = useState(null);
 
   const deleteOptionsLocal = [
@@ -169,7 +170,7 @@ function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
   ].map((opt) => ({ ...opt, label: t(`settings.captureFilters.quickDelete.options.${opt.key}`) }));
 
   const handleDeleteClick = (option) => {
-    setShowConfirm(option.id);
+    setPendingDeleteId(option.id);
   };
 
   const handleConfirmDelete = async (option) => {
@@ -178,9 +179,12 @@ function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
       await onDelete(option.minutes);
     } finally {
       setDeletingRange(null);
-      setShowConfirm(null);
+      setPendingDeleteId(null);
     }
   };
+
+  const pendingDelete = deleteOptionsLocal.find((option) => option.id === pendingDeleteId);
+  const confirmLoading = Boolean(pendingDelete && deletingRange === pendingDelete.id);
 
   return (
     <div className="space-y-3">
@@ -193,43 +197,14 @@ function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
           {deleteOptionsLocal.map((option) => (
             <div key={option.id} className="relative">
-              {showConfirm === option.id ? (
-                <div className="absolute inset-0 z-10 flex flex-col justify-center gap-2 p-2 bg-red-500 rounded-lg shadow-lg animate-in fade-in zoom-in duration-200">
-                  <div className="flex items-center justify-center gap-1 text-xs text-white font-medium">
-                    <AlertTriangle className="w-3 h-3" />
-                    <span>{t('settings.captureFilters.quickDelete.confirmTitle')}</span>
-                  </div>
-                  <div className="flex gap-1">
-                    <button
-                      onClick={() => handleConfirmDelete(option)}
-                      disabled={deletingRange === option.id}
-                      className="flex-1 flex items-center justify-center py-1 bg-white text-red-600 hover:bg-red-50 rounded text-[10px] font-bold transition-colors disabled:opacity-80"
-                    >
-                      {deletingRange === option.id ? (
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                      ) : (
-                        t('settings.captureFilters.quickDelete.yes')
-                      )}
-                    </button>
-                    <button
-                      onClick={() => setShowConfirm(null)}
-                      disabled={deletingRange === option.id}
-                      className="flex-1 py-1 bg-red-600 text-white hover:bg-red-700 rounded text-[10px] transition-colors disabled:opacity-80 border border-red-400"
-                    >
-                      {t('settings.captureFilters.quickDelete.no')}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <button
-                  onClick={() => handleDeleteClick(option)}
-                  disabled={isDeleting}
-                  className="w-full flex items-center justify-center gap-2 px-3 py-3 bg-ide-panel hover:bg-red-500/10 hover:border-red-500/30 border border-ide-border rounded-lg text-xs font-medium transition-all hover:scale-[1.02] disabled:opacity-50 disabled:hover:scale-100 h-10"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  {t('settings.captureFilters.quickDelete.button', { label: option.label })}
-                </button>
-              )}
+              <button
+                onClick={() => handleDeleteClick(option)}
+                disabled={isDeleting || Boolean(pendingDeleteId)}
+                className="w-full flex items-center justify-center gap-2 px-3 py-3 bg-ide-panel hover:bg-red-500/10 hover:border-red-500/30 border border-ide-border rounded-lg text-xs font-medium transition-all hover:scale-[1.02] disabled:opacity-50 disabled:hover:scale-100 h-10"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                {t('settings.captureFilters.quickDelete.button', { label: option.label })}
+              </button>
             </div>
           ))}
         </div>
@@ -241,6 +216,21 @@ function QuickDeleteSection({ onDelete, isDeleting, deleteMessage }) {
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        isOpen={Boolean(pendingDelete)}
+        onCancel={() => {
+          if (!confirmLoading) setPendingDeleteId(null);
+        }}
+        onConfirm={() => handleConfirmDelete(pendingDelete)}
+        title={t('settings.captureFilters.quickDelete.confirmTitle')}
+        message={t('settings.captureFilters.quickDelete.confirmMessage', '这会删除所选时间范围内的快照，且无法撤销。确定继续吗？')}
+        confirmLabel={t('settings.captureFilters.quickDelete.yes')}
+        cancelLabel={t('settings.captureFilters.quickDelete.no')}
+        confirmVariant="danger"
+        loading={confirmLoading}
+        loadingLabel={t('common.processing', '处理中…')}
+      />
     </div>
   );
 }

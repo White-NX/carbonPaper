@@ -541,6 +541,7 @@
         },
         "button": "{{label}}内",
         "confirmTitle": "确认？",
+        "confirmMessage": "这会删除所选时间范围内的快照和 OCR 记录，且无法撤销。确定继续吗？",
         "yes": "是",
         "no": "否"
       }
@@ -897,9 +898,11 @@
   },
   "common": {
     "cancel": "取消",
+    "confirm": "确认",
     "close": "关闭",
     "retry": "重试",
-    "save": "保存"
+    "save": "保存",
+    "processing": "处理中…"
   },
   "delete": {
     "failure": "删除失败: {{error}}",
@@ -1182,7 +1185,7 @@
     "stoppingHint": "正在停止，最多再等一个批次…",
     "progressStarting": "正在准备…",
     "progressRetrieving": "正在召回候选快照…",
-    "progressLoadingModel": "正在加载重排模型（约 570 MB），每次重排检索都要先做这一步…",
+    "progressLoadingModel": "正在加载重排模型…",
     "progressReranking": "正在重排候选 {{scored}}/{{total}}",
     "progressExternalBackend": "正在由 Python 后端重排，这一路径不报告进度…",
     "cancelledNotice": "已停止本次检索，还没有结果",
@@ -1234,6 +1237,7 @@
   "smartClusters": {
     "title": "智能聚类",
     "beta": "beta",
+    "confirmDeleteTitle": "删除智能聚类？",
     "confirmDelete": "确定要删除这个智能聚类吗？已分配的快照不会被删除。",
     "newCluster": "新建智能聚类",
     "processNowTooltip": "立即处理待处理队列",
@@ -1350,10 +1354,8 @@
     },
     "landing": {
       "recent_queries": "最近搜索",
-      "recent_queries_hint": "点一下直接重新搜",
       "clear_recent": "清除记录",
       "top_apps": "常用来源",
-      "top_apps_hint": "点一下作为筛选条件",
       "latest": "最近捕获的截图",
       "latest_hint": "共 {{count}} 张"
     },
@@ -1486,6 +1488,9 @@
     "clusteringAllScope": "全部可聚类快照",
     "clusteringLargeRangeReason": "可聚类快照数量较多",
     "clusteringLowMemoryReason": "当前可用内存不足，完整聚类可能明显变慢或失败",
+    "clusteringDegradeTitle": "选择聚类资源模式",
+    "clusteringDegradeConfirm": "使用降级分批模式",
+    "clusteringDegradeCancel": "使用全量模式",
     "clusteringDegradePrompt": "{{scope}}约 {{count}} 张快照。{{reason}}。建议使用降级分批模式；这会先对样本聚类，再分批归属剩余快照。预计峰值内存约 {{estimatedGb}} GB。\n\n选择“确定”使用降级分批；选择“取消”继续全量聚类。",
     "clusteringDegradedNotice": "本次使用降级分批模式：样本 {{sampleSize}} 张，分批归属 {{assignedCount}} 张。",
     "showInactive": "显示不活跃任务",
