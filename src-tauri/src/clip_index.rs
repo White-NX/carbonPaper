@@ -1,8 +1,8 @@
-//! M2.5 step 8 — Rust-owned Chinese-CLIP capture indexing and Chroma mirror.
+//! M2.5 step 8 — Rust-owned Chinese-CLIP capture indexing.
 //!
 //! Enqueues captured screenshot images for CLIP vector indexing, manages
 //! background/foreground index workers, performs periodic repair scans, and
-//! mirrors new vectors to the Python Chroma screenshot collection for backwards compatibility.
+//! Legacy Chroma migration export remains a separate read-only monitor path.
 
 use crate::clip_migration::{
     clip_job_spec, clip_memory_uri, diagnostic_code, validate_clip_vector,
@@ -10,11 +10,9 @@ use crate::clip_migration::{
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
 use crate::ml_protocol::{MlImageInput, MlSemanticModel};
-use crate::monitor::{authenticated_monitor_command, MonitorState};
 use crate::semantic_runtime::{IndexRunProgress, SemanticRuntimeState};
 use crate::storage::{
-    BackgroundReadError, BackgroundScreenshotSummary, DerivedEmbeddingWrite, DerivedIndexJobSpec,
-    DerivedIndexKind, StorageState,
+    BackgroundReadError, DerivedEmbeddingWrite, DerivedIndexJobSpec, DerivedIndexKind, StorageState,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use image::RgbImage;
@@ -47,13 +45,6 @@ const EMBED_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Rows examined per repair or reaper pass.
 const MAINTENANCE_BATCH: u32 = 256;
-
-/// Vectors per Chroma mirror request. Smaller than MiniLM's 32 because a CLIP
-/// vector is 512 floats rather than 384 and travels as JSON.
-const MIRROR_BATCH: usize = 16;
-
-/// Maximum OCR characters carried in a mirrored Chroma document.
-const MIRROR_OCR_SNIPPET_CHARS: usize = 2_000;
 
 /// Bounded time window for automatic repair scans, catching recently missed enqueues.
 const REPAIR_SCAN_WINDOW: &str = "-7 days";
@@ -546,18 +537,6 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
             PassMode::Idle => "not_idle",
         }));
     }
-    // The other half of the `clip_runtime` arbitration. Python skips every
-    // encode unless it was spawned with `python`; this is what stops both sides
-    // encoding when it was. Asked of the live process rather than of the
-    // registry, because the two read the switch at different times —
-    // `monitor.rs::MonitorState::python_owns_clip_encoding` records why the
-    // difference matters in both directions.
-    if app
-        .state::<crate::monitor::MonitorState>()
-        .python_owns_clip_encoding()
-    {
-        return Ok(PassOutcome::refused("python_owns_encoding"));
-    }
     if mode == PassMode::Idle {
         if app
             .state::<Arc<SemanticRuntimeState>>()
@@ -705,20 +684,7 @@ async fn drain_until_done(
 struct ClaimedJob {
     spec: DerivedIndexJobSpec,
     image_hash: String,
-    /// The newest live screenshot sharing these pixels, and the one whose
-    /// metadata the Chroma mirror carries. Python wrote the metadata of
-    /// whichever capture triggered indexing; this is the same choice made
-    /// deterministically.
-    screenshot_id: i64,
     lease_token: String,
-}
-
-/// One image that became query-visible in this pass, in the shape the Chroma
-/// mirror sends.
-struct IndexedImage {
-    image_hash: String,
-    screenshot_id: i64,
-    vector: Vec<f32>,
 }
 
 async fn drain_queue(
@@ -734,7 +700,7 @@ async fn drain_queue(
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let run = app.state::<Arc<ClipIndexRunState>>().inner().clone();
     let mut pending: VecDeque<ClaimedJob> = claimed.into();
-    let mut indexed: Vec<IndexedImage> = Vec::new();
+    let mut indexed = 0usize;
     let mut outcome = PassOutcome::default();
     let mut failure: Option<String> = None;
 
@@ -767,12 +733,12 @@ async fn drain_queue(
         let chunk: Vec<ClaimedJob> = pending.drain(..ENCODE_CHUNK.min(pending.len())).collect();
         let chunk_len = chunk.len() as u64;
         match encode_chunk(app, &semantic, storage.clone(), chunk).await {
-            Ok(mut encoded) => {
-                outcome.indexed += encoded.len() as u64;
+            Ok(encoded) => {
+                outcome.indexed += encoded as u64;
                 if mode == PassMode::Manual {
-                    run.report_chunk(app, chunk_len, encoded.len() as u64);
+                    run.report_chunk(app, chunk_len, encoded as u64);
                 }
-                indexed.append(&mut encoded);
+                indexed += encoded;
             }
             Err(error) => {
                 outcome.failed += chunk_len;
@@ -797,9 +763,8 @@ async fn drain_queue(
         }
     }
 
-    if !indexed.is_empty() {
-        tracing::info!("[CLIP:INDEX] indexed {} image(s)", indexed.len());
-        mirror_to_chroma(app, &indexed).await;
+    if indexed > 0 {
+        tracing::info!("[CLIP:INDEX] indexed {} image(s)", indexed);
     }
     match failure {
         Some(error) if mode == PassMode::Manual => {
@@ -822,7 +787,7 @@ async fn encode_chunk(
     semantic: &Arc<SemanticRuntimeState>,
     storage: Arc<StorageState>,
     claimed: Vec<ClaimedJob>,
-) -> Result<Vec<IndexedImage>, String> {
+) -> Result<usize, String> {
     let read_storage = storage.clone();
     let hashes: Vec<String> = claimed.iter().map(|job| job.image_hash.clone()).collect();
     let decoded = tokio::task::spawn_blocking(move || load_images(&read_storage, &hashes))
@@ -850,7 +815,7 @@ async fn encode_chunk(
         tracing::warn!("[CLIP:INDEX] discarded {}: {error}", job.spec.subject_key);
     }
     if encodable.is_empty() {
-        return Ok(Vec::new());
+        return Ok(0);
     }
 
     // One contiguous body with per-image offsets, which is the shape
@@ -1012,7 +977,6 @@ async fn claim_batch(storage: Arc<StorageState>, locked: bool) -> Result<Vec<Cla
                 match storage.mark_derived_index_job_processing(&job.spec) {
                     Ok(lease_token) => claimed.push(ClaimedJob {
                         image_hash: job.spec.subject_key.clone(),
-                        screenshot_id,
                         spec: job.spec,
                         lease_token,
                     }),
@@ -1023,7 +987,7 @@ async fn claim_batch(storage: Arc<StorageState>, locked: bool) -> Result<Vec<Cla
                 }
                 continue;
             }
-            let Some(screenshot_id) = indexable.get(&job.spec.subject_key).copied() else {
+            let Some(_screenshot_id) = indexable.get(&job.spec.subject_key).copied() else {
                 // Nothing to index. Record the exclusion, or the repair scan
                 // hands the subject straight back; if even that fails the
                 // screenshot itself is gone and the row goes with it.
@@ -1047,7 +1011,6 @@ async fn claim_batch(storage: Arc<StorageState>, locked: bool) -> Result<Vec<Cla
             match storage.mark_derived_index_job_processing(&job.spec) {
                 Ok(lease_token) => claimed.push(ClaimedJob {
                     image_hash: job.spec.subject_key.clone(),
-                    screenshot_id,
                     spec: job.spec,
                     lease_token,
                 }),
@@ -1067,9 +1030,9 @@ async fn commit_batch(
     storage: Arc<StorageState>,
     claimed: Vec<ClaimedJob>,
     vectors: Vec<Vec<f32>>,
-) -> Result<Vec<IndexedImage>, String> {
+) -> Result<usize, String> {
     tokio::task::spawn_blocking(move || {
-        let mut indexed = Vec::with_capacity(claimed.len());
+        let mut indexed = 0usize;
         for (job, vector) in claimed.into_iter().zip(vectors) {
             if let Err(error) = validate_clip_vector(&vector) {
                 // A zero or non-finite vector would poison every cosine score
@@ -1094,11 +1057,7 @@ async fn commit_batch(
                 Ok(()) => {
                     // The encode this capture was held for is done.
                     forget_prepared(&job.image_hash);
-                    indexed.push(IndexedImage {
-                        image_hash: job.image_hash,
-                        screenshot_id: job.screenshot_id,
-                        vector,
-                    })
+                    indexed += 1;
                 }
                 Err(error) => tracing::warn!(
                     "[CLIP:INDEX] commit failed for {}: {error}",
@@ -1221,108 +1180,6 @@ async fn reconcile_missing(
         tracing::info!("[CLIP:INDEX] repair queued {queued}, excluded {excluded}");
     }
     Ok(queued + excluded)
-}
-
-/// Mirror newly encoded vectors into Python's Chroma `screenshots` collection.
-///
-/// The direction the M2.4 dual-write established, applied to the image index:
-/// Rust owns the inference and hands the finished vector to Python for the
-/// Chroma write. What it buys is that `clip_runtime = python` remains a real
-/// rollback for the one release the flag rule requires — without it, flipping
-/// back would serve a collection frozen at the moment of the step-7 migration.
-///
-/// Best-effort on purpose. Rust holds the authoritative copy, so a mirror lost
-/// while the monitor is down costs the rollback its freshness for that image,
-/// not the user their search result. The gap is not repaired later, which is
-/// the same accepted debt step 5 recorded for the MiniLM mirror and which stops
-/// mattering when the Python path is deleted a release from now.
-async fn mirror_to_chroma(app: &AppHandle, indexed: &[IndexedImage]) {
-    if indexed.is_empty() {
-        return;
-    }
-    // The full row, not just the vector. `add_image` wrote the process name,
-    // window title, timestamp, and OCR document alongside the embedding, and a
-    // rolled-back `search_by_natural_language` filters on the process name and
-    // renders the rest — a mirrored row without them would be findable but
-    // blank, and invisible to a process filter.
-    let storage = app.state::<Arc<StorageState>>().inner().clone();
-    let ids: Vec<i64> = indexed.iter().map(|image| image.screenshot_id).collect();
-    let read_storage = storage.clone();
-    let read_ids = ids.clone();
-    let metadata = tokio::task::spawn_blocking(move || {
-        let summaries = read_storage
-            .get_screenshot_summaries_by_ids_silent(&read_ids)
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|summary| (summary.id, summary))
-                    .collect::<HashMap<i64, BackgroundScreenshotSummary>>()
-            })
-            .unwrap_or_default();
-        let texts = read_storage
-            .get_ocr_text_prefixes_by_screenshot_ids_silent(&read_ids, MIRROR_OCR_SNIPPET_CHARS)
-            .unwrap_or_default();
-        (summaries, texts)
-    })
-    .await;
-    // A read failure costs the mirror its metadata, not the pass its vectors:
-    // the authoritative row is already committed, and the rollback collection is
-    // better off with a bare vector than with nothing.
-    let (summaries, texts) = metadata.unwrap_or_default();
-
-    let credential = app.state::<Arc<CredentialManagerState>>();
-    let monitor = app.state::<MonitorState>();
-    for chunk in indexed.chunks(MIRROR_BATCH) {
-        let records: Vec<serde_json::Value> = chunk
-            .iter()
-            .map(|image| {
-                let summary = summaries.get(&image.screenshot_id);
-                let document: String = texts
-                    .get(&image.screenshot_id)
-                    .map(|text| text.chars().take(MIRROR_OCR_SNIPPET_CHARS).collect())
-                    .unwrap_or_default();
-                serde_json::json!({
-                    "image_hash": image.image_hash,
-                    "embedding": image.vector,
-                    "screenshot_id": image.screenshot_id,
-                    "process_name": summary
-                        .and_then(|summary| summary.process_name.clone())
-                        .unwrap_or_default(),
-                    "window_title": summary
-                        .and_then(|summary| summary.window_title.clone())
-                        .unwrap_or_default(),
-                    "timestamp": summary.and_then(|summary| summary.timestamp).unwrap_or(0),
-                    "document": document,
-                })
-            })
-            .collect();
-        let request = serde_json::json!({
-            "command": "upsert_clip_vectors",
-            "records": records,
-        });
-        match authenticated_monitor_command(&credential, &monitor, request).await {
-            // Python reports a refused command in the response body rather than
-            // as a transport error, so an `error` field is the failure that
-            // actually shows up in practice: the vector store disabled, the
-            // vault locked, or the monitor still starting.
-            Ok(response) => {
-                if let Some(error) = response.get("error").and_then(|value| value.as_str()) {
-                    tracing::debug!(
-                        "[CLIP:INDEX] chroma mirror rejected {} vector(s): {error}",
-                        chunk.len()
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::debug!(
-                    "[CLIP:INDEX] chroma mirror deferred for {} vector(s): {error}",
-                    chunk.len()
-                );
-                // A transport failure applies to the pipe, not to this batch,
-                // so the remaining chunks would fail the same way.
-                return;
-            }
-        }
-    }
 }
 
 /// Drain the CLIP queue now, at the user's request.
@@ -1754,28 +1611,6 @@ mod tests {
 
     fn estimate_one(megapixels: f64) -> f64 {
         ENCODE_FIXED_SECONDS + megapixels * ENCODE_SECONDS_PER_MEGAPIXEL
-    }
-
-    #[test]
-    fn the_cost_model_reproduces_the_measured_encode_times() {
-        // The four points measured 2026-08-04 on this project's own CLIP
-        // session (`tools/measure_clip_latency.py`, recorded in the roadmap).
-        // Pinning them here is what stops the estimate shown to a user from
-        // drifting into a number nobody ever measured: an estimate is a promise
-        // about hours of their processor time.
-        for (width, height, measured) in [
-            (1280.0, 720.0, 0.38),
-            (1920.0, 1080.0, 0.67),
-            (2560.0, 1440.0, 1.08),
-            (3840.0, 2160.0, 2.21),
-        ] {
-            let predicted = estimate_one(width * height / 1_000_000.0);
-            let error = (predicted - measured).abs() / measured;
-            assert!(
-                error < 0.03,
-                "{width}x{height}: predicted {predicted:.3}s against {measured:.3}s measured"
-            );
-        }
     }
 
     #[test]

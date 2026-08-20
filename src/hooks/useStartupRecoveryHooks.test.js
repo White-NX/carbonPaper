@@ -37,7 +37,7 @@ const t = (key, values) => (values ? `${key}:${JSON.stringify(values)}` : key);
 describe('startup and search recovery hooks', () => {
   beforeEach(() => {
     invoke.mockImplementation(async (command) => {
-      if (command === 'get_advanced_config') return { smart_cluster_enabled: false, use_onnx: false };
+      if (command === 'get_advanced_config') return { smart_cluster_enabled: false };
       if (command === 'storage_check_hmac_migration_status') return { needs_migration: false, is_running: false };
       return null;
     });
@@ -55,7 +55,6 @@ describe('startup and search recovery hooks', () => {
     const { result, unmount } = renderHook(() => useSearchBoxController({
       onSelectResult: vi.fn(),
       onSubmit: vi.fn(),
-      backendOnline: true,
       monitorPaused: false,
       handlePauseMonitor: vi.fn(),
       handleResumeMonitor: vi.fn(),
@@ -115,7 +114,7 @@ describe('startup and search recovery hooks', () => {
 
   it('retries required model download only when retry is requested after a failure', async () => {
     invoke.mockImplementation(async (command) => {
-      if (command === 'get_advanced_config') return { use_onnx: false };
+      if (command === 'get_advanced_config') return {};
       if (command === 'download_model') throw new Error('download failed');
       return null;
     });

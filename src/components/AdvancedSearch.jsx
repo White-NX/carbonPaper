@@ -18,7 +18,6 @@ export function AdvancedSearch({
   onOpenSnapshotPreview,
   searchMode,
   onSearchModeChange,
-  backendOnline,
   onTimelineSearchChange,
 }) {
   const { t } = useTranslation();
@@ -64,7 +63,6 @@ export function AdvancedSearch({
     searchParams,
     searchMode,
     onSearchModeChange,
-    backendOnline,
     t,
   });
   const isMigrating = useHmacMigrationStatus();
@@ -148,7 +146,7 @@ export function AdvancedSearch({
           mode={mode}
           hasFilters={hasFilters}
           onClearFilters={clearFilters}
-          onSwitchToVisual={backendOnline === false ? undefined : () => handleModeChange('nl')}
+          onSwitchToVisual={() => handleModeChange('nl')}
         />
       );
     }
@@ -243,7 +241,7 @@ export function AdvancedSearch({
         </div>
 
         <div className="mt-3.5 flex min-h-[34px] items-center gap-7">
-          <SearchModeTabs mode={mode} onChange={handleModeChange} backendOnline={backendOnline} />
+          <SearchModeTabs mode={mode} onChange={handleModeChange} />
 
           <div className="flex flex-1 flex-wrap items-center gap-2">
             <TimeRangeChip

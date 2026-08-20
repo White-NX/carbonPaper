@@ -324,7 +324,7 @@ export const cancelTimelineImageRequest = (key) => {
 /**
  * 搜索截图
  * @param {string} query - 搜索查询
- * @param {string} mode - 'ocr' 使用 Rust 存储, 'nl' 使用 Python 自然语言搜索
+ * @param {string} mode - 'ocr' 使用 Rust 存储, 'nl' 使用 Rust CLIP 搜索
  * @param {object} options - 搜索选项
  * 需要认证才能访问
  */
@@ -340,7 +340,7 @@ export const searchScreenshots = async (query, mode = 'ocr', options = {}) => {
     } = options || {};
     
     return withAuth(async () => {
-        // 自然语言搜索使用 Python IPC
+        // Natural-language image search is served directly by Rust.
         if (mode === 'nl') {
             const response = await invoke('monitor_search_nl', {
                 query,
@@ -665,7 +665,7 @@ export const getSmartClusterWorkerStatus = async () => {
                 // M2.5 step 6: clusters the Rust scorer refused to score because
                 // their stored threshold came from the retired Python scorer and
                 // could not be re-derived from the saved calibration examples.
-                // Absent from the Python backend's payload, hence the default.
+                // Keep the default for older status payloads that lack this field.
                 unverifiableThresholds: response.unverifiable_thresholds || 0,
             };
         } catch {
@@ -690,16 +690,9 @@ export const getBackgroundIndexProgress = async () => {
     }
 };
 
-export const getIndexHealth = async ({ refreshVector = false } = {}) => {
+export const getIndexHealth = async () => {
     return withAuth(
-        () => invoke('storage_get_index_health', { refreshVector }),
-        { autoPrompt: true },
-    );
-};
-
-export const retryVectorIndexing = async (limit = 32) => {
-    return withAuth(
-        () => invoke('storage_retry_vector_indexing', { limit }),
+        () => invoke('storage_get_index_health'),
         { autoPrompt: true },
     );
 };

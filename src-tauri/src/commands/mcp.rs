@@ -248,14 +248,8 @@ pub async fn mcp_get_status(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
     mcp_state: tauri::State<'_, mcp_server::McpRuntimeState>,
-    monitor_state: tauri::State<'_, crate::monitor::MonitorState>,
     ml_state: tauri::State<'_, Arc<crate::ml_runtime::MlRuntimeState>>,
 ) -> Result<serde_json::Value, String> {
-    let python_running = monitor_state
-        .process
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some();
     let storage_for_status = storage_state.inner().clone();
     let app_for_status = app.clone();
     // Policy/model inspection and every database read stay off the async IPC
@@ -265,7 +259,7 @@ pub async fn mcp_get_status(
         let port = mcp_server::port_from_policy(&policy);
         let privacy_acknowledged =
             mcp_privacy_acknowledged_from_policy_or_db(&storage_for_status, &policy);
-        let search_nl = clip_search_readiness(&storage_for_status, python_running);
+        let search_nl = clip_search_readiness(&storage_for_status);
         let failed_ocr = storage_for_status.count_failed_ocr().unwrap_or(0);
         let ocr_model_status = crate::ml_runtime::ocr_model_status(&app_for_status).ok();
         Ok((
@@ -721,18 +715,14 @@ struct ClipSearchReadiness {
     disabled_reason: Option<&'static str>,
 }
 
-/// Which backend can answer a natural-language image search right now and, when
-/// neither can, the backend-specific reason rather than a stale Python-only one.
+/// Whether the Rust natural-language image search can answer right now.
 ///
-/// Deliberately a *readiness diagnostic* rather than a configuration one. The
-/// Rust path can be selected and still stand down — for an unfinished step-7
-/// migration or an empty index. The MCP tool table remains static; this check
-/// only reports which backend would serve a call now. It mirrors the refusals
+/// Deliberately a readiness diagnostic rather than a configuration one. The
+/// Rust path can still stand down for an unfinished step-7 migration or an
+/// empty index. The MCP tool table remains static; this check mirrors the refusals
 /// in `clip_query::try_rust_clip_query` without running a query. Callers must
 /// keep this synchronous read on a blocking thread.
-fn clip_search_readiness(storage: &StorageState, python_running: bool) -> ClipSearchReadiness {
-    let rust_selected = crate::clip_query::clip_index_backend() == "rust"
-        && crate::clip_query::clip_runtime() == "rust";
+fn clip_search_readiness(storage: &StorageState) -> ClipSearchReadiness {
     if crate::maintenance::is_active() {
         return ClipSearchReadiness {
             backend: None,
@@ -740,8 +730,7 @@ fn clip_search_readiness(storage: &StorageState, python_running: bool) -> ClipSe
         };
     }
 
-    let rust_ready = rust_selected
-        && crate::clip_query::migration_settled(storage)
+    let rust_ready = crate::clip_query::migration_settled(storage)
         && storage
             .has_query_visible_embeddings(crate::storage::DerivedIndexKind::ClipImage)
             .unwrap_or(false);
@@ -751,18 +740,8 @@ fn clip_search_readiness(storage: &StorageState, python_running: bool) -> ClipSe
             disabled_reason: None,
         };
     }
-    if python_running {
-        return ClipSearchReadiness {
-            backend: Some("python"),
-            disabled_reason: None,
-        };
-    }
     ClipSearchReadiness {
         backend: None,
-        disabled_reason: Some(if rust_selected {
-            "clip_index_unavailable"
-        } else {
-            "python_monitor_not_running"
-        }),
+        disabled_reason: Some("clip_index_unavailable"),
     }
 }

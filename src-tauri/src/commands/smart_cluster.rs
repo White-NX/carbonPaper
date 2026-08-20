@@ -106,17 +106,9 @@ pub async fn smart_cluster_create(
         let anchor = normalize_anchor_text(&req.anchor_text)?;
         let id =
             state.create_smart_cluster(&anchor, req.threshold, req.dominant_color.as_deref())?;
-        // M2.5 step 6: stamp the scorer that produced this threshold — meaning
-        // the one that actually served the calibration query, which the caller
-        // reports back from that query's `backend` field. Reading the
-        // `rerank_runtime` switch instead would be a guess: `monitor_nl_cluster_query`
-        // hands a reranked query to Python whenever the Rust path stands down
-        // for a reason of its own — `semantic_index` or `semantic_runtime` set
-        // to something else, maintenance, an unfinished M2.4 migration, an empty
-        // Rust index, or an error mid-query — and a threshold derived from
-        // Python's DirectML logits stamped with Rust's CPU identity is the one
-        // outcome the provenance columns exist to prevent, because it is trusted
-        // instead of repaired.
+        // Stamp the scorer that produced this threshold. The Python identity is
+        // retained for requests from older clients so those thresholds are
+        // re-derived rather than trusted against Rust logits.
         if let Some(scorer) = scorer_stamp_for_backend(req.scorer_backend.as_deref()) {
             state.update_smart_cluster_threshold_with_scorer(id, req.threshold, &scorer)?;
         }
@@ -170,22 +162,16 @@ fn python_scorer() -> crate::storage::smart_cluster::SmartClusterScorer {
 
 /// The scorer a number read off the screen right now was produced by.
 ///
-/// Used for a hand-adjusted threshold, where the scores the user is reading are
-/// the ones already stored on the assignments — and those come from whichever
-/// worker the `rerank_runtime` switch has draining the queue. Not usable for
-/// calibration, where the query has its own reasons to fall back to Python; see
-/// `scorer_stamp_for_backend`.
+/// Used for a hand-adjusted threshold, where current assignments are always
+/// produced by the Rust worker.
 fn configured_scorer() -> crate::storage::smart_cluster::SmartClusterScorer {
-    if crate::rerank::rust_rerank_selected() {
-        let scorer = crate::rerank::ScorerIdentity::current();
-        return crate::storage::smart_cluster::SmartClusterScorer {
-            model_id: scorer.model_id,
-            model_revision: scorer.model_revision,
-            variant: scorer.variant,
-            provider: scorer.provider,
-        };
+    let scorer = crate::rerank::ScorerIdentity::current();
+    crate::storage::smart_cluster::SmartClusterScorer {
+        model_id: scorer.model_id,
+        model_revision: scorer.model_revision,
+        variant: scorer.variant,
+        provider: scorer.provider,
     }
-    python_scorer()
 }
 
 /// Deletes cluster `id` and its dependent data.
@@ -224,8 +210,7 @@ pub fn smart_cluster_update_anchor(
 /// reason a calibrated one is: the number is only meaningful next to the logits
 /// it will be compared against. Unlike calibration, the logits the user is
 /// reading here are the ones stored on the cluster's assignments, which were
-/// produced by whichever worker the `rerank_runtime` switch has draining the
-/// queue — so the configured backend is the right answer rather than a guess.
+/// produced by the Rust worker.
 #[tauri::command]
 pub fn smart_cluster_update_threshold(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -423,12 +408,8 @@ mod tests {
     #[test]
     fn a_python_served_calibration_never_passes_for_the_rust_scorer() {
         // The whole point of taking the backend from the response: a reranked
-        // query falls back to Python for reasons of its own — an unfinished
-        // M2.4 migration, an empty Rust index, `semantic_index` pointing at
-        // Chroma — none of which the `rerank_runtime` switch knows about. The
-        // 2026-07-20 audit put top-1 disagreement between those two providers
-        // at 20.5% on this model, so a threshold from one must never be trusted
-        // against logits from the other.
+        // Older clients can still submit a threshold produced by Python. It
+        // must never be trusted against Rust logits.
         let current = ScorerIdentity::current();
         let python = scorer_stamp_for_backend(Some("python")).expect("python is a known backend");
         assert!(!current.matches_stored(

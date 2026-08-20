@@ -83,7 +83,6 @@ describe('AdvancedSearch', () => {
         active
         searchParams={{ query: '', mode: 'ocr' }}
         onSelectResult={vi.fn()}
-        backendOnline
       />
     );
 
@@ -106,7 +105,6 @@ describe('AdvancedSearch', () => {
         active
         searchParams={{ query: '', mode: 'ocr' }}
         onSelectResult={vi.fn()}
-        backendOnline
       />
     );
 
@@ -124,7 +122,6 @@ describe('AdvancedSearch', () => {
         active
         searchParams={{ query: 'hello', mode: 'ocr' }}
         onSelectResult={vi.fn()}
-        backendOnline
       />
     );
 
@@ -136,7 +133,7 @@ describe('AdvancedSearch', () => {
     });
   });
 
-  it('auto-switches to OCR when backend is offline in NL mode', async () => {
+  it('keeps visual mode available when the monitor is offline', async () => {
     const onSearchModeChange = vi.fn();
 
     render(
@@ -146,13 +143,11 @@ describe('AdvancedSearch', () => {
         searchMode="nl"
         onSearchModeChange={onSearchModeChange}
         onSelectResult={vi.fn()}
-        backendOnline={false}
       />
     );
 
-    await waitFor(() => {
-      expect(onSearchModeChange).toHaveBeenCalledWith('ocr');
-    });
+    await waitFor(() => expect(screen.getByPlaceholderText('advancedSearch.search.placeholder_nl')).toBeInTheDocument());
+    expect(onSearchModeChange).not.toHaveBeenCalled();
   });
 
   it('shows no-result state when query exists but no matches', async () => {
@@ -163,7 +158,6 @@ describe('AdvancedSearch', () => {
         active
         searchParams={{ query: 'missing', mode: 'ocr' }}
         onSelectResult={vi.fn()}
-        backendOnline
       />
     );
 
@@ -180,7 +174,6 @@ describe('AdvancedSearch', () => {
         active
         searchParams={{ query: '', mode: 'ocr' }}
         onSelectResult={vi.fn()}
-        backendOnline
       />
     );
 
@@ -235,7 +228,6 @@ describe('AdvancedSearch', () => {
         active
         searchParams={{ query: 'page', mode: 'ocr' }}
         onSelectResult={vi.fn()}
-        backendOnline
       />
     );
 
@@ -270,7 +262,6 @@ describe('AdvancedSearch', () => {
         searchParams={{ query: 'page', mode: 'ocr' }}
         onSelectResult={vi.fn()}
         onTimelineSearchChange={onTimelineSearchChange}
-        backendOnline
       />
     );
 
@@ -311,7 +302,6 @@ describe('AdvancedSearch', () => {
         searchMode="nl"
         onSelectResult={vi.fn()}
         onTimelineSearchChange={onTimelineSearchChange}
-        backendOnline
       />
     );
 
@@ -329,7 +319,6 @@ describe('AdvancedSearch', () => {
           active
           searchParams={{ query: 'hello', mode: 'ocr' }}
           onSelectResult={vi.fn()}
-          backendOnline
         />
       );
 

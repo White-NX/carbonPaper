@@ -1,4 +1,4 @@
-//! BGE classification inference routing and its observable fallback diagnostic.
+//! BGE classification inference and its diagnostic.
 //!
 //! Classification orchestration and learned anchors remain in the Python
 //! post-process worker for now. The expensive text embedding call is served by
@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
-const DEFAULT_RUNTIME: &str = "rust";
 const EMBED_TIMEOUT: Duration = Duration::from_secs(120);
 const FOREGROUND_WAIT_BUDGET: Duration = Duration::from_secs(15);
 const BACKGROUND_BATCH_WAIT_BUDGET: Duration = Duration::from_secs(15);
@@ -21,16 +20,14 @@ const MAX_TEXTS_PER_REQUEST: usize = 512;
 
 #[derive(Debug, Clone, Default)]
 struct ClassificationDiagnosticInner {
-    last_backend: Option<String>,
     last_error: Option<String>,
-    fallback_count: u64,
+    failure_count: u64,
     success_count: u64,
     last_elapsed_ms: Option<f64>,
 }
 
 impl ClassificationDiagnosticInner {
     fn record_rust_success(&mut self, elapsed_ms: f64) {
-        self.last_backend = Some("rust".to_string());
         self.last_error = None;
         self.success_count = self.success_count.saturating_add(1);
         self.last_elapsed_ms = Some(elapsed_ms);
@@ -38,27 +35,15 @@ impl ClassificationDiagnosticInner {
 
     fn record_rust_failure(&mut self, error: &str, elapsed_ms: f64) {
         self.last_error = Some(truncate_error(error));
+        self.failure_count = self.failure_count.saturating_add(1);
         self.last_elapsed_ms = Some(elapsed_ms);
-    }
-
-    fn record_python_fallback(&mut self, error: &str) {
-        self.last_backend = Some("python".to_string());
-        self.last_error = Some(truncate_error(error));
-        self.fallback_count = self.fallback_count.saturating_add(1);
-    }
-
-    fn record_python_inference(&mut self) {
-        self.last_backend = Some("python".to_string());
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClassificationBackendStatus {
-    pub selected_runtime: String,
-    pub active_runtime: Option<String>,
-    pub last_backend: Option<String>,
     pub last_error: Option<String>,
-    pub fallback_count: u64,
+    pub failure_count: u64,
     pub success_count: u64,
     pub last_elapsed_ms: Option<f64>,
 }
@@ -78,31 +63,13 @@ fn diagnostic() -> &'static Mutex<ClassificationDiagnosticInner> {
     DIAGNOSTIC.get_or_init(|| Mutex::new(ClassificationDiagnosticInner::default()))
 }
 
-pub fn classification_runtime() -> String {
-    let configured = crate::registry_config::get_string("classification_runtime")
-        .unwrap_or_else(|| DEFAULT_RUNTIME.to_string());
-    if is_selectable_classification_runtime(&configured) {
-        configured
-    } else {
-        DEFAULT_RUNTIME.to_string()
-    }
-}
-
-pub fn is_selectable_classification_runtime(value: &str) -> bool {
-    matches!(value, "rust" | "python")
-}
-
-pub fn backend_status(active_runtime: Option<String>) -> ClassificationBackendStatus {
-    let selected_runtime = classification_runtime();
+pub fn backend_status() -> ClassificationBackendStatus {
     let inner = diagnostic()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     ClassificationBackendStatus {
-        last_backend: inner.last_backend.clone(),
-        selected_runtime,
-        active_runtime,
         last_error: inner.last_error.clone(),
-        fallback_count: inner.fallback_count,
+        failure_count: inner.failure_count,
         success_count: inner.success_count,
         last_elapsed_ms: inner.last_elapsed_ms,
     }
@@ -120,20 +87,6 @@ fn record_rust_failure(error: &str, elapsed_ms: f64) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     inner.record_rust_failure(error, elapsed_ms);
-}
-
-pub fn record_python_fallback(error: &str) {
-    let mut inner = diagnostic()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    inner.record_python_fallback(error);
-}
-
-pub fn record_python_inference() {
-    let mut inner = diagnostic()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    inner.record_python_inference();
 }
 
 fn truncate_error(error: &str) -> String {
@@ -317,16 +270,6 @@ pub async fn embed_bge_texts(
     texts: Vec<String>,
 ) -> Result<BgeEmbeddingResponse, String> {
     validate_texts(&texts)?;
-    let active_runtime = app
-        .state::<crate::monitor::MonitorState>()
-        .active_classification_runtime();
-    if active_runtime.as_deref() != Some("rust") {
-        return Err(format!(
-            "runtime_disabled: active classification runtime is {}",
-            active_runtime.as_deref().unwrap_or("stopped")
-        ));
-    }
-
     let started = Instant::now();
     let deadline = started + EMBED_TIMEOUT;
     let state = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
@@ -369,14 +312,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_live_classification_runtimes_are_selectable() {
-        assert!(is_selectable_classification_runtime("rust"));
-        assert!(is_selectable_classification_runtime("python"));
-        assert!(!is_selectable_classification_runtime("rust_shadow"));
-        assert!(!is_selectable_classification_runtime("chroma"));
-    }
-
-    #[test]
     fn directml_preference_yields_to_game_mode_suppression() {
         assert!(!directml_preference(false, false));
         assert!(directml_preference(true, false));
@@ -409,16 +344,11 @@ mod tests {
     }
 
     #[test]
-    fn rust_failures_only_count_after_python_serves_the_fallback() {
+    fn rust_failures_are_recorded_without_a_fallback_counter() {
         let mut diagnostic = ClassificationDiagnosticInner::default();
         diagnostic.record_rust_failure("worker_stopped: test", 12.0);
-
-        assert_eq!(diagnostic.fallback_count, 0);
-
-        diagnostic.record_python_fallback("worker_stopped: test");
-
-        assert_eq!(diagnostic.fallback_count, 1);
-        assert_eq!(diagnostic.last_backend.as_deref(), Some("python"));
+        assert_eq!(diagnostic.failure_count, 1);
+        assert!(diagnostic.last_error.is_some());
     }
 
     #[tokio::test]

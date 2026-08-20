@@ -4,17 +4,12 @@
 //! encode plus an exact cosine scan over the migrated derived store, and
 //! rehydrates the response metadata from SQLite. The shadow harness that proved
 //! this path is gone (see the M2.5 retirement block); what remains is the read
-//! path itself and the observable fallback the enum rule requires.
+//! path itself and its read-only diagnostics.
 //!
-//! **Both halves of the query now live here.** Step 4 cut over
-//! `enable_rerank = false` only, and left reranked queries — every Smart Cluster
-//! calibration query — on Python, because `query_by_text` fuses retrieval and
-//! reranking into one call and the ML protocol had no standalone rerank
-//! operation to bridge with. Step 6 moves the second half rather than building
-//! that bridge: `run_rust_reranked_nl_query` retrieves with the bi-encoder and
-//! re-scores with the Rust cross-encoder, and the scoring worker that compares
-//! against the thresholds this path produces moves in the same change. See
-//! `rerank.rs` for why those two could not be separated.
+//! **Both halves of the query now live here.** The non-reranked path retrieves
+//! from the Rust MiniLM index, while `run_rust_reranked_nl_query` adds the Rust
+//! cross-encoder used by Smart Cluster calibration. The scoring worker that
+//! compares against the thresholds produced by that path is Rust-owned too.
 //!
 //! Coverage is the failure mode this path has to reason about: ranking an
 //! incomplete corpus returns plausible results with screenshots silently
@@ -23,30 +18,20 @@
 //! its refusal:
 //!
 //! - The M2.4 migration has not finished. It commits page by page and its rows
-//!   become query-visible immediately, so an interrupted run leaves a partial —
-//!   not empty — index while Chroma still has the rest. The once-per-revision
-//!   sentinel gates this.
+//!   become query-visible immediately, so an interrupted run leaves a partial
+//!   index. The once-per-revision sentinel gates this.
 //! - The store is empty outright, which is the unmigrated machine.
 //!
-//! What no longer refuses is a capture-indexing backlog, and the reason is not
-//! that idle gating would trip it nightly. Through M2.5 step 4 the refusal was
-//! right because Python was the encoder: a vector it had written to Chroma and
-//! not yet mirrored was genuinely present in one store and absent from the
-//! other, so handing the query over recovered it. Step 5 makes Rust the only
-//! MiniLM encoder and reverses the mirror, so Chroma now receives its rows
-//! *from* this store. A screenshot waiting in the ledger is missing from both
-//! sides equally, and sending the query to Python would cost the user the faster
-//! path while recovering nothing. The backlog is therefore reported rather than
-//! acted on — a number in the backend diagnostic, alongside the count of jobs
-//! whose retry budget is spent and which will not clear themselves.
+//! A capture-indexing backlog is reported rather than used to select another
+//! query implementation. Rust is the only MiniLM encoder, so a screenshot
+//! waiting in the ledger is missing from the derived store until indexing runs;
+//! the diagnostic exposes that freshness cost and the count of exhausted jobs.
 //!
-//! Every refusal to serve from Rust falls back to Python and records why, so a
-//! user whose index is empty or whose worker is broken sees results rather than
-//! an empty page. The reason is readable through `get_ml_semantic_status` and
-//! shown in Settings → Advanced.
+//! A request that cannot be served from Rust records and returns the reason.
+//! The reason is readable through `get_ml_semantic_status` and shown in
+//! Settings → Advanced.
 
 use crate::ml_protocol::MlSemanticModel;
-use crate::registry_config;
 use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{BackgroundScreenshotSummary, DerivedIndexKind, StorageState};
 use serde::Serialize;
@@ -60,82 +45,19 @@ use tauri::{AppHandle, Manager};
 /// Matches the deadline the shadow harness measured this path under.
 ///
 /// The budget covers the wait for the semantic worker as well as the encode.
-/// Idle-gated capture indexing shares that one worker on a far more generous
-/// budget of its own, so a query that arrives mid-batch queues behind it; being
-/// refused here after five seconds and answered by Python is the point, since
-/// the alternative is a search box that hangs for as long as the batch runs.
+/// Idle-gated capture indexing shares that worker on a more generous budget.
+/// Refusing after five seconds bounds a user-facing search when a background
+/// request cannot yield promptly.
 const QUERY_EMBED_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `rust_shadow` was retired with the step-4 cutover: nothing can enter shadow
-/// mode anymore, so leaving the value selectable would offer a switch that does
-/// nothing. `python` / `chroma` remain as the one-release observable rollback.
-const RUNTIME_BACKENDS: &[&str] = &["python", "rust"];
-const INDEX_BACKENDS: &[&str] = &["chroma", "dual", "rust"];
-
-/// M2.5 step 4 flips both defaults. A cutover that left the default at `chroma`
-/// would ship a switch nobody flips. The new default is safe on a machine whose
-/// M2.4 migration has not run, because an empty Rust index falls back to Python
-/// rather than returning nothing.
-const DEFAULT_RUNTIME_BACKEND: &str = "rust";
-const DEFAULT_INDEX_BACKEND: &str = "rust";
-
-/// Selected semantic inference backend. Invalid/unset values resolve to the
-/// current default observably.
-pub fn semantic_runtime_backend() -> String {
-    normalize_enum(
-        registry_config::get_string("semantic_runtime"),
-        RUNTIME_BACKENDS,
-        DEFAULT_RUNTIME_BACKEND,
-    )
-}
-
-/// Selected semantic index ownership backend. `rust` routes non-reranked NL
-/// retrieval through this module; `chroma` and `dual` keep Python authoritative.
-pub fn semantic_index_backend() -> String {
-    normalize_enum(
-        registry_config::get_string("semantic_index"),
-        INDEX_BACKENDS,
-        DEFAULT_INDEX_BACKEND,
-    )
-}
-
-/// Whether `value` names a selectable semantic inference backend.
-///
-/// Exposed for the same reason as its CLIP counterpart in
-/// `clip_query.rs::is_selectable_clip_runtime`: the settings command validates
-/// against this list instead of maintaining a second copy that can silently
-/// fall behind it.
-pub fn is_selectable_semantic_runtime(value: &str) -> bool {
-    RUNTIME_BACKENDS.contains(&value)
-}
-
-/// Whether `value` names a selectable semantic index owner.
-pub fn is_selectable_semantic_index(value: &str) -> bool {
-    INDEX_BACKENDS.contains(&value)
-}
-
-fn normalize_enum(value: Option<String>, allowed: &[&str], default: &str) -> String {
-    match value {
-        Some(value) if allowed.contains(&value.as_str()) => value,
-        _ => default.to_string(),
-    }
-}
-
-/// Read-only backend diagnostic surfaced on `get_ml_semantic_status`. This is
-/// the whole of what the "observable fallback" rule requires — the shadow
-/// settings card with its percentiles is gone.
+/// Read-only semantic retrieval diagnostic surfaced on
+/// `get_ml_semantic_status`.
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticBackendStatus {
-    /// Configured index backend (`chroma` | `dual` | `rust`).
-    pub semantic_index: String,
-    /// Configured inference backend (`python` | `rust`).
-    pub semantic_runtime: String,
-    /// Backend that served the most recent non-reranked NL query.
-    pub last_query_backend: Option<String>,
-    /// Why the last Rust attempt did not serve, when it did not.
-    pub last_fallback_reason: Option<String>,
-    /// Rust retrieval attempts that fell back since process start.
-    pub fallback_count: u64,
+    /// Most recent Rust retrieval error, cleared by the next success.
+    pub last_error: Option<String>,
+    /// Rust retrieval failures since process start.
+    pub failure_count: u64,
     /// Query-visible `semantic_text` vectors held locally. `None` when the
     /// database could not be read (locked, or not yet initialized).
     pub indexed_vectors: Option<u64>,
@@ -162,9 +84,8 @@ pub struct SemanticBackendStatus {
 
 #[derive(Debug, Default)]
 struct BackendObservations {
-    last_query_backend: Option<String>,
-    last_fallback_reason: Option<String>,
-    fallback_count: u64,
+    last_error: Option<String>,
+    failure_count: u64,
 }
 
 static OBSERVATIONS: RwLock<Option<BackendObservations>> = RwLock::new(None);
@@ -173,9 +94,8 @@ static OBSERVATIONS: RwLock<Option<BackendObservations>> = RwLock::new(None);
 ///
 /// The sentinel is written once per vector-space revision and never cleared, so
 /// once it is observed the answer cannot change for the life of the process and
-/// the database does not need to be consulted again. Before that it has to be
-/// re-read, which is exactly the state in which the query is being handed to
-/// Python anyway.
+/// the database does not need to be consulted again. Before that it is re-read
+/// so a partial migration is reported instead of queried as a complete corpus.
 static MIGRATION_SETTLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the sentinel-triggered M2.4 copy has finished for this vector space.
@@ -211,27 +131,15 @@ fn with_observations<T>(edit: impl FnOnce(&mut BackendObservations) -> T) -> T {
     edit(guard.get_or_insert_with(BackendObservations::default))
 }
 
-/// Record which backend actually produced a response. Deliberately separate
-/// from [`observe_fallback`]: a fallback is decided before Python runs, and
-/// stamping the serving backend at decision time would claim Python served a
-/// query it may still fail.
-fn observe_served(backend: &str) {
-    with_observations(|entry| entry.last_query_backend = Some(backend.to_string()));
+fn observe_served() {
+    with_observations(|entry| entry.last_error = None);
 }
 
-/// Record why a Rust attempt refused to serve. Says nothing about who serves
-/// the query next.
-fn observe_fallback(reason: &str) {
+fn observe_failure(reason: &str) {
     with_observations(|entry| {
-        entry.last_fallback_reason = Some(reason.to_string());
-        entry.fallback_count = entry.fallback_count.saturating_add(1);
+        entry.last_error = Some(reason.to_string());
+        entry.failure_count = entry.failure_count.saturating_add(1);
     });
-}
-
-/// Mark Python as the backend that served the current non-reranked query.
-/// Called by `monitor_nl_cluster_query` after Python has actually answered.
-pub fn observe_python_served() {
-    observe_served("python");
 }
 
 pub fn backend_status(storage: Option<&StorageState>) -> SemanticBackendStatus {
@@ -251,13 +159,9 @@ fn backend_status_impl(
     let guard = OBSERVATIONS
         .read()
         .unwrap_or_else(|error| error.into_inner());
-    let (last_query_backend, last_fallback_reason, fallback_count) = match guard.as_ref() {
-        Some(entry) => (
-            entry.last_query_backend.clone(),
-            entry.last_fallback_reason.clone(),
-            entry.fallback_count,
-        ),
-        None => (None, None, 0),
+    let (last_error, failure_count) = match guard.as_ref() {
+        Some(entry) => (entry.last_error.clone(), entry.failure_count),
+        None => (None, 0),
     };
     // One ledger read for all three depth figures. Absent when the database is
     // locked or uninitialized, which is honestly "not known" rather than zero.
@@ -270,11 +174,8 @@ fn backend_status_impl(
             .ok()
     });
     SemanticBackendStatus {
-        semantic_index: semantic_index_backend(),
-        semantic_runtime: semantic_runtime_backend(),
-        last_query_backend,
-        last_fallback_reason,
-        fallback_count,
+        last_error,
+        failure_count,
         indexed_vectors: include_vector_count
             .then(|| {
                 storage.and_then(|storage| {
@@ -297,45 +198,33 @@ fn backend_status_impl(
 pub enum RustQueryOutcome {
     /// Rust served the query; the value is the complete command response.
     Served(serde_json::Value),
-    /// The configuration does not select Rust. Not a failure, not counted.
-    NotSelected,
-    /// Rust was selected but could not serve. The caller must use Python.
-    FellBack(String),
-    /// The user stopped the query. Distinct from `FellBack` because the caller
-    /// must *not* hand it to Python: re-running on the other backend the work
-    /// somebody just asked to end would take longer than not stopping at all.
+    /// Rust could not serve the request.
+    Unavailable(String),
+    /// The user stopped the query. Distinct from `Unavailable` because the caller
+    /// must not be reported as a model or index failure.
     Cancelled,
 }
 
 /// Offer one non-reranked NL cluster query to the Rust semantic index.
 ///
-/// Never returns an error: anything that prevents Rust from answering becomes
-/// `FellBack` so the caller can serve the user from Python instead. The only
-/// thing that would justify surfacing an error here is a broken auth session,
-/// and Python rejects that identically one call later.
+/// Anything that prevents Rust from answering becomes `Unavailable` so the
+/// caller can surface the specific model, migration, or index error.
 pub async fn try_rust_nl_query(app: &AppHandle, query: &str, n_results: u32) -> RustQueryOutcome {
     try_rust_nl_query_inner(app, query, n_results, false).await
 }
 
 /// Offer one **reranked** NL cluster query to the Rust path — M2.5 step 6.
 ///
-/// Every Smart Cluster calibration query is one of these. Step 4 deliberately
-/// left them on Python because `query_by_text` fuses retrieval and reranking
-/// and the protocol had no standalone rerank operation to bridge with; step 6
-/// resolves that by moving both halves rather than building the bridge.
+/// Every Smart Cluster calibration query is one of these; retrieval and
+/// cross-encoder scoring are both executed by Rust.
 ///
-/// The extra refusal beyond the bi-encoder path's set is `rerank_runtime =
-/// python`, the one-release rollback. Everything else — maintenance, an
-/// unfinished migration, an empty index — refuses for the same reasons and
-/// hands the query back to Python identically.
+/// It shares the same maintenance, migration-completeness, and empty-index
+/// checks as the bi-encoder path.
 pub async fn try_rust_reranked_nl_query(
     app: &AppHandle,
     query: &str,
     n_results: u32,
 ) -> RustQueryOutcome {
-    if !crate::rerank::rust_rerank_selected() {
-        return RustQueryOutcome::NotSelected;
-    }
     try_rust_nl_query_inner(app, query, n_results, true).await
 }
 
@@ -345,22 +234,11 @@ async fn try_rust_nl_query_inner(
     n_results: u32,
     rerank: bool,
 ) -> RustQueryOutcome {
-    if semantic_index_backend() != "rust" {
-        return RustQueryOutcome::NotSelected;
-    }
-    // Serving from the Rust store necessarily encodes the query with the Rust
-    // MiniLM runtime — scoring Rust-held vectors against a Python-produced query
-    // vector would mean an IPC round trip that defeats the point. So an explicit
-    // `semantic_runtime = python` is honored as a refusal rather than silently
-    // overridden; it is the second, independent rollback lever.
-    if semantic_runtime_backend() != "rust" {
-        return RustQueryOutcome::NotSelected;
-    }
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        // Python returns an empty list for a blank query; matching that here
-        // avoids paying for an encode that cannot rank anything.
-        observe_served("rust");
+        // Preserve the established empty-query contract without paying for an
+        // encode that cannot rank anything.
+        observe_served();
         return RustQueryOutcome::Served(success_response(Vec::new(), rerank));
     }
     // Announce the query before anything slow, so the background loops stop
@@ -374,12 +252,9 @@ async fn try_rust_nl_query_inner(
     let _foreground = semantic.foreground_lease();
 
     // A migration is rewriting the derived store; reading it would race the
-    // rewrite. Python is left to answer instead — it keeps serving from Chroma
-    // throughout maintenance, because the migration only pauses the monitor's
-    // capture loop rather than stopping the process, and command dispatch is
-    // not maintenance-gated. So this refusal costs the user nothing.
+    // rewrite. Refuse explicitly and let the caller show the maintenance state.
     if crate::maintenance::is_active() {
-        return fell_back("maintenance_in_progress");
+        return unavailable("maintenance_in_progress");
     }
     // The M2.4 copy has not finished, so whatever is in the store is a prefix of
     // the corpus rather than the corpus. Read on a blocking thread: it takes the
@@ -390,7 +265,7 @@ async fn try_rust_nl_query_inner(
         .await
         .unwrap_or(false);
     if !settled {
-        return fell_back("migration_incomplete");
+        return unavailable("migration_incomplete");
     }
 
     let outcome = if rerank {
@@ -404,45 +279,30 @@ async fn try_rust_nl_query_inner(
             // an empty (or entirely invisible) index — typically a machine that
             // has not run the M2.4 migration. Serving zero results there would
             // silently break NL search for that user.
-            fell_back("rust_index_empty")
+            unavailable("rust_index_empty")
         }
         Ok(results) => {
-            observe_served("rust");
+            observe_served();
             RustQueryOutcome::Served(success_response(results, rerank))
         }
-        // A stop is the one error that must not be retried on Python. It is
-        // also not a fallback worth counting: nothing was wrong with the Rust
-        // path, the user simply stopped waiting.
+        // A stop is not a model failure: the user simply stopped waiting.
         Err(error) if crate::rerank::is_cancelled(&error) => {
             tracing::info!("[SEMANTIC] reranked query stopped by the user: {error}");
             RustQueryOutcome::Cancelled
         }
-        Err(error) => fell_back(&error),
+        Err(error) => unavailable(&error),
     }
 }
 
-fn fell_back(reason: &str) -> RustQueryOutcome {
-    observe_fallback(reason);
-    RustQueryOutcome::FellBack(reason.to_string())
+fn unavailable(reason: &str) -> RustQueryOutcome {
+    observe_failure(reason);
+    RustQueryOutcome::Unavailable(reason.to_string())
 }
 
-/// Mark a Python-served response with the backend that produced it. Additive:
-/// existing consumers read `results` / `reranked` / `rerank_variant` and ignore
-/// the rest.
-pub fn tag_python_response(mut response: serde_json::Value) -> serde_json::Value {
-    if let serde_json::Value::Object(map) = &mut response {
-        map.insert(
-            "backend".to_string(),
-            serde_json::Value::String("python".to_string()),
-        );
-    }
-    response
-}
-
-/// Build the `nl_cluster_query` success envelope. Field-for-field the shape
-/// Python returns, so the frontend and the contract tests cannot tell the
-/// backends apart. `rerank_variant` is non-null exactly when reranking ran,
-/// which is what `NlClusterView` reads to label the result.
+/// Build the `nl_cluster_query` success envelope. The field names remain
+/// compatible with persisted callers; `backend` is always `rust` in the
+/// current production path. `rerank_variant` is non-null exactly when
+/// reranking ran, which is what `NlClusterView` reads to label the result.
 fn success_response(results: Vec<serde_json::Value>, reranked: bool) -> serde_json::Value {
     serde_json::json!({
         "status": "success",
@@ -712,64 +572,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_enum_values_fall_back_to_the_python_defaults() {
-        assert_eq!(
-            normalize_enum(Some("python".to_string()), RUNTIME_BACKENDS, "rust"),
-            "python"
-        );
-        assert_eq!(
-            normalize_enum(Some("nonsense".to_string()), RUNTIME_BACKENDS, "python"),
-            "python"
-        );
-        assert_eq!(normalize_enum(None, INDEX_BACKENDS, "chroma"), "chroma");
-    }
-
-    #[test]
-    fn step_four_defaults_select_rust_for_both_enums() {
-        // An unset registry must land on the cut-over backend, otherwise the
-        // switch ships inert. Both defaults must be legal enum values.
-        assert_eq!(
-            normalize_enum(None, RUNTIME_BACKENDS, DEFAULT_RUNTIME_BACKEND),
-            "rust"
-        );
-        assert_eq!(
-            normalize_enum(None, INDEX_BACKENDS, DEFAULT_INDEX_BACKEND),
-            "rust"
-        );
-        assert!(RUNTIME_BACKENDS.contains(&DEFAULT_RUNTIME_BACKEND));
-        assert!(INDEX_BACKENDS.contains(&DEFAULT_INDEX_BACKEND));
-    }
-
-    #[test]
-    fn rollback_values_survive_as_selectable_enum_members() {
-        // The one-release rollback the enum rule requires: either lever alone
-        // must be able to return the user to the Python path.
-        assert!(RUNTIME_BACKENDS.contains(&"python"));
-        assert!(INDEX_BACKENDS.contains(&"chroma"));
-    }
-
-    #[test]
-    fn retired_shadow_value_is_no_longer_selectable() {
-        // `rust_shadow` was deleted with the harness. A beta registry left
-        // holding the old value must resolve to the shipped default like any
-        // other unrecognized string — not to something that silently behaves
-        // like a third mode.
-        assert!(!RUNTIME_BACKENDS.contains(&"rust_shadow"));
-        assert_eq!(
-            normalize_enum(
-                Some("rust_shadow".to_string()),
-                RUNTIME_BACKENDS,
-                DEFAULT_RUNTIME_BACKEND
-            ),
-            DEFAULT_RUNTIME_BACKEND
-        );
-        assert_eq!(
-            normalize_enum(Some("rust_shadow".to_string()), RUNTIME_BACKENDS, "python"),
-            "python"
-        );
-    }
-
-    #[test]
     fn success_envelope_matches_the_python_non_reranked_contract() {
         let response = success_response(vec![serde_json::json!({"screenshot_id": 7})], false);
         assert_eq!(response["status"], "success");
@@ -790,67 +592,25 @@ mod tests {
         assert_eq!(response["backend"], "rust");
     }
 
-    #[test]
-    fn python_responses_are_tagged_without_disturbing_their_payload() {
-        let tagged = tag_python_response(serde_json::json!({
-            "status": "success",
-            "results": [{"screenshot_id": 3}],
-            "reranked": true,
-            "rerank_variant": "q4f16",
-        }));
-        assert_eq!(tagged["backend"], "python");
-        assert_eq!(tagged["reranked"], true);
-        assert_eq!(tagged["rerank_variant"], "q4f16");
-        assert_eq!(tagged["results"][0]["screenshot_id"], 3);
-    }
-
-    /// The observation slot and the debt counter are process-global, and cargo
+    /// The observation slot and failure counter are process-global, and cargo
     /// runs these tests on parallel threads. Every test that touches either one
     /// serializes on this lock so the assertions describe their own writes.
     static OBSERVATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn fallbacks_are_counted_and_explained_but_successes_are_not() {
+    fn failures_are_counted_and_success_clears_the_last_error() {
         let _guard = OBSERVATION_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let before = backend_status(None).fallback_count;
-        observe_served("rust");
-        assert_eq!(backend_status(None).fallback_count, before);
-        assert_eq!(
-            backend_status(None).last_query_backend.as_deref(),
-            Some("rust")
-        );
-
-        observe_fallback("rust_index_empty");
+        let before = backend_status(None).failure_count;
+        observe_failure("rust_index_empty");
         let after = backend_status(None);
-        assert_eq!(after.fallback_count, before + 1);
-        assert_eq!(
-            after.last_fallback_reason.as_deref(),
-            Some("rust_index_empty")
-        );
-    }
-
-    #[test]
-    fn a_fallback_does_not_claim_python_served_until_python_answers() {
-        let _guard = OBSERVATION_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        // The refusal is decided before Python runs. Stamping the serving
-        // backend there would report a successful Python answer even when the
-        // monitor call that follows fails outright.
-        observe_served("rust");
-        observe_fallback("embed_failed: worker_stopped");
-        assert_eq!(
-            backend_status(None).last_query_backend.as_deref(),
-            Some("rust"),
-            "the refusal must not retroactively credit python"
-        );
-        observe_python_served();
-        assert_eq!(
-            backend_status(None).last_query_backend.as_deref(),
-            Some("python")
-        );
+        assert_eq!(after.failure_count, before + 1);
+        assert_eq!(after.last_error.as_deref(), Some("rust_index_empty"));
+        observe_served();
+        let success = backend_status(None);
+        assert_eq!(success.failure_count, before + 1);
+        assert_eq!(success.last_error, None);
     }
 
     #[test]
@@ -870,16 +630,16 @@ mod tests {
             "rust_index_empty",
         ];
         for reason in reasons {
-            observe_fallback(reason);
+            observe_failure(reason);
         }
         let status = backend_status(None);
         assert!(
             !status
-                .last_fallback_reason
+                .last_error
                 .as_deref()
                 .unwrap_or("")
                 .contains("index_incomplete"),
-            "a backlog must not be spelled as a fallback reason anymore"
+            "a backlog must not be spelled as a retrieval error"
         );
         // Nothing was read from a database, so the depths are unknown rather
         // than zero — reporting zero would claim a complete index.

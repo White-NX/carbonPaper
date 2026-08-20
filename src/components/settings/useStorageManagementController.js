@@ -4,11 +4,11 @@ import { useProcessStorageDetails } from './storage/useProcessStorageDetails';
 import { useStorageMigration } from './storage/useStorageMigration';
 import { useStoragePolicy } from './storage/useStoragePolicy';
 
-export function useStorageManagementController({ storage, onRefresh, t, monitorStatus }) {
+export function useStorageManagementController({ storage, onRefresh, t }) {
   const storagePolicy = useStoragePolicy({ t });
   const storageMigration = useStorageMigration({ storage, onRefresh, t });
   const processDetails = useProcessStorageDetails({ onRefresh, t });
-  const indexHealthStatus = useIndexHealthStatus({ monitorStatus, t });
+  const indexHealthStatus = useIndexHealthStatus();
 
   const diskInfo = useMemo(() => {
     const rootPath = storage?.root_path || '';
@@ -35,7 +35,7 @@ export function useStorageManagementController({ storage, onRefresh, t, monitorS
   const handleRefresh = useCallback(() => {
     onRefresh?.();
     processDetails.loadDeleteQueueStatus();
-    indexHealthStatus.loadIndexHealth({ refreshVector: monitorStatus === 'running' });
+    indexHealthStatus.loadIndexHealth();
     if (processDetails.panelView === 'overview') {
       processDetails.loadProcessStats();
     }
@@ -44,7 +44,6 @@ export function useStorageManagementController({ storage, onRefresh, t, monitorS
     }
   }, [
     indexHealthStatus,
-    monitorStatus,
     onRefresh,
     processDetails,
   ]);

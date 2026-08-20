@@ -38,7 +38,6 @@
     "verify:ml-runtime": "src-tauri\\target\\release\\carbonpaper-ml.exe --verify-models --model-dir src-tauri\\pre-bundle\\ocr-models\\ppocrv5-ch-mobile-r1",
     "verify:office-runtime": "src-tauri\\target\\release\\carbonpaper-office.exe --probe",
     "verify:semantic-runtime": "node scripts/verify-semantic-runtime.mjs",
-    "validate:semantic-runtime": "python tools/validate_rust_semantic.py",
     "prepare:release-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1",
     "prepare:dev-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1 -DevelopmentOnly",
     "prepare:ocr-assets": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-release-assets.ps1 -OcrOnly",

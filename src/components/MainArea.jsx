@@ -130,7 +130,6 @@ export default function MainArea({
   onDeleteRecord,
   onDeleteNearbyRecords,
   onCopyText,
-  backendOnline,
   isAuthenticated,
   onTimelineSearchChange,
 }) {
@@ -397,14 +396,12 @@ export default function MainArea({
             onOpenSnapshotPreview={openSnapshotPreview}
             searchMode={searchMode}
             onSearchModeChange={onSearchModeChange}
-            backendOnline={backendOnline}
             onTimelineSearchChange={onTimelineSearchChange}
           />
         </div>
 
         <div className={`${activeTab === 'smart-cluster' ? 'flex flex-col' : 'hidden'} flex-1 w-full min-w-0 min-h-0 overflow-hidden`}>
           <SmartClustersView
-            backendOnline={backendOnline}
             isAuthenticated={isAuthenticated}
             active={activeTab === 'smart-cluster'}
             onOpenSnapshotPreview={openSnapshotPreview}

@@ -12,11 +12,11 @@ from .config import (
     update_exclusion_settings,
     get_exclusion_settings,
     _get_process_icon_base64,
-    update_advanced_capture_config,
     update_clustering_resource_config,
     update_feature_config,
 )
 from .clustering_commands import handle_clustering_command
+from legacy_clip_export import LegacyClipVectorExporter
 from .ipc_pipe import start_pipe_server
 import os
 import uuid
@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 CLUSTERING_AUTH_POLL_INTERVAL_SECS = 2.0
 
 _server = None
-_ocr_worker = None          # OCRService instance
+_model_worker = None        # Classification/postprocess worker proxy
 _classifier = None           # ClassificationService instance
+_clip_exporter = None        # Read-only legacy Chroma exporter
 _clustering_manager = None   # HotColdManager instance
 _clustering_scheduler = None # ClusteringScheduler instance
 _clustering_scheduler_active = False  # whether scheduler thread is currently active
@@ -138,41 +139,6 @@ def _start_clustering_auth_monitor():
     _clustering_auth_monitor_thread.start()
 
 
-# M2.5 step 5 removed the clustering ingest worker that used to run here.
-# It existed to hand each freshly OCR'd screenshot to
-# `HotColdManager.add_snapshot`, which encoded it with MiniLM and wrote the
-# Chroma hot layer. Rust now owns that encode: it queues the screenshot on the
-# OCR commit, encodes it on an idle-gated worker, and pushes the finished row
-# back through the `upsert_task_vectors` command. Keeping this queue as well
-# would embed every screenshot twice, and the Python half would run on the
-# capture path rather than while the machine is idle.
-
-
-def _delete_vectors_by_hashes(image_hashes):
-    """Best-effort delete from vector store using image hashes."""
-    if not image_hashes:
-        return {"deleted": 0, "requested": 0, "skipped": True}
-
-    if not _ocr_worker:
-        return {"deleted": 0, "requested": len(image_hashes), "skipped": True}
-    if not hasattr(_ocr_worker, 'delete_vector_image'):
-        return {"deleted": 0, "requested": len(image_hashes), "skipped": True}
-
-    deleted = 0
-    for image_hash in image_hashes:
-        if not isinstance(image_hash, str) or not image_hash:
-            continue
-        try:
-            ok = _ocr_worker.delete_vector_image(image_hash)
-            if ok:
-                deleted += 1
-        except Exception:
-            # Best-effort; ignore individual failures
-            continue
-
-    return {"deleted": deleted, "requested": len(image_hashes), "skipped": False}
-
-
 def get_data_dir():
     """Return the application data directory."""
     env_dir = os.environ.get('CARBONPAPER_DATA_DIR')
@@ -223,17 +189,6 @@ def _handle_command(req: dict):
     return result
 
 
-def _storage_ipc_health_snapshot():
-    try:
-        from storage_client import get_storage_client
-        sc = get_storage_client()
-        if sc and hasattr(sc, 'ipc_health_snapshot'):
-            return sc.ipc_health_snapshot()
-    except Exception as exc:
-        return {'error': str(exc)}
-    return None
-
-
 def _handle_command_impl(req: dict):
     """Actual command dispatch logic."""
     global _last_seq_no
@@ -272,21 +227,21 @@ def _handle_command_impl(req: dict):
     # ----- Lifecycle commands -----
     if cmd == 'pause':
         paused_event.set()
-        if _ocr_worker:
-            _ocr_worker.pause()
+        if _model_worker:
+            _model_worker.pause()
         return {'status': 'paused'}
 
     if cmd in ('resume', 'continue'):
         paused_event.clear()
-        if _ocr_worker:
-            _ocr_worker.resume()
+        if _model_worker:
+            _model_worker.resume()
         return {'status': 'resumed'}
 
     if cmd == 'stop':
         stop_event.set()
         paused_event.clear()
-        if _ocr_worker:
-            _ocr_worker.stop()
+        if _model_worker:
+            _model_worker.stop()
         return {'status': 'stopped'}
 
     if cmd == 'status':
@@ -297,49 +252,9 @@ def _handle_command_impl(req: dict):
             'clustering_auth_unlocked': _cached_clustering_session_valid(),
             'clustering_scheduler_active': _clustering_scheduler_active,
         }
-        if _ocr_worker:
-            status['ocr_stats'] = _ocr_worker.get_stats()
+        if _model_worker:
+            status['postprocess_stats'] = _model_worker.get_stats()
         return status
-
-    if cmd == 'index_health':
-        storage_ipc = _storage_ipc_health_snapshot()
-        if not _ocr_worker:
-            return {
-                'status': 'success',
-                'worker_available': False,
-                'worker_started': False,
-                'stats': {},
-                'postprocess': None,
-                'storage_ipc': storage_ipc,
-            }
-        try:
-            refresh = bool(req.get('refresh', False))
-            if hasattr(_ocr_worker, 'get_index_health'):
-                result = _ocr_worker.get_index_health(refresh=refresh)
-                if isinstance(result, dict):
-                    result['storage_ipc'] = storage_ipc
-                return result
-            return {
-                'status': 'success',
-                'worker_available': True,
-                'worker_started': None,
-                'stats': _ocr_worker.get_stats() if hasattr(_ocr_worker, 'get_stats') else {},
-                'postprocess': None,
-                'storage_ipc': storage_ipc,
-            }
-        except Exception as e:
-            logger.warning('Index health query failed: %s', e)
-            return {'status': 'error', 'error': str(e)}
-
-    if cmd == 'retry_vector_indexing':
-        if not _ocr_worker or not hasattr(_ocr_worker, 'retry_vector_indexing'):
-            return {'status': 'error', 'error': 'Vector indexing retry is not available'}
-        try:
-            limit = int(req.get('limit', 32) or 32)
-            return _ocr_worker.retry_vector_indexing(limit=limit)
-        except Exception as e:
-            logger.warning('Vector indexing retry failed: %s', e)
-            return {'status': 'error', 'error': str(e)}
 
     # ----- Configuration commands -----
     if cmd == 'update_filters':
@@ -355,16 +270,13 @@ def _handle_command_impl(req: dict):
             return {'error': str(e)}
 
     if cmd == 'update_advanced_config':
-        ocr_timeout_secs = int(req.get('ocr_timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
         allow_full_low_memory = bool(req.get(
             'clustering_allow_full_low_memory',
             getattr(config, 'CLUSTERING_ALLOW_FULL_LOW_MEMORY', False),
         ))
-        update_advanced_capture_config(ocr_timeout_secs)
         update_clustering_resource_config(allow_full_low_memory)
         return {
             'status': 'success',
-            'ocr_timeout_secs': ocr_timeout_secs,
             'clustering_allow_full_low_memory': allow_full_low_memory,
         }
 
@@ -378,86 +290,20 @@ def _handle_command_impl(req: dict):
             'classification_enabled': classification_enabled,
         }
 
-    # ----- Vector search -----
-    if cmd == 'search_nl':
-        query = req.get('query', '')
-        limit = req.get('limit', 10)
-        offset = req.get('offset', 0)
-        process_names = req.get('process_names') or None
-        start_time = req.get('start_time')
-        end_time = req.get('end_time')
-
-        if not _ocr_worker or not _ocr_worker.enable_vector_store:
-            return {'error': 'Vector store not enabled'}
-
-        if isinstance(process_names, list):
-            process_names = [p for p in process_names if isinstance(p, str) and p.strip()]
-            if len(process_names) == 0:
-                process_names = None
-        else:
-            process_names = None
-
-        def _normalize_timestamp(value):
-            if value in (None, ''):
-                return None
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return None
-
-        start_time = _normalize_timestamp(start_time)
-        end_time = _normalize_timestamp(end_time)
-
-        try:
-            results = _ocr_worker.search_by_natural_language(
-                query=query,
-                n_results=limit,
-                offset=offset,
-                process_names=process_names,
-                start_time=start_time,
-                end_time=end_time,
-            )
-        except Exception as exc:
-            return {'error': str(exc)}
-
-        return {'status': 'success', 'results': results}
-
-    # ----- Deletion (vector store cleanup; DB deletion handled by Rust) -----
-    if cmd == 'delete_screenshot':
-        image_hashes = []
-        image_hash = req.get('image_hash')
-        if isinstance(image_hash, str) and image_hash:
-            image_hashes.append(image_hash)
-        vector_info = _delete_vectors_by_hashes(image_hashes)
-        return {
-            'status': 'success',
-            'vector_deleted': vector_info.get('deleted', 0),
-        }
-
-    if cmd == 'delete_by_time_range':
-        image_hashes = req.get('image_hashes')
-        if not isinstance(image_hashes, list):
-            image_hashes = []
-        vector_info = _delete_vectors_by_hashes(image_hashes)
-        return {
-            'status': 'success',
-            'vector_deleted': vector_info.get('deleted', 0),
-        }
-
     if cmd == 'enqueue_ocr_postprocess':
         screenshot_id = req.get('screenshot_id')
         if screenshot_id is None:
             return {'error': 'screenshot_id is required'}
-        if not _ocr_worker or not hasattr(_ocr_worker, 'request'):
-            return {'error': 'OCR postprocess service is not initialised'}
-        timeout_secs = int(req.get('timeout_secs', getattr(config, '_ocr_timeout_secs', 120)))
+        if not _model_worker or not hasattr(_model_worker, 'request'):
+            return {'error': 'Classification postprocess service is not initialised'}
+        timeout_secs = int(req.get('timeout_secs', 120) or 120)
         try:
             # Sensitive-content filtering and classification only. The semantic
             # index used to be fed from here too, by handing the same payload to
             # the clustering ingest queue; M2.5 step 5 moved that to the Rust
             # capture path, which enqueues the screenshot the moment its OCR row
             # commits and encodes it while the machine is idle.
-            return _ocr_worker.request(
+            return _model_worker.request(
                 'enqueue_ocr_postprocess',
                 {'request': req},
                 timeout=max(30, min(600, timeout_secs)),
@@ -650,42 +496,27 @@ def _handle_command_impl(req: dict):
             logger.error('presidio_check_idle failed: %s', e)
             return {'error': str(e)}
 
-    # ----- CLIP image-vector snapshot export (M2.5 step 7 migration) -----
-    #
-    # The counterpart to `start_task_vectors_export` and friends, for the
-    # `screenshots` collection instead of the MiniLM hot layer. Rust drives the
-    # whole sequence and holds the durable cursor; these four calls are stateless
-    # apart from the snapshot registry the vector store owns.
-    #
-    # Unlike the MiniLM exports, these cannot be served from this process. The
-    # clustering manager those forward to lives here; the CLIP collection lives
-    # in the model worker child, and `_ocr_worker` is only a proxy to it. So the
-    # store's availability is not something this handler can test — it forwards,
-    # and the child answers.
-    #
-    # Auth is required for the same reason the clustering exports require it:
-    # a snapshot is a bulk read of derived user content, and an export id is a
-    # capability to page through it.
+    # ----- Legacy CLIP Chroma snapshot export (read-only) -----
     if cmd in (
         'start_clip_vectors_export',
         'get_clip_vectors_export_status',
         'export_clip_vectors_page',
         'finish_clip_vectors_export',
     ):
-        if not _ocr_worker or not _ocr_worker.enable_vector_store:
-            return {'error': 'Vector store not enabled'}
+        if not _clip_exporter:
+            return {'error': 'Legacy CLIP collection is unavailable'}
         if not _sync_clustering_scheduler_auth_gate(force=True):
             return {'error': 'AUTH_REQUIRED: the CLIP export requires an unlocked session'}
         export_id = req.get('export_id', '')
         try:
             if cmd == 'start_clip_vectors_export':
-                return {'status': 'success', **_ocr_worker.start_clip_vectors_export(export_id)}
+                return {'status': 'success', **_clip_exporter.start(export_id)}
             if cmd == 'get_clip_vectors_export_status':
-                return {'status': 'success', **_ocr_worker.get_clip_vectors_export_status(export_id)}
+                return {'status': 'success', **_clip_exporter.status(export_id)}
             if cmd == 'export_clip_vectors_page':
                 return {
                     'status': 'success',
-                    **_ocr_worker.export_clip_vectors_page(
+                    **_clip_exporter.page(
                         export_id,
                         cursor=req.get('cursor', 0),
                         limit=req.get('limit', 128),
@@ -693,27 +524,10 @@ def _handle_command_impl(req: dict):
                 }
             return {
                 'status': 'success',
-                'released': _ocr_worker.finish_clip_vectors_export(export_id),
+                'released': _clip_exporter.finish(export_id),
             }
         except Exception as exc:
             logger.exception('%s failed', cmd)
-            return {'error': str(exc)}
-
-    # ----- Rust-encoded CLIP vector mirror (M2.5 step 8) -----
-    #
-    # Rust owns CLIP inference on the capture path now; this is where the
-    # finished vector lands so the `clip_runtime = python` rollback keeps
-    # working. Same auth rule as the export: it writes derived user content.
-    if cmd == 'upsert_clip_vectors':
-        if not _ocr_worker or not _ocr_worker.enable_vector_store:
-            return {'error': 'Vector store not enabled'}
-        if not _sync_clustering_scheduler_auth_gate(force=True):
-            return {'error': 'AUTH_REQUIRED: the CLIP mirror requires an unlocked session'}
-        try:
-            written = _ocr_worker.upsert_clip_vectors(req.get('records') or [])
-            return {'status': 'success', 'written': written}
-        except Exception as exc:
-            logger.exception('upsert_clip_vectors failed')
             return {'error': str(exc)}
 
     clustering_response = handle_clustering_command(
@@ -733,7 +547,7 @@ def _handle_command_impl(req: dict):
 # ---------------------------------------------------------------------------
 
 def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: str = None):
-    """Start the IPC server and initialise the OCR service.
+    """Start the IPC server and initialise classification/postprocess services.
 
     Args:
         _debug: Debug mode flag.
@@ -741,7 +555,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         auth_token: Authentication token for IPC validation.
         storage_pipe: Storage service pipe name (Rust reverse IPC).
     """
-    global _server, _ocr_worker, _classifier, _storage_pipe, _clustering_manager, _clustering_scheduler, _clustering_scheduler_active, _clustering_auth_monitor_thread, _auth_token, _last_seq_no, _last_clustering_auth_check, _last_clustering_session_valid
+    global _server, _model_worker, _classifier, _clip_exporter, _storage_pipe, _clustering_manager, _clustering_scheduler, _clustering_scheduler_active, _clustering_auth_monitor_thread, _auth_token, _last_seq_no, _last_clustering_auth_check, _last_clustering_session_valid
 
     _auth_token = auth_token
     with _seq_lock:
@@ -787,22 +601,23 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
 
     from .worker_process import RestartableModelWorker
 
+    try:
+        _clip_exporter = LegacyClipVectorExporter(shared_chroma_client)
+    except Exception as exc:
+        logger.warning('Legacy CLIP export unavailable (non-fatal): %s', exc)
+        _clip_exporter = None
+
     worker_env = {
         'CARBONPAPER_CLUSTERING_ENABLED': str(config.CLUSTERING_ENABLED),
         'CARBONPAPER_CLASSIFICATION_ENABLED': str(config.CLASSIFICATION_ENABLED),
-        'CARBONPAPER_CLASSIFICATION_RUNTIME': os.environ.get(
-            'CARBONPAPER_CLASSIFICATION_RUNTIME', 'rust'
-        ),
         'CARBONPAPER_CLUSTERING_ALLOW_FULL_LOW_MEMORY': str(config.CLUSTERING_ALLOW_FULL_LOW_MEMORY),
-        'CARBONPAPER_USE_ONNX': os.environ.get('CARBONPAPER_USE_ONNX', 'true'),
-        'CARBONPAPER_OCR_TIMEOUT_SECS': str(getattr(config, '_ocr_timeout_secs', 120)),
     }
-    _ocr_worker = RestartableModelWorker(
+    _model_worker = RestartableModelWorker(
         storage_pipe=storage_pipe,
         data_dir=get_data_dir(),
         env=worker_env,
     )
-    _classifier = _ocr_worker
+    _classifier = _model_worker
     logger.info('Restartable model worker proxy initialised')
 
     # Initialise task clustering service (MiniLM + HDBSCAN)
@@ -833,41 +648,15 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         _clustering_scheduler_active = False
         _clustering_auth_monitor_thread = None
 
-    # Start smart cluster worker (idle-aware drain loop). Best-effort: any
-    # failure here must not block monitor startup since smart clusters are
-    # an optional feature.
-    #
-    # Since M2.5 step 6 Rust owns this queue by default. Two drainers on one
-    # `smart_cluster_pending` table would score the same snapshots twice, and
-    # against different logits — this worker's reranker prefers DirectML while
-    # the Rust engine refuses it for the same model. `CARBONPAPER_RERANK_RUNTIME`
-    # is the one-release rollback: set it to `python` and this worker takes the
-    # queue back, while the Rust one stands down on the same value.
-    try:
-        if os.environ.get('CARBONPAPER_RERANK_RUNTIME', 'rust').strip().lower() != 'python':
-            logger.info('Smart Cluster worker not started: Rust owns scoring')
-        elif _clustering_manager is not None and storage_pipe:
-            from smart_cluster_worker import SmartClusterWorker
-            from storage_client import get_storage_client
-            sc = get_storage_client()
-            if sc is not None:
-                SmartClusterWorker().start(
-                    sc,
-                    _clustering_manager.embedder,
-                    hot_collection_getter=lambda: _clustering_manager.hot_collection,
-                )
-                logger.info('Smart Cluster worker started')
-    except Exception as e:
-        logger.warning('Smart Cluster worker failed to start (non-fatal): %s', e)
-
-    # NOTE: Screenshot capture and OCR are handled by Rust. Python provides only
-    # classification, vector indexing, clustering, and related post-processing.
+    # Screenshot capture, OCR, semantic/CLIP inference, and Smart Cluster
+    # scoring are handled by Rust. Python provides classification orchestration,
+    # task clustering, Presidio, and legacy read-only migration export.
 
     return _server
 
 
 def stop():
-    """Shut down the OCR service and IPC server."""
+    """Shut down classification/postprocess services and the IPC server."""
     global _clustering_scheduler_active, _clustering_auth_monitor_thread
     stop_event.set()
     if _clustering_scheduler:
@@ -879,18 +668,13 @@ def stop():
     if _clustering_auth_monitor_thread:
         _clustering_auth_monitor_thread = None
     try:
-        from smart_cluster_worker import SmartClusterWorker
-        SmartClusterWorker().stop()
-    except Exception:
-        pass
-    try:
         from .presidio_worker import get_presidio_worker
         get_presidio_worker().stop()
     except Exception:
         pass
-    if _ocr_worker:
+    if _model_worker:
         try:
-            _ocr_worker.stop()
+            _model_worker.stop()
         except Exception:
             pass
     if _server:

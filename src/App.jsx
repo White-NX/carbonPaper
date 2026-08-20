@@ -257,7 +257,6 @@ function App() {
         handleStartBackend={handleStartBackend}
         handlePauseMonitor={handlePauseMonitor}
         handleResumeMonitor={handleResumeMonitor}
-        backendOnline={backendStatus === 'online'}
         isAuthenticated={isAuthenticated}
       />
 
@@ -365,7 +364,6 @@ function App() {
             advancedSearchParams={advancedSearchParams}
             searchMode={searchMode}
             onSearchModeChange={setSearchMode}
-            backendOnline={backendStatus === 'online'}
             isAuthenticated={isAuthenticated}
             onTimelineSearchChange={setTimelineSearch}
             onAdvancedSelect={selectSearchResult}

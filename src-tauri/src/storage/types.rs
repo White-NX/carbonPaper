@@ -4,6 +4,7 @@ use crate::credential_manager::{decrypt_row_key_with_cng, decrypt_with_master_ke
 use serde::{Deserialize, Serialize};
 
 use super::wire_time;
+use super::DerivedIndexBacklog;
 use super::StorageState;
 
 /// Screenshot record representing a row in the screenshots table, with decrypted fields.
@@ -200,7 +201,7 @@ pub struct SaveScreenshotRequest {
     pub visible_links: Option<Vec<VisibleLink>>,
 }
 
-/// OCR result from the Python backend for a single detected text region.
+/// OCR result input for a single detected text region.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OcrResultInput {
     pub text: String,
@@ -465,10 +466,11 @@ pub struct DeleteQueueStatus {
 pub struct IndexStorageStats {
     pub screenshots_count: i64,
     pub ocr_rows_count: i64,
-    /// Distinct image hashes estimated to be eligible for one CLIP image row
-    /// (non-deleted screenshots with at least one active OCR row). This is a
-    /// stable migration proxy, not an OCR-row count or a per-row health proof.
-    pub expected_clip_image_rows: i64,
+    /// Query-visible rows in the Rust-owned derived indexes.
+    pub semantic_text_rows: u64,
+    pub clip_image_rows: u64,
+    pub semantic_index_backlog: DerivedIndexBacklog,
+    pub clip_index_backlog: DerivedIndexBacklog,
     pub smart_cluster_pending_count: i64,
     pub delete_queue: DeleteQueueStatus,
 }

@@ -4,7 +4,6 @@
 //! for cross-encoder reranking operations.
 
 use crate::ml_protocol::{MlProvider, MlSemanticModel};
-use crate::registry_config;
 use crate::semantic_models::descriptor;
 use crate::semantic_runtime::SemanticRuntimeState;
 use serde::Serialize;
@@ -17,10 +16,9 @@ use tauri::{AppHandle, Emitter, Manager};
 ///
 /// Deliberately *not* `MINILM_OCR_SNIPPET_CHARS` (200). The bi-encoder index
 /// and the cross-encoder document are different contracts serving different
-/// models: Python's retrieval path passes `ocr_snippet_chars = 600`
-/// (`task_clustering.py::query_by_text`) and its worker uses the same 600
-/// (`smart_cluster_worker.py::OCR_SNIPPET_CHARS`). Matching 200 here would
-/// change every score relative to the thresholds already on disk.
+/// models. Persisted Smart Cluster thresholds were calibrated with the
+/// 600-character cross-encoder document contract; matching 200 here would
+/// change every score relative to those thresholds.
 pub const RERANK_OCR_SNIPPET_CHARS: usize = 600;
 
 /// The reranker variant this build scores with.
@@ -123,79 +121,6 @@ impl RerankClock {
         // bounded by its ceiling on the last chunk rather than overrunning it.
         Some(self.chunk.map_or(remaining, |chunk| chunk.min(remaining)))
     }
-}
-
-const RERANK_RUNTIMES: &[&str] = &["python", "rust"];
-const DEFAULT_RERANK_RUNTIME: &str = "rust";
-
-/// Which reranker serves Smart Cluster calibration and background scoring.
-///
-/// The flag rule's one-release rollback: `python` returns both to
-/// `monitor/reranker.py`, together, for the same reason they cut over
-/// together. Unset or unrecognized resolves to the shipped default.
-pub fn rerank_runtime() -> String {
-    match registry_config::get_string("rerank_runtime") {
-        Some(value) if RERANK_RUNTIMES.contains(&value.as_str()) => value,
-        _ => DEFAULT_RERANK_RUNTIME.to_string(),
-    }
-}
-
-pub fn rust_rerank_selected() -> bool {
-    rerank_runtime() == "rust"
-}
-
-/// Who is draining `smart_cluster_pending` right now.
-///
-/// Not the same question as which value `rerank_runtime` holds, because the two
-/// sides read that value at different times: Rust reads the registry on every
-/// pass, Python reads its environment once at startup. The switch alone
-/// therefore describes an intention, and this describes the arrangement that is
-/// actually in force.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SmartClusterQueueOwner {
-    /// The Rust worker in this process.
-    Rust,
-    /// The Python worker in the monitor process that is running right now.
-    Python,
-    /// Nobody. The switch hands the queue to Python, but the monitor running
-    /// right now — if one is running at all — was started before that and left
-    /// its worker unstarted. The queue simply waits, which is the honest
-    /// outcome: the user asked for the Python scorer and the Rust one taking
-    /// the work anyway would be the rollback lever doing nothing.
-    Neither,
-}
-
-/// The ownership rule, with both inputs supplied so it can be read and tested
-/// as the truth table it is.
-///
-/// A live Python worker wins over the switch, in both directions. Setting the
-/// key back to `rust` while that worker is running does not start a second
-/// drainer; it takes effect when the monitor next starts.
-pub fn queue_owner_from(rust_selected: bool, python_worker_live: bool) -> SmartClusterQueueOwner {
-    if python_worker_live {
-        SmartClusterQueueOwner::Python
-    } else if rust_selected {
-        SmartClusterQueueOwner::Rust
-    } else {
-        SmartClusterQueueOwner::Neither
-    }
-}
-
-/// The current owner. `None` for the monitor state means no monitor is managed
-/// in this process, which is the case in tests.
-pub fn smart_cluster_queue_owner(
-    monitor: Option<&crate::monitor::MonitorState>,
-) -> SmartClusterQueueOwner {
-    queue_owner_from(
-        rust_rerank_selected(),
-        monitor.is_some_and(|state| state.python_owns_smart_cluster_queue()),
-    )
-}
-
-/// Whether the Rust side may act on the queue: drain it, and answer the status,
-/// force-run, and cancel commands for it.
-pub fn rust_owns_smart_cluster_queue(monitor: Option<&crate::monitor::MonitorState>) -> bool {
-    smart_cluster_queue_owner(monitor) == SmartClusterQueueOwner::Rust
 }
 
 /// The scorer that produced a number, recorded next to that number.
@@ -370,9 +295,8 @@ pub fn build_rerank_document(process: &str, title: &str, ocr_text: &str) -> Stri
 /// therefore held the slot for 4.72 s, against a foreground budget of 5.0 s
 /// (`semantic_query.rs::QUERY_EMBED_TIMEOUT`) that also has to cover swapping
 /// the 570 MB cross-encoder out for MiniLM (0.50 s). The margin was −0.22 s: a
-/// search that arrived at the start of a chunk could not be served at all, and
-/// fell back to Python — a fallback the Python removal is in the middle of
-/// taking away.
+/// search that arrived at the start of a chunk could not be served inside its
+/// deadline and would now be reported unavailable.
 ///
 /// And the reduction is free. Per-document cost was measured flat from batch 1
 /// to batch 8 at every thread count (1.248 / 1.246 / 1.259 / 1.301 s at one
@@ -449,10 +373,8 @@ pub const NL_RERANK_PROGRESS_EVENT: &str = "nl-rerank-progress";
 
 /// Error prefix marking a reranked query the user stopped.
 ///
-/// Distinguished from every other error for one reason: an ordinary failure on
-/// the Rust path hands the query to Python, which is right for a stuck worker
-/// and wrong for a stop button. Re-running on the other backend the work
-/// somebody just asked to end is the opposite of what they asked for.
+/// Distinguished from every other error so callers can report a user-requested
+/// stop as cancellation instead of a model or retrieval failure.
 pub const CANCELLED_BY_USER: &str = "cancelled_by_user";
 
 /// Whether an error from [`rerank_documents`] is the user's stop.
@@ -469,8 +391,6 @@ pub enum RerankPhase {
     LoadingModel,
     /// Scoring documents in chunks (`scored` out of `total`).
     Reranking,
-    /// Fallback execution handled by the Python backend.
-    ExternalBackend,
 }
 
 impl RerankPhase {
@@ -479,7 +399,6 @@ impl RerankPhase {
             Self::Retrieving => "retrieving",
             Self::LoadingModel => "loading_model",
             Self::Reranking => "reranking",
-            Self::ExternalBackend => "external_backend",
         }
     }
 }
@@ -533,23 +452,6 @@ impl RerankQueryState {
             state: self.clone(),
             serial,
         }
-    }
-
-    /// Announce that another backend took the query, from a caller that never
-    /// claimed this state and never will.
-    ///
-    /// Deliberately not a claim: nothing here can be stopped or counted, and
-    /// taking the state would leave the stop command reporting that it had
-    /// something to cancel when it does not.
-    pub fn report_external_backend(app: &AppHandle) {
-        let _ = app.emit(
-            NL_RERANK_PROGRESS_EVENT,
-            serde_json::json!({
-                "phase": RerankPhase::ExternalBackend.label(),
-                "scored": 0,
-                "total": 0,
-            }),
-        );
     }
 
     fn emit(&self, app: &AppHandle, phase: RerankPhase) {
@@ -995,43 +897,6 @@ mod tests {
         state.request_cancel();
         let _second = state.begin();
         assert!(first.cancelled());
-    }
-
-    #[test]
-    fn the_runtime_switch_keeps_its_rollback_value() {
-        assert!(RERANK_RUNTIMES.contains(&"python"));
-        assert!(RERANK_RUNTIMES.contains(&DEFAULT_RERANK_RUNTIME));
-        assert_eq!(DEFAULT_RERANK_RUNTIME, "rust");
-    }
-
-    #[test]
-    fn a_live_python_worker_keeps_the_queue_until_the_monitor_restarts() {
-        // The switch is read live on this side and once at startup on Python's,
-        // so flipping it back to `rust` under a monitor that was started with
-        // `python` must not wake a second drainer. The spawned value wins.
-        assert_eq!(queue_owner_from(true, true), SmartClusterQueueOwner::Python);
-        assert_eq!(
-            queue_owner_from(false, true),
-            SmartClusterQueueOwner::Python
-        );
-    }
-
-    #[test]
-    fn the_rust_worker_drains_only_when_no_python_worker_is_running() {
-        assert_eq!(queue_owner_from(true, false), SmartClusterQueueOwner::Rust);
-    }
-
-    #[test]
-    fn a_rollback_that_has_not_taken_effect_yet_leaves_the_queue_unowned() {
-        // `rerank_runtime = python` under a monitor started with `rust`: that
-        // monitor left its worker unstarted, and this one stands down because
-        // the user asked for the Python scorer. Nothing drains until the
-        // monitor restarts, and the worker loop says so in the log rather than
-        // quietly scoring with the backend the user just rolled away from.
-        assert_eq!(
-            queue_owner_from(false, false),
-            SmartClusterQueueOwner::Neither
-        );
     }
 
     #[test]

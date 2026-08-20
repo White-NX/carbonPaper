@@ -12,8 +12,8 @@ const RESOURCE_POLICY_OPTIONS = [
     powerSaving: false,
     gameMode: false,
     colorClass: {
-      selected: 'bg-amber-500/20 text-amber-200 border-amber-400/50',
-      idle: 'text-amber-300/90 hover:bg-amber-500/10 hover:text-amber-200',
+      selected: 'bg-amber-100 text-amber-800 border-amber-500 dark:bg-amber-500/20 dark:text-amber-200 dark:border-amber-400/50',
+      idle: 'text-amber-700 hover:bg-amber-100 hover:text-amber-800 dark:text-amber-300/90 dark:hover:bg-amber-500/10 dark:hover:text-amber-200',
     },
   },
   {
@@ -21,8 +21,8 @@ const RESOURCE_POLICY_OPTIONS = [
     powerSaving: true,
     gameMode: false,
     colorClass: {
-      selected: 'bg-sky-500/20 text-sky-200 border-sky-400/50',
-      idle: 'text-sky-300/90 hover:bg-sky-500/10 hover:text-sky-200',
+      selected: 'bg-sky-100 text-sky-800 border-sky-500 dark:bg-sky-500/20 dark:text-sky-200 dark:border-sky-400/50',
+      idle: 'text-sky-700 hover:bg-sky-100 hover:text-sky-800 dark:text-sky-300/90 dark:hover:bg-sky-500/10 dark:hover:text-sky-200',
     },
   },
   {
@@ -30,8 +30,8 @@ const RESOURCE_POLICY_OPTIONS = [
     powerSaving: true,
     gameMode: true,
     colorClass: {
-      selected: 'bg-emerald-500/20 text-emerald-200 border-emerald-400/50',
-      idle: 'text-emerald-300/90 hover:bg-emerald-500/10 hover:text-emerald-200',
+      selected: 'bg-emerald-100 text-emerald-800 border-emerald-500 dark:bg-emerald-500/20 dark:text-emerald-200 dark:border-emerald-400/50',
+      idle: 'text-emerald-700 hover:bg-emerald-100 hover:text-emerald-800 dark:text-emerald-300/90 dark:hover:bg-emerald-500/10 dark:hover:text-emerald-200',
     },
   },
   {

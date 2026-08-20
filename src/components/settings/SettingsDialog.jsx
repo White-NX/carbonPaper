@@ -233,7 +233,6 @@ function SettingsDialog({
                 refreshing={analysisRefreshing}
                 error={analysisError}
                 onRefresh={handleRefreshAnalysis}
-                monitorStatus={monitorStatus}
               />
             </div>
           )}

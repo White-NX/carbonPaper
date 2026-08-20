@@ -39,42 +39,19 @@ fn generate_native_locales() {
 }
 
 fn prune_monitor_staging(prebundle_dir: &Path) {
-    if !prebundle_dir.starts_with(Path::new("pre-bundle")) || !prebundle_dir.exists() {
+    if !prebundle_dir.starts_with(Path::new("pre-bundle")) {
         return;
     }
-    let mut stale = WalkDir::new(prebundle_dir)
-        .contents_first(true)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path == prebundle_dir {
-                return None;
-            }
-            let name = path.file_name()?.to_string_lossy();
-            let remove_dir = path.is_dir()
-                && (name == "tests"
-                    || name == "tests_tmp"
-                    || name == "__pycache__"
-                    || name == ".pytest_cache"
-                    || name == ".tmp_pytest"
-                    || name.starts_with(".pytest"));
-            let remove_file = path.is_file()
-                && (name.ends_with(".pyc")
-                    || name == "test.py"
-                    || name.starts_with("test_")
-                    || name.ends_with("_test.py")
-                    || name.contains("_test_"));
-            (remove_dir || remove_file).then(|| path.to_path_buf())
-        })
-        .collect::<Vec<_>>();
-    stale.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for path in stale {
-        if path.is_dir() {
-            let _ = fs::remove_dir_all(path);
-        } else {
-            let _ = fs::remove_file(path);
-        }
+    if prebundle_dir.exists() {
+        // The directory is a generated mirror of monitor/. Rebuilding it from
+        // scratch prevents deleted Python modules from surviving in the
+        // resource tree and being shipped alongside the clean zipapp.
+        fs::remove_dir_all(prebundle_dir).unwrap_or_else(|error| {
+            panic!(
+                "Failed to clean generated monitor staging {}: {error}",
+                prebundle_dir.display()
+            )
+        });
     }
 }
 
@@ -124,9 +101,9 @@ fn main() {
     // 构建脚本将处理好的文件临时存放在这里
     let prebundle_dir = Path::new("pre-bundle/monitor");
 
-    // --- 2. 确保临时目录存在（避免每次清空导致热重载循环） ---
-    fs::create_dir_all(prebundle_dir).expect("Failed to create pre-bundle directory");
+    // --- 2. 清理并重建生成目录，避免已删除模块残留在发布资源中 ---
     prune_monitor_staging(prebundle_dir);
+    fs::create_dir_all(prebundle_dir).expect("Failed to create pre-bundle directory");
 
     // 只在内容变更时复制，避免无谓的文件时间戳抖动触发重建
     fn copy_file_if_needed(src: &Path, dst: &Path) {

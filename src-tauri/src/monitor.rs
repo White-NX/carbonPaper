@@ -95,23 +95,6 @@ pub struct MonitorState {
     pub game_mode_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     /// Set to true during intentional stop_monitor to suppress the watcher's monitor-exited event
     pub stopping: AtomicBool,
-    /// Whether the Python monitor was spawned with `rerank_runtime = python`,
-    /// i.e. whether its Smart Cluster worker was told to drain the queue.
-    ///
-    /// Read this through [`MonitorState::python_owns_smart_cluster_queue`]
-    /// rather than directly; the flag alone says nothing about whether the
-    /// process it describes is still alive.
-    python_smart_cluster_worker: AtomicBool,
-    /// Whether the Python monitor was spawned with `clip_runtime = python`,
-    /// i.e. whether its post-OCR worker was told to encode captures with CLIP.
-    ///
-    /// Read this through [`MonitorState::python_owns_clip_encoding`] rather
-    /// than directly, for the reason that method records.
-    python_clip_encoder: AtomicBool,
-    /// Classification runtime handed to the live Python monitor at spawn.
-    /// Unlike the registry selection, this value changes only with the child
-    /// process lifecycle.
-    active_classification_runtime: Mutex<Option<String>>,
     /// Prevents the monitor from restarting during migration tasks
     pub migration_lock: AtomicBool,
     recovery: Mutex<MonitorRecoveryState>,
@@ -138,108 +121,10 @@ impl MonitorState {
             game_mode_permanently_suppressed: AtomicBool::new(false),
             game_mode_task: Mutex::new(None),
             stopping: AtomicBool::new(false),
-            python_smart_cluster_worker: AtomicBool::new(false),
-            python_clip_encoder: AtomicBool::new(false),
-            active_classification_runtime: Mutex::new(None),
             migration_lock: AtomicBool::new(false),
             recovery: Mutex::new(MonitorRecoveryState::default()),
             python_ipc_client: AsyncMutex::new(None),
         }
-    }
-
-    /// Record which Smart Cluster drainer the monitor process just spawned was
-    /// told to run, taken from the `CARBONPAPER_RERANK_RUNTIME` value handed to
-    /// it. Cleared when that process goes away.
-    pub fn set_python_smart_cluster_worker(&self, enabled: bool) {
-        self.python_smart_cluster_worker
-            .store(enabled, Ordering::SeqCst);
-    }
-
-    /// Whether the Python worker is, right now, the drainer of
-    /// `smart_cluster_pending`.
-    ///
-    /// The two sides read the `rerank_runtime` switch at different times and
-    /// that difference is not cosmetic. Rust reads the registry on every pass,
-    /// while Python reads `CARBONPAPER_RERANK_RUNTIME` once, at startup
-    /// (`monitor/monitor/__init__.py`), from the value baked into its
-    /// environment at spawn. Setting the key back to `rust` under a monitor
-    /// that was started with `python` would therefore wake the Rust drainer
-    /// within a minute while the Python one keeps running — two workers on one
-    /// queue, scoring the same snapshots with logits from two providers the
-    /// 2026-07-20 audit measured as disagreeing on 20.5% of top-1 results, and
-    /// each deleting queue rows the other is still working through.
-    ///
-    /// So the value the live process was actually given wins until that process
-    /// restarts, and this is what says so. The liveness check is what keeps a
-    /// flag left over from a crashed monitor from silencing the Rust worker
-    /// forever.
-    pub fn python_owns_smart_cluster_queue(&self) -> bool {
-        if !self.python_smart_cluster_worker.load(Ordering::SeqCst) {
-            return false;
-        }
-        self.process
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-    }
-
-    /// Record which CLIP encoder the monitor process just spawned was told to
-    /// run, taken from the `CARBONPAPER_CLIP_RUNTIME` value handed to it.
-    pub fn set_python_clip_encoder(&self, enabled: bool) {
-        self.python_clip_encoder.store(enabled, Ordering::SeqCst);
-    }
-
-    /// Whether the Python worker is, right now, the CLIP encoder of the capture
-    /// path.
-    ///
-    /// The same split reading that
-    /// [`MonitorState::python_owns_smart_cluster_queue`] arbitrates, on the
-    /// capture path: `clip_index.rs` consults the registry on every pass, while
-    /// Python reads `CARBONPAPER_CLIP_RUNTIME` once at spawn
-    /// (`monitor/monitor/worker_process.py`). Deciding from the registry alone
-    /// would break in both directions. Setting the key to `python` under a
-    /// monitor started with `rust` would stand the Rust pass down while the
-    /// Python one is still skipping every job, and new captures would stop being
-    /// indexed by anyone — the silent gap this module's header calls the one
-    /// failure no user can detect. Setting it back to `rust` under a monitor
-    /// started with `python` would give one screenshot two encoders and two
-    /// conflicting writes into the single Chroma collection they share.
-    ///
-    /// So, as with the Smart Cluster queue, the value the live process was
-    /// actually given wins until that process restarts. The liveness check keeps
-    /// a flag left over from a crashed monitor from silencing Rust forever.
-    pub fn python_owns_clip_encoding(&self) -> bool {
-        if !self.python_clip_encoder.load(Ordering::SeqCst) {
-            return false;
-        }
-        self.process
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-    }
-
-    pub fn set_active_classification_runtime(&self, runtime: Option<String>) {
-        let mut active = self
-            .active_classification_runtime
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        *active = runtime;
-    }
-
-    /// Runtime selected by the environment of the currently live monitor.
-    pub fn active_classification_runtime(&self) -> Option<String> {
-        let running = self
-            .process
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_some();
-        if !running {
-            return None;
-        }
-        self.active_classification_runtime
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
     }
 
     /// Whether game mode currently prevents GPU inference.
@@ -376,10 +261,8 @@ fn set_monitor_recovery_crashed(
 }
 
 fn cleanup_monitor_runtime_after_unexpected_exit(state: &MonitorState) {
-    // The Python Smart Cluster worker died with its process, so the Rust one
-    // may take the queue back as soon as the switch allows it.
-    state.set_python_smart_cluster_worker(false);
-    state.set_active_classification_runtime(None);
+    // Clear the monitor IPC state. Rust-owned queues continue independently
+    // of the retained Python service lifecycle.
     {
         let mut guard = state.reverse_ipc.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut server) = *guard {
@@ -721,24 +604,21 @@ pub(crate) async fn authenticated_monitor_command(
 pub async fn monitor_search_nl(
     app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     query: String,
     limit: Option<u32>,
     offset: Option<u32>,
     process_names: Option<Vec<String>>,
     start_time: Option<f64>,
     end_time: Option<f64>,
-    fuzzy: Option<bool>,
+    _fuzzy: Option<bool>,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let limit = limit.unwrap_or(20).min(crate::clip_query::MAX_CLIP_RESULTS);
     let offset = offset.unwrap_or(0).min(crate::clip_query::MAX_CLIP_OFFSET);
     let process_names = process_names.unwrap_or_default();
 
-    // M2.5 step 9: Rust answers this from the migrated CLIP image index when the
-    // configuration selects it and nothing refuses. `fuzzy` is not passed on —
-    // Python accepts and ignores it, and a text-to-image search has no fuzzy
-    // matching to switch off.
+    // `fuzzy` is retained in the command contract but does not apply to
+    // text-to-image similarity.
     match crate::clip_query::try_rust_clip_query(
         &app,
         crate::clip_query::ClipQueryRequest {
@@ -752,36 +632,15 @@ pub async fn monitor_search_nl(
     )
     .await
     {
-        crate::clip_query::ClipQueryOutcome::Served(results) => {
-            return Ok(serde_json::json!({
-                "status": "success",
-                "results": results,
-                "backend": "rust",
-            }));
-        }
-        crate::clip_query::ClipQueryOutcome::NotSelected => {}
-        crate::clip_query::ClipQueryOutcome::FellBack(reason) => {
-            tracing::info!("[CLIP] search_nl fell back to Python: {reason}");
+        crate::clip_query::ClipQueryOutcome::Served(results) => Ok(serde_json::json!({
+            "status": "success",
+            "results": results,
+            "backend": "rust",
+        })),
+        crate::clip_query::ClipQueryOutcome::Unavailable(reason) => {
+            Err(format!("CLIP search unavailable: {reason}"))
         }
     }
-
-    let response = authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({
-            "command": "search_nl",
-            "query": query,
-            "limit": limit,
-            "offset": offset,
-            "process_names": process_names,
-            "start_time": start_time,
-            "end_time": end_time,
-            "fuzzy": fuzzy.unwrap_or(true),
-        }),
-    )
-    .await?;
-    crate::clip_query::observe_python_served();
-    Ok(crate::clip_query::tag_python_response(response))
 }
 
 #[tauri::command]
@@ -903,26 +762,25 @@ pub async fn monitor_get_task_clusters(
 pub async fn monitor_nl_cluster_query(
     app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     query: String,
     n_results: Option<u32>,
     enable_rerank: Option<bool>,
-    rerank_variant: Option<String>,
+    _rerank_variant: Option<String>,
 ) -> Result<Value, String> {
     let enable_rerank = enable_rerank.unwrap_or(false);
     // A non-reranked query keeps its old generous bound: it costs one query
     // encode and a cosine scan, and 200 of those is sub-second. A reranked one
     // is paid per candidate by a CPU cross-encoder, so its bound is the one
     // thing that decides how long the user waits — see `MAX_RERANK_RESULTS`.
-    // Clamped here rather than inside the Rust path so it holds for a query
-    // Python answers too, and the two stay comparable.
+    // Clamped here so the command contract and the Rust query implementation
+    // share one user-visible upper bound.
     let n_results = n_results.unwrap_or(30).min(if enable_rerank {
         crate::rerank::MAX_RERANK_RESULTS
     } else {
         200
     });
-    // Checked here rather than only inside `authenticated_monitor_command` so
-    // the Rust branch cannot serve a query the Python branch would have refused.
+    // Checked before entering the Rust query path so protected screenshot data
+    // is never read for an unauthenticated request.
     crate::commands::check_auth_required(&credential_state)?;
 
     // M2.5 step 6: both halves of the query are Rust-served now. Step 4 took
@@ -936,13 +794,10 @@ pub async fn monitor_nl_cluster_query(
     };
     match outcome {
         crate::semantic_query::RustQueryOutcome::Served(response) => return Ok(response),
-        crate::semantic_query::RustQueryOutcome::NotSelected => {}
-        crate::semantic_query::RustQueryOutcome::FellBack(reason) => {
-            tracing::warn!("[SEMANTIC] rust retrieval unavailable, serving from python: {reason}");
+        crate::semantic_query::RustQueryOutcome::Unavailable(reason) => {
+            return Err(format!("Semantic retrieval unavailable: {reason}"));
         }
-        // The user stopped it. Every other outcome here reaches for Python;
-        // this one must not, because the whole point of the stop was to end
-        // the wait, and Python would restart it from the beginning.
+        // The user stopped it.
         //
         // Returned as a success with `cancelled` set rather than as an error:
         // the view has to tell "you stopped this" apart from "this broke", and
@@ -958,133 +813,53 @@ pub async fn monitor_nl_cluster_query(
             }));
         }
     }
-
-    // Everything below runs on Python. For a reranked query that is a wait of
-    // the same order as the Rust one with none of its reporting, so the view is
-    // told which it is getting rather than being left to show a progress bar
-    // that will never move and a stop button that would silently do nothing.
-    if enable_rerank {
-        crate::rerank::RerankQueryState::report_external_backend(&app);
-    }
-
-    let response = authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({
-            "command": "nl_cluster_query",
-            "query": query,
-            "n_results": n_results,
-            "enable_rerank": enable_rerank,
-            // The only variant `model_management.rs` ever installs, and the only
-            // one `semantic_models.rs` resolves. The old `q4f16` default named a
-            // file that is never on disk, so a caller that omitted the argument
-            // asked Python to load something it could not find.
-            "rerank_variant": rerank_variant
-                .unwrap_or_else(|| crate::rerank::RERANK_VARIANT.to_string()),
-        }),
-    )
-    .await?;
-    // Recorded here, not at the point the Rust path stood down: the diagnostic
-    // answers "who served the last query", and Python has only now answered.
-    crate::semantic_query::observe_python_served();
-    Ok(crate::semantic_query::tag_python_response(response))
 }
 
 #[tauri::command]
 pub async fn monitor_nl_cluster_reranker_status(
     app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
 ) -> Result<Value, String> {
-    // M2.5 step 6: whoever scores answers for the scorer. Asking Python here
-    // while Rust serves the reranked query is wrong in both directions — it
-    // reports "unavailable" whenever Python is stopped or its model copy is
-    // missing, on a calibration screen that would have worked, and it reports
-    // "available" when the file Rust actually loads is absent.
-    if crate::rerank::rust_rerank_selected() {
-        crate::commands::check_auth_required(&credential_state)?;
-        return Ok(crate::rerank::reranker_status_value(&app));
-    }
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({ "command": "nl_cluster_reranker_status" }),
-    )
-    .await
+    crate::commands::check_auth_required(&credential_state)?;
+    Ok(crate::rerank::reranker_status_value(&app))
 }
 
 #[tauri::command]
 pub async fn monitor_smart_cluster_worker_status(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     storage: State<'_, Arc<crate::storage::StorageState>>,
     worker: State<'_, Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>,
 ) -> Result<Value, String> {
-    // M2.5 step 6: whichever worker owns the queue also answers for it. Asking
-    // Python while Rust drains would report a worker that has not been started
-    // — and the reverse holds too, which is why this asks who actually owns the
-    // queue rather than reading the switch: under a monitor spawned with
-    // `rerank_runtime = python`, the Python worker is the one draining however
-    // the registry key reads now.
-    if crate::rerank::rust_owns_smart_cluster_queue(Some(&state)) {
-        crate::commands::check_auth_required(&credential_state)?;
-        // The queue depth comes from the table rather than from the worker,
-        // which is what Python did too: the count has to be right even when no
-        // pass has run yet this session.
-        let storage = storage.inner().clone();
-        let pending = tokio::task::spawn_blocking(move || storage.count_smart_cluster_pending())
-            .await
-            .map_err(|error| format!("pending count task failed: {error}"))?
-            .unwrap_or(0);
-        return Ok(crate::smart_cluster_scoring::status_value(
-            worker.inner(),
-            pending,
-        ));
-    }
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({ "command": "smart_cluster_worker_status" }),
-    )
-    .await
+    crate::commands::check_auth_required(&credential_state)?;
+    let storage = storage.inner().clone();
+    let pending = tokio::task::spawn_blocking(move || storage.count_smart_cluster_pending())
+        .await
+        .map_err(|error| format!("pending count task failed: {error}"))?
+        .unwrap_or(0);
+    Ok(crate::smart_cluster_scoring::status_value(
+        worker.inner(),
+        pending,
+    ))
 }
 
 #[tauri::command]
 pub async fn monitor_smart_cluster_drain_now(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     worker: State<'_, Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>,
 ) -> Result<Value, String> {
-    if crate::rerank::rust_owns_smart_cluster_queue(Some(&state)) {
-        crate::commands::check_auth_required(&credential_state)?;
-        worker.request_drain_now();
-        return Ok(serde_json::json!({ "status": "success" }));
-    }
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({ "command": "smart_cluster_drain_now" }),
-    )
-    .await
+    crate::commands::check_auth_required(&credential_state)?;
+    worker.request_drain_now();
+    Ok(serde_json::json!({ "status": "success" }))
 }
 
 #[tauri::command]
 pub async fn monitor_smart_cluster_stop_drain(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     worker: State<'_, Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>,
 ) -> Result<Value, String> {
-    if crate::rerank::rust_owns_smart_cluster_queue(Some(&state)) {
-        crate::commands::check_auth_required(&credential_state)?;
-        worker.request_stop_drain();
-        return Ok(serde_json::json!({ "status": "success" }));
-    }
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({ "command": "smart_cluster_stop_drain" }),
-    )
-    .await
+    crate::commands::check_auth_required(&credential_state)?;
+    worker.request_stop_drain();
+    Ok(serde_json::json!({ "status": "success" }))
 }
 
 #[tauri::command]
@@ -1282,7 +1057,6 @@ fn append_known_native_dll_dirs(dirs: &mut Vec<PathBuf>, site_packages: &Path) {
         dirs.push(path);
     };
 
-    push(&["torch", "lib"]);
     push(&["onnxruntime", "capi"]);
     push(&["numpy.libs"]);
     push(&["scipy.libs"]);
@@ -1327,7 +1101,7 @@ fn python_launcher_dll_dirs(venv_dir: &Path, python_dll: &Path) -> String {
         .join(";")
 }
 
-/// Starts the Python monitor subprocess for screenshot capture and OCR.
+/// Starts the Python monitor subprocess for capture orchestration and retained services.
 pub async fn start_monitor_impl(
     state: State<'_, MonitorState>,
     app: AppHandle,
@@ -1351,22 +1125,7 @@ pub async fn start_monitor_impl(
             }
         }
     }
-    let resolved_model_runtime = crate::model_management::resolve_required_model_runtime().ok();
-    if let Some(resolved) = &resolved_model_runtime {
-        if resolved.used_pytorch_fallback {
-            tracing::warn!(
-                "ONNX models are incomplete; falling back to existing PyTorch models for monitor startup"
-            );
-            let _ = app.emit(
-                "app-toast",
-                serde_json::json!({
-                    "type": "info",
-                    "title": "模型运行时已回退",
-                    "message": "未检测到完整 ONNX 模型，已使用本机已有的 PyTorch 模型启动监控。联网后可在设置中下载 ONNX 模型以降低内存占用。",
-                }),
-            );
-        }
-    }
+    let resolved_onnx_paths = crate::model_management::resolve_required_onnx_paths().ok();
 
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -1563,12 +1322,10 @@ pub async fn start_monitor_impl(
         {
             let storage = app.state::<Arc<StorageState>>();
             let storage_arc = (*storage).clone();
-            let capture_state = app.state::<Arc<crate::capture::CaptureState>>();
-            let ocr_cache = capture_state.ocr_image_cache.clone();
 
             let mut reverse_server =
                 ReverseIpcServer::new(&reverse_pipe_name, reverse_ipc_auth_token.clone());
-            if let Err(e) = reverse_server.start(storage_arc, ocr_cache, app.clone()) {
+            if let Err(e) = reverse_server.start(storage_arc, app.clone()) {
                 tracing::error!("Failed to start reverse IPC server: {}", e);
             }
 
@@ -1671,33 +1428,6 @@ pub async fn start_monitor_impl(
             cmd_proc.env("CARBONPAPER_DATA_DIR", dd);
         }
 
-        let use_onnx = resolved_model_runtime
-            .as_ref()
-            .map(|resolved| resolved.runtime.use_onnx())
-            .unwrap_or_else(|| crate::registry_config::get_bool("use_onnx").unwrap_or(true));
-
-        // Sync persisted feature toggles into the Python monitor at startup.
-        //
-        // M2.5 step 6. Rust owns Smart Cluster scoring by default, and two
-        // drainers on one `smart_cluster_pending` queue would score the same
-        // snapshots twice against the same thresholds — with different logits,
-        // since Python's reranker prefers DirectML and Rust refuses it. Python
-        // reads this once, here, and leaves its worker unstarted. The value is
-        // also remembered on `MonitorState` below, because from that moment on
-        // it, and not the registry key it was read from, is what decides who
-        // owns the queue until this process exits.
-        let python_rerank_runtime = crate::rerank::rerank_runtime();
-        let python_drains_smart_clusters = python_rerank_runtime == "python";
-        // The same arbitration for the CLIP encoder, remembered for the same
-        // reason: from the moment this process starts, the value it was handed —
-        // not the registry key it came from — decides who encodes captures.
-        let python_clip_runtime = crate::clip_query::clip_runtime();
-        let python_encodes_clip = python_clip_runtime == "python";
-        // BGE classification remains orchestrated by the post-process worker,
-        // but its embedder calls the shared Rust semantic worker by default.
-        // The child reads this once, so changing the rollback lever takes effect
-        // with the same monitor restart as the other inference runtime flags.
-        let python_classification_runtime = crate::classification_runtime::classification_runtime();
         cmd_proc
             .env(
                 "CARBONPAPER_CLUSTERING_ENABLED",
@@ -1716,39 +1446,12 @@ pub async fn start_monitor_impl(
                 crate::registry_config::get_bool("clustering_allow_full_low_memory")
                     .unwrap_or(false)
                     .to_string(),
-            )
-            .env("CARBONPAPER_USE_ONNX", use_onnx.to_string())
-            .env("CARBONPAPER_RERANK_RUNTIME", &python_rerank_runtime)
-            // M2.5 step 8: Rust is the only CLIP encoder on the capture path
-            // unless this says otherwise. Read once at spawn, like the reranker
-            // switch and for the same reason — two encoders on one screenshot
-            // would embed every image twice and write conflicting vectors into
-            // the collection they both target.
-            .env("CARBONPAPER_CLIP_RUNTIME", &python_clip_runtime)
-            .env(
-                "CARBONPAPER_CLASSIFICATION_RUNTIME",
-                &python_classification_runtime,
-            )
-            .env(
-                "CARBONPAPER_OCR_TIMEOUT_SECS",
-                crate::registry_config::get_u32("ocr_timeout_secs")
-                    .unwrap_or(120)
-                    .clamp(30, 600)
-                    .to_string(),
             );
-
-        if let Some(resolved) = &resolved_model_runtime {
-            let paths = &resolved.paths;
-            cmd_proc
-                .env("MODEL_PATH", paths.clip_path.to_string_lossy().to_string())
-                .env(
-                    "BGE_MODEL_PATH",
-                    paths.bge_path.to_string_lossy().to_string(),
-                )
-                .env(
-                    "MINILM_MODEL_PATH",
-                    paths.minilm_path.to_string_lossy().to_string(),
-                );
+        if let Some(paths) = &resolved_onnx_paths {
+            cmd_proc.env(
+                "MINILM_MODEL_PATH",
+                paths.minilm_path.to_string_lossy().to_string(),
+            );
         }
 
         // Pass DirectML configuration. The persisted preference is not enough:
@@ -1893,13 +1596,6 @@ pub async fn start_monitor_impl(
         }
 
         *process_guard = Some(child);
-        // Latched here, next to the handle whose lifetime it describes: from now
-        // until this process exits, the value Python was handed decides who
-        // drains `smart_cluster_pending`, whatever the registry key says later.
-        state.set_python_smart_cluster_worker(python_drains_smart_clusters);
-        state.set_python_clip_encoder(python_encodes_clip);
-        state.set_active_classification_runtime(Some(python_classification_runtime));
-
         (python_executable, python_exists)
     };
 
@@ -2269,10 +1965,6 @@ pub async fn stop_monitor_impl(
     }
 
     // 清理状态
-    // The Python Smart Cluster worker stopped with its process; the queue is
-    // the Rust worker's again as soon as the switch allows it.
-    state.set_python_smart_cluster_worker(false);
-    state.set_active_classification_runtime(None);
     {
         let mut guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
@@ -2327,7 +2019,7 @@ pub async fn stop_monitor(
     stop_monitor_impl(state, capture_state, app).await
 }
 
-/// Pauses screenshot capture without stopping the Python process.
+/// Pauses screenshot capture without stopping the Python coordination process.
 pub async fn pause_monitor_impl(
     state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
@@ -2335,7 +2027,7 @@ pub async fn pause_monitor_impl(
 ) -> Result<String, String> {
     // Pause Rust capture loop
     capture_state.paused.store(true, Ordering::SeqCst);
-    // Also forward to Python so OCR worker pauses
+    // Also forward to Python so retained post-processing work pauses.
     let result = send_ipc_command_internal(&state, "pause").await;
     crate::refresh_tray_menu(&app);
     result
@@ -2361,7 +2053,7 @@ pub async fn resume_monitor_impl(
 ) -> Result<String, String> {
     // Resume Rust capture loop
     capture_state.paused.store(false, Ordering::SeqCst);
-    // Also forward to Python so OCR worker resumes
+    // Also forward to Python so retained post-processing work resumes.
     let result = send_ipc_command_internal(&state, "resume").await;
     crate::refresh_tray_menu(&app);
     result
@@ -2833,11 +2525,9 @@ mod tests {
         let venv_dir = temp.path();
         let site_packages = venv_dir.join("Lib").join("site-packages");
         let scripts_dir = venv_dir.join("Scripts");
-        let torch_lib = site_packages.join("torch").join("lib");
         let numpy_libs = site_packages.join("numpy.libs");
         let unlisted_native_dir = site_packages.join("unlisted_package").join("native");
         std::fs::create_dir_all(&scripts_dir).unwrap();
-        std::fs::create_dir_all(&torch_lib).unwrap();
         std::fs::create_dir_all(&numpy_libs).unwrap();
         std::fs::create_dir_all(&unlisted_native_dir).unwrap();
 
@@ -2851,7 +2541,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(entries.contains(&site_packages.canonicalize().unwrap()));
-        assert!(entries.contains(&torch_lib.canonicalize().unwrap()));
         assert!(entries.contains(&numpy_libs.canonicalize().unwrap()));
         assert!(!entries.contains(&unlisted_native_dir.canonicalize().unwrap()));
     }

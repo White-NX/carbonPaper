@@ -25,8 +25,8 @@ static MODEL_DOWNLOAD_LOCKS: once_cell::sync::Lazy<
     Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 > = once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
-fn model_download_lock(model_id: &str, use_onnx: bool) -> Arc<tokio::sync::Mutex<()>> {
-    let key = format!("{}:{}", model_id, if use_onnx { "onnx" } else { "pytorch" });
+fn model_download_lock(model_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let key = model_id.to_string();
     let mut locks = MODEL_DOWNLOAD_LOCKS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -75,9 +75,9 @@ struct ModelDownloadSpec {
     files: &'static [&'static str],
 }
 
-fn model_download_spec(model_id: &str, use_onnx: bool) -> Option<ModelDownloadSpec> {
-    match (model_id, use_onnx) {
-        ("chinese-clip", true) => Some(ModelDownloadSpec {
+fn model_download_spec(model_id: &str) -> Option<ModelDownloadSpec> {
+    match model_id {
+        "chinese-clip" => Some(ModelDownloadSpec {
             repo: "Xenova/chinese-clip-vit-base-patch16",
             revision: "f26904860903e70e050b8f48255e5f48401816e9",
             root: "models-onnx",
@@ -92,19 +92,7 @@ fn model_download_spec(model_id: &str, use_onnx: bool) -> Option<ModelDownloadSp
                 "special_tokens_map.json",
             ],
         }),
-        ("chinese-clip", false) => Some(ModelDownloadSpec {
-            repo: "OFA-Sys/chinese-clip-vit-base-patch16",
-            revision: "36e679e65c2a2fead755ae21162091293ad37834",
-            root: "models",
-            subdir: None,
-            files: &[
-                "vocab.txt",
-                "pytorch_model.bin",
-                "config.json",
-                "preprocessor_config.json",
-            ],
-        }),
-        ("bge-small-zh", true) => Some(ModelDownloadSpec {
+        "bge-small-zh" => Some(ModelDownloadSpec {
             repo: "Xenova/bge-small-zh-v1.5",
             revision: "75c43b069aac4d136ba6bc1122f995fedcfd2781",
             root: "models-onnx",
@@ -117,21 +105,7 @@ fn model_download_spec(model_id: &str, use_onnx: bool) -> Option<ModelDownloadSp
                 "onnx/model_quantized.onnx",
             ],
         }),
-        ("bge-small-zh", false) => Some(ModelDownloadSpec {
-            repo: "BAAI/bge-small-zh-v1.5",
-            revision: "7999e1d3359715c523056ef9478215996d62a620",
-            root: "models",
-            subdir: Some("bge-small-zh-v1.5"),
-            files: &[
-                "config.json",
-                "pytorch_model.bin",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "vocab.txt",
-                "special_tokens_map.json",
-            ],
-        }),
-        ("minilm-l12", true) => Some(ModelDownloadSpec {
+        "minilm-l12" => Some(ModelDownloadSpec {
             repo: "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
             revision: "2c4055b12046f11709e9df2c122e59ffbdc2f900",
             root: "models-onnx",
@@ -144,21 +118,7 @@ fn model_download_spec(model_id: &str, use_onnx: bool) -> Option<ModelDownloadSp
                 "onnx/model_quantized.onnx",
             ],
         }),
-        ("minilm-l12", false) => Some(ModelDownloadSpec {
-            repo: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-            revision: "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
-            root: "models",
-            subdir: Some("paraphrase-multilingual-MiniLM-L12-v2"),
-            files: &[
-                "config.json",
-                "pytorch_model.bin",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "special_tokens_map.json",
-                "sentencepiece.bpe.model",
-            ],
-        }),
-        ("bge-reranker-v2-m3", _) => Some(ModelDownloadSpec {
+        "bge-reranker-v2-m3" => Some(ModelDownloadSpec {
             repo: "onnx-community/bge-reranker-v2-m3-ONNX",
             revision: "6f5ff65298512715a1e669753bc754d2bc8f367b",
             root: "models",
@@ -250,175 +210,45 @@ fn minilm_onnx_missing(base: &Path) -> Vec<String> {
     )
 }
 
-fn chinese_clip_pytorch_missing(base: &Path) -> Vec<String> {
-    missing_files(
-        base,
-        &[
-            "vocab.txt",
-            "pytorch_model.bin",
-            "config.json",
-            "preprocessor_config.json",
-        ],
-    )
-}
-
-fn bge_pytorch_missing(base: &Path) -> Vec<String> {
-    missing_files(
-        base,
-        &[
-            "config.json",
-            "pytorch_model.bin",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "vocab.txt",
-            "special_tokens_map.json",
-        ],
-    )
-}
-
-fn minilm_pytorch_missing(base: &Path) -> Vec<String> {
-    missing_files(
-        base,
-        &[
-            "config.json",
-            "pytorch_model.bin",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "special_tokens_map.json",
-            "sentencepiece.bpe.model",
-        ],
-    )
-}
-
-fn required_onnx_complete_with_fallback(onnx_models_dir: &Path, models_dir: &Path) -> bool {
-    let clip_complete = chinese_clip_onnx_missing(onnx_models_dir).is_empty()
-        || chinese_clip_onnx_missing(models_dir).is_empty();
-    let bge_complete = bge_onnx_missing(&onnx_models_dir.join("bge-small-zh-v1.5")).is_empty()
-        || bge_onnx_missing(&models_dir.join("bge-small-zh-v1.5")).is_empty();
-    let minilm_complete =
-        minilm_onnx_missing(&onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"))
-            .is_empty()
-            || minilm_onnx_missing(&models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"))
-                .is_empty();
-
-    clip_complete && bge_complete && minilm_complete
-}
-
-fn required_pytorch_complete(models_dir: &Path) -> bool {
-    chinese_clip_pytorch_missing(models_dir).is_empty()
-        && bge_pytorch_missing(&models_dir.join("bge-small-zh-v1.5")).is_empty()
-        && minilm_pytorch_missing(&models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"))
-            .is_empty()
-}
-
 #[derive(Debug, Clone)]
 pub struct ResolvedRequiredModelPaths {
-    pub clip_path: PathBuf,
-    pub bge_path: PathBuf,
     pub minilm_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequiredModelRuntime {
-    Onnx,
-    Pytorch,
-}
-
-impl RequiredModelRuntime {
-    pub fn use_onnx(self) -> bool {
-        matches!(self, Self::Onnx)
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Onnx => "onnx",
-            Self::Pytorch => "pytorch",
-        }
+fn resolve_onnx_path(
+    primary: PathBuf,
+    legacy: PathBuf,
+    missing: fn(&Path) -> Vec<String>,
+) -> Option<PathBuf> {
+    if missing(&primary).is_empty() {
+        Some(primary)
+    } else if missing(&legacy).is_empty() {
+        Some(legacy)
+    } else {
+        None
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ResolvedRequiredModels {
-    pub runtime: RequiredModelRuntime,
-    pub used_pytorch_fallback: bool,
-    pub paths: ResolvedRequiredModelPaths,
-}
-
-fn resolve_required_model_paths(
-    runtime: RequiredModelRuntime,
-    models_dir: &Path,
-    onnx_models_dir: &Path,
-) -> ResolvedRequiredModelPaths {
-    match runtime {
-        RequiredModelRuntime::Onnx => {
-            let primary_bge = onnx_models_dir.join("bge-small-zh-v1.5");
-            let legacy_bge = models_dir.join("bge-small-zh-v1.5");
-            let primary_minilm = onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
-            let legacy_minilm = models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
-
-            ResolvedRequiredModelPaths {
-                clip_path: if chinese_clip_onnx_missing(onnx_models_dir).is_empty() {
-                    onnx_models_dir.to_path_buf()
-                } else {
-                    models_dir.to_path_buf()
-                },
-                bge_path: if bge_onnx_missing(&primary_bge).is_empty() {
-                    primary_bge
-                } else {
-                    legacy_bge
-                },
-                minilm_path: if minilm_onnx_missing(&primary_minilm).is_empty() {
-                    primary_minilm
-                } else {
-                    legacy_minilm
-                },
-            }
-        }
-        RequiredModelRuntime::Pytorch => ResolvedRequiredModelPaths {
-            clip_path: models_dir.to_path_buf(),
-            bge_path: models_dir.join("bge-small-zh-v1.5"),
-            minilm_path: models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
-        },
-    }
-}
-
-pub fn resolve_required_model_runtime() -> Result<ResolvedRequiredModels, String> {
+/// Resolve the reviewed ONNX locations used by the Rust workers and the
+/// remaining Python task-clustering consumer. The legacy `models` location is
+/// accepted only as an ONNX compatibility location; PyTorch is not selected.
+pub fn resolve_required_onnx_paths() -> Result<ResolvedRequiredModelPaths, String> {
     let appdata_dir = file_in_local_appdata()
         .ok_or_else(|| "Could not determine local appdata directory.".to_string())?;
     let models_dir = appdata_dir.join("models");
     let onnx_models_dir = appdata_dir.join("models-onnx");
-    let prefer_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
 
-    if prefer_onnx {
-        if required_onnx_complete_with_fallback(&onnx_models_dir, &models_dir) {
-            let runtime = RequiredModelRuntime::Onnx;
-            return Ok(ResolvedRequiredModels {
-                runtime,
-                used_pytorch_fallback: false,
-                paths: resolve_required_model_paths(runtime, &models_dir, &onnx_models_dir),
-            });
-        }
-        if required_pytorch_complete(&models_dir) {
-            let runtime = RequiredModelRuntime::Pytorch;
-            return Ok(ResolvedRequiredModels {
-                runtime,
-                used_pytorch_fallback: true,
-                paths: resolve_required_model_paths(runtime, &models_dir, &onnx_models_dir),
-            });
-        }
-    } else if required_pytorch_complete(&models_dir) {
-        let runtime = RequiredModelRuntime::Pytorch;
-        return Ok(ResolvedRequiredModels {
-            runtime,
-            used_pytorch_fallback: false,
-            paths: resolve_required_model_paths(runtime, &models_dir, &onnx_models_dir),
-        });
-    }
+    let minilm_path = resolve_onnx_path(
+        onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
+        models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
+        minilm_onnx_missing,
+    )
+    .ok_or_else(|| "MiniLM ONNX model files are incomplete".to_string())?;
 
-    Err("Required model files are incomplete".to_string())
+    Ok(ResolvedRequiredModelPaths { minilm_path })
 }
 
-fn insert_status_with_fallback(
+fn insert_status_with_legacy_location(
     result: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
     primary_base: &std::path::Path,
@@ -699,10 +529,9 @@ pub async fn download_model(
     model_id: String,
 ) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
-    let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
-    let spec = model_download_spec(&model_id, use_onnx)
+    let spec = model_download_spec(&model_id)
         .ok_or_else(|| format!("Unsupported model id: {}", model_id))?;
-    let download_lock = model_download_lock(&model_id, use_onnx);
+    let download_lock = model_download_lock(&model_id);
     let _download_guard = download_lock.lock().await;
 
     let mut download_path = file_in_local_appdata()
@@ -729,11 +558,9 @@ pub async fn download_model(
     })?;
 
     // prepare log file under log path
-    let runtime = if use_onnx { "onnx" } else { "pytorch" };
     let log_path = env::temp_dir().join(format!(
-        "carbonpaper_model_{}_{}.log",
+        "carbonpaper_model_{}_onnx.log",
         model_id.replace(|c: char| !c.is_ascii_alphanumeric(), "_"),
-        runtime
     ));
     if log_path.exists() {
         std::fs::remove_file(&log_path).map_err(|e| e.to_string())?;
@@ -769,86 +596,40 @@ pub async fn check_model_files() -> Result<serde_json::Value, String> {
     let models_dir = appdata_dir.join("models");
     let onnx_models_dir = appdata_dir.join("models-onnx");
 
-    let use_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
-    let use_pytorch_fallback = use_onnx
-        && !required_onnx_complete_with_fallback(&onnx_models_dir, &models_dir)
-        && required_pytorch_complete(&models_dir);
-    let active_runtime = if use_onnx && !use_pytorch_fallback {
-        RequiredModelRuntime::Onnx
-    } else {
-        RequiredModelRuntime::Pytorch
-    };
     let mut result = serde_json::Map::new();
 
-    if active_runtime.use_onnx() {
-        insert_status_with_fallback(
-            &mut result,
-            "chinese-clip",
-            &onnx_models_dir,
-            Some(&models_dir),
-            true,
-            chinese_clip_onnx_missing,
-        );
-        insert_status_with_fallback(
-            &mut result,
-            "bge-small-zh",
-            &onnx_models_dir.join("bge-small-zh-v1.5"),
-            Some(&models_dir.join("bge-small-zh-v1.5")),
-            true,
-            bge_onnx_missing,
-        );
-        insert_status_with_fallback(
-            &mut result,
-            "minilm-l12",
-            &onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
-            Some(&models_dir.join("paraphrase-multilingual-MiniLM-L12-v2")),
-            true,
-            minilm_onnx_missing,
-        );
-    } else {
-        insert_status_with_fallback(
-            &mut result,
-            "chinese-clip",
-            &models_dir,
-            None,
-            true,
-            chinese_clip_pytorch_missing,
-        );
-        insert_status_with_fallback(
-            &mut result,
-            "bge-small-zh",
-            &models_dir.join("bge-small-zh-v1.5"),
-            None,
-            true,
-            bge_pytorch_missing,
-        );
-        insert_status_with_fallback(
-            &mut result,
-            "minilm-l12",
-            &models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
-            None,
-            true,
-            minilm_pytorch_missing,
-        );
-    }
-
-    result.insert(
-        "_runtime".to_string(),
-        json!({
-            "complete": true,
-            "required": false,
-            "runtime": active_runtime.as_str(),
-            "pytorch_fallback": use_pytorch_fallback,
-        }),
-    );
-
-    insert_status_with_fallback(
+    insert_status_with_legacy_location(
         &mut result,
         "bge-reranker-v2-m3",
         &models_dir.join("bge-reranker-v2-m3"),
         None,
         false,
         reranker_missing,
+    );
+
+    insert_status_with_legacy_location(
+        &mut result,
+        "chinese-clip",
+        &onnx_models_dir,
+        Some(&models_dir),
+        true,
+        chinese_clip_onnx_missing,
+    );
+    insert_status_with_legacy_location(
+        &mut result,
+        "bge-small-zh",
+        &onnx_models_dir.join("bge-small-zh-v1.5"),
+        Some(&models_dir.join("bge-small-zh-v1.5")),
+        true,
+        bge_onnx_missing,
+    );
+    insert_status_with_legacy_location(
+        &mut result,
+        "minilm-l12",
+        &onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
+        Some(&models_dir.join("paraphrase-multilingual-MiniLM-L12-v2")),
+        true,
+        minilm_onnx_missing,
     );
 
     Ok(serde_json::Value::Object(result))
@@ -917,7 +698,6 @@ struct RequiredModelDef {
     purpose: &'static str,
     subdir: Option<&'static str>,
     onnx_missing: fn(&Path) -> Vec<String>,
-    pytorch_missing: fn(&Path) -> Vec<String>,
 }
 
 const REQUIRED_MODEL_DEFS: &[RequiredModelDef] = &[
@@ -927,7 +707,6 @@ const REQUIRED_MODEL_DEFS: &[RequiredModelDef] = &[
         purpose: "image_embedding",
         subdir: None,
         onnx_missing: chinese_clip_onnx_missing,
-        pytorch_missing: chinese_clip_pytorch_missing,
     },
     RequiredModelDef {
         id: "bge-small-zh",
@@ -935,7 +714,6 @@ const REQUIRED_MODEL_DEFS: &[RequiredModelDef] = &[
         purpose: "content_classification",
         subdir: Some("bge-small-zh-v1.5"),
         onnx_missing: bge_onnx_missing,
-        pytorch_missing: bge_pytorch_missing,
     },
     RequiredModelDef {
         id: "minilm-l12",
@@ -943,7 +721,6 @@ const REQUIRED_MODEL_DEFS: &[RequiredModelDef] = &[
         purpose: "task_clustering",
         subdir: Some("paraphrase-multilingual-MiniLM-L12-v2"),
         onnx_missing: minilm_onnx_missing,
-        pytorch_missing: minilm_pytorch_missing,
     },
 ];
 
@@ -957,7 +734,6 @@ const CLIP_ROOT_MEASURE_FILES: &[&str] = &[
     "tokenizer.json",
     "tokenizer_config.json",
     "special_tokens_map.json",
-    "pytorch_model.bin",
 ];
 
 fn dir_size_recursive(dir: &Path) -> u64 {
@@ -999,24 +775,7 @@ fn variant_dir(root: &Path, subdir: Option<&str>) -> PathBuf {
     }
 }
 
-fn required_model_entries(
-    models_dir: &Path,
-    onnx_models_dir: &Path,
-    prefer_onnx: bool,
-) -> Vec<ModelInventoryEntry> {
-    let onnx_ok = required_onnx_complete_with_fallback(onnx_models_dir, models_dir);
-    let pytorch_ok = required_pytorch_complete(models_dir);
-    // Mirrors resolve_required_model_runtime: ONNX is only active when the
-    // configured ONNX set is complete, while PyTorch may take over only when
-    // its complete set is available.
-    let global_runtime = if prefer_onnx && onnx_ok {
-        Some(RequiredModelRuntime::Onnx)
-    } else if pytorch_ok {
-        Some(RequiredModelRuntime::Pytorch)
-    } else {
-        None
-    };
-
+fn required_model_entries(models_dir: &Path, onnx_models_dir: &Path) -> Vec<ModelInventoryEntry> {
     let mut entries = Vec::new();
     for def in REQUIRED_MODEL_DEFS {
         let onnx_primary = variant_dir(onnx_models_dir, def.subdir);
@@ -1024,64 +783,32 @@ fn required_model_entries(
         let onnx_primary_ok = (def.onnx_missing)(&onnx_primary).is_empty();
         let onnx_legacy_ok = (def.onnx_missing)(&onnx_legacy).is_empty();
         let onnx_installed = onnx_primary_ok || onnx_legacy_ok;
-        let onnx_path = if onnx_primary_ok || !onnx_legacy_ok {
+        let onnx_path = if onnx_primary_ok {
             onnx_primary.clone()
+        } else if onnx_legacy_ok || dir_size_recursive(&onnx_legacy) > 0 {
+            onnx_legacy.clone()
         } else {
-            onnx_legacy
+            onnx_primary.clone()
         };
-
-        let pytorch_base = variant_dir(models_dir, def.subdir);
-        let pytorch_installed = (def.pytorch_missing)(&pytorch_base).is_empty();
-
-        let (onnx_primary_size, legacy_shared_size) = if def.subdir.is_some() {
-            // The legacy ONNX location and the PyTorch location share
-            // models/<subdir>, so walking the two distinct dirs is exact.
-            (
-                dir_size_recursive(&onnx_primary),
-                dir_size_recursive(&pytorch_base),
-            )
+        let size = if def.subdir.is_some() {
+            dir_size_recursive(&onnx_primary) + dir_size_recursive(&onnx_legacy)
         } else {
-            (clip_root_size(onnx_models_dir), clip_root_size(models_dir))
-        };
-        let size = onnx_primary_size + legacy_shared_size;
-
-        let active_runtime = match global_runtime {
-            Some(RequiredModelRuntime::Onnx) if onnx_installed => Some("onnx"),
-            Some(RequiredModelRuntime::Pytorch) if pytorch_installed => Some("pytorch"),
-            _ => None,
-        };
-
-        let path = match active_runtime {
-            Some("pytorch") => pytorch_base.clone(),
-            Some("onnx") => onnx_path.clone(),
-            None if prefer_onnx && onnx_primary_size > 0 => onnx_primary.clone(),
-            None if legacy_shared_size > 0 => pytorch_base.clone(),
-            None if onnx_primary_size > 0 => onnx_primary.clone(),
-            None if prefer_onnx => onnx_path.clone(),
-            None => pytorch_base.clone(),
-            Some(_) => unreachable!("unsupported model runtime"),
+            clip_root_size(onnx_models_dir) + clip_root_size(models_dir)
         };
 
         entries.push(ModelInventoryEntry {
             id: def.id.to_string(),
             display_name: def.display_name.to_string(),
             purpose: def.purpose,
-            installed: onnx_installed || pytorch_installed,
-            active_runtime,
+            installed: onnx_installed,
+            active_runtime: onnx_installed.then_some("onnx"),
             size,
-            path: path.to_string_lossy().to_string(),
-            variants: vec![
-                ModelVariantStatus {
-                    runtime: "onnx",
-                    path: onnx_path.to_string_lossy().to_string(),
-                    installed: onnx_installed,
-                },
-                ModelVariantStatus {
-                    runtime: "pytorch",
-                    path: pytorch_base.to_string_lossy().to_string(),
-                    installed: pytorch_installed,
-                },
-            ],
+            path: onnx_path.to_string_lossy().to_string(),
+            variants: vec![ModelVariantStatus {
+                runtime: "onnx",
+                path: onnx_path.to_string_lossy().to_string(),
+                installed: onnx_installed,
+            }],
         });
     }
     entries
@@ -1132,9 +859,7 @@ fn collect_model_inventory(
         .ok_or_else(|| "Could not determine local appdata directory.".to_string())?;
     let models_dir = appdata_dir.join("models");
     let onnx_models_dir = appdata_dir.join("models-onnx");
-    let prefer_onnx = registry_config::get_bool("use_onnx").unwrap_or(true);
-
-    let mut entries = required_model_entries(&models_dir, &onnx_models_dir, prefer_onnx);
+    let mut entries = required_model_entries(&models_dir, &onnx_models_dir);
     entries.push(reranker_entry(&models_dir));
 
     if let Some(status) = ocr_status {
@@ -1207,29 +932,6 @@ mod tests {
         fs::write(path, b"x").expect("write model marker");
     }
 
-    fn write_complete_pytorch_models(models_dir: &Path) {
-        for rel in [
-            "vocab.txt",
-            "pytorch_model.bin",
-            "config.json",
-            "preprocessor_config.json",
-            "bge-small-zh-v1.5/config.json",
-            "bge-small-zh-v1.5/pytorch_model.bin",
-            "bge-small-zh-v1.5/tokenizer.json",
-            "bge-small-zh-v1.5/tokenizer_config.json",
-            "bge-small-zh-v1.5/vocab.txt",
-            "bge-small-zh-v1.5/special_tokens_map.json",
-            "paraphrase-multilingual-MiniLM-L12-v2/config.json",
-            "paraphrase-multilingual-MiniLM-L12-v2/pytorch_model.bin",
-            "paraphrase-multilingual-MiniLM-L12-v2/tokenizer.json",
-            "paraphrase-multilingual-MiniLM-L12-v2/tokenizer_config.json",
-            "paraphrase-multilingual-MiniLM-L12-v2/special_tokens_map.json",
-            "paraphrase-multilingual-MiniLM-L12-v2/sentencepiece.bpe.model",
-        ] {
-            touch(models_dir, rel);
-        }
-    }
-
     fn write_complete_clip_onnx(base: &Path) {
         for rel in [
             "vocab.txt",
@@ -1252,20 +954,6 @@ mod tests {
         ] {
             touch(base, rel);
         }
-    }
-
-    #[test]
-    fn test_required_models_detect_complete_pytorch_without_onnx() {
-        let tmp = tempfile::tempdir().expect("create temp dir");
-        let models_dir = tmp.path().join("models");
-        let onnx_models_dir = tmp.path().join("models-onnx");
-        write_complete_pytorch_models(&models_dir);
-
-        assert!(!required_onnx_complete_with_fallback(
-            &onnx_models_dir,
-            &models_dir
-        ));
-        assert!(required_pytorch_complete(&models_dir));
     }
 
     #[test]
@@ -1301,28 +989,34 @@ mod tests {
         let primary_minilm = onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
         write_complete_text_onnx(&primary_minilm);
 
-        assert!(required_onnx_complete_with_fallback(
-            &onnx_models_dir,
-            &models_dir
-        ));
-
-        let paths =
-            resolve_required_model_paths(RequiredModelRuntime::Onnx, &models_dir, &onnx_models_dir);
-        assert_eq!(paths.clip_path, onnx_models_dir);
-        assert_eq!(paths.bge_path, legacy_bge);
-        assert_eq!(paths.minilm_path, primary_minilm);
+        assert_eq!(
+            resolve_onnx_path(
+                onnx_models_dir.join("bge-small-zh-v1.5"),
+                legacy_bge.clone(),
+                bge_onnx_missing,
+            ),
+            Some(legacy_bge)
+        );
+        assert_eq!(
+            resolve_onnx_path(
+                onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
+                models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
+                minilm_onnx_missing,
+            ),
+            Some(primary_minilm)
+        );
     }
 
     #[test]
     fn test_model_catalog_rejects_unknown_ids_and_pins_revisions() {
-        assert!(model_download_spec("unknown", true).is_none());
+        assert!(model_download_spec("unknown").is_none());
         for model_id in [
             "chinese-clip",
             "bge-small-zh",
             "minilm-l12",
             "bge-reranker-v2-m3",
         ] {
-            let spec = model_download_spec(model_id, true).expect("known model");
+            let spec = model_download_spec(model_id).expect("known model");
             assert_eq!(spec.revision.len(), 40);
             assert!(!spec.files.is_empty());
             assert!(spec.files.iter().all(|file| !file.contains("..")));
@@ -1345,13 +1039,13 @@ mod tests {
     #[test]
     fn inventory_reports_logical_models_instead_of_directory_names() {
         // Reproduces the layout that used to render as pseudo-rows named
-        // "onnx", "pytorch_model.bin", and unknown "bge-reranker-v2-m3".
+        // "onnx" and unknown "bge-reranker-v2-m3".
         let tmp = tempfile::tempdir().expect("create temp dir");
         let models_dir = tmp.path().join("models");
         let onnx_models_dir = tmp.path().join("models-onnx");
-        write_complete_pytorch_models(&models_dir);
-        touch(&models_dir, "onnx/model_q4.onnx");
-        touch(&models_dir, "tokenizer.json");
+        write_complete_clip_onnx(&models_dir);
+        write_complete_text_onnx(&models_dir.join("bge-small-zh-v1.5"));
+        write_complete_text_onnx(&models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"));
         for rel in [
             "config.json",
             "tokenizer.json",
@@ -1362,7 +1056,7 @@ mod tests {
             touch(&models_dir.join("bge-reranker-v2-m3"), rel);
         }
 
-        let mut entries = required_model_entries(&models_dir, &onnx_models_dir, true);
+        let mut entries = required_model_entries(&models_dir, &onnx_models_dir);
         entries.push(reranker_entry(&models_dir));
 
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
@@ -1380,9 +1074,7 @@ mod tests {
 
         let clip = &entries[0];
         assert_eq!(clip.purpose, "image_embedding");
-        // ONNX text models are incomplete, so the runtime falls back to
-        // PyTorch even though the CLIP ONNX weights exist at the legacy root.
-        assert_eq!(clip.active_runtime, Some("pytorch"));
+        assert_eq!(clip.active_runtime, Some("onnx"));
         assert!(clip
             .variants
             .iter()
@@ -1398,14 +1090,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let models_dir = tmp.path().join("models");
         let onnx_models_dir = tmp.path().join("models-onnx");
-        touch(&models_dir, "pytorch_model.bin");
         touch(&models_dir, "onnx/model_q4.onnx");
-        touch(&models_dir, "bge-small-zh-v1.5/pytorch_model.bin");
         touch(&models_dir, "bge-reranker-v2-m3/onnx/model_uint8.onnx");
         touch(&models_dir, "ocr/ppocrv5-ch-mobile/det.onnx");
 
-        // Each touched file is 1 byte; only the two CLIP files may count.
-        assert_eq!(clip_root_size(&models_dir), 2);
+        // Only the CLIP ONNX file may count; sibling model directories do not.
+        assert_eq!(clip_root_size(&models_dir), 1);
         assert_eq!(clip_root_size(&onnx_models_dir), 0);
     }
 
@@ -1415,23 +1105,9 @@ mod tests {
         let models_dir = tmp.path().join("models");
         let onnx_models_dir = tmp.path().join("models-onnx");
 
-        let mut entries = required_model_entries(&models_dir, &onnx_models_dir, true);
+        let mut entries = required_model_entries(&models_dir, &onnx_models_dir);
         entries.push(reranker_entry(&models_dir));
         assert!(entries.iter().all(|e| !e.installed && e.size == 0));
-    }
-
-    #[test]
-    fn configured_pytorch_does_not_report_onnx_as_active() {
-        let tmp = tempfile::tempdir().expect("create temp dir");
-        let models_dir = tmp.path().join("models");
-        let onnx_models_dir = tmp.path().join("models-onnx");
-        write_complete_clip_onnx(&onnx_models_dir);
-        write_complete_text_onnx(&onnx_models_dir.join("bge-small-zh-v1.5"));
-        write_complete_text_onnx(&onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"));
-
-        let entries = required_model_entries(&models_dir, &onnx_models_dir, false);
-        assert!(entries.iter().all(|entry| entry.installed));
-        assert!(entries.iter().all(|entry| entry.active_runtime.is_none()));
     }
 
     #[test]
@@ -1442,7 +1118,7 @@ mod tests {
         let partial_bge = models_dir.join("bge-small-zh-v1.5");
         touch(&partial_bge, "config.json");
 
-        let entries = required_model_entries(&models_dir, &onnx_models_dir, true);
+        let entries = required_model_entries(&models_dir, &onnx_models_dir);
         let bge = entries
             .iter()
             .find(|entry| entry.id == "bge-small-zh")

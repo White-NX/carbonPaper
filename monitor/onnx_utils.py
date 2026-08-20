@@ -19,10 +19,6 @@ def get_data_dir() -> str:
         raise RuntimeError('LOCALAPPDATA environment variable not set')
     return os.path.join(local_appdata, 'CarbonPaper', 'data')
 
-def is_onnx_testing_enabled() -> bool:
-    """Check if the ONNX inference testing is enabled via environment variable."""
-    return os.environ.get("CARBONPAPER_USE_ONNX", "").strip().lower() in _TRUE_VALUES
-
 def get_onnx_model_path(model_dir: str, model_name: str) -> str:
     """Construct and return the absolute path if the ONNX model file exists, else empty string."""
     path = os.path.join(model_dir, model_name)

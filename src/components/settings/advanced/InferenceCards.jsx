@@ -28,7 +28,6 @@ function ChangedNotice({
     </div>
   );
 }
-
 export function OcrEngineCard({
   config,
   status,
@@ -115,7 +114,6 @@ export function OcrEngineCard({
     </div>
   );
 }
-
 export function DmlAccelerationCard({
   config,
   monitorStatus,
@@ -218,30 +216,10 @@ export function DmlAccelerationCard({
     </div>
   );
 }
-
-/**
- * Retrieval of screenshot text: the rollback lever and the local diagnostic the
- * enum rule requires. Deliberately small — it reports which backend answered
- * the last query and why Rust stood down, not a percentile table. The retired
- * shadow card was a development instrument; this is not.
- *
- * The scope this card covers is narrower than "semantic search", and the label
- * says so now. It is the MiniLM path over the text of a screenshot, which
- * serves the natural-language grouping view and Smart Cluster calibration. The
- * main search box's natural-language mode is Chinese-CLIP over images and is
- * untouched by anything here.
- *
- * The one action it carries is the manual indexing run, which exists because
- * capture-side indexing waits for an idle window on mains power. That is the
- * right default and a poor fit for a machine that is rarely either, so the
- * roadmap's "idle *or* an explicit manual run" needs its second half reachable
- * next to the backlog number that motivates pressing it.
- */
+/** MiniLM text-index health and its explicit manual indexing path. */
 export function SemanticBackendCard({
-  config,
   status,
   statusLoading,
-  onToggleRustIndex,
   onRefresh,
   onRunIndexNow,
   onStopIndexNow,
@@ -252,17 +230,11 @@ export function SemanticBackendCard({
 }) {
   const { t } = useTranslation();
   const backend = status?.backend;
-  const usesRustIndex = (config.semantic_index || 'rust') === 'rust';
   // Captures waiting for an idle window to be encoded. Ordinary operation, not
   // a fault, so it is shown plainly; only a stalled job — one whose retry
   // budget is spent and which nothing will pick up again — gets a warning.
   const backlog = backend?.index_backlog ?? 0;
   const stalled = backend?.index_stalled ?? 0;
-
-  const servedLabel = {
-    rust: t('settings.advanced.semantic_backend.served_rust'),
-    python: t('settings.advanced.semantic_backend.served_python'),
-  }[backend?.last_query_backend] || t('settings.advanced.semantic_backend.served_unknown');
 
   // A finished run says what it did. `started: false` means a guard refused
   // before any encoding happened, which is a different message from "ran and
@@ -309,19 +281,13 @@ export function SemanticBackendCard({
       </label>
 
       <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex-1 min-w-0">
-            <p className="text-sm text-ide-text font-medium">
-              {t('settings.advanced.semantic_backend.label')}
-            </p>
-            <p className="text-xs text-ide-muted mt-1">
-              {t('settings.advanced.semantic_backend.description')}
-            </p>
-            <p className="text-xs text-ide-muted mt-1">
-              {t('settings.advanced.semantic_backend.rollback_note')}
-            </p>
-          </div>
-          <SettingsSwitch checked={usesRustIndex} onChange={() => onToggleRustIndex(!usesRustIndex)} />
+        <div>
+          <p className="text-sm text-ide-text font-medium">
+            {t('settings.advanced.semantic_backend.label')}
+          </p>
+          <p className="text-xs text-ide-muted mt-1">
+            {t('settings.advanced.semantic_backend.description')}
+          </p>
         </div>
 
         <div className="rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3 space-y-2">
@@ -340,8 +306,6 @@ export function SemanticBackendCard({
           </div>
 
           <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-            <span className="text-ide-muted">{t('settings.advanced.semantic_backend.last_query')}</span>
-            <span className="text-ide-text text-right">{servedLabel}</span>
             <span className="text-ide-muted">{t('settings.advanced.semantic_backend.indexed')}</span>
             <span className="text-ide-text text-right">{backend?.indexed_vectors ?? '—'}</span>
             <span className="text-ide-muted">{t('settings.advanced.semantic_backend.backlog')}</span>
@@ -352,13 +316,13 @@ export function SemanticBackendCard({
                 <span className="text-ide-warning text-right">{stalled}</span>
               </>
             )}
-            <span className="text-ide-muted">{t('settings.advanced.semantic_backend.fallbacks')}</span>
-            <span className="text-ide-text text-right">{backend?.fallback_count ?? 0}</span>
+            <span className="text-ide-muted">{t('settings.advanced.semantic_backend.failures')}</span>
+            <span className="text-ide-text text-right">{backend?.failure_count ?? 0}</span>
           </div>
 
-          {backend?.last_fallback_reason && (
+          {backend?.last_error && (
             <p className="text-[11px] text-ide-warning-muted leading-snug">
-              {t('settings.advanced.semantic_backend.last_reason')}: {backend.last_fallback_reason}
+              {t('settings.advanced.semantic_backend.last_error')}: {backend.last_error}
             </p>
           )}
           {backlog > 0 && (
@@ -386,9 +350,6 @@ export function SemanticBackendCard({
                 </div>
               )}
             </div>
-            {/* Not gated on the switch above. Capture indexing runs whichever
-                backend serves queries, so disabling the only control over it
-                while it keeps running would hide the work rather than stop it. */}
             {indexRunning ? (
               <button
                 onClick={onStopIndexNow}
@@ -414,21 +375,10 @@ export function SemanticBackendCard({
   );
 }
 
-/**
- * The M2.5 step-9 counterpart of {@link SemanticBackendCard}, for visual search.
- *
- * A separate card rather than a second row inside that one, because the two
- * govern different searches and roll back independently: this switch is the
- * main search box's natural-language mode — a text query matched against what a
- * screenshot *looks like* — while the other is the grouping view's search over
- * recognised text. A user who could not tell which was which would have no way
- * to act on either.
- */
+/** Chinese-CLIP image-index and ANN health with manual recovery actions. */
 export function ClipBackendCard({
-  config,
   status,
   statusLoading,
-  onToggleRustIndex,
   onRefresh,
   onRunIndexNow,
   onStopIndexNow,
@@ -444,7 +394,6 @@ export function ClipBackendCard({
 }) {
   const { t } = useTranslation();
   const backend = status?.clip_backend;
-  const usesRustIndex = (config.clip_index || 'rust') === 'rust';
   const backlog = backend?.index_backlog ?? 0;
   const stalled = backend?.index_stalled ?? 0;
   const annBuildUnhealthy = backend?.ann_build_state && backend.ann_build_state !== 'healthy';
@@ -459,11 +408,6 @@ export function ClipBackendCard({
     disabled: t('settings.advanced.clip_backend.ann_disabled'),
     unavailable: t('settings.advanced.clip_backend.ann_unavailable'),
   }[backend?.ann_state] || backend?.ann_state || '—';
-
-  const servedLabel = {
-    rust: t('settings.advanced.clip_backend.served_rust'),
-    python: t('settings.advanced.clip_backend.served_python'),
-  }[backend?.last_query_backend] || t('settings.advanced.clip_backend.served_unknown');
 
   const progressTotal = indexProgress?.total ?? 0;
   const progressProcessed = indexProgress?.processed ?? 0;
@@ -505,19 +449,13 @@ export function ClipBackendCard({
       </label>
 
       <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex-1 min-w-0">
-            <p className="text-sm text-ide-text font-medium">
-              {t('settings.advanced.clip_backend.label')}
-            </p>
-            <p className="text-xs text-ide-muted mt-1">
-              {t('settings.advanced.clip_backend.description')}
-            </p>
-            <p className="text-xs text-ide-muted mt-1">
-              {t('settings.advanced.clip_backend.rollback_note')}
-            </p>
-          </div>
-          <SettingsSwitch checked={usesRustIndex} onChange={() => onToggleRustIndex(!usesRustIndex)} />
+        <div>
+          <p className="text-sm text-ide-text font-medium">
+            {t('settings.advanced.clip_backend.label')}
+          </p>
+          <p className="text-xs text-ide-muted mt-1">
+            {t('settings.advanced.clip_backend.description')}
+          </p>
         </div>
 
         <div className="rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3 space-y-2">
@@ -536,8 +474,6 @@ export function ClipBackendCard({
           </div>
 
           <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-            <span className="text-ide-muted">{t('settings.advanced.clip_backend.last_query')}</span>
-            <span className="text-ide-text text-right">{servedLabel}</span>
             <span className="text-ide-muted">{t('settings.advanced.clip_backend.indexed')}</span>
             <span className="text-ide-text text-right">{backend?.indexed_vectors ?? '—'}</span>
             <span className="text-ide-muted">{t('settings.advanced.clip_backend.backlog')}</span>
@@ -548,8 +484,8 @@ export function ClipBackendCard({
                 <span className="text-ide-warning text-right">{stalled}</span>
               </>
             )}
-            <span className="text-ide-muted">{t('settings.advanced.clip_backend.fallbacks')}</span>
-            <span className="text-ide-text text-right">{backend?.fallback_count ?? 0}</span>
+            <span className="text-ide-muted">{t('settings.advanced.clip_backend.failures')}</span>
+            <span className="text-ide-text text-right">{backend?.failure_count ?? 0}</span>
             <span className="text-ide-muted">{t('settings.advanced.clip_backend.ann_status')}</span>
             <span className="text-ide-text text-right">{annStateLabel}</span>
             {backend?.ann_generation != null && (
@@ -599,9 +535,9 @@ export function ClipBackendCard({
             </div>
           )}
 
-          {backend?.last_fallback_reason && (
+          {backend?.last_error && (
             <p className="text-[11px] text-ide-warning-muted leading-snug">
-              {t('settings.advanced.clip_backend.last_reason')}: {backend.last_fallback_reason}
+              {t('settings.advanced.clip_backend.last_error')}: {backend.last_error}
             </p>
           )}
           {backlog > 0 && (
@@ -685,25 +621,13 @@ export function ClipBackendCard({
 }
 
 export function ClassificationBackendCard({
-  config,
   status,
-  monitorStatus,
-  runtimeChanged,
-  onToggleRust,
-  onRestartMonitor,
-  onClearChanged,
 }) {
   const { t } = useTranslation();
-  const usesRust = (config.classification_runtime || 'rust') === 'rust';
   const backend = status?.classification_backend;
-  const servedLabel = {
-    rust: t('settings.advanced.classification_backend.served_rust'),
-    python: t('settings.advanced.classification_backend.served_python'),
-  }[backend?.last_backend] || t('settings.advanced.classification_backend.served_unknown');
-  const activeLabel = {
-    rust: t('settings.advanced.classification_backend.runtime_rust'),
-    python: t('settings.advanced.classification_backend.runtime_python'),
-  }[backend?.active_runtime] || t('settings.advanced.classification_backend.runtime_stopped');
+  const elapsed = backend?.last_elapsed_ms == null
+    ? '—'
+    : `${Math.round(backend.last_elapsed_ms)} ms`;
 
   return (
     <div className="space-y-3">
@@ -713,111 +637,36 @@ export function ClassificationBackendCard({
       </label>
 
       <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex-1 min-w-0">
-            <p className="text-sm text-ide-text font-medium">
-              {t('settings.advanced.classification_backend.label')}
-            </p>
-            <p className="text-xs text-ide-muted mt-1">
-              {t('settings.advanced.classification_backend.description')}
-            </p>
-            <p className="text-xs text-ide-muted mt-1">
-              {t('settings.advanced.classification_backend.rollback_note')}
-            </p>
-          </div>
-          <SettingsSwitch checked={usesRust} onChange={() => onToggleRust(!usesRust)} />
+        <div>
+          <p className="text-sm text-ide-text font-medium">
+            {t('settings.advanced.classification_backend.label')}
+          </p>
+          <p className="text-xs text-ide-muted mt-1">
+            {t('settings.advanced.classification_backend.description')}
+          </p>
         </div>
 
         <div className="rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3 space-y-2">
           <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
             <span className="text-ide-muted">
-              {t('settings.advanced.classification_backend.selected')}
-            </span>
-            <span className="text-ide-text text-right">
-              {usesRust
-                ? t('settings.advanced.classification_backend.runtime_rust')
-                : t('settings.advanced.classification_backend.runtime_python')}
-            </span>
-            <span className="text-ide-muted">
-              {t('settings.advanced.classification_backend.last_inference')}
-            </span>
-            <span className="text-ide-text text-right">{servedLabel}</span>
-            <span className="text-ide-muted">
-              {t('settings.advanced.classification_backend.active')}
-            </span>
-            <span className="text-ide-text text-right">{activeLabel}</span>
-            <span className="text-ide-muted">
               {t('settings.advanced.classification_backend.successes')}
             </span>
             <span className="text-ide-text text-right">{backend?.success_count ?? 0}</span>
             <span className="text-ide-muted">
-              {t('settings.advanced.classification_backend.fallbacks')}
+              {t('settings.advanced.classification_backend.failures')}
             </span>
-            <span className="text-ide-text text-right">{backend?.fallback_count ?? 0}</span>
+            <span className="text-ide-text text-right">{backend?.failure_count ?? 0}</span>
+            <span className="text-ide-muted">
+              {t('settings.advanced.classification_backend.last_elapsed')}
+            </span>
+            <span className="text-ide-text text-right">{elapsed}</span>
           </div>
           {backend?.last_error && (
             <p className="text-[11px] text-ide-warning-muted leading-snug break-words">
-              {t('settings.advanced.classification_backend.last_reason')}: {backend.last_error}
+              {t('settings.advanced.classification_backend.last_error')}: {backend.last_error}
             </p>
           )}
         </div>
-
-        {runtimeChanged && (
-          <ChangedNotice
-            monitorStatus={monitorStatus}
-            onRestartMonitor={onRestartMonitor}
-            onClearChanged={onClearChanged}
-          >
-            {t('settings.advanced.classification_backend.changed_notice')}
-          </ChangedNotice>
-        )}
-      </div>
-    </div>
-  );
-}
-
-export function OnnxRuntimeCard({
-  config,
-  monitorStatus,
-  onnxChanged,
-  onToggle,
-  onRestartMonitor,
-  onClearChanged,
-}) {
-  const { t } = useTranslation();
-
-  return (
-    <div className="space-y-3">
-      <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
-        <Zap className="w-4 h-4" />
-        {t('settings.advanced.onnx.title')}
-      </label>
-
-      <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-4">
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex-1 min-w-0">
-            <p className="text-sm text-ide-text font-medium">
-              {t('settings.advanced.onnx.label')}
-              <SettingsHelpTooltip variant="term">{t('settings.advanced.terms.onnx')}</SettingsHelpTooltip>
-            </p>
-            <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.onnx.description')}</p>
-            <p className="text-xs text-ide-muted mt-1">{t('settings.advanced.onnx.notice')}</p>
-          </div>
-          <SettingsSwitch
-            checked={config.use_onnx}
-            onChange={() => onToggle('use_onnx')}
-          />
-        </div>
-
-        {onnxChanged && (
-          <ChangedNotice
-            monitorStatus={monitorStatus}
-            onRestartMonitor={onRestartMonitor}
-            onClearChanged={onClearChanged}
-          >
-            {t('settings.advanced.onnx.changed_notice')}
-          </ChangedNotice>
-        )}
       </div>
     </div>
   );

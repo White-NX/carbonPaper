@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use super::types::{RawRecentCaptureRow, RawScreenshotRow};
 use super::{
     wire_time, BackgroundReadError, BackgroundScreenshotSummary, DeleteQueueStatus, DensityBucket,
-    IndexStorageStats, OcrResultInput, QueueScreenshotCandidate, RecentCapture,
+    DerivedIndexKind, IndexStorageStats, OcrResultInput, QueueScreenshotCandidate, RecentCapture,
     SaveScreenshotRequest, SaveScreenshotResponse, ScreenshotRecord, SoftDeleteResult,
     SoftDeleteScreenshotsResult, StorageState,
 };
@@ -1680,7 +1680,17 @@ impl StorageState {
         Ok(IndexStorageStats {
             screenshots_count: self.count_active_screenshots()?,
             ocr_rows_count: self.count_active_ocr_rows()?,
-            expected_clip_image_rows: self.count_expected_clip_image_rows()?,
+            semantic_text_rows: self
+                .count_query_visible_embeddings(DerivedIndexKind::SemanticText)?,
+            clip_image_rows: self.count_query_visible_embeddings(DerivedIndexKind::ClipImage)?,
+            semantic_index_backlog: self.derived_index_backlog(
+                DerivedIndexKind::SemanticText,
+                crate::minilm_index::MAX_ATTEMPTS,
+            )?,
+            clip_index_backlog: self.derived_index_backlog(
+                DerivedIndexKind::ClipImage,
+                crate::clip_index::MAX_ATTEMPTS,
+            )?,
             smart_cluster_pending_count: self.count_smart_cluster_pending()?,
             delete_queue: self.get_delete_queue_status()?,
         })

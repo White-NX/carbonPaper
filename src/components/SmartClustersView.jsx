@@ -344,7 +344,6 @@ function emitAuthRequired() {
 }
 
 export default function SmartClustersView({
-  backendOnline,
   isAuthenticated = true,
   active = true,
   onSelectScreenshot,
@@ -391,7 +390,7 @@ export default function SmartClustersView({
   }, [active, isAuthenticated]);
 
   const loadStatus = useCallback(async () => {
-    if (!active || !backendOnline || !isAuthenticated) return;
+    if (!active || !isAuthenticated) return;
     try {
       const s = await getSmartClusterStatus();
       const w = await getSmartClusterWorkerStatus();
@@ -404,7 +403,7 @@ export default function SmartClustersView({
     } catch (err) {
       if (isAuthRequiredError(err)) emitAuthRequired();
     }
-  }, [active, backendOnline, isAuthenticated]);
+  }, [active, isAuthenticated]);
 
   const loadAssignments = useCallback(async (id) => {
     if (!active || !isAuthenticated || !id) { setAssignments([]); return; }
@@ -593,7 +592,6 @@ export default function SmartClustersView({
     return (
       <NlClusterView
         mode="calibrate"
-        backendOnline={backendOnline}
         onSelectScreenshot={onSelectScreenshot}
         onSaveCalibration={handleSaveCalibration}
         onCancelCalibration={() => setCreating(false)}
@@ -614,7 +612,6 @@ export default function SmartClustersView({
           <div className="flex items-center gap-1.5">
             <button
               onClick={() => setCreating(true)}
-              disabled={!backendOnline}
               className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-accent bg-ide-accent/20 text-ide-accent hover:bg-ide-accent/30 disabled:opacity-40 transition-colors"
             >
               <Plus className="w-3 h-3" />
@@ -622,7 +619,7 @@ export default function SmartClustersView({
             </button>
             <button
               onClick={handleDrainNow}
-              disabled={!backendOnline || !statusData?.pending_count || statusData?.is_running}
+              disabled={!statusData?.pending_count || statusData?.is_running}
               className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-border text-ide-muted hover:text-ide-text hover:bg-ide-hover/30 disabled:opacity-40 transition-colors"
               title={t('smartClusters.processNowTooltip', '立即处理待处理队列')}
             >

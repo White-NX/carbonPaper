@@ -24,11 +24,10 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 
 vi.mock('../../lib/monitor_api', () => ({
   fetchThumbnailBatch: vi.fn(async () => ({})),
-  getIndexHealth: vi.fn(async () => ({ status: 'success', monitor_available: false })),
+  getIndexHealth: vi.fn(async () => ({ status: 'success' })),
   getProcessMonthlyThumbnails: vi.fn(),
   getProcessStorageStats: vi.fn(async () => []),
   getSoftDeleteQueueStatus: vi.fn(async () => ({ pending_screenshots: 0, pending_ocr: 0, running: false })),
-  retryVectorIndexing: vi.fn(),
   softDeleteProcessMonth: vi.fn(),
   softDeleteScreenshots: vi.fn(),
 }));
@@ -45,10 +44,9 @@ describe('useStorageManagementController', () => {
     getSoftDeleteQueueStatus.mockClear();
   });
 
-  it('loads index health diagnostics even when the monitor is stopped', async () => {
+  it('loads Rust-owned index health diagnostics', async () => {
     getIndexHealth.mockResolvedValueOnce({
       status: 'success',
-      monitor_available: false,
       screenshots_count: 12,
       ocr_rows_count: 34,
     });
@@ -57,36 +55,33 @@ describe('useStorageManagementController', () => {
       storage: { root_path: 'C:/CarbonPaper' },
       onRefresh: vi.fn(),
       t,
-      monitorStatus: 'stopped',
     }));
 
     // Wait on the state, not on the call: the call is recorded synchronously
     // during mount, so waiting on it can return before the response is applied.
     await waitFor(() => expect(result.current.indexHealth).toMatchObject({
-      monitor_available: false,
       screenshots_count: 12,
       ocr_rows_count: 34,
     }));
-    expect(getIndexHealth).toHaveBeenCalledWith({ refreshVector: false });
+    expect(getIndexHealth).toHaveBeenCalledWith();
   });
 
-  it('does not request vector refresh from the overview refresh when the monitor is stopped', async () => {
+  it('refreshes index health without monitor-dependent options', async () => {
     const onRefresh = vi.fn();
     const { result } = renderHook(() => useStorageManagementController({
       storage: { root_path: 'C:/CarbonPaper' },
       onRefresh,
       t,
-      monitorStatus: 'stopped',
     }));
 
-    await waitFor(() => expect(getIndexHealth).toHaveBeenCalledWith({ refreshVector: false }));
+    await waitFor(() => expect(getIndexHealth).toHaveBeenCalledWith());
     getIndexHealth.mockClear();
 
     act(() => {
       result.current.handleRefresh();
     });
 
-    await waitFor(() => expect(getIndexHealth).toHaveBeenCalledWith({ refreshVector: false }));
+    await waitFor(() => expect(getIndexHealth).toHaveBeenCalledWith());
     expect(onRefresh).toHaveBeenCalledTimes(1);
   });
 
@@ -98,7 +93,6 @@ describe('useStorageManagementController', () => {
       storage: { root_path: 'C:/CarbonPaper' },
       onRefresh: vi.fn(),
       t,
-      monitorStatus: 'stopped',
     }));
 
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('storage_get_policy'));
@@ -117,7 +111,6 @@ describe('useStorageManagementController', () => {
       storage: { root_path: 'C:/CarbonPaper' },
       onRefresh: vi.fn(),
       t,
-      monitorStatus: 'stopped',
     }));
 
     await waitFor(() => expect(result.current.storageLimit).toBe('50'));
@@ -132,7 +125,6 @@ describe('useStorageManagementController', () => {
       storage: { root_path: 'C:/CarbonPaper' },
       onRefresh: vi.fn(),
       t,
-      monitorStatus: 'stopped',
     }));
 
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('storage_get_policy'));
@@ -155,7 +147,6 @@ describe('useStorageManagementController', () => {
       storage,
       onRefresh: vi.fn(),
       t,
-      monitorStatus: 'stopped',
     }));
 
     it('derives disk figures from the overview payload instead of a fixed placeholder', () => {

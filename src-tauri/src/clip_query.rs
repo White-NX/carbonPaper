@@ -6,7 +6,6 @@ use crate::clip_migration::{
     clip_document_id, clip_memory_uri, CLIP_DIMENSIONS, CLIP_VECTOR_SPACE_REVISION,
 };
 use crate::ml_protocol::MlSemanticModel;
-use crate::registry_config;
 use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{DerivedIndexKind, StorageState};
 use serde::Serialize;
@@ -31,72 +30,19 @@ const QUERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// scan this feature exists to remove.
 const QUERY_ANN_ARM_WAIT: Duration = Duration::from_secs(10);
 
-/// Python's own bound on `limit`, preserved so the two backends cannot be told
-/// apart by a caller that asks for too much.
+/// Bound on the number of results returned by one request.
 pub const MAX_CLIP_RESULTS: u32 = 200;
 /// Preserve the existing IPC/MCP deep-pagination contract. Requests whose
 /// exact over-fetch exceeds the ANN envelope explicitly use one full exact
 /// scan rather than being silently clamped to a shallower page.
 pub const MAX_CLIP_OFFSET: u32 = 10_000;
 
-const CLIP_RUNTIMES: &[&str] = &["python", "rust"];
-const CLIP_INDEXES: &[&str] = &["chroma", "dual", "rust"];
-
-const DEFAULT_CLIP_RUNTIME: &str = "rust";
-const DEFAULT_CLIP_INDEX: &str = "rust";
-
-/// Selected CLIP inference backend (`python` | `rust`).
-pub fn clip_runtime() -> String {
-    normalize_enum(
-        registry_config::get_string("clip_runtime"),
-        CLIP_RUNTIMES,
-        DEFAULT_CLIP_RUNTIME,
-    )
-}
-
-/// Selected CLIP index ownership backend (`chroma` | `dual` | `rust`).
-pub fn clip_index_backend() -> String {
-    normalize_enum(
-        registry_config::get_string("clip_index"),
-        CLIP_INDEXES,
-        DEFAULT_CLIP_INDEX,
-    )
-}
-
-/// Whether `value` names a selectable CLIP inference backend.
-///
-/// Exposed so the command that persists the choice validates against this list
-/// rather than a copy of it. Both CLIP keys first shipped readable but not
-/// writable: the readers above landed while the settings command kept its own
-/// hard-coded list of enum names, and nothing forced that list to grow with
-/// them. One owner per enum is what stops that repeating.
-pub fn is_selectable_clip_runtime(value: &str) -> bool {
-    CLIP_RUNTIMES.contains(&value)
-}
-
-/// Whether `value` names a selectable CLIP index owner.
-pub fn is_selectable_clip_index(value: &str) -> bool {
-    CLIP_INDEXES.contains(&value)
-}
-
-fn normalize_enum(value: Option<String>, allowed: &[&str], default: &str) -> String {
-    match value {
-        Some(value) if allowed.contains(&value.as_str()) => value,
-        _ => default.to_string(),
-    }
-}
-
-/// Read-only backend diagnostic, the whole of what the observable-fallback rule
-/// requires for this capability.
+/// Read-only CLIP retrieval and ANN diagnostic.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClipBackendStatus {
-    pub clip_index: String,
-    pub clip_runtime: String,
-    /// Backend that served the most recent `search_nl`.
-    pub last_query_backend: Option<String>,
-    /// Why the last Rust attempt did not serve, when it did not.
-    pub last_fallback_reason: Option<String>,
-    pub fallback_count: u64,
+    /// Most recent Rust retrieval error, cleared by the next success.
+    pub last_error: Option<String>,
+    pub failure_count: u64,
     /// Query-visible `clip_image` vectors held locally.
     pub indexed_vectors: Option<u64>,
     /// Images captured but not yet encoded, waiting for an idle window.
@@ -123,9 +69,8 @@ pub struct ClipBackendStatus {
 
 #[derive(Debug, Default)]
 struct BackendObservations {
-    last_query_backend: Option<String>,
-    last_fallback_reason: Option<String>,
-    fallback_count: u64,
+    last_error: Option<String>,
+    failure_count: u64,
 }
 
 static OBSERVATIONS: RwLock<Option<BackendObservations>> = RwLock::new(None);
@@ -171,21 +116,15 @@ fn with_observations<T>(edit: impl FnOnce(&mut BackendObservations) -> T) -> T {
     edit(guard.get_or_insert_with(BackendObservations::default))
 }
 
-fn observe_served(backend: &str) {
-    with_observations(|entry| entry.last_query_backend = Some(backend.to_string()));
+fn observe_served() {
+    with_observations(|entry| entry.last_error = None);
 }
 
-fn observe_fallback(reason: &str) {
+fn observe_failure(reason: &str) {
     with_observations(|entry| {
-        entry.last_fallback_reason = Some(reason.to_string());
-        entry.fallback_count = entry.fallback_count.saturating_add(1);
+        entry.last_error = Some(reason.to_string());
+        entry.failure_count = entry.failure_count.saturating_add(1);
     });
-}
-
-/// Mark Python as the backend that served the current query. Called after
-/// Python has actually answered, not when the fallback is decided.
-pub fn observe_python_served() {
-    observe_served("python");
 }
 
 pub fn backend_status(
@@ -210,13 +149,9 @@ fn backend_status_impl(
     let guard = OBSERVATIONS
         .read()
         .unwrap_or_else(|error| error.into_inner());
-    let (last_query_backend, last_fallback_reason, fallback_count) = match guard.as_ref() {
-        Some(entry) => (
-            entry.last_query_backend.clone(),
-            entry.last_fallback_reason.clone(),
-            entry.fallback_count,
-        ),
-        None => (None, None, 0),
+    let (last_error, failure_count) = match guard.as_ref() {
+        Some(entry) => (entry.last_error.clone(), entry.failure_count),
+        None => (None, 0),
     };
     let backlog = storage.and_then(|storage| {
         storage
@@ -255,11 +190,8 @@ fn backend_status_impl(
         .unwrap_or("healthy");
     let persisted_ann_error = ann_build.as_ref().map(|state| state.last_error.clone());
     ClipBackendStatus {
-        clip_index: clip_index_backend(),
-        clip_runtime: clip_runtime(),
-        last_query_backend,
-        last_fallback_reason,
-        fallback_count,
+        last_error,
+        failure_count,
         indexed_vectors: include_vector_count
             .then(|| {
                 storage.and_then(|storage| {
@@ -297,10 +229,8 @@ fn backend_status_impl(
 pub enum ClipQueryOutcome {
     /// Rust served it; the value is the complete `results` array.
     Served(Vec<serde_json::Value>),
-    /// The configuration does not select Rust. Not a failure, not counted.
-    NotSelected,
-    /// Rust was selected but could not serve. The caller must use Python.
-    FellBack(String),
+    /// Rust could not serve the request.
+    Unavailable(String),
 }
 
 /// One `search_nl` request, in the shape the Tauri command and the MCP tool
@@ -317,26 +247,15 @@ pub struct ClipQueryRequest<'a> {
 
 /// Offer one natural-language image query to the Rust CLIP index.
 ///
-/// Never returns an error: anything that stops Rust answering becomes
-/// `FellBack`, so the caller can serve the user from Python instead.
+/// Anything that stops Rust answering becomes `Unavailable` with a specific
+/// model, migration, or index reason.
 pub async fn try_rust_clip_query(
     app: &AppHandle,
     request: ClipQueryRequest<'_>,
 ) -> ClipQueryOutcome {
-    if clip_index_backend() != "rust" {
-        return ClipQueryOutcome::NotSelected;
-    }
-    // Serving from the Rust store necessarily encodes the query with the Rust
-    // CLIP runtime — scoring Rust-held vectors against a Python-produced query
-    // vector would mean an IPC round trip that defeats the point. So an explicit
-    // `clip_runtime = python` is honoured as a refusal rather than silently
-    // overridden; it is the second, independent rollback lever.
-    if clip_runtime() != "rust" {
-        return ClipQueryOutcome::NotSelected;
-    }
     let trimmed = request.query.trim();
     if trimmed.is_empty() {
-        observe_served("rust");
+        observe_served();
         return ClipQueryOutcome::Served(Vec::new());
     }
 
@@ -347,17 +266,16 @@ pub async fn try_rust_clip_query(
     let _foreground = semantic.foreground_lease();
 
     // A migration is rewriting the derived store; reading it would race the
-    // rewrite. Python keeps serving from Chroma throughout maintenance, so this
-    // refusal costs the user nothing.
+    // rewrite, so report the temporary unavailability explicitly.
     if crate::maintenance::is_active() {
-        return fell_back("maintenance_in_progress");
+        return unavailable("maintenance_in_progress");
     }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let settled = tokio::task::spawn_blocking(move || migration_settled(&storage))
         .await
         .unwrap_or(false);
     if !settled {
-        return fell_back("migration_incomplete");
+        return unavailable("migration_incomplete");
     }
 
     match run_rust_clip_query(app, trimmed, &request).await {
@@ -377,34 +295,22 @@ pub async fn try_rust_clip_query(
             .await
             .unwrap_or(true);
             if empty {
-                return fell_back("rust_index_empty");
+                return unavailable("rust_index_empty");
             }
-            observe_served("rust");
+            observe_served();
             ClipQueryOutcome::Served(Vec::new())
         }
         Ok(results) => {
-            observe_served("rust");
+            observe_served();
             ClipQueryOutcome::Served(results)
         }
-        Err(error) => fell_back(&error),
+        Err(error) => unavailable(&error),
     }
 }
 
-/// Mark a Python-served response with the backend that produced it. Additive:
-/// existing consumers read `results` and ignore the rest.
-pub fn tag_python_response(mut response: serde_json::Value) -> serde_json::Value {
-    if let serde_json::Value::Object(map) = &mut response {
-        map.insert(
-            "backend".to_string(),
-            serde_json::Value::String("python".to_string()),
-        );
-    }
-    response
-}
-
-fn fell_back(reason: &str) -> ClipQueryOutcome {
-    observe_fallback(reason);
-    ClipQueryOutcome::FellBack(reason.to_string())
+fn unavailable(reason: &str) -> ClipQueryOutcome {
+    observe_failure(reason);
+    ClipQueryOutcome::Unavailable(reason.to_string())
 }
 
 async fn run_rust_clip_query(
@@ -862,38 +768,6 @@ mod tests {
 
     fn json_rows(count: usize) -> Vec<serde_json::Value> {
         (0..count).map(|index| serde_json::json!(index)).collect()
-    }
-
-    #[test]
-    fn unknown_enum_values_fall_back_to_the_shipped_defaults() {
-        assert_eq!(
-            normalize_enum(Some("python".to_string()), CLIP_RUNTIMES, "rust"),
-            "python"
-        );
-        // A `rust_shadow` written by a future build, or by hand, normalizes
-        // rather than selecting a mode that does not exist.
-        assert_eq!(
-            normalize_enum(Some("rust_shadow".to_string()), CLIP_RUNTIMES, "rust"),
-            "rust"
-        );
-        assert_eq!(
-            normalize_enum(None, CLIP_INDEXES, DEFAULT_CLIP_INDEX),
-            "rust"
-        );
-    }
-
-    #[test]
-    fn the_cutover_defaults_select_rust_for_both_enums() {
-        // A cutover that left the defaults at the Python values would ship a
-        // switch nobody flips.
-        assert_eq!(
-            normalize_enum(None, CLIP_RUNTIMES, DEFAULT_CLIP_RUNTIME),
-            "rust"
-        );
-        assert_eq!(
-            normalize_enum(None, CLIP_INDEXES, DEFAULT_CLIP_INDEX),
-            "rust"
-        );
     }
 
     #[test]

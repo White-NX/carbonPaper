@@ -138,26 +138,6 @@ describe('useAdvancedSectionController', () => {
     hook.unmount();
   });
 
-  it('persists the Python classification rollback and marks it for restart', async () => {
-    clipRunActive = false;
-    const hook = renderHook(() => useAdvancedSectionController({
-      monitorStatus: 'running',
-      t,
-    }));
-
-    await waitFor(() => expect(hook.result.current.config).toEqual({}));
-
-    await act(async () => {
-      await hook.result.current.handleToggleRustClassification(false);
-    });
-
-    expect(invoke).toHaveBeenCalledWith('set_advanced_config', {
-      config: { classification_runtime: 'python' },
-    });
-    expect(hook.result.current.config.classification_runtime).toBe('python');
-    expect(hook.result.current.classificationRuntimeChanged).toBe(true);
-  });
-
   it('runs an authenticated manual ANN retry and refreshes diagnostics', async () => {
     clipRunActive = false;
     invoke.mockImplementation(async (command) => {

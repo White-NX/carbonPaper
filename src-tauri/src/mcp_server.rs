@@ -1307,9 +1307,8 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
     let start_time = args.get("start_time").and_then(Value::as_f64);
     let end_time = args.get("end_time").and_then(Value::as_f64);
 
-    // M2.5 step 9: the same Rust-first routing `monitor_search_nl` uses, so the
-    // agent and the search box cannot end up on different backends. The PII
-    // filtering below is unchanged and runs over whichever one answered.
+    // Use the same Rust CLIP path as the application search surface. The PII
+    // filtering below remains unchanged.
     let rust = crate::clip_query::try_rust_clip_query(
         &state.app_handle,
         crate::clip_query::ClipQueryRequest {
@@ -1325,23 +1324,8 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
 
     let result = match rust {
         crate::clip_query::ClipQueryOutcome::Served(results) => Value::Array(results),
-        outcome => {
-            if let crate::clip_query::ClipQueryOutcome::FellBack(reason) = &outcome {
-                tracing::info!("[CLIP] MCP search_nl fell back to Python: {reason}");
-            }
-            let monitor_state = state.app_handle.state::<MonitorState>();
-            let payload = serde_json::json!({
-                "command": "search_nl",
-                "query": query,
-                "limit": limit,
-                "offset": offset,
-                "process_names": process_names,
-                "start_time": start_time,
-                "end_time": end_time,
-            });
-            let answered = monitor::forward_command_to_python(&monitor_state, payload).await?;
-            crate::clip_query::observe_python_served();
-            answered
+        crate::clip_query::ClipQueryOutcome::Unavailable(reason) => {
+            return Err(format!("CLIP search unavailable: {reason}"));
         }
     };
 

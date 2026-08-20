@@ -84,7 +84,7 @@ export default function OcrModelRepairCard({ isOpen, onClose }) {
               <p className="text-sm text-ide-muted mt-2 leading-relaxed">
                 {installed
                   ? t('ocrModelRepair.readyDescription', '新的截图将恢复生成 OCR 文本。')
-                  : t('ocrModelRepair.description', 'CarbonPaper 仍会安全保存截图，但在模型修复前不会生成 OCR 文本，也不会回退到 JPEG 或 Python OCR。')}
+                  : t('ocrModelRepair.description', 'CarbonPaper 会继续保存截图，修复 Rust OCR 模型后即可恢复生成 OCR 文本。')}
               </p>
             </div>
           </div>

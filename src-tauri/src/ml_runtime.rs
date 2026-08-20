@@ -1192,39 +1192,10 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
     if !storage.is_session_valid() {
         return Ok(());
     }
-    let capture = app
-        .state::<Arc<crate::capture::CaptureState>>()
-        .inner()
-        .clone();
     let ids = storage.list_pending_ocr_postprocess_ids(10)?;
     for screenshot_id in ids {
         let Some(record) = storage.get_screenshot_by_id(screenshot_id)? else {
             continue;
-        };
-        // The live monitor's spawn-time ownership is authoritative. When Rust
-        // owns CLIP, Python only classifies text and must not make this retry
-        // loop read and decrypt a full image just to leave it unused.
-        let python_needs_image = app
-            .state::<crate::monitor::MonitorState>()
-            .python_owns_clip_encoding();
-        let image_bytes = if python_needs_image {
-            match storage.read_image_bytes_silent(&record.image_path) {
-                Ok((bytes, _)) => Some(bytes),
-                Err(crate::storage::BackgroundReadError::AuthRequired) => {
-                    storage.set_ocr_postprocess_status(
-                        screenshot_id,
-                        "waiting_for_auth",
-                        Some("Waiting for user authentication"),
-                    )?;
-                    continue;
-                }
-                Err(error) => {
-                    let _ = storage.record_ocr_postprocess_retry(screenshot_id, &error.to_string());
-                    continue;
-                }
-            }
-        } else {
-            None
         };
         let ocr_results = match storage.get_screenshot_ocr_results_silent(screenshot_id) {
             Ok(results) => results,
@@ -1248,14 +1219,7 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
             box_coords: result.box_coords,
         })
         .collect::<Vec<_>>();
-        if let Some(image_bytes) = image_bytes {
-            let mut cache = capture
-                .ocr_image_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            cache.insert(screenshot_id, Arc::from(image_bytes));
-        }
-        let enqueue_result = crate::capture::enqueue_python_ocr_postprocess(
+        let enqueue_result = crate::capture::enqueue_ocr_postprocess(
             app,
             screenshot_id,
             &record.image_hash,
@@ -1267,17 +1231,11 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
             &ocr_results,
         )
         .await;
-        if python_needs_image {
-            let mut cache = capture
-                .ocr_image_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            cache.remove(&screenshot_id);
-        }
         match enqueue_result {
             Ok(true) => storage.set_ocr_postprocess_status(screenshot_id, "queued", None)?,
-            Ok(false) => storage
-                .record_ocr_postprocess_retry(screenshot_id, "Python postprocess queue is full")?,
+            Ok(false) => {
+                storage.record_ocr_postprocess_retry(screenshot_id, "Postprocess queue is full")?
+            }
             Err(error) if is_monitor_unavailable_error(&error) => {
                 // Keep the row pending with its retry budget intact; the next
                 // pass retries once the monitor is reachable again.

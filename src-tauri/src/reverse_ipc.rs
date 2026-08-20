@@ -1,25 +1,20 @@
-//! Restful API Server for Storage - Windows Named Pipe Implementation
+//! Windows named-pipe services for retained Python features and browser native
+//! messaging.
 //!
-//! This module implements a reverse IPC server using Windows Named Pipes
-//! to allow external processes (like Python scripts) to send storage-related
-//! commands to the Rust backend. This is used for scenarios like browser
-//! extensions or other integrations that need to save screenshots and OCR
-//! results without going through the full capture pipeline.
+//! The authenticated reverse pipe exposes the narrow storage and inference
+//! operations needed by classification and task clustering. Browser-extension
+//! screenshot ingestion uses the separate NMH pipe in this module.
 //!
 use crate::capture::CaptureState;
-use crate::capture::OcrImageCache;
 use crate::monitor::MonitorState;
-use crate::reverse_ipc_protocol::{
-    read_ipc_frame, write_ipc_binary_frame, write_ipc_frame, StorageResponse,
-};
+use crate::reverse_ipc_protocol::{read_ipc_frame, write_ipc_frame, StorageResponse};
 #[cfg(test)]
 use crate::storage::ScreenshotRecord;
 use crate::storage::{
-    BackgroundReadError, BackgroundScreenshotSummary, OcrResultInput, SaveScreenshotRequest,
-    StorageState,
+    BackgroundReadError, BackgroundScreenshotSummary, SaveScreenshotRequest, StorageState,
 };
 use rand::RngCore;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
 use tauri::Manager;
@@ -27,70 +22,6 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer};
 use tokio::sync::{mpsc, Semaphore};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
-
-/// Commands that Python can send to Rust via the reverse IPC named pipe.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "command")]
-#[allow(dead_code)]
-pub enum StorageCommand {
-    /// Save a screenshot with image data, metadata, and optional OCR results.
-    #[serde(rename = "save_screenshot")]
-    SaveScreenshot {
-        image_data: String,
-        image_hash: String,
-        width: i32,
-        height: i32,
-        window_title: Option<String>,
-        process_name: Option<String>,
-        metadata: Option<serde_json::Value>,
-        ocr_results: Option<Vec<OcrResultInput>>,
-    },
-    /// Save a screenshot as pending, awaiting a subsequent commit or abort.
-    #[serde(rename = "save_screenshot_temp")]
-    SaveScreenshotTemp {
-        image_data: String,
-        image_hash: String,
-        width: i32,
-        height: i32,
-        window_title: Option<String>,
-        process_name: Option<String>,
-        metadata: Option<serde_json::Value>,
-    },
-    /// Commit a pending screenshot and write its OCR results.
-    #[serde(rename = "commit_screenshot")]
-    CommitScreenshot {
-        screenshot_id: String,
-        ocr_results: Option<Vec<OcrResultInput>>,
-    },
-    /// Abort a pending screenshot (delete temp files and roll back the DB record).
-    #[serde(rename = "abort_screenshot")]
-    AbortScreenshot {
-        screenshot_id: String,
-        reason: Option<String>,
-    },
-    /// Retrieve the RSA public key for encryption.
-    #[serde(rename = "get_public_key")]
-    GetPublicKey,
-    /// Encrypt plaintext data for storage in ChromaDB.
-    #[serde(rename = "encrypt_for_chromadb")]
-    EncryptForChromaDb { plaintext: String },
-    /// Decrypt data previously encrypted for ChromaDB.
-    #[serde(rename = "decrypt_from_chromadb")]
-    DecryptFromChromaDb { encrypted: String },
-    /// Check whether a screenshot with the given hash already exists.
-    #[serde(rename = "screenshot_exists")]
-    ScreenshotExists { image_hash: String },
-    #[serde(rename = "set_ocr_postprocess_status")]
-    SetOcrPostprocessStatus {
-        screenshot_id: i64,
-        status: String,
-        error: Option<String>,
-    },
-    #[serde(rename = "record_ocr_postprocess_retry")]
-    RecordOcrPostprocessRetry { screenshot_id: i64, error: String },
-}
-
-// Use OcrResultInput from crate::storage to keep a single canonical type
 
 #[cfg(test)]
 fn screenshot_record_with_ocr_json(
@@ -306,7 +237,6 @@ impl ReverseIpcServer {
     pub fn start(
         &mut self,
         storage: Arc<StorageState>,
-        ocr_cache: OcrImageCache,
         app_handle: tauri::AppHandle,
     ) -> Result<(), String> {
         let pipe_name = self.pipe_name.clone();
@@ -405,12 +335,11 @@ impl ReverseIpcServer {
 
                             // 处理客户端请求
                             let storage_clone = storage.clone();
-                            let ocr_cache_clone = ocr_cache.clone();
                             let app_clone = app_handle.clone();
                             let auth_token_clone = auth_token.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                handle_client(server, storage_clone, ocr_cache_clone, app_clone, auth_token_clone).await;
+                                handle_client(server, storage_clone, app_clone, auth_token_clone).await;
                             });
                         }
                     }
@@ -438,7 +367,6 @@ impl ReverseIpcServer {
 async fn handle_client(
     mut server: NamedPipeServer,
     storage: Arc<StorageState>,
-    ocr_cache: OcrImageCache,
     app_handle: tauri::AppHandle,
     expected_auth_token: String,
 ) {
@@ -546,42 +474,13 @@ async fn handle_client(
             .unwrap_or(false);
         requests_handled = requests_handled.saturating_add(1);
 
-        if req.get("command").and_then(|c| c.as_str()) == Some("get_temp_image") {
-            match get_temp_image_bytes(&req, &storage, &ocr_cache) {
-                Ok((image_bytes, mime_type)) => {
-                    let metadata = StorageResponse::success(serde_json::json!({
-                        "mime_type": mime_type,
-                        "binary_body_len": image_bytes.len(),
-                        "binary_frame": true,
-                    }));
-                    let metadata_bytes = serde_json::to_vec(&metadata).unwrap_or_default();
-                    if let Err(e) = write_ipc_frame(&mut server, &metadata_bytes).await {
-                        tracing::error!("Write binary metadata error: {}", e);
-                        return;
-                    }
-                    if let Err(e) = write_ipc_binary_frame(&mut server, &image_bytes).await {
-                        tracing::error!("Write binary body error: {}", e);
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let response = StorageResponse::error(&e);
-                    let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-                    if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
-                        tracing::error!("Write error: {}", e);
-                        return;
-                    }
-                }
-            }
-        } else {
-            let response = process_request(&req, &storage, &app_handle).await;
+        let response = process_request(&req, &storage, &app_handle).await;
 
-            // 发送响应
-            let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
-            if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
-                tracing::error!("Write error: {}", e);
-                return;
-            }
+        // 发送响应
+        let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
+        if let Err(e) = write_ipc_frame(&mut server, &response_bytes).await {
+            tracing::error!("Write error: {}", e);
+            return;
         }
 
         if keepalive && requests_handled % 100 == 0 {
@@ -629,33 +528,6 @@ async fn process_request(
                     serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
                 ),
                 Err(error) => StorageResponse::error(&error),
-            }
-        }
-
-        "classification_record_python_fallback" => {
-            let error = req
-                .get("error")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Rust BGE inference was unavailable");
-            crate::classification_runtime::record_python_fallback(error);
-            StorageResponse::success(serde_json::json!({ "recorded": true }))
-        }
-
-        "classification_record_python_inference" => {
-            crate::classification_runtime::record_python_inference();
-            StorageResponse::success(serde_json::json!({ "recorded": true }))
-        }
-
-        "save_screenshot" => {
-            // 解析保存截图请求
-            let request = match serde_json::from_value::<SaveScreenshotRequest>(req.clone()) {
-                Ok(r) => r,
-                Err(e) => return StorageResponse::error(&format!("Invalid request: {}", e)),
-            };
-
-            match storage.save_screenshot(&request) {
-                Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
-                Err(e) => StorageResponse::error(&e),
             }
         }
 
@@ -720,16 +592,6 @@ async fn process_request(
             "session_valid": storage.is_session_valid()
         })),
 
-        "screenshot_exists" => {
-            let image_hash = req.get("image_hash").and_then(|h| h.as_str()).unwrap_or("");
-
-            match storage.screenshot_exists(image_hash) {
-                Ok(exists) => StorageResponse::success(serde_json::json!({
-                    "exists": exists
-                })),
-                Err(e) => StorageResponse::error(&e),
-            }
-        }
         "set_ocr_postprocess_status" => {
             let screenshot_id = req
                 .get("screenshot_id")
@@ -763,131 +625,6 @@ async fn process_request(
             match storage.record_ocr_postprocess_retry(screenshot_id, error) {
                 Ok(()) => StorageResponse::success(serde_json::json!({ "updated": true })),
                 Err(error) => StorageResponse::error(&error),
-            }
-        }
-        "save_screenshot_temp" => {
-            let request = match serde_json::from_value::<SaveScreenshotRequest>(req.clone()) {
-                Ok(r) => r,
-                Err(e) => return StorageResponse::error(&format!("Invalid request: {}", e)),
-            };
-
-            match storage.save_screenshot_temp(&request) {
-                Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
-                Err(e) => StorageResponse::error(&e),
-            }
-        }
-        "commit_screenshot" => {
-            // Accept screenshot_id as number or string
-            let screenshot_id_val = req.get("screenshot_id").cloned();
-            let screenshot_id = match screenshot_id_val {
-                Some(v) => {
-                    if v.is_i64() {
-                        v.as_i64().unwrap_or(-1)
-                    } else if v.is_u64() {
-                        v.as_u64().map(|x| x as i64).unwrap_or(-1)
-                    } else if v.is_string() {
-                        v.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1)
-                    } else {
-                        -1
-                    }
-                }
-                None => -1,
-            };
-
-            if screenshot_id < 0 {
-                return StorageResponse::error("Invalid screenshot_id");
-            }
-
-            // Parse ocr_results strictly: fail the whole request if any entry is invalid
-            // If parsing fails, ensure we abort the pending screenshot to avoid leaking .pending files
-            let ocr_results = match req.get("ocr_results") {
-                Some(v) => {
-                    let arr = match v.as_array() {
-                        Some(arr) => arr,
-                        None => {
-                            let msg = "ocr_results must be an array when provided";
-                            if let Err(e) = storage.abort_screenshot(screenshot_id, Some(msg)) {
-                                tracing::error!(
-                                    "Failed to abort screenshot {}: {}",
-                                    screenshot_id,
-                                    e
-                                );
-                            }
-                            return StorageResponse::error(msg);
-                        }
-                    };
-
-                    let mut results = Vec::with_capacity(arr.len());
-                    for (idx, item) in arr.iter().enumerate() {
-                        match serde_json::from_value::<OcrResultInput>(item.clone()) {
-                            Ok(parsed) => results.push(parsed),
-                            Err(e) => {
-                                let msg = format!("Invalid ocr_results[{}]: {}", idx, e);
-                                if let Err(abort_err) =
-                                    storage.abort_screenshot(screenshot_id, Some(&msg))
-                                {
-                                    tracing::error!(
-                                        "Failed to abort screenshot {}: {}",
-                                        screenshot_id,
-                                        abort_err
-                                    );
-                                }
-                                return StorageResponse::error(&msg);
-                            }
-                        }
-                    }
-
-                    Some(results)
-                }
-                None => None,
-            };
-
-            // Extract category from request (may be provided by Python classification)
-            let category = req
-                .get("category")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let category_confidence = req.get("category_confidence").and_then(|v| v.as_f64());
-
-            match storage.commit_screenshot(
-                screenshot_id,
-                ocr_results.as_ref(),
-                category.as_deref(),
-                category_confidence,
-            ) {
-                Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
-                Err(e) => StorageResponse::error(&e),
-            }
-        }
-        "abort_screenshot" => {
-            let screenshot_id_val = req.get("screenshot_id").cloned();
-            let screenshot_id = match screenshot_id_val {
-                Some(v) => {
-                    if v.is_i64() {
-                        v.as_i64().unwrap_or(-1)
-                    } else if v.is_u64() {
-                        v.as_u64().map(|x| x as i64).unwrap_or(-1)
-                    } else if v.is_string() {
-                        v.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1)
-                    } else {
-                        -1
-                    }
-                }
-                None => -1,
-            };
-
-            if screenshot_id < 0 {
-                return StorageResponse::error("Invalid screenshot_id");
-            }
-
-            let reason = req
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            match storage.abort_screenshot(screenshot_id, reason.as_deref()) {
-                Ok(result) => StorageResponse::success(serde_json::to_value(result).unwrap()),
-                Err(e) => StorageResponse::error(&e),
             }
         }
         "update_screenshot_category" => {
@@ -965,44 +702,6 @@ async fn process_request(
             }
         }
 
-        "get_screenshots_with_ocr_by_ids" => {
-            if !storage.is_session_valid() {
-                return StorageResponse::error("AUTH_REQUIRED");
-            }
-
-            let ids: Vec<i64> = req
-                .get("ids")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
-                .unwrap_or_default();
-
-            if ids.is_empty() {
-                return StorageResponse::success(serde_json::json!({ "screenshots": [] }));
-            }
-
-            // Cap the batch size to bound work for a single IPC request.
-            const MAX_BATCH: usize = 500;
-            let ids: Vec<i64> = ids.into_iter().take(MAX_BATCH).collect();
-
-            // Fetch OCR results in silent mode. Authentication loss aborts the
-            // entire batch instead of retrying CNG once per OCR row.
-            let ocr_map = match storage.get_ocr_results_by_screenshot_ids_silent(&ids) {
-                Ok(map) => map,
-                Err(error) => return background_read_error_response(error),
-            };
-
-            match storage.get_screenshot_summaries_by_ids_silent(&ids) {
-                Ok(records) => {
-                    let out: Vec<serde_json::Value> = records
-                        .into_iter()
-                        .map(|rec| background_screenshot_with_ocr_json(rec, &ocr_map))
-                        .collect();
-                    StorageResponse::success(serde_json::json!({ "screenshots": out }))
-                }
-                Err(error) => background_read_error_response(error),
-            }
-        }
-
         // M2.5 step 5 retired three MiniLM mirror commands that lived here:
         // `upsert_minilm_derived_embeddings`, `report_minilm_import_debt`, and
         // `delete_minilm_derived_embeddings`. All three existed because Python
@@ -1013,8 +712,6 @@ async fn process_request(
         // here. Removing them rather than leaving them inert matters: a handler
         // that still accepts vectors is a second writer for a store that is
         // supposed to have exactly one.
-
-        // ============ Smart Cluster reverse IPC ============
         "get_idle_state" => {
             use std::sync::atomic::Ordering;
             use tauri::Manager;
@@ -1023,106 +720,12 @@ async fn process_request(
                     "is_idle": s.is_idle.load(Ordering::SeqCst),
                     "idle_secs": s.idle_secs.load(Ordering::SeqCst),
                     "fullscreen_exclusive": s.fullscreen_exclusive.load(Ordering::SeqCst),
-                    // Additive. The Python Smart Cluster worker gates on
-                    // `is_idle` alone, which already accounts for battery; this
-                    // is here so a log line from that worker can say which of
-                    // the three signals closed the gate.
+                    // Additive. The retained Python task-clustering scheduler
+                    // gates on `is_idle` alone, which already accounts for
+                    // battery; this lets diagnostics identify the gate signal.
                     "ac_connected": s.ac_connected.load(Ordering::SeqCst),
                 })),
                 None => StorageResponse::error("IdleState not initialised"),
-            }
-        }
-
-        "smart_cluster_list_enabled" => match storage.list_smart_clusters() {
-            Ok(clusters) => {
-                let enabled: Vec<serde_json::Value> = clusters
-                    .into_iter()
-                    .filter(|c| c.enabled)
-                    .map(|c| {
-                        serde_json::json!({
-                            "id": c.id,
-                            "anchor_text": c.anchor_text,
-                            "threshold": c.threshold,
-                        })
-                    })
-                    .collect();
-                StorageResponse::success(serde_json::json!({ "clusters": enabled }))
-            }
-            Err(e) => StorageResponse::error(&e),
-        },
-
-        "smart_cluster_enqueue_pending" => {
-            let id = req
-                .get("screenshot_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            if id <= 0 {
-                return StorageResponse::error("missing screenshot_id");
-            }
-            match storage.enqueue_smart_cluster_pending(id) {
-                Ok(()) => StorageResponse::success(serde_json::json!({ "ok": true })),
-                Err(e) => StorageResponse::error(&e),
-            }
-        }
-
-        "smart_cluster_peek_pending" => {
-            let limit = req
-                .get("limit")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(32)
-                .clamp(1, 256);
-            match storage.peek_smart_cluster_pending_batch(limit) {
-                Ok(ids) => StorageResponse::success(serde_json::json!({ "ids": ids })),
-                Err(e) => StorageResponse::error(&e),
-            }
-        }
-
-        "smart_cluster_delete_pending" => {
-            let ids: Vec<i64> = req
-                .get("ids")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
-                .unwrap_or_default();
-            if ids.is_empty() {
-                return StorageResponse::success(serde_json::json!({ "ok": true, "deleted": 0 }));
-            }
-            // Cap to bound per-IPC work; the worker batch is ≤256 so this is
-            // a defence-in-depth check, not a normal-case limit.
-            const MAX_BATCH: usize = 1000;
-            let ids: Vec<i64> = ids.into_iter().take(MAX_BATCH).collect();
-            let count = ids.len() as i64;
-            match storage.delete_smart_cluster_pending_ids(&ids) {
-                Ok(()) => {
-                    StorageResponse::success(serde_json::json!({ "ok": true, "deleted": count }))
-                }
-                Err(e) => StorageResponse::error(&e),
-            }
-        }
-
-        "smart_cluster_count_pending" => match storage.count_smart_cluster_pending() {
-            Ok(n) => StorageResponse::success(serde_json::json!({ "count": n })),
-            Err(e) => StorageResponse::error(&e),
-        },
-
-        "smart_cluster_record_assignment" => {
-            let cluster_id = req
-                .get("smart_cluster_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let screenshot_id = req
-                .get("screenshot_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let score = req
-                .get("rerank_score")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            if cluster_id <= 0 || screenshot_id <= 0 {
-                return StorageResponse::error("missing smart_cluster_id or screenshot_id");
-            }
-            match storage.record_smart_cluster_assignment(cluster_id, screenshot_id, score) {
-                Ok(()) => StorageResponse::success(serde_json::json!({ "ok": true })),
-                Err(e) => StorageResponse::error(&e),
             }
         }
 
@@ -1137,54 +740,6 @@ async fn process_request(
         );
     }
     response
-}
-
-fn parse_screenshot_id(req: &serde_json::Value) -> Result<i64, String> {
-    let Some(v) = req.get("screenshot_id") else {
-        return Err("Invalid screenshot_id".to_string());
-    };
-    let screenshot_id = if v.is_i64() {
-        v.as_i64().unwrap_or(-1)
-    } else if v.is_u64() {
-        v.as_u64().map(|x| x as i64).unwrap_or(-1)
-    } else if v.is_string() {
-        v.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1)
-    } else {
-        -1
-    };
-    if screenshot_id < 0 {
-        Err("Invalid screenshot_id".to_string())
-    } else {
-        Ok(screenshot_id)
-    }
-}
-
-fn get_temp_image_bytes(
-    req: &serde_json::Value,
-    storage: &StorageState,
-    ocr_cache: &OcrImageCache,
-) -> Result<(Vec<u8>, String), String> {
-    let screenshot_id = parse_screenshot_id(req)?;
-
-    let cached = {
-        let cache = ocr_cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache.get(&screenshot_id).cloned()
-    };
-
-    if let Some(jpeg_bytes) = cached {
-        return Ok((jpeg_bytes.to_vec(), "image/jpeg".to_string()));
-    }
-
-    match storage.get_screenshot_by_id(screenshot_id) {
-        Ok(Some(record)) => {
-            let (bytes, mime) = storage
-                .read_image_bytes(&record.image_path)
-                .map_err(|e| format!("Failed to read image: {}", e))?;
-            Ok((bytes, mime))
-        }
-        Ok(None) => Err("Screenshot not found".to_string()),
-        Err(e) => Err(e),
-    }
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -1750,22 +1305,13 @@ async fn process_nmh_request(
 
                     // Dispatch to OCR pipeline if we have a screenshot_id
                     if let Some(screenshot_id) = result.screenshot_id {
-                        // Store storage JPEG in cache for Python post-processing only.
-                        {
-                            let mut cache = capture_state
-                                .ocr_image_cache
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            cache.insert(screenshot_id, jpeg_bytes.clone());
-                        }
-
                         // Spawn async OCR task
                         let storage_arc = storage.clone();
                         let app_clone = app_handle.clone();
                         let window_title = page_title.unwrap_or_default();
                         let timestamp_ms = chrono::Utc::now().timestamp_millis();
 
-                        let ocr_guard = ocr_slot.into_task_guard(screenshot_id);
+                        let ocr_guard = ocr_slot.into_task_guard();
                         tokio::spawn(async move {
                             let _ocr_guard = ocr_guard;
                             let route = crate::capture::OcrRouteConfig::from_app(&app_clone);
@@ -2345,68 +1891,6 @@ mod tests {
         ));
         let resized = resize_extension_ocr_image(image);
         assert_eq!(resized.dimensions(), (1200, 800));
-    }
-
-    #[test]
-    fn test_storage_command_deserialize_save_screenshot_temp() {
-        let payload = serde_json::json!({
-            "command": "save_screenshot_temp",
-            "image_data": "base64",
-            "image_hash": "h123",
-            "width": 1920,
-            "height": 1080,
-            "window_title": "Editor",
-            "process_name": "code.exe",
-            "metadata": {"k": "v"}
-        });
-
-        let cmd: StorageCommand = serde_json::from_value(payload).unwrap();
-        match cmd {
-            StorageCommand::SaveScreenshotTemp {
-                image_hash,
-                width,
-                height,
-                ..
-            } => {
-                assert_eq!(image_hash, "h123");
-                assert_eq!(width, 1920);
-                assert_eq!(height, 1080);
-            }
-            _ => panic!("expected SaveScreenshotTemp"),
-        }
-    }
-
-    #[test]
-    fn test_storage_command_deserialize_commit_screenshot() {
-        let payload = serde_json::json!({
-            "command": "commit_screenshot",
-            "screenshot_id": "42",
-            "ocr_results": []
-        });
-
-        let cmd: StorageCommand = serde_json::from_value(payload).unwrap();
-        match cmd {
-            StorageCommand::CommitScreenshot {
-                screenshot_id,
-                ocr_results,
-            } => {
-                assert_eq!(screenshot_id, "42");
-                assert!(ocr_results.is_some());
-            }
-            _ => panic!("expected CommitScreenshot"),
-        }
-    }
-
-    #[test]
-    fn test_storage_command_unknown_tag_rejected() {
-        let payload = serde_json::json!({
-            "command": "list_screenshots_for_clustering",
-            "start_ts": 0,
-            "end_ts": 1
-        });
-
-        let result: Result<StorageCommand, _> = serde_json::from_value(payload);
-        assert!(result.is_err());
     }
 
     #[test]

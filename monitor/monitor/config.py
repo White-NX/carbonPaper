@@ -83,9 +83,6 @@ USER_EXCLUDED_PROCESSES: set = set()
 USER_EXCLUDED_TITLES: set = set()
 IGNORE_PROTECTED_WINDOWS: bool = True
 
-# Advanced capture config (synced from Rust CaptureState)
-_ocr_timeout_secs: int = int(os.environ.get("CARBONPAPER_OCR_TIMEOUT_SECS", "120") or "120")
-
 FILTER_SETTINGS_PATH = os.path.join(get_data_dir(), "monitor_filters.json")
 
 # ---------------------------------------------------------------------------
@@ -192,13 +189,6 @@ def get_exclusion_settings():
         "titles": sorted(USER_EXCLUDED_TITLES),
         "ignore_protected": IGNORE_PROTECTED_WINDOWS,
     }
-
-
-def update_advanced_capture_config(ocr_timeout_secs: int = None):
-    """Update advanced capture configuration (called via IPC, takes effect immediately)."""
-    global _ocr_timeout_secs
-    if ocr_timeout_secs is not None:
-        _ocr_timeout_secs = max(30, min(600, int(ocr_timeout_secs)))
 
 
 # Load persisted settings on module import

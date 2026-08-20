@@ -17,7 +17,6 @@ import {
   getIndexHealth,
   getSmartClusterWorkerStatus,
   removeLocalAnchorsByProcess,
-  retryVectorIndexing,
 } from './monitor_api';
 import {
   createSmartCluster,
@@ -59,8 +58,7 @@ describe('API contract payloads', () => {
         is_force_running: false,
         unverifiable_thresholds: 2,
       })
-      .mockResolvedValueOnce({ status: 'success', screenshots_count: 10 })
-      .mockResolvedValueOnce({ status: 'success', enqueued: 2 });
+      .mockResolvedValueOnce({ status: 'success', screenshots_count: 10 });
 
     await classifyDebug({ title: 'Editor', ocrText: 'text', processName: 'code.exe' });
     await removeLocalAnchorsByProcess('Development', 'code.exe');
@@ -74,8 +72,7 @@ describe('API contract payloads', () => {
       // the retired scorer and could not be re-derived.
       unverifiableThresholds: 2,
     });
-    await getIndexHealth({ refreshVector: true });
-    await retryVectorIndexing(12);
+    await getIndexHealth();
 
     expect(invoke).toHaveBeenNthCalledWith(1, 'monitor_classify_debug', {
       title: 'Editor',
@@ -94,21 +91,15 @@ describe('API contract payloads', () => {
       endTime: 1000000,
     });
     expect(invoke).toHaveBeenNthCalledWith(5, 'monitor_smart_cluster_worker_status');
-    expect(invoke).toHaveBeenNthCalledWith(6, 'storage_get_index_health', {
-      refreshVector: true,
-    });
-    expect(invoke).toHaveBeenNthCalledWith(7, 'storage_retry_vector_indexing', {
-      limit: 12,
-    });
+    expect(invoke).toHaveBeenNthCalledWith(6, 'storage_get_index_health');
 
-    expect(withAuth).toHaveBeenCalledTimes(7);
+    expect(withAuth).toHaveBeenCalledTimes(6);
     expectWithAuth(1, { autoPrompt: true });
     expectWithAuth(2, { autoPrompt: true });
     expectWithAuth(3, { autoPrompt: true });
     expectWithAuth(4, { autoPrompt: true });
     expectWithAuth(5);
     expectWithAuth(6, { autoPrompt: true });
-    expectWithAuth(7, { autoPrompt: true });
   });
 
   it('sends task and natural-language clustering payloads', async () => {
@@ -117,22 +108,19 @@ describe('API contract payloads', () => {
         results: [{ id: 1 }],
         reranked: true,
         rerank_variant: 'uint8',
-        backend: 'python',
+        backend: 'rust',
       })
       .mockResolvedValueOnce({ task_id: 7, screenshots: [] })
       .mockResolvedValueOnce(99)
       .mockResolvedValueOnce([101, 102]);
 
-    // `backend` survives the wrapper: a reranked query is a Smart Cluster
-    // calibration query, and the threshold derived from these scores is stored
-    // with the scorer that produced them. Here the Rust path stood down and
-    // Python answered even though Rust reranking is the configured default,
-    // which is the case the field exists for.
+    // `backend` survives the wrapper so calibration provenance remains explicit.
+    // Current production responses are Rust-served.
     await expect(nlClusterQuery('invoice', 12, true)).resolves.toEqual({
       results: [{ id: 1 }],
       reranked: true,
       rerank_variant: 'uint8',
-      backend: 'python',
+      backend: 'rust',
       // Absent on the wire means "not cancelled". The field only appears when
       // the user stopped the query, and it is a success rather than an error
       // because nothing failed.

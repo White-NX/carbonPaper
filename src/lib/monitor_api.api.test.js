@@ -48,7 +48,7 @@ describe('monitor_api command wrappers', () => {
     }
   };
 
-  it('calls nl search with monitor command payload', async () => {
+  it('calls Rust visual search with the stable command payload', async () => {
     invoke.mockResolvedValue({ results: [{ id: 1 }] });
 
     const results = await searchScreenshots('invoice', 'nl', {
