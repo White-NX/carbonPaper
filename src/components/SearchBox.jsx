@@ -4,7 +4,7 @@ import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square } from 'lucid
 import { fetchThumbnail } from '../lib/monitor_api';
 import { useSearchBoxController } from '../hooks/useSearchBoxController';
 
-export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, backendOnline, monitorPaused, handlePauseMonitor, handleResumeMonitor }) {
+export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, monitorPaused, handlePauseMonitor, handleResumeMonitor }) {
     const { t } = useTranslation();
     const {
         query,
@@ -48,7 +48,6 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         onSubmit,
         controlledMode,
         onModeChange,
-        backendOnline,
         monitorPaused,
         handlePauseMonitor,
         handleResumeMonitor,
@@ -71,9 +70,9 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                 )}
                 <div className="relative z-10 flex items-center border-r border-ide-border mr-2">
                 <button
-                    className={`p-2 text-ide-muted hover:text-ide-text transition-colors ${backendOnline === false && mode === 'ocr' ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    className="p-2 text-ide-muted hover:text-ide-text transition-colors"
                     onClick={toggleMode}
-                    title={backendOnline === false && mode === 'ocr' ? t('search.nl.disabled_hint') : (mode === 'ocr' ? t('search.switchToNL') : t('search.switchToOCR'))}
+                    title={mode === 'ocr' ? t('search.switchToNL') : t('search.switchToOCR')}
                 >
                     {mode === 'ocr' ? <Type size={16} /> : <ImageIcon size={16} />}
                 </button>
@@ -132,16 +131,14 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                         </div>
                     </button>
                     <button
-                        className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'nl' ? 'bg-ide-active border border-ide-border' : ''} ${backendOnline === false ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        className={`flex items-start gap-3 p-3 rounded hover:bg-ide-hover text-left transition-colors ${mode === 'nl' ? 'bg-ide-active border border-ide-border' : ''}`}
                         onClick={() => selectMode('nl')}
-                        title={backendOnline === false ? t('search.nl.disabled_hint') : ''}
                     >
                         <div className="mt-1 text-ide-success"><ImageIcon size={18} /></div>
                         <div>
                             <div className="text-sm font-bold text-ide-text">{t('search.mode.nl.title')}</div>
                             <div className="text-xs text-ide-muted leading-relaxed">
                                 {t('search.mode.nl.description')}
-                                {backendOnline === false && <span className="block text-xs text-red-400 mt-1">{t('search.nl.disabled_hint')}</span>}
                             </div>
                         </div>
                     </button>

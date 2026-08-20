@@ -14,7 +14,6 @@ and finally marked as unclustered noise awaiting the next HDBSCAN run.
 
 import os
 import gc
-import sys
 import json
 import time
 import base64
@@ -81,10 +80,11 @@ PACMAP_N_COMPONENTS = 15          # target dims for PaCMAP reduction
 # ---------------------------------------------------------------------------
 
 class TaskEmbedder:
-    """Singleton for paraphrase-multilingual-MiniLM-L12-v2.
+    """Singleton for the ONNX MiniLM task-clustering encoder.
 
-    Designed to be loaded on demand and **unloaded** after clustering to
-    reclaim ~200 MB of RAM.
+    The model is loaded only for a clustering pass and unloaded afterwards.
+    Task clustering is still Python-owned, but its model format is fixed to the
+    reviewed ONNX artifact; there is no PyTorch runtime fallback.
     """
 
     _instance = None
@@ -95,42 +95,59 @@ class TaskEmbedder:
             cls._instance = super().__new__(cls)
             cls._instance._model = None
             cls._instance._tokenizer = None
-            cls._instance._is_onnx = False
         return cls._instance
 
     # ---- lifecycle -------------------------------------------------------
 
     @staticmethod
-    def is_model_available() -> bool:
-        """Check whether the MiniLM model files exist on disk."""
-        model_path = os.environ.get("MINILM_MODEL_PATH")
-        if not model_path:
-            model_path = os.path.join(
-                os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                "carbonpaper",
-                "models",
-                "paraphrase-multilingual-MiniLM-L12-v2",
-            )
-        from onnx_utils import is_onnx_testing_enabled, get_onnx_model_path
-        if is_onnx_testing_enabled():
-            primary_onnx_path = os.path.join(
-                os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+    def _model_path() -> str:
+        """Return the first configured MiniLM directory with an ONNX file."""
+        explicit = os.environ.get("MINILM_MODEL_PATH")
+        local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        candidates = [
+            explicit,
+            os.path.join(
+                local_appdata,
                 "CarbonPaper",
                 "models-onnx",
                 "paraphrase-multilingual-MiniLM-L12-v2",
-            )
-            if not os.environ.get("MINILM_MODEL_PATH") and (
-                get_onnx_model_path(primary_onnx_path, "model_int8.onnx")
-                or get_onnx_model_path(primary_onnx_path, os.path.join("onnx", "model_quantized.onnx"))
+            ),
+            os.path.join(
+                local_appdata,
+                "carbonpaper",
+                "models-onnx",
+                "paraphrase-multilingual-MiniLM-L12-v2",
+            ),
+            os.path.join(
+                local_appdata,
+                "CarbonPaper",
+                "models",
+                "paraphrase-multilingual-MiniLM-L12-v2",
+            ),
+        ]
+        from onnx_utils import get_onnx_model_path
+
+        for candidate in candidates:
+            if candidate and (
+                get_onnx_model_path(candidate, "model_int8.onnx")
+                or get_onnx_model_path(candidate, os.path.join("onnx", "model_quantized.onnx"))
             ):
-                model_path = primary_onnx_path
-            has_onnx = bool(get_onnx_model_path(model_path, "model_int8.onnx") or
-                            get_onnx_model_path(model_path, os.path.join("onnx", "model_quantized.onnx")))
-            required_files = ["config.json", "tokenizer.json"]
-            return has_onnx and all(os.path.isfile(os.path.join(model_path, f)) for f in required_files)
-        else:
-            required_files = ["config.json", "pytorch_model.bin", "tokenizer.json"]
-            return all(os.path.isfile(os.path.join(model_path, f)) for f in required_files)
+                return candidate
+        return next((candidate for candidate in candidates if candidate), candidates[-1])
+
+    @staticmethod
+    def is_model_available() -> bool:
+        """Check whether the MiniLM model files exist on disk."""
+        model_path = TaskEmbedder._model_path()
+        from onnx_utils import get_onnx_model_path
+
+        onnx_file = get_onnx_model_path(model_path, "model_int8.onnx") or get_onnx_model_path(
+            model_path, os.path.join("onnx", "model_quantized.onnx")
+        )
+        required_files = ["config.json", "tokenizer.json"]
+        return bool(onnx_file) and all(
+            os.path.isfile(os.path.join(model_path, filename)) for filename in required_files
+        )
 
     def is_loaded(self) -> bool:
         return self._model is not None
@@ -144,53 +161,26 @@ class TaskEmbedder:
             if self._model is not None:
                 return
 
-            model_path = os.environ.get("MINILM_MODEL_PATH")
-            if not model_path:
-                model_path = os.path.join(
-                    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                    "carbonpaper",
-                    "models",
-                    "paraphrase-multilingual-MiniLM-L12-v2",
-                )
-
-            from onnx_utils import is_onnx_testing_enabled, get_onnx_model_path, create_onnx_session
-
-            if is_onnx_testing_enabled():
-                primary_onnx_path = os.path.join(
-                    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                    "CarbonPaper",
-                    "models-onnx",
-                    "paraphrase-multilingual-MiniLM-L12-v2",
-                )
-                if not os.environ.get("MINILM_MODEL_PATH") and (
-                    get_onnx_model_path(primary_onnx_path, "model_int8.onnx")
-                    or get_onnx_model_path(primary_onnx_path, os.path.join("onnx", "model_quantized.onnx"))
-                ):
-                    model_path = primary_onnx_path
-                onnx_file = get_onnx_model_path(model_path, "model_int8.onnx") or get_onnx_model_path(model_path, os.path.join("onnx", "model_quantized.onnx"))
-                if onnx_file:
-                    from logging_config import log_model_loading
-                    log_model_loading("MiniLM-L12-v2 (ONNX)")
-                    logger.info("Loading MiniLM-L12-v2 from ONNX: %s ...", onnx_file)
-                    from numpy_tokenizer import NumpyTokenizer
-                    self._tokenizer = NumpyTokenizer(model_path)
-                    self._model = create_onnx_session(onnx_file)
-                    self._is_onnx = True
-                    logger.info("MiniLM-L12-v2 loaded successfully via ONNX")
-                    return
-
-            from transformers import AutoTokenizer, AutoModel
+            model_path = self._model_path()
+            from onnx_utils import get_onnx_model_path, create_onnx_session
             from logging_config import log_model_loading
-            log_model_loading("MiniLM-L12-v2")
-            logger.info("Loading MiniLM-L12-v2 from %s …", model_path)
-            self._tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-            self._model = AutoModel.from_pretrained(model_path, local_files_only=True)
-            self._model.eval()
-            self._is_onnx = False
-            logger.info("MiniLM-L12-v2 loaded (device=%s)", self._model.device)
+            onnx_file = get_onnx_model_path(model_path, "model_int8.onnx") or get_onnx_model_path(
+                model_path, os.path.join("onnx", "model_quantized.onnx")
+            )
+            if not onnx_file:
+                raise ModelNotAvailableError(
+                    f"MiniLM ONNX model is missing from {model_path}"
+                )
+            log_model_loading("MiniLM-L12-v2 (ONNX)")
+            logger.info("Loading MiniLM-L12-v2 from ONNX: %s ...", onnx_file)
+            from numpy_tokenizer import NumpyTokenizer
+
+            self._tokenizer = NumpyTokenizer(model_path)
+            self._model = create_onnx_session(onnx_file)
+            logger.info("MiniLM-L12-v2 loaded successfully via ONNX")
 
     def _acquire_runtime(self, attempts: int = 3):
-        """Return a consistent ``(model, tokenizer, is_onnx)`` snapshot.
+        """Return a consistent ``(model, tokenizer)`` snapshot.
 
         The three pieces are read together under ``_lock`` so a concurrent
         :meth:`unload` cannot null one of them between the reads. The caller
@@ -198,26 +188,19 @@ class TaskEmbedder:
         landing mid-pass drops the singleton's handles while the objects
         themselves stay alive until that pass returns.
 
-        ``Reranker.rerank`` has always done exactly this — snapshot the session
-        and tokenizer under its lock, then run the forward pass outside it —
-        which is why the reranker never had this bug and this class did.
-
         The snapshot is what lets ``run_clustering`` keep unloading the model in
         its ``finally``, worth ~479 MB resident on the ONNX backend, while no
-        longer holding the manager lock across the whole run. A foreground NL
-        search encodes outside that lock on purpose, and until now ``encode``
-        read ``_is_onnx``, ``_tokenizer`` and ``_model`` as three separate
-        unguarded attribute loads, so an interleaved unload turned the third
-        one into ``'NoneType' object has no attribute 'get_inputs'``.
+        longer holding the manager lock across the whole run. Without this
+        snapshot, an interleaved unload could turn the third attribute read
+        into ``'NoneType' object has no attribute 'get_inputs'``.
         """
         for _ in range(max(1, attempts)):
             self.load()
             with self._lock:
-                # `load` assigns the tokenizer before the model on both
-                # backends, so a non-None model implies a usable tokenizer.
-                # Keep that order if either branch is ever rewritten.
+                # `load` assigns the tokenizer before the model, so a non-None
+                # model implies a usable tokenizer.
                 if self._model is not None:
-                    return self._model, self._tokenizer, self._is_onnx
+                    return self._model, self._tokenizer
         raise ModelNotAvailableError(
             "MiniLM was unloaded repeatedly while a caller was trying to use it"
         )
@@ -225,20 +208,9 @@ class TaskEmbedder:
     def unload(self):
         """Release model & tokenizer to free memory."""
         with self._lock:
-            was_onnx = self._is_onnx
             self._model = None
             self._tokenizer = None
-            self._is_onnx = False
         gc.collect()
-        # Never import Torch merely to clear its cache. In ONNX mode that
-        # would load hundreds of MiB of native DLLs during model teardown.
-        if not was_onnx and "torch" in sys.modules:
-            try:
-                torch = sys.modules["torch"]
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
         logger.info("MiniLM-L12-v2 unloaded — memory released")
 
     # ---- encoding --------------------------------------------------------
@@ -248,49 +220,25 @@ class TaskEmbedder:
         # One consistent snapshot, then a forward pass on local references only:
         # a concurrent unload() must not be able to null the model out from
         # under a pass that has already started. See _acquire_runtime.
-        model, tokenizer, is_onnx = self._acquire_runtime()
-
-        if is_onnx:
-            encoded = tokenizer(
-                texts,
-                padding=True,
-                truncation=True,
-                max_length=256,
-                return_tensors="np",
-            )
-            from onnx_utils import build_transformer_inputs
-            inputs = build_transformer_inputs(model, encoded)
-            outputs = model.run(None, inputs)
-            token_embeddings = outputs[0]
-
-            attention_mask = encoded["attention_mask"]
-            input_mask_expanded = np.expand_dims(attention_mask, axis=-1).astype(np.float32)
-            sum_embeddings = np.sum(token_embeddings * input_mask_expanded, axis=1)
-            sum_mask = np.clip(np.sum(input_mask_expanded, axis=1), a_min=1e-9, a_max=None)
-            emb = sum_embeddings / sum_mask
-
-            norm = np.linalg.norm(emb, axis=1, keepdims=True)
-            emb = emb / np.clip(norm, a_min=1e-9, a_max=None)
-            return emb
-
-        import torch
-
+        model, tokenizer = self._acquire_runtime()
         encoded = tokenizer(
             texts,
             padding=True,
             truncation=True,
             max_length=256,
-            return_tensors="pt",
+            return_tensors="np",
         )
-        with torch.no_grad():
-            out = model(**encoded)
-            # Mean pooling (standard for sentence-transformers)
-            attention_mask = encoded["attention_mask"]
-            token_embeddings = out.last_hidden_state
-            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-            emb = (token_embeddings * input_mask_expanded).sum(1) / input_mask_expanded.sum(1).clamp(min=1e-9)
-            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-        return emb.cpu().numpy()
+        from onnx_utils import build_transformer_inputs
+
+        inputs = build_transformer_inputs(model, encoded)
+        token_embeddings = model.run(None, inputs)[0]
+        attention_mask = encoded["attention_mask"]
+        input_mask_expanded = np.expand_dims(attention_mask, axis=-1).astype(np.float32)
+        sum_embeddings = np.sum(token_embeddings * input_mask_expanded, axis=1)
+        sum_mask = np.clip(np.sum(input_mask_expanded, axis=1), a_min=1e-9, a_max=None)
+        emb = sum_embeddings / sum_mask
+        norm = np.linalg.norm(emb, axis=1, keepdims=True)
+        return emb / np.clip(norm, a_min=1e-9, a_max=None)
 
     def encode_single(self, text: str) -> np.ndarray:
         """Encode one text → (384,) vector."""
@@ -1265,140 +1213,6 @@ class HotColdManager:
             m["dominant_process"] = self._decrypt(m.get("dominant_process", ""))
             out.append(m)
         return out
-
-    # ---- Natural-language retrieval (demo) -------------------------------
-
-    def query_by_text(
-        self,
-        query: str,
-        n_results: int = 30,
-        enable_rerank: bool = False,
-        rerank_overfetch: int = 4,
-        ocr_snippet_chars: int = 600,
-        rerank_variant: str = "uint8",
-    ) -> List[Dict[str, Any]]:
-        """Retrieve hot-layer snapshots most similar to a natural-language query.
-
-        Reuses the MiniLM embedder + the existing ``task_vectors`` ChromaDB
-        collection (cosine space). Returns a list ordered by descending
-        similarity; each entry includes the decrypted process/title metadata
-        so the caller can render it directly.
-
-        When ``enable_rerank`` is True, fetches ``n_results * rerank_overfetch``
-        candidates from the embedding index, pulls OCR text for each via the
-        reverse storage IPC, and re-scores with the bge-reranker-v2-m3 cross
-        encoder. The reranker sees ``process | title | OCR`` jointly with the
-        query, which gives it the context to disambiguate cases the bi-encoder
-        collapses (e.g. "神经网络" ML vs neuroscience). Each returned entry
-        gains a ``rerank_score`` field; the list is sorted by it.
-        """
-        if not query or not query.strip():
-            return []
-
-        if not TaskEmbedder.is_model_available():
-            raise ModelNotAvailableError("MiniLM model not downloaded")
-
-        collection = self.hot_collection
-        if collection is None:
-            return []
-
-        # Empty collection guard — ChromaDB raises on query against an empty index.
-        try:
-            if collection.count() == 0:
-                return []
-        except Exception:
-            pass
-
-        # How many to pull from the bi-encoder. Reranker over-fetches.
-        fetch_n = max(1, int(n_results))
-        if enable_rerank:
-            fetch_n = max(fetch_n, fetch_n * max(1, int(rerank_overfetch)))
-
-        # No manager lock around the model load, and none around the forward
-        # pass. Both were the wrong place for it: this runs in a named-pipe
-        # handler thread, and a cold load takes 1.5 s on the ONNX backend and
-        # 22 s on torch — time the manager lock must never spend, since every
-        # hot-layer write waits behind it. TaskEmbedder now hands out a
-        # consistent (model, tokenizer, backend) snapshot per call, so an
-        # unload from a finishing clustering run cannot tear the model down
-        # underneath this encode.
-        vec = self._embedder.encode_single(query.strip())
-
-        try:
-            raw = collection.query(
-                query_embeddings=[vec.tolist()],
-                n_results=fetch_n,
-                include=["metadatas", "distances"],
-            )
-        except Exception as e:
-            logger.warning("[task_clustering] query_by_text failed: %s", e)
-            return []
-
-        ids_batch = (raw.get("ids") or [[]])[0]
-        metas_batch = (raw.get("metadatas") or [[]])[0]
-        dists_batch = (raw.get("distances") or [[]])[0]
-
-        candidates: List[Dict[str, Any]] = []
-        for doc_id, meta, dist in zip(ids_batch, metas_batch, dists_batch):
-            meta = meta or {}
-            similarity = 1.0 - float(dist) if dist is not None else None
-            candidates.append({
-                "screenshot_id": int(meta.get("screenshot_id", doc_id) or 0),
-                "similarity": similarity,
-                "distance": float(dist) if dist is not None else None,
-                "timestamp": float(meta.get("timestamp", 0.0) or 0.0),
-                "process_name": self._decrypt(meta.get("process_name", "")),
-                "window_title": self._decrypt(meta.get("window_title", "")),
-                "category": meta.get("category", ""),
-                "layer": meta.get("layer", "hot"),
-            })
-
-        if not enable_rerank or not candidates:
-            return candidates[:int(n_results)]
-
-        # ---- rerank path ---------------------------------------------------
-        from reranker import Reranker, RerankerNotAvailableError
-
-        try:
-            reranker = Reranker()
-            reranker.load(rerank_variant)  # raises RerankerNotAvailableError if missing
-        except RerankerNotAvailableError:
-            # Surface as a tagged exception so the caller can show a friendly hint.
-            raise
-
-        # Fetch OCR text for the candidate IDs in one IPC round-trip.
-        ocr_by_id: Dict[int, str] = {}
-        if self._storage_client:
-            try:
-                ids_to_fetch = [c["screenshot_id"] for c in candidates if c["screenshot_id"]]
-                resp = self._storage_client.get_screenshots_with_ocr_by_ids(ids_to_fetch)
-                for row in resp.get("screenshots", []) or []:
-                    rid = int(row.get("id", 0) or 0)
-                    if rid:
-                        ocr_by_id[rid] = row.get("ocr_text", "") or ""
-            except Exception as e:
-                logger.warning("[task_clustering] OCR fetch for rerank failed: %s", e)
-
-        docs: List[str] = []
-        for c in candidates:
-            ocr_text = ocr_by_id.get(c["screenshot_id"], "")
-            if ocr_text and ocr_snippet_chars > 0:
-                ocr_text = ocr_text[:ocr_snippet_chars]
-            parts = [p for p in (c["process_name"], c["window_title"], ocr_text) if p]
-            docs.append(" | ".join(parts) if parts else "(empty)")
-
-        try:
-            rerank_scores = reranker.rerank(query.strip(), docs, variant=rerank_variant)
-        except Exception as e:
-            logger.warning("[task_clustering] reranker failed, falling back to embedding order: %s", e)
-            return candidates[:int(n_results)]
-
-        for c, s in zip(candidates, rerank_scores):
-            c["rerank_score"] = float(s)
-
-        candidates.sort(key=lambda c: c.get("rerank_score", float("-inf")), reverse=True)
-        return candidates[:int(n_results)]
-
 
 # ---------------------------------------------------------------------------
 # ClusteringScheduler — background timer for periodic re-runs

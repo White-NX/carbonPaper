@@ -33,20 +33,18 @@
 //! backlog is reported as a number rather than hidden.
 //!
 //! **A backlog is no longer a reason to refuse to serve.** The step-4 read path
-//! stood down whenever the Rust store was known to be behind, which was correct
-//! while Python held a complete corpus to fall back to. Once Rust is the
-//! encoder, Chroma receives its rows from this mirror, so both stores are behind
-//! by exactly the same screenshots — handing the query to Python would cost the
-//! user the faster path and recover nothing. See `semantic_query.rs`.
+//! stood down whenever the Rust store was known to be behind. Now that Rust is
+//! the encoder, the remaining Chroma mirror receives its rows from this index,
+//! so both stores are behind by exactly the same screenshots. Refusing the Rust
+//! query would recover nothing. See `semantic_query.rs`.
 //!
 //! **The Chroma mirror is best-effort and a lost row is not re-sent.** Rust
 //! holds the authoritative copy, so a mirror that fails while the monitor is
 //! down costs that screenshot its place in unsupervised task clustering — not
 //! its findability by search. Python's `_backfill_from_screenshots` only rebuilds
 //! the hot layer when it is found *entirely* empty, so a partial gap is not
-//! repaired; the Smart Cluster prefilter, which falls back to a live encode for
-//! any id the collection lacks, is unaffected. Closing that gap belongs with
-//! Milestone 4, which is where `task_vectors` is actually consumed.
+//! repaired. Closing that gap belongs with Milestone 4, which is where
+//! `task_vectors` is actually consumed.
 //!
 //! **This pass is one of two background users of a single-slot worker.** Smart
 //! Cluster scoring (`smart_cluster_scoring.rs`) polls on the same 60-second
@@ -1159,9 +1157,8 @@ async fn fail_claims(
 /// The M2.4 dual-write with its direction reversed. Milestone 4 task clustering
 /// still reads `task_vectors`, and Python no longer runs MiniLM, so without this
 /// the clustering corpus would stop growing. It reuses `upsert_task_vectors` —
-/// the command the M2.4 rollback path already established for "write a
-/// Rust-produced vector into the hot layer" — rather than inventing a second
-/// ingest contract for the same write.
+/// the existing command for writing a Rust-produced vector into the hot layer
+/// rather than adding a second ingest contract for the same write.
 ///
 /// The full row is sent, not just the vector. `add_snapshot` used to write the
 /// metadata and the document alongside it, and both are load-bearing: clustering
@@ -1246,10 +1243,8 @@ fn mirror_record(subject: &IndexedSubject) -> serde_json::Value {
 /// budget and backoff, and the runaway deadline. It is single-flight against
 /// itself and against the idle worker.
 ///
-/// Note that this does not require `semantic_index = rust`. Capture indexing is
-/// unconditional — the worker in this module writes vectors whichever backend
-/// serves queries — so gating the manual run on the read-path switch would
-/// disable the only control over work that is running either way.
+/// Capture indexing is unconditional; the manual command is the explicit
+/// alternative to waiting for the idle worker.
 #[tauri::command]
 pub async fn semantic_index_run_now(
     window: tauri::Window,

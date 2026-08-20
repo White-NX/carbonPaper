@@ -10,8 +10,6 @@ class _RustStorage:
         self.response = response
         self.error = error
         self.requests = []
-        self.fallbacks = []
-        self.python_inferences = 0
 
     def embed_bge_texts(self, texts):
         self.requests.append(list(texts))
@@ -19,28 +17,17 @@ class _RustStorage:
             raise RuntimeError(self.error)
         return self.response
 
-    def record_classification_python_fallback(self, error):
-        self.fallbacks.append(error)
-
-    def record_classification_python_inference(self):
-        self.python_inferences += 1
-
 
 @pytest.fixture
-def fresh_embedder(monkeypatch):
-    monkeypatch.setenv("CARBONPAPER_CLASSIFICATION_RUNTIME", "rust")
+def fresh_embedder():
     classifier.TextEmbedder._instance = None
-    classifier.TextEmbedder._model = None
-    classifier.TextEmbedder._tokenizer = None
-    classifier.TextEmbedder._is_onnx = False
     classifier.TextEmbedder._initialized = False
-    classifier.TextEmbedder._selected_runtime = None
-    classifier.TextEmbedder._last_backend = None
     yield classifier.TextEmbedder()
     classifier.TextEmbedder._instance = None
+    classifier.TextEmbedder._initialized = False
 
 
-def test_rust_is_the_default_classification_embedder(fresh_embedder, monkeypatch):
+def test_text_embedder_uses_the_rust_bridge(fresh_embedder, monkeypatch):
     storage = _RustStorage({
         "dimensions": 2,
         "vectors": [[0.0, 1.0], [1.0, 0.0]],
@@ -54,64 +41,43 @@ def test_rust_is_the_default_classification_embedder(fresh_embedder, monkeypatch
         np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
     )
     assert storage.requests == [["alpha", "beta"]]
-    assert fresh_embedder._last_backend == "rust"
-    assert fresh_embedder._model is None
+    assert fresh_embedder._initialized is True
+    assert not hasattr(fresh_embedder, "_model")
 
 
-def test_rust_failure_falls_back_to_python_and_records_it(fresh_embedder, monkeypatch):
-    storage = _RustStorage(error="worker_stopped: test")
-    monkeypatch.setattr(storage_client, "get_storage_client", lambda: storage)
-    expected = np.asarray([[0.25, 0.75]], dtype=np.float32)
-    monkeypatch.setattr(
-        fresh_embedder,
-        "_initialize_python_model",
-        lambda: setattr(fresh_embedder, "_model", object()),
-    )
-    monkeypatch.setattr(fresh_embedder, "_encode_python", lambda texts: expected)
-
-    result = fresh_embedder.encode(["fallback"])
-
-    assert result is expected
-    assert fresh_embedder._last_backend == "python"
-    assert storage.fallbacks == ["worker_stopped: test"]
-
-
-def test_foreground_priority_does_not_trigger_python_competition(fresh_embedder, monkeypatch):
-    storage = _RustStorage(error="foreground_busy: query active")
-    monkeypatch.setattr(storage_client, "get_storage_client", lambda: storage)
-    called = []
-    monkeypatch.setattr(fresh_embedder, "_encode_python", lambda texts: called.append(texts))
-
-    with pytest.raises(RuntimeError, match="foreground_busy"):
-        fresh_embedder.encode(["wait"])
-
-    assert called == []
-
-
-def test_background_batch_contention_does_not_trigger_python_competition(
+def test_text_embedder_propagates_rust_failures_without_python_fallback(
     fresh_embedder, monkeypatch
 ):
-    storage = _RustStorage(error="background_busy: CLIP batch active")
+    storage = _RustStorage(error="worker_stopped: test")
     monkeypatch.setattr(storage_client, "get_storage_client", lambda: storage)
-    called = []
-    monkeypatch.setattr(fresh_embedder, "_encode_python", lambda texts: called.append(texts))
 
-    with pytest.raises(RuntimeError, match="background_busy"):
-        fresh_embedder.encode(["wait"])
+    with pytest.raises(RuntimeError, match="worker_stopped"):
+        fresh_embedder.encode(["text"])
 
-    assert called == []
+    assert not hasattr(fresh_embedder, "_encode_python")
+    assert not hasattr(fresh_embedder, "_selected_runtime")
 
 
-def test_explicit_python_runtime_reports_the_serving_backend(fresh_embedder, monkeypatch):
-    storage = _RustStorage()
+@pytest.mark.parametrize(
+    "response, message",
+    [
+        ({"dimensions": 2, "vectors": [[1.0]]}, "expected 2"),
+        ({"dimensions": 3, "vectors": [[1.0, 0.0]]}, "expected 3"),
+        ({"dimensions": 2, "vectors": [[float("nan"), 0.0]]}, "non-finite"),
+    ],
+)
+def test_text_embedder_validates_rust_contract(
+    fresh_embedder, monkeypatch, response, message
+):
+    storage = _RustStorage(response)
     monkeypatch.setattr(storage_client, "get_storage_client", lambda: storage)
-    fresh_embedder._selected_runtime = "python"
-    fresh_embedder._initialized = True
-    expected = np.asarray([[0.5, 0.5]], dtype=np.float32)
-    monkeypatch.setattr(fresh_embedder, "_encode_python", lambda texts: expected)
 
-    result = fresh_embedder.encode(["python"])
+    with pytest.raises(RuntimeError, match=message):
+        fresh_embedder.encode(["text"])
 
-    assert result is expected
-    assert fresh_embedder._last_backend == "python"
-    assert storage.python_inferences == 1
+
+def test_text_embedder_requires_a_storage_client(fresh_embedder, monkeypatch):
+    monkeypatch.setattr(storage_client, "get_storage_client", lambda: None)
+
+    with pytest.raises(RuntimeError, match="Rust storage client is unavailable"):
+        fresh_embedder.encode(["text"])

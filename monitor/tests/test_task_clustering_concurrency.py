@@ -285,8 +285,8 @@ def test_encode_survives_an_unload_landing_mid_pass(monkeypatch):
     the ONNX backend — and that unload no longer happens behind a lock that
     keeps other users away.
 
-    Before `_acquire_runtime`, `encode` read `_is_onnx`, `_tokenizer` and
-    `_model` as three separate unguarded attribute loads. Against the real model
+    Before `_acquire_runtime`, `encode` read `_tokenizer` and `_model` as
+    separate unguarded attribute loads. Against the real model
     an interleaved unload failed the very first encode with
     `'NoneType' object has no attribute 'get_inputs'`.
     """
@@ -300,7 +300,6 @@ def test_encode_survives_an_unload_landing_mid_pass(monkeypatch):
             if self._model is None:
                 self._tokenizer = _FakeTokenizer()
                 self._model = _FakeSession()
-                self._is_onnx = True
 
     monkeypatch.setattr(tc.TaskEmbedder, "load", fake_load)
     monkeypatch.setattr(tc.gc, "collect", lambda *a, **k: 0)

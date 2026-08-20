@@ -36,7 +36,6 @@ export function useAdvancedSearchController({
   searchParams,
   searchMode,
   onSearchModeChange,
-  backendOnline,
   t,
 }) {
   const [query, setQuery] = useState(searchParams?.query || '');
@@ -130,12 +129,6 @@ export function useAdvancedSearchController({
     if (searchMode === undefined || searchMode === mode) return;
     setMode(searchMode);
   }, [searchMode, mode]);
-
-  useEffect(() => {
-    if (backendOnline === false && mode === 'nl') {
-      handleModeChange('ocr');
-    }
-  }, [backendOnline, mode, handleModeChange]);
 
   useEffect(() => {
     if (!searchParams) return;

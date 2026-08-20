@@ -158,11 +158,6 @@ impl Drop for WgcCaptureSession {
 
 // ==================== Capture State ====================
 
-/// In-memory cache for storage JPEG bytes used by Python post-processing.
-/// Rust OCR never reads this cache. Entries avoid re-reading encrypted storage,
-/// which could otherwise trigger Windows Hello authentication.
-pub type OcrImageCache = Arc<Mutex<HashMap<i64, Arc<[u8]>>>>;
-
 /// Shared state for the capture subsystem, including pause/stop flags and OCR backpressure.
 pub struct CaptureState {
     pub paused: AtomicBool,
@@ -174,7 +169,6 @@ pub struct CaptureState {
     pub ocr_cold_start_pending: AtomicBool,
     pub startup_pending_cleanup_cancelled: AtomicBool,
     pub capture_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
-    pub ocr_image_cache: OcrImageCache,
     pub wgc_state: Mutex<Option<WgcCaptureSession>>,
     /// Game mode: capture paused because a non-browser fullscreen app is in the foreground
     pub game_mode_capture_paused: AtomicBool,
@@ -186,11 +180,10 @@ pub(crate) struct OcrSlotReservation {
 }
 
 impl OcrSlotReservation {
-    pub(crate) fn into_task_guard(mut self, screenshot_id: i64) -> OcrTaskGuard {
+    pub(crate) fn into_task_guard(mut self) -> OcrTaskGuard {
         self.active = false;
         OcrTaskGuard {
             capture_state: self.capture_state.clone(),
-            screenshot_id,
         }
     }
 }
@@ -210,19 +203,10 @@ impl Drop for OcrSlotReservation {
 /// runtime shutdown when Tokio drops the task future.
 pub(crate) struct OcrTaskGuard {
     capture_state: Arc<CaptureState>,
-    screenshot_id: i64,
 }
 
 impl Drop for OcrTaskGuard {
     fn drop(&mut self) {
-        {
-            let mut cache = self
-                .capture_state
-                .ocr_image_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            cache.remove(&self.screenshot_id);
-        }
         release_ocr_slot(&self.capture_state);
     }
 }
@@ -256,7 +240,6 @@ impl CaptureState {
             ocr_cold_start_pending: AtomicBool::new(true),
             startup_pending_cleanup_cancelled: AtomicBool::new(false),
             capture_task: Mutex::new(None),
-            ocr_image_cache: Arc::new(Mutex::new(HashMap::new())),
             wgc_state: Mutex::new(None),
             game_mode_capture_paused: AtomicBool::new(false),
         }
@@ -1782,7 +1765,6 @@ pub async fn run_capture_loop(
         // Spawn async OCR task
         let storage_clone = storage.clone();
         let capture_state_clone = capture_state.clone();
-        let jpeg_bytes = captured.jpeg_bytes.clone();
         let rgb_image = captured.rgb_image.clone();
         let image_hash_clone = image_hash.clone();
         let window_title_clone = window_info.title.clone();
@@ -1790,7 +1772,7 @@ pub async fn run_capture_loop(
         let timestamp_ms = chrono::Utc::now().timestamp_millis();
         let app_clone = app.clone();
 
-        let ocr_guard = ocr_slot.into_task_guard(screenshot_id);
+        let ocr_guard = ocr_slot.into_task_guard();
         tokio::spawn(async move {
             let _ocr_guard = ocr_guard;
             process_ocr_async(
@@ -1798,7 +1780,6 @@ pub async fn run_capture_loop(
                 storage_clone,
                 capture_state_clone,
                 screenshot_id,
-                jpeg_bytes,
                 rgb_image,
                 image_hash_clone,
                 window_title_clone,
@@ -1821,7 +1802,6 @@ async fn process_ocr_async(
     storage: Arc<StorageState>,
     capture_state: Arc<CaptureState>,
     screenshot_id: i64,
-    jpeg_bytes: Arc<[u8]>,
     rgb_image: Arc<RgbImage>,
     image_hash: String,
     window_title: String,
@@ -1860,16 +1840,6 @@ async fn process_ocr_async(
         in_flight_after_inc,
         process_name
     );
-
-    // Store JPEG bytes in in-memory cache so Python can fetch via get_temp_image
-    // without triggering CNG decryption (Windows Hello PIN).
-    {
-        let mut cache = capture_state
-            .ocr_image_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        cache.insert(screenshot_id, jpeg_bytes.clone());
-    }
 
     let timeout_secs = if capture_state
         .ocr_cold_start_pending
@@ -2078,7 +2048,7 @@ pub(crate) async fn process_ocr_inner(
             error
         );
     }
-    match enqueue_python_ocr_postprocess(
+    match enqueue_ocr_postprocess(
         app,
         screenshot_id,
         image_hash,
@@ -2099,7 +2069,7 @@ pub(crate) async fn process_ocr_inner(
             }
         }
         Ok(false) => {
-            let error = "Python postprocess queue is full";
+            let error = "Postprocess queue is full";
             let _ = storage.record_ocr_postprocess_retry(screenshot_id, error);
             tracing::warn!("[ML:POSTPROCESS] {} screenshot_id={}", error, screenshot_id);
         }
@@ -2156,7 +2126,7 @@ fn convert_ml_ocr_blocks(
     Ok(results)
 }
 
-pub(crate) async fn enqueue_python_ocr_postprocess(
+pub(crate) async fn enqueue_ocr_postprocess(
     app: &tauri::AppHandle,
     screenshot_id: i64,
     image_hash: &str,
@@ -2437,20 +2407,13 @@ mod tests {
     }
 
     #[test]
-    fn ocr_task_guard_releases_slot_and_cache_on_drop() {
+    fn ocr_task_guard_releases_slot_on_drop() {
         let state = Arc::new(CaptureState::new());
         let reservation = state.try_reserve_ocr_slot().expect("first slot");
-        state
-            .ocr_image_cache
-            .lock()
-            .unwrap()
-            .insert(42, Arc::<[u8]>::from(vec![1, 2, 3]));
-
-        let guard = reservation.into_task_guard(42);
+        let guard = reservation.into_task_guard();
         drop(guard);
 
         assert_eq!(state.in_flight_ocr_count.load(Ordering::SeqCst), 0);
-        assert!(state.ocr_image_cache.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2458,7 +2421,6 @@ mod tests {
         let state = Arc::new(CaptureState::new());
         let guard = OcrTaskGuard {
             capture_state: state.clone(),
-            screenshot_id: 7,
         };
         drop(guard);
 

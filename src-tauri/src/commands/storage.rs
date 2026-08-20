@@ -70,124 +70,28 @@ fn redact_policy_for_frontend(policy: &mut serde_json::Value) {
     }
 }
 
-fn value_as_i64(value: Option<&serde_json::Value>) -> Option<i64> {
-    value.and_then(|v| {
-        v.as_i64()
-            .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
-    })
-}
-
-fn compose_index_health_response(
-    storage_stats: storage::IndexStorageStats,
-    monitor_health: Result<serde_json::Value, String>,
-) -> serde_json::Value {
-    let (monitor_available, python, transport_error) = match monitor_health {
-        Ok(value) => (true, Some(value), None),
-        Err(error) => (false, None, Some(error)),
-    };
-
-    let vector_stats = python
-        .as_ref()
-        .and_then(|value| value.get("stats"))
-        .and_then(|stats| stats.get("vector_stats"))
-        .cloned();
-    let postprocess = python
-        .as_ref()
-        .and_then(|value| value.get("postprocess"))
-        .cloned();
-    let storage_ipc = python
-        .as_ref()
-        .and_then(|value| value.get("storage_ipc"))
-        .cloned();
-    let worker_storage_ipc = python
-        .as_ref()
-        .and_then(|value| value.get("worker_storage_ipc"))
-        .cloned();
-    let actual_clip_image_rows = vector_stats
-        .as_ref()
-        .and_then(|stats| value_as_i64(stats.get("count")));
-    let pending_retry_queue_count = postprocess
-        .as_ref()
-        .and_then(|stats| value_as_i64(stats.get("vector_retry_backlog_count")));
-    let last_indexing_error = postprocess
-        .as_ref()
-        .and_then(|stats| stats.get("last_indexing_error"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let last_indexing_error_at = postprocess
-        .as_ref()
-        .and_then(|stats| stats.get("last_indexing_error_at"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let monitor_error = transport_error
-        .map(serde_json::Value::String)
-        .or_else(|| {
-            python
-                .as_ref()
-                .and_then(|value| value.get("error"))
-                .and_then(|value| value.as_str())
-                .map(|s| serde_json::Value::String(s.to_string()))
-        })
-        .unwrap_or(serde_json::Value::Null);
-
-    // Count-level CLIP image-index check (Milestone 1): compares the
-    // SQLite-derived eligibility estimate against the live Python Chroma
-    // `screenshots` collection count. This is not a per-row or vector-quality
-    // check; equal counts can still hide missing/orphan swaps.
-    let clip_image_index = match actual_clip_image_rows {
-        Some(actual) => {
-            let expected = storage_stats.expected_clip_image_rows;
-            let missing = (expected - actual).max(0);
-            let orphaned = (actual - expected).max(0);
-            serde_json::json!({
-                "expected_eligible_images": expected,
-                "actual_rows": actual,
-                "missing_lower_bound": missing,
-                "orphaned_lower_bound": orphaned,
-                "assessment": if missing == 0 && orphaned == 0 { "count_match" } else { "count_mismatch" },
-                "eligibility": "active screenshot with active OCR row",
-                "eligibility_is_proxy": true,
-            })
-        }
-        None => serde_json::json!({
-            "expected_eligible_images": storage_stats.expected_clip_image_rows,
-            "actual_rows": serde_json::Value::Null,
-            "assessment": "unknown",
-            "eligibility": "active screenshot with active OCR row",
-            "eligibility_is_proxy": true,
-        }),
-    };
-
+fn compose_index_health_response(storage_stats: storage::IndexStorageStats) -> serde_json::Value {
     serde_json::json!({
         "status": "success",
         "screenshots_count": storage_stats.screenshots_count,
         "ocr_rows_count": storage_stats.ocr_rows_count,
-        "vector_rows_count": actual_clip_image_rows,
-        "clip_image_index": clip_image_index,
-        "pending_retry_queue_count": pending_retry_queue_count,
+        "semantic_text_rows": storage_stats.semantic_text_rows,
+        "vector_rows_count": storage_stats.clip_image_rows,
+        "clip_image_index": {
+            "actual_rows": storage_stats.clip_image_rows,
+            "assessment": "rust_owned",
+        },
+        "semantic_index_backlog": storage_stats.semantic_index_backlog,
+        "clip_index_backlog": storage_stats.clip_index_backlog,
         "smart_cluster_pending_count": storage_stats.smart_cluster_pending_count,
         "delete_queue": storage_stats.delete_queue,
-        "last_indexing_error": last_indexing_error,
-        "last_indexing_error_at": last_indexing_error_at,
-        "monitor_available": monitor_available,
-        "monitor_error": monitor_error,
-        "worker_started": python
-            .as_ref()
-            .and_then(|value| value.get("worker_started"))
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-        "storage_ipc": storage_ipc.unwrap_or(serde_json::Value::Null),
-        "worker_storage_ipc": worker_storage_ipc.unwrap_or(serde_json::Value::Null),
-        "vector_status": vector_stats.unwrap_or(serde_json::Value::Null),
-        "postprocess": postprocess.unwrap_or(serde_json::Value::Null),
-        "python": python.unwrap_or(serde_json::Value::Null),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{compose_index_health_response, merge_policy_update, redact_policy_for_frontend};
-    use crate::storage::{DeleteQueueStatus, IndexStorageStats};
+    use crate::storage::{DeleteQueueStatus, DerivedIndexBacklog, IndexStorageStats};
     use serde_json::json;
 
     #[test]
@@ -234,11 +138,14 @@ mod tests {
     }
 
     #[test]
-    fn compose_index_health_response_merges_storage_and_monitor_counts() {
+    fn compose_index_health_response_reports_rust_owned_counts() {
         let storage_stats = IndexStorageStats {
             screenshots_count: 10,
             ocr_rows_count: 12,
-            expected_clip_image_rows: 9,
+            semantic_text_rows: 8,
+            clip_image_rows: 9,
+            semantic_index_backlog: DerivedIndexBacklog::default(),
+            clip_index_backlog: DerivedIndexBacklog::default(),
             smart_cluster_pending_count: 3,
             delete_queue: DeleteQueueStatus {
                 pending_screenshots: 1,
@@ -246,37 +153,35 @@ mod tests {
                 running: false,
             },
         };
-        let monitor_health = Ok(json!({
-            "status": "success",
-            "worker_started": true,
-            "stats": { "vector_stats": { "count": 9 } },
-            "postprocess": {
-                "vector_retry_backlog_count": 4,
-                "last_indexing_error": "chroma down",
-                "last_indexing_error_at": 123.0
-            }
-        }));
-
-        let response = compose_index_health_response(storage_stats, monitor_health);
+        let response = compose_index_health_response(storage_stats);
 
         assert_eq!(response["screenshots_count"], 10);
         assert_eq!(response["ocr_rows_count"], 12);
+        assert_eq!(response["semantic_text_rows"], 8);
         assert_eq!(response["vector_rows_count"], 9);
         assert_eq!(response["clip_image_index"]["actual_rows"], 9);
-        assert_eq!(response["clip_image_index"]["expected_eligible_images"], 9);
-        assert_eq!(response["clip_image_index"]["assessment"], "count_match");
-        assert_eq!(response["clip_image_index"]["missing_lower_bound"], 0);
-        assert_eq!(response["pending_retry_queue_count"], 4);
-        assert_eq!(response["monitor_available"], true);
-        assert_eq!(response["last_indexing_error"], "chroma down");
+        assert_eq!(response["clip_image_index"]["assessment"], "rust_owned");
+        assert!(response.get("monitor_available").is_none());
+        assert!(response.get("worker_started").is_none());
     }
 
     #[test]
-    fn compose_index_health_response_reports_clip_image_count_mismatch() {
+    fn compose_index_health_response_reports_rust_backlog() {
         let storage_stats = IndexStorageStats {
             screenshots_count: 20,
             ocr_rows_count: 40,
-            expected_clip_image_rows: 15,
+            semantic_text_rows: 15,
+            clip_image_rows: 9,
+            semantic_index_backlog: DerivedIndexBacklog {
+                claimable: 2,
+                exhausted: 1,
+                oldest_claimable_age_secs: Some(30),
+            },
+            clip_index_backlog: DerivedIndexBacklog {
+                claimable: 4,
+                exhausted: 3,
+                oldest_claimable_age_secs: Some(60),
+            },
             smart_cluster_pending_count: 0,
             delete_queue: DeleteQueueStatus {
                 pending_screenshots: 0,
@@ -284,28 +189,23 @@ mod tests {
                 running: false,
             },
         };
-        let monitor_health = Ok(json!({
-            "status": "success",
-            "worker_started": true,
-            "stats": { "vector_stats": { "count": 9 } },
-            "postprocess": {}
-        }));
+        let response = compose_index_health_response(storage_stats);
 
-        let response = compose_index_health_response(storage_stats, monitor_health);
-
-        assert_eq!(response["clip_image_index"]["assessment"], "count_mismatch");
-        assert_eq!(response["clip_image_index"]["expected_eligible_images"], 15);
-        assert_eq!(response["clip_image_index"]["actual_rows"], 9);
-        assert_eq!(response["clip_image_index"]["missing_lower_bound"], 6);
-        assert_eq!(response["clip_image_index"]["orphaned_lower_bound"], 0);
+        assert_eq!(response["semantic_index_backlog"]["claimable"], 2);
+        assert_eq!(response["semantic_index_backlog"]["exhausted"], 1);
+        assert_eq!(response["clip_index_backlog"]["claimable"], 4);
+        assert_eq!(response["clip_index_backlog"]["exhausted"], 3);
     }
 
     #[test]
-    fn compose_index_health_response_keeps_storage_counts_when_monitor_unavailable() {
+    fn compose_index_health_response_does_not_depend_on_monitor_state() {
         let storage_stats = IndexStorageStats {
             screenshots_count: 10,
             ocr_rows_count: 12,
-            expected_clip_image_rows: 9,
+            semantic_text_rows: 8,
+            clip_image_rows: 9,
+            semantic_index_backlog: DerivedIndexBacklog::default(),
+            clip_index_backlog: DerivedIndexBacklog::default(),
             smart_cluster_pending_count: 3,
             delete_queue: DeleteQueueStatus {
                 pending_screenshots: 1,
@@ -314,19 +214,11 @@ mod tests {
             },
         };
 
-        let response =
-            compose_index_health_response(storage_stats, Err("Monitor not started".to_string()));
+        let response = compose_index_health_response(storage_stats);
 
         assert_eq!(response["screenshots_count"], 10);
-        assert_eq!(response["vector_rows_count"], serde_json::Value::Null);
-        assert_eq!(response["clip_image_index"]["assessment"], "unknown");
-        assert_eq!(response["clip_image_index"]["expected_eligible_images"], 9);
-        assert_eq!(
-            response["clip_image_index"]["actual_rows"],
-            serde_json::Value::Null
-        );
-        assert_eq!(response["monitor_available"], false);
-        assert_eq!(response["monitor_error"], "Monitor not started");
+        assert_eq!(response["vector_rows_count"], 9);
+        assert!(response.get("monitor_available").is_none());
     }
 }
 
@@ -829,40 +721,14 @@ pub async fn storage_get_screenshot_details(
 pub async fn storage_delete_screenshot(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
-    monitor_state: tauri::State<'_, MonitorState>,
     screenshot_id: i64,
 ) -> Result<serde_json::Value, String> {
     check_auth_required(&credential_state)?;
-
-    let image_hash = match state.get_screenshot_by_id(screenshot_id)? {
-        Some(record) => Some(record.image_hash),
-        None => None,
-    };
-
     let deleted = state.delete_screenshot(screenshot_id)?;
-    let mut vector_deleted: Option<i64> = None;
-
-    if deleted {
-        if let Some(hash) = image_hash {
-            let payload = serde_json::json!({
-                "command": "delete_screenshot",
-                "screenshot_id": screenshot_id,
-                "image_hash": hash
-            });
-            match monitor::forward_command_to_python(&monitor_state, payload).await {
-                Ok(resp) => {
-                    vector_deleted = resp.get("vector_deleted").and_then(|v| v.as_i64());
-                }
-                Err(e) => {
-                    tracing::error!("Vector delete failed: {}", e);
-                }
-            }
-        }
-    }
     Ok(serde_json::json!({
         "status": "success",
         "deleted": deleted,
-        "vector_deleted": vector_deleted
+        "vector_deleted": serde_json::Value::Null
     }))
 }
 
@@ -874,49 +740,15 @@ pub async fn storage_delete_screenshot(
 pub async fn storage_delete_by_time_range(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
-    monitor_state: tauri::State<'_, MonitorState>,
     start_time: f64,
     end_time: f64,
 ) -> Result<serde_json::Value, String> {
     check_auth_required(&credential_state)?;
-
-    let start_ts = start_time / 1000.0;
-    let end_ts = end_time / 1000.0;
-    let image_hashes = match state.get_screenshots_by_time_range(start_ts, end_ts) {
-        Ok(records) => records
-            .into_iter()
-            .map(|r| r.image_hash)
-            .collect::<Vec<_>>(),
-        Err(e) => {
-            tracing::error!("Failed to load hashes: {}", e);
-            Vec::new()
-        }
-    };
-
     let deleted_count = state.delete_screenshots_by_time_range(start_time, end_time)?;
-    let mut vector_deleted: Option<i64> = None;
-
-    if !image_hashes.is_empty() {
-        let payload = serde_json::json!({
-            "command": "delete_by_time_range",
-            "start_time": start_time,
-            "end_time": end_time,
-            "image_hashes": image_hashes
-        });
-
-        match monitor::forward_command_to_python(&monitor_state, payload).await {
-            Ok(resp) => {
-                vector_deleted = resp.get("vector_deleted").and_then(|v| v.as_i64());
-            }
-            Err(e) => {
-                tracing::error!("Vector delete failed: {}", e);
-            }
-        }
-    }
     Ok(serde_json::json!({
         "status": "success",
         "deleted_count": deleted_count,
-        "vector_deleted": vector_deleted
+        "vector_deleted": serde_json::Value::Null
     }))
 }
 
@@ -1044,16 +876,13 @@ pub async fn storage_get_delete_queue_status(
         .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
-/// Combines encrypted-storage index statistics with Python vector-index health.
+/// Returns Rust-owned encrypted-storage and derived-index statistics.
 ///
-/// Authentication: required. `refresh_vector` requests a live vector recount. Returns a
-/// JSON health object for both stores. Frontend: `lib/monitor_api.js`.
+/// Authentication: required. Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_get_index_health(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
-    monitor_state: tauri::State<'_, MonitorState>,
-    refresh_vector: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     check_auth_required(&credential_state)?;
 
@@ -1063,38 +892,7 @@ pub async fn storage_get_index_health(
             .await
             .map_err(|e| format!("Task join error: {:?}", e))??;
 
-    let monitor_health = monitor::forward_command_to_python(
-        &monitor_state,
-        serde_json::json!({
-            "command": "index_health",
-            "refresh": refresh_vector.unwrap_or(false),
-        }),
-    )
-    .await;
-
-    Ok(compose_index_health_response(storage_stats, monitor_health))
-}
-
-/// Retries failed vector indexing through the monitor service.
-///
-/// Authentication: required. `limit` defaults to 32 and is clamped to 1..=256; returns
-/// the monitor's retry result object. Frontend: `lib/monitor_api.js`.
-#[tauri::command]
-pub async fn storage_retry_vector_indexing(
-    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
-    monitor_state: tauri::State<'_, MonitorState>,
-    limit: Option<u32>,
-) -> Result<serde_json::Value, String> {
-    check_auth_required(&credential_state)?;
-
-    monitor::forward_command_to_python(
-        &monitor_state,
-        serde_json::json!({
-            "command": "retry_vector_indexing",
-            "limit": limit.unwrap_or(32).clamp(1, 256),
-        }),
-    )
-    .await
+    Ok(compose_index_health_response(storage_stats))
 }
 
 /// Persists a screenshot and its metadata from a trusted native producer.

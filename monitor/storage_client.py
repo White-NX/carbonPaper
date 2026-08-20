@@ -73,14 +73,8 @@ READ_RETRY_COMMANDS = {
     'decrypt_from_chromadb',
     'decrypt_many_from_chromadb',
     'list_screenshots_for_clustering',
-    'get_screenshots_with_ocr_by_ids',
     'get_idle_state',
-    'smart_cluster_list_enabled',
-    'smart_cluster_peek_pending',
-    'smart_cluster_count_pending',
     'get_auth_status',
-    'get_temp_image',
-    'screenshot_exists',
     'bge_embed_texts',
 }
 
@@ -88,16 +82,6 @@ IDEMPOTENT_RETRY_COMMANDS = {
     'update_screenshot_category',
     'set_ocr_postprocess_status',
     'record_ocr_postprocess_retry',
-    'smart_cluster_enqueue_pending',
-    'smart_cluster_delete_pending',
-    'smart_cluster_record_assignment',
-    'abort_screenshot',
-}
-
-UNSAFE_AFTER_SEND_COMMANDS = {
-    'save_screenshot',
-    'save_screenshot_temp',
-    'commit_screenshot',
 }
 
 SAFE_RETRY_AFTER_SEND_COMMANDS = READ_RETRY_COMMANDS | IDEMPOTENT_RETRY_COMMANDS
@@ -711,22 +695,6 @@ class StorageClient:
             'limit': limit,
         })
 
-    def get_screenshots_with_ocr_by_ids(self, ids: List[int]) -> Dict[str, Any]:
-        """Fetch screenshots + OCR text for a specific set of IDs (single round-trip).
-
-        Used by the NL-cluster reranker path to enrich candidate text before
-        cross-encoder scoring. Returns {'screenshots': [...]} (no 'total').
-        """
-        if not ids:
-            return {'screenshots': []}
-        response = self._send_request({
-            'command': 'get_screenshots_with_ocr_by_ids',
-            'ids': [int(i) for i in ids],
-        })
-        if response.get('status') == 'success':
-            return response.get('data', {'screenshots': []})
-        raise RuntimeError(response.get('error', 'Unknown error during IPC get_screenshots_with_ocr_by_ids'))
-
     def update_screenshot_category(
         self,
         screenshot_id: int,
@@ -759,21 +727,6 @@ class StorageClient:
                 return data
         raise RuntimeError(response.get('error', 'Rust BGE inference failed'))
 
-    def record_classification_python_fallback(self, error: str) -> None:
-        """Best-effort diagnostic after Python serves a failed Rust request."""
-        self._send_request({
-            'command': 'classification_record_python_fallback',
-            'error': str(error),
-        })
-
-    def record_classification_python_inference(self) -> None:
-        """Record that the explicit Python rollback served an inference."""
-        self._send_request({
-            'command': 'classification_record_python_inference',
-        })
-
-    # ---- Smart Cluster reverse IPC --------------------------------------
-
     def get_idle_state(self) -> Dict[str, Any]:
         """Read the current system idle state from Rust.
 
@@ -787,67 +740,6 @@ class StorageClient:
                 return data
         return {'is_idle': False, 'idle_secs': 0, 'fullscreen_exclusive': True}
 
-    def smart_cluster_list_enabled(self) -> List[Dict[str, Any]]:
-        """Return enabled smart clusters with anchor text and threshold."""
-        response = self._send_request({'command': 'smart_cluster_list_enabled'})
-        if response.get('status') == 'success':
-            return response.get('data', {}).get('clusters', [])
-        return []
-
-    def smart_cluster_enqueue_pending(self, screenshot_id: int) -> bool:
-        response = self._send_request({
-            'command': 'smart_cluster_enqueue_pending',
-            'screenshot_id': int(screenshot_id),
-        })
-        return response.get('status') == 'success'
-
-    def smart_cluster_peek_pending(self, limit: int = 32) -> List[int]:
-        """Read up to ``limit`` pending screenshot ids WITHOUT removing them.
-
-        Rust applies a 30-day TTL filter and opportunistically prunes
-        expired rows in the same transaction. The caller must invoke
-        :meth:`smart_cluster_delete_pending` for ids it has fully processed;
-        on any failure path the ids stay in the queue and are retried on
-        the next idle window.
-        """
-        response = self._send_request({
-            'command': 'smart_cluster_peek_pending',
-            'limit': int(limit),
-        })
-        if response.get('status') == 'success':
-            return response.get('data', {}).get('ids', [])
-        return []
-
-    def smart_cluster_delete_pending(self, ids: List[int]) -> bool:
-        """Remove pending ids after they have been scored and assignments persisted."""
-        if not ids:
-            return True
-        response = self._send_request({
-            'command': 'smart_cluster_delete_pending',
-            'ids': [int(i) for i in ids],
-        })
-        return response.get('status') == 'success'
-
-    def smart_cluster_count_pending(self) -> int:
-        response = self._send_request({'command': 'smart_cluster_count_pending'})
-        if response.get('status') == 'success':
-            return int(response.get('data', {}).get('count', 0))
-        return 0
-
-    def smart_cluster_record_assignment(
-        self,
-        smart_cluster_id: int,
-        screenshot_id: int,
-        rerank_score: float,
-    ) -> bool:
-        response = self._send_request({
-            'command': 'smart_cluster_record_assignment',
-            'smart_cluster_id': int(smart_cluster_id),
-            'screenshot_id': int(screenshot_id),
-            'rerank_score': float(rerank_score),
-        })
-        return response.get('status') == 'success'
-
     def is_session_valid(self) -> bool:
         """Check whether the Rust credential session is currently unlocked."""
         response = self._send_request({'command': 'get_auth_status'})
@@ -855,157 +747,6 @@ class StorageClient:
             data = response.get('data', {})
             return bool(data.get('session_valid', False))
         return False
-
-    def get_temp_image_bytes(self, screenshot_id: int) -> Dict[str, Any]:
-        """Fetch temporary OCR image bytes using v2 binary response framing."""
-        response = self._send_request({
-            'command': 'get_temp_image',
-            'screenshot_id': int(screenshot_id),
-        })
-        if response.get('status') != 'success':
-            return response
-
-        data = response.get('data', {})
-        image_bytes = response.get('_binary_body')
-        if image_bytes is None:
-            return {'status': 'error', 'error': 'Binary image response missing body frame'}
-
-        return {
-            'status': 'success',
-            'data': {
-                'image_bytes': image_bytes,
-                'mime_type': data.get('mime_type', 'image/jpeg'),
-            },
-        }
-
-    def screenshot_exists(self, image_hash: str) -> bool:
-        """
-        Check whether a screenshot already exists.
-
-        Args:
-            image_hash: Image hash.
-
-        Returns:
-            Whether it exists.
-        """
-        response = self._send_request({
-            'command': 'screenshot_exists',
-            'image_hash': image_hash
-        })
-        
-        if response.get('status') == 'success':
-            data = response.get('data', {})
-            return data.get('exists', False)
-        
-        return False
-    
-    def save_screenshot(
-        self,
-        image_data: bytes,
-        image_hash: str,
-        width: int,
-        height: int,
-        window_title: Optional[str] = None,
-        process_name: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        ocr_results: Optional[List[Dict[str, Any]]] = None
-    ) -> Dict[str, Any]:
-        """
-        Save a screenshot to the Rust storage service.
-
-        Args:
-            image_data: Image binary data.
-            image_hash: Image hash.
-            width: Image width.
-            height: Image height.
-            window_title: Window title.
-            process_name: Process name.
-            metadata: Metadata.
-            ocr_results: OCR result list.
-
-        Returns:
-            Save result.
-        """
-        import base64
-        
-        request = {
-            'command': 'save_screenshot',
-            'image_data': base64.b64encode(image_data).decode('utf-8'),
-            'image_hash': image_hash,
-            'width': width,
-            'height': height,
-            'window_title': window_title,
-            'process_name': process_name,
-            'metadata': metadata,
-            'ocr_results': ocr_results
-        }
-        
-        response = self._send_request(request)
-        
-        if response.get('status') == 'success':
-            return response.get('data', {})
-        
-        return {
-            'status': 'error',
-            'error': response.get('error', 'Unknown error')
-        }
-
-    def save_screenshot_temp(
-        self,
-        image_data: bytes,
-        image_hash: str,
-        width: int,
-        height: int,
-        window_title: Optional[str] = None,
-        process_name: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        Temporarily save a screenshot (encrypted and marked as pending); returns a
-        screenshot_id for later commit/abort.
-        """
-        import base64
-
-        request = {
-            'command': 'save_screenshot_temp',
-            'image_data': base64.b64encode(image_data).decode('utf-8'),
-            'image_hash': image_hash,
-            'width': width,
-            'height': height,
-            'window_title': window_title,
-            'process_name': process_name,
-            'metadata': metadata
-        }
-
-        response = self._send_request(request)
-
-        if response.get('status') == 'success':
-            return response.get('data', {})
-
-        return {
-            'status': 'error',
-            'error': response.get('error', 'Unknown error')
-        }
-
-    def commit_screenshot(self, screenshot_id: str, ocr_results: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
-        """
-        Commit a previously saved temporary screenshot and write OCR results and index.
-        """
-        request = {
-            'command': 'commit_screenshot',
-            'screenshot_id': screenshot_id,
-            'ocr_results': ocr_results
-        }
-
-        response = self._send_request(request)
-
-        if response.get('status') == 'success':
-            return response.get('data', {})
-
-        return {
-            'status': 'error',
-            'error': response.get('error', 'Unknown error')
-        }
 
     def set_ocr_postprocess_status(
         self,
@@ -1028,27 +769,6 @@ class StorageClient:
             'error': str(error or 'OCR postprocess failed'),
         })
         return response.get('status') == 'success'
-
-    def abort_screenshot(self, screenshot_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Abort a previously saved temporary screenshot (delete temp files and roll back the record).
-        """
-        request = {
-            'command': 'abort_screenshot',
-            'screenshot_id': screenshot_id,
-            'reason': reason
-        }
-
-        response = self._send_request(request)
-
-        if response.get('status') == 'success':
-            return response.get('data', {})
-
-        return {
-            'status': 'error',
-            'error': response.get('error', 'Unknown error')
-        }
-
 
 # Global storage client instance
 _storage_client: Optional[StorageClient] = None

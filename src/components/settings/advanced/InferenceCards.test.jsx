@@ -20,12 +20,11 @@ describe('ClipBackendCard ANN health', () => {
     const onRetryAnn = vi.fn();
     render(
       <ClipBackendCard
-        config={{ clip_index: 'rust' }}
         status={{
           clip_backend: {
             index_backlog: 0,
             index_stalled: 0,
-            fallback_count: 0,
+            failure_count: 0,
             ann_state: 'armed',
             ann_generation: 7,
             ann_build_state: 'circuit_open',
@@ -36,7 +35,6 @@ describe('ClipBackendCard ANN health', () => {
           },
         }}
         statusLoading={false}
-        onToggleRustIndex={vi.fn()}
         onRefresh={vi.fn()}
         onRunIndexNow={vi.fn()}
         onStopIndexNow={vi.fn()}

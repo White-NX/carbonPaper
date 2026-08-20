@@ -12,8 +12,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [clusteringDropdownOpen, setClusteringDropdownOpen] = useState(false);
   const [cpuChanged, setCpuChanged] = useState(false);
   const [dmlChanged, setDmlChanged] = useState(false);
-  const [onnxChanged, setOnnxChanged] = useState(false);
-  const [classificationRuntimeChanged, setClassificationRuntimeChanged] = useState(false);
   const [gpus, setGpus] = useState([]);
   const [gpuLoading, setGpuLoading] = useState(false);
   const [vacuumRunning, setVacuumRunning] = useState(false);
@@ -26,10 +24,9 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [semanticStatusLoading, setSemanticStatusLoading] = useState(false);
   const [semanticIndexRunning, setSemanticIndexRunning] = useState(false);
   const [semanticIndexRun, setSemanticIndexRun] = useState(null);
-  // The CLIP image index has its own run, its own progress event and its own
-  // rollback lever. Kept separate from the MiniLM ones above rather than shared:
-  // the two passes can be running at once, and one status line for both would
-  // report whichever finished last.
+  // The CLIP image index has its own run and progress event. The two passes can
+  // run independently, so one status line for both would report whichever
+  // finished last.
   const [clipIndexRunning, setClipIndexRunning] = useState(false);
   const [clipIndexRun, setClipIndexRun] = useState(null);
   const [clipIndexStopping, setClipIndexStopping] = useState(false);
@@ -227,42 +224,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     const timer = window.setInterval(() => readSemanticStatus({ quiet: true }), 2000);
     return () => window.clearInterval(timer);
   }, [semanticIndexRunning, clipIndexRunning]);
-
-  /**
-   * The one-release rollback lever. `chroma` hands retrieval of screenshot text
-   * back to Python; the vectors stay where they are and Rust keeps writing
-   * them, so it is reversible at any time and it does not stop indexing.
-   * `semantic_runtime` stays a separate registry-only switch because it rolls
-   * back Rust inference itself, which is a developer concern.
-   */
-  const handleToggleRustSemanticIndex = async (enabled) => {
-    const newConfig = { ...config, semantic_index: enabled ? 'rust' : 'chroma' };
-    const saved = await saveConfig(newConfig);
-    if (saved) await refreshSemanticStatus();
-  };
-
-  /**
-   * The same one-release rollback for visual search. `chroma` hands the
-   * text-to-image query back to Python; Rust keeps encoding new captures and
-   * keeps mirroring them into the Chroma collection, so the switch is
-   * reversible at any time and does not stop indexing either.
-   */
-  const handleToggleRustClipIndex = async (enabled) => {
-    const newConfig = { ...config, clip_index: enabled ? 'rust' : 'chroma' };
-    const saved = await saveConfig(newConfig);
-    if (saved) await refreshSemanticStatus();
-  };
-
-  const handleToggleRustClassification = async (enabled) => {
-    const newConfig = {
-      ...config,
-      classification_runtime: enabled ? 'rust' : 'python',
-    };
-    const saved = await saveConfig(newConfig);
-    if (!saved) return;
-    setClassificationRuntimeChanged(true);
-    await refreshSemanticStatus();
-  };
 
   /**
    * Progress of a running manual pass, one event per encoded chunk of four.
@@ -467,7 +428,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     if (!saved) return;
     if (key === 'cpu_limit_enabled') setCpuChanged(true);
     if (key === 'use_dml') setDmlChanged(true);
-    if (key === 'use_onnx') setOnnxChanged(true);
     if (key === 'clustering_allow_full_low_memory') {
       await syncOcrConfigToMonitor(newConfig);
     }
@@ -547,8 +507,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     clusteringDropdownOpen,
     cpuChanged,
     dmlChanged,
-    onnxChanged,
-    classificationRuntimeChanged,
     gpus,
     gpuLoading,
     vacuumRunning,
@@ -577,8 +535,6 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     setClusteringDropdownOpen,
     clearCpuChanged: () => setCpuChanged(false),
     clearDmlChanged: () => setDmlChanged(false),
-    clearOnnxChanged: () => setOnnxChanged(false),
-    clearClassificationRuntimeChanged: () => setClassificationRuntimeChanged(false),
     handleToggle,
     handleCpuPercentChange,
     handleOcrTimeoutDraftChange,
@@ -588,11 +544,8 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     handleManualVacuum,
     handleRestartMlOcr,
     handleDownloadRustOcrModel,
-    handleToggleRustSemanticIndex,
     handleRunSemanticIndexNow,
     handleStopSemanticIndex,
-    handleToggleRustClipIndex,
-    handleToggleRustClassification,
     handleRunClipIndexNow,
     handleStopClipIndex,
     handleRetryClipAnn,

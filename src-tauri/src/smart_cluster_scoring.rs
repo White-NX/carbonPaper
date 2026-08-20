@@ -1,11 +1,9 @@
 //! M2.5 step 6 — the Rust Smart Cluster scoring worker.
 //!
-//! Replaces `monitor/smart_cluster_worker.py` as the default drainer of the
-//! `smart_cluster_pending` queue. The pipeline is the same three stages Python
-//! ran — MiniLM cosine prefilter against each cluster's anchor, cross-encoder
-//! rerank of whatever survives, assignment above the cluster's threshold — with
-//! the same constants, because the thresholds those constants produced are
-//! already on disk.
+//! Owns the `smart_cluster_pending` queue. The pipeline preserves the three-stage
+//! scoring contract used for thresholds already on disk: MiniLM cosine prefilter
+//! against each cluster's anchor, cross-encoder rerank of whatever survives, and
+//! assignment above the cluster's threshold.
 //!
 //! **Why this moved with calibration rather than after it.** The threshold in
 //! `smart_clusters.threshold` is produced by the calibration query and consumed
@@ -83,9 +81,7 @@
 
 use crate::idle::IdleState;
 use crate::ml_protocol::MlSemanticModel;
-use crate::rerank::{
-    build_rerank_document, ScorerIdentity, SmartClusterQueueOwner, RERANK_OCR_SNIPPET_CHARS,
-};
+use crate::rerank::{build_rerank_document, ScorerIdentity, RERANK_OCR_SNIPPET_CHARS};
 use crate::semantic_runtime::{SemanticRuntimeState, FOREGROUND_POLL_INTERVAL};
 use crate::storage::smart_cluster::{
     anchor_text_hash, SmartClusterScorer, SmartClusterScoringTarget,
@@ -93,7 +89,7 @@ use crate::storage::smart_cluster::{
 use crate::storage::{DerivedIndexKind, StorageState};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -207,10 +203,6 @@ pub struct SmartClusterWorkerState {
     /// Clusters skipped in the last pass because their threshold could not be
     /// re-derived for the current scorer.
     unverifiable_thresholds: AtomicU64,
-    /// The last queue-ownership verdict written to the log, so an arrangement
-    /// that needs the user to do something is explained when it changes rather
-    /// than once a minute forever.
-    last_owner_note: AtomicU8,
 }
 
 impl SmartClusterWorkerState {
@@ -231,39 +223,6 @@ impl SmartClusterWorkerState {
         self.abort_requested.load(Ordering::SeqCst)
     }
 
-    /// Log who owns the queue, but only when the answer changes.
-    ///
-    /// Two of the three answers are states the user has to resolve, and neither
-    /// is visible anywhere else: `rerank_runtime` has no settings control, so
-    /// it is edited in the registry and its two sides take effect at different
-    /// times. Saying nothing would leave a queue that stops moving with no
-    /// explanation anywhere.
-    fn note_queue_owner(&self, owner: SmartClusterQueueOwner) {
-        let code = match owner {
-            SmartClusterQueueOwner::Rust => 1u8,
-            SmartClusterQueueOwner::Python => 2,
-            SmartClusterQueueOwner::Neither => 3,
-        };
-        if self.last_owner_note.swap(code, Ordering::SeqCst) == code {
-            return;
-        }
-        match owner {
-            SmartClusterQueueOwner::Rust => {
-                tracing::info!("[SMART_CLUSTER] this worker owns the scoring queue")
-            }
-            SmartClusterQueueOwner::Python => tracing::info!(
-                "[SMART_CLUSTER] standing down: the running monitor was started with \
-                 rerank_runtime=python and its worker owns the queue. Restart the monitor to \
-                 hand scoring back to Rust."
-            ),
-            SmartClusterQueueOwner::Neither => tracing::warn!(
-                "[SMART_CLUSTER] nothing is draining the scoring queue: rerank_runtime=python, \
-                 but the Python worker only starts when the monitor is spawned with that value. \
-                 Restart the monitor for the rollback to take effect."
-            ),
-        }
-    }
-
     pub fn status(&self) -> SmartClusterWorkerStatus {
         SmartClusterWorkerStatus {
             backend: "rust",
@@ -276,8 +235,9 @@ impl SmartClusterWorkerState {
     }
 }
 
-/// Read-only diagnostic for the worker, the shape `monitor_smart_cluster_worker_status`
-/// used to forward from Python plus the scorer identity step 6 makes relevant.
+/// Read-only diagnostic for the worker. The existing
+/// `monitor_smart_cluster_worker_status` command name is retained for frontend
+/// compatibility, and the payload includes the scorer identity added in step 6.
 #[derive(Debug, Clone, Serialize)]
 pub struct SmartClusterWorkerStatus {
     pub backend: &'static str,
@@ -303,10 +263,6 @@ pub async fn run_smart_cluster_worker(app: AppHandle) {
             continue;
         }
         last_tick = Instant::now();
-        {
-            let monitor = app.try_state::<crate::monitor::MonitorState>();
-            state.note_queue_owner(crate::rerank::smart_cluster_queue_owner(monitor.as_deref()));
-        }
         state.running.store(true, Ordering::SeqCst);
         state.force_running.store(forced, Ordering::SeqCst);
         // Serialized against capture indexing. Both loops poll every 60 s on
@@ -345,24 +301,6 @@ pub async fn run_smart_cluster_worker(app: AppHandle) {
 /// Whether a pass may run at all.
 fn may_run(app: &AppHandle, forced: bool) -> bool {
     if crate::maintenance::is_active() {
-        return false;
-    }
-    // The one-release rollback, asked as "who owns the queue" rather than as
-    // "what does the switch say". Those differ while a monitor spawned with
-    // `rerank_runtime = python` is running: its worker is draining, and this
-    // one must stand down even if the key has since been set back to `rust`.
-    //
-    // `semantic_runtime` is deliberately *not* consulted here. That lever
-    // chooses which runtime answers an NL query, and there is no Python side
-    // left for this pass to fall back to: the prefilter vectors live in the
-    // Rust derived store, which the Python worker cannot read, and the Python
-    // scorer only starts when `rerank_runtime = python` handed it the queue at
-    // spawn. Honoring `semantic_runtime` here would not move the work to
-    // Python, it would stop the queue being drained at all. `rerank_runtime` is
-    // the lever for this pass, and it moves calibration with it.
-    if !crate::rerank::rust_owns_smart_cluster_queue(
-        app.try_state::<crate::monitor::MonitorState>().as_deref(),
-    ) {
         return false;
     }
     if forced {
@@ -1428,13 +1366,11 @@ async fn delete_pending(storage: Arc<StorageState>, ids: &[i64]) -> Result<(), S
 //
 // Deliberately not three new Tauri commands. `monitor_smart_cluster_worker_status`,
 // `monitor_smart_cluster_drain_now`, and `monitor_smart_cluster_stop_drain`
-// already exist and already forward to Python; step 6 makes them branch on
-// `rerank_runtime` instead. The frontend contract does not move, and the
-// rollback lever switches the whole surface — status, force-run, and cancel —
-// in one place rather than leaving the UI talking to two workers at once.
+// already exist, so the frontend contract does not move when Rust owns the
+// worker implementation.
 
-/// Status in the JSON shape the Python handler returned, plus the scorer
-/// identity that only became meaningful at step 6.
+/// Status in the established frontend JSON shape, plus the scorer identity that
+/// only became meaningful at step 6.
 ///
 /// `pending_count` is not decoration. `SmartClustersView` computes
 /// `is_running && pending_count > 0`, so a payload that omitted the queue depth
@@ -1644,23 +1580,6 @@ mod tests {
         // Concretely, at the shipped idle batch of 32 with one cluster enabled,
         // a pass commits twice rather than once.
         assert_eq!(batch_size_for(false, 1) as usize / commit_group_size(1), 2);
-    }
-
-    #[test]
-    fn the_ownership_note_is_written_once_per_change() {
-        // `rerank_runtime` has no settings control, so the states that need the
-        // user to restart the monitor are only ever visible in the log. Once
-        // per change, not once per minute.
-        let state = SmartClusterWorkerState::default();
-        assert_eq!(state.last_owner_note.load(Ordering::SeqCst), 0);
-        state.note_queue_owner(SmartClusterQueueOwner::Rust);
-        assert_eq!(state.last_owner_note.load(Ordering::SeqCst), 1);
-        state.note_queue_owner(SmartClusterQueueOwner::Rust);
-        assert_eq!(state.last_owner_note.load(Ordering::SeqCst), 1);
-        state.note_queue_owner(SmartClusterQueueOwner::Python);
-        assert_eq!(state.last_owner_note.load(Ordering::SeqCst), 2);
-        state.note_queue_owner(SmartClusterQueueOwner::Neither);
-        assert_eq!(state.last_owner_note.load(Ordering::SeqCst), 3);
     }
 
     #[test]

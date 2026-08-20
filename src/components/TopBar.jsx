@@ -64,7 +64,6 @@ export default function TopBar({
   handleStartBackend,
   handlePauseMonitor,
   handleResumeMonitor,
-  backendOnline,
   isAuthenticated,
 }) {
   const { t } = useTranslation();
@@ -85,7 +84,6 @@ export default function TopBar({
         onSubmit={onSearchSubmit}
         mode={searchMode}
         onModeChange={onSearchModeChange}
-        backendOnline={backendOnline}
         monitorPaused={monitorPaused}
         handlePauseMonitor={handlePauseMonitor}
         handleResumeMonitor={handleResumeMonitor}

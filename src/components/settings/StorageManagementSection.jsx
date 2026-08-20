@@ -18,7 +18,6 @@ export default function StorageManagementSection({
   refreshing,
   error,
   onRefresh,
-  monitorStatus,
 }) {
   const { t } = useTranslation();
   const {
@@ -54,22 +53,16 @@ export default function StorageManagementSection({
     indexHealth,
     indexHealthLoading,
     indexHealthError,
-    vectorRetrying,
     groupedMonthItems,
     selectedCountByMonth,
     storageLimitOptions,
     retentionOptions,
     diskInfo,
     currentStoragePath,
-    vectorRetryBacklog,
+    indexBacklog,
     indexHealthDeleteQueuePending,
-    lastIndexingError,
-    lastIndexingErrorAt,
-    storageIpcLabel,
-    storageIpcRetryAfter,
     handleRefresh,
     loadIndexHealth,
-    handleRetryVectorIndexing,
     formatIndexCount,
     openProcessDetail,
     toggleScreenshotSelection,
@@ -80,7 +73,7 @@ export default function StorageManagementSection({
     handleChangeStoragePath,
     handleCancelMigrationChoice,
     handleApplyStoragePath,
-  } = useStorageManagementController({ storage, onRefresh, t, monitorStatus });
+  } = useStorageManagementController({ storage, onRefresh, t });
 
   const openBackupDialog = (mode) => {
     setBackupMode(mode);
@@ -123,16 +116,9 @@ export default function StorageManagementSection({
             indexHealth={indexHealth}
             indexHealthLoading={indexHealthLoading}
             indexHealthError={indexHealthError}
-            vectorRetrying={vectorRetrying}
-            vectorRetryBacklog={vectorRetryBacklog}
+            indexBacklog={indexBacklog}
             deleteQueuePending={indexHealthDeleteQueuePending}
-            lastIndexingError={lastIndexingError}
-            lastIndexingErrorAt={lastIndexingErrorAt}
-            storageIpcLabel={storageIpcLabel}
-            storageIpcRetryAfter={storageIpcRetryAfter}
-            monitorStatus={monitorStatus}
             onRefresh={loadIndexHealth}
-            onRetryVectorIndexing={handleRetryVectorIndexing}
             formatIndexCount={formatIndexCount}
           />
 

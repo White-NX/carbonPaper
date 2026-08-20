@@ -223,13 +223,9 @@ export async function getTaskClusters() {
  * named a file that is never on disk. The backend still reports which variant
  * produced the scores, in `rerank_variant`.
  *
- * `backend` is which engine actually answered — `rust` or `python`. It is not
- * decoration: a reranked query is a Smart Cluster calibration query, and the
- * threshold derived from its scores is stored with the scorer that produced
- * them. The Rust path stands down for several reasons the caller cannot see
- * (an unfinished M2.4 migration, an empty Rust index, an index backend pointing
- * at Chroma), so this field is the only honest answer to "whose logits are
- * these".
+ * `backend` is retained in the response envelope for persisted calibration
+ * provenance. Current production responses always report `rust`; historical
+ * Python scorer values are accepted only when reading old Smart Cluster data.
  *
  * `cancelled` is set when the user stopped a reranked query through
  * `nlRerankStopNow`. It is a success rather than an error on purpose: nothing
@@ -242,7 +238,7 @@ export async function getTaskClusters() {
  * @param {string} query
  * @param {number} [nResults=30] - clamped to 30 by the backend when reranking
  * @param {boolean} [enableRerank=false] - if true, over-fetches and re-scores with bge-reranker-v2-m3
- * @returns {Promise<{results: Array, reranked: boolean, rerank_variant: string|null, backend: string|null, cancelled: boolean}>}
+ * @returns {Promise<{results: Array, reranked: boolean, rerank_variant: string|null, backend: 'rust', cancelled: boolean}>}
  */
 export async function nlClusterQuery(query, nResults = 30, enableRerank = false) {
   const result = await withAuth(() => invoke('monitor_nl_cluster_query', {
@@ -259,7 +255,7 @@ export async function nlClusterQuery(query, nResults = 30, enableRerank = false)
     results: result?.results || [],
     reranked: !!result?.reranked,
     rerank_variant: result?.rerank_variant || null,
-    backend: result?.backend || null,
+    backend: result?.backend || 'rust',
     cancelled: !!result?.cancelled,
   };
 }
@@ -327,10 +323,9 @@ export async function getSmartClusterExamples(id) {
  * @param {number} req.threshold
  * @param {string} [req.dominant_color]
  * @param {Array} req.examples - [{ screenshot_id, is_positive, rerank_score }]
- * @param {string} [req.scorer_backend] - the `backend` the calibration query
- *   reported, i.e. which reranker produced the scores this threshold was
- *   derived from. Omitted means "unknown", which the backend records as no
- *   provenance at all and later repairs by re-deriving the threshold.
+ * @param {string} [req.scorer_backend] - current calibration queries use
+ *   `rust`; the backend also accepts historical `python` provenance so old
+ *   thresholds can be re-derived without starting a Python scorer.
  * @returns {Promise<{id: number, enqueued: number}>}
  */
 export async function createSmartCluster(req) {
@@ -385,17 +380,12 @@ export async function getSmartClusterStatus() {
   return withAuth(() => invoke('smart_cluster_status'));
 }
 
-/**
- * Trigger the Python worker to drain the pending queue immediately,
- * bypassing the idle gate for one pass.
- */
+/** Trigger the Rust Smart Cluster scorer to drain the pending queue once. */
 export async function smartClusterDrainNow() {
   return withAuth(() => invoke('monitor_smart_cluster_drain_now'), { autoPrompt: true });
 }
 
-/**
- * Trigger the Python worker to stop the currently running forced drain pass.
- */
+/** Stop the currently running Rust Smart Cluster drain pass. */
 export async function smartClusterStopDrain() {
   return withAuth(() => invoke('monitor_smart_cluster_stop_drain'), { autoPrompt: true });
 }

@@ -4,8 +4,8 @@ import storage_client as sc
 def _capture_requests(client, responses):
     requests = []
 
-    def fake_send(request):
-        requests.append(request)
+    def fake_send(request, timeout=sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS):
+        requests.append((request, timeout))
         response = responses.pop(0)
         return response(request) if callable(response) else response
 
@@ -13,168 +13,103 @@ def _capture_requests(client, responses):
     return requests
 
 
-def test_storage_client_screenshot_lifecycle_payload_contract():
-    client = sc.StorageClient("test-pipe")
-    requests = _capture_requests(
-        client,
-        [
-            {"status": "success", "data": {"id": 42}},
-            {"status": "success", "data": {"committed": True}},
-            {"status": "success", "data": {"aborted": True}},
-        ],
-    )
-
-    assert client.save_screenshot_temp(
-        b"image-bytes",
-        image_hash="hash-1",
-        width=800,
-        height=600,
-        window_title="Editor",
-        process_name="code.exe",
-        metadata={"source": "contract-test"},
-    ) == {"id": 42}
-    assert client.commit_screenshot("42", [{"text": "hello", "confidence": 0.9}]) == {"committed": True}
-    assert client.abort_screenshot("43", reason="ocr failed") == {"aborted": True}
-
-    assert requests[0] == {
-        "command": "save_screenshot_temp",
-        "image_data": "aW1hZ2UtYnl0ZXM=",
-        "image_hash": "hash-1",
-        "width": 800,
-        "height": 600,
-        "window_title": "Editor",
-        "process_name": "code.exe",
-        "metadata": {"source": "contract-test"},
-    }
-    assert requests[1] == {
-        "command": "commit_screenshot",
-        "screenshot_id": "42",
-        "ocr_results": [{"text": "hello", "confidence": 0.9}],
-    }
-    assert requests[2] == {
-        "command": "abort_screenshot",
-        "screenshot_id": "43",
-        "reason": "ocr failed",
-    }
-
-
 def test_storage_client_clustering_and_category_payload_contract():
     client = sc.StorageClient("test-pipe")
-    requests = _capture_requests(
-        client,
-        [
-            {"status": "success", "data": {"screenshots": []}},
-            {"status": "success", "data": {"updated": True}},
-        ],
-    )
+    requests = _capture_requests(client, [
+        {"status": "success", "data": {"screenshots": [], "total": 0}},
+        {"status": "success", "data": {"updated": True}},
+    ])
 
-    assert client.get_screenshots_with_ocr_by_ids([7, "8"]) == {"screenshots": []}
+    assert client.list_screenshots_for_clustering(10.0, 20.0, 3, 9) == {
+        "status": "success",
+        "data": {"screenshots": [], "total": 0},
+    }
     assert client.update_screenshot_category(9, "Development", 0.75) is True
-
     assert requests == [
-        {
-            "command": "get_screenshots_with_ocr_by_ids",
-            "ids": [7, 8],
-        },
-        {
+        ({
+            "command": "list_screenshots_for_clustering",
+            "start_ts": 10.0,
+            "end_ts": 20.0,
+            "offset": 3,
+            "limit": 9,
+        }, sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS),
+        ({
             "command": "update_screenshot_category",
             "screenshot_id": 9,
             "category": "Development",
             "category_confidence": 0.75,
-        },
+        }, sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS),
     ]
 
 
-def test_storage_client_smart_cluster_reverse_ipc_payload_contract():
+def test_storage_client_postprocess_payload_contract():
     client = sc.StorageClient("test-pipe")
-    requests = _capture_requests(
-        client,
-        [
-            {"status": "success", "data": {"clusters": [{"id": 1}]}},
-            {"status": "success", "data": {"ok": True}},
-            {"status": "success", "data": {"ids": [11, 12]}},
-            {"status": "success", "data": {"ok": True, "deleted": 2}},
-            {"status": "success", "data": {"count": 4}},
-            {"status": "success", "data": {"ok": True}},
-        ],
-    )
+    requests = _capture_requests(client, [
+        {"status": "success", "data": {"updated": True}},
+        {"status": "success", "data": {"updated": True}},
+    ])
 
-    assert client.smart_cluster_list_enabled() == [{"id": 1}]
-    assert client.smart_cluster_enqueue_pending(10) is True
-    assert client.smart_cluster_peek_pending(limit=2) == [11, 12]
-    assert client.smart_cluster_delete_pending([11, "12"]) is True
-    assert client.smart_cluster_count_pending() == 4
-    assert client.smart_cluster_record_assignment(3, 10, 0.88) is True
-
+    assert client.set_ocr_postprocess_status(12, "pending", "foreground_busy") is True
+    assert client.record_ocr_postprocess_retry(12, "failed") is True
     assert requests == [
-        {"command": "smart_cluster_list_enabled"},
-        {"command": "smart_cluster_enqueue_pending", "screenshot_id": 10},
-        {"command": "smart_cluster_peek_pending", "limit": 2},
-        {"command": "smart_cluster_delete_pending", "ids": [11, 12]},
-        {"command": "smart_cluster_count_pending"},
-        {
-            "command": "smart_cluster_record_assignment",
-            "smart_cluster_id": 3,
-            "screenshot_id": 10,
-            "rerank_score": 0.88,
-        },
+        ({
+            "command": "set_ocr_postprocess_status",
+            "screenshot_id": 12,
+            "status": "pending",
+            "error": "foreground_busy",
+        }, sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS),
+        ({
+            "command": "record_ocr_postprocess_retry",
+            "screenshot_id": 12,
+            "error": "failed",
+        }, sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS),
     ]
 
 
 def test_storage_client_bge_bridge_payload_and_retry_contract():
     client = sc.StorageClient("test-pipe")
-    calls = []
-    responses = [
+    requests = _capture_requests(client, [
         {"status": "success", "data": {"dimensions": 2, "vectors": [[0.0, 1.0]]}},
-        {"status": "success", "data": {"recorded": True}},
-        {"status": "success", "data": {"recorded": True}},
-    ]
-
-    def fake_send(request, timeout=sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS):
-        calls.append((request, timeout))
-        return responses.pop(0)
-
-    client._send_request = fake_send
+    ])
 
     assert client.embed_bge_texts(["alpha"]) == {
         "dimensions": 2,
         "vectors": [[0.0, 1.0]],
     }
-    client.record_classification_python_fallback("worker_stopped: test")
-    client.record_classification_python_inference()
-
-    assert calls == [
+    assert requests == [
         ({"command": "bge_embed_texts", "texts": ["alpha"]}, 150),
-        (
-            {
-                "command": "classification_record_python_fallback",
-                "error": "worker_stopped: test",
-            },
-            sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS,
-        ),
-        (
-            {"command": "classification_record_python_inference"},
-            sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS,
-        ),
     ]
     assert "bge_embed_texts" in sc.READ_RETRY_COMMANDS
-    assert "classification_record_python_fallback" not in sc.SAFE_RETRY_AFTER_SEND_COMMANDS
-    assert "classification_record_python_inference" not in sc.SAFE_RETRY_AFTER_SEND_COMMANDS
 
 
-def test_the_retired_minilm_mirror_commands_are_not_retried_as_idempotent():
-    """M2.5 step 5 removed the Python→Rust MiniLM mirror in both directions.
-
-    The retry set is the part that has to stay in step. A command listed there
-    is re-sent after a pipe failure, so a name left behind after its method was
-    deleted would keep promising retry semantics for a command nothing can
-    issue and the Rust side no longer answers.
-    """
-    for retired in (
-        "upsert_minilm_derived_embeddings",
-        "delete_minilm_derived_embeddings",
-        "report_minilm_import_debt",
+def test_retired_python_backend_commands_are_absent():
+    for retired_method in (
+        "get_temp_image_bytes",
+        "get_screenshots_with_ocr_by_ids",
+        "smart_cluster_list_enabled",
+        "smart_cluster_enqueue_pending",
+        "smart_cluster_peek_pending",
+        "smart_cluster_delete_pending",
+        "smart_cluster_count_pending",
+        "smart_cluster_record_assignment",
+        "record_classification_python_fallback",
+        "record_classification_python_inference",
+        "save_screenshot",
     ):
-        assert not hasattr(sc.StorageClient, retired), retired
-        assert retired not in sc.IDEMPOTENT_RETRY_COMMANDS, retired
-        assert retired not in sc.READ_RETRY_COMMANDS, retired
+        assert not hasattr(sc.StorageClient, retired_method), retired_method
+
+    for retired_command in (
+        "get_temp_image",
+        "get_screenshots_with_ocr_by_ids",
+        "smart_cluster_list_enabled",
+        "smart_cluster_enqueue_pending",
+        "smart_cluster_peek_pending",
+        "smart_cluster_delete_pending",
+        "smart_cluster_count_pending",
+        "smart_cluster_record_assignment",
+        "classification_record_python_fallback",
+        "classification_record_python_inference",
+        "save_screenshot",
+    ):
+        assert retired_command not in sc.IDEMPOTENT_RETRY_COMMANDS
+        assert retired_command not in sc.READ_RETRY_COMMANDS

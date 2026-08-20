@@ -70,7 +70,6 @@ export function useSearchBoxController({
   onSubmit,
   controlledMode,
   onModeChange,
-  backendOnline,
   monitorPaused,
   handlePauseMonitor,
   handleResumeMonitor,
@@ -101,12 +100,6 @@ export function useSearchBoxController({
   const mode = controlledMode ?? localMode;
   const setMode = onModeChange ?? setLocalMode;
   const isMigrating = useHmacMigrationStatus();
-
-  useEffect(() => {
-    if (backendOnline === false && mode === 'nl') {
-      setMode('ocr');
-    }
-  }, [backendOnline, mode, setMode]);
 
   useEffect(() => {
     function handleClickOutside(event) {
@@ -425,21 +418,17 @@ export function useSearchBoxController({
   }, []);
 
   const switchMode = (nextMode) => {
-    if (nextMode === 'nl' && backendOnline === false) return;
     userInteractionRef.current = true;
     setMode(nextMode);
   };
 
   const toggleMode = () => {
-    if (backendOnline === false && mode === 'ocr') return;
     switchMode(mode === 'ocr' ? 'nl' : 'ocr');
   };
 
   const selectMode = (nextMode) => {
     switchMode(nextMode);
-    if (nextMode !== 'nl' || backendOnline !== false) {
-      setShowModeMenu(false);
-    }
+    setShowModeMenu(false);
   };
 
   const handleSelect = (item) => {

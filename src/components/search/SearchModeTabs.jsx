@@ -11,15 +11,13 @@ import { useTranslation } from 'react-i18next';
  * @param {object} props
  * @param {'ocr' | 'nl'} props.mode 当前模式
  * @param {(mode: 'ocr' | 'nl') => void} props.onChange 切换回调
- * @param {boolean} [props.backendOnline] Python 服务是否在线，离线时画面搜索不可用
  */
-export function SearchModeTabs({ mode, onChange, backendOnline }) {
+export function SearchModeTabs({ mode, onChange }) {
   const { t } = useTranslation();
-  const nlDisabled = backendOnline === false;
 
   const tabs = [
     { value: 'ocr', label: t('advancedSearch.modes.ocr'), hint: t('advancedSearch.modes.ocr_hint'), Icon: Type, disabled: false },
-    { value: 'nl', label: t('advancedSearch.modes.nl'), hint: nlDisabled ? t('search.nl.disabled_hint') : t('advancedSearch.modes.nl_hint'), Icon: ImageIcon, disabled: nlDisabled },
+    { value: 'nl', label: t('advancedSearch.modes.nl'), hint: t('advancedSearch.modes.nl_hint'), Icon: ImageIcon, disabled: false },
   ];
 
   return (

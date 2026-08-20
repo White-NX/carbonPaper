@@ -53,20 +53,11 @@ pub struct SemanticRuntimeStatus {
     pub last_error: Option<String>,
     pub last_elapsed_ms: Option<f64>,
     pub directml_disabled_for_session: bool,
-    /// M2.5 observable-fallback diagnostic: which semantic backend is selected,
-    /// which one actually served the last NL query, why a Rust configuration
-    /// was refused, and how far the local index is known to be behind. This
-    /// read-only field is what survives of the retired shadow settings card —
-    /// the enum rule requires a local diagnostic, not a dev panel.
+    /// Rust semantic retrieval health and local index backlog.
     pub backend: crate::semantic_query::SemanticBackendStatus,
-    /// The same diagnostic for the Chinese-CLIP image index (M2.5 step 9).
-    /// Separate rather than folded in, because the two searches cut over on
-    /// their own schedules and each has its own rollback lever: a user reading
-    /// one field could not tell which of the two it described.
+    /// Chinese-CLIP retrieval, image-index, and ANN health.
     pub clip_backend: crate::clip_query::ClipBackendStatus,
-    /// BGE automatic-classification inference selection and fallback history.
-    /// Classification has no derived index, so its diagnostic is only runtime
-    /// ownership, the last backend that served it, and the last Rust failure.
+    /// BGE classification embedding success, failure, and latency diagnostics.
     pub classification_backend: crate::classification_runtime::ClassificationBackendStatus,
 }
 
@@ -689,7 +680,7 @@ impl SemanticRuntimeState {
             directml_disabled_for_session: inner.directml_disabled_for_session,
             backend: crate::semantic_query::backend_status(None),
             clip_backend: crate::clip_query::backend_status(None, None),
-            classification_backend: crate::classification_runtime::backend_status(None),
+            classification_backend: crate::classification_runtime::backend_status(),
         }
     }
 
@@ -1044,8 +1035,7 @@ pub static BACKGROUND_PASS_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 /// Background capture indexing and foreground search share this worker, and the
 /// background batch runs on a far more generous budget than a user query does.
 /// An unbounded wait here would therefore let a 5 s search hang for the length
-/// of a background batch — its own budget would never start counting, and it
-/// could not fall back to Python either, because nothing had failed yet.
+/// of a background batch before its own budget started counting.
 ///
 /// Losing the wait is deliberately not recorded as a worker failure and does not
 /// restart anything: the worker is healthy, it is busy. The caller sees a
@@ -1347,7 +1337,7 @@ fn assign_kill_on_close_job(child: &Child) -> Result<SemanticJobHandle, String> 
 #[tauri::command]
 pub async fn get_ml_semantic_status(
     state: tauri::State<'_, Arc<SemanticRuntimeState>>,
-    monitor: tauri::State<'_, crate::monitor::MonitorState>,
+    _monitor: tauri::State<'_, crate::monitor::MonitorState>,
     storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
     index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
     clip_run: tauri::State<'_, Arc<crate::clip_index::ClipIndexRunState>>,
@@ -1355,8 +1345,7 @@ pub async fn get_ml_semantic_status(
     refresh_diagnostics: Option<bool>,
 ) -> Result<SemanticRuntimeStatus, String> {
     let mut status = state.status();
-    status.classification_backend =
-        crate::classification_runtime::backend_status(monitor.active_classification_runtime());
+    status.classification_backend = crate::classification_runtime::backend_status();
     // Read before the blocking call below, so a run that finishes while the
     // ledger read is queued behind the database mutex is not reported as still
     // going. Erring towards "finished" is the safe direction: the settings
@@ -1477,13 +1466,12 @@ pub fn get_background_index_progress(
 pub fn restart_ml_semantic_worker(
     window: tauri::Window,
     state: tauri::State<'_, Arc<SemanticRuntimeState>>,
-    monitor: tauri::State<'_, crate::monitor::MonitorState>,
+    _monitor: tauri::State<'_, crate::monitor::MonitorState>,
 ) -> Result<SemanticRuntimeStatus, String> {
     crate::commands::check_main_window(&window)?;
     state.stop();
     let mut status = state.status();
-    status.classification_backend =
-        crate::classification_runtime::backend_status(monitor.active_classification_runtime());
+    status.classification_backend = crate::classification_runtime::backend_status();
     Ok(status)
 }
 

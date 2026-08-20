@@ -43,7 +43,6 @@ const cluster = {
 function renderView() {
   return render(
     <SmartClustersView
-      backendOnline
       isAuthenticated
       active
       onSelectScreenshot={vi.fn()}

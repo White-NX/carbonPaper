@@ -85,7 +85,6 @@ function colorFromAnchor(text) {
  *
  * Props:
  *   mode                 - 'explore' | 'calibrate'
- *   backendOnline        - whether the Python backend is reachable
  *   onSelectScreenshot   - (item) => void; called when user clicks a card body
  *   onSaveCalibration    - ({ anchorText, threshold, examples, dominantColor }) => Promise<void>
  *                          required in 'calibrate' mode
@@ -94,7 +93,6 @@ function colorFromAnchor(text) {
  */
 export default function NlClusterView({
   mode = 'explore',
-  backendOnline,
   onSelectScreenshot,
   onSaveCalibration,
   onCancelCalibration,
@@ -113,11 +111,6 @@ export default function NlClusterView({
   const [reranked, setReranked] = useState(false);
   const [activeVariant, setActiveVariant] = useState(null);
   const [lastQuery, setLastQuery] = useState('');
-  // Which engine produced the scores currently in `scoreById`. Saved alongside
-  // the threshold derived from them, because a reranked query is served by Rust
-  // or by Python depending on conditions this screen cannot see, and the two
-  // disagree enough that a threshold from one cannot be applied to the other.
-  const [lastBackend, setLastBackend] = useState(null);
   const [thumbnailCache, setThumbnailCache] = useState({});
   const [rerankerStatus, setRerankerStatus] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -155,15 +148,14 @@ export default function NlClusterView({
     };
   }, []);
 
-  // Check reranker availability whenever backend status / settings change
+  // Check the Rust reranker availability when the view opens.
   useEffect(() => {
-    if (!backendOnline) { setRerankerStatus(null); return; }
     let active = true;
     getRerankerStatus()
       .then(s => { if (active) setRerankerStatus(s); })
       .catch(() => { if (active) setRerankerStatus({ available: false, loaded: false, available_variants: [], model_path: '' }); });
     return () => { active = false; };
-  }, [backendOnline]);
+  }, []);
 
   // Progress of the running reranked query, one event per finished chunk.
   // Subscribed for the view's lifetime, not the query's: MainArea keeps this
@@ -176,7 +168,7 @@ export default function NlClusterView({
   const handleSubmit = useCallback(async (e) => {
     e?.preventDefault?.();
     const trimmed = query.trim();
-    if (!trimmed || !backendOnline) return;
+    if (!trimmed) return;
 
     setLoading(true);
     inFlightRef.current = true;
@@ -188,14 +180,13 @@ export default function NlClusterView({
     // In calibrate mode, clear selection when starting a fresh query against
     // a different anchor — but preserve it if the same query is re-run. The
     // cached scores go with it: they are what the saved threshold is derived
-    // from, and keeping scores from an earlier query would let one threshold
-    // mix numbers produced by two different backends.
+    // from, and keeping scores from an earlier query would mix two result sets.
     if (isCalibrate && trimmed !== lastQuery) {
       setSelection({});
       setScoreById({});
     }
     try {
-      const { results: out, reranked: didRerank, rerank_variant: usedVariant, backend, cancelled: wasCancelled } =
+      const { results: out, reranked: didRerank, rerank_variant: usedVariant, cancelled: wasCancelled } =
         await nlClusterQuery(trimmed, nResults, enableRerank);
       // A stopped query returns no ranking, so nothing about the previous one
       // is replaced — including `lastQuery`, which is what decides whether the
@@ -208,7 +199,6 @@ export default function NlClusterView({
       setReranked(didRerank);
       setActiveVariant(usedVariant);
       setLastQuery(trimmed);
-      setLastBackend(backend);
       // Snapshot scores for threshold computation later.
       const scoreMap = {};
       for (const r of out) {
@@ -225,18 +215,15 @@ export default function NlClusterView({
       setStopping(false);
       setProgress(null);
     }
-  }, [query, nResults, enableRerank, backendOnline, isCalibrate, lastQuery]);
+  }, [query, nResults, enableRerank, isCalibrate, lastQuery]);
 
   /**
    * Stop the running query. The backend checks between chunks of eight
    * documents, so the button stays in its "stopping" state until the query's
    * own promise settles — which is what clears `loading`.
    *
-   * Resolving `false` means there was nothing to stop, which on this screen has
-   * one cause: Python is answering. Its rerank is a single opaque IPC call with
-   * no chunk boundary to stop at, so the honest response is to say so and put
-   * the button back rather than leave it spinning on a request that will never
-   * be honoured.
+   * Resolving `false` means the Rust backend no longer has a query to stop, so
+   * the button returns to its normal state while the request finishes.
    */
   const handleStop = useCallback(async () => {
     setStopping(true);
@@ -338,9 +325,7 @@ export default function NlClusterView({
         threshold,
         dominant_color: colorFromAnchor(lastQuery),
         examples: [...positives, ...negatives],
-        // Whose logits this threshold was computed from. Not the configured
-        // backend — the one that answered.
-        scorer_backend: lastBackend,
+        scorer_backend: 'rust',
       });
       if (mountedRef.current) {
         // Reset on success
@@ -348,7 +333,6 @@ export default function NlClusterView({
         setResults([]);
         setQuery('');
         setLastQuery('');
-        setLastBackend(null);
       }
     } catch (err) {
       if (mountedRef.current) {
@@ -416,19 +400,12 @@ export default function NlClusterView({
           scored: Number(progress.scored) || 0,
           total: Number(progress.total) || 0,
         });
-      case 'external_backend':
-        return t('nlCluster.progressExternalBackend', '正在由 Python 后端重排，这一路径不报告进度…');
       default:
         return t('nlCluster.progressStarting', '正在准备…');
     }
   }, [enableRerank, progress, t]);
 
-  /**
-   * Python's rerank has no chunk boundary to stop at, so the button is hidden
-   * rather than shown and refused. Everything else — including the moments
-   * before the first progress event — is stoppable.
-   */
-  const canStop = enableRerank && progress?.phase !== 'external_backend';
+  const canStop = enableRerank;
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -496,7 +473,7 @@ export default function NlClusterView({
           ) : (
             <button
               type="submit"
-              disabled={loading || !backendOnline || !query.trim()}
+              disabled={loading || !query.trim()}
               className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-accent bg-ide-accent/20 text-ide-accent hover:bg-ide-accent/30 disabled:opacity-40 transition-colors"
             >
               {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}

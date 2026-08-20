@@ -199,7 +199,7 @@ def test_send_request_watchdog_closes_handle_during_blocking_read(monkeypatch):
     assert close_calls
 
 
-def test_unsafe_write_command_is_not_retried_after_pipe_close(monkeypatch):
+def test_unlisted_write_command_is_not_retried_after_pipe_close(monkeypatch):
     state = {"create_calls": 0, "write_calls": 0}
 
     def create_file(*_args, **_kwargs):
@@ -219,7 +219,7 @@ def test_unsafe_write_command_is_not_retried_after_pipe_close(monkeypatch):
     )
 
     client = sc.StorageClient("pipe")
-    result = client._send_request({"command": "save_screenshot_temp"})
+    result = client._send_request({"command": "non_idempotent_write"})
 
     assert result["status"] == "error"
     assert "IPC error" in result["error"]

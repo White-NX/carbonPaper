@@ -77,6 +77,24 @@ def test_monitor_pyz_excludes_chroma_db():
     assert not leaked, f"chroma_db files leaked into production monitor.pyz: {leaked}"
 
 
+def test_monitor_bundle_excludes_retired_python_inference_modules():
+    """Removed inference workers must not survive in generated copies."""
+    retired = {
+        "ocr_engine.py",
+        "ocr_service.py",
+        "rapidocr_capability.py",
+        "reranker.py",
+        "smart_cluster_worker.py",
+        "vector_store.py",
+    }
+    root = _project_root()
+    generated_dir = root / "src-tauri" / "pre-bundle" / "monitor"
+    if generated_dir.exists():
+        assert not retired.intersection(p.name for p in generated_dir.iterdir())
+    with zipfile.ZipFile(_pyz_path()) as z:
+        assert not retired.intersection(Path(name).name for name in z.namelist())
+
+
 def test_monitor_pyz_contains_current_source_files():
     """监管陈旧文件不会因为 build.rs 的某条路径偷偷流入 .pyz。
     对每个源 .py 文件，确认其在 .pyz 内的副本与源内容一致。"""

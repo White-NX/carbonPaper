@@ -4,7 +4,7 @@ import AdvancedWarning from './advanced/AdvancedWarning';
 import ClusteringTechnicalCard from './advanced/ClusteringTechnicalCard';
 import CpuLimitCard from './advanced/CpuLimitCard';
 import DatabaseMaintenanceCard from './advanced/DatabaseMaintenanceCard';
-import { ClassificationBackendCard, ClipBackendCard, DmlAccelerationCard, OcrEngineCard, OnnxRuntimeCard, SemanticBackendCard } from './advanced/InferenceCards';
+import { ClassificationBackendCard, ClipBackendCard, DmlAccelerationCard, OcrEngineCard, SemanticBackendCard } from './advanced/InferenceCards';
 import NetworkAccessCard from './advanced/NetworkAccessCard';
 import OcrQueueCard from './advanced/OcrQueueCard';
 import { useAdvancedSectionController } from './useAdvancedSectionController';
@@ -19,8 +19,6 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     clusteringDropdownOpen,
     cpuChanged,
     dmlChanged,
-    onnxChanged,
-    classificationRuntimeChanged,
     gpus,
     gpuLoading,
     vacuumRunning,
@@ -35,8 +33,6 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     setClusteringDropdownOpen,
     clearCpuChanged,
     clearDmlChanged,
-    clearOnnxChanged,
-    clearClassificationRuntimeChanged,
     handleToggle,
     handleCpuPercentChange,
     handleOcrTimeoutDraftChange,
@@ -58,14 +54,11 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     clipBackfill,
     clipBackfillBusy,
     handleClipBackfillDecision,
-    handleToggleRustClipIndex,
-    handleToggleRustClassification,
     handleRunClipIndexNow,
     handleStopClipIndex,
     handleRetryClipAnn,
     semanticIndexProgress,
     semanticIndexStopping,
-    handleToggleRustSemanticIndex,
     handleRunSemanticIndexNow,
     handleStopSemanticIndex,
     refreshSemanticStatus,
@@ -127,30 +120,13 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         onClearChanged={clearDmlChanged}
       />
 
-      <OnnxRuntimeCard
-        config={config}
-        monitorStatus={monitorStatus}
-        onnxChanged={onnxChanged}
-        onToggle={handleToggle}
-        onRestartMonitor={onRestartMonitor}
-        onClearChanged={clearOnnxChanged}
-      />
-
       <ClassificationBackendCard
-        config={config}
         status={semanticStatus}
-        monitorStatus={monitorStatus}
-        runtimeChanged={classificationRuntimeChanged}
-        onToggleRust={handleToggleRustClassification}
-        onRestartMonitor={onRestartMonitor}
-        onClearChanged={clearClassificationRuntimeChanged}
       />
 
       <SemanticBackendCard
-        config={config}
         status={semanticStatus}
         statusLoading={semanticStatusLoading}
-        onToggleRustIndex={handleToggleRustSemanticIndex}
         onRefresh={refreshSemanticStatus}
         onRunIndexNow={handleRunSemanticIndexNow}
         onStopIndexNow={handleStopSemanticIndex}
@@ -161,10 +137,8 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
       />
 
       <ClipBackendCard
-        config={config}
         status={semanticStatus}
         statusLoading={semanticStatusLoading}
-        onToggleRustIndex={handleToggleRustClipIndex}
         onRefresh={refreshSemanticStatus}
         onRunIndexNow={handleRunClipIndexNow}
         onStopIndexNow={handleStopClipIndex}

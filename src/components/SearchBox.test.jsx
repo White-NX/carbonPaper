@@ -44,7 +44,6 @@ describe('SearchBox', () => {
       <SearchBox
         onSelectResult={vi.fn()}
         onSubmit={onSubmit}
-        backendOnline
       />
     );
 
@@ -54,21 +53,15 @@ describe('SearchBox', () => {
     expect(onSubmit).toHaveBeenCalledWith({ query: 'invoice', mode: 'ocr' });
   });
 
-  it('forces controlled mode back to ocr when backend is offline', async () => {
-    const onModeChange = vi.fn();
-
+  it('keeps controlled visual mode available when the monitor is offline', async () => {
     render(
       <SearchBox
         onSelectResult={vi.fn()}
         mode="nl"
-        onModeChange={onModeChange}
-        backendOnline={false}
       />
     );
 
-    await waitFor(() => {
-      expect(onModeChange).toHaveBeenCalledWith('ocr');
-    });
+    expect(screen.getByPlaceholderText('search.placeholder.nl')).toBeInTheDocument();
   });
 
   it('displays search error message when search fails', async () => {
@@ -80,7 +73,6 @@ describe('SearchBox', () => {
       render(
         <SearchBox
           onSelectResult={vi.fn()}
-          backendOnline
         />
       );
 

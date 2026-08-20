@@ -147,7 +147,7 @@ def test_send_request_reconnects_once_when_write_sees_closing_pipe(monkeypatch):
     monkeypatch.setattr(sc.win32file, "ReadFile", fake_read_file)
     monkeypatch.setattr(sc.win32file, "CloseHandle", lambda _h: state.__setitem__("close_calls", state["close_calls"] + 1))
 
-    result = sc.StorageClient("test-pipe")._send_request({"command": "get_temp_image"})
+    result = sc.StorageClient("test-pipe")._send_request({"command": "get_idle_state"})
 
     assert result == response_obj
     assert state["create_calls"] == 2
@@ -290,49 +290,3 @@ def test_list_screenshots_for_clustering_uses_expected_payload(monkeypatch):
         "limit": 9,
     }
     assert result["status"] == "success"
-
-
-def test_get_temp_image_bytes_reads_binary_frame(monkeypatch):
-    metadata = {
-        "status": "success",
-        "data": {
-            "mime_type": "image/jpeg",
-            "binary_frame": True,
-            "binary_body_len": 4,
-        },
-    }
-    metadata_bytes = json.dumps(metadata).encode("utf-8")
-    image_bytes = b"\xff\xd8\xff\xd9"
-    stream = bytearray(
-        struct.pack("<I", len(metadata_bytes))
-        + metadata_bytes
-        + struct.pack("<I", len(image_bytes))
-        + image_bytes
-    )
-
-    monkeypatch.setattr(sc.pywintypes, "error", FakePyWinError)
-    monkeypatch.setattr(sc.win32file, "CreateFile", lambda *_a, **_k: object())
-    monkeypatch.setattr(sc.win32pipe, "SetNamedPipeHandleState", lambda *_a, **_k: None)
-    monkeypatch.setattr(sc.win32file, "WriteFile", lambda _h, payload: (0, len(payload)))
-    monkeypatch.setattr(sc.win32file, "FlushFileBuffers", lambda _h: None)
-    monkeypatch.setattr(sc.win32file, "CloseHandle", lambda _h: None)
-
-    def fake_read_file(_handle, size):
-        if not stream:
-            return 0, b""
-        n = min(size, len(stream))
-        chunk = bytes(stream[:n])
-        del stream[:n]
-        return 0, chunk
-
-    monkeypatch.setattr(sc.win32file, "ReadFile", fake_read_file)
-
-    result = sc.StorageClient("test-pipe").get_temp_image_bytes(123)
-
-    assert result == {
-        "status": "success",
-        "data": {
-            "image_bytes": image_bytes,
-            "mime_type": "image/jpeg",
-        },
-    }

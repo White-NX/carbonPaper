@@ -12,11 +12,6 @@ HANDLED_CLUSTERING_COMMANDS = {
     "get_clustering_status",
     "set_clustering_interval",
     "get_tasks",
-    "nl_cluster_query",
-    "nl_cluster_reranker_status",
-    "smart_cluster_drain_now",
-    "smart_cluster_stop_drain",
-    "smart_cluster_worker_status",
     "start_task_vectors_export",
     "get_task_vectors_export_status",
     "export_task_vectors_page",
@@ -134,57 +129,6 @@ def handle_clustering_command(
         except Exception as e:
             return {"error": str(e)}
 
-    if cmd == "nl_cluster_query":
-        service_error = _requires_service(manager=manager)
-        if service_error:
-            return service_error
-        auth_error = _requires_auth(auth_gate)
-        if auth_error:
-            return auth_error
-        query = req.get("query", "")
-        n_results = req.get("n_results", 30)
-        enable_rerank = bool(req.get("enable_rerank", False))
-        rerank_variant = req.get("rerank_variant") or "uint8"
-        try:
-            from task_clustering import ModelNotAvailableError
-            from reranker import RerankerNotAvailableError
-            try:
-                results = manager.query_by_text(
-                    query,
-                    n_results=int(n_results),
-                    enable_rerank=enable_rerank,
-                    rerank_variant=rerank_variant,
-                )
-            except ModelNotAvailableError:
-                return {"error": "MiniLM model not downloaded — run clustering setup first"}
-            except RerankerNotAvailableError as e:
-                return {"error": f"RERANKER_UNAVAILABLE: {e}"}
-            return {
-                "status": "success",
-                "results": results,
-                "reranked": enable_rerank,
-                "rerank_variant": rerank_variant if enable_rerank else None,
-            }
-        except Exception as e:
-            logger.exception("nl_cluster_query failed")
-            return {"error": str(e)}
-
-    if cmd == "nl_cluster_reranker_status":
-        try:
-            from reranker import Reranker, _resolve_model_path, list_available_variants
-            r = Reranker()
-            return {
-                "status": "success",
-                "available": Reranker.is_model_available(),
-                "loaded": r.is_loaded(),
-                "loaded_variant": r.loaded_variant,
-                "provider": r.provider,
-                "available_variants": list_available_variants(),
-                "model_path": _resolve_model_path(),
-            }
-        except Exception as e:
-            return {"error": str(e)}
-
     if cmd == "start_task_vectors_export":
         service_error = _requires_service(manager=manager)
         if service_error:
@@ -255,37 +199,6 @@ def handle_clustering_command(
             return {"status": "success", "upserted": count}
         except Exception as e:
             logger.exception("upsert_task_vectors failed")
-            return {"error": str(e)}
-
-    if cmd == "smart_cluster_drain_now":
-        try:
-            from smart_cluster_worker import SmartClusterWorker
-            SmartClusterWorker().request_drain_now()
-            return {"status": "success"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    if cmd == "smart_cluster_stop_drain":
-        try:
-            from smart_cluster_worker import SmartClusterWorker
-            SmartClusterWorker().request_stop_drain()
-            return {"status": "success"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    if cmd == "smart_cluster_worker_status":
-        try:
-            from smart_cluster_worker import SmartClusterWorker
-            worker = SmartClusterWorker()
-            sc = worker.storage_client
-            pending_count = sc.smart_cluster_count_pending() if sc else 0
-            return {
-                "status": "success",
-                "is_running": worker.is_running(),
-                "is_force_running": worker.is_force_running(),
-                "pending_count": pending_count,
-            }
-        except Exception as e:
             return {"error": str(e)}
 
     return None
