@@ -33,9 +33,12 @@ import { useSelectedSnapshot, normalizeTimestampToMs } from './hooks/useSelected
 import { useStartupWizards } from './hooks/useStartupWizards';
 import { useUpdateManager } from './hooks/useUpdateManager';
 import { useTauriEventListener } from './hooks/useTauriEventListener';
+import { initAuthListeners } from './lib/auth_api';
 
 function App() {
   const { t } = useTranslation();
+
+  useEffect(() => initAuthListeners(), []);
 
   useEffect(() => {
     const handleContextMenu = (e) => {

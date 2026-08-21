@@ -1881,9 +1881,13 @@ impl StorageState {
     fn decrypt_screenshot_summary_with_unwrap(
         row: EncryptedScreenshotSummaryRow,
         unwrap_row_key: &dyn Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
+        is_authorized: &dyn Fn() -> bool,
     ) -> Result<BackgroundScreenshotSummary, BackgroundReadError> {
         let needs_row_key = row.window_title_enc.is_some() || row.process_name_enc.is_some();
         let mut row_key = if needs_row_key {
+            if !is_authorized() {
+                return Err(BackgroundReadError::AuthRequired);
+            }
             let encrypted_key = row.content_key_enc.as_deref().ok_or_else(|| {
                 BackgroundReadError::Other(format!(
                     "Missing content key for screenshot summary id={}",
@@ -1956,12 +1960,21 @@ impl StorageState {
     /// Decrypts summary rows in parallel with one CNG session per worker
     /// thread, preserving input order.
     fn decrypt_summaries_parallel(
+        &self,
         raw_rows: Vec<EncryptedScreenshotSummaryRow>,
     ) -> Result<Vec<BackgroundScreenshotSummary>, BackgroundReadError> {
+        if !self.is_silent_read_authorized() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
         unwrap_batch_parallel(raw_rows, |session, row| {
-            Self::decrypt_screenshot_summary_with_unwrap(row, &|ciphertext| {
-                session.unwrap_row_key(ciphertext)
-            })
+            if !self.is_silent_read_authorized() {
+                return Err(BackgroundReadError::AuthRequired);
+            }
+            Self::decrypt_screenshot_summary_with_unwrap(
+                row,
+                &|ciphertext| session.unwrap_row_key(ciphertext),
+                &|| self.is_silent_read_authorized(),
+            )
         })
     }
 
@@ -1975,7 +1988,7 @@ impl StorageState {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        if !self.is_session_valid() {
+        if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
 
@@ -2021,7 +2034,10 @@ impl StorageState {
             rows
         };
 
-        Self::decrypt_summaries_parallel(raw_rows)
+        if !self.is_silent_read_authorized() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
+        self.decrypt_summaries_parallel(raw_rows)
     }
 
     pub(crate) fn get_screenshot_summaries_by_time_range_paged_silent(
@@ -2031,7 +2047,7 @@ impl StorageState {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<BackgroundScreenshotSummary>, BackgroundReadError> {
-        if !self.is_session_valid() {
+        if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
 
@@ -2083,7 +2099,10 @@ impl StorageState {
             rows
         };
 
-        Self::decrypt_summaries_parallel(raw_rows)
+        if !self.is_silent_read_authorized() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
+        self.decrypt_summaries_parallel(raw_rows)
     }
 
     pub fn get_screenshot_by_id(&self, id: i64) -> Result<Option<ScreenshotRecord>, String> {
@@ -2271,6 +2290,9 @@ impl StorageState {
         &self,
         screenshot_id: i64,
     ) -> Result<Vec<super::OcrResult>, BackgroundReadError> {
+        if !self.is_silent_read_authorized() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
         let encrypted_rows = {
             let guard = self
                 .get_connection_named("get_screenshot_ocr_results_silent")
@@ -2316,6 +2338,9 @@ impl StorageState {
         encrypted_rows
             .into_iter()
             .map(|row| {
+                if !self.is_silent_read_authorized() {
+                    return Err(BackgroundReadError::AuthRequired);
+                }
                 let text = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
                     (Some(data), Some(key)) => {
                         String::from_utf8(self.decrypt_payload_with_row_key_silent(data, key)?)
@@ -2356,7 +2381,7 @@ impl StorageState {
         &self,
         screenshot_ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, String>, BackgroundReadError> {
-        if !screenshot_ids.is_empty() && !self.is_session_valid() {
+        if !screenshot_ids.is_empty() && !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
         self.get_ocr_results_by_screenshot_ids_with_mode(screenshot_ids, true)
@@ -2381,7 +2406,7 @@ impl StorageState {
         if screenshot_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        if !self.is_session_valid() {
+        if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
 
@@ -2424,6 +2449,10 @@ impl StorageState {
             raw_rows
         };
 
+        if !self.is_silent_read_authorized() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
+
         // Phase 2: group boxes per screenshot. Each id lives in exactly one
         // IN chunk and every chunk is ordered by screenshot_id, so the rows
         // of one screenshot are contiguous and in insertion order — the exact
@@ -2440,6 +2469,9 @@ impl StorageState {
         // Phase 3: decrypt each screenshot's prefix in parallel.
         let maps = unwrap_batch_parallel(groups, |session, group| {
             assemble_ocr_text_prefixes(group, min_chars, |data, key| {
+                if !self.is_silent_read_authorized() {
+                    return Err(BackgroundReadError::AuthRequired);
+                }
                 let bytes = Self::decrypt_payload_with_unwrap(data, key, &|ciphertext| {
                     session.unwrap_row_key(ciphertext)
                 })?;
@@ -2529,6 +2561,9 @@ impl StorageState {
         }
 
         for (screenshot_id, text_enc, text_key_enc) in raw_rows {
+            if silent && !self.is_silent_read_authorized() {
+                return Err(BackgroundReadError::AuthRequired);
+            }
             let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
                 (Some(data), Some(key)) if silent => Some(
                     String::from_utf8(self.decrypt_payload_with_row_key_silent(data, key)?)

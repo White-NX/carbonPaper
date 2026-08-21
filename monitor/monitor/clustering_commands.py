@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 HANDLED_CLUSTERING_COMMANDS = {
     "run_clustering",
+    "run_scheduled_clustering",
     "get_clustering_status",
     "set_clustering_interval",
     "get_tasks",
@@ -71,6 +72,51 @@ def handle_clustering_command(
             )
             return {"status": "success", **result}
         except Exception as e:
+            return {"error": str(e)}
+
+    if cmd == "run_scheduled_clustering":
+        service_error = _requires_service(scheduler=scheduler, manager=manager)
+        if service_error:
+            return service_error
+        manual = bool(req.get("manual", False))
+        storage_client = getattr(manager, "_storage_client", None)
+        if storage_client is not None:
+            # A scheduler-admitted manual slice may use the live UI session
+            # even when unattended processing is disabled. Both paths still
+            # call the background-safe clustering code, so decryption can
+            # never open an authentication dialog.
+            authorized = storage_client.is_background_authorized()
+            if manual:
+                authorized = authorized or storage_client.is_session_valid()
+            if not authorized:
+                return {"error": "AUTH_REQUIRED"}
+        elif not manual:
+            # Without the Rust storage client there is no way to prove that an
+            # automatic request holds the process-scoped background lease.
+            # Fail closed; only explicit compatibility/manual requests may use
+            # the UI session gate.
+            return {"error": "AUTH_REQUIRED"}
+        elif manual and not auth_gate(force=True):
+            return {"error": "AUTH_REQUIRED"}
+        try:
+            if scheduler is not None and hasattr(scheduler, "run_scheduled"):
+                result = scheduler.run_scheduled()
+            else:
+                from monitor.config import CLUSTERING_ALLOW_FULL_LOW_MEMORY, CLUSTERING_ENABLED
+                if not CLUSTERING_ENABLED:
+                    return {"status": "success", "result": {"status": "disabled"}}
+                result = manager.run_clustering(
+                    auto_compress=True,
+                    clustering_mode="auto",
+                    manual=False,
+                    allow_full_low_memory=CLUSTERING_ALLOW_FULL_LOW_MEMORY,
+                    background=True,
+                )
+            if result.get("status") == "already_running":
+                return {"error": "CLUSTERING_ALREADY_RUNNING", "result": result}
+            return {"status": "success", "result": result}
+        except Exception as e:
+            logger.exception("run_scheduled_clustering failed")
             return {"error": str(e)}
 
     if cmd == "get_clustering_status":

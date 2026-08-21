@@ -99,6 +99,17 @@ export function useDelayedClusteringSetupRunner({
           return;
         }
 
+        if (result?.status === 'queued' || result?.queued) {
+          pushNotification({
+            id: `clustering-queued-${Date.now()}`,
+            type: 'info',
+            title: '任务聚类',
+            message: '聚类任务已加入后台整理队列，系统会在合适时机执行。',
+            timestamp: Date.now(),
+          });
+          return;
+        }
+
         if (result?.clusters?.length > 0) {
           const tasks = buildTaskRequests(result.clusters);
           await saveClusteringResults(tasks);

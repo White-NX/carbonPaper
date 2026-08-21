@@ -40,6 +40,9 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [clipBackfillBusy, setClipBackfillBusy] = useState(false);
   const [semanticIndexProgress, setSemanticIndexProgress] = useState(null);
   const [semanticIndexStopping, setSemanticIndexStopping] = useState(false);
+  const [backgroundProcessingEnabled, setBackgroundProcessingEnabled] = useState(true);
+  const [backgroundSchedulerStatus, setBackgroundSchedulerStatus] = useState(null);
+  const [backgroundProcessingSaving, setBackgroundProcessingSaving] = useState(false);
   const mlOcrStatusRequestRef = useRef(null);
 
   const saveConfig = async (newConfig) => {
@@ -106,6 +109,49 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   useEffect(() => {
     loadConfig();
   }, []);
+
+  const refreshBackgroundSchedulerStatus = async () => {
+    try {
+      const [enabled, status] = await Promise.all([
+        invoke('credential_get_background_processing_enabled'),
+        invoke('background_scheduler_status'),
+      ]);
+      setBackgroundProcessingEnabled(Boolean(enabled));
+      setBackgroundSchedulerStatus(status);
+    } catch (err) {
+      console.warn('Failed to read background scheduler status:', err);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer = null;
+    const poll = async () => {
+      await refreshBackgroundSchedulerStatus();
+      if (!cancelled) timer = window.setTimeout(poll, 3000);
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, []);
+
+  const handleBackgroundProcessingChange = async (enabled) => {
+    setBackgroundProcessingSaving(true);
+    try {
+      await withAuth(
+        () => invoke('credential_set_background_processing_enabled', { enabled }),
+        { autoPrompt: true },
+      );
+      setBackgroundProcessingEnabled(enabled);
+      await refreshBackgroundSchedulerStatus();
+    } catch (err) {
+      console.warn('Failed to update background processing:', err);
+    } finally {
+      setBackgroundProcessingSaving(false);
+    }
+  };
 
   useEffect(() => {
     if (config?.use_dml) {
@@ -288,6 +334,11 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     try {
       const summary = await invoke('semantic_index_run_now');
       setSemanticIndexRun(summary);
+      if (summary?.queued) {
+        ownsRun.current = false;
+        await refreshBackgroundSchedulerStatus();
+        return summary;
+      }
       await refreshSemanticStatus();
       return summary;
     } catch (err) {
@@ -336,6 +387,11 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     try {
       const summary = await invoke('clip_index_run_now');
       setClipIndexRun(summary);
+      if (summary?.queued) {
+        ownsClipRun.current = false;
+        await refreshBackgroundSchedulerStatus();
+        return summary;
+      }
       await refreshSemanticStatus();
       return summary;
     } catch (err) {
@@ -530,6 +586,9 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     handleClipBackfillDecision,
     semanticIndexProgress,
     semanticIndexStopping,
+    backgroundProcessingEnabled,
+    backgroundSchedulerStatus,
+    backgroundProcessingSaving,
     setCpuDropdownOpen,
     setGpuDropdownOpen,
     setClusteringDropdownOpen,
@@ -550,5 +609,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     handleStopClipIndex,
     handleRetryClipAnn,
     refreshSemanticStatus,
+    refreshBackgroundSchedulerStatus,
+    handleBackgroundProcessingChange,
   };
 }

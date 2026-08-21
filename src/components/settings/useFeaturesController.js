@@ -172,6 +172,15 @@ export function useFeaturesController({
         });
       }
 
+      if (result?.status === 'queued' || result?.queued) {
+        setClusteringNotice(t(
+          'settings.features.management.clustering.queued',
+          '已加入后台整理队列',
+        ));
+        await refreshClusteringStatus();
+        return;
+      }
+
       if (result?.status === 'empty') {
         setClusteringError(t('tasks.noData'));
       }

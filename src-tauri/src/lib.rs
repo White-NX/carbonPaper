@@ -6,6 +6,7 @@
 mod analysis;
 mod ann_format;
 mod autostart;
+mod background_scheduler;
 mod capture;
 mod classification_runtime;
 mod clip_ann;
@@ -400,6 +401,9 @@ fn is_open_tray_click(button: MouseButton, button_state: MouseButtonState) -> bo
 
 fn open_main_window(app: &tauri::AppHandle, show_ocr_model_repair: bool) {
     cancel_auto_lightweight_timer(app);
+    if let Some(credential_state) = app.try_state::<Arc<CredentialManagerState>>() {
+        credential_state.set_foreground_state(true);
+    }
 
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -531,7 +535,16 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     let cs = app_handle.state::<Arc<CaptureState>>();
                     let _ = monitor::stop_monitor_impl(state, cs, app_handle.clone()).await;
                     let start_state = app_handle.state::<MonitorState>();
-                    let _ = monitor::start_monitor_impl(start_state, app_handle.clone()).await;
+                    if monitor::start_monitor_impl(start_state, app_handle.clone())
+                        .await
+                        .is_ok()
+                    {
+                        if let Some(scheduler) = app_handle
+                            .try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
+                        {
+                            scheduler.clear_monitor_restart_degraded(&app_handle);
+                        }
+                    }
                 });
             }
             MENU_ID_LIGHTWEIGHT => {
@@ -553,6 +566,16 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let app_handle = app.clone();
                 IS_QUITTING.store(true, Ordering::Relaxed);
                 cancel_auto_lightweight_timer(&app_handle);
+                if let Some(credential_state) =
+                    app_handle.try_state::<Arc<CredentialManagerState>>()
+                {
+                    credential_state.clear_all_cached_keys();
+                }
+                if let Some(scheduler) =
+                    app_handle.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
+                {
+                    scheduler.stop();
+                }
 
                 let state = app_handle.state::<MonitorState>();
                 state.stopping.store(true, Ordering::SeqCst);
@@ -700,6 +723,9 @@ fn start_auto_lightweight_timer(app: tauri::AppHandle) {
 pub(crate) fn hide_main_window_to_tray(window: &tauri::Window) -> Result<(), String> {
     window.hide().map_err(|e| e.to_string())?;
     let app = window.app_handle();
+    if let Some(credential_state) = app.try_state::<Arc<CredentialManagerState>>() {
+        credential_state.set_foreground_state(false);
+    }
     let _ = app.emit("app-hidden", ());
     start_auto_lightweight_timer(app.clone());
     Ok(())
@@ -729,6 +755,12 @@ pub fn run() {
     }
 
     let credential_state = Arc::new(CredentialManagerState::new(data_dir.clone()));
+    if start_hidden {
+        // A hidden/lightweight launch has no foreground UI. Do this before the
+        // state is managed so every startup path observes the same lifecycle
+        // state, including the interval before setup creates the tray.
+        credential_state.set_foreground_state(false);
+    }
     let storage_state = Arc::new(StorageState::new(
         data_dir.clone(),
         credential_state.clone(),
@@ -748,6 +780,7 @@ pub fn run() {
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(office_runtime::OfficeRuntimeState::new()))
         .manage(Arc::new(semantic_runtime::SemanticRuntimeState::new()))
+        .manage(Arc::new(background_scheduler::BackgroundSchedulerState::default()))
         .manage(Arc::new(minilm_migration::MinilmMigrationState::new()))
         .manage(Arc::new(clip_migration::ClipMigrationState::new()))
         .manage(Arc::new(clip_index::ClipIndexRunState::default()))
@@ -935,34 +968,15 @@ pub fn run() {
                             }
                         });
 
-                        // M2.5 step 5: Rust owns MiniLM capture indexing and
-                        // retention. Strictly idle-gated, so this loop spends
-                        // most of a working day deciding to do nothing.
-                        let app_handle_semantic_index = app.handle().clone();
-                        tauri::async_runtime::spawn(async move {
-                            minilm_index::run_semantic_index_worker(app_handle_semantic_index)
-                                .await;
-                        });
-
-                        // M2.5 step 8: the same for Chinese-CLIP image vectors.
-                        // A third claimant of one single-slot worker, which is
-                        // why all three take `BACKGROUND_PASS_GUARD` rather than
-                        // trusting their poll intervals to keep them apart.
-                        let app_handle_clip_index = app.handle().clone();
-                        tauri::async_runtime::spawn(async move {
-                            clip_index::run_clip_index_worker(app_handle_clip_index).await;
-                        });
-
-                        // M2.5 step 6: Rust owns Smart Cluster scoring, which
-                        // moved with the calibration threshold it compares
-                        // against. It remains idle-gated like the indexer.
-                        let app_handle_smart_cluster = app.handle().clone();
-                        tauri::async_runtime::spawn(async move {
-                            smart_cluster_scoring::run_smart_cluster_worker(
-                                app_handle_smart_cluster,
-                            )
-                            .await;
-                        });
+                        // One scheduler arbitrates all four automatic model
+                        // tasks. Their business queues remain durable in
+                        // SQLite/Chroma; only admission and slice ordering live
+                        // in this loop.
+                        let scheduler = app
+                            .state::<Arc<background_scheduler::BackgroundSchedulerState>>()
+                            .inner()
+                            .clone();
+                        scheduler.start(app.handle().clone());
                     }
                 } else {
                     tracing::error!("Storage initialization deferred: public key unavailable");
@@ -1216,6 +1230,9 @@ pub fn run() {
             commands::credential::credential_set_foreground,
             commands::credential::credential_set_session_timeout,
             commands::credential::credential_get_session_timeout,
+            commands::credential::credential_get_background_processing_enabled,
+            commands::credential::credential_set_background_processing_enabled,
+            background_scheduler::background_scheduler_status,
             get_autostart_status,
             set_autostart,
             python::check_python_status,
@@ -1292,31 +1309,30 @@ pub fn run() {
         // 单实例保护应该始终启用，无论窗口是否隐藏
         // 这样可以防止多个实例竞争共享资源（SQLite、命名管道等）
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // 如果窗口存在，聚焦它
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_focus();
-                let _ = window.show();
-                let _ = window.unminimize();
-            } else {
-                // 如果窗口不存在（轻量模式），切换回标准模式
-                if let Some(lightweight_state) = app.try_state::<Arc<LightweightModeState>>() {
-                    if *lightweight_state.is_lightweight.lock().unwrap() {
-                        let _ = crate::create_main_window(&app);
-                        *lightweight_state.is_lightweight.lock().unwrap() = false;
-                    }
-                }
-            }
+            open_main_window_from_tray(app);
         }));
     }
 
     builder
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
+        .run(|app_handle, event| {
             // 阻止应用在所有窗口关闭时退出
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
                 if !IS_UPDATING.load(Ordering::Relaxed) && !IS_QUITTING.load(Ordering::Relaxed) {
                     api.prevent_exit();
+                }
+            }
+            if let tauri::RunEvent::Exit = event {
+                if let Some(scheduler) =
+                    app_handle.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
+                {
+                    scheduler.stop();
+                }
+                if let Some(credential_state) =
+                    app_handle.try_state::<Arc<CredentialManagerState>>()
+                {
+                    credential_state.clear_all_cached_keys();
                 }
             }
         });

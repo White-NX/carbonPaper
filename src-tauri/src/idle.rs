@@ -152,6 +152,7 @@ pub fn start_idle_monitor(app: AppHandle) {
 
     let handle = tauri::async_runtime::spawn(async move {
         let mut last_emitted_idle: Option<bool> = None;
+        let mut last_scheduler_gate: Option<(bool, bool, bool)> = None;
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
@@ -204,6 +205,20 @@ pub fn start_idle_monitor(app: AppHandle) {
             st.fullscreen_exclusive.store(fullscreen, Ordering::SeqCst);
             st.ac_connected.store(ac_connected, Ordering::SeqCst);
             st.is_idle.store(is_idle, Ordering::SeqCst);
+
+            // Wake the unified scheduler as soon as any admission signal
+            // changes. The ten-second probe remains the source of truth, but
+            // a scheduler waiting on a retry or unlock should not wait for its
+            // own two-second fallback tick after the gate opens.
+            let scheduler_gate = (is_idle, fullscreen, ac_connected);
+            if last_scheduler_gate != Some(scheduler_gate) {
+                if let Some(scheduler) = app_clone
+                    .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+                {
+                    scheduler.wake();
+                }
+                last_scheduler_gate = Some(scheduler_gate);
+            }
 
             // Emit event only on state flips to keep noise low.
             if last_emitted_idle != Some(is_idle) {

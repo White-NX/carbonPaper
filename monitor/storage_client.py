@@ -72,6 +72,8 @@ READ_RETRY_COMMANDS = {
     'encrypt_for_chromadb',
     'decrypt_from_chromadb',
     'decrypt_many_from_chromadb',
+    'decrypt_from_chromadb_silent',
+    'decrypt_many_from_chromadb_silent',
     'list_screenshots_for_clustering',
     'get_idle_state',
     'get_auth_status',
@@ -619,6 +621,38 @@ class StorageClient:
         logger.error("[storage_client] Decryption failed: %s", response.get('error'))
         return None
 
+    def decrypt_from_chromadb_silent(self, encrypted: str) -> Optional[str]:
+        """Decrypt one field through the non-interactive background path."""
+        if not encrypted:
+            return encrypted
+        response = self._send_request({
+            'command': 'decrypt_from_chromadb_silent',
+            'encrypted': encrypted,
+        })
+        if response.get('status') == 'success':
+            return response.get('data', {}).get('decrypted')
+        if response.get('error') in ('AUTH_REQUIRED', 'AUTH_REQUIRED: background lease unavailable'):
+            raise PermissionError('AUTH_REQUIRED')
+        logger.error("[storage_client] Silent decryption failed: %s", response.get('error'))
+        return None
+
+    def decrypt_many_from_chromadb_silent(self, encrypted_list: List[str]) -> List[Optional[str]]:
+        """Batch decrypt fields without permitting an authentication prompt."""
+        if not encrypted_list:
+            return []
+        response = self._send_request({
+            'command': 'decrypt_many_from_chromadb_silent',
+            'encrypted_list': encrypted_list,
+        })
+        if response.get('status') == 'success':
+            values = response.get('data', {}).get('decrypted_list')
+            if isinstance(values, list) and len(values) == len(encrypted_list):
+                return values
+        if response.get('error') in ('AUTH_REQUIRED', 'AUTH_REQUIRED: background lease unavailable'):
+            raise PermissionError('AUTH_REQUIRED')
+        logger.error("[storage_client] Silent batch decryption failed: %s", response.get('error'))
+        return [None] * len(encrypted_list)
+
     def decrypt_many_from_chromadb(self, encrypted_list: List[str]) -> List[Optional[str]]:
         """
         Batch-decrypt data.
@@ -746,6 +780,13 @@ class StorageClient:
         if response.get('status') == 'success':
             data = response.get('data', {})
             return bool(data.get('session_valid', False))
+        return False
+
+    def is_background_authorized(self) -> bool:
+        """Whether Rust granted this process the unattended processing lease."""
+        response = self._send_request({'command': 'get_auth_status'})
+        if response.get('status') == 'success':
+            return bool(response.get('data', {}).get('background_authorized', False))
         return False
 
     def set_ocr_postprocess_status(

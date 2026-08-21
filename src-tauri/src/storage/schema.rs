@@ -701,6 +701,25 @@ impl StorageState {
                 value TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            -- One durable row per automatic background task. The scheduler
+            -- owns ordering and retry state; the task-specific queues remain
+            -- in their existing business tables.
+            CREATE TABLE IF NOT EXISTS background_scheduler_tasks (
+                task_kind TEXT PRIMARY KEY,
+                ready_since_ms INTEGER NOT NULL,
+                next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_served_seq INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_completed_at_ms INTEGER,
+                status TEXT NOT NULL DEFAULT 'queued',
+                manual_pending INTEGER NOT NULL DEFAULT 0,
+                manual_in_flight INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_background_scheduler_ready
+                ON background_scheduler_tasks(status, next_attempt_at_ms,
+                                               ready_since_ms, last_served_seq);
             "#,
         )
         .map_err(|e| format!("Failed to initialize tables: {}", e))?;
@@ -937,6 +956,16 @@ impl StorageState {
             "INTEGER",
         )?;
         Self::add_column_if_missing(conn, "derived_index_jobs", "lease_token", "TEXT")?;
+        // A manual request is consumed when its slice starts, but must be
+        // restored when that slice is deferred or fails. Keep that distinction
+        // durable so cancellation and process restart cannot resurrect or lose
+        // a request accidentally.
+        Self::add_column_if_missing(
+            conn,
+            "background_scheduler_tasks",
+            "manual_in_flight",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         // `derived_migration_runs.index_kind` is deliberately not here: the
         // CREATE batch indexes over it, so it has to be in place before that

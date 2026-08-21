@@ -697,6 +697,7 @@ pub async fn monitor_update_feature_config(
 
 #[tauri::command]
 pub async fn monitor_run_clustering(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: State<'_, MonitorState>,
     start_time: Option<f64>,
@@ -704,6 +705,22 @@ pub async fn monitor_run_clustering(
     clustering_mode: Option<String>,
     manual: Option<bool>,
 ) -> Result<Value, String> {
+    if manual.unwrap_or(false) && start_time.is_none() && end_time.is_none() {
+        crate::commands::check_auth_required(&credential_state)?;
+        let scheduler = app
+            .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+            .ok_or_else(|| "Background scheduler is unavailable".to_string())?;
+        scheduler.enqueue(
+            &app,
+            crate::background_scheduler::BackgroundTaskKind::PythonClustering,
+            true,
+        )?;
+        return Ok(serde_json::json!({
+            "status": "queued",
+            "queued": true,
+            "task": "python_clustering",
+        }));
+    }
     authenticated_monitor_command(
         &credential_state,
         &state,
@@ -720,29 +737,57 @@ pub async fn monitor_run_clustering(
 
 #[tauri::command]
 pub async fn monitor_get_clustering_status(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
+    scheduler: State<'_, Arc<crate::background_scheduler::BackgroundSchedulerState>>,
 ) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({ "command": "get_clustering_status" }),
-    )
-    .await
+    crate::commands::check_auth_required(&credential_state)?;
+    let status = scheduler.status(&app);
+    let task = status
+        .tasks
+        .iter()
+        .find(|task| task.task_kind == crate::background_scheduler::TASK_PYTHON_CLUSTERING);
+    let interval = crate::registry_config::get_string("clustering_interval")
+        .unwrap_or_else(|| "1w".to_string());
+    let interval_secs = match interval.as_str() {
+        "1d" => 86_400,
+        "1m" => 2_592_000,
+        "6m" => 15_552_000,
+        _ => 604_800,
+    };
+    Ok(serde_json::json!({
+        "status": "success",
+        "config": {
+            "interval": interval,
+            "interval_secs": interval_secs,
+            "last_run": task.and_then(|task| task.last_completed_at_ms).map(|ms| ms as f64 / 1000.0),
+            "running": status.running_task.as_deref() == Some(crate::background_scheduler::TASK_PYTHON_CLUSTERING),
+        },
+        "last_result": task.map(|task| serde_json::json!({
+            "status": task.status,
+            "last_error": task.last_error,
+        })),
+        "scheduler": status,
+    }))
 }
 
 #[tauri::command]
 pub async fn monitor_set_clustering_interval(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     interval: String,
 ) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({ "command": "set_clustering_interval", "interval": interval }),
-    )
-    .await
+    crate::commands::check_auth_required(&credential_state)?;
+    if !matches!(interval.as_str(), "1d" | "1w" | "1m" | "6m") {
+        return Err(format!("Unknown clustering interval: {interval}"));
+    }
+    crate::registry_config::set_string("clustering_interval", &interval)?;
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.wake();
+    }
+    Ok(serde_json::json!({ "status": "success", "interval": interval }))
 }
 
 #[tauri::command]
@@ -844,21 +889,44 @@ pub async fn monitor_smart_cluster_worker_status(
 
 #[tauri::command]
 pub async fn monitor_smart_cluster_drain_now(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     worker: State<'_, Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
-    worker.request_drain_now();
+    let scheduler = app
+        .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        .ok_or_else(|| "Background scheduler is unavailable".to_string())?;
+    let rollback = worker.request_drain_now();
+    if let Err(error) = scheduler.enqueue(
+        &app,
+        crate::background_scheduler::BackgroundTaskKind::SmartCluster,
+        true,
+    ) {
+        worker.cancel_pending_drain_request(rollback);
+        return Err(error);
+    }
     Ok(serde_json::json!({ "status": "success" }))
 }
 
 #[tauri::command]
 pub async fn monitor_smart_cluster_stop_drain(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    storage: State<'_, Arc<crate::storage::StorageState>>,
     worker: State<'_, Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     worker.request_stop_drain();
+    // Stopping a forced drain must also cancel a request that has not reached
+    // the worker yet. Otherwise the durable scheduler row would run it on the
+    // next idle tick despite the user's stop action.
+    storage.cancel_manual_background_task(crate::background_scheduler::TASK_SMART_CLUSTER)?;
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.wake();
+    }
     Ok(serde_json::json!({ "status": "success" }))
 }
 
@@ -1750,7 +1818,18 @@ pub async fn start_monitor(
 ) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
     crate::maintenance::guard()?;
-    start_monitor_impl(state, app).await
+    let result = start_monitor_impl(state, app.clone()).await;
+    if result.is_ok() {
+        if let Some(scheduler) =
+            app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        {
+            // This command is the explicit recovery action exposed to the
+            // user. It is the only event that clears the in-process monitor
+            // restart degradation latch.
+            scheduler.clear_monitor_restart_degraded(&app);
+        }
+    }
+    result
 }
 
 #[tauri::command]

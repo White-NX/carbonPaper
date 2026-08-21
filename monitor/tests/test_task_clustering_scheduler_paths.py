@@ -1,6 +1,7 @@
 import numpy as np
 
 import task_clustering as tc
+from monitor import config
 
 
 def test_scheduler_skips_when_model_not_available(monkeypatch):
@@ -121,6 +122,42 @@ def test_run_now_returns_already_running():
 
     result = scheduler.run_now()
     assert result == {"status": "already_running"}
+
+
+def test_run_scheduled_does_not_record_waiting_for_index_as_completed(monkeypatch):
+    class Manager:
+        def run_clustering(self, **_kwargs):
+            return {"status": "waiting_for_index"}
+
+    scheduler = tc.ClusteringScheduler(Manager())
+    save_calls = []
+    scheduler._save_config = lambda: save_calls.append(True)
+    before = scheduler._last_run
+
+    result = scheduler.run_scheduled()
+
+    assert result == {"status": "waiting_for_index"}
+    assert scheduler._last_run == before
+    assert save_calls == []
+    assert scheduler.get_config()["running"] is False
+
+
+def test_run_scheduled_does_not_record_disabled_as_completed(monkeypatch):
+    class Manager:
+        def run_clustering(self, **_kwargs):
+            return {"status": "success"}
+
+    scheduler = tc.ClusteringScheduler(Manager())
+    save_calls = []
+    scheduler._save_config = lambda: save_calls.append(True)
+    before = scheduler._last_run
+    monkeypatch.setattr(config, "CLUSTERING_ENABLED", False)
+
+    result = scheduler.run_scheduled()
+
+    assert result["status"] == "disabled"
+    assert scheduler._last_run == before
+    assert save_calls == []
 
 
 def test_run_now_updates_last_run_only_for_default_mode(monkeypatch):

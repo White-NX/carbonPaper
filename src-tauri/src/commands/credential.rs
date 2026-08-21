@@ -8,6 +8,7 @@ use crate::credential_manager::{self, CredentialManagerState};
 use crate::mcp_server;
 use crate::storage::StorageState;
 use std::sync::Arc;
+use tauri::Manager;
 
 /// Initializes the CNG key pair, cached public key, master key, and encrypted storage.
 ///
@@ -16,6 +17,7 @@ use std::sync::Arc;
 /// Frontend: `components/AuthMask.jsx` and `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn credential_initialize(
+    app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     storage_state: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<String, String> {
@@ -36,12 +38,18 @@ pub async fn credential_initialize(
             .map_err(|e| format!("Failed to create master key: {}", e))?;
 
         storage_state.initialize()?;
+        if let Some(scheduler) =
+            app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        {
+            scheduler.start(app.clone());
+        }
 
         Ok("Credentials initialized successfully".to_string())
     }
 
     #[cfg(not(windows))]
     {
+        let _ = &app;
         let _ = &credential_state;
         let _ = &storage_state;
         Err("Windows Hello is only available on Windows".to_string())
@@ -70,6 +78,12 @@ pub async fn credential_verify_user(
             .map_err(|e| format!("Verification failed: {}", e))?;
 
         state.update_auth_time();
+        state.grant_background_lease();
+        if let Some(scheduler) =
+            app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        {
+            scheduler.wake();
+        }
         storage_state.try_dedup_migration();
         storage_state.try_bitmap_index_migration();
         if let Err(e) =
@@ -155,4 +169,32 @@ pub async fn credential_get_session_timeout(
     state: tauri::State<'_, Arc<CredentialManagerState>>,
 ) -> Result<i64, String> {
     Ok(state.get_session_timeout())
+}
+
+/// Returns whether unattended organization is enabled. The process lease is
+/// deliberately not exposed here; scheduler status reports whether work is
+/// currently waiting for an unlock.
+#[tauri::command]
+pub async fn credential_get_background_processing_enabled(
+    state: tauri::State<'_, Arc<CredentialManagerState>>,
+) -> Result<bool, String> {
+    Ok(state.background_processing_enabled())
+}
+
+/// Enables or disables unattended organization after the UI is locked. The
+/// setting is persistent; disabling it revokes the current process lease.
+#[tauri::command]
+pub async fn credential_set_background_processing_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<CredentialManagerState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::commands::check_auth_required(&state)?;
+    state.set_background_processing_enabled(enabled)?;
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.wake();
+    }
+    Ok(())
 }

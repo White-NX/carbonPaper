@@ -592,10 +592,14 @@ class HotColdManager:
                 return enc
         return text
 
-    def _decrypt(self, text: str) -> str:
+    def _decrypt(self, text: str, *, background: bool = False) -> str:
         if self._storage_client and text:
             if text.startswith("ENC2:") or text.startswith("ENC:"):
-                dec = self._storage_client.decrypt_from_chromadb(text)
+                dec = (
+                    self._storage_client.decrypt_from_chromadb_silent(text)
+                    if background
+                    else self._storage_client.decrypt_from_chromadb(text)
+                )
                 if dec is not None:
                     return dec
         return text
@@ -1013,6 +1017,7 @@ class HotColdManager:
         clustering_mode: str = "auto",
         manual: bool = False,
         allow_full_low_memory: bool = False,
+        background: bool = False,
     ) -> Dict[str, Any]:
         """Execute HDBSCAN clustering on hot-layer vectors.
 
@@ -1103,6 +1108,23 @@ class HotColdManager:
 
                 # If hot layer is empty, try backfilling from screenshot_embeddings
                 if len(ids) == 0:
+                    # Automatic clustering must never become a second MiniLM
+                    # worker. Rust owns semantic indexing and mirrors completed
+                    # vectors into this collection; while that queue is still
+                    # catching up, leave the scheduled task for a later pass
+                    # instead of loading Python's legacy encoder concurrently.
+                    if background:
+                        logger.info(
+                            "Hot layer empty during scheduled clustering; waiting for Rust semantic indexing"
+                        )
+                        return {
+                            "clusters": [],
+                            "noise_ids": [],
+                            "n_clusters": 0,
+                            "n_noise": 0,
+                            "n_total": 0,
+                            "status": "waiting_for_index",
+                        }
                     logger.warning("Hot layer empty — attempting backfill from SQLite")
                     self._embedder.load()
                     backfilled = self._backfill_from_screenshots(start_time, end_time)
@@ -1172,7 +1194,10 @@ class HotColdManager:
                     cl_copy = dict(cl)
                     cl_copy["centroid"] = cl["centroid"].tolist()
                     # Decrypt display fields
-                    cl_copy["dominant_process"] = self._decrypt(cl_copy.get("dominant_process", ""))
+                    cl_copy["dominant_process"] = self._decrypt(
+                        cl_copy.get("dominant_process", ""),
+                        background=background,
+                    )
                     clusters_serialisable.append(cl_copy)
 
                 return {
@@ -1215,7 +1240,7 @@ class HotColdManager:
         return out
 
 # ---------------------------------------------------------------------------
-# ClusteringScheduler — background timer for periodic re-runs
+# ClusteringScheduler — compatibility facade for explicit runs
 # ---------------------------------------------------------------------------
 
 # Interval presets (seconds)
@@ -1229,21 +1254,20 @@ DEFAULT_INTERVAL_KEY = "1w"
 
 
 class ClusteringScheduler:
-    """Background scheduler that periodically triggers HDBSCAN on the hot layer."""
+    """Compatibility facade for explicit clustering requests.
+
+    Periodic scheduling moved to Rust. This object intentionally creates no
+    timer or authentication-monitor thread.
+    """
 
     def __init__(self, manager: HotColdManager, storage_client=None):
         self._manager = manager
         self._storage_client = storage_client
         self._interval_key = DEFAULT_INTERVAL_KEY
         self._interval_secs = INTERVAL_PRESETS[DEFAULT_INTERVAL_KEY]
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
         self._last_run: float = 0.0
         self._running = False
         self._last_result: Optional[Dict] = None
-
-        # Load persisted config
-        self._load_config()
 
     def _config_path(self) -> str:
         data_dir = os.environ.get("CARBONPAPER_DATA_DIR")
@@ -1267,16 +1291,10 @@ class ClusteringScheduler:
             logger.warning("Failed to load clustering config: %s", e)
 
     def _save_config(self):
-        try:
-            path = self._config_path()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "interval": self._interval_key,
-                    "last_run": self._last_run,
-                }, f)
-        except Exception as e:
-            logger.warning("Failed to save clustering config: %s", e)
+        # Rust persists scheduler timing in SQLite. Keep the hook as a
+        # compatibility seam for callers/tests that observe an explicit run,
+        # but never recreate the legacy JSON file.
+        return None
 
     def set_interval(self, key: str):
         """Set the clustering interval (e.g. '1d', '1w', '1m', '6m')."""
@@ -1284,7 +1302,6 @@ class ClusteringScheduler:
             raise ValueError(f"Unknown interval key: {key!r}")
         self._interval_key = key
         self._interval_secs = INTERVAL_PRESETS[key]
-        self._save_config()
         logger.info("Clustering interval set to %s (%ds)", key, self._interval_secs)
 
     def get_config(self) -> Dict[str, Any]:
@@ -1296,40 +1313,59 @@ class ClusteringScheduler:
         }
 
     def start(self):
-        """Start the scheduler background thread."""
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="clustering-scheduler")
-        self._thread.start()
-        logger.info("Clustering scheduler started (interval=%s)", self._interval_key)
+        """Retained for compatibility; Rust owns automatic scheduling."""
+        logger.debug("Ignoring Python clustering scheduler start; Rust owns scheduling")
 
     def stop(self):
-        """Stop the scheduler."""
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=5)
-        logger.info("Clustering scheduler stopped")
+        """Retained for compatibility; there is no Python timer to stop."""
 
-    def _loop(self):
-        """Scheduler loop — run when due based on (last_run + interval)."""
-        while not self._stop_event.is_set():
-            now = time.time()
-            elapsed = now - self._last_run
-            if elapsed >= self._interval_secs:
-                did_run = self._do_run()
-                if not did_run:
-                    # Back off to avoid busy-spin when run is skipped/failed
-                    # (e.g. model unavailable, concurrent run, exception path).
-                    self._stop_event.wait(timeout=60.0)
-                continue
+    def run_scheduled(self) -> Dict[str, Any]:
+        """Run one Rust-admitted automatic clustering slice.
 
-            # Wait until the next due time (bounded to keep stop/config updates responsive).
-            remaining = max(1.0, self._interval_secs - elapsed)
-            self._stop_event.wait(timeout=min(60.0, remaining))
+        Rust owns the idle gate, retry policy, and interval. Keeping the
+        result on this compatibility facade is still important because the
+        existing ``get_tasks`` IPC response reads the most recent hot-cluster
+        result from here.
+        """
+        from monitor.config import CLUSTERING_ALLOW_FULL_LOW_MEMORY, CLUSTERING_ENABLED
+
+        if not CLUSTERING_ENABLED:
+            result = {"status": "disabled", "error": "Clustering is disabled"}
+            self._last_result = result
+            return result
+        if self._running:
+            return {"status": "already_running"}
+
+        self._running = True
+        try:
+            result = self._manager.run_clustering(
+                auto_compress=True,
+                clustering_mode="auto",
+                manual=False,
+                allow_full_low_memory=CLUSTERING_ALLOW_FULL_LOW_MEMORY,
+                background=True,
+            )
+            if result.get("status") in {"already_running", "waiting_for_index"}:
+                # Neither outcome completed a clustering interval. In
+                # particular, waiting_for_index means Rust has not mirrored
+                # semantic vectors yet; recording a run here would postpone
+                # the next attempt for the full configured interval.
+                return result
+            self._last_result = result
+            self._last_run = time.time()
+            self._save_config()
+            return result
+        finally:
+            self._running = False
 
     def _do_run(self) -> bool:
-        """Execute one clustering run. Returns True only on successful completion."""
+        """Compatibility probe for callers from pre-Rust scheduler releases.
+
+        Production automatic work enters through :meth:`run_scheduled`, which
+        is admitted by Rust after the unified idle/auth/retry checks. This
+        method remains synchronous for older integrations and tests that called
+        the former worker directly; it is never started by :meth:`start`.
+        """
         from monitor.config import CLUSTERING_ALLOW_FULL_LOW_MEMORY, CLUSTERING_ENABLED
         if not CLUSTERING_ENABLED:
             logger.debug("Skipping scheduled clustering: feature disabled")

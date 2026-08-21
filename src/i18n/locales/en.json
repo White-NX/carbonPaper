@@ -272,6 +272,23 @@
         "gpu_loading": "Detecting GPUs...",
         "gpu_none": "No compatible GPU detected"
       },
+      "background_processing": {
+        "title": "Background organization",
+        "label": "Continue organizing while locked",
+        "description": "After one successful unlock, CarbonPaper can keep organizing records for this app session. Unlock again after restarting.",
+        "status": "Current status",
+        "refresh": "Refresh status",
+        "states": {
+          "waiting_for_idle": "Waiting for idle",
+          "waiting_for_unlock": "Waiting for unlock",
+          "running": "Running",
+          "retry_wait": "Retrying later",
+          "monitor_unavailable": "Monitor unavailable",
+          "disabled": "Task grouping is off",
+          "organizing": "Organizing",
+          "preparing": "Preparing records"
+        }
+      },
       "clustering": {
         "title": "Task Clustering",
         "interval_label": "Auto-clustering interval",
@@ -312,7 +329,8 @@
         "run_stop_pending": "Stopping…",
         "run_stopping": "Stopping. The run ends once the current batch finishes.",
         "run_done": "Indexed {{indexed}} screenshot(s); {{remaining}} still waiting.",
-        "run_skipped": "This run did not start: {{reason}}."
+        "run_skipped": "This run did not start: {{reason}}.",
+        "run_queued": "Added to the background organization queue."
       },
       "clip_backend": {
         "title": "Screenshot image search",
@@ -339,6 +357,7 @@
         "ann_failure_detail": "{{count}} consecutive failure(s) · {{code}} · next automatic attempt: {{retryAt}}",
         "ann_retry_now": "Retry now",
         "ann_retrying": "Retrying…",
+        "run_queued": "Added to the background organization queue.",
         "backlog_hint": "Image encoding runs only while the computer is idle and on mains power, so screenshots captured during active use become findable by image search after the next idle period.",
         "stalled_hint": "These images exhausted their encoding retries and will not be picked up again on their own. They stay out of image search until indexing is rebuilt.",
         "run_now": "Index now",
@@ -807,6 +826,7 @@
           "interval_desc": "Set the interval for background auto clustering",
           "advanced_label": "Advanced",
           "run_now": "Run clustering now",
+          "queued": "Added to the background organization queue",
           "completed": "Clustering complete: saved {{count}} activities"
         },
         "classification": {
