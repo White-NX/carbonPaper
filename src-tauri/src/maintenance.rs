@@ -89,6 +89,8 @@ pub fn reverse_ipc_command_allowed(command: &str) -> bool {
             | "encrypt_for_chromadb"
             | "decrypt_from_chromadb"
             | "decrypt_many_from_chromadb"
+            | "decrypt_from_chromadb_silent"
+            | "decrypt_many_from_chromadb_silent"
             | "register_nmh"
             | "unregister_nmh"
     )

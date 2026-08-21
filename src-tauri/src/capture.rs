@@ -2048,6 +2048,20 @@ pub(crate) async fn process_ocr_inner(
             error
         );
     }
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        let _ = scheduler.enqueue(
+            app,
+            crate::background_scheduler::BackgroundTaskKind::SemanticIndex,
+            false,
+        );
+        let _ = scheduler.enqueue(
+            app,
+            crate::background_scheduler::BackgroundTaskKind::ClipIndex,
+            false,
+        );
+    }
     match enqueue_ocr_postprocess(
         app,
         screenshot_id,

@@ -28,6 +28,65 @@ function ChangedNotice({
     </div>
   );
 }
+
+export function BackgroundSchedulerCard({ enabled, saving, status, onChange, onRefresh }) {
+  const { t } = useTranslation();
+  const stateKey = status?.running_task
+    ? 'running'
+    : (status?.blocked_reason || (status?.next_retry_at_ms ? 'retry_wait' : 'waiting_for_idle'));
+  const stateLabel = {
+    waiting_for_idle: t('settings.advanced.background_processing.states.waiting_for_idle', '等待空闲'),
+    waiting_for_unlock: t('settings.advanced.background_processing.states.waiting_for_unlock', '等待解锁'),
+    running: t('settings.advanced.background_processing.states.running', '执行中'),
+    retry_wait: t('settings.advanced.background_processing.states.retry_wait', '失败重试'),
+    monitor_unavailable: t('settings.advanced.background_processing.states.monitor_unavailable', '监控不可用'),
+    disabled: t('settings.advanced.background_processing.states.disabled', '任务分组已关闭'),
+    clustering_already_running: t('settings.advanced.background_processing.states.organizing', '正在整理'),
+    waiting_for_index: t('settings.advanced.background_processing.states.preparing', '正在准备记录'),
+    waiting_for_ac_power: t('settings.advanced.background_processing.states.waiting_for_idle', '等待空闲'),
+    waiting_for_fullscreen: t('settings.advanced.background_processing.states.waiting_for_idle', '等待空闲'),
+    foreground_request: t('settings.advanced.background_processing.states.waiting_for_idle', '等待空闲'),
+    maintenance: t('settings.advanced.background_processing.states.waiting_for_idle', '等待空闲'),
+    semantic_worker_busy: t('settings.advanced.background_processing.states.waiting_for_idle', '等待空闲'),
+  }[stateKey] || t('settings.advanced.background_processing.states.waiting_for_idle', '等待空闲');
+
+  return (
+    <div className="space-y-3">
+      <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
+        <RefreshCw className="w-4 h-4" />
+        {t('settings.advanced.background_processing.title', '后台自动整理')}
+      </label>
+      <div className="p-4 bg-ide-bg border border-ide-border rounded-xl space-y-3">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-sm text-ide-text font-medium">
+              {t('settings.advanced.background_processing.label', '锁定后继续自动整理')}
+            </p>
+            <p className="text-xs text-ide-muted mt-1">
+              {t('settings.advanced.background_processing.description', '成功解锁一次后，应用可在本次运行期间继续整理记录。')}
+            </p>
+          </div>
+          <SettingsSwitch checked={enabled} disabled={saving} onChange={onChange} />
+        </div>
+        <div className="flex items-center justify-between rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3">
+          <div>
+            <p className="text-xs text-ide-muted">
+              {t('settings.advanced.background_processing.status', '当前状态')}
+            </p>
+            <p className="text-sm text-ide-text mt-0.5">{enabled ? stateLabel : '—'}</p>
+          </div>
+          <button
+            onClick={onRefresh}
+            className="p-1.5 text-ide-muted hover:text-ide-text hover:bg-ide-hover rounded transition-colors"
+            title={t('settings.advanced.background_processing.refresh', '刷新状态')}
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 export function OcrEngineCard({
   config,
   status,
@@ -263,7 +322,9 @@ export function SemanticBackendCard({
       runMessage = t('settings.advanced.semantic_backend.run_preparing');
     }
   } else if (indexRun) {
-    runMessage = indexRun.started
+    runMessage = indexRun.queued
+      ? t('settings.advanced.semantic_backend.run_queued', '已加入后台整理队列')
+      : indexRun.started
       ? t('settings.advanced.semantic_backend.run_done', {
         indexed: indexRun.indexed ?? 0,
         remaining: indexRun.remaining ?? 0,
@@ -431,7 +492,9 @@ export function ClipBackendCard({
       runMessage = t('settings.advanced.clip_backend.run_preparing');
     }
   } else if (indexRun) {
-    runMessage = indexRun.started
+    runMessage = indexRun.queued
+      ? t('settings.advanced.clip_backend.run_queued', '已加入后台整理队列')
+      : indexRun.started
       ? t('settings.advanced.clip_backend.run_done', {
         indexed: indexRun.indexed ?? 0,
         remaining: indexRun.remaining ?? 0,

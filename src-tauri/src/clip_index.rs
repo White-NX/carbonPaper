@@ -4,6 +4,7 @@
 //! background/foreground index workers, performs periodic repair scans, and
 //! Legacy Chroma migration export remains a separate read-only monitor path.
 
+use crate::background_scheduler::ScheduledSliceResult;
 use crate::clip_migration::{
     clip_job_spec, clip_memory_uri, diagnostic_code, validate_clip_vector,
 };
@@ -24,8 +25,6 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// How often the worker asks whether the machine has gone idle.
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Subjects claimed from the ledger per drain.
 const DRAIN_BATCH: usize = 8;
 
@@ -319,42 +318,58 @@ fn indexable_hashes(
     Ok(indexable)
 }
 
-/// Idle-gated capture indexing and orphan repair.
-pub async fn run_clip_index_worker(app: AppHandle) {
-    let mut ticker = tokio::time::interval(POLL_INTERVAL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        ticker.tick().await;
-        // A manual run, a MiniLM pass, or a Smart Cluster scoring pass holds
-        // this for its whole duration. Skipping is the right answer rather than
-        // queuing behind it: whatever holds the guard is using the worker this
-        // pass would have to evict a model to reach.
-        let Ok(_guard) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
-            continue;
-        };
-        match run_pass(&app, PassMode::Idle).await {
-            Ok(outcome) if outcome.refused.is_none() && outcome.stopped_because.is_none() => {
-                // A first base generation is useful as soon as *any* migrated
-                // vectors exist. Pending captures become the exact tail and
-                // must not postpone acceleration of the existing corpus.
-                if let Err(error) = crate::clip_ann::maybe_rebuild(&app, false).await {
-                    tracing::warn!("[CLIP:ANN] idle rebuild failed: {error}");
-                }
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!("[CLIP:INDEX] idle pass failed: {error}"),
-        }
+/// Execute one automatic CLIP index/repair slice. The unified scheduler owns
+/// admission and the semantic-worker guard.
+pub async fn run_scheduled_slice(
+    app: &AppHandle,
+    manual: bool,
+) -> Result<ScheduledSliceResult, String> {
+    let run = app.state::<Arc<ClipIndexRunState>>().inner().clone();
+    let _active = manual.then(|| run.begin());
+    let outcome = run_pass(
+        app,
+        if manual {
+            PassMode::ScheduledManual
+        } else {
+            PassMode::Idle
+        },
+    )
+    .await?;
+    if let Some(reason) = outcome.refused.or(outcome.stopped_because) {
+        return Ok(ScheduledSliceResult::skipped(reason));
     }
+    if let Err(error) = crate::clip_ann::maybe_rebuild(app, false).await {
+        tracing::warn!("[CLIP:ANN] scheduled rebuild failed: {error}");
+    }
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let backlog = tokio::task::spawn_blocking(move || {
+        storage
+            .derived_index_backlog(DerivedIndexKind::ClipImage, MAX_ATTEMPTS)
+            .map(|backlog| backlog.claimable)
+    })
+    .await
+    .map_err(|error| format!("clip backlog task failed: {error}"))??;
+    Ok(ScheduledSliceResult::complete(
+        backlog > 0 || has_prepared_captures(),
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PassMode {
     Idle,
     Manual,
+    ScheduledManual,
+}
+
+impl PassMode {
+    fn is_manual(self) -> bool {
+        matches!(self, Self::Manual | Self::ScheduledManual)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClipIndexRunSummary {
+    pub queued: bool,
     pub started: bool,
     pub indexed: u64,
     pub failed: u64,
@@ -443,7 +458,7 @@ fn may_run(app: &AppHandle, mode: PassMode) -> bool {
     if crate::maintenance::is_active() {
         return false;
     }
-    if mode == PassMode::Manual {
+    if mode.is_manual() {
         return true;
     }
     app.state::<Arc<IdleState>>()
@@ -532,9 +547,10 @@ const MAX_REPAIR_PASSES: usize = 4096;
 
 async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String> {
     if !may_run(app, mode) {
-        return Ok(PassOutcome::refused(match mode {
-            PassMode::Manual => "maintenance_in_progress",
-            PassMode::Idle => "not_idle",
+        return Ok(PassOutcome::refused(if mode.is_manual() {
+            "maintenance_in_progress"
+        } else {
+            "not_idle"
         }));
     }
     if mode == PassMode::Idle {
@@ -556,9 +572,16 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
     // narrows the pass to those rather than refusing it — and refuses only when
     // there are none, which keeps the ledger untouched rather than marking a
     // batch `waiting_for_auth` on every tick.
-    let locked = !storage.is_session_valid();
+    let locked = match mode {
+        PassMode::Idle => !storage.is_background_authorized(),
+        PassMode::Manual | PassMode::ScheduledManual => !storage.is_silent_read_authorized(),
+    };
     if locked && !has_prepared_captures() {
-        return Ok(PassOutcome::refused("session_locked"));
+        return Ok(PassOutcome::refused(if mode == PassMode::Idle {
+            "waiting_for_unlock"
+        } else {
+            "session_locked"
+        }));
     }
 
     match mode {
@@ -575,6 +598,15 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
                 reconcile_missing(storage.clone(), scope).await?;
             }
             drain_queue(app, storage, mode, locked).await
+        }
+        PassMode::ScheduledManual => {
+            reap_orphans(storage.clone()).await?;
+            let scope_storage = storage.clone();
+            let scope = tokio::task::spawn_blocking(move || repair_scope(&scope_storage))
+                .await
+                .unwrap_or(RepairScope::Suspended);
+            reconcile_missing(storage.clone(), scope).await?;
+            drain_queue(app, storage, mode, false).await
         }
         PassMode::Manual => {
             reap_orphans(storage.clone()).await?;
@@ -705,10 +737,10 @@ async fn drain_queue(
     let mut failure: Option<String> = None;
 
     while !pending.is_empty() {
-        let stopped = if mode == PassMode::Manual && run.stopped_by_user() {
+        let stopped = if mode.is_manual() && run.stopped_by_user() {
             Some(STOPPED_BY_USER)
         } else if !may_run(app, mode) {
-            Some(if mode == PassMode::Manual {
+            Some(if mode.is_manual() {
                 MAINTENANCE_STARTED
             } else {
                 "idle_lost"
@@ -735,14 +767,28 @@ async fn drain_queue(
         match encode_chunk(app, &semantic, storage.clone(), chunk).await {
             Ok(encoded) => {
                 outcome.indexed += encoded as u64;
-                if mode == PassMode::Manual {
+                if mode.is_manual() {
                     run.report_chunk(app, chunk_len, encoded as u64);
                 }
                 indexed += encoded;
+                if !matches!(mode, PassMode::Manual) && !pending.is_empty() {
+                    // A scheduled request owns one bounded image batch. Give
+                    // the remaining claimed jobs back without consuming retry
+                    // budget so the unified scheduler can rotate to the next
+                    // task at the next admission point.
+                    release_claims(
+                        storage.clone(),
+                        Vec::from(std::mem::take(&mut pending)),
+                        "slice_yielded",
+                        "the scheduler completed one CLIP batch",
+                    )
+                    .await;
+                    break;
+                }
             }
             Err(error) => {
                 outcome.failed += chunk_len;
-                if mode == PassMode::Manual {
+                if mode.is_manual() {
                     run.report_chunk(app, chunk_len, 0);
                 }
                 // Whatever broke the worker breaks every remaining chunk the
@@ -767,7 +813,7 @@ async fn drain_queue(
         tracing::info!("[CLIP:INDEX] indexed {} image(s)", indexed);
     }
     match failure {
-        Some(error) if mode == PassMode::Manual => {
+        Some(error) if mode.is_manual() => {
             outcome.stopped_because = Some("encode_failed");
             tracing::warn!("[CLIP:INDEX] manual run stopped: {error}");
             Ok(outcome)
@@ -1194,34 +1240,17 @@ pub async fn clip_index_run_now(
     run: tauri::State<'_, Arc<ClipIndexRunState>>,
 ) -> Result<ClipIndexRunSummary, String> {
     crate::commands::check_auth_required(&credential)?;
-    let Ok(_guard) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
-        return Ok(ClipIndexRunSummary {
-            started: false,
-            indexed: 0,
-            failed: 0,
-            remaining: None,
-            stalled: None,
-            skipped_reason: Some("another_pass_running".to_string()),
-        });
-    };
-    let run = run.inner().clone();
-    if run.is_running() {
-        return Ok(ClipIndexRunSummary {
-            started: false,
-            indexed: 0,
-            failed: 0,
-            remaining: None,
-            stalled: None,
-            skipped_reason: Some("already_running".to_string()),
-        });
-    }
-    let _active = run.begin();
-
-    let outcome = run_pass(&app, PassMode::Manual).await?;
-    if outcome.refused.is_none() && outcome.stopped_because.is_none() {
-        if let Err(error) = crate::clip_ann::maybe_rebuild(&app, false).await {
-            tracing::warn!("[CLIP:ANN] manual rebuild failed: {error}");
-        }
+    let _ = run;
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.enqueue(
+            &app,
+            crate::background_scheduler::BackgroundTaskKind::ClipIndex,
+            true,
+        )?;
+    } else {
+        return Err("Background scheduler is unavailable".to_string());
     }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let backlog = tokio::task::spawn_blocking(move || {
@@ -1234,15 +1263,13 @@ pub async fn clip_index_run_now(
     .flatten();
 
     Ok(ClipIndexRunSummary {
-        started: outcome.refused.is_none(),
-        indexed: outcome.indexed,
-        failed: outcome.failed,
+        queued: true,
+        started: false,
+        indexed: 0,
+        failed: 0,
         remaining: backlog.map(|backlog| backlog.claimable),
         stalled: backlog.map(|backlog| backlog.exhausted),
-        skipped_reason: outcome
-            .refused
-            .or(outcome.stopped_because)
-            .map(str::to_string),
+        skipped_reason: Some("queued".to_string()),
     })
 }
 
@@ -1266,15 +1293,25 @@ pub async fn clip_index_run_now(
 #[tauri::command]
 pub async fn clip_index_stop_now(
     window: tauri::Window,
+    app: AppHandle,
     run: tauri::State<'_, Arc<ClipIndexRunState>>,
 ) -> Result<bool, String> {
     crate::commands::check_main_window(&window)?;
-    if !run.is_running() {
-        return Ok(false);
-    }
+    let was_running = run.is_running();
     run.request_stop();
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let was_queued = storage
+        .background_scheduler_task(crate::background_scheduler::TASK_CLIP_INDEX)?
+        .map(|task| task.manual_pending)
+        .unwrap_or(false);
+    storage.cancel_manual_background_task(crate::background_scheduler::TASK_CLIP_INDEX)?;
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.wake();
+    }
     tracing::info!("[CLIP:INDEX] manual run asked to stop");
-    Ok(true)
+    Ok(was_running || was_queued)
 }
 
 /// What a CLIP backfill would cover, and why it is being offered.

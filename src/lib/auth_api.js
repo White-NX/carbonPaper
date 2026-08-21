@@ -164,24 +164,31 @@ export const withAuth = async (apiCall, options = {}) => {
  * 应在应用启动时调用
  */
 export const initAuthListeners = () => {
-    // 监听页面可见性变化
-    document.addEventListener('visibilitychange', () => {
+    const handleVisibilityChange = () => {
         const isVisible = document.visibilityState === 'visible';
         setForegroundState(isVisible);
-    });
+    };
+    const handleFocus = () => {
+        setForegroundState(true);
+    };
+    const handleBlur = () => {};
+
+    // 监听页面可见性变化
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     
     // 监听窗口焦点变化
-    window.addEventListener('focus', () => {
-        setForegroundState(true);
-    });
+    window.addEventListener('focus', handleFocus);
     
-    window.addEventListener('blur', () => {
-        // 失去焦点不立即设为后台，让用户切换应用时有时间
-        // 只有当窗口完全不可见时才设为后台（由 visibilitychange 处理）
-    });
+    window.addEventListener('blur', handleBlur);
     
     // 初始状态
     setForegroundState(document.visibilityState === 'visible');
+
+    return () => {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+        window.removeEventListener('focus', handleFocus);
+        window.removeEventListener('blur', handleBlur);
+    };
 };
 
 export default {

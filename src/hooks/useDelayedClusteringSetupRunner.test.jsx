@@ -111,4 +111,27 @@ describe('useDelayedClusteringSetupRunner', () => {
       clusteringMode: 'full',
     });
   });
+
+  it('reports a queued manual run without treating it as empty', async () => {
+    const pushNotification = vi.fn();
+    runClustering.mockResolvedValueOnce({ status: 'queued', queued: true });
+
+    const { result } = renderHook(() => useDelayedClusteringSetupRunner({
+      delayMs: 10,
+      onResourceChoice: vi.fn(),
+      onClose: vi.fn(),
+      pushNotification,
+    }));
+
+    act(() => result.current(true));
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    expect(saveClusteringResults).not.toHaveBeenCalled();
+    expect(pushNotification).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'info',
+      message: expect.stringContaining('后台整理队列'),
+    }));
+  });
 });

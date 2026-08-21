@@ -272,6 +272,23 @@
         "gpu_loading": "正在检测 GPU...",
         "gpu_none": "未检测到兼容的 GPU"
       },
+      "background_processing": {
+        "title": "后台自动整理",
+        "label": "锁定后继续自动整理",
+        "description": "成功解锁一次后，应用可在本次运行期间继续整理记录。关闭应用后需要重新解锁。",
+        "status": "当前状态",
+        "refresh": "刷新状态",
+        "states": {
+          "waiting_for_idle": "等待空闲",
+          "waiting_for_unlock": "等待解锁",
+          "running": "执行中",
+          "retry_wait": "失败重试",
+          "monitor_unavailable": "监控不可用",
+          "disabled": "任务分组已关闭",
+          "organizing": "正在整理",
+          "preparing": "正在准备记录"
+        }
+      },
       "clustering": {
         "title": "任务聚类",
         "interval_label": "自动聚类间隔",
@@ -312,7 +329,8 @@
         "run_stop_pending": "正在停止…",
         "run_stopping": "正在停止，当前这一批处理完就会结束。",
         "run_done": "本次索引了 {{indexed}} 张截图，还有 {{remaining}} 张在等待。",
-        "run_skipped": "这次没有开始索引：{{reason}}。"
+        "run_skipped": "这次没有开始索引：{{reason}}。",
+        "run_queued": "已加入后台整理队列。"
       },
       "clip_backend": {
         "title": "截图画面检索（文搜图）",
@@ -339,6 +357,7 @@
         "ann_failure_detail": "连续失败 {{count}} 次 · {{code}} · 下次自动尝试：{{retryAt}}",
         "ann_retry_now": "立即重试",
         "ann_retrying": "正在重试…",
+        "run_queued": "已加入后台整理队列。",
         "backlog_hint": "画面编码只在电脑空闲且接入电源时进行，因此使用期间截取的画面要等到下一个空闲时段才能被文搜图找到。",
         "stalled_hint": "这些画面已经用尽编码重试次数，不会再被自动处理。在重建索引之前，它们不会出现在文搜图结果里。",
         "run_now": "立即编码",
@@ -807,6 +826,7 @@
           "interval_desc": "设置后台自动运行任务聚类的时间间隔",
           "advanced_label": "高级",
           "run_now": "立即运行聚类",
+          "queued": "已加入后台整理队列",
           "completed": "聚类完成：已保存 {{count}} 个活动"
         },
         "classification": {

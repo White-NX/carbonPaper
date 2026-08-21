@@ -564,6 +564,17 @@ async fn process_request(
             }
         }
 
+        "decrypt_from_chromadb_silent" => {
+            let encrypted = req.get("encrypted").and_then(|p| p.as_str()).unwrap_or("");
+
+            match storage.decrypt_from_chromadb_silent(encrypted) {
+                Ok(decrypted) => StorageResponse::success(serde_json::json!({
+                    "decrypted": decrypted
+                })),
+                Err(error) => background_read_error_response(error),
+            }
+        }
+
         "decrypt_many_from_chromadb" => {
             let list_value = req.get("encrypted_list");
             let mut decrypted_list: Vec<String> = Vec::new();
@@ -588,8 +599,26 @@ async fn process_request(
             }))
         }
 
+        "decrypt_many_from_chromadb_silent" => {
+            let Some(values) = req.get("encrypted_list").and_then(|v| v.as_array()) else {
+                return StorageResponse::error("encrypted_list must be an array");
+            };
+            let encrypted_list: Vec<String> = values
+                .iter()
+                .map(|value| value.as_str().unwrap_or("").to_string())
+                .collect();
+            match storage.decrypt_many_from_chromadb_silent(&encrypted_list) {
+                Ok(decrypted_list) => StorageResponse::success(serde_json::json!({
+                    "decrypted_list": decrypted_list,
+                    "error_count": 0
+                })),
+                Err(error) => background_read_error_response(error),
+            }
+        }
+
         "get_auth_status" => StorageResponse::success(serde_json::json!({
-            "session_valid": storage.is_session_valid()
+            "session_valid": storage.is_session_valid(),
+            "background_authorized": storage.is_background_authorized()
         })),
 
         "set_ocr_postprocess_status" => {
@@ -648,7 +677,7 @@ async fn process_request(
             }
         }
         "list_screenshots_for_clustering" => {
-            if !storage.is_session_valid() {
+            if !storage.is_silent_read_authorized() {
                 return StorageResponse::error("AUTH_REQUIRED");
             }
 

@@ -63,6 +63,7 @@
 //! silently cancelled would make that button unreliable. See
 //! [`stand_aside_for_foreground`].
 
+use crate::background_scheduler::ScheduledSliceResult;
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
 use crate::minilm_migration::{
@@ -88,11 +89,6 @@ use tauri::{AppHandle, Emitter, Manager};
 /// expiry. Expressed as a SQLite datetime modifier and always bound as a
 /// parameter, never interpolated.
 pub const SEMANTIC_TEXT_RETENTION: &str = "-30 days";
-
-/// How often the worker asks whether the machine has gone idle. The check
-/// itself is one atomic load, so a short cadence costs nothing and keeps the
-/// queue moving early in an idle window rather than up to an hour into it.
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Subjects claimed from the ledger per drain.
 ///
@@ -309,24 +305,56 @@ pub fn enqueue_captured_screenshot(
     Ok(())
 }
 
-/// Idle-gated capture indexing, retention, and repair.
-pub async fn run_semantic_index_worker(app: AppHandle) {
-    let mut ticker = tokio::time::interval(POLL_INTERVAL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        ticker.tick().await;
-        // A manual run, or a Smart Cluster scoring pass, holds this for its
-        // whole duration. Skipping the tick is the right answer rather than
-        // queuing behind it: the next tick is a minute away, and whatever holds
-        // the guard is using the worker this pass would have to evict a model
-        // to reach.
-        let Ok(_guard) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
-            continue;
-        };
-        if let Err(error) = run_pass(&app, PassMode::Idle).await {
-            tracing::warn!("[SEMANTIC:INDEX] idle pass failed: {error}");
+/// Execute exactly one automatic MiniLM maintenance/encode slice. Scheduling,
+/// authorization, and serialization are owned by `background_scheduler`.
+pub async fn run_scheduled_slice(
+    app: &AppHandle,
+    manual: bool,
+) -> Result<ScheduledSliceResult, String> {
+    let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
+    let _active = manual.then(|| run.begin());
+    let outcome = run_pass(
+        app,
+        if manual {
+            PassMode::ScheduledManual
+        } else {
+            PassMode::Idle
+        },
+    )
+    .await?;
+    if let Some(reason) = outcome.refused.or(outcome.stopped_because) {
+        return Ok(ScheduledSliceResult::skipped(reason));
+    }
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let backlog = tokio::task::spawn_blocking(move || {
+        storage
+            .derived_index_backlog(DerivedIndexKind::SemanticText, MAX_ATTEMPTS)
+            .map(|backlog| backlog.claimable)
+    })
+    .await
+    .map_err(|error| format!("semantic backlog task failed: {error}"))??;
+    if outcome.indexed > 0 {
+        if let Some(scheduler) =
+            app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        {
+            let _ = scheduler.enqueue(
+                app,
+                crate::background_scheduler::BackgroundTaskKind::SmartCluster,
+                false,
+            );
+            // Python HDBSCAN consumes the mirrored hot layer only after the
+            // semantic queue reaches a boundary. Queue it when this slice
+            // drained the backlog so it does not rerun once per MiniLM batch.
+            if backlog == 0 {
+                let _ = scheduler.enqueue(
+                    app,
+                    crate::background_scheduler::BackgroundTaskKind::PythonClustering,
+                    false,
+                );
+            }
         }
     }
+    Ok(ScheduledSliceResult::complete(backlog > 0))
 }
 
 /// What is allowed to stop a pass.
@@ -340,11 +368,23 @@ enum PassMode {
     /// ledger's retry budget — and the run stops on the user's word or on the
     /// runaway deadline.
     Manual,
+    /// A user request dispatched by the unified scheduler. It ignores the
+    /// idle gate like `Manual`, but returns after one drain so other queued
+    /// tasks get a scheduling boundary.
+    ScheduledManual,
+}
+
+impl PassMode {
+    fn is_manual(self) -> bool {
+        matches!(self, Self::Manual | Self::ScheduledManual)
+    }
 }
 
 /// Outcome of one manual run, as reported to Settings → Advanced.
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticIndexRunSummary {
+    /// True when the unified scheduler accepted the request.
+    pub queued: bool,
     /// False when something refused before any encoding was attempted;
     /// `skipped_reason` then says which guard it was.
     pub started: bool,
@@ -474,7 +514,7 @@ fn may_run(app: &AppHandle, mode: PassMode) -> bool {
     if crate::maintenance::is_active() {
         return false;
     }
-    if mode == PassMode::Manual {
+    if mode.is_manual() {
         return true;
     }
     app.state::<Arc<IdleState>>()
@@ -485,9 +525,10 @@ fn may_run(app: &AppHandle, mode: PassMode) -> bool {
 /// One pass: expire, repair, then drain as much of the queue as the mode allows.
 async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String> {
     if !may_run(app, mode) {
-        return Ok(PassOutcome::refused(match mode {
-            PassMode::Manual => "maintenance_in_progress",
-            PassMode::Idle => "not_idle",
+        return Ok(PassOutcome::refused(if mode.is_manual() {
+            "maintenance_in_progress"
+        } else {
+            "not_idle"
         }));
     }
     // Checked before the retention and repair reads, not only before the
@@ -521,7 +562,10 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
     // Every read below decrypts OCR text, so a locked session can do nothing
     // but wait. Bailing here keeps the ledger untouched rather than marking a
     // batch `waiting_for_auth` on every tick of a locked machine.
-    if !storage.is_session_valid() {
+    if mode == PassMode::Idle && !storage.is_background_authorized() {
+        return Ok(PassOutcome::refused("waiting_for_unlock"));
+    }
+    if mode.is_manual() && !storage.is_silent_read_authorized() {
         return Ok(PassOutcome::refused("session_locked"));
     }
 
@@ -532,6 +576,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
 
     match mode {
         PassMode::Idle => drain_queue(app, storage, mode).await,
+        PassMode::ScheduledManual => drain_queue(app, storage, mode).await,
         PassMode::Manual => {
             // The queue depth the user is about to watch drain, read once and
             // after the repair pass that can add to it. Re-reading it per chunk
@@ -853,10 +898,10 @@ async fn drain_queue(
         // both sides slower than running them in sequence, which is not a trade
         // the user consented to and not one they can see. So the run stands
         // aside here and resumes in `drain_until_done`; only the idle pass ends.
-        let stopped = if mode == PassMode::Manual && run.stopped_by_user() {
+        let stopped = if mode.is_manual() && run.stopped_by_user() {
             Some(STOPPED_BY_USER)
         } else if !may_run(app, mode) {
-            Some(if mode == PassMode::Manual {
+            Some(if mode.is_manual() {
                 MAINTENANCE_STARTED
             } else {
                 "idle_lost"
@@ -885,14 +930,28 @@ async fn drain_queue(
                 // The whole chunk left the queue; not all of it necessarily
                 // became a vector, since an invalid one is discarded rather
                 // than retried. Both are progress, only one is an index.
-                if mode == PassMode::Manual {
+                if mode.is_manual() {
                     run.report_chunk(app, chunk_len, encoded.len() as u64);
                 }
                 indexed.append(&mut encoded);
+                if mode != PassMode::Manual && !pending.is_empty() {
+                    // One scheduler slice is one worker request and commit.
+                    // Return the rest of this broader database claim without
+                    // charging attempts so the task can re-enter at the FIFO
+                    // tail and another automatic task gets a turn.
+                    release_claims(
+                        storage.clone(),
+                        Vec::from(std::mem::take(&mut pending)),
+                        "slice_yielded",
+                        "the scheduler completed one MiniLM batch",
+                    )
+                    .await;
+                    break;
+                }
             }
             Err(error) => {
                 outcome.failed += chunk_len;
-                if mode == PassMode::Manual {
+                if mode.is_manual() {
                     run.report_chunk(app, chunk_len, 0);
                 }
                 // Whatever broke the worker will break every remaining chunk the
@@ -921,7 +980,7 @@ async fn drain_queue(
         // A manual run reports the failure through its summary instead of
         // propagating it, so the user sees "3 indexed, 4 failed" rather than an
         // error dialog that hides the work that did land.
-        Some(error) if mode == PassMode::Manual => {
+        Some(error) if mode.is_manual() => {
             outcome.stopped_because = Some("encode_failed");
             tracing::warn!("[SEMANTIC:INDEX] manual run stopped: {error}");
             Ok(outcome)
@@ -1254,26 +1313,17 @@ pub async fn semantic_index_run_now(
     crate::commands::check_main_window(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
-    // The guard is shared with Smart Cluster scoring now, so this no longer
-    // means only "an index run is already going". The reason string is
-    // interpolated raw into the Settings → Advanced line (`InferenceCards.jsx`)
-    // rather than mapped to a translation key, so widening it costs nothing and
-    // "already_running" would have been wrong half the time.
-    let Ok(_guard) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
-        return Ok(SemanticIndexRunSummary {
-            started: false,
-            indexed: 0,
-            failed: 0,
-            remaining: None,
-            stalled: None,
-            skipped_reason: Some("semantic_worker_busy".to_string()),
-        });
-    };
-    let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
-    // Held for the rest of the command, so `running` clears on the `?` path too.
-    let _active = run.begin();
-
-    let outcome = run_pass(&app, PassMode::Manual).await?;
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.enqueue(
+            &app,
+            crate::background_scheduler::BackgroundTaskKind::SemanticIndex,
+            true,
+        )?;
+    } else {
+        return Err("Background scheduler is unavailable".to_string());
+    }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let backlog = tokio::task::spawn_blocking(move || {
         storage
@@ -1284,15 +1334,13 @@ pub async fn semantic_index_run_now(
     .unwrap_or(None);
 
     Ok(SemanticIndexRunSummary {
-        started: outcome.refused.is_none(),
-        indexed: outcome.indexed,
-        failed: outcome.failed,
+        queued: true,
+        started: false,
+        indexed: 0,
+        failed: 0,
         remaining: backlog.map(|backlog| backlog.claimable),
         stalled: backlog.map(|backlog| backlog.exhausted),
-        skipped_reason: outcome
-            .refused
-            .or(outcome.stopped_because)
-            .map(str::to_string),
+        skipped_reason: Some("queued".to_string()),
     })
 }
 
@@ -1317,12 +1365,21 @@ pub async fn semantic_index_stop_now(
 ) -> Result<bool, String> {
     crate::commands::check_main_window(&window)?;
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
-    if !run.is_running() {
-        return Ok(false);
-    }
+    let was_running = run.is_running();
     run.request_stop();
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let was_queued = storage
+        .background_scheduler_task(crate::background_scheduler::TASK_SEMANTIC_INDEX)?
+        .map(|task| task.manual_pending)
+        .unwrap_or(false);
+    storage.cancel_manual_background_task(crate::background_scheduler::TASK_SEMANTIC_INDEX)?;
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.wake();
+    }
     tracing::info!("[SEMANTIC:INDEX] manual run asked to stop");
-    Ok(true)
+    Ok(was_running || was_queued)
 }
 
 #[cfg(test)]

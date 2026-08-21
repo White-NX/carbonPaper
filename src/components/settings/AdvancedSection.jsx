@@ -4,7 +4,7 @@ import AdvancedWarning from './advanced/AdvancedWarning';
 import ClusteringTechnicalCard from './advanced/ClusteringTechnicalCard';
 import CpuLimitCard from './advanced/CpuLimitCard';
 import DatabaseMaintenanceCard from './advanced/DatabaseMaintenanceCard';
-import { ClassificationBackendCard, ClipBackendCard, DmlAccelerationCard, OcrEngineCard, SemanticBackendCard } from './advanced/InferenceCards';
+import { BackgroundSchedulerCard, ClassificationBackendCard, ClipBackendCard, DmlAccelerationCard, OcrEngineCard, SemanticBackendCard } from './advanced/InferenceCards';
 import NetworkAccessCard from './advanced/NetworkAccessCard';
 import OcrQueueCard from './advanced/OcrQueueCard';
 import { useAdvancedSectionController } from './useAdvancedSectionController';
@@ -62,6 +62,11 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     handleRunSemanticIndexNow,
     handleStopSemanticIndex,
     refreshSemanticStatus,
+    backgroundProcessingEnabled,
+    backgroundSchedulerStatus,
+    backgroundProcessingSaving,
+    refreshBackgroundSchedulerStatus,
+    handleBackgroundProcessingChange,
   } = useAdvancedSectionController({ monitorStatus, t });
 
   if (loading || !config) {
@@ -122,6 +127,14 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
 
       <ClassificationBackendCard
         status={semanticStatus}
+      />
+
+      <BackgroundSchedulerCard
+        enabled={backgroundProcessingEnabled}
+        saving={backgroundProcessingSaving}
+        status={backgroundSchedulerStatus}
+        onChange={handleBackgroundProcessingChange}
+        onRefresh={refreshBackgroundSchedulerStatus}
       />
 
       <SemanticBackendCard

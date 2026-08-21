@@ -80,6 +80,12 @@ impl StorageState {
         &self,
         path: &str,
     ) -> Result<(Vec<u8>, String), BackgroundReadError> {
+        // Keep the authorization check at the helper boundary as well as at
+        // scheduler call sites. The preference/lease can be revoked between
+        // a caller's admission check and the first database read.
+        if !self.is_silent_read_authorized() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
         self.read_image_bytes_with_mode(path, true)
     }
 
@@ -135,6 +141,9 @@ impl StorageState {
         let encrypted_key = key_enc.as_ref().ok_or_else(|| {
             BackgroundReadError::Other("Failed to unwrap image row key".to_string())
         })?;
+        if silent && !self.is_silent_read_authorized() {
+            return Err(BackgroundReadError::AuthRequired);
+        }
         let mut row_key = if silent {
             decrypt_row_key_with_cng_silent(encrypted_key)
         } else {

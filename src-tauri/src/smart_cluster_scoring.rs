@@ -79,6 +79,7 @@
 //! head — a machine whose idle windows are shorter than a batch takes to score
 //! would redo the same work forever and never reach a newly captured screenshot.
 
+use crate::background_scheduler::ScheduledSliceResult;
 use crate::idle::IdleState;
 use crate::ml_protocol::MlSemanticModel;
 use crate::rerank::{build_rerank_document, ScorerIdentity, RERANK_OCR_SNIPPET_CHARS};
@@ -90,13 +91,9 @@ use crate::storage::{DerivedIndexKind, StorageState};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
-
-/// How often the worker asks whether there is work and whether it may run.
-/// Matches Python's `TICK_INTERVAL_SECS`.
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Snapshots drained per pass. Python used 32 idle / 128 forced; the same split
 /// is kept so a manual run still clears a visible amount in one go.
@@ -187,8 +184,9 @@ pub struct SmartClusterWorkerState {
     running: AtomicBool,
     /// The executing pass is a user-requested one.
     force_running: AtomicBool,
-    /// Set by `smart_cluster_drain_now`, cleared when the pass picks it up.
-    drain_requested: AtomicBool,
+    /// Pending manual request plus a generation used to make enqueue rollback
+    /// safe when two UI requests overlap.
+    drain_request: Mutex<DrainRequestState>,
     /// Set by `smart_cluster_stop_drain`; the forced pass checks it between
     /// clusters and between batches.
     abort_requested: AtomicBool,
@@ -205,10 +203,63 @@ pub struct SmartClusterWorkerState {
     unverifiable_thresholds: AtomicU64,
 }
 
+#[derive(Default)]
+struct DrainRequestState {
+    requested: bool,
+    generation: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DrainRequestRollback {
+    generation: u64,
+    drain_was_requested: bool,
+    abort_was_requested: bool,
+}
+
 impl SmartClusterWorkerState {
-    pub fn request_drain_now(&self) {
-        self.abort_requested.store(false, Ordering::SeqCst);
-        self.drain_requested.store(true, Ordering::SeqCst);
+    pub(crate) fn request_drain_now(&self) -> DrainRequestRollback {
+        let abort_was_requested = self.abort_requested.swap(false, Ordering::SeqCst);
+        let mut request = self
+            .drain_request
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        request.generation = request.generation.wrapping_add(1);
+        let generation = request.generation;
+        let drain_was_requested = std::mem::replace(&mut request.requested, true);
+        DrainRequestRollback {
+            generation,
+            drain_was_requested,
+            abort_was_requested,
+        }
+    }
+
+    /// Undo a request that could not be persisted by the scheduler. This only
+    /// clears the not-yet-consumed request and does not interrupt a pass that
+    /// may already be running.
+    pub(crate) fn cancel_pending_drain_request(&self, rollback: DrainRequestRollback) {
+        let restored = {
+            let mut request = self
+                .drain_request
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if request.generation != rollback.generation || !request.requested {
+                false
+            } else {
+                request.requested = rollback.drain_was_requested;
+                true
+            }
+        };
+        if restored && rollback.abort_was_requested {
+            // Preserve a stop that predated this failed request, but never
+            // overwrite a newer stop or abort a request already consumed by
+            // the worker.
+            let _ = self.abort_requested.compare_exchange(
+                false,
+                true,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
     }
 
     pub fn request_stop_drain(&self) {
@@ -216,7 +267,11 @@ impl SmartClusterWorkerState {
     }
 
     fn take_drain_request(&self) -> bool {
-        self.drain_requested.swap(false, Ordering::SeqCst)
+        let mut request = self
+            .drain_request
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        std::mem::take(&mut request.requested)
     }
 
     fn aborted(&self) -> bool {
@@ -250,52 +305,42 @@ pub struct SmartClusterWorkerStatus {
     pub scorer: ScorerIdentity,
 }
 
-/// Background loop. Wakes on the tick or on a drain request.
-pub async fn run_smart_cluster_worker(app: AppHandle) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(2));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_tick = Instant::now() - POLL_INTERVAL;
-    loop {
-        ticker.tick().await;
-        let state = app.state::<Arc<SmartClusterWorkerState>>().inner().clone();
-        let forced = state.take_drain_request();
-        if !forced && last_tick.elapsed() < POLL_INTERVAL {
-            continue;
-        }
-        last_tick = Instant::now();
-        state.running.store(true, Ordering::SeqCst);
-        state.force_running.store(forced, Ordering::SeqCst);
-        // Serialized against capture indexing. Both loops poll every 60 s on
-        // the same idle signal and were spawned seconds apart, so they wake
-        // together; and they want different models from an engine that keeps
-        // one resident, so running them at once means taking turns evicting a
-        // 570 MB session instead of finishing either pass sooner.
-        //
-        // An idle tick that loses the guard skips: the next one is a minute
-        // away and the queue is not going anywhere. A forced drain waits for
-        // it, because the user pressed a button and an index pass releases the
-        // guard in bounded time; `run_pass` re-checks the abort flag first
-        // thing, so a stop pressed while waiting still takes effect.
-        let guard = if forced {
-            Some(crate::semantic_runtime::BACKGROUND_PASS_GUARD.lock().await)
-        } else {
-            crate::semantic_runtime::BACKGROUND_PASS_GUARD
-                .try_lock()
-                .ok()
-        };
-        match guard {
-            Some(_guard) => {
-                if let Err(error) = run_pass(&app, &state, forced).await {
-                    tracing::warn!("[SMART_CLUSTER] pass failed: {error}");
-                }
-            }
-            None => tracing::debug!(
-                "[SMART_CLUSTER] skipping this tick: another background pass holds the semantic worker"
-            ),
-        }
-        state.force_running.store(false, Ordering::SeqCst);
-        state.running.store(false, Ordering::SeqCst);
+/// Execute one bounded automatic Smart Cluster scoring batch.
+pub async fn run_scheduled_slice(
+    app: &AppHandle,
+    manual: bool,
+) -> Result<ScheduledSliceResult, String> {
+    let state = app.state::<Arc<SmartClusterWorkerState>>().inner().clone();
+    state.running.store(true, Ordering::SeqCst);
+    state.force_running.store(manual, Ordering::SeqCst);
+    if manual {
+        let _ = state.take_drain_request();
     }
+    // A scheduled manual request still runs one batch. Passing `false` keeps
+    // the business loop bounded while the scheduler has already waived the
+    // idle gate for this slice.
+    let result = if manual {
+        run_batch(
+            app,
+            &state,
+            app.state::<Arc<StorageState>>().inner().clone(),
+            true,
+            Instant::now() + FORCED_DEADLINE,
+            &mut HashSet::new(),
+        )
+        .await
+        .map(|_| ())
+    } else {
+        run_pass(app, &state, false).await
+    };
+    state.running.store(false, Ordering::SeqCst);
+    state.force_running.store(false, Ordering::SeqCst);
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let pending = tokio::task::spawn_blocking(move || storage.count_smart_cluster_pending())
+        .await
+        .map_err(|error| format!("smart cluster backlog task failed: {error}"))??;
+    result?;
+    Ok(ScheduledSliceResult::complete(pending > 0))
 }
 
 /// Whether a pass may run at all.
@@ -451,7 +496,10 @@ async fn run_pass(
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     // Unattended work must never ask Rust to decrypt protected data before the
     // user has unlocked the session.
-    if !storage.is_session_valid() {
+    if !forced && !storage.is_background_authorized() {
+        return Ok(());
+    }
+    if forced && !storage.is_session_valid() {
         return Ok(());
     }
 
@@ -1431,6 +1479,36 @@ mod tests {
         assert!(state.aborted());
         state.request_drain_now();
         assert!(!state.aborted());
+    }
+
+    #[test]
+    fn a_failed_enqueue_can_cancel_the_pending_drain_request() {
+        let state = SmartClusterWorkerState::default();
+        let rollback = state.request_drain_now();
+        state.cancel_pending_drain_request(rollback);
+        assert!(!state.take_drain_request());
+    }
+
+    #[test]
+    fn a_failed_enqueue_restores_a_preexisting_stop_request() {
+        let state = SmartClusterWorkerState::default();
+        state.request_stop_drain();
+        let rollback = state.request_drain_now();
+        assert!(!state.aborted());
+
+        state.cancel_pending_drain_request(rollback);
+        assert!(state.aborted());
+        assert!(!state.take_drain_request());
+    }
+
+    #[test]
+    fn an_old_failed_enqueue_cannot_cancel_a_newer_request() {
+        let state = SmartClusterWorkerState::default();
+        let old = state.request_drain_now();
+        let _new = state.request_drain_now();
+
+        state.cancel_pending_drain_request(old);
+        assert!(state.take_drain_request());
     }
 
     #[test]

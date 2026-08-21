@@ -48,6 +48,7 @@ pub enum CredentialError {
 
 /// Default authenticated-session timeout in seconds.
 const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 15 * 60; // 15 分钟
+const BACKGROUND_PROCESSING_ENABLED_KEY: &str = "background_processing_enabled";
 const MASTER_KEY_FILE_NAME: &str = "credential_master_key.bin";
 const MASTER_KEY_LEN: usize = 32;
 const MASTER_KEY_FILE_MAGIC: &[u8; 5] = b"CPMK3"; // 版本升级
@@ -71,6 +72,11 @@ pub struct CredentialManagerState {
     app_in_foreground: Mutex<bool>,
     /// Session timeout in seconds; `-1` disables time-based expiry.
     session_timeout_secs: Mutex<i64>,
+    /// Persisted user preference controlling unattended processing.
+    background_processing_enabled: Mutex<bool>,
+    /// Process-scoped lease granted after a successful Windows Hello unlock.
+    /// This is intentionally never persisted across application restarts.
+    background_lease_active: Mutex<bool>,
 }
 
 impl CredentialManagerState {
@@ -97,6 +103,9 @@ impl CredentialManagerState {
             }
         }
 
+        let background_processing_enabled =
+            crate::registry_config::get_bool(BACKGROUND_PROCESSING_ENABLED_KEY).unwrap_or(true);
+
         Self {
             cached_db_key: Mutex::new(None),
             cached_public_key: Mutex::new(None),
@@ -105,7 +114,68 @@ impl CredentialManagerState {
             last_auth_time: Mutex::new(None),
             app_in_foreground: Mutex::new(true),
             session_timeout_secs: Mutex::new(initial_timeout),
+            background_processing_enabled: Mutex::new(background_processing_enabled),
+            background_lease_active: Mutex::new(false),
         }
+    }
+
+    /// Whether the user has enabled unattended background processing.
+    pub fn background_processing_enabled(&self) -> bool {
+        *self
+            .background_processing_enabled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Returns whether the current process may perform protected background
+    /// reads. The lease is granted only by a successful unlock and is never
+    /// restored from disk.
+    pub fn background_authorized(&self) -> bool {
+        self.background_processing_enabled()
+            && *self
+                .background_lease_active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+            && get_cached_master_key(self).is_some()
+    }
+
+    /// Grant the process-scoped background lease after Windows Hello succeeds.
+    pub fn grant_background_lease(&self) {
+        if self.background_processing_enabled() {
+            let mut lease = self
+                .background_lease_active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *lease = true;
+        }
+    }
+
+    /// Revoke only the process-scoped background lease.
+    pub fn revoke_background_lease(&self) {
+        let mut lease = self
+            .background_lease_active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *lease = false;
+    }
+
+    /// Persist the unattended-processing preference. Turning it off also
+    /// invalidates the in-memory lease immediately.
+    pub fn set_background_processing_enabled(&self, enabled: bool) -> Result<(), String> {
+        crate::registry_config::set_bool(BACKGROUND_PROCESSING_ENABLED_KEY, enabled)?;
+        {
+            let mut value = self
+                .background_processing_enabled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *value = enabled;
+        }
+        if !enabled {
+            self.revoke_background_lease();
+        } else if self.is_session_valid() && get_cached_master_key(self).is_some() {
+            self.grant_background_lease();
+        }
+        Ok(())
     }
 
     /// Sets the session timeout in seconds; `-1` disables time-based expiry.
@@ -212,6 +282,7 @@ impl CredentialManagerState {
 
     /// Clears every cached key during shutdown or credential reset.
     pub fn clear_all_cached_keys(&self) {
+        self.revoke_background_lease();
         {
             let mut cached_db = self.cached_db_key.lock().unwrap_or_else(|e| e.into_inner());
             *cached_db = None;
@@ -286,6 +357,12 @@ impl CredentialManagerState {
         std::fs::write(key_file, file_data).map_err(|e| {
             CredentialError::SystemError(format!("Failed to write master key file: {}", e))
         })?;
+
+        // Replacing credentials invalidates both the UI proof and any
+        // process-scoped unattended lease. The imported key remains cached so
+        // storage can reopen, but protected reads require a fresh unlock.
+        self.invalidate_session();
+        self.revoke_background_lease();
 
         // Update caches
         let mut cached_master = self

@@ -5,6 +5,7 @@
 //! 2. Screenshot metadata and OCR results
 //! 3. OCR data storage and search
 
+mod background_scheduler;
 mod derived_index;
 mod derived_migration;
 mod document_ref;
@@ -25,6 +26,7 @@ pub mod task;
 mod types;
 pub(crate) mod wire_time;
 
+pub use background_scheduler::BackgroundTaskState;
 #[allow(unused_imports)]
 pub use derived_index::*;
 #[allow(unused_imports)]
@@ -372,6 +374,20 @@ impl StorageState {
     /// Returns whether the current credential session is unlocked/valid.
     pub fn is_session_valid(&self) -> bool {
         self.credential_state.is_session_valid()
+    }
+
+    /// Whether this process holds the opt-in lease for unattended protected
+    /// reads. Unlike the UI session, this survives foreground locking but not
+    /// application restart, preference disablement, or key-cache clearing.
+    pub fn is_background_authorized(&self) -> bool {
+        self.credential_state.background_authorized()
+    }
+
+    /// Silent read helpers are also used by explicit user-initiated jobs. A
+    /// live UI session therefore authorizes them even when unattended work is
+    /// disabled, while automatic scheduling requires the background lease.
+    pub(crate) fn is_silent_read_authorized(&self) -> bool {
+        self.is_session_valid() || self.is_background_authorized()
     }
 
     /// The identity of the currently open database file.

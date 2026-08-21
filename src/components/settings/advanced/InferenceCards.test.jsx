@@ -2,7 +2,7 @@ import React from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
-import { ClipBackendCard } from './InferenceCards';
+import { BackgroundSchedulerCard, ClipBackendCard } from './InferenceCards';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -57,5 +57,25 @@ describe('ClipBackendCard ANN health', () => {
 
     fireEvent.click(screen.getByText('settings.advanced.clip_backend.ann_retry_now'));
     expect(onRetryAnn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('BackgroundSchedulerCard status', () => {
+  it.each([
+    ['disabled', 'settings.advanced.background_processing.states.disabled'],
+    ['clustering_already_running', 'settings.advanced.background_processing.states.organizing'],
+    ['waiting_for_index', 'settings.advanced.background_processing.states.preparing'],
+  ])('shows a user-facing label for %s', (blockedReason, expectedKey) => {
+    render(
+      <BackgroundSchedulerCard
+        enabled
+        saving={false}
+        status={{ blocked_reason: blockedReason }}
+        onChange={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(expectedKey)).toBeInTheDocument();
   });
 });

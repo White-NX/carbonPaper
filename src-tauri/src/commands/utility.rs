@@ -41,8 +41,18 @@ pub fn get_log_dir() -> String {
 /// Authentication: main-window origin required. Returns only on failure.
 /// Frontend: `hooks/useAppWindowState.js`.
 #[tauri::command]
-pub fn restart_app(app: tauri::AppHandle, window: tauri::Window) -> Result<(), String> {
+pub fn restart_app(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+) -> Result<(), String> {
     crate::commands::check_main_window(&window)?;
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.stop();
+    }
+    credential_state.clear_all_cached_keys();
     tauri::process::restart(&app.env())
 }
 
@@ -74,6 +84,7 @@ pub async fn exit_app(
     window: tauri::Window,
     monitor_state: tauri::State<'_, MonitorState>,
     capture_state: tauri::State<'_, Arc<CaptureState>>,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
 ) -> Result<(), String> {
     crate::commands::check_main_window(&window)?;
     IS_QUITTING.store(true, Ordering::Relaxed);
@@ -89,6 +100,12 @@ pub async fn exit_app(
         handle.abort();
     }
     capture_state.clear_wgc_session("app_exit_command");
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.stop();
+    }
+    credential_state.clear_all_cached_keys();
     app.exit(0);
     Ok(())
 }
@@ -115,8 +132,12 @@ pub fn set_app_language(app: tauri::AppHandle, language: String) -> Result<(), S
 ///
 /// Authentication: main-window origin required. Returns only if termination fails.
 #[tauri::command]
-pub fn close_process(window: tauri::Window) -> Result<(), String> {
+pub fn close_process(
+    window: tauri::Window,
+    credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+) -> Result<(), String> {
     crate::commands::check_main_window(&window)?;
+    credential_state.clear_all_cached_keys();
     std::process::exit(0);
 }
 
@@ -479,6 +500,15 @@ pub async fn switch_to_lightweight_mode(
         tracing::info!("Main window destroyed");
     }
 
+    // Destroying the UI is a foreground transition. It expires the ordinary
+    // session while deliberately retaining any process-scoped background
+    // lease that was granted by a prior Hello unlock.
+    if let Some(credential_state) =
+        app.try_state::<Arc<crate::credential_manager::CredentialManagerState>>()
+    {
+        credential_state.set_foreground_state(false);
+    }
+
     // Publish the new mode to shared state.
     *lightweight_state.is_lightweight.lock().unwrap() = true;
 
@@ -509,6 +539,12 @@ pub async fn switch_to_standard_mode(
 
     // Recreate the standard UI.
     crate::create_main_window(&app).map_err(|e| e.to_string())?;
+
+    if let Some(credential_state) =
+        app.try_state::<Arc<crate::credential_manager::CredentialManagerState>>()
+    {
+        credential_state.set_foreground_state(true);
+    }
 
     // Publish the new mode to shared state.
     *lightweight_state.is_lightweight.lock().unwrap() = false;
