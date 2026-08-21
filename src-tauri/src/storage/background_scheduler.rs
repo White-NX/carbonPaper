@@ -92,20 +92,61 @@ impl StorageState {
             .map_err(|e| format!("Failed to decode scheduler state: {e}"))
     }
 
-    /// Add or wake a task. Duplicate enqueue notifications coalesce into one
-    /// row; a manual notification is retained until a successful slice.
+    /// Add or wake a task. Duplicate automatic notifications for an already
+    /// active row are handled as reads so they do not start a SQLite write
+    /// transaction. A manual notification is retained until a successful
+    /// slice.
     pub fn enqueue_background_task(
         &self,
         task_kind: &str,
         manual: bool,
         now_ms: i64,
     ) -> Result<(), String> {
+        self.enqueue_background_task_if_changed(task_kind, manual, now_ms)
+            .map(|_| ())
+    }
+
+    /// Variant used by scheduler reconciliation, where the caller must know
+    /// whether durable state changed but must not wake the scheduler loop.
+    pub fn enqueue_background_task_if_changed(
+        &self,
+        task_kind: &str,
+        manual: bool,
+        now_ms: i64,
+    ) -> Result<bool, String> {
         let guard = self.get_connection_named("enqueue_background_task")?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| "Database not initialized".to_string())?;
-        conn.execute(
-            r#"
+
+        let existing = conn
+            .query_row(
+                "SELECT status, manual_pending
+                 FROM background_scheduler_tasks
+                 WHERE task_kind = ?1",
+                params![task_kind],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to inspect background task before enqueue: {e}"))?;
+        let needs_write = match existing {
+            None => true,
+            Some((status, manual_pending)) if manual => {
+                !manual_pending
+                    || matches!(
+                        status.as_str(),
+                        "retry_wait" | "degraded" | "parked" | "completed" | "failed"
+                    )
+            }
+            Some((status, _)) => matches!(status.as_str(), "parked" | "completed" | "failed"),
+        };
+        if !needs_write {
+            return Ok(false);
+        }
+
+        let changed = conn
+            .execute(
+                r#"
             INSERT INTO background_scheduler_tasks
                 (task_kind, ready_since_ms, next_attempt_at_ms, status, manual_pending)
             VALUES (?1, ?2, 0, 'queued', ?3)
@@ -150,10 +191,10 @@ impl StorageState {
                     ELSE background_scheduler_tasks.last_error
                 END
             "#,
-            params![task_kind, now_ms, if manual { 1 } else { 0 }],
-        )
-        .map_err(|e| format!("Failed to enqueue background task: {e}"))?;
-        Ok(())
+                params![task_kind, now_ms, if manual { 1 } else { 0 }],
+            )
+            .map_err(|e| format!("Failed to enqueue background task: {e}"))?;
+        Ok(changed > 0)
     }
 
     /// Put a task back into the runnable queue after an explicit user action.
@@ -403,6 +444,81 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap()
+    }
+
+    fn scheduler_total_change_count(storage: &StorageState) -> u64 {
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        guard.as_ref().unwrap().total_changes()
+    }
+
+    #[test]
+    fn duplicate_automatic_enqueue_is_a_read_only_noop() {
+        let (_temp, storage) = test_storage();
+        assert!(storage
+            .enqueue_background_task_if_changed("semantic_index", false, 10)
+            .unwrap());
+        let changes_after_insert = scheduler_total_change_count(&storage);
+
+        assert!(!storage
+            .enqueue_background_task_if_changed("semantic_index", false, 20)
+            .unwrap());
+
+        let task = storage
+            .background_scheduler_task("semantic_index")
+            .unwrap()
+            .unwrap();
+        assert_eq!(scheduler_total_change_count(&storage), changes_after_insert);
+        assert_eq!(task.ready_since_ms, 10);
+        assert_eq!(task.status, "queued");
+    }
+
+    #[test]
+    fn duplicate_manual_enqueue_is_a_read_only_noop() {
+        let (_temp, storage) = test_storage();
+        assert!(storage
+            .enqueue_background_task_if_changed("smart_cluster", true, 10)
+            .unwrap());
+        let changes_after_insert = scheduler_total_change_count(&storage);
+
+        assert!(!storage
+            .enqueue_background_task_if_changed("smart_cluster", true, 20)
+            .unwrap());
+
+        let task = storage
+            .background_scheduler_task("smart_cluster")
+            .unwrap()
+            .unwrap();
+        assert_eq!(scheduler_total_change_count(&storage), changes_after_insert);
+        assert_eq!(task.ready_since_ms, 10);
+        assert!(task.manual_pending);
+    }
+
+    #[test]
+    fn automatic_enqueue_preserves_retry_backoff_without_writing() {
+        let (_temp, storage) = test_storage();
+        storage
+            .enqueue_background_task("clip_index", false, 10)
+            .unwrap();
+        storage
+            .mark_background_task_failed("clip_index", 2, 9_999, "temporary")
+            .unwrap();
+        let changes_before_enqueue = scheduler_total_change_count(&storage);
+
+        assert!(!storage
+            .enqueue_background_task_if_changed("clip_index", false, 20)
+            .unwrap());
+
+        let task = storage
+            .background_scheduler_task("clip_index")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            scheduler_total_change_count(&storage),
+            changes_before_enqueue
+        );
+        assert_eq!(task.status, "retry_wait");
+        assert_eq!(task.next_attempt_at_ms, 9_999);
+        assert_eq!(task.failure_count, 2);
     }
 
     #[test]

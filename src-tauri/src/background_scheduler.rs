@@ -312,6 +312,10 @@ impl BackgroundSchedulerState {
             tracing::debug!("[SCHEDULER] enqueue {} failed: {error}", kind.as_str());
         }
         result?;
+        // This is the externally visible admission path. Even when the row is
+        // already queued, a caller may be retrying after changing an admission
+        // condition, so preserve the prompt wake-up semantics. The internal
+        // backlog reconciliation deliberately bypasses this method.
         self.wake();
         Ok(())
     }
@@ -516,17 +520,18 @@ async fn refresh_backlog(app: &AppHandle) {
     let Ok((semantic, clip, smart)) = counts else {
         return;
     };
-    let Some(scheduler) = app.try_state::<Arc<BackgroundSchedulerState>>() else {
-        return;
-    };
+    // This reconciliation already runs inside the scheduler loop. Persist any
+    // newly discovered work directly: using the public enqueue path here would
+    // notify the same loop while it is running, leave a Notify permit behind,
+    // and turn an admission-gated queue into a self-waking hot loop.
     if semantic > 0 {
-        let _ = scheduler.enqueue(app, BackgroundTaskKind::SemanticIndex, false);
+        let _ = storage.enqueue_background_task_if_changed(TASK_SEMANTIC_INDEX, false, now_ms());
     }
     if clip > 0 {
-        let _ = scheduler.enqueue(app, BackgroundTaskKind::ClipIndex, false);
+        let _ = storage.enqueue_background_task_if_changed(TASK_CLIP_INDEX, false, now_ms());
     }
     if smart > 0 {
-        let _ = scheduler.enqueue(app, BackgroundTaskKind::SmartCluster, false);
+        let _ = storage.enqueue_background_task_if_changed(TASK_SMART_CLUSTER, false, now_ms());
     }
 
     if crate::registry_config::get_bool("clustering_enabled").unwrap_or(true) {
@@ -547,7 +552,8 @@ async fn refresh_backlog(app: &AppHandle) {
             })
             .unwrap_or(true);
         if due {
-            let _ = scheduler.enqueue(app, BackgroundTaskKind::PythonClustering, false);
+            let _ =
+                storage.enqueue_background_task_if_changed(TASK_PYTHON_CLUSTERING, false, now_ms());
         }
     }
 }
@@ -665,22 +671,48 @@ async fn execute_slice(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchedulerWake {
+    Startup,
+    Tick,
+    Notification,
+}
+
+async fn wait_for_scheduler_wake(
+    first_pass: &mut bool,
+    ticker: &mut tokio::time::Interval,
+    wake: &Notify,
+) -> SchedulerWake {
+    if std::mem::take(first_pass) {
+        return SchedulerWake::Startup;
+    }
+    tokio::select! {
+        _ = ticker.tick() => SchedulerWake::Tick,
+        _ = wake.notified() => SchedulerWake::Notification,
+    }
+}
+
+fn should_refresh_backlog(reason: SchedulerWake) -> bool {
+    !matches!(reason, SchedulerWake::Notification)
+}
+
 async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Do not wait for the first fallback tick to discover queues restored from
-    // an older release. The normal tick remains in place as a recovery path.
+    // Consume Tokio's immediate first tick, then run one startup pass without
+    // waiting. Later passes require either the fallback tick or a real external
+    // notification; backlog reconciliation must never wake this loop itself.
     ticker.tick().await;
-    refresh_backlog(&app).await;
+    let mut first_pass = true;
     loop {
-        tokio::select! {
-            _ = ticker.tick() => {},
-            _ = runtime.wake.notified() => {},
-        }
+        let wake_reason =
+            wait_for_scheduler_wake(&mut first_pass, &mut ticker, &runtime.wake).await;
         if runtime.stop.load(Ordering::SeqCst) {
             break;
         }
-        refresh_backlog(&app).await;
+        if should_refresh_backlog(wake_reason) {
+            refresh_backlog(&app).await;
+        }
         let Some(storage_state) = app.try_state::<Arc<StorageState>>() else {
             continue;
         };
@@ -930,5 +962,39 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::from_secs(60));
         assert_eq!(retry_delay(2), Duration::from_secs(120));
         assert_eq!(retry_delay(99), MAX_RETRY_DELAY);
+    }
+
+    #[tokio::test]
+    async fn scheduler_waits_after_the_startup_pass_until_a_real_wake() {
+        let wake = Notify::new();
+        let mut ticker = tokio::time::interval(TICK_INTERVAL);
+        ticker.tick().await;
+        let mut first_pass = true;
+
+        assert_eq!(
+            wait_for_scheduler_wake(&mut first_pass, &mut ticker, &wake).await,
+            SchedulerWake::Startup
+        );
+
+        assert!(tokio::time::timeout(
+            Duration::from_millis(25),
+            wait_for_scheduler_wake(&mut first_pass, &mut ticker, &wake),
+        )
+        .await
+        .is_err());
+
+        wake.notify_one();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                wait_for_scheduler_wake(&mut first_pass, &mut ticker, &wake),
+            )
+            .await
+            .expect("external notification should wake the scheduler"),
+            SchedulerWake::Notification
+        );
+        assert!(!should_refresh_backlog(SchedulerWake::Notification));
+        assert!(should_refresh_backlog(SchedulerWake::Startup));
+        assert!(should_refresh_backlog(SchedulerWake::Tick));
     }
 }
