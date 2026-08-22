@@ -226,16 +226,125 @@ function MarkdownInline({ text, evidenceItems, onOpenCitation }) {
   return parts;
 }
 
+export function parseMarkdownBlocks(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  const blocks = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    if (!line) {
+      i += 1;
+      continue;
+    }
+
+    const fence = line.match(/^```(\w+)?\s*$/);
+    if (fence) {
+      const codeLines = [];
+      i += 1;
+      while (i < lines.length && !lines[i].trim().startsWith('```')) {
+        codeLines.push(lines[i]);
+        i += 1;
+      }
+      if (i < lines.length) i += 1;
+      blocks.push({ type: 'code', text: codeLines.join('\n') });
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      blocks.push({ type: 'heading', level: heading[1].length, text: heading[2].trim() });
+      i += 1;
+      continue;
+    }
+
+    const unordered = line.match(/^[-*]\s+(.+)$/);
+    if (unordered) {
+      const items = [];
+      while (i < lines.length) {
+        const item = lines[i].trim().match(/^[-*]\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1].trim());
+        i += 1;
+      }
+      blocks.push({ type: 'ul', items });
+      continue;
+    }
+
+    const ordered = line.match(/^\d+\.\s+(.+)$/);
+    if (ordered) {
+      const items = [];
+      while (i < lines.length) {
+        const item = lines[i].trim().match(/^\d+\.\s+(.+)$/);
+        if (!item) break;
+        items.push(item[1].trim());
+        i += 1;
+      }
+      blocks.push({ type: 'ol', items });
+      continue;
+    }
+
+    const paragraph = [];
+    while (i < lines.length) {
+      const current = lines[i].trim();
+      if (!current) break;
+      if (/^```/.test(current)
+        || /^(#{1,3})\s+/.test(current)
+        || /^[-*]\s+/.test(current)
+        || /^\d+\.\s+/.test(current)) break;
+      paragraph.push(current);
+      i += 1;
+    }
+    blocks.push({ type: 'p', text: paragraph.join(' ') });
+  }
+
+  return blocks;
+}
+
 function MarkdownText({ text, evidenceItems = [], onOpenCitation, className }) {
   if (!text) return null;
-  const paragraphs = String(text).split(/\n\s*\n/).filter((p) => p.trim());
+  const blocks = parseMarkdownBlocks(text);
+
   return (
     <div className={className}>
-      {paragraphs.map((p, idx) => (
-        <p key={idx} className="leading-relaxed">
-          <MarkdownInline text={p} evidenceItems={evidenceItems} onOpenCitation={onOpenCitation} />
-        </p>
-      ))}
+      {blocks.map((block, idx) => {
+        if (block.type === 'heading') {
+          const headingClass = block.level === 1
+            ? 'text-[15px] font-bold text-ide-text'
+            : block.level === 2
+              ? 'text-[14px] font-bold text-ide-text'
+              : 'text-[13px] font-semibold text-ide-text';
+          return (
+            <div key={idx} className={headingClass}>
+              <MarkdownInline text={block.text} evidenceItems={evidenceItems} onOpenCitation={onOpenCitation} />
+            </div>
+          );
+        }
+        if (block.type === 'ul' || block.type === 'ol') {
+          const ListTag = block.type;
+          return (
+            <ListTag key={idx} className={`space-y-1 pl-5 ${block.type === 'ul' ? 'list-disc' : 'list-decimal'}`}>
+              {block.items.map((item, itemIdx) => (
+                <li key={itemIdx} className="break-words">
+                  <MarkdownInline text={item} evidenceItems={evidenceItems} onOpenCitation={onOpenCitation} />
+                </li>
+              ))}
+            </ListTag>
+          );
+        }
+        if (block.type === 'code') {
+          return (
+            <pre key={idx} className="overflow-x-auto rounded-md border border-ide-border bg-ide-bg p-3 text-xs leading-5 text-ide-text">
+              <code>{block.text}</code>
+            </pre>
+          );
+        }
+        return (
+          <p key={idx} className="break-words">
+            <MarkdownInline text={block.text} evidenceItems={evidenceItems} onOpenCitation={onOpenCitation} />
+          </p>
+        );
+      })}
     </div>
   );
 }

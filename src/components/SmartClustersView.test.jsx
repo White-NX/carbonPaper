@@ -29,7 +29,7 @@ vi.mock('../lib/monitor_api', () => ({
   })),
 }));
 
-import SmartClustersView from './SmartClustersView';
+import SmartClustersView, { parseMarkdownBlocks } from './SmartClustersView';
 import {
   deleteSmartCluster,
   getSmartClusterAssignments,
@@ -186,5 +186,70 @@ describe('SmartClustersView cluster metadata', () => {
     renderView();
 
     expect(await screen.findByText('chrome.exe · Research notes')).toBeInTheDocument();
+  });
+});
+
+describe('smart cluster markdown rendering', () => {
+  it('parses headings, lists, and fenced code as separate blocks', () => {
+    expect(parseMarkdownBlocks([
+      '# Summary',
+      '',
+      '- first point',
+      '- second point',
+      '',
+      '1. first step',
+      '2. second step',
+      '',
+      '```text',
+      'const answer = 42;',
+      '```',
+    ].join('\n'))).toEqual([
+      { type: 'heading', level: 1, text: 'Summary' },
+      { type: 'ul', items: ['first point', 'second point'] },
+      { type: 'ol', items: ['first step', 'second step'] },
+      { type: 'code', text: 'const answer = 42;' },
+    ]);
+  });
+
+  it('renders markdown blocks with list and code semantics', async () => {
+    listSmartClusters.mockResolvedValue([{
+      ...cluster,
+      summary: {
+        title: 'Summary',
+        summary: '# Findings\n\n- First finding\n- Second finding\n\n```text\nconst answer = 42;\n```',
+      },
+    }]);
+    getSmartClusterAssignments.mockResolvedValue([]);
+
+    const user = userEvent.setup();
+    renderView();
+    await user.click(await screen.findByRole('button', { name: 'Research notes' }));
+
+    expect(await screen.findByText('Findings')).toHaveClass('font-bold');
+    expect(screen.getByRole('list', { name: '' })).toBeInTheDocument();
+    expect(screen.getByText('First finding')).toBeInTheDocument();
+    expect(screen.getByText('const answer = 42;')).toBeInTheDocument();
+    expect(screen.getByText('const answer = 42;').closest('code')).toBeInTheDocument();
+  });
+
+  it('keeps safe links and evidence citations interactive inside summaries', async () => {
+    listSmartClusters.mockResolvedValue([{
+      ...cluster,
+      summary: {
+        title: 'Summary',
+        summary: 'Read [the source](https://example.com) [1].',
+        evidence: [{ screenshot_id: 42, label: 'Source snapshot' }],
+      },
+    }]);
+    getSmartClusterAssignments.mockResolvedValue([]);
+
+    const user = userEvent.setup();
+    renderView();
+    await user.click(await screen.findByRole('button', { name: 'Research notes' }));
+
+    const link = await screen.findByRole('link', { name: 'the source' });
+    expect(link).toHaveAttribute('href', 'https://example.com');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(screen.getByRole('button', { name: '1' })).toHaveAttribute('title', '#42');
   });
 });
