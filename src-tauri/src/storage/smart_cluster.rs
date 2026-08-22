@@ -65,7 +65,13 @@ fn read_cached_anchor_vector(row: &Row<'_>) -> rusqlite::Result<Option<CachedAnc
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmartClusterRecord {
     pub id: i64,
+    /// What the scorer matches snapshots against. Changing it changes what the
+    /// cluster collects, so it is not what a rename writes — see `display_name`.
     pub anchor_text: String,
+    /// The label shown in the UI. `None` for a cluster created before the two
+    /// were separated, where the anchor text doubles as the name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub threshold: f64,
     pub enabled: bool,
     pub dominant_color: Option<String>,
@@ -74,8 +80,79 @@ pub struct SmartClusterRecord {
     /// Computed at query time; not stored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignment_count: Option<i64>,
+    /// How many of those arrived in the last seven days. Computed at query
+    /// time; what the list view shows as a cluster's recent activity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_assignment_count: Option<i64>,
+    /// When the most recent snapshot was filed here, and where it came from.
+    /// All three are `None` for a cluster that has never matched anything, and
+    /// the two source fields are also `None` when that snapshot recorded no
+    /// process or window title of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_assigned_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_process_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_window_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<SmartClusterSummaryRecord>,
+}
+
+/// The columns and joins every read of a cluster row shares.
+///
+/// Column layout, which [`read_cluster_from_row`] depends on: `0..=6` the
+/// cluster itself, `7` its assignment count, `8..=20` the joined summary (read
+/// by `read_summary_from_row`), `21` how many assignments are from the last
+/// seven days, `22..=24` when the most recent snapshot was filed here and what
+/// it was showing, and `25` the display name.
+///
+/// The `la` join picks that single most recent assignment through the table's
+/// own primary key rather than a window function, so it stays one index lookup
+/// per cluster instead of a scan over every assignment ever made.
+const SMART_CLUSTER_PROJECTION: &str = "SELECT sc.id, sc.anchor_text, sc.threshold, sc.enabled, \
+            sc.dominant_color, sc.created_at, sc.updated_at, \
+            COALESCE(\
+                (SELECT COUNT(*) FROM smart_cluster_assignments a \
+                 JOIN screenshots s ON s.id = a.screenshot_id \
+                 WHERE a.smart_cluster_id = sc.id AND s.is_deleted = 0), 0) AS cnt, \
+            ss.smart_cluster_id, ss.title, ss.summary, ss.ocr_summary, \
+            ss.key_points_json, ss.evidence_json, ss.source_snapshot_count, \
+            ss.source_hash, ss.model_provider, ss.model_name, ss.prompt_version, \
+            ss.created_at, ss.updated_at, \
+            COALESCE(\
+                (SELECT COUNT(*) FROM smart_cluster_assignments ra \
+                 JOIN screenshots rs ON rs.id = ra.screenshot_id \
+                 WHERE ra.smart_cluster_id = sc.id AND rs.is_deleted = 0 \
+                   AND ra.assigned_at >= datetime('now', '-7 days')), 0) AS recent_cnt, \
+            la.assigned_at, ls.process_name, ls.window_title, sc.display_name \
+     FROM smart_clusters sc \
+     LEFT JOIN smart_cluster_summaries ss ON ss.smart_cluster_id = sc.id \
+     LEFT JOIN smart_cluster_assignments la \
+            ON la.smart_cluster_id = sc.id \
+           AND la.screenshot_id = (\
+               SELECT na.screenshot_id FROM smart_cluster_assignments na \
+               JOIN screenshots ns ON ns.id = na.screenshot_id \
+               WHERE na.smart_cluster_id = sc.id AND ns.is_deleted = 0 \
+               ORDER BY na.assigned_at DESC, na.screenshot_id DESC LIMIT 1) \
+     LEFT JOIN screenshots ls ON ls.id = la.screenshot_id";
+
+fn read_cluster_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SmartClusterRecord> {
+    Ok(SmartClusterRecord {
+        id: row.get(0)?,
+        anchor_text: row.get(1)?,
+        display_name: row.get(25)?,
+        threshold: row.get(2)?,
+        enabled: row.get::<_, i64>(3)? != 0,
+        dominant_color: row.get(4)?,
+        created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+        updated_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        assignment_count: Some(row.get::<_, i64>(7)?),
+        recent_assignment_count: Some(row.get::<_, i64>(21)?),
+        last_assigned_at: row.get(22)?,
+        last_process_name: row.get(23)?,
+        last_window_title: row.get(24)?,
+        summary: read_summary_from_row(row, 8)?,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,15 +334,16 @@ impl StorageState {
         anchor_text: &str,
         threshold: f64,
         dominant_color: Option<&str>,
+        display_name: Option<&str>,
     ) -> Result<i64, String> {
         let guard = self.get_connection_named("create_smart_cluster")?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
-            "INSERT INTO smart_clusters (anchor_text, threshold, dominant_color, enabled) \
-             VALUES (?, ?, ?, 1)",
-            params![anchor_text, threshold, dominant_color],
+            "INSERT INTO smart_clusters (anchor_text, threshold, dominant_color, display_name, enabled) \
+             VALUES (?, ?, ?, ?, 1)",
+            params![anchor_text, threshold, dominant_color, display_name],
         )
         .map_err(|e| format!("Failed to create smart cluster: {}", e))?;
         Ok(conn.last_insert_rowid())
@@ -277,36 +355,12 @@ impl StorageState {
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
         let mut stmt = conn
-            .prepare(
-                "SELECT sc.id, sc.anchor_text, sc.threshold, sc.enabled, sc.dominant_color, \
-                        sc.created_at, sc.updated_at, \
-                        COALESCE(\
-                            (SELECT COUNT(*) FROM smart_cluster_assignments a \
-                             JOIN screenshots s ON s.id = a.screenshot_id \
-                             WHERE a.smart_cluster_id = sc.id AND s.is_deleted = 0), 0) AS cnt, \
-                        ss.smart_cluster_id, ss.title, ss.summary, ss.ocr_summary, \
-                        ss.key_points_json, ss.evidence_json, ss.source_snapshot_count, \
-                        ss.source_hash, ss.model_provider, ss.model_name, ss.prompt_version, \
-                        ss.created_at, ss.updated_at \
-                 FROM smart_clusters sc \
-                 LEFT JOIN smart_cluster_summaries ss ON ss.smart_cluster_id = sc.id \
-                 ORDER BY sc.updated_at DESC",
-            )
+            .prepare(&format!(
+                "{SMART_CLUSTER_PROJECTION} ORDER BY sc.updated_at DESC"
+            ))
             .map_err(|e| format!("Failed to prepare list_smart_clusters: {}", e))?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(SmartClusterRecord {
-                    id: row.get(0)?,
-                    anchor_text: row.get(1)?,
-                    threshold: row.get(2)?,
-                    enabled: row.get::<_, i64>(3)? != 0,
-                    dominant_color: row.get(4)?,
-                    created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                    updated_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                    assignment_count: Some(row.get::<_, i64>(7)?),
-                    summary: read_summary_from_row(row, 8)?,
-                })
-            })
+            .query_map([], read_cluster_from_row)
             .map_err(|e| format!("Failed to query smart clusters: {}", e))?;
         let mut out = Vec::new();
         for row in rows {
@@ -321,33 +375,9 @@ impl StorageState {
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
         match conn.query_row(
-            "SELECT sc.id, sc.anchor_text, sc.threshold, sc.enabled, sc.dominant_color, \
-                    sc.created_at, sc.updated_at, \
-                    COALESCE(\
-                        (SELECT COUNT(*) FROM smart_cluster_assignments a \
-                         JOIN screenshots s ON s.id = a.screenshot_id \
-                         WHERE a.smart_cluster_id = sc.id AND s.is_deleted = 0), 0) AS cnt, \
-                    ss.smart_cluster_id, ss.title, ss.summary, ss.ocr_summary, \
-                    ss.key_points_json, ss.evidence_json, ss.source_snapshot_count, \
-                    ss.source_hash, ss.model_provider, ss.model_name, ss.prompt_version, \
-                    ss.created_at, ss.updated_at \
-             FROM smart_clusters sc \
-             LEFT JOIN smart_cluster_summaries ss ON ss.smart_cluster_id = sc.id \
-             WHERE sc.id = ?",
+            &format!("{SMART_CLUSTER_PROJECTION} WHERE sc.id = ?"),
             params![id],
-            |row| {
-                Ok(SmartClusterRecord {
-                    id: row.get(0)?,
-                    anchor_text: row.get(1)?,
-                    threshold: row.get(2)?,
-                    enabled: row.get::<_, i64>(3)? != 0,
-                    dominant_color: row.get(4)?,
-                    created_at: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                    updated_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                    assignment_count: Some(row.get::<_, i64>(7)?),
-                    summary: read_summary_from_row(row, 8)?,
-                })
-            },
+            read_cluster_from_row,
         ) {
             Ok(record) => Ok(Some(record)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -365,16 +395,23 @@ impl StorageState {
         Ok(())
     }
 
-    pub fn update_smart_cluster_anchor(&self, id: i64, anchor: &str) -> Result<(), String> {
-        let guard = self.get_connection_named("update_smart_cluster_anchor")?;
+    /// Rename a cluster.
+    ///
+    /// This writes the label only. The anchor text the scorer matches against
+    /// is deliberately left alone: rewriting it here would change what the
+    /// cluster collects from now on and strand the threshold, which was
+    /// calibrated against the old wording on examples the user has already
+    /// approved.
+    pub fn update_smart_cluster_display_name(&self, id: i64, name: &str) -> Result<(), String> {
+        let guard = self.get_connection_named("update_smart_cluster_display_name")?;
         let conn = guard
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
-            "UPDATE smart_clusters SET anchor_text = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            params![anchor, id],
+            "UPDATE smart_clusters SET display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            params![name, id],
         )
-        .map_err(|e| format!("Failed to update smart cluster anchor: {}", e))?;
+        .map_err(|e| format!("Failed to update smart cluster name: {}", e))?;
         Ok(())
     }
 
@@ -1063,6 +1100,51 @@ mod tests {
         // A cluster that predates the cache reads back as a cold cache, which
         // costs one encode and is not an error.
         assert!(targets[0].anchor_vector.is_none());
+    }
+
+    /// Renaming a cluster must not change what it collects.
+    ///
+    /// The anchor is what the scorer matches against and what the stored
+    /// threshold was calibrated for, so a rename that rewrote it would quietly
+    /// re-aim the cluster and strand the number that decides how strict it is.
+    #[test]
+    fn renaming_a_cluster_leaves_the_text_it_matches_against_alone() {
+        let (_temp, storage) = test_storage();
+        let id = storage
+            .create_smart_cluster("receipts and invoices", -2.5, None, Some("Receipts"))
+            .expect("create cluster");
+
+        storage
+            .update_smart_cluster_display_name(id, "Shopping")
+            .expect("rename cluster");
+
+        let record = storage
+            .get_smart_cluster(id)
+            .expect("read cluster")
+            .expect("cluster exists");
+        assert_eq!(record.display_name.as_deref(), Some("Shopping"));
+        assert_eq!(record.anchor_text, "receipts and invoices");
+
+        let targets = storage
+            .list_smart_cluster_scoring_targets()
+            .expect("scoring targets");
+        assert_eq!(targets[0].anchor_text, "receipts and invoices");
+    }
+
+    /// A cluster created before names and anchors were separate columns still
+    /// has something to show in the list: readers fall back to the anchor text,
+    /// which is the string those clusters were already displaying.
+    #[test]
+    fn a_cluster_written_before_names_existed_reads_back_without_one() {
+        let (_temp, storage) = test_storage();
+        let id = insert_cluster(&storage, "receipts");
+
+        let record = storage
+            .get_smart_cluster(id)
+            .expect("read cluster")
+            .expect("cluster exists");
+        assert!(record.display_name.is_none());
+        assert_eq!(record.anchor_text, "receipts");
     }
 
     #[test]

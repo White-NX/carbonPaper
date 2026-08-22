@@ -501,7 +501,6 @@ export default function SnapshotPreviewDock({
     || activeTab.metadata?.screenshot_created_at
     || activeTab.created_at
     || activeTab.metadata?.created_at;
-  const score = activeTab.rerank_score;
   const assignedAt = activeTab.assigned_at;
   const sourceLabel = getLocalizedSourceLabel(activeTab, t);
   const sourceDetail = activeTab.sourceDetail;
@@ -742,9 +741,6 @@ export default function SnapshotPreviewDock({
                 <MetadataRow icon={Clock} label={t('snapshotPreview.assignedAt')} value={formatTimestamp(assignedAt)} />
               )}
               <MetadataRow icon={Hash} label={t('snapshotPreview.id')} value={screenshotId ? String(screenshotId) : null} />
-              {typeof score === 'number' && (
-                <MetadataRow icon={Hash} label={t('snapshotPreview.score')} value={score.toFixed(3)} />
-              )}
               {category && (
                 <MetadataRow icon={Tag} label={t('snapshotPreview.category')}>
                   <CategoryBadge category={category} />

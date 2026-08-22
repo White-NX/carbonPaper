@@ -34,6 +34,11 @@ fn normalize_anchor_text(anchor: &str) -> Result<String, String> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateSmartClusterRequest {
     pub anchor_text: String,
+    /// The label to show for this cluster. Absent means the anchor text is
+    /// also the name, which is how every cluster read before the two were
+    /// separated.
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub threshold: f64,
     pub dominant_color: Option<String>,
     pub examples: Vec<SmartClusterExample>,
@@ -104,8 +109,17 @@ pub async fn smart_cluster_create(
     let state = state.inner().clone();
     tokio::task::spawn_blocking(move || {
         let anchor = normalize_anchor_text(&req.anchor_text)?;
-        let id =
-            state.create_smart_cluster(&anchor, req.threshold, req.dominant_color.as_deref())?;
+        let display_name = req
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let id = state.create_smart_cluster(
+            &anchor,
+            req.threshold,
+            req.dominant_color.as_deref(),
+            display_name,
+        )?;
         // Stamp the scorer that produced this threshold. The Python identity is
         // retained for requests from older clients so those thresholds are
         // re-derived rather than trusted against Rust logits.
@@ -187,19 +201,26 @@ pub fn smart_cluster_delete(
     state.delete_smart_cluster(id)
 }
 
-/// Replaces the normalized natural-language anchor for cluster `id`.
+/// Renames cluster `id`.
 ///
 /// Authentication: required. Returns JSON `null`. Frontend: `lib/task_api.js`.
+///
+/// The name is a label. The anchor text a cluster matches against is fixed at
+/// creation, when its threshold is calibrated against examples the user picked
+/// for that exact wording — so renaming does not touch it.
 #[tauri::command]
-pub fn smart_cluster_update_anchor(
+pub fn smart_cluster_rename(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
     id: i64,
-    anchor: String,
+    name: String,
 ) -> Result<(), String> {
     check_auth_required(&credential_state)?;
-    let anchor = normalize_anchor_text(&anchor)?;
-    state.update_smart_cluster_anchor(id, &anchor)
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name cannot be empty".to_string());
+    }
+    state.update_smart_cluster_display_name(id, name)
 }
 
 /// Changes the match threshold for cluster `id`.

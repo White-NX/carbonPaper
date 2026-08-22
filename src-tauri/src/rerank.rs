@@ -193,11 +193,11 @@ fn provider_label(provider: MlProvider) -> &'static str {
 /// The reranker availability payload, in the shape Python's
 /// `nl_cluster_reranker_status` returned.
 ///
-/// `NlClusterView` reads `available` to decide whether to warn that a
-/// calibration query cannot be reranked, and `loaded_variant` to label the
-/// scores. Both have to describe the engine that will actually serve the
-/// query: answering from Python while Rust reranks would warn on a screen that
-/// works whenever Python is stopped, and stay silent when the file Rust loads
+/// `SmartClusterCreateView.jsx` reads `available` to decide whether to tell
+/// the user the feature is not set up yet. It has to describe the engine that
+/// will actually serve the query: answering from Python while Rust reranks
+/// would warn on a screen that works whenever Python is stopped, and stay
+/// silent when the file Rust loads
 /// is missing.
 ///
 /// `available_variants` carries exactly one entry rather than the list Python
@@ -930,8 +930,9 @@ mod tests {
     #[test]
     fn the_reranker_status_keeps_the_fields_the_calibration_screen_reads() {
         // `task_api.js::getRerankerStatus` normalizes exactly these keys, and
-        // `NlClusterView` warns on `available === false` and prints
-        // `loaded_variant`. A missing key would silently become "unavailable".
+        // `SmartClusterCreateView.jsx` tells the user the feature is not ready
+        // when `available === false`. A missing key would silently become
+        // "unavailable".
         let installed = reranker_status_payload(true, true, "C:/models/model_uint8.onnx");
         assert_eq!(installed["status"], "success");
         assert_eq!(installed["available"], true);

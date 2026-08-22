@@ -16,7 +16,7 @@ vi.mock('../lib/task_api', () => ({
   smartClusterDrainNow: vi.fn(),
   smartClusterStopDrain: vi.fn(),
   toggleSmartClusterEnabled: vi.fn(),
-  updateSmartClusterAnchor: vi.fn(),
+  renameSmartCluster: vi.fn(),
 }));
 
 vi.mock('../lib/monitor_api', () => ({
@@ -30,11 +30,18 @@ vi.mock('../lib/monitor_api', () => ({
 }));
 
 import SmartClustersView from './SmartClustersView';
-import { deleteSmartCluster, listSmartClusters } from '../lib/task_api';
+import {
+  deleteSmartCluster,
+  getSmartClusterStatus,
+  listSmartClusters,
+  smartClusterDrainNow,
+} from '../lib/task_api';
+import { getSmartClusterWorkerStatus } from '../lib/monitor_api';
 
 const cluster = {
   id: 7,
   anchor_text: 'Research notes',
+  display_name: 'Research notes',
   assignment_count: 0,
   threshold: 0.8,
   enabled: true,
@@ -52,7 +59,9 @@ function renderView() {
 
 async function openDeleteDialog(user) {
   await screen.findByText('Research notes');
-  await user.click(screen.getByTitle('clusterCard.actionDelete'));
+  // 行内操作收进了「更多」菜单，删除要先把菜单打开。
+  await user.click(screen.getByTitle('smartClusters.rowMenu'));
+  await user.click(screen.getByRole('button', { name: 'clusterCard.actionDelete' }));
   return screen.findByRole('dialog');
 }
 
@@ -105,5 +114,44 @@ describe('SmartClustersView deletion confirmation', () => {
     await waitFor(() => expect(authRequired).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     window.removeEventListener('cp-auth-required', authRequired);
+  });
+});
+
+describe('SmartClustersView manual drain', () => {
+  beforeEach(() => {
+    listSmartClusters.mockResolvedValue([cluster]);
+    getSmartClusterStatus.mockResolvedValue({
+      pending_count: 2,
+      enabled_cluster_count: 1,
+      total_cluster_count: 1,
+    });
+    getSmartClusterWorkerStatus.mockResolvedValue({
+      running: false,
+      forceRunning: false,
+      pending_count: 2,
+      unverifiableThresholds: 0,
+    });
+    smartClusterDrainNow.mockResolvedValue({ status: 'success' });
+  });
+
+  it('shows the requested drain immediately and exposes stop while it is admitted', async () => {
+    const user = userEvent.setup();
+    renderView();
+
+    await user.click(await screen.findByRole('button', { name: 'smartClusters.processNow' }));
+
+    expect(smartClusterDrainNow).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'smartClusters.stopDrain' })).toBeInTheDocument();
+  });
+
+  it('renders a backend error instead of silently ignoring a failed request', async () => {
+    smartClusterDrainNow.mockRejectedValue(new Error('Background scheduler is unavailable'));
+    const user = userEvent.setup();
+    renderView();
+
+    await user.click(await screen.findByRole('button', { name: 'smartClusters.processNow' }));
+
+    expect(await screen.findByText('Background scheduler is unavailable')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'smartClusters.processNow' })).toBeInTheDocument();
   });
 });

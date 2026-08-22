@@ -144,7 +144,7 @@ const COMMAND_TIERS = {
   'commands::smart_cluster::smart_cluster_get_examples': 'session_required',
   'commands::smart_cluster::smart_cluster_create': 'session_required',
   'commands::smart_cluster::smart_cluster_delete': 'session_required',
-  'commands::smart_cluster::smart_cluster_update_anchor': 'session_required',
+  'commands::smart_cluster::smart_cluster_rename': 'session_required',
   'commands::smart_cluster::smart_cluster_update_threshold': 'session_required',
   'commands::smart_cluster::smart_cluster_toggle_enabled': 'session_required',
   'commands::smart_cluster::smart_cluster_assignments': 'session_required',
