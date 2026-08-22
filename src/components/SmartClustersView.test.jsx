@@ -174,3 +174,17 @@ describe('SmartClustersView assignments pagination', () => {
     });
   });
 });
+
+describe('SmartClustersView cluster metadata', () => {
+  it('renders the backend last process and window title as the subtitle', async () => {
+    listSmartClusters.mockResolvedValue([{
+      ...cluster,
+      last_process_name: 'chrome.exe',
+      last_window_title: 'Research notes',
+    }]);
+
+    renderView();
+
+    expect(await screen.findByText('chrome.exe · Research notes')).toBeInTheDocument();
+  });
+});

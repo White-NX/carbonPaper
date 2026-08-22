@@ -24,13 +24,13 @@ function clusterName(cluster) {
 
 function clusterSubtitle(cluster) {
   if (!cluster) return '';
-  if (cluster.latest_window_title) {
-    return cluster.latest_process_name
-      ? `${cluster.latest_process_name} · ${cluster.latest_window_title}`
-      : cluster.latest_window_title;
+  if (cluster.last_window_title) {
+    return cluster.last_process_name
+      ? `${cluster.last_process_name} · ${cluster.last_window_title}`
+      : cluster.last_window_title;
   }
-  if (cluster.latest_process_name) {
-    return cluster.latest_process_name;
+  if (cluster.last_process_name) {
+    return cluster.last_process_name;
   }
   return '';
 }
