@@ -683,9 +683,11 @@ impl StorageState {
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
         conn.execute(
-            "INSERT OR REPLACE INTO smart_cluster_assignments \
-             (smart_cluster_id, screenshot_id, rerank_score, assigned_at) \
-             VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            "INSERT INTO smart_cluster_assignments \
+             (smart_cluster_id, screenshot_id, rerank_score) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(smart_cluster_id, screenshot_id) DO UPDATE SET \
+                 rerank_score = excluded.rerank_score",
             params![cluster_id, screenshot_id, rerank_score],
         )
         .map_err(|e| format!("Failed to record assignment: {}", e))?;
@@ -1084,6 +1086,24 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    fn insert_screenshot(storage: &StorageState, id: i64, process_name: &str, window_title: &str) {
+        let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+        let conn = guard.as_ref().expect("database");
+        conn.execute(
+            "INSERT INTO screenshots \
+             (id, image_path, image_hash, process_name, window_title) \
+             VALUES (?, ?, ?, ?, ?)",
+            params![
+                id,
+                format!("{id}.enc"),
+                format!("hash-{id}"),
+                process_name,
+                window_title,
+            ],
+        )
+        .expect("insert screenshot");
+    }
+
     #[test]
     fn a_database_written_before_the_anchor_cache_gains_it_without_losing_a_cluster() {
         let (_temp, storage) = test_storage();
@@ -1145,6 +1165,61 @@ mod tests {
             .expect("cluster exists");
         assert!(record.display_name.is_none());
         assert_eq!(record.anchor_text, "receipts");
+    }
+
+    #[test]
+    fn rescoring_an_existing_assignment_preserves_archive_time_and_latest_source() {
+        let (_temp, storage) = test_storage();
+        let cluster_id = storage
+            .create_smart_cluster("research notes", -2.5, None, Some("Research"))
+            .expect("create cluster");
+        insert_screenshot(&storage, 1, "old.exe", "Old source");
+        insert_screenshot(&storage, 2, "new.exe", "New source");
+
+        storage
+            .record_smart_cluster_assignment(cluster_id, 1, 0.8)
+            .expect("record first assignment");
+        storage
+            .record_smart_cluster_assignment(cluster_id, 2, 0.9)
+            .expect("record second assignment");
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().expect("database");
+            conn.execute(
+                "UPDATE smart_cluster_assignments SET assigned_at = CASE screenshot_id \
+                 WHEN 1 THEN '2000-01-01 00:00:00' \
+                 WHEN 2 THEN '2000-01-02 00:00:00' END \
+                 WHERE smart_cluster_id = ?",
+                params![cluster_id],
+            )
+            .expect("age assignments");
+        }
+
+        storage
+            .record_smart_cluster_assignment(cluster_id, 1, 0.95)
+            .expect("rescore first assignment");
+
+        let assignments = storage
+            .list_smart_cluster_assignments(cluster_id, 0, 50)
+            .expect("list assignments");
+        let rescored = assignments
+            .iter()
+            .find(|assignment| assignment.screenshot_id == 1)
+            .expect("rescored assignment");
+        assert_eq!(rescored.rerank_score, Some(0.95));
+        assert_eq!(rescored.assigned_at, "2000-01-01 00:00:00");
+
+        let record = storage
+            .get_smart_cluster(cluster_id)
+            .expect("read cluster")
+            .expect("cluster exists");
+        assert_eq!(record.recent_assignment_count, Some(0));
+        assert_eq!(
+            record.last_assigned_at.as_deref(),
+            Some("2000-01-02 00:00:00")
+        );
+        assert_eq!(record.last_process_name.as_deref(), Some("new.exe"));
+        assert_eq!(record.last_window_title.as_deref(), Some("New source"));
     }
 
     #[test]
