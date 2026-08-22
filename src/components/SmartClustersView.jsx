@@ -321,7 +321,7 @@ export default function SmartClustersView({
       return;
     }
     try {
-      const res = await getSmartClusterAssignments(clusterId, 1, 50);
+      const res = await getSmartClusterAssignments(clusterId, 0, 50);
       const items = res?.items || res || [];
       setAssignments(items);
       const ids = items.map((a) => a.screenshot_id).filter(Boolean);

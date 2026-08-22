@@ -32,6 +32,7 @@ vi.mock('../lib/monitor_api', () => ({
 import SmartClustersView from './SmartClustersView';
 import {
   deleteSmartCluster,
+  getSmartClusterAssignments,
   getSmartClusterStatus,
   listSmartClusters,
   smartClusterDrainNow,
@@ -153,5 +154,23 @@ describe('SmartClustersView manual drain', () => {
 
     expect(await screen.findByText('Background scheduler is unavailable')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'smartClusters.processNow' })).toBeInTheDocument();
+  });
+});
+
+describe('SmartClustersView assignments pagination', () => {
+  beforeEach(() => {
+    listSmartClusters.mockResolvedValue([cluster]);
+    getSmartClusterAssignments.mockResolvedValue([]);
+  });
+
+  it('loads the first assignment page when a cluster is selected', async () => {
+    const user = userEvent.setup();
+    renderView();
+
+    await user.click(await screen.findByRole('button', { name: 'Research notes' }));
+
+    await waitFor(() => {
+      expect(getSmartClusterAssignments).toHaveBeenCalledWith(7, 0, 50);
+    });
   });
 });
