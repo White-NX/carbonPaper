@@ -97,6 +97,21 @@ impl Default for SensitiveFilterState {
 }
 
 impl SensitiveFilterState {
+    #[cfg(test)]
+    pub(crate) fn with_test_words(words: &[&str]) -> Self {
+        let state = Self::default();
+        {
+            let mut word_lists = state.word_lists.write().unwrap();
+            word_lists.insert(
+                "cat_01".to_string(),
+                words.iter().map(|word| (*word).to_string()).collect(),
+            );
+        }
+        let config = state.get_config();
+        state.rebuild_automaton(&config);
+        state
+    }
+
     /// Load encrypted dictionary files from Tauri resources and build automata.
     pub fn load_dicts(&self, app_handle: &tauri::AppHandle) {
         let key: [u8; 32] = Sha256::digest(DICT_KEY_MATERIAL).into();

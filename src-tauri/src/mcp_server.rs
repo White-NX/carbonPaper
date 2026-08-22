@@ -708,6 +708,163 @@ fn cleanse_smart_cluster_summary(
     }
 }
 
+fn cleanse_smart_cluster_record(
+    mut cluster: crate::storage::smart_cluster::SmartClusterRecord,
+    filter: &SensitiveFilterState,
+) -> Option<crate::storage::smart_cluster::SmartClusterRecord> {
+    if !filter.is_enabled() {
+        return Some(cluster);
+    }
+
+    let anchor_sensitive = filter.contains_sensitive(&cluster.anchor_text);
+    let display_name_sensitive = cluster
+        .display_name
+        .as_deref()
+        .is_some_and(|text| filter.contains_sensitive(text));
+    let process_name_sensitive = cluster
+        .last_process_name
+        .as_deref()
+        .is_some_and(|text| filter.contains_sensitive(text));
+    let window_title_sensitive = cluster
+        .last_window_title
+        .as_deref()
+        .is_some_and(|text| filter.contains_sensitive(text));
+
+    if !(anchor_sensitive
+        || display_name_sensitive
+        || process_name_sensitive
+        || window_title_sensitive)
+    {
+        return Some(cluster);
+    }
+
+    match filter.get_mode().as_str() {
+        "mask" => {
+            if anchor_sensitive {
+                cluster.anchor_text = filter.mask_sensitive(&cluster.anchor_text);
+            }
+            if display_name_sensitive {
+                if let Some(ref mut text) = cluster.display_name {
+                    *text = filter.mask_sensitive(text);
+                }
+            }
+            if process_name_sensitive {
+                if let Some(ref mut text) = cluster.last_process_name {
+                    *text = filter.mask_sensitive(text);
+                }
+            }
+            if window_title_sensitive {
+                if let Some(ref mut text) = cluster.last_window_title {
+                    *text = filter.mask_sensitive(text);
+                }
+            }
+            Some(cluster)
+        }
+        "remove_paragraph" => {
+            if anchor_sensitive {
+                cluster.anchor_text = CENSORED_LABEL.to_string();
+            }
+            if display_name_sensitive {
+                cluster.display_name = Some(CENSORED_LABEL.to_string());
+            }
+            if process_name_sensitive {
+                cluster.last_process_name = Some(CENSORED_LABEL.to_string());
+            }
+            if window_title_sensitive {
+                cluster.last_window_title = Some(CENSORED_LABEL.to_string());
+            }
+            Some(cluster)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod smart_cluster_filter_tests {
+    use super::*;
+    use crate::sensitive_filter::SensitiveFilterState;
+    use crate::storage::smart_cluster::SmartClusterRecord;
+
+    fn cluster() -> SmartClusterRecord {
+        SmartClusterRecord {
+            id: 1,
+            anchor_text: "research notes".to_string(),
+            display_name: Some("Research".to_string()),
+            threshold: 0.5,
+            enabled: true,
+            dominant_color: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            assignment_count: Some(1),
+            recent_assignment_count: Some(1),
+            last_assigned_at: None,
+            last_process_name: None,
+            last_window_title: None,
+            summary: None,
+        }
+    }
+
+    fn filter_with_mode(mode: &str) -> SensitiveFilterState {
+        let filter = SensitiveFilterState::with_test_words(&["alice", "chrome", "private"]);
+        let mut config = filter.get_config();
+        config.mode = mode.to_string();
+        filter.update_config(config);
+        filter
+    }
+
+    #[test]
+    fn rejects_clusters_when_any_new_metadata_field_is_sensitive() {
+        let filter = filter_with_mode("reject");
+
+        for field in ["display_name", "last_process_name", "last_window_title"] {
+            let mut record = cluster();
+            match field {
+                "display_name" => record.display_name = Some("alice's notes".to_string()),
+                "last_process_name" => record.last_process_name = Some("chrome".to_string()),
+                "last_window_title" => {
+                    record.last_window_title = Some("private portal".to_string())
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                cleanse_smart_cluster_record(record, &filter).is_none(),
+                "sensitive {field} should reject the cluster"
+            );
+        }
+    }
+
+    #[test]
+    fn masks_new_metadata_fields_without_changing_safe_fields() {
+        let filter = filter_with_mode("mask");
+        let mut record = cluster();
+        record.display_name = Some("alice's notes".to_string());
+        record.last_process_name = Some("chrome".to_string());
+        record.last_window_title = Some("private portal".to_string());
+
+        let result = cleanse_smart_cluster_record(record, &filter).expect("cluster retained");
+
+        assert_eq!(result.anchor_text, "research notes");
+        assert!(result.display_name.unwrap().contains('█'));
+        assert!(result.last_process_name.unwrap().contains('█'));
+        assert!(result.last_window_title.unwrap().contains('█'));
+    }
+
+    #[test]
+    fn censors_new_metadata_fields_in_remove_paragraph_mode() {
+        let filter = filter_with_mode("remove_paragraph");
+        let mut record = cluster();
+        record.display_name = Some("alice's notes".to_string());
+        record.last_process_name = Some("chrome".to_string());
+        record.last_window_title = Some("private portal".to_string());
+
+        let result = cleanse_smart_cluster_record(record, &filter).expect("cluster retained");
+
+        assert_eq!(result.display_name.as_deref(), Some(CENSORED_LABEL));
+        assert_eq!(result.last_process_name.as_deref(), Some(CENSORED_LABEL));
+        assert_eq!(result.last_window_title.as_deref(), Some(CENSORED_LABEL));
+    }
+}
+
 async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value, String> {
     require_authenticated_session(&state.app_handle)?;
 
@@ -1737,18 +1894,11 @@ async fn tool_get_smart_clusters(state: &McpServerInner, _args: Value) -> Result
     let filter = filter.inner().clone();
 
     let clusters = tokio::task::spawn_blocking(move || {
-        let filter_mode = filter.get_mode();
         let clusters = storage.list_smart_clusters()?;
         let clusters: Vec<_> = clusters
             .into_iter()
             .filter_map(|mut c| {
-                if filter.is_enabled() && filter.contains_sensitive(&c.anchor_text) {
-                    match filter_mode.as_str() {
-                        "mask" => c.anchor_text = filter.mask_sensitive(&c.anchor_text),
-                        "remove_paragraph" => c.anchor_text = CENSORED_LABEL.to_string(),
-                        _ => return None,
-                    }
-                }
+                c = cleanse_smart_cluster_record(c, &filter)?;
                 c.summary = c
                     .summary
                     .and_then(|summary| cleanse_smart_cluster_summary(summary, &filter));
