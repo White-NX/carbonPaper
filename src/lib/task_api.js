@@ -319,7 +319,9 @@ export async function getSmartClusterExamples(id) {
 /**
  * Create a new smart cluster from calibration.
  * @param {Object} req
- * @param {string} req.anchor_text
+ * @param {string} req.anchor_text - what the scorer matches snapshots against
+ * @param {string} [req.display_name] - the label shown in the UI; defaults to
+ *   the anchor text when absent
  * @param {number} req.threshold
  * @param {string} [req.dominant_color]
  * @param {Array} req.examples - [{ screenshot_id, is_positive, rerank_score }]
@@ -336,8 +338,15 @@ export async function deleteSmartCluster(id) {
   return withAuth(() => invoke('smart_cluster_delete', { id }), { autoPrompt: true });
 }
 
-export async function updateSmartClusterAnchor(id, anchor) {
-  return withAuth(() => invoke('smart_cluster_update_anchor', { id, anchor }), { autoPrompt: true });
+/**
+ * Rename a smart cluster.
+ *
+ * Only the label changes. The anchor text stays as the user wrote it at
+ * creation, because the cluster's threshold was calibrated against that exact
+ * wording — renaming must not quietly change what the cluster collects.
+ */
+export async function renameSmartCluster(id, name) {
+  return withAuth(() => invoke('smart_cluster_rename', { id, name }), { autoPrompt: true });
 }
 
 export async function updateSmartClusterThreshold(id, threshold) {

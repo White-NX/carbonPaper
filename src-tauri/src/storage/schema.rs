@@ -1265,6 +1265,20 @@ impl StorageState {
             "TEXT",
         )?;
 
+        // The label the user sees, kept apart from the anchor text the scorer
+        // matches against.
+        //
+        // These were one column until the cluster list started showing names:
+        // an anchor is a sentence describing what to collect, which is the
+        // right input for the scorer and the wrong thing to read down a 320px
+        // list. Worse, renaming used to rewrite the anchor, so giving a cluster
+        // a shorter name silently changed what it collected and invalidated the
+        // threshold calibrated against the old wording.
+        //
+        // NULL means the row predates the split, and readers fall back to
+        // `anchor_text` — the same string those clusters were already showing.
+        Self::add_column_if_missing(conn, "smart_clusters", "display_name", "TEXT")?;
+
         // Staging table for bitmap index migration (same structure as blind_bitmap_index)
         Self::create_table_if_missing(
             conn,

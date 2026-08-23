@@ -1,25 +1,44 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Sparkles, Plus, Loader2, RefreshCw, AlertCircle, X,
-  Zap, Image as ImageIcon, Clock, Hash, FileText,
+  Zap, Clock, FileText, CircleDot, PauseCircle, Inbox,
 } from 'lucide-react';
 import {
-  listSmartClusters, deleteSmartCluster, updateSmartClusterAnchor,
+  listSmartClusters, deleteSmartCluster, renameSmartCluster,
   toggleSmartClusterEnabled, getSmartClusterAssignments,
   smartClusterDrainNow, getSmartClusterStatus, createSmartCluster,
   smartClusterStopDrain,
 } from '../lib/task_api';
 import { fetchThumbnailBatch, getSmartClusterWorkerStatus } from '../lib/monitor_api';
 import { ThumbnailCard } from './ThumbnailCard';
-import ClusterCard from './ClusterCard';
-import NlClusterView from './NlClusterView';
+import ClusterRow, { formatRelativeStamp } from './cluster/ClusterRow';
+import SmartClusterCreateView from './SmartClusterCreateView';
+import { PageHeader, StatusChip } from './PageHeader';
 import { ConfirmDialog } from './ConfirmDialog';
+
+function clusterName(cluster) {
+  if (!cluster) return '';
+  return cluster.display_name || cluster.anchor_text || '';
+}
+
+function clusterSubtitle(cluster) {
+  if (!cluster) return '';
+  if (cluster.last_window_title) {
+    return cluster.last_process_name
+      ? `${cluster.last_process_name} · ${cluster.last_window_title}`
+      : cluster.last_window_title;
+  }
+  if (cluster.last_process_name) {
+    return cluster.last_process_name;
+  }
+  return '';
+}
 
 function formatTimestamp(ts) {
   if (!ts) return '—';
   try {
-    const d = new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z');
+    const d = new Date(ts.includes('T') ? ts : `${ts.replace(' ', 'T')}Z`);
     if (Number.isNaN(d.getTime())) return '—';
     return d.toLocaleString();
   } catch {
@@ -27,22 +46,12 @@ function formatTimestamp(ts) {
   }
 }
 
-function formatAssignedAt(ts) {
-  if (!ts) return '';
-  const d = new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z');
-  if (Number.isNaN(d.getTime())) return ts;
-  return d.toLocaleString();
-}
-
 function isAuthRequiredError(err) {
   return String(err?.message || err || '').includes('AUTH_REQUIRED');
 }
 
-function normalizeSummaryList(value) {
-  if (!value) return [];
-  if (Array.isArray(value)) return value;
-  if (typeof value === 'object') return Object.values(value);
-  return [value];
+function emitAuthRequired() {
+  window.dispatchEvent(new CustomEvent('cp-auth-required'));
 }
 
 function extractSnapshotId(item) {
@@ -169,7 +178,7 @@ function MarkdownInline({ text, evidenceItems, onOpenCitation }) {
             className="text-ide-accent underline decoration-ide-accent/40 underline-offset-2 hover:text-ide-accent/80"
           >
             <MarkdownInline text={label} evidenceItems={evidenceItems} onOpenCitation={onOpenCitation} />
-          </a>
+          </a>,
         );
       } else {
         parts.push(label);
@@ -188,7 +197,7 @@ function MarkdownInline({ text, evidenceItems, onOpenCitation }) {
             title={`#${snapshotId}`}
           >
             {ref}
-          </button>
+          </button>,
         );
       } else {
         parts.push(token);
@@ -197,33 +206,33 @@ function MarkdownInline({ text, evidenceItems, onOpenCitation }) {
       parts.push(
         <code key={`code-${match.index}`} className="rounded bg-ide-bg px-1 py-0.5 font-mono text-[0.92em] text-ide-accent">
           {token.slice(1, -1)}
-        </code>
+        </code>,
       );
     } else if (token.startsWith('**')) {
-      parts.push(<strong key={`bold-${match.index}`} className="font-bold text-ide-text">{token.slice(2, -2)}</strong>);
+      parts.push(<strong key={`bold-${match.index}`}>{token.slice(2, -2)}</strong>);
     } else if (token.startsWith('*')) {
-      parts.push(<em key={`em-${match.index}`} className="italic">{token.slice(1, -1)}</em>);
+      parts.push(<em key={`italic-${match.index}`}>{token.slice(1, -1)}</em>);
     } else {
       parts.push(token);
     }
-    lastIndex = pattern.lastIndex;
+
+    lastIndex = match.index + token.length;
   }
 
   if (lastIndex < text.length) {
     parts.push(text.slice(lastIndex));
   }
 
-  return <>{parts}</>;
+  return parts;
 }
 
-function parseMarkdownBlocks(text) {
+export function parseMarkdownBlocks(text) {
   const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
   const blocks = [];
   let i = 0;
 
   while (i < lines.length) {
-    const raw = lines[i];
-    const line = raw.trim();
+    const line = lines[i].trim();
     if (!line) {
       i += 1;
       continue;
@@ -279,7 +288,10 @@ function parseMarkdownBlocks(text) {
     while (i < lines.length) {
       const current = lines[i].trim();
       if (!current) break;
-      if (/^```/.test(current) || /^(#{1,3})\s+/.test(current) || /^[-*]\s+/.test(current) || /^\d+\.\s+/.test(current)) break;
+      if (/^```/.test(current)
+        || /^(#{1,3})\s+/.test(current)
+        || /^[-*]\s+/.test(current)
+        || /^\d+\.\s+/.test(current)) break;
       paragraph.push(current);
       i += 1;
     }
@@ -289,7 +301,7 @@ function parseMarkdownBlocks(text) {
   return blocks;
 }
 
-function MarkdownText({ text, evidenceItems, onOpenCitation, className }) {
+function MarkdownText({ text, evidenceItems = [], onOpenCitation, className }) {
   if (!text) return null;
   const blocks = parseMarkdownBlocks(text);
 
@@ -337,217 +349,199 @@ function MarkdownText({ text, evidenceItems, onOpenCitation, className }) {
   );
 }
 
-function emitAuthRequired() {
-  if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('cp-auth-required'));
-  }
-}
-
 export default function SmartClustersView({
-  isAuthenticated = true,
-  active = true,
   onSelectScreenshot,
   onOpenSnapshotPreview,
+  active = true,
 }) {
   const { t } = useTranslation();
   const [clusters, setClusters] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [assignments, setAssignments] = useState([]);
-  const [loading, setLoading] = useState(false);
   const [statusData, setStatusData] = useState(null);
-  const [creating, setCreating] = useState(false);
+  const [workerStatus, setWorkerStatus] = useState(null);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [thumbnailCache, setThumbnailCache] = useState({});
+  const [creating, setCreating] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
-
-  const selected = clusters.find(c => c.id === selectedId) || null;
-  const selectedSummary = selected?.summary || null;
-  const selectedKeyPoints = normalizeSummaryList(selectedSummary?.key_points);
-  const selectedEvidence = normalizeSummaryList(selectedSummary?.evidence);
+  const [drainRequested, setDrainRequested] = useState(false);
+  const [thumbnailCache, setThumbnailCache] = useState({});
 
   const loadClusters = useCallback(async () => {
-    if (!active || !isAuthenticated) {
-      setLoading(false);
-      return;
-    }
     setLoading(true);
+    setError(null);
     try {
-      const result = await listSmartClusters();
-      setClusters(result || []);
-      setError(null);
+      const list = await listSmartClusters();
+      setClusters(list || []);
     } catch (err) {
       if (isAuthRequiredError(err)) {
-        setError(null);
         emitAuthRequired();
         return;
       }
-      console.error('Failed to load smart clusters:', err);
       setError(err?.message || String(err));
     } finally {
       setLoading(false);
     }
-  }, [active, isAuthenticated]);
+  }, []);
 
   const loadStatus = useCallback(async () => {
-    if (!active || !isAuthenticated) return;
     try {
-      const s = await getSmartClusterStatus();
-      const w = await getSmartClusterWorkerStatus();
-      setStatusData({
-        ...s,
-        is_running: w.running && w.pending_count > 0,
-        is_force_running: w.forceRunning && w.pending_count > 0,
-        unverifiable_thresholds: w.unverifiableThresholds || 0,
-      });
+      const [s, ws] = await Promise.allSettled([
+        getSmartClusterStatus(),
+        getSmartClusterWorkerStatus(),
+      ]);
+      if (s.status === 'fulfilled' && s.value) setStatusData(s.value);
+      if (ws.status === 'fulfilled' && ws.value) setWorkerStatus(ws.value);
     } catch (err) {
-      if (isAuthRequiredError(err)) emitAuthRequired();
+      console.warn('loadStatus error:', err);
     }
-  }, [active, isAuthenticated]);
-
-  const loadAssignments = useCallback(async (id) => {
-    if (!active || !isAuthenticated || !id) { setAssignments([]); return; }
-    try {
-      const result = await getSmartClusterAssignments(id, 0, 100);
-      setAssignments(result || []);
-    } catch (err) {
-      if (isAuthRequiredError(err)) {
-        emitAuthRequired();
-        return;
-      }
-      console.error('Failed to load assignments:', err);
-    }
-  }, [active, isAuthenticated]);
-
-  // Polling helper
-  const handlePoll = useCallback(async () => {
-    if (!active || !isAuthenticated) return;
-    await loadStatus();
-    try {
-      const result = await listSmartClusters();
-      setClusters(result || []);
-    } catch (err) {
-      if (isAuthRequiredError(err)) emitAuthRequired();
-    }
-    if (selectedId) {
-      await loadAssignments(selectedId);
-    }
-  }, [active, isAuthenticated, loadStatus, selectedId, loadAssignments]);
+  }, []);
 
   useEffect(() => {
-    if (!active || !isAuthenticated) {
-      setLoading(false);
-      setError(null);
-      setPendingDeleteId(null);
-      setDeleteLoading(false);
-      return undefined;
-    }
+    if (!active) return;
     loadClusters();
     loadStatus();
-    const interval = setInterval(handlePoll, 10000);
-    return () => clearInterval(interval);
-  }, [active, isAuthenticated, loadClusters, loadStatus, handlePoll]);
+  }, [active, loadClusters, loadStatus]);
 
-  // Load assignments when a cluster is selected
+  const selected = useMemo(
+    () => clusters.find((c) => c.id === selectedId) || null,
+    [clusters, selectedId],
+  );
+
+  const selectedSummary = selected?.summary || null;
+  const selectedEvidence = useMemo(() => {
+    if (!selectedSummary?.evidence) return [];
+    if (Array.isArray(selectedSummary.evidence)) return selectedSummary.evidence;
+    if (typeof selectedSummary.evidence === 'object') return Object.values(selectedSummary.evidence);
+    return [];
+  }, [selectedSummary]);
+
+  const selectedKeyPoints = useMemo(() => {
+    if (!selectedSummary?.key_points) return [];
+    if (Array.isArray(selectedSummary.key_points)) return selectedSummary.key_points;
+    if (typeof selectedSummary.key_points === 'object') return Object.values(selectedSummary.key_points);
+    return [];
+  }, [selectedSummary]);
+
+  const loadAssignments = useCallback(async (clusterId) => {
+    if (!clusterId) {
+      setAssignments([]);
+      return;
+    }
+    try {
+      const res = await getSmartClusterAssignments(clusterId, 0, 50);
+      const items = res?.items || res || [];
+      setAssignments(items);
+      const ids = items.map((a) => a.screenshot_id).filter(Boolean);
+      if (ids.length > 0) {
+        fetchThumbnailBatch(ids)
+          .then((batch) => {
+            if (batch) setThumbnailCache((prev) => ({ ...prev, ...batch }));
+          })
+          .catch((err) => console.error('fetchThumbnailBatch failed:', err));
+      }
+    } catch (err) {
+      if (isAuthRequiredError(err)) {
+        emitAuthRequired();
+        return;
+      }
+      console.error('loadAssignments failed:', err);
+    }
+  }, []);
+
   useEffect(() => {
-    loadAssignments(selectedId);
+    if (selectedId) loadAssignments(selectedId);
+    else setAssignments([]);
   }, [selectedId, loadAssignments]);
 
-  // Batch-load thumbnails
-  useEffect(() => {
-    if (!assignments.length) { setThumbnailCache({}); return; }
-    let active = true;
-    const ids = [...new Set(assignments
-      .map(s => s.screenshot_id)
-      .filter(id => typeof id === 'number' && id > 0))];
-    if (!ids.length) return;
-    fetchThumbnailBatch(ids)
-      .then(batch => { if (active && batch) setThumbnailCache(batch); })
-      .catch(err => console.error('thumbnail batch failed:', err));
-    return () => { active = false; };
-  }, [assignments]);
-
-  const handleRename = async (id, label) => {
+  const handleTogglePause = useCallback(async (id) => {
+    const c = clusters.find((item) => item.id === id);
+    if (!c) return;
     try {
-      await updateSmartClusterAnchor(id, label);
+      await toggleSmartClusterEnabled(id, !c.enabled);
       await loadClusters();
+      await loadStatus();
     } catch (err) {
       if (isAuthRequiredError(err)) {
-        setError(null);
         emitAuthRequired();
         return;
       }
-      console.error('Rename failed:', err);
       setError(err?.message || String(err));
+    }
+  }, [clusters, loadClusters, loadStatus]);
+
+  const handleRename = useCallback(async (id, newName) => {
+    try {
+      await renameSmartCluster(id, newName);
+      await loadClusters();
+    } catch (err) {
+      if (isAuthRequiredError(err)) {
+        emitAuthRequired();
+        return;
+      }
       throw err;
     }
-  };
+  }, [loadClusters]);
 
-  const handleDelete = (id) => {
-    if (!deleteLoading) setPendingDeleteId(id);
-  };
+  const handleDelete = useCallback((id) => {
+    setPendingDeleteId(id);
+  }, []);
 
-  const handleConfirmDelete = async () => {
-    if (!pendingDeleteId || deleteLoading) return;
-    const id = pendingDeleteId;
+  const handleConfirmDelete = useCallback(async () => {
+    if (!pendingDeleteId) return;
     setDeleteLoading(true);
     try {
-      await deleteSmartCluster(id);
-      if (selectedId === id) setSelectedId(null);
-      await loadClusters();
+      await deleteSmartCluster(pendingDeleteId);
+      if (selectedId === pendingDeleteId) setSelectedId(null);
       setPendingDeleteId(null);
+      await loadClusters();
+      await loadStatus();
     } catch (err) {
       if (isAuthRequiredError(err)) {
-        setPendingDeleteId(null);
-        setError(null);
         emitAuthRequired();
+        setPendingDeleteId(null);
         return;
       }
-      console.error('Delete failed:', err);
       setError(err?.message || String(err));
     } finally {
       setDeleteLoading(false);
     }
-  };
+  }, [pendingDeleteId, selectedId, loadClusters, loadStatus]);
 
-  const handleCancelDelete = () => {
-    if (!deleteLoading) setPendingDeleteId(null);
-  };
+  const handleCancelDelete = useCallback(() => {
+    if (deleteLoading) return;
+    setPendingDeleteId(null);
+  }, [deleteLoading]);
 
-  const handleTogglePause = async (id) => {
-    const cluster = clusters.find(c => c.id === id);
-    if (!cluster) return;
+  const handleDrainNow = useCallback(async () => {
+    setDrainRequested(true);
     try {
-      await toggleSmartClusterEnabled(id, !cluster.enabled);
-      await loadClusters();
+      await smartClusterDrainNow();
+      await loadStatus();
     } catch (err) {
+      setDrainRequested(false);
       if (isAuthRequiredError(err)) {
-        setError(null);
         emitAuthRequired();
         return;
       }
-      console.error('Toggle failed:', err);
       setError(err?.message || String(err));
     }
-  };
+  }, [loadStatus]);
 
-  const handleDrainNow = async () => {
-    try {
-      await smartClusterDrainNow();
-      setTimeout(loadStatus, 500);
-    } catch (err) {
-      console.error('Drain now failed:', err);
-    }
-  };
-
-  const handleStopDrain = async () => {
+  const handleStopDrain = useCallback(async () => {
+    setDrainRequested(false);
     try {
       await smartClusterStopDrain();
-      setTimeout(loadStatus, 500);
+      await loadStatus();
     } catch (err) {
-      console.error('Stop drain failed:', err);
+      if (isAuthRequiredError(err)) {
+        emitAuthRequired();
+        return;
+      }
+      setError(err?.message || String(err));
     }
-  };
+  }, [loadStatus]);
 
   const handleSaveCalibration = useCallback(async (req) => {
     try {
@@ -568,172 +562,215 @@ export default function SmartClustersView({
   const handleOpenSummaryEvidence = useCallback((item, index = 0) => {
     const evidence = formatEvidenceItem(item, index);
     if (!evidence.payload) return;
+    const sourceDetail = clusterName(selected) || null;
     const payload = {
       ...evidence.payload,
       sourceLabel: t('smartClusters.aiSummary', 'AI 汇总'),
-      sourceDetail: selected?.anchor_text || null,
+      sourceDetail,
       sourceType: 'smart-cluster-summary',
     };
 
     if (onOpenSnapshotPreview) {
       onOpenSnapshotPreview(payload, {
         sourceLabel: t('smartClusters.aiSummary', 'AI 汇总'),
-        sourceDetail: selected?.anchor_text || null,
+        sourceDetail,
         sourceType: 'smart-cluster-summary',
       });
       return;
     }
 
     onSelectScreenshot?.(payload);
-  }, [onOpenSnapshotPreview, onSelectScreenshot, selected?.anchor_text, t]);
+  }, [onOpenSnapshotPreview, onSelectScreenshot, selected, t]);
 
-  // Render the calibration sub-page when creating
+  const activeClusters = useMemo(() => clusters.filter((c) => c.enabled), [clusters]);
+  const pausedClusters = useMemo(() => clusters.filter((c) => !c.enabled), [clusters]);
+
+  const activeCount = activeClusters.length;
+  const pausedCount = pausedClusters.length;
+  const pendingCount = statusData?.pending_count ?? workerStatus?.pending_count ?? 0;
+  const unverifiableCount = statusData?.unverifiable_thresholds ?? workerStatus?.unverifiableThresholds ?? 0;
+
+  const isDraining = drainRequested
+    || Boolean(statusData?.is_force_running)
+    || Boolean(statusData?.is_running)
+    || Boolean(workerStatus?.forceRunning)
+    || Boolean(workerStatus?.running);
+
+  const overview = useMemo(() => {
+    let total = 0;
+    let recent = 0;
+    let latest = null;
+
+    for (const c of clusters) {
+      const count = Number(c.assignment_count) || 0;
+      const rCount = Number(c.recent_assignment_count) || 0;
+      total += count;
+      recent += rCount;
+      if (c.last_assigned_at) {
+        if (!latest || new Date(c.last_assigned_at) > new Date(latest.last_assigned_at)) {
+          latest = c;
+        }
+      }
+    }
+    return { total, recent, latest };
+  }, [clusters]);
+
   if (creating) {
     return (
-      <NlClusterView
-        mode="calibrate"
+      <SmartClusterCreateView
         onSelectScreenshot={onSelectScreenshot}
-        onSaveCalibration={handleSaveCalibration}
-        onCancelCalibration={() => setCreating(false)}
+        onSave={handleSaveCalibration}
+        onCancel={() => setCreating(false)}
       />
     );
   }
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
-      {/* Toolbar */}
-      <div className="shrink-0 border-b border-ide-border bg-ide-panel px-4 py-2.5 space-y-2">
-        <div className="flex items-center justify-between gap-2">
-          <h2 className="text-sm font-semibold text-ide-text flex items-center gap-2">
-            <Sparkles className="w-4 h-4 text-ide-accent" />
-            {t('smartClusters.title', '智能聚类')}
-            <span className="px-1 py-0.5 bg-amber-500/20 text-amber-400 text-[10px] rounded">{t('smartClusters.beta', 'beta')}</span>
-          </h2>
-          <div className="flex items-center gap-1.5">
-            <button
-              onClick={() => setCreating(true)}
-              className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-accent bg-ide-accent/20 text-ide-accent hover:bg-ide-accent/30 disabled:opacity-40 transition-colors"
-            >
-              <Plus className="w-3 h-3" />
-              {t('smartClusters.newCluster', '新建智能聚类')}
-            </button>
-            <button
-              onClick={handleDrainNow}
-              disabled={!statusData?.pending_count || statusData?.is_running}
-              className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-border text-ide-muted hover:text-ide-text hover:bg-ide-hover/30 disabled:opacity-40 transition-colors"
-              title={t('smartClusters.processNowTooltip', '立即处理待处理队列')}
-            >
-              <Zap className="w-3 h-3" />
-              {t('smartClusters.processNow', '立即处理')}
-            </button>
-            {statusData?.is_force_running && (
+      <PageHeader>
+        <button
+          type="button"
+          onClick={() => setCreating(true)}
+          className="flex h-[34px] shrink-0 items-center gap-1.5 rounded-md bg-ide-accent px-3.5 text-xs font-medium text-white transition hover:brightness-110"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          {t('smartClusters.newCluster', '新建智能聚类')}
+        </button>
+
+        <span className="mx-1 h-5 w-px shrink-0 bg-ide-border" aria-hidden="true" />
+
+        <StatusChip icon={<CircleDot className="h-3 w-3" />} tone="accent">
+          {t('smartClusters.chipRunning', '{{count}} 个运行中', {
+            count: statusData?.enabled_cluster_count ?? activeCount,
+          })}
+        </StatusChip>
+        {pausedCount > 0 && (
+          <StatusChip icon={<PauseCircle className="h-3 w-3" />}>
+            {t('smartClusters.chipPaused', '{{count}} 个已暂停', { count: pausedCount })}
+          </StatusChip>
+        )}
+        {pendingCount > 0 && (
+          <StatusChip
+            icon={<Inbox className="h-3 w-3" />}
+            title={t('smartClusters.idleWarning', '后台评分仅在系统空闲时运行')}
+            action={isDraining ? (
               <button
+                type="button"
                 onClick={handleStopDrain}
-                className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-rose-500/30 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 transition-colors"
                 title={t('smartClusters.stopDrainTooltip', '停止处理')}
+                className="flex h-[22px] items-center gap-1 rounded-full bg-ide-hover px-2 text-[11px] text-ide-muted transition-colors hover:text-ide-text"
               >
-                <X className="w-3 h-3 text-rose-400" />
+                <X className="h-2.5 w-2.5" />
                 {t('smartClusters.stopDrain', '停止')}
               </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleDrainNow}
+                title={t('smartClusters.processNowTooltip', '立即处理待归档快照队列')}
+                className="flex h-[22px] items-center gap-1 rounded-full bg-ide-hover px-2 text-[11px] text-ide-muted transition-colors hover:text-ide-text disabled:opacity-40"
+              >
+                <Zap className="h-2.5 w-2.5" />
+                {t('smartClusters.processNow', '立即处理')}
+              </button>
             )}
-            <button
-              onClick={loadClusters}
-              className="flex items-center gap-1 px-3 py-1.5 text-xs rounded border border-ide-border text-ide-muted hover:text-ide-text hover:bg-ide-hover/30 transition-colors"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-              {t('smartClusters.refresh', '刷新')}
-            </button>
-          </div>
-        </div>
+          >
+            {t('smartClusters.chipPending', '{{count}} 张待处理', { count: pendingCount })}
+          </StatusChip>
+        )}
 
-        {/* Status row */}
-        <div className="flex items-center gap-3 text-[11px] text-ide-muted">
-          <span>{t('smartClusters.statusClusters', '聚类:')} <span className="text-ide-text font-mono">{statusData?.enabled_cluster_count ?? 0}/{statusData?.total_cluster_count ?? clusters.length}</span> {t('smartClusters.statusEnabled', '已启用')}</span>
-          <span>·</span>
-          <span>{t('smartClusters.statusPending', '待处理:')} <span className="text-ide-text font-mono">{statusData?.pending_count ?? 0}</span></span>
-          <span className="ml-auto opacity-70">
-            {t('smartClusters.idleWarning', '后台工作线程仅在系统空闲时运行')}
+        <button
+          type="button"
+          onClick={loadClusters}
+          title={t('smartClusters.refresh', '刷新')}
+          aria-label={t('smartClusters.refresh', '刷新')}
+          className="ml-auto grid h-[30px] w-[30px] shrink-0 place-items-center rounded-md text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text"
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+        </button>
+      </PageHeader>
+
+      {unverifiableCount > 0 && (
+        <div className="mx-6 mt-3 flex shrink-0 items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+          <span className="text-[11px] text-amber-400">
+            {t(
+              'smartClusters.unverifiableThresholds',
+              '{{count}} 个智能聚类的匹配阈值无法在当前模型下生效，需重新创建。',
+              { count: unverifiableCount },
+            )}
           </span>
         </div>
+      )}
 
-        {/*
-          A cluster whose threshold came from the retired Python scorer is
-          re-derived from its saved calibration examples. When even that fails —
-          typically because the marked screenshots were deleted — the cluster
-          stops being scored, and saying so is the only way the user can tell a
-          quiet cluster from a broken one.
-        */}
-        {statusData?.unverifiable_thresholds > 0 && (
-          <div className="flex items-center gap-2 px-2.5 py-1.5 bg-amber-500/10 border border-amber-500/30 rounded-lg">
-            <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-            <span className="text-[11px] text-amber-400">
-              {t(
-                'smartClusters.unverifiableThresholds',
-                '{{count}} 个聚类的匹配阈值无法在当前打分模型下重新推导，已暂停打分。请重新校准这些聚类。',
-                { count: statusData.unverifiable_thresholds },
-              )}
-            </span>
-          </div>
-        )}
-
-        {error && (
-          <div className="flex items-center gap-2 px-2.5 py-1.5 bg-red-500/10 border border-red-500/30 rounded-lg">
-            <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
-            <span className="text-xs text-red-400 break-all flex-1">{error}</span>
-            <button onClick={() => setError(null)} className="text-red-400 hover:text-red-300">
-              <X className="w-3 h-3" />
-            </button>
-          </div>
-        )}
-      </div>
+      {error && (
+        <div className="mx-6 mt-3 flex shrink-0 items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0 text-red-400" />
+          <span className="flex-1 break-all text-xs text-red-400">{error}</span>
+          <button onClick={() => setError(null)} className="text-red-400 hover:text-red-300">
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      )}
 
       {/* Content */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* List pane */}
-        <div className="w-80 shrink-0 border-r border-ide-border overflow-y-auto p-2 space-y-2">
+        <div className="w-80 shrink-0 overflow-y-auto border-r border-ide-border custom-scrollbar">
           {loading && !clusters.length ? (
-            <div className="flex items-center justify-center h-32">
-              <Loader2 className="w-5 h-5 animate-spin text-ide-muted" />
+            <div className="flex h-32 items-center justify-center">
+              <Loader2 className="h-5 w-5 animate-spin text-ide-muted" />
             </div>
           ) : !clusters.length ? (
-            <div className="flex flex-col items-center justify-center h-48 text-sm text-ide-muted gap-3 px-6 text-center">
-              <Sparkles className="w-8 h-8 opacity-40" />
-              <div>
-                <p className="text-ide-text font-medium">{t('smartClusters.noClusters', '还没有智能聚类')}</p>
-                <p className="text-[11px] opacity-70 mt-1">
-                  {t('smartClusters.noClustersHint', '新建一个智能聚类，让相关快照自动归档')}
-                </p>
-              </div>
-              <button
-                onClick={() => setCreating(true)}
-                className="flex items-center gap-1 px-3 py-1.5 text-xs rounded bg-ide-accent text-white hover:bg-ide-accent/90 transition-colors"
-              >
-                <Plus className="w-3 h-3" />
-                {t('smartClusters.createFirst', '创建第一个聚类')}
-              </button>
-            </div>
+            <p className="px-6 py-8 text-center text-[11.5px] leading-relaxed text-ide-muted">
+              {t('smartClusters.noClustersHint', '新建智能聚类，程序将自动归档符合描述的快照')}
+            </p>
           ) : (
-            clusters.map((c) => (
-              <ClusterCard
-                key={c.id}
-                variant="smart"
-                id={c.id}
-                title={c.anchor_text}
-                subtitle={null}
-                accentColor={c.dominant_color || '#6b7280'}
-                metaChips={[
-                  { key: 'count', icon: ImageIcon, text: String(c.assignment_count ?? 0) },
-                  { key: 'thresh', icon: Hash, text: `≥${(c.threshold ?? 0).toFixed(2)}` },
-                ]}
-                timeRange={t('smartClusters.updatedAt', '更新于 {{time}}', { time: formatTimestamp(c.updated_at) })}
-                status={c.enabled ? 'active' : 'paused'}
-                selected={selectedId === c.id}
-                onSelect={setSelectedId}
-                onRename={handleRename}
-                onDelete={handleDelete}
-                onTogglePause={handleTogglePause}
-              />
-            ))
+            <>
+              {activeClusters.map((c) => (
+                <ClusterRow
+                  key={c.id}
+                  id={c.id}
+                  title={clusterName(c)}
+                  subtitle={clusterSubtitle(c)}
+                  stamp={formatRelativeStamp(c.last_assigned_at || c.updated_at)}
+                  accentColor={c.dominant_color || '#6b7280'}
+                  count={c.assignment_count ?? 0}
+                  recentCount={c.recent_assignment_count ?? 0}
+                  selected={selectedId === c.id}
+                  onSelect={setSelectedId}
+                  onRename={handleRename}
+                  onDelete={handleDelete}
+                  onTogglePause={handleTogglePause}
+                />
+              ))}
+
+              {pausedClusters.length > 0 && (
+                <>
+                  <div className="px-3 pt-3 pb-1 text-[11px] font-medium text-ide-muted">
+                    {t('smartClusters.pausedGroup', '已暂停 {{count}} 个', { count: pausedClusters.length })}
+                  </div>
+                  {pausedClusters.map((c) => (
+                    <ClusterRow
+                      key={c.id}
+                      id={c.id}
+                      title={clusterName(c)}
+                      subtitle={clusterSubtitle(c)}
+                      stamp={formatRelativeStamp(c.last_assigned_at || c.updated_at)}
+                      accentColor={c.dominant_color || '#6b7280'}
+                      count={c.assignment_count ?? 0}
+                      recentCount={c.recent_assignment_count ?? 0}
+                      paused
+                      selected={selectedId === c.id}
+                      onSelect={setSelectedId}
+                      onRename={handleRename}
+                      onDelete={handleDelete}
+                      onTogglePause={handleTogglePause}
+                    />
+                  ))}
+                </>
+              )}
+            </>
           )}
         </div>
 
@@ -744,24 +781,30 @@ export default function SmartClustersView({
               <div className="p-4 space-y-3">
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1 min-w-0">
-                    <div className="text-sm text-ide-text font-medium flex items-center gap-2">
-                      <div
-                        className="w-2 h-2 rounded-full"
+                    <div className="flex items-center gap-2 text-sm font-medium text-ide-text">
+                      <span
+                        className="h-2 w-2 rounded-[3px]"
                         style={{ backgroundColor: selected.dominant_color || '#6b7280' }}
+                        aria-hidden="true"
                       />
-                      {selected.anchor_text}
-                      <span className={`px-1.5 py-0.5 rounded text-[10px] ${
-                        selected.enabled
-                          ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                          : 'bg-ide-bg text-ide-muted border border-ide-border'
-                      }`}>
-                        {selected.enabled ? t('smartClusters.enabled', '已启用') : t('smartClusters.paused', '已暂停')}
-                      </span>
+                      <span className="truncate">{clusterName(selected)}</span>
+                      {!selected.enabled && (
+                        <span className="rounded border border-ide-border bg-ide-bg px-1.5 py-0.5 text-[10px] text-ide-muted">
+                          {t('smartClusters.paused', '已暂停')}
+                        </span>
+                      )}
                     </div>
-                    <div className="text-[11px] text-ide-muted mt-1 flex items-center gap-3">
-                      <span>{t('smartClusters.threshold', '阈值:')} <span className="font-mono text-ide-text">{(selected.threshold ?? 0).toFixed(2)}</span></span>
-                      <span>·</span>
-                      <span>{t('smartClusters.archived', '已归档:')} <span className="font-mono text-ide-text">{selected.assignment_count ?? 0}</span> {t('smartClusters.snapshotsCount', '张快照')}</span>
+                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ide-muted">
+                      <span>
+                        {t('smartClusters.archived', '已归档')}
+                        <span className="mx-1 font-mono text-ide-text">{selected.assignment_count ?? 0}</span>
+                        {t('smartClusters.snapshotsCount', '张快照')}
+                      </span>
+                      {selected.display_name && selected.display_name !== selected.anchor_text && (
+                        <span className="truncate" title={selected.anchor_text}>
+                          {t('smartClusters.collecting', '聚类规则：{{text}}', { text: selected.anchor_text })}
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -800,7 +843,7 @@ export default function SmartClustersView({
                     {selectedSummary.ocr_summary && (
                       <div className="space-y-2">
                         <div className="text-xs font-semibold text-ide-muted">
-                          {t('smartClusters.ocrSummary', 'OCR 统合概述')}
+                          {t('smartClusters.ocrSummary', '文字内容概述')}
                         </div>
                         <MarkdownText
                           text={selectedSummary.ocr_summary}
@@ -835,7 +878,7 @@ export default function SmartClustersView({
                     {selectedEvidence.length > 0 && (
                       <details className="group">
                         <summary className="cursor-pointer select-none text-xs font-semibold text-ide-muted hover:text-ide-text">
-                          {t('smartClusters.evidence', '证据')}
+                          {t('smartClusters.evidence', '来源')}
                         </summary>
                         <ul className="mt-2 space-y-1 text-[11px] text-ide-muted">
                           {selectedEvidence.map((item, idx) => {
@@ -881,9 +924,9 @@ export default function SmartClustersView({
                 {assignments.length === 0 ? (
                   <div className="flex flex-col items-center justify-center h-40 text-sm text-ide-muted gap-2">
                     <Clock className="w-6 h-6 opacity-40" />
-                    <span>{t('smartClusters.noAssignments', '暂无已分配的快照')}</span>
+                    <span>{t('smartClusters.noAssignments', '暂无归档快照')}</span>
                     <span className="text-[11px] opacity-70">
-                      {t('smartClusters.idleProcessingHint', '后台工作线程会在系统空闲时陆续处理待评分队列')}
+                      {t('smartClusters.idleProcessingHint', '系统空闲时将自动处理待评分快照')}
                     </span>
                   </div>
                 ) : (
@@ -900,35 +943,21 @@ export default function SmartClustersView({
                           category: s.category,
                           created_at: s.created_at,
                           assigned_at: s.assigned_at,
-                          rerank_score: s.rerank_score,
                         }}
                         preloadedSrc={thumbnailCache[s.screenshot_id] || null}
                         onSelect={(payload) => {
-                          const enriched = {
-                            ...payload,
-                            assigned_at: s.assigned_at,
-                            rerank_score: s.rerank_score,
-                          };
-                          onSelectScreenshot?.(enriched);
+                          onSelectScreenshot?.({ ...payload, assigned_at: s.assigned_at });
                         }}
                         onOpenFloatingPreview={onOpenSnapshotPreview
                           ? (payload) => {
-                            const enriched = {
-                              ...payload,
-                              assigned_at: s.assigned_at,
-                              rerank_score: s.rerank_score,
-                            };
-                            onOpenSnapshotPreview(enriched, {
+                            onOpenSnapshotPreview({ ...payload, assigned_at: s.assigned_at }, {
                               thumbnailSrc: thumbnailCache[s.screenshot_id] || null,
                               sourceLabel: t('smartClusters.title', '智能聚类'),
-                              sourceDetail: selected.anchor_text,
+                              sourceDetail: clusterName(selected),
                               sourceType: 'smart-cluster',
                             });
                           }
                           : undefined}
-                        footerText={s.rerank_score !== null && s.rerank_score !== undefined
-                          ? `score ${s.rerank_score.toFixed(2)}`
-                          : null}
                         footerPersistent={false}
                       />
                     ))}
@@ -936,8 +965,78 @@ export default function SmartClustersView({
                 )}
               </div>
             ) : (
-              <div className="flex items-center justify-center h-full text-sm text-ide-muted">
-                {t('smartClusters.selectClusterToView', '选择左侧聚类查看已归档的快照')}
+              <div className="flex h-full items-center justify-center px-8">
+                <div className="w-full max-w-md">
+                  {clusters.length === 0 ? (
+                    <div className="text-center">
+                      <Sparkles className="mx-auto h-9 w-9 text-ide-muted/40" />
+                      <p className="mt-4 text-sm font-medium text-ide-text">
+                        {t('smartClusters.noClusters', '暂无智能聚类')}
+                      </p>
+                      <p className="mx-auto mt-2 max-w-xs text-[12px] leading-relaxed text-ide-muted">
+                        {t('smartClusters.overviewEmptyHint', '输入自然语言描述创建聚类，程序将自动匹配并归档历史与新捕获的快照。')}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => setCreating(true)}
+                        className="mx-auto mt-5 flex h-[34px] items-center gap-1.5 rounded-md bg-ide-accent px-4 text-xs font-medium text-white transition hover:brightness-110"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                        {t('smartClusters.newCluster', '新建智能聚类')}
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex items-baseline gap-2">
+                        <span className="font-mono text-[34px] leading-none tabular-nums text-ide-text">
+                          {overview.total}
+                        </span>
+                        <span className="text-[12px] text-ide-muted">
+                          {t('smartClusters.overviewTotal', '张快照已归档至 {{count}} 个聚类', {
+                            count: clusters.length,
+                          })}
+                        </span>
+                      </div>
+
+                      <dl className="mt-6 space-y-3 border-t border-ide-border pt-4 text-[12px]">
+                        <div className="flex items-baseline justify-between gap-4">
+                          <dt className="text-ide-muted">{t('smartClusters.overviewRecent', '本周新增')}</dt>
+                          <dd className="font-mono tabular-nums text-ide-text">{overview.recent}</dd>
+                        </div>
+                        {overview.latest && (
+                          <div className="flex items-baseline justify-between gap-4">
+                            <dt className="shrink-0 text-ide-muted">
+                              {t('smartClusters.overviewLatest', '最近归档')}
+                            </dt>
+                            <dd className="flex min-w-0 items-center gap-2 text-ide-text">
+                              <span
+                                className="h-2 w-2 shrink-0 rounded-[3px]"
+                                style={{ backgroundColor: overview.latest.dominant_color || '#6b7280' }}
+                                aria-hidden="true"
+                              />
+                              <span className="truncate" title={clusterName(overview.latest)}>
+                                {clusterName(overview.latest)}
+                              </span>
+                              <span className="shrink-0 font-mono text-[11px] text-ide-muted">
+                                {formatRelativeStamp(overview.latest.last_assigned_at)}
+                              </span>
+                            </dd>
+                          </div>
+                        )}
+                        {pendingCount > 0 && (
+                          <div className="flex items-baseline justify-between gap-4">
+                            <dt className="text-ide-muted">{t('smartClusters.overviewPending', '待处理')}</dt>
+                            <dd className="font-mono tabular-nums text-ide-text">{pendingCount}</dd>
+                          </div>
+                        )}
+                      </dl>
+
+                      <p className="mt-6 text-[12px] text-ide-muted">
+                        {t('smartClusters.selectClusterToView', '选择左侧聚类查看归档快照')}
+                      </p>
+                    </>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -949,7 +1048,7 @@ export default function SmartClustersView({
         onCancel={handleCancelDelete}
         onConfirm={handleConfirmDelete}
         title={t('smartClusters.confirmDeleteTitle', '删除智能聚类？')}
-        message={t('smartClusters.confirmDelete', '确定要删除这个智能聚类吗？已分配的快照不会被删除。')}
+        message={t('smartClusters.confirmDelete', '确定删除此智能聚类？已归档的快照不会被删除。')}
         confirmLabel={t('common.confirm', '删除')}
         cancelLabel={t('common.cancel', '取消')}
         confirmVariant="danger"

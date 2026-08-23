@@ -26,7 +26,7 @@ import {
   nlClusterQuery,
   saveClusteringResults,
   toggleSmartClusterEnabled,
-  updateSmartClusterAnchor,
+  renameSmartCluster,
   updateSmartClusterThreshold,
 } from './task_api';
 
@@ -169,7 +169,7 @@ describe('API contract payloads', () => {
     };
 
     await createSmartCluster(createRequest);
-    await updateSmartClusterAnchor(7, 'Receipts');
+    await renameSmartCluster(7, 'Receipts');
     await updateSmartClusterThreshold(7, 0.8);
     await toggleSmartClusterEnabled(7, false);
     await getSmartClusterAssignments(7, 2, 20);
@@ -177,9 +177,9 @@ describe('API contract payloads', () => {
     expect(invoke).toHaveBeenNthCalledWith(1, 'smart_cluster_create', {
       req: createRequest,
     });
-    expect(invoke).toHaveBeenNthCalledWith(2, 'smart_cluster_update_anchor', {
+    expect(invoke).toHaveBeenNthCalledWith(2, 'smart_cluster_rename', {
       id: 7,
-      anchor: 'Receipts',
+      name: 'Receipts',
     });
     expect(invoke).toHaveBeenNthCalledWith(3, 'smart_cluster_update_threshold', {
       id: 7,

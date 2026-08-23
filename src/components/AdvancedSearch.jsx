@@ -7,6 +7,7 @@ import { TimeRangeChip, ProcessChip, CategoryChip } from './search/SearchFilters
 import { SearchStatsBar } from './search/SearchStatsBar';
 import { SearchResultRow } from './search/SearchResultRow';
 import { SearchLanding, SearchNoResults } from './search/SearchLanding';
+import { PageHeader } from './PageHeader';
 import { useAdvancedSearchController } from '../hooks/useAdvancedSearchController';
 import { useHmacMigrationStatus } from '../hooks/useHmacMigrationStatus';
 import { buildSearchTimelineMarkers, searchResultMarkerId } from '../lib/timeline_search';
@@ -206,9 +207,47 @@ export function AdvancedSearch({
         </div>
       )}
 
-      <form
-        className={`shrink-0 bg-ide-panel px-6 pt-4 ${showStats ? '' : 'border-b border-ide-border'}`}
+      <PageHeader
+        as="form"
         onSubmit={handleSubmit}
+        bordered={!showStats}
+        flushBottom
+        secondaryRow={(
+          <>
+            <SearchModeTabs mode={mode} onChange={handleModeChange} />
+
+            <div className="flex flex-1 flex-wrap items-center gap-2">
+              <TimeRangeChip
+                preset={rangePreset}
+                startDate={startDate}
+                endDate={endDate}
+                onChange={setTimeRange}
+              />
+              <ProcessChip
+                processes={processOptions}
+                selected={selectedProcesses}
+                onChange={setSelectedProcesses}
+              />
+              {mode === 'ocr' && (
+                <CategoryChip
+                  categories={categoryOptions}
+                  selected={selectedCategories}
+                  onChange={setSelectedCategories}
+                />
+              )}
+              {hasFilters && (
+                <button
+                  type="button"
+                  onClick={clearFilters}
+                  className="ml-auto flex h-[30px] items-center gap-1.5 rounded-full px-3 text-xs text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  {t('advancedSearch.filters.reset')}
+                </button>
+              )}
+            </div>
+          </>
+        )}
       >
         <div className="flex h-10 w-full max-w-[620px] items-center gap-1 rounded-lg border border-ide-border bg-ide-bg pl-3.5 pr-1.5 transition-colors focus-within:border-ide-accent focus-within:ring-2 focus-within:ring-ide-accent/20">
           <input
@@ -239,42 +278,7 @@ export function AdvancedSearch({
             <Search className="h-4 w-4" />
           </button>
         </div>
-
-        <div className="mt-3.5 flex min-h-[34px] items-center gap-7">
-          <SearchModeTabs mode={mode} onChange={handleModeChange} />
-
-          <div className="flex flex-1 flex-wrap items-center gap-2">
-            <TimeRangeChip
-              preset={rangePreset}
-              startDate={startDate}
-              endDate={endDate}
-              onChange={setTimeRange}
-            />
-            <ProcessChip
-              processes={processOptions}
-              selected={selectedProcesses}
-              onChange={setSelectedProcesses}
-            />
-            {mode === 'ocr' && (
-              <CategoryChip
-                categories={categoryOptions}
-                selected={selectedCategories}
-                onChange={setSelectedCategories}
-              />
-            )}
-            {hasFilters && (
-              <button
-                type="button"
-                onClick={clearFilters}
-                className="ml-auto flex h-[30px] items-center gap-1.5 rounded-full px-3 text-xs text-ide-muted transition-colors hover:bg-ide-hover hover:text-ide-text"
-              >
-                <RefreshCw className="h-3.5 w-3.5" />
-                {t('advancedSearch.filters.reset')}
-              </button>
-            )}
-          </div>
-        </div>
-      </form>
+      </PageHeader>
 
       {showStats && (
         <SearchStatsBar count={results.length} elapsedMs={elapsedMs} hasMore={hasMore} mode={mode} />
