@@ -2059,6 +2059,50 @@ mod tests {
     }
 
     #[test]
+    fn database_replacement_discards_rebuild_waiting_on_publish_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(test_storage(temp.path()));
+        let state = Arc::new(ClipAnnState::default());
+        let lifecycle_token = state.lifecycle_token();
+        let replacement_guard = storage.derived_generation_publish_guard();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let build_storage = storage.clone();
+        let build_state = state.clone();
+        let build_path = temp.path().to_path_buf();
+        let builder = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _publish_guard = build_storage.derived_generation_publish_guard();
+            acquired_tx.send(()).unwrap();
+            let prepared =
+                PreparedGeneration::new(test_reader(&build_path, 15, &["old"], &[vec![1.0, 0.0]]));
+            let flat_path = build_path
+                .join("derived-indexes")
+                .join(&prepared.reader().manifest.flat_file_name);
+            let ann_path = build_path
+                .join("derived-indexes")
+                .join(&prepared.reader().manifest.ann_file_name);
+            let published = build_state
+                .publish_from_lifecycle(lifecycle_token, &build_storage, prepared)
+                .unwrap();
+            (published, flat_path, ann_path)
+        });
+
+        started_rx.recv().unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        state.disarm();
+        drop(replacement_guard);
+
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (published, flat_path, ann_path) = builder.join().unwrap();
+        assert!(!published);
+        assert!(!state.has_generation());
+        assert!(!flat_path.exists());
+        assert!(!ann_path.exists());
+        assert!(state.begin_arm().is_some());
+    }
+
+    #[test]
     fn reader_switch_waits_for_old_tail_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Arc::new(test_storage(temp.path()));

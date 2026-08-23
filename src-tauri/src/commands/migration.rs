@@ -582,7 +582,15 @@ pub async fn storage_import_backup(
             .quiesce(std::time::Duration::from_secs(5))
             .await;
 
+        // Keep ANN sidecar publication and database replacement in one
+        // lifecycle boundary. A builder may have captured the old database
+        // generation before this import; disarming here invalidates its
+        // publication token before the restored files are installed.
+        let _derived_publish_guard = state.derived_generation_publish_guard();
         let _database_maintenance = state.database_maintenance("backup_import");
+        app_handle
+            .state::<Arc<crate::clip_ann::ClipAnnState>>()
+            .disarm();
         let result = (|| {
             state.shutdown_under_maintenance()?;
 
@@ -721,6 +729,13 @@ pub async fn storage_import_backup(
                 "Migration: Failed to re-initialize storage after import: {}",
                 e
             );
+        }
+        if init_result.is_ok() {
+            // The restore intentionally does not carry derived-index sidecars
+            // in the backup. Schedule a fresh arm while the replacement
+            // boundary is still held; its worker will remain parked on the
+            // publication guard until the restored database is fully visible.
+            crate::clip_ann::spawn_startup_arm(app_handle.clone());
         }
 
         (result, init_result)
