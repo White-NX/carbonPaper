@@ -302,7 +302,8 @@ fn unavailable(reason: &str) -> RustQueryOutcome {
 /// Build the `nl_cluster_query` success envelope. The field names remain
 /// compatible with persisted callers; `backend` is always `rust` in the
 /// current production path. `rerank_variant` is non-null exactly when
-/// reranking ran, which is what `NlClusterView` reads to label the result.
+/// reranking ran, which records which scorer produced the scores the caller
+/// stores as a cluster's calibration.
 fn success_response(results: Vec<serde_json::Value>, reranked: bool) -> serde_json::Value {
     serde_json::json!({
         "status": "success",
@@ -583,9 +584,11 @@ mod tests {
 
     #[test]
     fn a_reranked_envelope_names_the_variant_that_produced_the_scores() {
-        // `NlClusterView` reads `reranked` to decide whether to show scores at
-        // all, and `rerank_variant` to label them. A reranked response that
-        // left the variant null would render as an un-reranked one.
+        // `reranked` says whether the scores in the payload came from the
+        // cross-encoder, and `rerank_variant` names the model that produced
+        // them — the provenance stamped onto a cluster's threshold at
+        // creation. A reranked response that left the variant null would be
+        // stored as one with no provenance at all.
         let response = success_response(vec![serde_json::json!({"screenshot_id": 7})], true);
         assert_eq!(response["reranked"], true);
         assert_eq!(response["rerank_variant"], crate::rerank::RERANK_VARIANT);

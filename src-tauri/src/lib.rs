@@ -1271,7 +1271,7 @@ pub fn run() {
             commands::smart_cluster::smart_cluster_get_examples,
             commands::smart_cluster::smart_cluster_create,
             commands::smart_cluster::smart_cluster_delete,
-            commands::smart_cluster::smart_cluster_update_anchor,
+            commands::smart_cluster::smart_cluster_rename,
             commands::smart_cluster::smart_cluster_update_threshold,
             commands::smart_cluster::smart_cluster_toggle_enabled,
             commands::smart_cluster::smart_cluster_assignments,

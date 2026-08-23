@@ -129,7 +129,7 @@ export function useDelayedClusteringSetupRunner({
           title: '任务聚类完成',
           message: result?.degraded
             ? `未发现可归类的任务。本次使用降级分批模式：样本 ${result.sample_size ?? 0} 张，分批归属 ${result.assigned_count ?? 0} 张。`
-            : '未发现可归类的任务。快照数量可能不足，系统将在积累更多数据后自动尝试。',
+            : '未发现可归类的任务。快照数量可能不足，程序将在积累更多数据后自动尝试。',
           timestamp: Date.now(),
         });
       } catch (err) {

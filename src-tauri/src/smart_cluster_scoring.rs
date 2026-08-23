@@ -1133,7 +1133,8 @@ async fn rederive_threshold(
     Ok(Some(threshold))
 }
 
-/// The calibration threshold formula, ported from `NlClusterView.jsx`.
+/// The calibration threshold formula, ported from
+/// `SmartClusterCreateView.jsx`.
 ///
 /// ```text
 /// base = min(positive) * 0.85
