@@ -6,7 +6,7 @@ use crate::credential_manager::{
 use rusqlite::{params, Connection};
 use std::sync::atomic::Ordering;
 
-use super::{connection, StorageState};
+use super::{connection, database_snapshot, StorageState};
 
 impl StorageState {
     const MCP_PRIVACY_ACKNOWLEDGED_KEY: &'static str = "mcp_privacy_acknowledged";
@@ -44,6 +44,8 @@ impl StorageState {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
+        database_snapshot::ensure_database_creation_is_safe(&data_dir)?;
+
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data directory: {}", e))?;
         std::fs::create_dir_all(&screenshot_dir)
@@ -78,6 +80,7 @@ impl StorageState {
         self.initialize_database_mode_metadata(&conn, &connection_status.journal_mode)?;
         self.cleanup_derived_index_sidecars_at_startup(&conn, &data_dir)?;
         Self::set_auto_vacuum_incremental(&conn)?;
+        database_snapshot::mark_storage_initialized(&data_dir)?;
         let tables_dur = t3.elapsed();
 
         {

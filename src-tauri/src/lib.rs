@@ -824,6 +824,23 @@ pub fn run() {
 
                 build_tray(app)?;
 
+                match storage::database_snapshot::recover_interrupted_restore(&data_dir) {
+                    Ok(true) => tracing::warn!(
+                        "Recovered an interrupted backup restore before storage startup"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!("Failed to recover interrupted backup restore: {error}");
+                        error_window::show_error_window(
+                            app.handle(),
+                            &format!(
+                                "CarbonPaper could not safely recover an interrupted backup restore. Your existing data has been left untouched.\n\n{error}"
+                            ),
+                        );
+                        return Ok(());
+                    }
+                }
+
                 if updater::is_update_smoke_test_enabled() {
                     if let Some(window) = app.get_webview_window("main") {
                         if let Err(e) = window.destroy() {

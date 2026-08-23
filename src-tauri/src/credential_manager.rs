@@ -49,7 +49,7 @@ pub enum CredentialError {
 /// Default authenticated-session timeout in seconds.
 const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 15 * 60; // 15 分钟
 const BACKGROUND_PROCESSING_ENABLED_KEY: &str = "background_processing_enabled";
-const MASTER_KEY_FILE_NAME: &str = "credential_master_key.bin";
+pub(crate) const MASTER_KEY_FILE_NAME: &str = "credential_master_key.bin";
 const MASTER_KEY_LEN: usize = 32;
 const MASTER_KEY_FILE_MAGIC: &[u8; 5] = b"CPMK3"; // 版本升级
 const CNG_KEY_NAME: &str = "CarbonPaperMasterKeyV3";
@@ -79,14 +79,13 @@ pub struct CredentialManagerState {
     background_lease_active: Mutex<bool>,
 }
 
-/// In-memory and persisted state changed by backup credential import.
+/// In-memory state changed by backup credential import.
 ///
-/// Backup restore captures this before installing a replacement master key so
-/// any later file, database-initialization, or rollback failure can put the
-/// authenticated session and credential file back exactly as they were.
+/// The credential file itself is owned by the durable restore transaction. This
+/// snapshot only restores process-local session and cache state after an
+/// in-process rollback.
 #[derive(Debug)]
 pub(crate) struct CredentialImportSnapshot {
-    master_key_file: Option<Vec<u8>>,
     cached_db_key: Option<Vec<u8>>,
     cached_public_key: Option<Vec<u8>>,
     cached_master_key: Option<Vec<u8>>,
@@ -356,21 +355,8 @@ impl CredentialManagerState {
         self.file_path(MASTER_KEY_FILE_NAME)
     }
 
-    pub(crate) fn snapshot_import_state(&self) -> Result<CredentialImportSnapshot, String> {
-        let master_key_path = self.master_key_file_path();
-        let master_key_file = if master_key_path.exists() {
-            Some(std::fs::read(&master_key_path).map_err(|error| {
-                format!(
-                    "Failed to snapshot credential file {}: {error}",
-                    master_key_path.display()
-                )
-            })?)
-        } else {
-            None
-        };
-
-        Ok(CredentialImportSnapshot {
-            master_key_file,
+    pub(crate) fn snapshot_import_state(&self) -> CredentialImportSnapshot {
+        CredentialImportSnapshot {
             cached_db_key: self
                 .cached_db_key
                 .lock()
@@ -394,41 +380,10 @@ impl CredentialManagerState {
                 .background_lease_active
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()),
-        })
+        }
     }
 
-    pub(crate) fn restore_import_state(
-        &self,
-        snapshot: CredentialImportSnapshot,
-    ) -> Result<(), String> {
-        let master_key_path = self.master_key_file_path();
-        let file_result = match snapshot.master_key_file {
-            Some(contents) => {
-                if let Some(parent) = master_key_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| {
-                        format!(
-                            "Failed to recreate credential directory {}: {error}",
-                            parent.display()
-                        )
-                    })?;
-                }
-                std::fs::write(&master_key_path, contents).map_err(|error| {
-                    format!(
-                        "Failed to restore credential file {}: {error}",
-                        master_key_path.display()
-                    )
-                })
-            }
-            None => match std::fs::remove_file(&master_key_path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(format!(
-                    "Failed to remove replacement credential file {}: {error}",
-                    master_key_path.display()
-                )),
-            },
-        };
-
+    pub(crate) fn restore_import_state(&self, snapshot: CredentialImportSnapshot) {
         *self
             .cached_db_key
             .lock()
@@ -449,11 +404,12 @@ impl CredentialManagerState {
             .background_lease_active
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = snapshot.background_lease_active;
-
-        file_result
     }
 
-    pub fn import_master_key(&self, master_key: &[u8]) -> Result<(), CredentialError> {
+    pub(crate) fn prepare_import_master_key_file(
+        &self,
+        master_key: &[u8],
+    ) -> Result<Vec<u8>, CredentialError> {
         if master_key.len() != MASTER_KEY_LEN {
             return Err(CredentialError::CryptoError(format!(
                 "Invalid master key length: {} (expected {})",
@@ -463,13 +419,20 @@ impl CredentialManagerState {
         }
 
         let ciphertext = encrypt_master_key_with_cng(master_key)?;
-        let file_data = encode_master_key_file(&ciphertext);
-        let key_file = self.master_key_file_path();
+        Ok(encode_master_key_file(&ciphertext))
+    }
 
-        std::fs::write(key_file, file_data).map_err(|e| {
-            CredentialError::SystemError(format!("Failed to write master key file: {}", e))
-        })?;
-
+    pub(crate) fn activate_imported_master_key(
+        &self,
+        master_key: &[u8],
+    ) -> Result<(), CredentialError> {
+        if master_key.len() != MASTER_KEY_LEN {
+            return Err(CredentialError::CryptoError(format!(
+                "Invalid master key length: {} (expected {})",
+                master_key.len(),
+                MASTER_KEY_LEN
+            )));
+        }
         // Replacing credentials invalidates both the UI proof and any
         // process-scoped unattended lease. The imported key remains cached so
         // storage can reopen, but protected reads require a fresh unlock.
@@ -1584,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn import_snapshot_restores_credential_file_and_cached_state() {
+    fn import_snapshot_restores_cached_state_without_touching_credential_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state = CredentialManagerState::new(temp.path().to_path_buf());
         std::fs::write(state.master_key_file_path(), b"old-credential").unwrap();
@@ -1594,7 +1557,7 @@ mod tests {
         state.update_auth_time();
         *state.background_lease_active.lock().unwrap() = true;
 
-        let snapshot = state.snapshot_import_state().unwrap();
+        let snapshot = state.snapshot_import_state();
         std::fs::write(state.master_key_file_path(), b"replacement").unwrap();
         *state.cached_db_key.lock().unwrap() = None;
         *state.cached_public_key.lock().unwrap() = None;
@@ -1602,11 +1565,11 @@ mod tests {
         *state.last_auth_time.lock().unwrap() = None;
         *state.background_lease_active.lock().unwrap() = false;
 
-        state.restore_import_state(snapshot).unwrap();
+        state.restore_import_state(snapshot);
 
         assert_eq!(
             std::fs::read(state.master_key_file_path()).unwrap(),
-            b"old-credential"
+            b"replacement"
         );
         assert_eq!(*state.cached_db_key.lock().unwrap(), Some(vec![1, 2, 3]));
         assert_eq!(

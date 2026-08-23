@@ -6,6 +6,7 @@
 //! by backup restore and data-directory migration.
 
 use super::connection;
+use crate::credential_manager::MASTER_KEY_FILE_NAME;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,7 +37,7 @@ pub(crate) const DATABASE_RUNTIME_FILE_NAMES: [&str; 4] = [
 ];
 
 const BACKUP_FORMAT_VERSION: u32 = 2;
-const RESTORE_ENTRY_NAMES: [&str; 7] = [
+const RESTORE_ENTRY_NAMES: [&str; 8] = [
     DATABASE_FILE_NAME,
     DATABASE_WAL_FILE_NAME,
     DATABASE_SHM_FILE_NAME,
@@ -44,7 +45,22 @@ const RESTORE_ENTRY_NAMES: [&str; 7] = [
     "chroma_db",
     "screenshots",
     "derived-indexes",
+    MASTER_KEY_FILE_NAME,
 ];
+
+const RESTORE_TRANSACTION_FORMAT_VERSION: u32 = 1;
+const RESTORE_PREPARING_PREFIX: &str = ".carbonpaper-restore-preparing-";
+const RESTORE_TRANSACTION_PREFIX: &str = ".carbonpaper-restore-transaction-";
+const RESTORE_COMMITTED_CLEANUP_PREFIX: &str = ".carbonpaper-restore-cleanup-committed-";
+const RESTORE_ROLLBACK_CLEANUP_PREFIX: &str = ".carbonpaper-restore-cleanup-rolled-back-";
+const LEGACY_RESTORE_ROLLBACK_PREFIX: &str = ".carbonpaper-restore-rollback-";
+const LEGACY_RESTORE_RECOVERY_PREFIX: &str = ".carbonpaper-restore-legacy-recovery-";
+const LEGACY_RESTORE_CLEANUP_PREFIX: &str = ".carbonpaper-restore-cleanup-legacy-";
+const RESTORE_TRANSACTION_MANIFEST_NAME: &str = "transaction.json";
+const LEGACY_RECOVERY_MANIFEST_NAME: &str = "legacy-recovery.json";
+const RESTORE_INSTALLING_MARKER_NAME: &str = "installing-new";
+const RESTORE_COMMITTED_MARKER_NAME: &str = "committed";
+pub(crate) const STORAGE_INITIALIZED_MARKER_NAME: &str = ".carbonpaper-storage-initialized";
 
 static NEXT_TEMP_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -157,19 +173,6 @@ impl TemporaryDirectory {
     pub(crate) fn release(mut self) -> PathBuf {
         self.cleanup = false;
         self.path.clone()
-    }
-
-    pub(crate) fn remove(mut self) -> Result<(), String> {
-        self.cleanup = false;
-        if self.path.exists() {
-            std::fs::remove_dir_all(&self.path).map_err(|error| {
-                format!(
-                    "Failed to remove temporary directory {}: {error}",
-                    self.path.display()
-                )
-            })?;
-        }
-        Ok(())
     }
 }
 
@@ -867,11 +870,34 @@ pub(crate) fn validate_database_snapshot(
 #[derive(Debug)]
 pub(crate) struct RestoreFileTransaction {
     data_directory: PathBuf,
-    staged_directory: PathBuf,
-    rollback_directory: TemporaryDirectory,
-    moved_old: Vec<&'static str>,
-    installed_new: Vec<&'static str>,
+    transaction_directory: PathBuf,
+    manifest: RestoreTransactionManifest,
+    committed: bool,
     complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreTransactionManifest {
+    format_version: u32,
+    old_entries: BTreeSet<String>,
+    new_entries: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRecoveryManifest {
+    old_entries: BTreeSet<String>,
+    partial_new_entries: BTreeSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct RestoreDirectoryScan {
+    preparing: Vec<PathBuf>,
+    active: Vec<PathBuf>,
+    cleanup: Vec<PathBuf>,
+    legacy_rollback: Vec<PathBuf>,
+    legacy_recovery: Vec<PathBuf>,
 }
 
 /// Atomic target-directory swap used by data-directory migration.
@@ -998,9 +1024,731 @@ impl Drop for DirectorySwapTransaction {
     }
 }
 
+impl RestoreTransactionManifest {
+    fn validate(&self) -> Result<(), String> {
+        if self.format_version != RESTORE_TRANSACTION_FORMAT_VERSION {
+            return Err(format!(
+                "Unsupported restore transaction format: {}",
+                self.format_version
+            ));
+        }
+        for name in self.old_entries.iter().chain(self.new_entries.iter()) {
+            if !RESTORE_ENTRY_NAMES.contains(&name.as_str()) {
+                return Err(format!(
+                    "Restore transaction contains unsupported entry: {name}"
+                ));
+            }
+        }
+        for required in [DATABASE_FILE_NAME, MASTER_KEY_FILE_NAME] {
+            if !self.new_entries.contains(required) {
+                return Err(format!(
+                    "Restore transaction is missing required staged entry: {required}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn old_contains(&self, name: &str) -> bool {
+        self.old_entries.contains(name)
+    }
+
+    fn new_contains(&self, name: &str) -> bool {
+        self.new_entries.contains(name)
+    }
+}
+
+fn checked_path_exists(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "Restore transaction path must not be a symbolic link: {}",
+            path.display()
+        )),
+        Ok(metadata) if metadata.is_file() || metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!(
+            "Restore transaction path has an unsupported type: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("Failed to inspect {}: {error}", path.display())),
+    }
+}
+
+fn write_durable_new_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("Failed to create {}: {error}", path.display()))?;
+    file.write_all(contents)
+        .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("Failed to sync {}: {error}", path.display()))
+}
+
+pub(crate) fn write_staged_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    write_durable_new_file(path, contents)
+}
+
+fn create_durable_marker(directory: &Path, name: &str) -> Result<(), String> {
+    let path = directory.join(name);
+    if checked_path_exists(&path)? {
+        return if std::fs::read(&path).ok().as_deref() == Some(b"1\n") {
+            Ok(())
+        } else {
+            Err(format!(
+                "Restore transaction marker is incomplete: {}",
+                path.display()
+            ))
+        };
+    }
+    write_durable_new_file(&path, b"1\n")
+}
+
+fn durable_marker_exists(directory: &Path, name: &str) -> Result<bool, String> {
+    let path = directory.join(name);
+    if !checked_path_exists(&path)? {
+        return Ok(false);
+    }
+    if !path.is_file() {
+        return Err(format!(
+            "Restore transaction marker is not a file: {}",
+            path.display()
+        ));
+    }
+    Ok(std::fs::read(&path)
+        .map_err(|error| format!("Failed to read marker {}: {error}", path.display()))?
+        == b"1\n")
+}
+
+fn marker_path_exists(directory: &Path, name: &str) -> Result<bool, String> {
+    checked_path_exists(&directory.join(name))
+}
+
+#[cfg(windows)]
+fn rename_durable(source: &Path, target: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let source_wide: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let target_wide: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both path buffers are live, NUL-terminated UTF-16 strings for
+    // the duration of the synchronous move call.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source_wide.as_ptr()),
+            PCWSTR(target_wide.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| {
+        format!(
+            "Failed to move {} to {}: {error}",
+            source.display(),
+            target.display()
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn rename_durable(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::rename(source, target).map_err(|error| {
+        format!(
+            "Failed to move {} to {}: {error}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    for parent in [source.parent(), target.parent()].into_iter().flatten() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("Failed to sync directory {}: {error}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn sync_restore_tree(root: &Path) -> Result<(), String> {
+    if !checked_path_exists(root)? {
+        return Ok(());
+    }
+    for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter() {
+        let entry = entry.map_err(|error| {
+            format!(
+                "Failed to scan staged restore tree {}: {error}",
+                root.display()
+            )
+        })?;
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "Symbolic links are not allowed in restore transactions: {}",
+                entry.path().display()
+            ));
+        }
+        if entry.file_type().is_file() {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(entry.path())
+                .and_then(|file| file.sync_all())
+                .map_err(|error| {
+                    format!(
+                        "Failed to sync staged file {}: {error}",
+                        entry.path().display()
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
+fn path_with_reclassified_prefix(
+    path: &Path,
+    source_prefix: &str,
+    target_prefix: &str,
+) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Restore transaction has no parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("Invalid restore transaction name: {}", path.display()))?;
+    let suffix = name.strip_prefix(source_prefix).ok_or_else(|| {
+        format!(
+            "Restore transaction {} does not use expected prefix {source_prefix}",
+            path.display()
+        )
+    })?;
+    Ok(parent.join(format!("{target_prefix}{suffix}")))
+}
+
+fn read_restore_manifest(directory: &Path) -> Result<RestoreTransactionManifest, String> {
+    let path = directory.join(RESTORE_TRANSACTION_MANIFEST_NAME);
+    let bytes = std::fs::read(&path).map_err(|error| {
+        format!(
+            "Failed to read restore transaction {}: {error}",
+            path.display()
+        )
+    })?;
+    let manifest: RestoreTransactionManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Invalid restore transaction {}: {error}", path.display()))?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+fn scan_restore_directories(parent: &Path) -> Result<RestoreDirectoryScan, String> {
+    let mut scan = RestoreDirectoryScan::default();
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(scan),
+        Err(error) => {
+            return Err(format!(
+                "Failed to scan restore transaction directory {}: {error}",
+                parent.display()
+            ))
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "Failed to inspect restore transaction under {}: {error}",
+                parent.display()
+            )
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let target = if name.starts_with(RESTORE_PREPARING_PREFIX) {
+            Some(&mut scan.preparing)
+        } else if name.starts_with(RESTORE_TRANSACTION_PREFIX) {
+            Some(&mut scan.active)
+        } else if name.starts_with(RESTORE_COMMITTED_CLEANUP_PREFIX)
+            || name.starts_with(RESTORE_ROLLBACK_CLEANUP_PREFIX)
+            || name.starts_with(LEGACY_RESTORE_CLEANUP_PREFIX)
+        {
+            Some(&mut scan.cleanup)
+        } else if name.starts_with(LEGACY_RESTORE_ROLLBACK_PREFIX) {
+            Some(&mut scan.legacy_rollback)
+        } else if name.starts_with(LEGACY_RESTORE_RECOVERY_PREFIX) {
+            Some(&mut scan.legacy_recovery)
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            continue;
+        };
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "Failed to inspect restore path {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Err(format!(
+                "Restore transaction path is not a regular directory: {}",
+                entry.path().display()
+            ));
+        }
+        target.push(entry.path());
+    }
+    scan.preparing.sort();
+    scan.active.sort();
+    scan.cleanup.sort();
+    scan.legacy_rollback.sort();
+    scan.legacy_recovery.sort();
+    Ok(scan)
+}
+
+fn finish_transaction_directory(
+    transaction_directory: &Path,
+    cleanup_prefix: &str,
+) -> Result<(), String> {
+    let cleanup = path_with_reclassified_prefix(
+        transaction_directory,
+        RESTORE_TRANSACTION_PREFIX,
+        cleanup_prefix,
+    )?;
+    if checked_path_exists(transaction_directory)? {
+        if checked_path_exists(&cleanup)? {
+            return Err(format!(
+                "Restore cleanup target already exists: {}",
+                cleanup.display()
+            ));
+        }
+        rename_durable(transaction_directory, &cleanup)?;
+    }
+    if let Err(error) = remove_path(&cleanup) {
+        tracing::warn!("Restore transaction cleanup deferred: {error}");
+    }
+    Ok(())
+}
+
+fn live_restore_is_committable(
+    data_directory: &Path,
+    manifest: &RestoreTransactionManifest,
+) -> Result<bool, String> {
+    for name in RESTORE_ENTRY_NAMES {
+        let exists = checked_path_exists(&data_directory.join(name))?;
+        if manifest.new_contains(name) && !exists {
+            return Ok(false);
+        }
+        // Opening SQLite can create runtime sidecars even when a clean WAL
+        // snapshot did not need to archive them. They are part of the restored
+        // database generation, not evidence that an old entry survived.
+        let optional_runtime_entry = matches!(
+            name,
+            DATABASE_WAL_FILE_NAME | DATABASE_SHM_FILE_NAME | DATABASE_JOURNAL_FILE_NAME
+        );
+        if !manifest.new_contains(name) && exists && !optional_runtime_entry {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn rollback_transaction_directory(
+    data_directory: &Path,
+    transaction_directory: &Path,
+    manifest: &RestoreTransactionManifest,
+) -> Result<(), String> {
+    manifest.validate()?;
+    let old_directory = transaction_directory.join("old");
+    let install_started =
+        marker_path_exists(transaction_directory, RESTORE_INSTALLING_MARKER_NAME)?
+            || marker_path_exists(transaction_directory, RESTORE_COMMITTED_MARKER_NAME)?;
+
+    for name in RESTORE_ENTRY_NAMES.iter().rev().copied() {
+        let old = old_directory.join(name);
+        let current = data_directory.join(name);
+        let old_exists = checked_path_exists(&old)?;
+        let current_exists = checked_path_exists(&current)?;
+        if old_exists {
+            if current_exists {
+                remove_path(&current)?;
+            }
+            rename_durable(&old, &current)?;
+        } else if manifest.old_contains(name) {
+            if !current_exists {
+                return Err(format!(
+                    "Cannot recover previous restore entry; both copies are missing: {}",
+                    current.display()
+                ));
+            }
+        } else if install_started && current_exists {
+            remove_path(&current)?;
+        } else if !install_started && current_exists {
+            return Err(format!(
+                "Unexpected entry appeared while preparing restore rollback: {}",
+                current.display()
+            ));
+        }
+    }
+
+    for name in RESTORE_ENTRY_NAMES {
+        let exists = checked_path_exists(&data_directory.join(name))?;
+        if exists != manifest.old_contains(name) {
+            return Err(format!(
+                "Restore rollback verification failed for {}",
+                data_directory.join(name).display()
+            ));
+        }
+    }
+    finish_transaction_directory(transaction_directory, RESTORE_ROLLBACK_CLEANUP_PREFIX)
+}
+
+fn read_legacy_recovery_manifest(directory: &Path) -> Result<LegacyRecoveryManifest, String> {
+    let path = directory.join(LEGACY_RECOVERY_MANIFEST_NAME);
+    let bytes = std::fs::read(&path).map_err(|error| {
+        format!(
+            "Failed to read legacy restore recovery state {}: {error}",
+            path.display()
+        )
+    })?;
+    let manifest: LegacyRecoveryManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "Invalid legacy restore recovery state {}: {error}",
+            path.display()
+        )
+    })?;
+    for name in manifest
+        .old_entries
+        .iter()
+        .chain(manifest.partial_new_entries.iter())
+    {
+        if name == MASTER_KEY_FILE_NAME || !RESTORE_ENTRY_NAMES.contains(&name.as_str()) {
+            return Err(format!(
+                "Legacy restore recovery contains unsupported entry: {name}"
+            ));
+        }
+    }
+    if !manifest.old_entries.contains(DATABASE_FILE_NAME) {
+        return Err("Legacy restore recovery does not contain screenshots.db".to_string());
+    }
+    Ok(manifest)
+}
+
+fn prepare_legacy_recovery(
+    data_directory: &Path,
+    rollback_directory: &Path,
+) -> Result<PathBuf, String> {
+    let mut old_entries = BTreeSet::new();
+    let mut partial_new_entries = BTreeSet::new();
+    for name in RESTORE_ENTRY_NAMES {
+        if name == MASTER_KEY_FILE_NAME {
+            continue;
+        }
+        if checked_path_exists(&rollback_directory.join(name))? {
+            old_entries.insert(name.to_string());
+        }
+        if checked_path_exists(&data_directory.join(name))? {
+            partial_new_entries.insert(name.to_string());
+        }
+    }
+    let manifest = LegacyRecoveryManifest {
+        old_entries,
+        partial_new_entries,
+    };
+    if !manifest.old_entries.contains(DATABASE_FILE_NAME) {
+        return Err(format!(
+            "Legacy restore rollback does not contain screenshots.db: {}",
+            rollback_directory.display()
+        ));
+    }
+    let manifest_path = rollback_directory.join(LEGACY_RECOVERY_MANIFEST_NAME);
+    if checked_path_exists(&manifest_path)? {
+        read_legacy_recovery_manifest(rollback_directory)?;
+    } else {
+        let bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| format!("Failed to encode legacy recovery state: {error}"))?;
+        write_durable_new_file(&manifest_path, &bytes)?;
+    }
+
+    let recovery_directory = path_with_reclassified_prefix(
+        rollback_directory,
+        LEGACY_RESTORE_ROLLBACK_PREFIX,
+        LEGACY_RESTORE_RECOVERY_PREFIX,
+    )?;
+    rename_durable(rollback_directory, &recovery_directory)?;
+    Ok(recovery_directory)
+}
+
+fn resume_legacy_restore_recovery(
+    data_directory: &Path,
+    recovery_directory: &Path,
+) -> Result<(), String> {
+    let manifest = read_legacy_recovery_manifest(recovery_directory)?;
+    for name in RESTORE_ENTRY_NAMES.iter().rev().copied() {
+        if name == MASTER_KEY_FILE_NAME {
+            continue;
+        }
+        let old = recovery_directory.join(name);
+        let current = data_directory.join(name);
+        let old_exists = checked_path_exists(&old)?;
+        let current_exists = checked_path_exists(&current)?;
+        if manifest.old_entries.contains(name) {
+            if old_exists {
+                if current_exists {
+                    remove_path(&current)?;
+                }
+                rename_durable(&old, &current)?;
+            } else if !current_exists {
+                return Err(format!(
+                    "Legacy restore recovery lost both copies of {}",
+                    current.display()
+                ));
+            }
+        } else if manifest.partial_new_entries.contains(name) && current_exists {
+            remove_path(&current)?;
+        }
+    }
+    for name in RESTORE_ENTRY_NAMES {
+        if name == MASTER_KEY_FILE_NAME {
+            continue;
+        }
+        if checked_path_exists(&data_directory.join(name))? != manifest.old_entries.contains(name) {
+            return Err(format!(
+                "Legacy restore recovery verification failed for {}",
+                data_directory.join(name).display()
+            ));
+        }
+    }
+    let cleanup = path_with_reclassified_prefix(
+        recovery_directory,
+        LEGACY_RESTORE_RECOVERY_PREFIX,
+        LEGACY_RESTORE_CLEANUP_PREFIX,
+    )?;
+    if checked_path_exists(recovery_directory)? {
+        rename_durable(recovery_directory, &cleanup)?;
+    }
+    if let Err(error) = remove_path(&cleanup) {
+        tracing::warn!("Legacy restore cleanup deferred: {error}");
+    }
+    Ok(())
+}
+
+pub(crate) fn recover_interrupted_restore(data_directory: &Path) -> Result<bool, String> {
+    let parent = data_directory.parent().unwrap_or(data_directory);
+    let scan = scan_restore_directories(parent)?;
+    let stateful_count =
+        scan.active.len() + scan.legacy_rollback.len() + scan.legacy_recovery.len();
+    if stateful_count > 1 {
+        return Err(format!(
+            "Multiple incomplete restore transactions were found beside {}",
+            data_directory.display()
+        ));
+    }
+
+    let mut recovered = false;
+    for directory in scan.preparing.iter().chain(scan.cleanup.iter()) {
+        if let Err(error) = remove_path(directory) {
+            // These directories are no longer part of an active transaction.
+            // A failed best-effort cleanup must not prevent the database from
+            // opening; the next startup can retry it.
+            tracing::warn!(
+                "Failed to remove stale restore transaction directory {}: {error}",
+                directory.display()
+            );
+        } else {
+            recovered = true;
+        }
+    }
+
+    if let Some(transaction_directory) = scan.active.first() {
+        let manifest = read_restore_manifest(transaction_directory)?;
+        if durable_marker_exists(transaction_directory, RESTORE_COMMITTED_MARKER_NAME)? {
+            // A valid commit marker is the irreversible transaction boundary.
+            // Runtime may already have modified the restored files, so rolling
+            // them back based on a later shape check could discard new data.
+            finish_transaction_directory(transaction_directory, RESTORE_COMMITTED_CLEANUP_PREFIX)?;
+        } else {
+            rollback_transaction_directory(data_directory, transaction_directory, &manifest)?;
+        }
+        recovered = true;
+    } else if let Some(recovery_directory) = scan.legacy_recovery.first() {
+        resume_legacy_restore_recovery(data_directory, recovery_directory)?;
+        recovered = true;
+    } else if let Some(rollback_directory) = scan.legacy_rollback.first() {
+        if checked_path_exists(&data_directory.join(DATABASE_FILE_NAME))? {
+            return Err(format!(
+                "An incomplete legacy restore was found at {}; automatic recovery is ambiguous",
+                rollback_directory.display()
+            ));
+        }
+        let recovery_directory = prepare_legacy_recovery(data_directory, rollback_directory)?;
+        resume_legacy_restore_recovery(data_directory, &recovery_directory)?;
+        recovered = true;
+    }
+    Ok(recovered)
+}
+
+pub(crate) fn ensure_database_creation_is_safe(data_directory: &Path) -> Result<(), String> {
+    let marker = data_directory.join(STORAGE_INITIALIZED_MARKER_NAME);
+    if checked_path_exists(&marker)?
+        && !checked_path_exists(&data_directory.join(DATABASE_FILE_NAME))?
+    {
+        return Err(format!(
+            "Refusing to create an empty database because initialized storage is missing {}",
+            data_directory.join(DATABASE_FILE_NAME).display()
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_storage_initialized(data_directory: &Path) -> Result<(), String> {
+    let marker = data_directory.join(STORAGE_INITIALIZED_MARKER_NAME);
+    if checked_path_exists(&marker)? {
+        return Ok(());
+    }
+    write_durable_new_file(&marker, b"1\n")
+}
+
 impl RestoreFileTransaction {
     pub(crate) fn install(data_directory: &Path, staged_directory: &Path) -> Result<Self, String> {
         Self::install_inner(data_directory, staged_directory, None)
+    }
+
+    fn prepare(data_directory: &Path, staged_directory: &Path) -> Result<Self, String> {
+        let parent = data_directory.parent().unwrap_or(data_directory);
+        let scan = scan_restore_directories(parent)?;
+        if !scan.active.is_empty()
+            || !scan.legacy_rollback.is_empty()
+            || !scan.legacy_recovery.is_empty()
+        {
+            return Err(
+                "An earlier restore transaction must be recovered before importing another backup"
+                    .to_string(),
+            );
+        }
+        for directory in scan.preparing.iter().chain(scan.cleanup.iter()) {
+            remove_path(directory)?;
+        }
+
+        std::fs::create_dir_all(data_directory).map_err(|error| {
+            format!(
+                "Failed to create data directory {}: {error}",
+                data_directory.display()
+            )
+        })?;
+        let preparing = TemporaryDirectory::create(parent, "carbonpaper-restore-preparing")?;
+        let old_directory = preparing.path().join("old");
+        let new_directory = preparing.path().join("new");
+        std::fs::create_dir(&old_directory)
+            .map_err(|error| format!("Failed to create restore rollback directory: {error}"))?;
+        std::fs::create_dir(&new_directory)
+            .map_err(|error| format!("Failed to create staged restore directory: {error}"))?;
+
+        let mut old_entries = BTreeSet::new();
+        let mut new_entries = BTreeSet::new();
+        for name in RESTORE_ENTRY_NAMES {
+            if checked_path_exists(&data_directory.join(name))? {
+                old_entries.insert(name.to_string());
+            }
+            let staged = staged_directory.join(name);
+            if checked_path_exists(&staged)? {
+                rename_durable(&staged, &new_directory.join(name))?;
+                new_entries.insert(name.to_string());
+            }
+        }
+        // Storage initialization always creates the screenshot directory. Keep
+        // an empty directory in the durable transaction even when the backup
+        // archive omitted it (ZIP archives commonly omit empty directories).
+        let screenshots_directory = new_directory.join("screenshots");
+        if !checked_path_exists(&screenshots_directory)? {
+            std::fs::create_dir(&screenshots_directory).map_err(|error| {
+                format!(
+                    "Failed to create staged screenshots directory {}: {error}",
+                    screenshots_directory.display()
+                )
+            })?;
+        }
+        new_entries.insert("screenshots".to_string());
+        let manifest = RestoreTransactionManifest {
+            format_version: RESTORE_TRANSACTION_FORMAT_VERSION,
+            old_entries,
+            new_entries,
+        };
+        manifest.validate()?;
+        sync_restore_tree(&new_directory)?;
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| format!("Failed to encode restore transaction: {error}"))?;
+        write_durable_new_file(
+            &preparing.path().join(RESTORE_TRANSACTION_MANIFEST_NAME),
+            &manifest_bytes,
+        )?;
+
+        let transaction_directory = path_with_reclassified_prefix(
+            preparing.path(),
+            RESTORE_PREPARING_PREFIX,
+            RESTORE_TRANSACTION_PREFIX,
+        )?;
+        rename_durable(preparing.path(), &transaction_directory)?;
+        let _ = preparing.release();
+        Ok(Self {
+            data_directory: data_directory.to_path_buf(),
+            transaction_directory,
+            manifest,
+            committed: false,
+            complete: false,
+        })
+    }
+
+    fn move_old_entries(&mut self, fail_after_moves: Option<usize>) -> Result<(), String> {
+        let old_directory = self.transaction_directory.join("old");
+        let mut moved = 0usize;
+        for name in RESTORE_ENTRY_NAMES {
+            if !self.manifest.old_contains(name) {
+                continue;
+            }
+            let current = self.data_directory.join(name);
+            if !checked_path_exists(&current)? {
+                return Err(format!(
+                    "Current restore entry disappeared before activation: {}",
+                    current.display()
+                ));
+            }
+            rename_durable(&current, &old_directory.join(name))?;
+            moved += 1;
+            if fail_after_moves == Some(moved) {
+                return Err("Injected restore interruption while moving old data".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn install_new_entries(&mut self, fail_after_installs: Option<usize>) -> Result<(), String> {
+        create_durable_marker(&self.transaction_directory, RESTORE_INSTALLING_MARKER_NAME)?;
+        let new_directory = self.transaction_directory.join("new");
+        let mut installed = 0usize;
+        for name in RESTORE_ENTRY_NAMES {
+            if !self.manifest.new_contains(name) {
+                continue;
+            }
+            let staged = new_directory.join(name);
+            if !checked_path_exists(&staged)? {
+                return Err(format!(
+                    "Staged restore entry disappeared before activation: {}",
+                    staged.display()
+                ));
+            }
+            rename_durable(&staged, &self.data_directory.join(name))?;
+            installed += 1;
+            if fail_after_installs == Some(installed) {
+                return Err("Injected restore installation failure".to_string());
+            }
+        }
+        Ok(())
     }
 
     fn install_inner(
@@ -1008,57 +1756,10 @@ impl RestoreFileTransaction {
         staged_directory: &Path,
         fail_after_installs: Option<usize>,
     ) -> Result<Self, String> {
-        let parent = data_directory.parent().unwrap_or(data_directory);
-        let rollback_directory =
-            TemporaryDirectory::create(parent, "carbonpaper-restore-rollback")?;
-        let mut transaction = Self {
-            data_directory: data_directory.to_path_buf(),
-            staged_directory: staged_directory.to_path_buf(),
-            rollback_directory,
-            moved_old: Vec::new(),
-            installed_new: Vec::new(),
-            complete: false,
-        };
-
-        let install_result = (|| {
-            std::fs::create_dir_all(data_directory).map_err(|error| {
-                format!(
-                    "Failed to create data directory {}: {error}",
-                    data_directory.display()
-                )
-            })?;
-            for name in RESTORE_ENTRY_NAMES {
-                let current = data_directory.join(name);
-                if current.exists() {
-                    let rollback = transaction.rollback_directory.path().join(name);
-                    std::fs::rename(&current, &rollback).map_err(|error| {
-                        format!(
-                            "Failed to move current data {} into rollback storage: {error}",
-                            current.display()
-                        )
-                    })?;
-                    transaction.moved_old.push(name);
-                }
-            }
-            for name in RESTORE_ENTRY_NAMES {
-                let staged = staged_directory.join(name);
-                if staged.exists() {
-                    let current = data_directory.join(name);
-                    std::fs::rename(&staged, &current).map_err(|error| {
-                        format!(
-                            "Failed to install restored data {}: {error}",
-                            staged.display()
-                        )
-                    })?;
-                    transaction.installed_new.push(name);
-                    if fail_after_installs == Some(transaction.installed_new.len()) {
-                        return Err("Injected restore installation failure".to_string());
-                    }
-                }
-            }
-            Ok(())
-        })();
-
+        let mut transaction = Self::prepare(data_directory, staged_directory)?;
+        let install_result = transaction
+            .move_old_entries(None)
+            .and_then(|()| transaction.install_new_entries(fail_after_installs));
         if let Err(error) = install_result {
             let rollback_error = transaction.rollback().err();
             return Err(match rollback_error {
@@ -1072,68 +1773,66 @@ impl RestoreFileTransaction {
     }
 
     pub(crate) fn rollback(&mut self) -> Result<(), String> {
-        let mut errors = Vec::new();
-        for name in self.installed_new.iter().rev().copied() {
-            let current = self.data_directory.join(name);
-            let staged = self.staged_directory.join(name);
-            if current.exists() {
-                if staged.exists() {
-                    if let Err(error) = remove_path(&staged) {
-                        errors.push(error);
-                        continue;
-                    }
-                }
-                if let Err(error) = std::fs::rename(&current, &staged) {
-                    errors.push(format!(
-                        "Failed to remove partially restored {}: {error}",
-                        current.display()
-                    ));
-                }
-            }
+        if self.committed
+            || durable_marker_exists(&self.transaction_directory, RESTORE_COMMITTED_MARKER_NAME)?
+        {
+            return Err("A committed restore transaction cannot be rolled back".to_string());
         }
-        for name in self.moved_old.iter().rev().copied() {
-            let rollback = self.rollback_directory.path().join(name);
-            let current = self.data_directory.join(name);
-            if rollback.exists() {
-                if current.exists() {
-                    if let Err(error) = remove_path(&current) {
-                        errors.push(error);
-                        continue;
-                    }
-                }
-                if let Err(error) = std::fs::rename(&rollback, &current) {
-                    errors.push(format!(
-                        "Failed to restore previous data {}: {error}",
-                        current.display()
-                    ));
-                }
-            }
-        }
-        self.complete = errors.is_empty();
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
+        rollback_transaction_directory(
+            &self.data_directory,
+            &self.transaction_directory,
+            &self.manifest,
+        )?;
+        self.complete = true;
+        Ok(())
     }
 
-    pub(crate) fn commit(mut self) -> Result<(), String> {
+    pub(crate) fn mark_committed(&mut self) -> Result<(), String> {
+        if self.committed {
+            return Ok(());
+        }
+        if !live_restore_is_committable(&self.data_directory, &self.manifest)? {
+            return Err("Restored data set is incomplete and cannot be committed".to_string());
+        }
+        create_durable_marker(&self.transaction_directory, RESTORE_COMMITTED_MARKER_NAME)?;
+        self.committed = true;
+        Ok(())
+    }
+
+    pub(crate) fn commit(&mut self) -> Result<(), String> {
+        self.mark_committed()?;
         self.complete = true;
-        let rollback_directory = std::mem::replace(
-            &mut self.rollback_directory,
-            TemporaryDirectory {
-                path: PathBuf::new(),
-                cleanup: false,
-            },
-        );
-        rollback_directory.remove()
+        if let Err(error) = finish_transaction_directory(
+            &self.transaction_directory,
+            RESTORE_COMMITTED_CLEANUP_PREFIX,
+        ) {
+            tracing::warn!(
+                "Restored data is committed but transaction cleanup was deferred: {error}"
+            );
+        }
+        Ok(())
     }
 }
 
 impl Drop for RestoreFileTransaction {
     fn drop(&mut self) {
-        if !self.complete {
-            let _ = self.rollback();
+        if self.complete {
+            return;
+        }
+        if self.committed
+            || durable_marker_exists(&self.transaction_directory, RESTORE_COMMITTED_MARKER_NAME)
+                .unwrap_or(false)
+        {
+            let _ = finish_transaction_directory(
+                &self.transaction_directory,
+                RESTORE_COMMITTED_CLEANUP_PREFIX,
+            );
+        } else {
+            let _ = rollback_transaction_directory(
+                &self.data_directory,
+                &self.transaction_directory,
+                &self.manifest,
+            );
         }
     }
 }
@@ -1188,6 +1887,10 @@ mod tests {
             zip.write_all(contents).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    fn write_restore_credential(directory: &Path, contents: &[u8]) {
+        std::fs::write(directory.join(MASTER_KEY_FILE_NAME), contents).unwrap();
     }
 
     #[test]
@@ -1389,6 +2092,8 @@ mod tests {
         std::fs::create_dir_all(staged.join("chroma_db")).unwrap();
         std::fs::write(staged.join("screenshots/new.enc"), b"new image").unwrap();
         std::fs::write(staged.join("chroma_db/new.bin"), b"new index").unwrap();
+        write_restore_credential(&data, b"old credential");
+        write_restore_credential(&staged, b"new credential");
 
         let error = RestoreFileTransaction::install_inner(&data, &staged, Some(2)).unwrap_err();
         assert!(error.contains("Injected"), "{error}");
@@ -1406,6 +2111,10 @@ mod tests {
             std::fs::read(data.join(DATABASE_JOURNAL_FILE_NAME)).unwrap(),
             b"old rollback journal"
         );
+        assert_eq!(
+            std::fs::read(data.join(MASTER_KEY_FILE_NAME)).unwrap(),
+            b"old credential"
+        );
     }
 
     #[test]
@@ -1418,6 +2127,8 @@ mod tests {
         std::fs::write(data.join(DATABASE_FILE_NAME), b"old").unwrap();
         std::fs::write(data.join(DATABASE_JOURNAL_FILE_NAME), b"stale").unwrap();
         std::fs::write(staged.join(DATABASE_FILE_NAME), b"new").unwrap();
+        write_restore_credential(&data, b"old credential");
+        write_restore_credential(&staged, b"new credential");
 
         RestoreFileTransaction::install(&data, &staged)
             .unwrap()
@@ -1429,5 +2140,240 @@ mod tests {
             b"new"
         );
         assert!(!data.join(DATABASE_JOURNAL_FILE_NAME).exists());
+        assert_eq!(
+            std::fs::read(data.join(MASTER_KEY_FILE_NAME)).unwrap(),
+            b"new credential"
+        );
+    }
+
+    #[test]
+    fn successful_restore_materializes_omitted_empty_screenshots_directory() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let staged = root.path().join("staged");
+        std::fs::create_dir_all(data.join("screenshots")).unwrap();
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(data.join(DATABASE_FILE_NAME), b"old").unwrap();
+        std::fs::write(data.join("screenshots/old.enc"), b"old image").unwrap();
+        std::fs::write(staged.join(DATABASE_FILE_NAME), b"new").unwrap();
+        write_restore_credential(&data, b"old credential");
+        write_restore_credential(&staged, b"new credential");
+
+        RestoreFileTransaction::install(&data, &staged)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(data.join(DATABASE_FILE_NAME)).unwrap(),
+            b"new"
+        );
+        assert!(data.join("screenshots").is_dir());
+        assert!(std::fs::read_dir(data.join("screenshots"))
+            .unwrap()
+            .next()
+            .is_none());
+        assert!(!data.join("screenshots/old.enc").exists());
+    }
+
+    #[test]
+    fn failed_commit_is_rolled_back_by_transaction_drop() {
+        let root = tempdir().unwrap();
+        let (data, staged) = create_interruption_fixture(root.path());
+        let mut transaction = RestoreFileTransaction::install(&data, &staged).unwrap();
+        std::fs::remove_file(data.join(DATABASE_FILE_NAME)).unwrap();
+        assert!(transaction.commit().is_err());
+        drop(transaction);
+
+        assert_old_restore_fixture(&data);
+        assert_no_restore_transaction(root.path());
+    }
+
+    fn create_interruption_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let data = root.join("data");
+        let staged = root.join("staged");
+        std::fs::create_dir_all(data.join("screenshots")).unwrap();
+        std::fs::create_dir_all(data.join("chroma_db")).unwrap();
+        std::fs::create_dir_all(staged.join("screenshots")).unwrap();
+        std::fs::create_dir_all(staged.join("chroma_db")).unwrap();
+        for name in DATABASE_FILE_NAMES {
+            std::fs::write(data.join(name), format!("old-{name}")).unwrap();
+            std::fs::write(staged.join(name), format!("new-{name}")).unwrap();
+        }
+        std::fs::write(data.join("screenshots/old.enc"), b"old image").unwrap();
+        std::fs::write(data.join("chroma_db/old.bin"), b"old index").unwrap();
+        std::fs::write(staged.join("screenshots/new.enc"), b"new image").unwrap();
+        std::fs::write(staged.join("chroma_db/new.bin"), b"new index").unwrap();
+        write_restore_credential(&data, b"old credential");
+        write_restore_credential(&staged, b"new credential");
+        (data, staged)
+    }
+
+    fn assert_old_restore_fixture(data: &Path) {
+        for name in DATABASE_FILE_NAMES {
+            assert_eq!(
+                std::fs::read_to_string(data.join(name)).unwrap(),
+                format!("old-{name}")
+            );
+        }
+        assert!(data.join("screenshots/old.enc").exists());
+        assert!(!data.join("screenshots/new.enc").exists());
+        assert!(data.join("chroma_db/old.bin").exists());
+        assert!(!data.join("chroma_db/new.bin").exists());
+        assert_eq!(
+            std::fs::read(data.join(MASTER_KEY_FILE_NAME)).unwrap(),
+            b"old credential"
+        );
+    }
+
+    fn assert_new_restore_fixture(data: &Path) {
+        for name in DATABASE_FILE_NAMES {
+            assert_eq!(
+                std::fs::read_to_string(data.join(name)).unwrap(),
+                format!("new-{name}")
+            );
+        }
+        assert!(!data.join("screenshots/old.enc").exists());
+        assert!(data.join("screenshots/new.enc").exists());
+        assert!(!data.join("chroma_db/old.bin").exists());
+        assert!(data.join("chroma_db/new.bin").exists());
+        assert_eq!(
+            std::fs::read(data.join(MASTER_KEY_FILE_NAME)).unwrap(),
+            b"new credential"
+        );
+    }
+
+    fn assert_no_restore_transaction(parent: &Path) {
+        let scan = scan_restore_directories(parent).unwrap();
+        assert!(scan.preparing.is_empty());
+        assert!(scan.active.is_empty());
+        assert!(scan.cleanup.is_empty());
+        assert!(scan.legacy_rollback.is_empty());
+        assert!(scan.legacy_recovery.is_empty());
+    }
+
+    #[test]
+    fn startup_recovery_rolls_back_interruption_while_moving_old_entries() {
+        let root = tempdir().unwrap();
+        let (data, staged) = create_interruption_fixture(root.path());
+        let mut transaction = RestoreFileTransaction::prepare(&data, &staged).unwrap();
+        assert!(transaction.move_old_entries(Some(2)).is_err());
+        std::mem::forget(transaction);
+
+        assert!(recover_interrupted_restore(&data).unwrap());
+
+        assert_old_restore_fixture(&data);
+        assert_no_restore_transaction(root.path());
+    }
+
+    #[test]
+    fn startup_recovery_rolls_back_interruption_while_installing_new_entries() {
+        let root = tempdir().unwrap();
+        let (data, staged) = create_interruption_fixture(root.path());
+        let mut transaction = RestoreFileTransaction::prepare(&data, &staged).unwrap();
+        transaction.move_old_entries(None).unwrap();
+        assert!(transaction.install_new_entries(Some(2)).is_err());
+        std::mem::forget(transaction);
+
+        assert!(recover_interrupted_restore(&data).unwrap());
+
+        assert_old_restore_fixture(&data);
+        assert_no_restore_transaction(root.path());
+    }
+
+    #[test]
+    fn startup_recovery_rolls_back_fully_installed_uncommitted_restore() {
+        let root = tempdir().unwrap();
+        let (data, staged) = create_interruption_fixture(root.path());
+        let mut transaction = RestoreFileTransaction::prepare(&data, &staged).unwrap();
+        transaction.move_old_entries(None).unwrap();
+        transaction.install_new_entries(None).unwrap();
+        std::mem::forget(transaction);
+
+        assert!(recover_interrupted_restore(&data).unwrap());
+
+        assert_old_restore_fixture(&data);
+        assert_no_restore_transaction(root.path());
+    }
+
+    #[test]
+    fn startup_recovery_keeps_committed_restore_and_only_cleans_rollback() {
+        let root = tempdir().unwrap();
+        let (data, staged) = create_interruption_fixture(root.path());
+        let mut transaction = RestoreFileTransaction::prepare(&data, &staged).unwrap();
+        transaction.move_old_entries(None).unwrap();
+        transaction.install_new_entries(None).unwrap();
+        transaction.mark_committed().unwrap();
+        std::mem::forget(transaction);
+
+        assert!(recover_interrupted_restore(&data).unwrap());
+
+        assert_new_restore_fixture(&data);
+        assert_no_restore_transaction(root.path());
+    }
+
+    #[test]
+    fn startup_recovery_never_rolls_back_a_committed_restore_after_runtime_changes() {
+        let root = tempdir().unwrap();
+        let (data, staged) = create_interruption_fixture(root.path());
+        let mut transaction = RestoreFileTransaction::prepare(&data, &staged).unwrap();
+        transaction.move_old_entries(None).unwrap();
+        transaction.install_new_entries(None).unwrap();
+        transaction.mark_committed().unwrap();
+        std::fs::create_dir(data.join("derived-indexes")).unwrap();
+        std::fs::write(
+            data.join("derived-indexes/runtime.cpdvec"),
+            b"runtime index",
+        )
+        .unwrap();
+        std::mem::forget(transaction);
+
+        assert!(recover_interrupted_restore(&data).unwrap());
+
+        assert_new_restore_fixture(&data);
+        assert_eq!(
+            std::fs::read(data.join("derived-indexes/runtime.cpdvec")).unwrap(),
+            b"runtime index"
+        );
+        assert_no_restore_transaction(root.path());
+    }
+
+    #[test]
+    fn legacy_rollback_is_recovered_when_the_live_database_is_missing() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let rollback = root
+            .path()
+            .join(".carbonpaper-restore-rollback-legacy-test");
+        std::fs::create_dir_all(data.join("screenshots")).unwrap();
+        std::fs::create_dir_all(data.join("chroma_db")).unwrap();
+        std::fs::create_dir_all(rollback.join("screenshots")).unwrap();
+        std::fs::write(data.join("screenshots/new.enc"), b"partial new").unwrap();
+        std::fs::write(data.join("chroma_db/new.bin"), b"partial new index").unwrap();
+        std::fs::write(rollback.join(DATABASE_FILE_NAME), b"old database").unwrap();
+        std::fs::write(rollback.join("screenshots/old.enc"), b"old image").unwrap();
+
+        assert!(recover_interrupted_restore(&data).unwrap());
+
+        assert_eq!(
+            std::fs::read(data.join(DATABASE_FILE_NAME)).unwrap(),
+            b"old database"
+        );
+        assert!(data.join("screenshots/old.enc").exists());
+        assert!(!data.join("screenshots/new.enc").exists());
+        assert!(!data.join("chroma_db").exists());
+        assert_no_restore_transaction(root.path());
+    }
+
+    #[test]
+    fn initialized_storage_marker_prevents_silent_empty_database_creation() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        mark_storage_initialized(&data).unwrap();
+
+        let error = ensure_database_creation_is_safe(&data).unwrap_err();
+
+        assert!(error.contains("Refusing to create an empty database"));
     }
 }

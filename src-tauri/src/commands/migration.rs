@@ -5,7 +5,9 @@
 //! requires a valid authenticated session.
 
 use crate::capture::CaptureState;
-use crate::credential_manager::{get_cached_master_key, CredentialManagerState};
+use crate::credential_manager::{
+    get_cached_master_key, CredentialManagerState, MASTER_KEY_FILE_NAME,
+};
 use crate::monitor::{start_monitor_impl, stop_monitor_impl, MonitorState};
 use crate::storage::database_snapshot::{
     self, BACKUP_MANIFEST_FILE_NAME, BACKUP_MASTER_KEY_FILE_NAME, BACKUP_METADATA_FILE_NAME,
@@ -667,29 +669,33 @@ pub async fn storage_import_backup(
                 &extracted.manifest,
                 &database_key,
             )?;
+            let imported_credential_file = credential_state
+                .prepare_import_master_key_file(&master_key)
+                .map_err(|error| error.to_string())?;
+            database_snapshot::write_staged_file(
+                &extracted.path().join(MASTER_KEY_FILE_NAME),
+                &imported_credential_file,
+            )?;
             state.shutdown_under_maintenance()?;
-            let credential_snapshot = credential_state.snapshot_import_state()?;
+            let credential_snapshot = credential_state.snapshot_import_state();
             let mut file_transaction =
                 database_snapshot::RestoreFileTransaction::install(&data_dir, extracted.path())?;
             let apply_result = (|| {
                 credential_state
-                    .import_master_key(&master_key)
+                    .activate_imported_master_key(&master_key)
                     .map_err(|error| error.to_string())?;
                 state.initialize_under_maintenance()?;
+                file_transaction.commit()?;
                 Ok::<(), String>(())
             })();
 
             if let Err(error) = apply_result {
                 let _ = state.shutdown_under_maintenance();
                 let file_rollback = file_transaction.rollback();
-                let credential_rollback =
-                    credential_state.restore_import_state(credential_snapshot);
+                credential_state.restore_import_state(credential_snapshot);
                 let reopen = state.initialize_under_maintenance();
                 let mut rollback_errors = Vec::new();
                 if let Err(error) = file_rollback {
-                    rollback_errors.push(error);
-                }
-                if let Err(error) = credential_rollback {
                     rollback_errors.push(error);
                 }
                 if let Err(error) = reopen {
@@ -700,11 +706,6 @@ pub async fn storage_import_backup(
                 } else {
                     format!("{error}; rollback failures: {}", rollback_errors.join("; "))
                 });
-            }
-            if let Err(error) = file_transaction.commit() {
-                tracing::warn!(
-                    "Migration: restored data is active but rollback cleanup failed: {error}"
-                );
             }
             Ok::<(), String>(())
         })();
