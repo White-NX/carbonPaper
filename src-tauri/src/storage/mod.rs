@@ -6,6 +6,7 @@
 //! 3. OCR data storage and search
 
 mod background_scheduler;
+mod connection;
 mod derived_index;
 mod derived_migration;
 mod document_ref;
@@ -46,7 +47,7 @@ use crate::credential_manager::{
 use rusqlite::{Connection, OpenFlags};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Error returned by background-only reads of encrypted screenshot content.
@@ -98,11 +99,19 @@ pub struct StorageState {
     /// Serializes derived-index sidecar publication without participating in
     /// the data-directory/database lock ordering.
     derived_generation_publish_lock: Mutex<()>,
-    /// Foreground read activity versus database compaction. Queries hold a
-    /// shared guard across vector selection and hydration; opportunistic
-    /// incremental VACUUM only runs when it can acquire the exclusive side
-    /// without waiting.
-    foreground_db_activity: RwLock<()>,
+    /// Long-running query activity versus database maintenance. Queries hold a
+    /// shared permit across vector selection and hydration. Maintenance takes
+    /// the exclusive side first so nested independent reads can finish without
+    /// deadlocking a waiting maintenance operation.
+    foreground_db_activity: connection::ActivityGate,
+    /// Every independent SQLCipher connection holds a shared permit for its
+    /// complete lifetime. Backup, restore, VACUUM, and directory migration
+    /// drain this gate before touching database state.
+    independent_db_activity: connection::ActivityGate,
+    /// Non-zero from the moment maintenance starts waiting. Search-order
+    /// publication checks this before retaining its long-lived data-version
+    /// connection, allowing maintenance to drain all independent handles.
+    database_maintenance_pending: Arc<AtomicUsize>,
     /// Resident `semantic_text` vectors for the exact-scan read path. Loaded on
     /// first query, kept current by the write path, released when idle. The
     /// per-kind budget may choose the paged exact fallback instead of retaining
@@ -201,7 +210,9 @@ impl StorageState {
             thumbnail_warmup_done: AtomicBool::new(false),
             startup_vacuum_in_progress: AtomicBool::new(false),
             derived_generation_publish_lock: Mutex::new(()),
-            foreground_db_activity: RwLock::new(()),
+            foreground_db_activity: connection::ActivityGate::default(),
+            independent_db_activity: connection::ActivityGate::default(),
+            database_maintenance_pending: Arc::new(AtomicUsize::new(0)),
             semantic_vector_cache: RwLock::new(None),
             semantic_cache_used_at: AtomicU64::new(0),
             clip_vector_cache: RwLock::new(None),
@@ -276,20 +287,45 @@ impl StorageState {
         self.startup_vacuum_in_progress.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn foreground_db_read(&self) -> std::sync::RwLockReadGuard<'_, ()> {
-        self.foreground_db_activity
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
+    pub(crate) fn foreground_db_read(&self) -> connection::ActivityReadGuard {
+        self.foreground_db_activity.read("foreground_query")
     }
 
-    pub(crate) fn foreground_db_write(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
-        self.foreground_db_activity
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
+    pub(crate) fn database_maintenance(
+        &self,
+        caller: &'static str,
+    ) -> connection::DatabaseMaintenanceGuard {
+        let pending = connection::MaintenanceRequestGuard::new(Arc::clone(
+            &self.database_maintenance_pending,
+        ));
+        let foreground = self.foreground_db_activity.write(caller);
+        // A cached search order owns an independent connection indefinitely.
+        // Once publication is disabled above, clearing it makes the remaining
+        // independent-read drain finite.
+        self.clear_search_order_cache();
+        let independent_reads = self.independent_db_activity.write(caller);
+        connection::DatabaseMaintenanceGuard::from_parts(pending, foreground, independent_reads)
     }
 
-    pub(crate) fn try_foreground_db_write(&self) -> Option<std::sync::RwLockWriteGuard<'_, ()>> {
-        self.foreground_db_activity.try_write().ok()
+    pub(crate) fn try_database_maintenance(
+        &self,
+        caller: &'static str,
+    ) -> Option<connection::DatabaseMaintenanceGuard> {
+        let pending = connection::MaintenanceRequestGuard::new(Arc::clone(
+            &self.database_maintenance_pending,
+        ));
+        let foreground = self.foreground_db_activity.try_write(caller)?;
+        self.clear_search_order_cache();
+        let independent_reads = self.independent_db_activity.try_write(caller)?;
+        Some(connection::DatabaseMaintenanceGuard::from_parts(
+            pending,
+            foreground,
+            independent_reads,
+        ))
+    }
+
+    pub(crate) fn is_database_maintenance_pending(&self) -> bool {
+        self.database_maintenance_pending.load(Ordering::Acquire) > 0
     }
 
     pub(crate) fn derived_generation_publish_guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -337,8 +373,9 @@ impl StorageState {
     pub(crate) fn open_read_connection_named(
         &self,
         caller: &'static str,
-    ) -> Result<Connection, String> {
+    ) -> Result<connection::IndependentReadConnection, String> {
         let started = std::time::Instant::now();
+        let activity = self.independent_db_activity.read(caller);
         let data_dir = self
             .data_dir
             .lock()
@@ -354,11 +391,8 @@ impl StorageState {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| format!("Failed to open read database connection: {}", e))?;
-        let key_hex = hex::encode(&db_key);
-        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key_hex))
-            .map_err(|e| format!("Failed to set read database key: {}", e))?;
-        conn.execute_batch("SELECT count(*) FROM sqlite_master;")
-            .map_err(|e| format!("Read database key verification failed: {}", e))?;
+        let status = connection::configure_sqlcipher_connection(&conn, &db_key)
+            .map_err(|e| format!("Failed to configure read database connection: {}", e))?;
 
         let elapsed = started.elapsed();
         if elapsed.as_millis() >= 250 {
@@ -368,7 +402,13 @@ impl StorageState {
                 elapsed
             );
         }
-        Ok(conn)
+        tracing::debug!(
+            "[DIAG:DB] read connection configured caller={} journal_mode={} synchronous={}",
+            caller,
+            status.journal_mode,
+            status.synchronous
+        );
+        Ok(connection::IndependentReadConnection::new(conn, activity))
     }
 
     /// Returns whether the current credential session is unlocked/valid.
@@ -407,5 +447,61 @@ impl StorageState {
     /// before its statement runs.
     pub(super) fn bump_db_generation(&self) {
         self.db_generation.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_storage() -> (tempfile::TempDir, StorageState) {
+        let temp = tempfile::tempdir().expect("create temporary storage directory");
+        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential);
+        (temp, storage)
+    }
+
+    #[test]
+    fn try_maintenance_fails_cleanly_when_foreground_is_active() {
+        let (_temp, storage) = test_storage();
+        let foreground_reader = storage
+            .foreground_db_activity
+            .read("test_foreground_reader");
+
+        assert!(storage
+            .try_database_maintenance("test_maintenance")
+            .is_none());
+        assert!(!storage.is_database_maintenance_pending());
+
+        drop(foreground_reader);
+        let maintenance = storage
+            .try_database_maintenance("test_maintenance_after_reader")
+            .expect("maintenance succeeds after foreground reader exits");
+        assert!(storage.is_database_maintenance_pending());
+        drop(maintenance);
+        assert!(!storage.is_database_maintenance_pending());
+    }
+
+    #[test]
+    fn try_maintenance_releases_foreground_when_independent_read_is_active() {
+        let (_temp, storage) = test_storage();
+        let independent_reader = storage
+            .independent_db_activity
+            .read("test_independent_reader");
+
+        assert!(storage
+            .try_database_maintenance("test_maintenance")
+            .is_none());
+        assert!(!storage.is_database_maintenance_pending());
+        let foreground = storage
+            .foreground_db_activity
+            .try_write("test_foreground_after_failure")
+            .expect("failed maintenance releases its foreground permit");
+        drop(foreground);
+
+        drop(independent_reader);
+        assert!(storage
+            .try_database_maintenance("test_maintenance_after_reader")
+            .is_some());
     }
 }

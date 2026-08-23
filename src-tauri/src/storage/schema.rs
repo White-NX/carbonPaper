@@ -6,13 +6,19 @@ use crate::credential_manager::{
 use rusqlite::{params, Connection};
 use std::sync::atomic::Ordering;
 
-use super::StorageState;
+use super::{connection, StorageState};
 
 impl StorageState {
     const MCP_PRIVACY_ACKNOWLEDGED_KEY: &'static str = "mcp_privacy_acknowledged";
 
     /// Initialize storage (create directories and database).
     pub fn initialize(&self) -> Result<(), String> {
+        let _maintenance = self.database_maintenance("initialize");
+        self.initialize_under_maintenance()
+    }
+
+    /// Initialize while the caller already owns the database maintenance gate.
+    pub(crate) fn initialize_under_maintenance(&self) -> Result<(), String> {
         let init_start = std::time::Instant::now();
         let mut initialized = self.initialized.lock().unwrap_or_else(|e| e.into_inner());
         if *initialized {
@@ -58,15 +64,12 @@ impl StorageState {
             Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
         let open_dur = t1.elapsed();
 
-        // Set SQLCipher key (hex format)
+        // Set the SQLCipher key, verify it, and apply shared connection-local
+        // policy. The helper intentionally leaves journal mode unchanged;
+        // V1 remains on the existing DELETE default.
         let t2 = std::time::Instant::now();
-        let key_hex = hex::encode(&db_key);
-        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key_hex))
-            .map_err(|e| format!("Failed to set database key: {}", e))?;
-
-        // Verify that the key is correct
-        conn.execute_batch("SELECT count(*) FROM sqlite_master;")
-            .map_err(|e| format!("Database key verification failed: {}", e))?;
+        let connection_status = connection::configure_sqlcipher_connection(&conn, &db_key)
+            .map_err(|e| format!("Failed to configure database connection: {}", e))?;
         let pragma_dur = t2.elapsed();
 
         // Initialize table schema
@@ -102,11 +105,13 @@ impl StorageState {
         *initialized = true;
 
         tracing::info!(
-            "[DIAG:INIT] SQLCipher initialized in {:?} (key_derive={:?}, db_open={:?}, pragma={:?}, init_tables={:?})",
+            "[DIAG:INIT] SQLCipher initialized in {:?} (key_derive={:?}, db_open={:?}, pragma={:?}, journal_mode={}, synchronous={}, init_tables={:?})",
             init_start.elapsed(),
             key_derive_dur,
             open_dur,
             pragma_dur,
+            connection_status.journal_mode,
+            connection_status.synchronous,
             tables_dur
         );
 
@@ -115,6 +120,12 @@ impl StorageState {
 
     /// Shut down storage: close database connection.
     pub fn shutdown(&self) -> Result<(), String> {
+        let _maintenance = self.database_maintenance("shutdown");
+        self.shutdown_under_maintenance()
+    }
+
+    /// Close the primary connection while the maintenance gate is already held.
+    pub(crate) fn shutdown_under_maintenance(&self) -> Result<(), String> {
         self.lazy_indexer_shutdown.store(true, Ordering::SeqCst);
         // The resident semantic matrix belongs to the connection being closed.
         // Its freshness epoch is per-database, so carrying it into whatever
@@ -692,9 +703,6 @@ impl StorageState {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Enable foreign key constraints
-            PRAGMA foreign_keys = ON;
-
             -- Generic key-value store for app-level metadata / migration markers
             CREATE TABLE IF NOT EXISTS app_metadata (
                 key TEXT PRIMARY KEY,
@@ -821,6 +829,7 @@ impl StorageState {
         }
 
         let result = (|| {
+            let _maintenance = self.database_maintenance("startup_vacuum_run");
             let guard = self.get_connection_named("startup_vacuum_run")?;
             let conn = guard.as_ref().unwrap();
             Self::set_auto_vacuum_incremental(conn)?;
@@ -872,6 +881,7 @@ impl StorageState {
         }
 
         let result = (|| {
+            let _maintenance = self.database_maintenance("manual_vacuum_run");
             let guard = self.get_connection_named("manual_vacuum_run")?;
             let conn = guard.as_ref().unwrap();
             Self::set_auto_vacuum_incremental(conn)?;

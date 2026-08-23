@@ -30,7 +30,10 @@ use std::time::{Duration, Instant};
 use super::screenshot::unwrap_batch_parallel;
 use super::search_plan::{BigramGroup, QueryPlan};
 use super::search_rank;
-use super::{wire_time, BackgroundReadError, SearchResult, StorageState};
+use super::{
+    connection::IndependentReadConnection, wire_time, BackgroundReadError, SearchResult,
+    StorageState,
+};
 
 type SearchSqlParam = Box<dyn ToSql>;
 
@@ -1066,7 +1069,7 @@ pub(super) struct CachedSearchOrder {
     /// stays alive with the cached order instead of comparing values sampled
     /// from unrelated per-search connections.
     data_version: i64,
-    version_connection: Connection,
+    version_connection: IndependentReadConnection,
     /// Protects against an old-file search publishing after a database swap.
     reset_generation: u64,
     /// Result rows in final order. A multi-keyword search stores one
@@ -1417,7 +1420,7 @@ impl StorageState {
         complete: bool,
         data_version: i64,
         reset_generation: u64,
-        version_connection: Connection,
+        version_connection: IndependentReadConnection,
     ) {
         let mut guard = self
             .search_order_cache
@@ -1426,10 +1429,11 @@ impl StorageState {
         // Both checks happen while holding the publication lock. Otherwise a
         // database reset could clear the cache between an earlier check and
         // this assignment, allowing an old-file result to reappear afterward.
-        if self
-            .semantic_cache_reset_generation
-            .load(AtomicOrdering::Acquire)
-            != reset_generation
+        if self.is_database_maintenance_pending()
+            || self
+                .semantic_cache_reset_generation
+                .load(AtomicOrdering::Acquire)
+                != reset_generation
             || sqlite_data_version(&version_connection)
                 .map_or(true, |current| current != data_version)
         {
@@ -1632,7 +1636,7 @@ impl StorageState {
     #[allow(clippy::too_many_arguments)]
     fn rank_and_page(
         &self,
-        conn: Connection,
+        conn: IndependentReadConnection,
         plan: &QueryPlan,
         candidates: Vec<Candidate>,
         cache_key: String,
@@ -2872,7 +2876,10 @@ mod tests {
             false,
             version,
             0,
-            watcher,
+            IndependentReadConnection::new(
+                watcher,
+                storage.independent_db_activity.read("test_cache_watcher"),
+            ),
         );
 
         let (ordered, complete) = storage
@@ -2886,6 +2893,46 @@ mod tests {
             .execute("INSERT INTO rows DEFAULT VALUES", [])
             .expect("commit external write");
         assert!(storage.cached_order("query", 0).is_none());
+    }
+
+    #[test]
+    fn maintenance_request_clears_long_lived_search_connection() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let storage = Arc::new(StorageState::new(
+            temp.path().to_path_buf(),
+            Arc::new(CredentialManagerState::new(temp.path().to_path_buf())),
+        ));
+        let watcher = Connection::open_in_memory().expect("open cache watcher");
+        let version_connection = IndependentReadConnection::new(
+            watcher,
+            storage.independent_db_activity.read("test_cache_watcher"),
+        );
+        storage.store_order(
+            "query".to_string(),
+            &[4, 3, 2, 1],
+            false,
+            1,
+            0,
+            version_connection,
+        );
+        assert!(storage.search_order_cache.lock().unwrap().is_some());
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let maintenance_storage = Arc::clone(&storage);
+        let worker = thread::spawn(move || {
+            let _maintenance = maintenance_storage.database_maintenance("test_cache_clear");
+            done_tx.send(()).unwrap();
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("maintenance should drain cached connection");
+        worker.join().unwrap();
+        assert!(storage.search_order_cache.lock().unwrap().is_none());
     }
 
     #[test]

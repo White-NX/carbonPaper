@@ -44,7 +44,7 @@ impl StorageState {
         }
         self.credential_state.set_data_dir(src.to_path_buf());
 
-        if let Err(e) = self.initialize() {
+        if let Err(e) = self.initialize_under_maintenance() {
             let msg = format!("{}; failed to reinitialize source storage: {}", message, e);
             let _ = app_handle.emit(
                 "storage-migration-error",
@@ -92,11 +92,9 @@ impl StorageState {
         // migration_in_progress and fail before entering this boundary.
         let _derived_publish_guard = self.derived_generation_publish_guard();
 
-        // Searches pin the currently armed generation through an Arc while
-        // scanning its mmap files. Wait for all such foreground work to
-        // finish, and prevent new searches from opening the old database,
-        // before disarming or moving the directory.
-        let _foreground_gate = self.foreground_db_write();
+        // Drain long queries and every independent SQLCipher connection, then
+        // keep new reads parked until the selected database is initialized.
+        let _database_maintenance = self.database_maintenance("migrate_data_dir");
 
         // The reader holds mmap views into the current data directory. Drop
         // them before files are copied or removed; Windows will not unlink a
@@ -148,7 +146,7 @@ impl StorageState {
         let mut created_dirs: Vec<PathBuf> = Vec::new();
         let mut source_removed = false;
 
-        if let Err(e) = self.shutdown() {
+        if let Err(e) = self.shutdown_under_maintenance() {
             let _ = app_handle.emit(
                 "storage-migration-error",
                 json!({ "message": format!("Failed to shutdown storage: {}", e), "recoverable": false }),
@@ -348,7 +346,7 @@ impl StorageState {
         }
         self.credential_state.set_data_dir(dst.clone());
 
-        if let Err(e) = self.initialize() {
+        if let Err(e) = self.initialize_under_maintenance() {
             let msg = format!("Failed to reinitialize storage after migration: {}", e);
             let _ = app_handle.emit(
                 "storage-migration-error",

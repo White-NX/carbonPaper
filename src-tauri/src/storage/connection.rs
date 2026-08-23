@@ -1,0 +1,597 @@
+//! Shared SQLCipher connection setup and journal-mode diagnostics.
+
+use rusqlite::{Connection, Result};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// Keep lock waits bounded and explicit on every connection.
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Preserve the existing durability policy while DELETE remains the default
+/// journal mode. WAL experiments can choose a different policy explicitly.
+const SYNCHRONOUS_FULL: &str = "FULL";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectionStatus {
+    pub(crate) journal_mode: String,
+    pub(crate) synchronous: String,
+}
+
+#[derive(Default)]
+struct ActivityState {
+    active_readers: usize,
+    active_writer: bool,
+    waiting_writers: usize,
+}
+
+#[derive(Default)]
+struct ActivityGateInner {
+    state: Mutex<ActivityState>,
+    changed: Condvar,
+}
+
+/// A blocking, writer-preferred activity gate.
+///
+/// The gate deliberately owns its state through an `Arc` rather than exposing
+/// a standard-library lock guard. Maintenance commands can therefore hold the
+/// exclusive permit while awaiting monitor shutdown or performing filesystem
+/// work without borrowing a `StorageState` or keeping a `MutexGuard` alive.
+#[derive(Clone, Default)]
+pub(crate) struct ActivityGate {
+    inner: Arc<ActivityGateInner>,
+}
+
+impl ActivityGate {
+    pub(crate) fn read(&self, caller: &'static str) -> ActivityReadGuard {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while state.active_writer || state.waiting_writers > 0 {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        state.active_readers += 1;
+        drop(state);
+
+        ActivityReadGuard {
+            inner: Arc::clone(&self.inner),
+            caller,
+            acquired_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn write(&self, caller: &'static str) -> ActivityWriteGuard {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.waiting_writers += 1;
+        while state.active_writer || state.active_readers > 0 {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        state.waiting_writers -= 1;
+        state.active_writer = true;
+        drop(state);
+
+        ActivityWriteGuard {
+            inner: Arc::clone(&self.inner),
+            caller,
+            acquired_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn try_write(&self, caller: &'static str) -> Option<ActivityWriteGuard> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.active_writer || state.active_readers > 0 || state.waiting_writers > 0 {
+            return None;
+        }
+        state.active_writer = true;
+        drop(state);
+
+        Some(ActivityWriteGuard {
+            inner: Arc::clone(&self.inner),
+            caller,
+            acquired_at: Instant::now(),
+        })
+    }
+}
+
+pub(crate) struct ActivityReadGuard {
+    inner: Arc<ActivityGateInner>,
+    caller: &'static str,
+    acquired_at: Instant,
+}
+
+impl Drop for ActivityReadGuard {
+    fn drop(&mut self) {
+        let held_for = self.acquired_at.elapsed();
+        if held_for.as_secs() >= 1 {
+            tracing::debug!(
+                "[DIAG:DB] activity read held for {:?} by '{}'",
+                held_for,
+                self.caller
+            );
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.active_readers = state.active_readers.saturating_sub(1);
+        self.inner.changed.notify_all();
+    }
+}
+
+pub(crate) struct ActivityWriteGuard {
+    inner: Arc<ActivityGateInner>,
+    caller: &'static str,
+    acquired_at: Instant,
+}
+
+pub(crate) struct MaintenanceRequestGuard {
+    pending: Arc<AtomicUsize>,
+}
+
+impl MaintenanceRequestGuard {
+    pub(crate) fn new(pending: Arc<AtomicUsize>) -> Self {
+        pending.fetch_add(1, Ordering::AcqRel);
+        Self { pending }
+    }
+}
+
+impl Drop for MaintenanceRequestGuard {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for ActivityWriteGuard {
+    fn drop(&mut self) {
+        let held_for = self.acquired_at.elapsed();
+        if held_for.as_secs() >= 1 {
+            tracing::debug!(
+                "[DIAG:DB] activity maintenance held for {:?} by '{}'",
+                held_for,
+                self.caller
+            );
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.active_writer = false;
+        self.inner.changed.notify_all();
+    }
+}
+
+/// Exclusive permit for operations that may close, replace, or compact the
+/// database. The long-query gate is acquired first, then the independent-read
+/// gate; all callers must preserve this order.
+pub(crate) struct DatabaseMaintenanceGuard {
+    _independent_reads: ActivityWriteGuard,
+    _foreground: ActivityWriteGuard,
+    _pending: MaintenanceRequestGuard,
+}
+
+impl DatabaseMaintenanceGuard {
+    pub(crate) fn from_parts(
+        pending: MaintenanceRequestGuard,
+        foreground: ActivityWriteGuard,
+        independent_reads: ActivityWriteGuard,
+    ) -> Self {
+        Self {
+            _independent_reads: independent_reads,
+            _foreground: foreground,
+            _pending: pending,
+        }
+    }
+}
+
+/// Independent SQLCipher read connection with an activity permit tied to its
+/// lifetime. The connection is dropped before the permit, so maintenance can
+/// only proceed after SQLite has released the read handle.
+pub(crate) struct IndependentReadConnection {
+    conn: Option<Connection>,
+    _activity: ActivityReadGuard,
+}
+
+impl IndependentReadConnection {
+    pub(crate) fn new(conn: Connection, activity: ActivityReadGuard) -> Self {
+        Self {
+            conn: Some(conn),
+            _activity: activity,
+        }
+    }
+}
+
+impl Deref for IndependentReadConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.conn
+            .as_ref()
+            .expect("independent connection is present until drop")
+    }
+}
+
+impl Drop for IndependentReadConnection {
+    fn drop(&mut self) {
+        // Close SQLite before `_activity` is released. Maintenance that wakes
+        // on the permit must never race a still-open Windows file handle.
+        drop(self.conn.take());
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JournalMode {
+    Delete,
+    Wal,
+}
+
+impl JournalMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Wal => "wal",
+        }
+    }
+}
+
+/// Configure an encrypted connection in the required SQLCipher order.
+///
+/// The key pragma is deliberately the first SQLite statement. The busy timeout
+/// follows immediately so key verification also waits for transient locks;
+/// settings that inspect or change database state are applied only after key
+/// verification succeeds.
+pub(crate) fn configure_sqlcipher_connection(
+    conn: &Connection,
+    db_key: &[u8],
+) -> Result<ConnectionStatus> {
+    let key_hex = hex::encode(db_key);
+    conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key_hex))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+
+    // Verify the key before reading or changing any other database state.
+    conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
+    configure_connection_pragmas(conn)
+}
+
+/// Apply the connection-local policy shared by primary and independent reads.
+pub(crate) fn configure_connection_pragmas(conn: &Connection) -> Result<ConnectionStatus> {
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    conn.pragma_update(None, "synchronous", SYNCHRONOUS_FULL)?;
+    inspect_connection(conn)
+}
+
+/// Read the effective connection state without changing the journal mode.
+pub(crate) fn inspect_connection(conn: &Connection) -> Result<ConnectionStatus> {
+    let journal_mode =
+        conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?;
+    let synchronous = conn.pragma_query_value(None, "synchronous", |row| {
+        let value: i64 = row.get(0)?;
+        let label = match value {
+            0 => "OFF",
+            1 => "NORMAL",
+            2 => "FULL",
+            3 => "EXTRA",
+            _ => "UNKNOWN",
+        };
+        Ok(label.to_string())
+    })?;
+
+    Ok(ConnectionStatus {
+        journal_mode: journal_mode.trim().to_ascii_lowercase(),
+        synchronous,
+    })
+}
+
+/// Request a journal mode and verify SQLite's effective result.
+///
+/// V1 does not call this during startup. Later WAL experiments can use it and
+/// receive a clear diagnostic when a read-only connection, filesystem, or
+/// SQLite build cannot establish the requested mode.
+#[allow(dead_code)]
+pub(crate) fn set_journal_mode(
+    conn: &Connection,
+    requested: JournalMode,
+) -> Result<ConnectionStatus, String> {
+    let requested = requested.as_str();
+
+    let actual = conn
+        .pragma_update_and_check(None, "journal_mode", requested, |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| {
+            format!(
+                "Failed to set SQLite journal mode to '{}': {}",
+                requested, error
+            )
+        })?
+        .trim()
+        .to_ascii_lowercase();
+
+    if actual != requested {
+        return Err(format!(
+            "SQLite did not establish requested journal mode '{}'; effective mode is '{}'",
+            requested, actual
+        ));
+    }
+
+    inspect_connection(conn).map_err(|error| {
+        format!(
+            "Failed to inspect SQLite connection after setting journal mode: {}",
+            error
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::{Connection, OpenFlags};
+    use std::sync::mpsc;
+    use std::thread;
+
+    #[test]
+    fn shared_pragmas_are_explicit_and_reported() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        let status = configure_connection_pragmas(&conn).expect("configure connection");
+
+        assert_eq!(status.journal_mode, "memory");
+        assert_eq!(status.synchronous, "FULL");
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .expect("read foreign_keys");
+        assert_eq!(foreign_keys, 1);
+        let busy_timeout: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .expect("read busy_timeout");
+        assert_eq!(busy_timeout, BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[test]
+    fn configuration_preserves_existing_journal_mode() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("journal-mode.db");
+        let conn = Connection::open(path).expect("open database");
+        let established: String = conn
+            .pragma_update_and_check(None, "journal_mode", "TRUNCATE", |row| row.get(0))
+            .expect("set fixture journal mode");
+        assert_eq!(established.to_ascii_lowercase(), "truncate");
+
+        let status = configure_connection_pragmas(&conn).expect("configure connection");
+        assert_eq!(status.journal_mode, "truncate");
+    }
+
+    #[test]
+    fn journal_mode_requests_verify_sqlite_result() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("requested-journal-mode.db");
+        let conn = Connection::open(path).expect("open database");
+
+        let status = set_journal_mode(&conn, JournalMode::Wal).expect("enable WAL for the test");
+        assert_eq!(status.journal_mode, "wal");
+
+        let status = set_journal_mode(&conn, JournalMode::Delete).expect("restore DELETE");
+        assert_eq!(status.journal_mode, "delete");
+    }
+
+    #[test]
+    fn encrypted_database_reopens_with_shared_read_settings() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("encrypted.db");
+        let key = [0x5a; 32];
+
+        {
+            let conn = Connection::open(&path).expect("open encrypted database");
+            let status = configure_sqlcipher_connection(&conn, &key)
+                .expect("configure primary encrypted connection");
+            assert_eq!(status.journal_mode, "delete");
+            conn.execute_batch(
+                "CREATE TABLE sample (value TEXT NOT NULL); INSERT INTO sample VALUES ('ready');",
+            )
+            .expect("write encrypted fixture");
+        }
+
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("reopen encrypted database read-only");
+        let status = configure_sqlcipher_connection(&conn, &key)
+            .expect("configure read-only encrypted connection");
+        assert_eq!(status.journal_mode, "delete");
+        assert_eq!(status.synchronous, "FULL");
+        let value: String = conn
+            .query_row("SELECT value FROM sample", [], |row| row.get(0))
+            .expect("read encrypted fixture");
+        assert_eq!(value, "ready");
+    }
+
+    #[test]
+    fn key_verification_waits_for_transient_database_lock() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("locked-encrypted.db");
+        let key = [0x7b; 32];
+
+        let writer = Connection::open(&path).expect("open encrypted database");
+        configure_sqlcipher_connection(&writer, &key).expect("configure writer connection");
+        writer
+            .execute_batch("CREATE TABLE sample (value TEXT); BEGIN EXCLUSIVE;")
+            .expect("hold exclusive database lock");
+
+        let reader = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("open read-only database");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let outcome = configure_sqlcipher_connection(&reader, &key)
+                .map(|status| status.journal_mode)
+                .map_err(|error| error.to_string());
+            finished_tx.send(outcome).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader starts configuration");
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "key verification should wait instead of failing immediately"
+        );
+
+        writer
+            .execute_batch("COMMIT;")
+            .expect("release database lock");
+        let journal_mode = finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader finishes after lock release")
+            .expect("reader configuration succeeds");
+        assert_eq!(journal_mode, "delete");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn maintenance_waits_for_readers_and_blocks_new_readers() {
+        let gate = ActivityGate::default();
+        let held = gate.read("test_reader");
+        let (writer_started_tx, writer_started_rx) = mpsc::channel();
+        let (writer_release_tx, writer_release_rx) = mpsc::channel();
+        let writer_gate = gate.clone();
+        let writer = thread::spawn(move || {
+            let _writer = writer_gate.write("test_writer");
+            writer_started_tx.send(()).unwrap();
+            writer_release_rx.recv().unwrap();
+        });
+
+        assert!(writer_started_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        drop(held);
+        writer_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer acquires after reader release");
+
+        let (reader_started_tx, reader_started_rx) = mpsc::channel();
+        let (reader_release_tx, reader_release_rx) = mpsc::channel();
+        let reader_gate = gate.clone();
+        let reader = thread::spawn(move || {
+            let _reader = reader_gate.read("test_blocked_reader");
+            reader_started_tx.send(()).unwrap();
+            reader_release_rx.recv().unwrap();
+        });
+        assert!(reader_started_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+
+        writer_release_tx.send(()).unwrap();
+        reader_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader resumes after maintenance");
+        reader_release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn maintenance_guard_drains_both_activity_domains() {
+        let foreground = ActivityGate::default();
+        let independent = ActivityGate::default();
+        let _foreground_reader = foreground.read("test_foreground_reader");
+        let _independent_reader = independent.read("test_independent_reader");
+        let foreground_for_writer = foreground.clone();
+        let independent_for_writer = independent.clone();
+        let (foreground_acquired_tx, foreground_acquired_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (maintenance_acquired_tx, maintenance_acquired_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let pending = MaintenanceRequestGuard::new(Arc::new(AtomicUsize::new(0)));
+            let foreground_guard = foreground_for_writer.write("test_maintenance");
+            foreground_acquired_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            let independent_guard = independent_for_writer.write("test_maintenance");
+            let _guard =
+                DatabaseMaintenanceGuard::from_parts(pending, foreground_guard, independent_guard);
+            maintenance_acquired_tx.send(()).unwrap();
+        });
+
+        assert!(foreground_acquired_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        drop(_foreground_reader);
+        foreground_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("maintenance acquires foreground domain");
+        continue_tx.send(()).unwrap();
+        assert!(maintenance_acquired_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        drop(_independent_reader);
+        maintenance_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("maintenance acquires after both readers drain");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn independent_connection_drops_before_activity_permit() {
+        let gate = ActivityGate::default();
+        let conn = Connection::open_in_memory().expect("open database");
+        let reader = IndependentReadConnection::new(conn, gate.read("test_connection"));
+        assert_eq!(reader.is_autocommit(), true);
+        drop(reader);
+        assert!(gate.try_write("test_maintenance").is_some());
+    }
+
+    #[test]
+    fn read_only_journal_mode_failure_names_request_and_sqlite_error() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("read-only-journal-mode.db");
+        {
+            let conn = Connection::open(&path).expect("create database");
+            conn.execute_batch("CREATE TABLE sample (value TEXT);")
+                .expect("create fixture");
+        }
+
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("open read-only database");
+        let error = set_journal_mode(&conn, JournalMode::Wal).expect_err("WAL must be rejected");
+        assert!(
+            error.contains("wal"),
+            "diagnostic should name request: {error}"
+        );
+        assert!(
+            error.to_ascii_lowercase().contains("readonly")
+                || error.to_ascii_lowercase().contains("read-only")
+                || error.contains("effective mode is"),
+            "diagnostic should preserve SQLite failure context: {error}"
+        );
+    }
+}
