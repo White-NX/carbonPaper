@@ -156,6 +156,13 @@ impl StorageState {
         }
     }
 
+    fn is_migration_excluded(relative: &Path) -> bool {
+        let normalized = relative.to_string_lossy().replace('\\', "/");
+        database_snapshot::DATABASE_RUNTIME_FILE_NAMES.contains(&normalized.as_str())
+            || normalized == "logs"
+            || normalized.starts_with("logs/")
+    }
+
     fn migration_file_count(source: &Path) -> Result<usize, String> {
         let mut count = 0usize;
         for entry in WalkDir::new(source).follow_links(false).into_iter() {
@@ -167,8 +174,7 @@ impl StorageState {
                 .path()
                 .strip_prefix(source)
                 .map_err(|error| format!("Failed to compute migration path: {error}"))?;
-            let relative = relative.to_string_lossy().replace('\\', "/");
-            if !database_snapshot::DATABASE_RUNTIME_FILE_NAMES.contains(&relative.as_str()) {
+            if !Self::is_migration_excluded(relative) {
                 count += 1;
             }
         }
@@ -295,15 +301,7 @@ impl StorageState {
             let copy_result = database_snapshot::copy_directory_tree(
                 &source,
                 staging.path(),
-                |relative, _| {
-                    relative
-                        .to_str()
-                        .map(|value| {
-                            database_snapshot::DATABASE_RUNTIME_FILE_NAMES
-                                .contains(&value.replace('\\', "/").as_str())
-                        })
-                        .unwrap_or(false)
-                },
+                |relative, _| Self::is_migration_excluded(relative),
                 |copied, relative| {
                     if self.is_migration_cancel_requested() {
                         return Err(CANCELLED.to_string());
@@ -463,6 +461,33 @@ mod tests {
         assert!(error.contains("injected"));
         assert_eq!(std::fs::read(source.join("one.bin")).unwrap(), b"one");
         assert_eq!(std::fs::read(source.join("two.bin")).unwrap(), b"two");
+    }
+
+    #[test]
+    fn migration_excludes_logs_from_count_and_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let staging = root.path().join("staging");
+        let log_path = source
+            .join("logs")
+            .join("2026-08-24")
+            .join("carbonpaper.log");
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(&log_path, b"active log").unwrap();
+        std::fs::write(source.join("keep.bin"), b"keep").unwrap();
+
+        assert_eq!(StorageState::migration_file_count(&source).unwrap(), 1);
+        database_snapshot::copy_directory_tree(
+            &source,
+            &staging,
+            |relative, _| StorageState::is_migration_excluded(relative),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(staging.join("keep.bin")).unwrap(), b"keep");
+        assert!(!staging.join("logs").exists());
     }
 
     #[test]
