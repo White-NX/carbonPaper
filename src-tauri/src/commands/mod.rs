@@ -24,6 +24,7 @@ pub fn check_main_window(window: &tauri::Window) -> Result<(), String> {
 }
 
 pub mod credential;
+pub mod database_mode;
 pub mod mcp;
 pub mod migration;
 pub mod smart_cluster;

@@ -15,6 +15,7 @@ mod encryption;
 mod image_io;
 mod link_scoring;
 pub mod migration;
+mod mode;
 mod policy;
 mod process;
 mod schema;
@@ -36,6 +37,7 @@ pub use derived_migration::*;
 pub use document_ref::STALE_DOCUMENT_REF_GENERATION;
 #[allow(unused_imports)]
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
+pub(crate) use mode::{DatabaseModeEligibility, DatabaseModeMetadata};
 pub(crate) use policy::disk_totals_for_path;
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;

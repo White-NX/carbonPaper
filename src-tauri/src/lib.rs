@@ -1189,6 +1189,9 @@ pub fn run() {
             commands::migration::storage_hmac_migration_cancel,
             commands::migration::storage_export_backup,
             commands::migration::storage_import_backup,
+            commands::database_mode::storage_get_database_mode_metadata,
+            commands::database_mode::storage_check_database_mode_eligibility,
+            commands::database_mode::storage_transition_wal_to_delete,
             // 任务聚类命令
             commands::storage::storage_get_tasks,
             commands::storage::storage_get_related_screenshots,

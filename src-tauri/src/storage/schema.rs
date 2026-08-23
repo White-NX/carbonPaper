@@ -75,6 +75,7 @@ impl StorageState {
         // Initialize table schema
         let t3 = std::time::Instant::now();
         self.init_tables(&conn)?;
+        self.initialize_database_mode_metadata(&conn, &connection_status.journal_mode)?;
         self.cleanup_derived_index_sidecars_at_startup(&conn, &data_dir)?;
         Self::set_auto_vacuum_incremental(&conn)?;
         let tables_dur = t3.elapsed();
@@ -708,6 +709,32 @@ impl StorageState {
                 key TEXT PRIMARY KEY,
                 value TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Persist the effective SQLite journal mode and the last
+            -- controlled-transition outcome.  The row is deliberately kept
+            -- in the authoritative database so a restart can diagnose an
+            -- interrupted WAL-to-DELETE request without relying on sidecars.
+            CREATE TABLE IF NOT EXISTS database_mode_metadata (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                actual_journal_mode TEXT NOT NULL CHECK (
+                    actual_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
+                ),
+                requested_journal_mode TEXT NOT NULL CHECK (
+                    requested_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
+                ),
+                transition_state TEXT NOT NULL CHECK (
+                    transition_state IN ('stable', 'transitioning', 'failed')
+                ),
+                transition_id TEXT,
+                previous_journal_mode TEXT CHECK (
+                    previous_journal_mode IS NULL OR
+                    previous_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
+                ),
+                last_error TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             -- One durable row per automatic background task. The scheduler
