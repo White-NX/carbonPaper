@@ -7,6 +7,7 @@
 
 mod background_scheduler;
 mod connection;
+pub(crate) mod database_snapshot;
 mod derived_index;
 mod derived_migration;
 mod document_ref;
@@ -330,6 +331,35 @@ impl StorageState {
 
     pub(crate) fn derived_generation_publish_guard(&self) -> std::sync::MutexGuard<'_, ()> {
         self.derived_generation_publish_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn database_key(&self) -> Result<Vec<u8>, String> {
+        let public_key = get_cached_public_key(&self.credential_state)
+            .or_else(|| load_public_key_from_file(&self.credential_state).ok())
+            .ok_or_else(|| "Public key not initialized".to_string())?;
+        Ok(derive_db_key_from_public_key(&public_key))
+    }
+
+    /// Prepare the live primary connection for a closed, static snapshot and
+    /// return its effective journal mode while the caller owns maintenance.
+    pub(crate) fn prepare_database_snapshot_under_maintenance(&self) -> Result<String, String> {
+        let guard = self.get_connection_named("database_journal_mode_snapshot")?;
+        let connection = guard
+            .as_ref()
+            .ok_or_else(|| "Database not initialized".to_string())?;
+        let status = connection::inspect_connection(connection)
+            .map_err(|error| format!("Failed to inspect database journal mode: {error}"))?;
+        if status.journal_mode == "wal" {
+            connection::preserve_wal_sidecars_on_close(connection)?;
+        }
+        Ok(status.journal_mode)
+    }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        *self
+            .initialized
             .lock()
             .unwrap_or_else(|error| error.into_inner())
     }

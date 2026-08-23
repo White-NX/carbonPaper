@@ -304,6 +304,33 @@ pub(crate) fn inspect_connection(conn: &Connection) -> Result<ConnectionStatus> 
     })
 }
 
+/// Keep WAL and shared-memory sidecars after the final connection closes.
+///
+/// SQLite normally checkpoints and removes both files when the last WAL
+/// connection exits. Backup and data-directory migration need the closed,
+/// static file group to retain those members long enough to copy and hash
+/// them, so they enable this per-file-handle control immediately before
+/// shutting down the primary connection.
+pub(crate) fn preserve_wal_sidecars_on_close(conn: &Connection) -> Result<(), String> {
+    let mut enabled = 1i32;
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            b"main\0".as_ptr().cast(),
+            rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+            (&mut enabled as *mut i32).cast(),
+        )
+    };
+    if result == rusqlite::ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(format!(
+            "Failed to preserve WAL sidecars for snapshot: SQLite error {result} ({})",
+            rusqlite::ffi::code_to_str(result)
+        ))
+    }
+}
+
 /// Request a journal mode and verify SQLite's effective result.
 ///
 /// V1 does not call this during startup. Later WAL experiments can use it and
@@ -393,6 +420,28 @@ mod tests {
 
         let status = set_journal_mode(&conn, JournalMode::Delete).expect("restore DELETE");
         assert_eq!(status.journal_mode, "delete");
+    }
+
+    #[test]
+    fn persistent_wal_control_keeps_sidecars_after_last_connection_closes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("persistent-wal.db");
+        let conn = Connection::open(&path).expect("open database");
+        conn.execute_batch("CREATE TABLE records(value TEXT);")
+            .expect("create table");
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable autocheckpoint");
+        set_journal_mode(&conn, JournalMode::Wal).expect("enable WAL");
+        conn.execute("INSERT INTO records VALUES ('committed')", [])
+            .expect("insert");
+        assert!(path.with_extension("db-wal").exists());
+        assert!(path.with_extension("db-shm").exists());
+
+        preserve_wal_sidecars_on_close(&conn).expect("preserve sidecars");
+        drop(conn);
+
+        assert!(path.with_file_name("persistent-wal.db-wal").exists());
+        assert!(path.with_file_name("persistent-wal.db-shm").exists());
     }
 
     #[test]

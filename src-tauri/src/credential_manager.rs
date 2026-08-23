@@ -79,6 +79,21 @@ pub struct CredentialManagerState {
     background_lease_active: Mutex<bool>,
 }
 
+/// In-memory and persisted state changed by backup credential import.
+///
+/// Backup restore captures this before installing a replacement master key so
+/// any later file, database-initialization, or rollback failure can put the
+/// authenticated session and credential file back exactly as they were.
+#[derive(Debug)]
+pub(crate) struct CredentialImportSnapshot {
+    master_key_file: Option<Vec<u8>>,
+    cached_db_key: Option<Vec<u8>>,
+    cached_public_key: Option<Vec<u8>>,
+    cached_master_key: Option<Vec<u8>>,
+    last_auth_time: Option<std::time::Instant>,
+    background_lease_active: bool,
+}
+
 impl CredentialManagerState {
     pub fn get_hmac_key(&self) -> Result<Vec<u8>, String> {
         let guard = self.cached_master_key.lock().unwrap();
@@ -339,6 +354,103 @@ impl CredentialManagerState {
 
     fn master_key_file_path(&self) -> PathBuf {
         self.file_path(MASTER_KEY_FILE_NAME)
+    }
+
+    pub(crate) fn snapshot_import_state(&self) -> Result<CredentialImportSnapshot, String> {
+        let master_key_path = self.master_key_file_path();
+        let master_key_file = if master_key_path.exists() {
+            Some(std::fs::read(&master_key_path).map_err(|error| {
+                format!(
+                    "Failed to snapshot credential file {}: {error}",
+                    master_key_path.display()
+                )
+            })?)
+        } else {
+            None
+        };
+
+        Ok(CredentialImportSnapshot {
+            master_key_file,
+            cached_db_key: self
+                .cached_db_key
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+            cached_public_key: self
+                .cached_public_key
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+            cached_master_key: self
+                .cached_master_key
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+            last_auth_time: *self
+                .last_auth_time
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            background_lease_active: *self
+                .background_lease_active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        })
+    }
+
+    pub(crate) fn restore_import_state(
+        &self,
+        snapshot: CredentialImportSnapshot,
+    ) -> Result<(), String> {
+        let master_key_path = self.master_key_file_path();
+        let file_result = match snapshot.master_key_file {
+            Some(contents) => {
+                if let Some(parent) = master_key_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!(
+                            "Failed to recreate credential directory {}: {error}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                std::fs::write(&master_key_path, contents).map_err(|error| {
+                    format!(
+                        "Failed to restore credential file {}: {error}",
+                        master_key_path.display()
+                    )
+                })
+            }
+            None => match std::fs::remove_file(&master_key_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!(
+                    "Failed to remove replacement credential file {}: {error}",
+                    master_key_path.display()
+                )),
+            },
+        };
+
+        *self
+            .cached_db_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot.cached_db_key;
+        *self
+            .cached_public_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot.cached_public_key;
+        *self
+            .cached_master_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot.cached_master_key;
+        *self
+            .last_auth_time
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot.last_auth_time;
+        *self
+            .background_lease_active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot.background_lease_active;
+
+        file_result
     }
 
     pub fn import_master_key(&self, master_key: &[u8]) -> Result<(), CredentialError> {
@@ -1469,6 +1581,44 @@ mod tests {
             get_cached_master_key(&state),
             Some(vec![9u8; MASTER_KEY_LEN])
         );
+    }
+
+    #[test]
+    fn import_snapshot_restores_credential_file_and_cached_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = CredentialManagerState::new(temp.path().to_path_buf());
+        std::fs::write(state.master_key_file_path(), b"old-credential").unwrap();
+        *state.cached_db_key.lock().unwrap() = Some(vec![1, 2, 3]);
+        *state.cached_public_key.lock().unwrap() = Some(vec![4, 5, 6]);
+        *state.cached_master_key.lock().unwrap() = Some(vec![7; MASTER_KEY_LEN]);
+        state.update_auth_time();
+        *state.background_lease_active.lock().unwrap() = true;
+
+        let snapshot = state.snapshot_import_state().unwrap();
+        std::fs::write(state.master_key_file_path(), b"replacement").unwrap();
+        *state.cached_db_key.lock().unwrap() = None;
+        *state.cached_public_key.lock().unwrap() = None;
+        *state.cached_master_key.lock().unwrap() = None;
+        *state.last_auth_time.lock().unwrap() = None;
+        *state.background_lease_active.lock().unwrap() = false;
+
+        state.restore_import_state(snapshot).unwrap();
+
+        assert_eq!(
+            std::fs::read(state.master_key_file_path()).unwrap(),
+            b"old-credential"
+        );
+        assert_eq!(*state.cached_db_key.lock().unwrap(), Some(vec![1, 2, 3]));
+        assert_eq!(
+            *state.cached_public_key.lock().unwrap(),
+            Some(vec![4, 5, 6])
+        );
+        assert_eq!(
+            *state.cached_master_key.lock().unwrap(),
+            Some(vec![7; MASTER_KEY_LEN])
+        );
+        assert!(state.last_auth_time.lock().unwrap().is_some());
+        assert!(*state.background_lease_active.lock().unwrap());
     }
 
     #[test]
