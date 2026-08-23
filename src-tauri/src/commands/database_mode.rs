@@ -48,6 +48,10 @@ pub async fn storage_transition_wal_to_delete(
 ) -> Result<DatabaseModeMetadata, String> {
     super::check_auth_required(&credential_state)?;
 
+    let Some(_maintenance) = crate::maintenance::enter("database_mode_wal_to_delete") else {
+        return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
+    };
+
     let was_running = monitor_state
         .process
         .lock()

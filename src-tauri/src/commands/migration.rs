@@ -261,6 +261,10 @@ pub async fn storage_migrate_data_dir(
 ) -> Result<serde_json::Value, String> {
     super::check_auth_required(&credential_state)?;
 
+    let Some(_maintenance) = crate::maintenance::enter("migrate_data_dir") else {
+        return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
+    };
+
     let was_running = monitor_state
         .process
         .lock()
@@ -370,6 +374,10 @@ pub async fn storage_export_backup(
     export_path: String,
 ) -> Result<(), String> {
     super::check_auth_required(&credential_state)?;
+
+    let Some(_maintenance) = crate::maintenance::enter("backup_export") else {
+        return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
+    };
 
     tracing::info!("Migration: Starting data export to {}", export_path);
 
@@ -566,6 +574,10 @@ pub async fn storage_import_backup(
     backup_zip_path: String,
 ) -> Result<(), String> {
     super::check_auth_required(&credential_state)?;
+
+    let Some(_maintenance) = crate::maintenance::enter("backup_import") else {
+        return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
+    };
 
     tracing::info!("Migration: Starting data import from {}", backup_zip_path);
 
