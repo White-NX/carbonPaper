@@ -37,7 +37,7 @@ try {
         'storage::migration::data_dir',
         'storage::connection::tests',
         'storage::mode',
-        'credential_manager::tests::import_snapshot_restores_credential_file_and_cached_state'
+        'credential_manager::tests::import_snapshot_restores_cached_state_without_touching_credential_file'
     )
 
     foreach ($test in $tests) {
