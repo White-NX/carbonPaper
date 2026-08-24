@@ -1,6 +1,6 @@
 //! Shared SQLCipher connection setup and journal-mode diagnostics.
 
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, OptionalExtension, Result};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -13,10 +13,28 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// journal mode. WAL experiments can choose a different policy explicitly.
 const SYNCHRONOUS_FULL: &str = "FULL";
 
+/// Minimum SQLite version carried by the SQLCipher bundle for this release.
+/// SQLite encodes versions as major * 1_000_000 + minor * 1_000 + patch.
+pub(crate) const MIN_SQLITE_VERSION: &str = "3.51.3";
+pub(crate) const MIN_SQLITE_VERSION_NUMBER: i64 = 3_051_003;
+#[cfg(test)]
+pub(crate) const BUNDLED_SQLCIPHER_VERSION: &str = "4.14.0";
+#[cfg(test)]
+pub(crate) const BUNDLED_SQLITE_SOURCE_ID: &str =
+    "2026-03-13 10:38:09 737ae4a34738ffa0c3ff7f9bb18df914dd1cad163f28fd6b6e114a344fe6alt1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqliteEngineIdentity {
+    pub(crate) sqlite_version: String,
+    pub(crate) sqlite_source_id: String,
+    pub(crate) cipher_version: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConnectionStatus {
     pub(crate) journal_mode: String,
     pub(crate) synchronous: String,
+    pub(crate) engine: SqliteEngineIdentity,
 }
 
 #[derive(Default)]
@@ -271,7 +289,9 @@ pub(crate) fn configure_sqlcipher_connection(
 
     // Verify the key before reading or changing any other database state.
     conn.execute_batch("SELECT count(*) FROM sqlite_master;")?;
-    configure_connection_pragmas(conn)
+    let status = configure_connection_pragmas(conn)?;
+    ensure_supported_sqlite_engine(&status.engine, true)?;
+    Ok(status)
 }
 
 /// Apply the connection-local policy shared by primary and independent reads.
@@ -284,6 +304,9 @@ pub(crate) fn configure_connection_pragmas(conn: &Connection) -> Result<Connecti
 
 /// Read the effective connection state without changing the journal mode.
 pub(crate) fn inspect_connection(conn: &Connection) -> Result<ConnectionStatus> {
+    let engine = inspect_sqlite_engine(conn)?;
+    ensure_supported_sqlite_engine(&engine, false)?;
+
     let journal_mode =
         conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?;
     let synchronous = conn.pragma_query_value(None, "synchronous", |row| {
@@ -301,7 +324,82 @@ pub(crate) fn inspect_connection(conn: &Connection) -> Result<ConnectionStatus> 
     Ok(ConnectionStatus {
         journal_mode: journal_mode.trim().to_ascii_lowercase(),
         synchronous,
+        engine,
     })
+}
+
+/// Query the SQLite and SQLCipher identities from the linked runtime.
+///
+/// These values are collected at runtime instead of inferred from the Rust
+/// dependency graph so a release log can prove which native library was
+/// actually linked and opened the database.
+pub(crate) fn inspect_sqlite_engine(conn: &Connection) -> Result<SqliteEngineIdentity> {
+    let (sqlite_version, sqlite_source_id): (String, String) =
+        conn.query_row("SELECT sqlite_version(), sqlite_source_id()", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    let cipher_version = conn
+        .query_row("PRAGMA cipher_version", [], |row| row.get::<_, String>(0))
+        .optional()?
+        .unwrap_or_default();
+
+    Ok(SqliteEngineIdentity {
+        sqlite_version,
+        sqlite_source_id,
+        cipher_version,
+    })
+}
+
+fn ensure_supported_sqlite_engine(
+    engine: &SqliteEngineIdentity,
+    require_sqlcipher: bool,
+) -> Result<()> {
+    let version_number = parse_sqlite_version_number(&engine.sqlite_version).ok_or_else(|| {
+        engine_compatibility_error(format!(
+            "SQLCipher reported an invalid SQLite version '{}'; minimum supported version is {}",
+            engine.sqlite_version, MIN_SQLITE_VERSION
+        ))
+    })?;
+
+    if version_number < MIN_SQLITE_VERSION_NUMBER {
+        return Err(engine_compatibility_error(format!(
+            "SQLCipher SQLite version {} is below the required baseline {}; source_id='{}', cipher_version='{}'",
+            engine.sqlite_version,
+            MIN_SQLITE_VERSION,
+            engine.sqlite_source_id,
+            engine.cipher_version
+        )));
+    }
+    if engine.sqlite_source_id.trim().is_empty() {
+        return Err(engine_compatibility_error(
+            "SQLCipher returned an empty SQLite source id".to_string(),
+        ));
+    }
+    if require_sqlcipher && engine.cipher_version.trim().is_empty() {
+        return Err(engine_compatibility_error(
+            "The linked SQLite runtime does not expose SQLCipher cipher_version".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_sqlite_version_number(version: &str) -> Option<i64> {
+    let mut components = version.split('.');
+    let major = components.next()?.parse::<i64>().ok()?;
+    let minor = components.next()?.parse::<i64>().ok()?;
+    let patch = components.next()?.parse::<i64>().ok()?;
+    if components.next().is_some() || major < 0 || minor < 0 || patch < 0 {
+        return None;
+    }
+    Some(major * 1_000_000 + minor * 1_000 + patch)
+}
+
+fn engine_compatibility_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(message),
+    )
 }
 
 /// Keep WAL and shared-memory sidecars after the final connection closes.
@@ -396,6 +494,40 @@ mod tests {
     }
 
     #[test]
+    fn bundled_sqlcipher_reports_supported_runtime_identity() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        let engine = inspect_sqlite_engine(&conn).expect("inspect SQLite engine");
+
+        assert_eq!(engine.sqlite_version, MIN_SQLITE_VERSION);
+        assert_eq!(engine.sqlite_source_id, BUNDLED_SQLITE_SOURCE_ID);
+        assert!(
+            engine
+                .cipher_version
+                .split_whitespace()
+                .next()
+                .is_some_and(|version| version == BUNDLED_SQLCIPHER_VERSION),
+            "unexpected SQLCipher runtime version: {}",
+            engine.cipher_version
+        );
+
+        let status = configure_connection_pragmas(&conn).expect("configure connection");
+        assert_eq!(status.engine, engine);
+    }
+
+    #[test]
+    fn sqlite_baseline_guard_rejects_older_runtime() {
+        let engine = SqliteEngineIdentity {
+            sqlite_version: "3.45.3".into(),
+            sqlite_source_id: "fixture-source".into(),
+            cipher_version: format!("{} community", BUNDLED_SQLCIPHER_VERSION),
+        };
+
+        let error = ensure_supported_sqlite_engine(&engine, true)
+            .expect_err("an older SQLite runtime must be rejected");
+        assert!(error.to_string().contains(MIN_SQLITE_VERSION));
+    }
+
+    #[test]
     fn configuration_preserves_existing_journal_mode() {
         let temp = tempfile::tempdir().expect("create temporary directory");
         let path = temp.path().join("journal-mode.db");
@@ -474,6 +606,25 @@ mod tests {
             .query_row("SELECT value FROM sample", [], |row| row.get(0))
             .expect("read encrypted fixture");
         assert_eq!(value, "ready");
+    }
+
+    #[test]
+    fn encrypted_database_rejects_an_incorrect_key() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("wrong-key.db");
+        let key = [0x3a; 32];
+
+        {
+            let conn = Connection::open(&path).expect("open encrypted database");
+            configure_sqlcipher_connection(&conn, &key).expect("configure database");
+            conn.execute_batch("CREATE TABLE sample (value TEXT NOT NULL);")
+                .expect("create encrypted fixture");
+        }
+
+        let conn = Connection::open(&path).expect("reopen encrypted database");
+        let error = configure_sqlcipher_connection(&conn, &[0x3b; 32])
+            .expect_err("an incorrect key must fail before pragmas are applied");
+        assert!(!error.to_string().trim().is_empty());
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use super::StorageState;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use rand::RngCore;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -24,6 +24,15 @@ const MAX_VECTOR_DIMENSIONS: usize = 65_536;
 const SIDECAR_PAGE_SIZE: u32 = 512;
 const LEASE_TOKEN_BYTES: usize = 16;
 pub const DERIVED_GENERATION_CANCELLED: &str = "DERIVED_GENERATION_CANCELLED";
+
+fn sqlite_i64(value: u64, field: &str) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| format!("{field} exceeds SQLite INTEGER range: {value}"))
+}
+
+fn sqlite_u64_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1811,11 +1820,11 @@ impl StorageState {
             |row| {
                 Ok(DerivedIndexGeneration {
                     index_kind,
-                    generation: row.get(0)?,
-                    data_epoch: row.get(1)?,
+                    generation: sqlite_u64_from_row(row, 0)?,
+                    data_epoch: sqlite_u64_from_row(row, 1)?,
                     file_name: row.get(2)?,
                     checksum_sha256: row.get(3)?,
-                    row_count: row.get(4)?,
+                    row_count: sqlite_u64_from_row(row, 4)?,
                     dimensions: row.get(5)?,
                     model_id: row.get(6)?,
                     model_revision: row.get(7)?,
@@ -2132,6 +2141,9 @@ impl StorageState {
         if current_epoch < generation.covered_epoch {
             return Err("ANN generation covers an epoch newer than SQLite".to_string());
         }
+        let generation_id = sqlite_i64(generation.generation, "ANN generation")?;
+        let covered_epoch = sqlite_i64(generation.covered_epoch, "ANN covered epoch")?;
+        let row_count = sqlite_i64(generation.row_count, "ANN row count")?;
         tx.execute(
             r#"
             INSERT INTO derived_ann_generations (
@@ -2171,13 +2183,13 @@ impl StorageState {
             "#,
             params![
                 generation.index_kind.as_str(),
-                generation.generation,
-                generation.covered_epoch,
+                generation_id,
+                covered_epoch,
                 generation.flat_file_name,
                 generation.flat_checksum_sha256,
                 generation.ann_file_name,
                 generation.ann_checksum_sha256,
-                generation.row_count,
+                row_count,
                 generation.dimensions,
                 generation.model_id,
                 generation.model_revision,
@@ -2199,7 +2211,7 @@ impl StorageState {
             DELETE FROM derived_ann_changes
             WHERE index_kind = ?1 AND change_epoch <= ?2
             "#,
-            params![generation.index_kind.as_str(), generation.covered_epoch],
+            params![generation.index_kind.as_str(), covered_epoch],
         )
         .map_err(|error| format!("Failed to prune covered ANN changes: {error}"))?;
         tx.execute(
@@ -2225,7 +2237,10 @@ impl StorageState {
                 SELECT COUNT(*) FROM derived_ann_changes
                 WHERE index_kind = ?1 AND change_epoch > ?2
                 "#,
-                params![index_kind.as_str(), covered_epoch],
+                params![
+                    index_kind.as_str(),
+                    sqlite_i64(covered_epoch, "ANN covered epoch")?
+                ],
                 |row| row.get(0),
             )
             .map_err(|error| format!("Failed to count ANN tail: {error}"))?;
@@ -2277,13 +2292,19 @@ impl StorageState {
                 )
                 .map_err(|error| format!("Failed to prepare ANN tail query: {error}"))?;
             let rows = statement
-                .query_map(params![index_kind.as_str(), covered_epoch], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                    ))
-                })
+                .query_map(
+                    params![
+                        index_kind.as_str(),
+                        sqlite_i64(covered_epoch, "ANN covered epoch")?
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                        ))
+                    },
+                )
                 .map_err(|error| format!("Failed to query ANN tail: {error}"))?;
             let mut out = Vec::with_capacity(count as usize);
             for row in rows {
@@ -2407,6 +2428,9 @@ impl StorageState {
         if current_epoch != generation.data_epoch {
             return Err("Derived index changed while generation was being published".to_string());
         }
+        let generation_id = sqlite_i64(generation.generation, "derived generation")?;
+        let data_epoch = sqlite_i64(generation.data_epoch, "derived data epoch")?;
+        let row_count = sqlite_i64(generation.row_count, "derived row count")?;
         tx.execute(
             r#"
             INSERT INTO derived_index_generations (
@@ -2427,11 +2451,11 @@ impl StorageState {
             "#,
             params![
                 generation.index_kind.as_str(),
-                generation.generation,
-                generation.data_epoch,
+                generation_id,
+                data_epoch,
                 generation.file_name,
                 generation.checksum_sha256,
-                generation.row_count,
+                row_count,
                 generation.dimensions,
                 generation.model_id,
                 generation.model_revision,

@@ -1853,9 +1853,30 @@ pub(crate) fn remove_path(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::{
+        aead::{Aead, KeyInit},
+        Aes256Gcm, Nonce,
+    };
+    use argon2::Argon2;
+    use base64::Engine;
     use std::io::Write;
     use tempfile::tempdir;
     use zip::write::SimpleFileOptions;
+
+    const LEGACY_SQLCIPHER_3453_FIXTURE_BASE64: &str =
+        include_str!("fixtures/sqlcipher-3.45.3.db.b64");
+
+    fn write_legacy_sqlcipher_fixture(directory: &Path) -> PathBuf {
+        let path = directory.join(DATABASE_FILE_NAME);
+        let encoded = LEGACY_SQLCIPHER_3453_FIXTURE_BASE64
+            .split_whitespace()
+            .collect::<String>();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("decode legacy SQLCipher fixture");
+        std::fs::write(&path, bytes).expect("write legacy SQLCipher fixture");
+        path
+    }
 
     fn create_encrypted_database(directory: &Path, key: &[u8]) -> Connection {
         std::fs::create_dir_all(directory).unwrap();
@@ -1907,6 +1928,216 @@ mod tests {
         assert!(snapshot.path().join(DATABASE_FILE_NAME).exists());
         assert!(!snapshot.path().join(DATABASE_WAL_FILE_NAME).exists());
         assert!(!snapshot.path().join(DATABASE_SHM_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn delete_snapshot_validates_and_reopens_encrypted_database() {
+        let source = tempdir().unwrap();
+        let key = [13u8; 32];
+        let connection = create_encrypted_database(source.path(), &key);
+        connection
+            .execute("INSERT INTO records VALUES ('from delete')", [])
+            .unwrap();
+        drop(connection);
+        let parent = tempdir().unwrap();
+
+        let snapshot = create_database_snapshot(source.path(), "delete", parent.path()).unwrap();
+        validate_database_snapshot(snapshot.path(), &snapshot.manifest, &key).unwrap();
+
+        let copied = Connection::open(snapshot.path().join(DATABASE_FILE_NAME)).unwrap();
+        let status = connection::configure_sqlcipher_connection(&copied, &key).unwrap();
+        let values: Vec<String> = copied
+            .prepare("SELECT value FROM records ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        assert_eq!(values, ["base", "from delete"]);
+        assert_eq!(status.engine.sqlite_version, connection::MIN_SQLITE_VERSION);
+        assert_eq!(status.journal_mode, "delete");
+        assert_eq!(snapshot.manifest.database_files.len(), 1);
+    }
+
+    #[test]
+    fn legacy_sqlcipher_3453_database_survives_new_runtime_snapshot_and_reopen() {
+        let source = tempdir().unwrap();
+        let key = [0x3a; 32];
+        let database = write_legacy_sqlcipher_fixture(source.path());
+
+        let connection = Connection::open(&database).unwrap();
+        let status = connection::configure_sqlcipher_connection(&connection, &key).unwrap();
+        assert_eq!(status.engine.sqlite_version, connection::MIN_SQLITE_VERSION);
+        assert_eq!(status.engine.cipher_version, "4.14.0 community");
+        let legacy_value: String = connection
+            .query_row(
+                "SELECT value FROM legacy_records ORDER BY rowid LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_value, "old-baseline");
+        connection
+            .execute(
+                "INSERT INTO legacy_records(value) VALUES (?1)",
+                ["new-baseline"],
+            )
+            .unwrap();
+        drop(connection);
+
+        let parent = tempdir().unwrap();
+        let snapshot = create_database_snapshot(source.path(), "delete", parent.path()).unwrap();
+        validate_database_snapshot(snapshot.path(), &snapshot.manifest, &key).unwrap();
+
+        let reopened = Connection::open(snapshot.path().join(DATABASE_FILE_NAME)).unwrap();
+        connection::configure_sqlcipher_connection(&reopened, &key).unwrap();
+        let values: Vec<String> = reopened
+            .prepare("SELECT value FROM legacy_records ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(values, ["old-baseline", "new-baseline"]);
+    }
+
+    #[test]
+    fn encrypted_delete_backup_archive_round_trips_through_restore_transaction() {
+        let root = tempdir().unwrap();
+        let data = root.path().join("data");
+        let archive_path = root.path().join("backup.zip");
+        let snapshot_parent = tempdir().unwrap();
+        let extraction_parent = tempdir().unwrap();
+        let database_key = [0x2au8; 32];
+        let master_key = [0x71u8; 32];
+        let password = b"archive-password";
+        let salt = "carbonpaper-archive-test-salt";
+        let nonce_bytes = [0x43u8; 12];
+
+        let connection = create_encrypted_database(&data, &database_key);
+        connection
+            .execute("INSERT INTO records VALUES ('archive payload')", [])
+            .unwrap();
+        drop(connection);
+        std::fs::create_dir_all(data.join("screenshots")).unwrap();
+        std::fs::create_dir_all(data.join("chroma_db")).unwrap();
+        std::fs::write(data.join("screenshots/record.enc"), b"encrypted screenshot").unwrap();
+        std::fs::write(data.join("chroma_db/record.bin"), b"derived payload").unwrap();
+        write_restore_credential(&data, b"old wrapped credential");
+
+        // Build the same four-part encrypted archive produced by the export
+        // command: database snapshot, payload files, metadata, and wrapped
+        // master key.  Keeping this in a unit test exercises the actual ZIP
+        // extraction boundary rather than only testing synthetic entries.
+        let snapshot = create_database_snapshot(&data, "delete", snapshot_parent.path()).unwrap();
+        copy_payload_tree(&data, snapshot.path()).unwrap();
+        let mut derived_key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(password, salt.as_bytes(), &mut derived_key)
+            .unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&derived_key).unwrap();
+        let encrypted_master_key = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), master_key.as_slice())
+            .unwrap();
+        std::fs::write(
+            snapshot.path().join(BACKUP_METADATA_FILE_NAME),
+            serde_json::json!({
+                "salt": salt,
+                "nonce": hex::encode(nonce_bytes),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            snapshot.path().join(BACKUP_MASTER_KEY_FILE_NAME),
+            encrypted_master_key,
+        )
+        .unwrap();
+        write_manifest(
+            &snapshot.path().join(BACKUP_MANIFEST_FILE_NAME),
+            &snapshot.manifest,
+        )
+        .unwrap();
+
+        let mut files = Vec::new();
+        for entry in walkdir::WalkDir::new(snapshot.path())
+            .follow_links(false)
+            .into_iter()
+        {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file() {
+                let relative = entry.path().strip_prefix(snapshot.path()).unwrap();
+                files.push((
+                    entry.path().to_path_buf(),
+                    relative.to_string_lossy().replace('\\', "/"),
+                ));
+            }
+        }
+        files.sort_by(|left, right| left.1.cmp(&right.1));
+        let output = File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(output);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (path, name) in files {
+            zip.start_file(name, options).unwrap();
+            let mut input = File::open(path).unwrap();
+            std::io::copy(&mut input, &mut zip).unwrap();
+        }
+        zip.finish().unwrap();
+
+        let extracted =
+            extract_backup_archive(&archive_path, extraction_parent.path(), |_, _, _| {}).unwrap();
+        assert!(!extracted.legacy);
+        let metadata: serde_json::Value = serde_json::from_slice(&extracted.metadata).unwrap();
+        let extracted_salt = metadata["salt"].as_str().unwrap();
+        let extracted_nonce = hex::decode(metadata["nonce"].as_str().unwrap()).unwrap();
+        let mut extracted_derived_key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(
+                password,
+                extracted_salt.as_bytes(),
+                &mut extracted_derived_key,
+            )
+            .unwrap();
+        let extracted_master_key = Aes256Gcm::new_from_slice(&extracted_derived_key)
+            .unwrap()
+            .decrypt(
+                Nonce::from_slice(&extracted_nonce),
+                extracted.encrypted_master_key.as_slice(),
+            )
+            .unwrap();
+        assert_eq!(extracted_master_key, master_key);
+
+        validate_database_snapshot(extracted.path(), &extracted.manifest, &database_key).unwrap();
+        write_staged_file(
+            &extracted.path().join(MASTER_KEY_FILE_NAME),
+            b"new wrapped credential",
+        )
+        .unwrap();
+        RestoreFileTransaction::install(&data, extracted.path())
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let reopened = Connection::open(data.join(DATABASE_FILE_NAME)).unwrap();
+        connection::configure_sqlcipher_connection(&reopened, &database_key).unwrap();
+        let values: Vec<String> = reopened
+            .prepare("SELECT value FROM records ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(values, ["base", "archive payload"]);
+        assert_eq!(
+            std::fs::read(data.join("screenshots/record.enc")).unwrap(),
+            b"encrypted screenshot"
+        );
+        assert_eq!(
+            std::fs::read(data.join(MASTER_KEY_FILE_NAME)).unwrap(),
+            b"new wrapped credential"
+        );
     }
 
     #[test]

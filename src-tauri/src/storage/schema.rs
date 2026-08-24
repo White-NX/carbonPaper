@@ -109,11 +109,14 @@ impl StorageState {
         *initialized = true;
 
         tracing::info!(
-            "[DIAG:INIT] SQLCipher initialized in {:?} (key_derive={:?}, db_open={:?}, pragma={:?}, journal_mode={}, synchronous={}, init_tables={:?})",
+            "[DIAG:INIT] SQLCipher initialized in {:?} (key_derive={:?}, db_open={:?}, pragma={:?}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, journal_mode={}, synchronous={}, init_tables={:?})",
             init_start.elapsed(),
             key_derive_dur,
             open_dur,
             pragma_dur,
+            connection_status.engine.sqlite_version,
+            connection_status.engine.sqlite_source_id,
+            connection_status.engine.cipher_version,
             connection_status.journal_mode,
             connection_status.synchronous,
             tables_dur
@@ -1680,6 +1683,100 @@ mod tests {
             "idx_derived_migration_runs_updated"
         ));
         assert!(object_exists(&conn, "table", "screenshot_document_refs"));
+    }
+
+    #[test]
+    fn encrypted_schema_initialization_is_idempotent_after_reopen() {
+        let (temp, storage) = test_storage();
+        let path = temp.path().join("schema-upgrade.db");
+        let key = [0x6d; 32];
+
+        {
+            let conn = Connection::open(&path).expect("open encrypted schema database");
+            connection::configure_sqlcipher_connection(&conn, &key)
+                .expect("configure encrypted schema database");
+            storage
+                .init_tables(&conn)
+                .expect("initialize encrypted schema");
+            conn.execute(
+                "INSERT INTO app_metadata (key, value) VALUES (?1, ?2)",
+                params!["sqlcipher_baseline_fixture", "preserved"],
+            )
+            .expect("write compatibility marker");
+        }
+
+        let conn = Connection::open(&path).expect("reopen encrypted schema database");
+        let status = connection::configure_sqlcipher_connection(&conn, &key)
+            .expect("configure reopened encrypted schema database");
+        storage
+            .init_tables(&conn)
+            .expect("re-run schema migrations after reopen");
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM app_metadata WHERE key = ?1",
+                ["sqlcipher_baseline_fixture"],
+                |row| row.get(0),
+            )
+            .expect("read compatibility marker");
+
+        assert_eq!(value, "preserved");
+        assert_eq!(status.engine.sqlite_version, connection::MIN_SQLITE_VERSION);
+        assert_eq!(status.journal_mode, "delete");
+    }
+
+    #[test]
+    fn encrypted_schema_migration_carries_legacy_rows_across_reopen() {
+        let (temp, storage) = test_storage();
+        let path = temp.path().join("encrypted-schema-migration.db");
+        let key = [0x74; 32];
+
+        {
+            let conn = Connection::open(&path).expect("open encrypted migration database");
+            connection::configure_sqlcipher_connection(&conn, &key)
+                .expect("configure encrypted migration database");
+            conn.execute_batch(LEGACY_MIGRATION_TABLES)
+                .expect("install legacy migration tables");
+            conn.execute_batch(LEGACY_MIGRATION_INDEXES)
+                .expect("install legacy migration indexes");
+            insert_legacy_run(&conn, "minilm_migration_runs", "encrypted-legacy-run");
+            conn.execute_batch(
+                "INSERT INTO minilm_migration_subjects
+                     (run_id, subject_key, outcome, source_fingerprint)
+                 VALUES ('encrypted-legacy-run', 'screenshot:7', 'migrated', 'fingerprint-7');",
+            )
+            .expect("insert encrypted legacy subject row");
+
+            storage
+                .init_tables(&conn)
+                .expect("migrate encrypted legacy schema");
+        }
+
+        let conn = Connection::open(&path).expect("reopen encrypted migration database");
+        let status = connection::configure_sqlcipher_connection(&conn, &key)
+            .expect("configure reopened encrypted migration database");
+        storage
+            .init_tables(&conn)
+            .expect("re-run encrypted schema migration");
+
+        let kind: String = conn
+            .query_row(
+                "SELECT index_kind FROM derived_migration_runs WHERE run_id = ?1",
+                ["encrypted-legacy-run"],
+                |row| row.get(0),
+            )
+            .expect("read migrated encrypted legacy run");
+        let subjects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM derived_migration_subjects WHERE run_id = ?1",
+                ["encrypted-legacy-run"],
+                |row| row.get(0),
+            )
+            .expect("count migrated encrypted subjects");
+
+        assert_eq!(kind, "semantic_text");
+        assert_eq!(subjects, 1);
+        assert_eq!(status.engine.sqlite_version, connection::MIN_SQLITE_VERSION);
+        assert_eq!(status.journal_mode, "delete");
     }
 
     #[test]

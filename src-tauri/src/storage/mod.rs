@@ -435,8 +435,11 @@ impl StorageState {
             );
         }
         tracing::debug!(
-            "[DIAG:DB] read connection configured caller={} journal_mode={} synchronous={}",
+            "[DIAG:DB] read connection configured caller={} sqlite_version={} sqlite_source_id={} cipher_version={} journal_mode={} synchronous={}",
             caller,
+            status.engine.sqlite_version,
+            status.engine.sqlite_source_id,
+            status.engine.cipher_version,
             status.journal_mode,
             status.synchronous
         );
