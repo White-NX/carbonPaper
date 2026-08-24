@@ -824,6 +824,23 @@ pub fn run() {
 
                 build_tray(app)?;
 
+                match storage::database_snapshot::recover_interrupted_restore(&data_dir) {
+                    Ok(true) => tracing::warn!(
+                        "Recovered an interrupted backup restore before storage startup"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!("Failed to recover interrupted backup restore: {error}");
+                        error_window::show_error_window(
+                            app.handle(),
+                            &format!(
+                                "CarbonPaper could not safely recover an interrupted backup restore. Your existing data has been left untouched.\n\n{error}"
+                            ),
+                        );
+                        return Ok(());
+                    }
+                }
+
                 if updater::is_update_smoke_test_enabled() {
                     if let Some(window) = app.get_webview_window("main") {
                         if let Err(e) = window.destroy() {
@@ -1189,6 +1206,9 @@ pub fn run() {
             commands::migration::storage_hmac_migration_cancel,
             commands::migration::storage_export_backup,
             commands::migration::storage_import_backup,
+            commands::database_mode::storage_get_database_mode_metadata,
+            commands::database_mode::storage_check_database_mode_eligibility,
+            commands::database_mode::storage_transition_wal_to_delete,
             // 任务聚类命令
             commands::storage::storage_get_tasks,
             commands::storage::storage_get_related_screenshots,

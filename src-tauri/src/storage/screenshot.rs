@@ -3354,7 +3354,8 @@ impl StorageState {
         freelist_threshold: i64,
         vacuum_pages: i64,
     ) -> Result<bool, String> {
-        let Some(_foreground_gate) = self.try_foreground_db_write() else {
+        let Some(_maintenance) = self.try_database_maintenance("run_incremental_vacuum_if_idle")
+        else {
             return Ok(false);
         };
         let guard = self.get_connection_named("run_incremental_vacuum_if_idle")?;

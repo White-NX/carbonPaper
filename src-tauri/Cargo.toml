@@ -55,7 +55,10 @@ percent-encoding = "2.3.2"
 sysinfo = "0.30"
 walkdir = "2.5.0"
 rand = "0.8"
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "=0.40.2", default-features = false, features = [
+    "cache",
+    "bundled-sqlcipher-vendored-openssl",
+] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 aes-gcm = "0.10"

@@ -19,6 +19,7 @@
     "test:python:prebundle-sync": "python -m pytest monitor/tests/test_prebundle_sync.py -q --timeout=15",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
     "test:security": "node scripts/security-guards.cjs",
+    "verify:wal-foundation": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-wal-foundation.ps1",
     "test:backend:fast": "npm run test:security && npm run test:python:regression && npm run test:rust && npm run test:python:prebundle-sync",
     "tauri": "tauri",
     "debug": "npm run prepare:dev-assets && node scripts/build-ml.mjs && npm run build:semantic-ml && tauri dev",

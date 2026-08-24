@@ -6,13 +6,19 @@ use crate::credential_manager::{
 use rusqlite::{params, Connection};
 use std::sync::atomic::Ordering;
 
-use super::StorageState;
+use super::{connection, database_snapshot, StorageState};
 
 impl StorageState {
     const MCP_PRIVACY_ACKNOWLEDGED_KEY: &'static str = "mcp_privacy_acknowledged";
 
     /// Initialize storage (create directories and database).
     pub fn initialize(&self) -> Result<(), String> {
+        let _maintenance = self.database_maintenance("initialize");
+        self.initialize_under_maintenance()
+    }
+
+    /// Initialize while the caller already owns the database maintenance gate.
+    pub(crate) fn initialize_under_maintenance(&self) -> Result<(), String> {
         let init_start = std::time::Instant::now();
         let mut initialized = self.initialized.lock().unwrap_or_else(|e| e.into_inner());
         if *initialized {
@@ -38,6 +44,8 @@ impl StorageState {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
+        database_snapshot::ensure_database_creation_is_safe(&data_dir)?;
+
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data directory: {}", e))?;
         std::fs::create_dir_all(&screenshot_dir)
@@ -58,22 +66,21 @@ impl StorageState {
             Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
         let open_dur = t1.elapsed();
 
-        // Set SQLCipher key (hex format)
+        // Set the SQLCipher key, verify it, and apply shared connection-local
+        // policy. The helper intentionally leaves journal mode unchanged;
+        // V1 remains on the existing DELETE default.
         let t2 = std::time::Instant::now();
-        let key_hex = hex::encode(&db_key);
-        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key_hex))
-            .map_err(|e| format!("Failed to set database key: {}", e))?;
-
-        // Verify that the key is correct
-        conn.execute_batch("SELECT count(*) FROM sqlite_master;")
-            .map_err(|e| format!("Database key verification failed: {}", e))?;
+        let connection_status = connection::configure_sqlcipher_connection(&conn, &db_key)
+            .map_err(|e| format!("Failed to configure database connection: {}", e))?;
         let pragma_dur = t2.elapsed();
 
         // Initialize table schema
         let t3 = std::time::Instant::now();
         self.init_tables(&conn)?;
+        self.initialize_database_mode_metadata(&conn, &connection_status.journal_mode)?;
         self.cleanup_derived_index_sidecars_at_startup(&conn, &data_dir)?;
         Self::set_auto_vacuum_incremental(&conn)?;
+        database_snapshot::mark_storage_initialized(&data_dir)?;
         let tables_dur = t3.elapsed();
 
         {
@@ -102,11 +109,16 @@ impl StorageState {
         *initialized = true;
 
         tracing::info!(
-            "[DIAG:INIT] SQLCipher initialized in {:?} (key_derive={:?}, db_open={:?}, pragma={:?}, init_tables={:?})",
+            "[DIAG:INIT] SQLCipher initialized in {:?} (key_derive={:?}, db_open={:?}, pragma={:?}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, journal_mode={}, synchronous={}, init_tables={:?})",
             init_start.elapsed(),
             key_derive_dur,
             open_dur,
             pragma_dur,
+            connection_status.engine.sqlite_version,
+            connection_status.engine.sqlite_source_id,
+            connection_status.engine.cipher_version,
+            connection_status.journal_mode,
+            connection_status.synchronous,
             tables_dur
         );
 
@@ -115,6 +127,12 @@ impl StorageState {
 
     /// Shut down storage: close database connection.
     pub fn shutdown(&self) -> Result<(), String> {
+        let _maintenance = self.database_maintenance("shutdown");
+        self.shutdown_under_maintenance()
+    }
+
+    /// Close the primary connection while the maintenance gate is already held.
+    pub(crate) fn shutdown_under_maintenance(&self) -> Result<(), String> {
         self.lazy_indexer_shutdown.store(true, Ordering::SeqCst);
         // The resident semantic matrix belongs to the connection being closed.
         // Its freshness epoch is per-database, so carrying it into whatever
@@ -692,14 +710,37 @@ impl StorageState {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Enable foreign key constraints
-            PRAGMA foreign_keys = ON;
-
             -- Generic key-value store for app-level metadata / migration markers
             CREATE TABLE IF NOT EXISTS app_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Persist the effective SQLite journal mode and the last
+            -- controlled-transition outcome.  The row is deliberately kept
+            -- in the authoritative database so a restart can diagnose an
+            -- interrupted WAL-to-DELETE request without relying on sidecars.
+            CREATE TABLE IF NOT EXISTS database_mode_metadata (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                actual_journal_mode TEXT NOT NULL CHECK (
+                    actual_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
+                ),
+                requested_journal_mode TEXT NOT NULL CHECK (
+                    requested_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
+                ),
+                transition_state TEXT NOT NULL CHECK (
+                    transition_state IN ('stable', 'transitioning', 'failed')
+                ),
+                transition_id TEXT,
+                previous_journal_mode TEXT CHECK (
+                    previous_journal_mode IS NULL OR
+                    previous_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
+                ),
+                last_error TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             -- One durable row per automatic background task. The scheduler
@@ -821,6 +862,7 @@ impl StorageState {
         }
 
         let result = (|| {
+            let _maintenance = self.database_maintenance("startup_vacuum_run");
             let guard = self.get_connection_named("startup_vacuum_run")?;
             let conn = guard.as_ref().unwrap();
             Self::set_auto_vacuum_incremental(conn)?;
@@ -872,6 +914,7 @@ impl StorageState {
         }
 
         let result = (|| {
+            let _maintenance = self.database_maintenance("manual_vacuum_run");
             let guard = self.get_connection_named("manual_vacuum_run")?;
             let conn = guard.as_ref().unwrap();
             Self::set_auto_vacuum_incremental(conn)?;
@@ -1640,6 +1683,100 @@ mod tests {
             "idx_derived_migration_runs_updated"
         ));
         assert!(object_exists(&conn, "table", "screenshot_document_refs"));
+    }
+
+    #[test]
+    fn encrypted_schema_initialization_is_idempotent_after_reopen() {
+        let (temp, storage) = test_storage();
+        let path = temp.path().join("schema-upgrade.db");
+        let key = [0x6d; 32];
+
+        {
+            let conn = Connection::open(&path).expect("open encrypted schema database");
+            connection::configure_sqlcipher_connection(&conn, &key)
+                .expect("configure encrypted schema database");
+            storage
+                .init_tables(&conn)
+                .expect("initialize encrypted schema");
+            conn.execute(
+                "INSERT INTO app_metadata (key, value) VALUES (?1, ?2)",
+                params!["sqlcipher_baseline_fixture", "preserved"],
+            )
+            .expect("write compatibility marker");
+        }
+
+        let conn = Connection::open(&path).expect("reopen encrypted schema database");
+        let status = connection::configure_sqlcipher_connection(&conn, &key)
+            .expect("configure reopened encrypted schema database");
+        storage
+            .init_tables(&conn)
+            .expect("re-run schema migrations after reopen");
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM app_metadata WHERE key = ?1",
+                ["sqlcipher_baseline_fixture"],
+                |row| row.get(0),
+            )
+            .expect("read compatibility marker");
+
+        assert_eq!(value, "preserved");
+        assert_eq!(status.engine.sqlite_version, connection::MIN_SQLITE_VERSION);
+        assert_eq!(status.journal_mode, "delete");
+    }
+
+    #[test]
+    fn encrypted_schema_migration_carries_legacy_rows_across_reopen() {
+        let (temp, storage) = test_storage();
+        let path = temp.path().join("encrypted-schema-migration.db");
+        let key = [0x74; 32];
+
+        {
+            let conn = Connection::open(&path).expect("open encrypted migration database");
+            connection::configure_sqlcipher_connection(&conn, &key)
+                .expect("configure encrypted migration database");
+            conn.execute_batch(LEGACY_MIGRATION_TABLES)
+                .expect("install legacy migration tables");
+            conn.execute_batch(LEGACY_MIGRATION_INDEXES)
+                .expect("install legacy migration indexes");
+            insert_legacy_run(&conn, "minilm_migration_runs", "encrypted-legacy-run");
+            conn.execute_batch(
+                "INSERT INTO minilm_migration_subjects
+                     (run_id, subject_key, outcome, source_fingerprint)
+                 VALUES ('encrypted-legacy-run', 'screenshot:7', 'migrated', 'fingerprint-7');",
+            )
+            .expect("insert encrypted legacy subject row");
+
+            storage
+                .init_tables(&conn)
+                .expect("migrate encrypted legacy schema");
+        }
+
+        let conn = Connection::open(&path).expect("reopen encrypted migration database");
+        let status = connection::configure_sqlcipher_connection(&conn, &key)
+            .expect("configure reopened encrypted migration database");
+        storage
+            .init_tables(&conn)
+            .expect("re-run encrypted schema migration");
+
+        let kind: String = conn
+            .query_row(
+                "SELECT index_kind FROM derived_migration_runs WHERE run_id = ?1",
+                ["encrypted-legacy-run"],
+                |row| row.get(0),
+            )
+            .expect("read migrated encrypted legacy run");
+        let subjects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM derived_migration_subjects WHERE run_id = ?1",
+                ["encrypted-legacy-run"],
+                |row| row.get(0),
+            )
+            .expect("count migrated encrypted subjects");
+
+        assert_eq!(kind, "semantic_text");
+        assert_eq!(subjects, 1);
+        assert_eq!(status.engine.sqlite_version, connection::MIN_SQLITE_VERSION);
+        assert_eq!(status.journal_mode, "delete");
     }
 
     #[test]
