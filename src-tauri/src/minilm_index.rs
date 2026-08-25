@@ -352,7 +352,7 @@ pub async fn run_scheduled_slice(
 
 fn scheduled_pass_mode(manual: bool) -> PassMode {
     if manual {
-        PassMode::ScheduledManual
+        PassMode::Manual
     } else {
         PassMode::Idle
     }
@@ -364,30 +364,26 @@ enum PassMode {
     /// Background work: runs only inside an idle window and stands down the
     /// moment the user comes back.
     Idle,
-    /// The user asked for this run and the scheduler admitted it, so the idle
-    /// gate does not apply and the queue drains without yielding to another
-    /// background task. Every other guard still does — maintenance mode, the
-    /// locked session, the ledger's retry budget — and the run stops on the
-    /// user's word or on the runaway deadline.
+    /// The user asked for this run, so the idle gate does not apply and the
+    /// queue drains without yielding to another background task. Every other
+    /// guard still does — maintenance mode, the locked session, the ledger's
+    /// retry budget — and the run stops on the user's word or on the runaway
+    /// deadline.
+    ///
+    /// The unified scheduler owns admission: the command enqueues and returns,
+    /// so by the time this runs nobody is awaiting it. That is why an encode
+    /// failure propagates out of the pass instead of being folded into a run
+    /// summary — see the failure match at the end of [`drain_queue`].
     Manual,
-    /// The same complete drain after admission by the unified scheduler. This
-    /// stays distinct from `Manual` only so worker failures return to the
-    /// scheduler's durable retry/backoff policy instead of becoming a command
-    /// summary for a caller that is no longer awaiting the run.
-    ScheduledManual,
 }
 
 impl PassMode {
     fn is_manual(self) -> bool {
-        matches!(self, Self::Manual | Self::ScheduledManual)
+        self == Self::Manual
     }
 
     fn yields_after_chunk(self) -> bool {
         self == Self::Idle
-    }
-
-    fn reports_failure_in_summary(self) -> bool {
-        self == Self::Manual
     }
 }
 
@@ -563,8 +559,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
         {
             return Ok(PassOutcome::refused(FOREGROUND_QUERY_STOP));
         }
-    } else if let Some(reason) = stand_aside_for_foreground(app, mode, deadline, &mut waited).await
-    {
+    } else if let Some(reason) = stand_aside_for_foreground(app, deadline, &mut waited).await {
         // Nothing was attempted, so this is a refusal rather than a stop: the
         // summary says "skipped, and here is which guard", which is the true
         // account of a click that never reached the worker.
@@ -588,7 +583,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
 
     match mode {
         PassMode::Idle => drain_queue(app, storage, mode).await,
-        PassMode::Manual | PassMode::ScheduledManual => {
+        PassMode::Manual => {
             // The queue depth the user is about to watch drain, read once and
             // after the repair pass that can add to it. Re-reading it per chunk
             // would take the process-wide database mutex several times a second
@@ -622,13 +617,14 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
 /// sitting when one of them fires. Nothing is claimed while this waits: the
 /// drain released its leases uncharged on its way out, so a run that never
 /// resumes leaves the ledger exactly as it found it.
+///
+/// Only a manual pass calls this: an idle pass yields to the foreground by
+/// ending rather than by waiting.
 async fn stand_aside_for_foreground(
     app: &AppHandle,
-    mode: PassMode,
     deadline: Instant,
     waited: &mut Duration,
 ) -> Option<&'static str> {
-    debug_assert!(mode.is_manual());
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     if !semantic.foreground_waiting() {
         return None;
@@ -693,7 +689,7 @@ async fn drain_until_done(
         // Before claiming anything, not after: a batch claimed and then held
         // through a pause is a batch nobody else can encode, and the leases
         // would be released uncharged one chunk later anyway.
-        if let Some(reason) = stand_aside_for_foreground(app, mode, deadline, &mut waited).await {
+        if let Some(reason) = stand_aside_for_foreground(app, deadline, &mut waited).await {
             total.stopped_because = Some(reason);
             break;
         }
@@ -992,14 +988,13 @@ async fn drain_queue(
         mirror_to_chroma(app, &indexed).await;
     }
     match failure {
-        // A manual run reports the failure through its summary instead of
-        // propagating it, so the user sees "3 indexed, 4 failed" rather than an
-        // error dialog that hides the work that did land.
-        Some(error) if mode.reports_failure_in_summary() => {
-            outcome.stopped_because = Some("encode_failed");
-            tracing::warn!("[SEMANTIC:INDEX] manual run stopped: {error}");
-            Ok(outcome)
-        }
+        // The failure propagates rather than being folded into the summary:
+        // the command that asked for this run enqueued it and returned, so
+        // nothing is awaiting a report and only the scheduler's durable retry
+        // and backoff can act on it. Reporting it as a pass that stopped early
+        // would have the scheduler defer by a single tick and re-enter without
+        // counting the attempt, which is a tight loop against a worker that is
+        // already down.
         Some(error) => Err(error),
         None => Ok(outcome),
     }
@@ -1620,25 +1615,14 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_binds_a_manual_run_but_idleness_does_not() {
-        // The two guards a manual run must treat differently. The idle gate
-        // exists to protect the foreground, and the user pressing the button is
-        // the foreground; maintenance mode exists because the migration is
-        // rewriting the same store, which consent cannot make safe.
-        assert_eq!(PassMode::Manual, PassMode::Manual);
-        assert_ne!(PassMode::Idle, PassMode::Manual);
-    }
-
-    #[test]
     fn a_scheduled_manual_request_uses_the_complete_drain_mode() {
         // The scheduler owns admission, not the meaning of the user's action.
         // Once admitted, a manual request must keep the worker until the queue
         // is empty (or a real manual stop condition fires).
         let mode = scheduled_pass_mode(true);
-        assert_eq!(mode, PassMode::ScheduledManual);
+        assert_eq!(mode, PassMode::Manual);
         assert!(mode.is_manual());
         assert!(!mode.yields_after_chunk());
-        assert!(!mode.reports_failure_in_summary());
         assert_eq!(scheduled_pass_mode(false), PassMode::Idle);
     }
 

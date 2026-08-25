@@ -349,7 +349,7 @@ pub async fn run_scheduled_slice(
 
 fn scheduled_pass_mode(manual: bool) -> PassMode {
     if manual {
-        PassMode::ScheduledManual
+        PassMode::Manual
     } else {
         PassMode::Idle
     }
@@ -358,23 +358,21 @@ fn scheduled_pass_mode(manual: bool) -> PassMode {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PassMode {
     Idle,
+    /// A complete manual drain, admitted by the unified scheduler. The command
+    /// enqueues and returns, so by the time this runs nobody is awaiting it:
+    /// an encode failure propagates out of the pass rather than being folded
+    /// into a run summary, which leaves the retry to the scheduler's durable
+    /// backoff. See the failure match at the end of [`drain_queue`].
     Manual,
-    /// A complete manual drain whose admission and failure retry are owned by
-    /// the unified scheduler.
-    ScheduledManual,
 }
 
 impl PassMode {
     fn is_manual(self) -> bool {
-        matches!(self, Self::Manual | Self::ScheduledManual)
+        self == Self::Manual
     }
 
     fn yields_after_chunk(self) -> bool {
         self == Self::Idle
-    }
-
-    fn reports_failure_in_summary(self) -> bool {
-        self == Self::Manual
     }
 }
 
@@ -571,7 +569,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
         {
             return Ok(PassOutcome::refused(FOREGROUND_QUERY_STOP));
         }
-    } else if let Some(reason) = stand_aside_for_foreground(app, mode).await {
+    } else if let Some(reason) = stand_aside_for_foreground(app).await {
         return Ok(PassOutcome::refused(reason));
     }
 
@@ -585,7 +583,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
     // batch `waiting_for_auth` on every tick.
     let locked = match mode {
         PassMode::Idle => !storage.is_background_authorized(),
-        PassMode::Manual | PassMode::ScheduledManual => !storage.is_silent_read_authorized(),
+        PassMode::Manual => !storage.is_silent_read_authorized(),
     };
     if locked && !has_prepared_captures() {
         return Ok(PassOutcome::refused(if mode == PassMode::Idle {
@@ -610,7 +608,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
             }
             drain_queue(app, storage, mode, locked).await
         }
-        PassMode::Manual | PassMode::ScheduledManual => {
+        PassMode::Manual => {
             reap_orphans(storage.clone()).await?;
             let scope_storage = storage.clone();
             let scope = tokio::task::spawn_blocking(move || repair_scope(&scope_storage))
@@ -653,8 +651,10 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
 /// starts again at the next, so it bounds a run that cannot make progress
 /// rather than a run that has been politely yielding for a long time — see
 /// [`MANUAL_FOREGROUND_WAIT_BUDGET`].
-async fn stand_aside_for_foreground(app: &AppHandle, mode: PassMode) -> Option<&'static str> {
-    debug_assert!(mode.is_manual());
+///
+/// Only a manual pass calls this: an idle pass yields to the foreground by
+/// ending rather than by waiting.
+async fn stand_aside_for_foreground(app: &AppHandle) -> Option<&'static str> {
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut waited = Duration::ZERO;
     loop {
@@ -703,7 +703,7 @@ async fn drain_until_done(
             // A foreground query took the worker: wait for it and claim again,
             // rather than ending a run somebody started.
             Some(FOREGROUND_QUERY_STOP) => {
-                if let Some(reason) = stand_aside_for_foreground(app, mode).await {
+                if let Some(reason) = stand_aside_for_foreground(app).await {
                     total.stopped_because = Some(reason);
                     return Ok(total);
                 }
@@ -818,11 +818,13 @@ async fn drain_queue(
         tracing::info!("[CLIP:INDEX] indexed {} image(s)", indexed);
     }
     match failure {
-        Some(error) if mode.reports_failure_in_summary() => {
-            outcome.stopped_because = Some("encode_failed");
-            tracing::warn!("[CLIP:INDEX] manual run stopped: {error}");
-            Ok(outcome)
-        }
+        // The failure propagates rather than being folded into the summary:
+        // the command that asked for this run enqueued it and returned, so
+        // nothing is awaiting a report and only the scheduler's durable retry
+        // and backoff can act on it. Reporting it as a pass that stopped early
+        // would have the scheduler defer by a single tick and re-enter without
+        // counting the attempt, which is a tight loop against a worker that is
+        // already down.
         Some(error) => Err(error),
         None => Ok(outcome),
     }
@@ -1639,10 +1641,9 @@ mod tests {
         // The scheduler decides when this starts. It must not turn the user's
         // complete drain into one image followed by ordinary idle work.
         let mode = scheduled_pass_mode(true);
-        assert_eq!(mode, PassMode::ScheduledManual);
+        assert_eq!(mode, PassMode::Manual);
         assert!(mode.is_manual());
         assert!(!mode.yields_after_chunk());
-        assert!(!mode.reports_failure_in_summary());
         assert_eq!(scheduled_pass_mode(false), PassMode::Idle);
     }
 
