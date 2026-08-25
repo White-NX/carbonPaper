@@ -639,6 +639,8 @@ export default function SmartClustersView({
   const pausedCount = pausedClusters.length;
   const pendingCount = statusData?.pending_count ?? workerStatus?.pending_count ?? 0;
   const unverifiableCount = statusData?.unverifiable_thresholds ?? workerStatus?.unverifiableThresholds ?? 0;
+  const drainFailed = workerStatus?.phase === 'failed'
+    || workerStatus?.schedulerStatus === 'failed';
 
   const isDraining = drainRequested
     || Boolean(workerStatus?.manualActive)
@@ -721,11 +723,19 @@ export default function SmartClustersView({
                 className="flex h-[22px] items-center gap-1 rounded-full bg-ide-hover px-2 text-[11px] text-ide-muted transition-colors hover:text-ide-text disabled:opacity-40"
               >
                 <Zap className="h-2.5 w-2.5" />
-                {t('smartClusters.processNow', '立即处理')}
+                {drainFailed
+                  ? t('smartClusters.retryFailed', '重试')
+                  : t('smartClusters.processNow', '立即处理')}
               </button>
             )}
           >
             {t('smartClusters.chipPending', '{{count}} 张待处理', { count: pendingCount })}
+          </StatusChip>
+        )}
+
+        {drainFailed && (
+          <StatusChip icon={<AlertCircle className="h-3 w-3" />}>
+            {t('smartClusters.processingFailed', '处理失败')}
           </StatusChip>
         )}
 
@@ -760,6 +770,18 @@ export default function SmartClustersView({
           <button onClick={() => setError(null)} className="text-red-400 hover:text-red-300">
             <X className="h-3 w-3" />
           </button>
+        </div>
+      )}
+
+      {drainFailed && (
+        <div
+          className="mx-6 mt-3 flex shrink-0 items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2"
+          title={workerStatus?.lastError || undefined}
+        >
+          <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+          <span className="flex-1 break-all text-xs text-amber-300">
+            {t('smartClusters.processingFailedDetail', '连续处理失败，自动重试已暂停。你可以重试此任务。')}
+          </span>
         </div>
       )}
 

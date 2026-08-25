@@ -87,9 +87,9 @@ use crate::semantic_runtime::{SemanticRuntimeState, FOREGROUND_POLL_INTERVAL};
 use crate::storage::smart_cluster::{
     anchor_text_hash, SmartClusterScorer, SmartClusterScoringTarget,
 };
-use crate::storage::{DerivedIndexKind, StorageState};
+use crate::storage::{BackgroundTaskState, DerivedIndexKind, StorageState};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -130,6 +130,48 @@ const RERANK_TIMEOUT: Duration = Duration::from_secs(300);
 /// sentences, and MiniLM is usually already resident from capture indexing.
 const ANCHOR_EMBED_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Consecutive scheduled failures allowed before Smart Cluster scoring opens
+/// its retry circuit. Unknown runtime failures get a small recovery window;
+/// deterministic contract/packaging failures open it immediately.
+pub(crate) const MAX_SCHEDULED_FAILURES: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScheduledFailurePolicy {
+    pub code: &'static str,
+    pub terminal: bool,
+}
+
+/// Classify a failed scheduled slice without relying on classification for the
+/// safety bound. Known deterministic failures stop immediately; everything
+/// else is retried a few times and then reaches the same terminal state.
+pub(crate) fn scheduled_failure_policy(
+    error: &str,
+    consecutive_failures: u32,
+) -> ScheduledFailurePolicy {
+    let lower = error.to_ascii_lowercase();
+    let (code, deterministic) = if lower.contains("model_mismatch") {
+        ("model_mismatch", true)
+    } else if lower.contains("invalid_request") {
+        ("invalid_request", true)
+    } else if lower.contains("protocol:") {
+        ("protocol_error", true)
+    } else if lower.contains("worker_stopped") && lower.contains("was not found") {
+        ("worker_missing", true)
+    } else if lower.contains("timeout:") {
+        ("timeout", false)
+    } else if lower.contains("provider_unavailable") {
+        ("provider_unavailable", false)
+    } else if lower.contains("inference:") || lower.contains("rerank_failed") {
+        ("inference_failed", false)
+    } else {
+        ("scoring_failed", false)
+    };
+    ScheduledFailurePolicy {
+        code,
+        terminal: deterministic || consecutive_failures >= MAX_SCHEDULED_FAILURES,
+    }
+}
+
 /// The one stand-down reason a forced drain resumes from instead of ending on.
 ///
 /// Every other reason [`stand_down_reason`] gives is a verdict about whether
@@ -162,6 +204,7 @@ pub enum SmartClusterDrainPhase {
     Completed,
     Stopped,
     Retrying,
+    Failed,
 }
 
 impl SmartClusterDrainPhase {
@@ -347,6 +390,30 @@ impl SmartClusterWorkerState {
         }
     }
 
+    /// Reconcile the in-memory progress state with the scheduler's durable
+    /// failure decision. This also covers failures that happen outside
+    /// `run_pass`, such as the final backlog read.
+    pub(crate) fn record_scheduled_failure(&self, app: &AppHandle, terminal: bool) {
+        self.set_manual_phase(
+            if terminal {
+                SmartClusterDrainPhase::Failed
+            } else {
+                SmartClusterDrainPhase::Retrying
+            },
+            None,
+        );
+        self.emit_progress(app);
+    }
+
+    /// A second click made a fresh manual request while the previous slice was
+    /// still settling. The durable scheduler row remains queued, so keep the
+    /// progress surface aligned with that newer request rather than publishing
+    /// the older slice's terminal verdict over it.
+    pub(crate) fn record_manual_requeued(&self, app: &AppHandle) {
+        self.set_manual_phase(SmartClusterDrainPhase::Queued, None);
+        self.emit_progress(app);
+    }
+
     fn report_processed(&self, processed: u64, remaining: u64) {
         let mut progress = self
             .drain_progress
@@ -458,9 +525,14 @@ pub async fn run_scheduled_slice(
                 state
                     .set_manual_phase(SmartClusterDrainPhase::Stopped, Some(pending.max(0) as u64));
             }
-            Err(_) => {
+            Err(error) => {
+                let policy = scheduled_failure_policy(error, 1);
                 state.set_manual_phase(
-                    SmartClusterDrainPhase::Retrying,
+                    if policy.terminal {
+                        SmartClusterDrainPhase::Failed
+                    } else {
+                        SmartClusterDrainPhase::Retrying
+                    },
                     Some(pending.max(0) as u64),
                 );
             }
@@ -598,12 +670,6 @@ async fn run_pass(
     }
 
     let mut scored_anything = false;
-    // Clusters whose re-derivation failed for a reason that may not repeat — a
-    // rerank error or timeout. Remembered for the length of this pass so a
-    // forced drain does not re-attempt, and re-pay for, the same failure once
-    // per batch. Deliberately not persisted: the next pass is a minute away and
-    // a transient failure deserves another try by then.
-    let mut rederive_failed_this_pass: HashSet<i64> = HashSet::new();
     let result = loop {
         // One read of the lease per iteration, and waiting is the response to
         // it rather than a separate check in front of it. A pre-check would
@@ -639,15 +705,7 @@ async fn run_pass(
             }
             continue;
         }
-        let batch = match run_batch(
-            app,
-            state,
-            storage.clone(),
-            forced,
-            &mut rederive_failed_this_pass,
-        )
-        .await
-        {
+        let batch = match run_batch(app, state, storage.clone(), forced).await {
             Ok(batch) => batch,
             Err(error) => break Err(error),
         };
@@ -758,7 +816,6 @@ async fn run_batch(
     state: &Arc<SmartClusterWorkerState>,
     storage: Arc<StorageState>,
     forced: bool,
-    rederive_failed_this_pass: &mut HashSet<i64>,
 ) -> Result<BatchProgress, String> {
     let read = {
         let storage = storage.clone();
@@ -800,7 +857,6 @@ async fn run_batch(
         inputs.targets,
         &scorer,
         forced,
-        rederive_failed_this_pass,
     )
     .await;
     state
@@ -815,13 +871,14 @@ async fn run_batch(
         // deleted and nothing is scored; the next pass starts over.
         return Ok(BatchProgress::stopped(reason));
     }
+    if let Some(error) = resolution.retry_error {
+        // Threshold resolution is all-or-nothing for a queue batch. Scoring
+        // against only the clusters that resolved successfully and deleting
+        // the ids would permanently skip the failed cluster.
+        return Err(error);
+    }
     let targets = resolution.usable;
     if targets.is_empty() {
-        if resolution.retryable > 0 {
-            // At least one cluster failed for a reason that may not repeat, so
-            // the ids stay queued for a pass that can score them.
-            return Ok(BatchProgress::completed(false));
-        }
         // Every enabled cluster has been given up on: its saved examples cannot
         // produce a threshold under this scorer, and nothing but a
         // recalibration will change that. Draining is the same call the
@@ -920,11 +977,13 @@ async fn run_batch(
                     break;
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        "[SMART_CLUSTER] rerank failed for cluster {}: {error}",
+                    // Assignments already written for earlier targets are
+                    // harmless upserts. Keep this whole group queued so the
+                    // failed target is never skipped when the retry succeeds.
+                    return Err(format!(
+                        "rerank_failed: cluster {} could not score its pending snapshots: {error}",
                         target.id
-                    );
-                    continue;
+                    ));
                 }
             };
             let recorded =
@@ -1004,10 +1063,9 @@ struct ThresholdResolution {
     usable: Vec<SmartClusterScoringTarget>,
     /// Enabled clusters that will not be scored, for the status banner.
     unverifiable: usize,
-    /// How many of those might succeed later. Zero means every unusable cluster
-    /// has been given up on, which is what lets the caller drain a queue that
-    /// nothing will ever score.
-    retryable: usize,
+    /// A runtime failure that requires the whole queue batch to remain intact.
+    /// The scheduler owns its bounded retry and terminal-failure policy.
+    retry_error: Option<String>,
     /// Why the pass stood down before every enabled cluster had been
     /// considered, if it did.
     ///
@@ -1040,13 +1098,12 @@ async fn resolve_thresholds(
     targets: Vec<SmartClusterScoringTarget>,
     scorer: &ScorerIdentity,
     forced: bool,
-    failed_this_pass: &mut HashSet<i64>,
 ) -> ThresholdResolution {
     let fingerprint = scorer.fingerprint();
     let mut resolution = ThresholdResolution {
         usable: Vec::with_capacity(targets.len()),
         unverifiable: 0,
-        retryable: 0,
+        retry_error: None,
         interrupted: None,
     };
     for mut target in targets {
@@ -1057,11 +1114,6 @@ async fn resolve_thresholds(
             Some(&target.scorer.provider),
         ) {
             resolution.usable.push(target);
-            continue;
-        }
-        if failed_this_pass.contains(&target.id) {
-            resolution.unverifiable += 1;
-            resolution.retryable += 1;
             continue;
         }
         if target.rederive_failed_scorer.as_deref() == Some(fingerprint.as_str()) {
@@ -1133,12 +1185,15 @@ async fn resolve_thresholds(
             }
             Err(error) => {
                 resolution.unverifiable += 1;
-                resolution.retryable += 1;
-                failed_this_pass.insert(target.id);
                 tracing::warn!(
                     "[SMART_CLUSTER] could not re-derive the threshold for cluster {}: {error}",
                     target.id
                 );
+                resolution.retry_error = Some(format!(
+                    "rerank_failed: cluster {} could not re-derive its threshold: {error}",
+                    target.id
+                ));
+                break;
             }
         }
     }
@@ -1498,12 +1553,15 @@ async fn record_assignments(
     tokio::task::spawn_blocking(move || -> Result<u64, String> {
         let mut recorded = 0u64;
         for (screenshot_id, score) in matches {
-            match storage.record_smart_cluster_assignment(cluster_id, screenshot_id, score) {
-                Ok(()) => recorded += 1,
-                Err(error) => tracing::warn!(
-                    "[SMART_CLUSTER] failed to record assignment {cluster_id}/{screenshot_id}: {error}"
-                ),
-            }
+            storage
+                .record_smart_cluster_assignment(cluster_id, screenshot_id, score)
+                .map_err(|error| {
+                    format!(
+                        "assignment_write_failed: failed to record assignment \
+                         {cluster_id}/{screenshot_id}: {error}"
+                    )
+                })?;
+            recorded += 1;
         }
         Ok(recorded)
     })
@@ -1554,19 +1612,35 @@ async fn commit_pending(
 pub fn status_value(
     state: &Arc<SmartClusterWorkerState>,
     pending_count: i64,
-    manual_pending: bool,
+    scheduler_task: Option<&BackgroundTaskState>,
 ) -> serde_json::Value {
     let status = state.status();
     let mut progress = status.progress;
-    if manual_pending && !progress.phase.is_active() {
+    let manual_pending = scheduler_task.is_some_and(|task| task.manual_pending);
+    if scheduler_task.is_some_and(|task| task.status == "failed") {
+        let remaining = pending_count.max(0) as u64;
+        progress.phase = SmartClusterDrainPhase::Failed;
+        progress.remaining = remaining;
+        progress.total = progress.total.max(progress.processed + remaining);
+    } else if manual_pending && !progress.phase.is_active() {
         progress = SmartClusterDrainProgress {
-            phase: SmartClusterDrainPhase::Queued,
+            phase: if scheduler_task.is_some_and(|task| task.status == "retry_wait") {
+                SmartClusterDrainPhase::Retrying
+            } else {
+                SmartClusterDrainPhase::Queued
+            },
             total: pending_count.max(0) as u64,
             processed: 0,
             remaining: pending_count.max(0) as u64,
         };
     }
     let manual_active = manual_pending || status.is_force_running || progress.phase.is_active();
+    let last_error = scheduler_task.and_then(|task| task.last_error.as_deref());
+    let failure_kind = scheduler_task.and_then(|task| {
+        task.last_error
+            .as_deref()
+            .map(|error| scheduled_failure_policy(error, task.failure_count.max(1)).code)
+    });
     serde_json::json!({
         "status": "success",
         "backend": status.backend,
@@ -1577,6 +1651,12 @@ pub fn status_value(
         "total": progress.total,
         "processed": progress.processed,
         "pending_count": pending_count,
+        "scheduler_status": scheduler_task.map(|task| task.status.as_str()),
+        "failure_count": scheduler_task.map(|task| task.failure_count).unwrap_or(0),
+        "failure_kind": failure_kind,
+        "last_error": last_error,
+        "next_retry_at_ms": scheduler_task
+            .and_then(|task| (task.next_attempt_at_ms > 0).then_some(task.next_attempt_at_ms)),
         "assigned_total": status.assigned_total,
         "unverifiable_thresholds": status.unverifiable_thresholds,
         "scorer": status.scorer,
@@ -1588,6 +1668,25 @@ mod tests {
     use super::*;
     use crate::storage::smart_cluster::CachedAnchorVector;
 
+    fn scheduler_task(
+        status: &str,
+        manual_pending: bool,
+        failure_count: u32,
+        last_error: Option<&str>,
+    ) -> BackgroundTaskState {
+        BackgroundTaskState {
+            task_kind: crate::background_scheduler::TASK_SMART_CLUSTER.to_string(),
+            ready_since_ms: 0,
+            next_attempt_at_ms: if status == "retry_wait" { 1_000 } else { 0 },
+            failure_count,
+            last_served_seq: 0,
+            last_error: last_error.map(str::to_string),
+            last_completed_at_ms: None,
+            status: status.to_string(),
+            manual_pending,
+        }
+    }
+
     #[test]
     fn the_status_payload_keeps_the_two_fields_the_ui_reads() {
         // `SmartClustersView` polls `is_running` / `is_force_running` to decide
@@ -1595,13 +1694,36 @@ mod tests {
         // `pending_count > 0`, so dropping the queue depth would leave a stop
         // button that never appears.
         let state = Arc::new(SmartClusterWorkerState::default());
-        let value = status_value(&state, 4, false);
+        let value = status_value(&state, 4, None);
         assert_eq!(value["status"], "success");
         assert_eq!(value["is_running"], false);
         assert_eq!(value["is_force_running"], false);
         assert_eq!(value["pending_count"], 4);
         assert_eq!(value["backend"], "rust");
         assert_eq!(value["scorer"]["provider"], "cpu");
+    }
+
+    #[test]
+    fn durable_retry_and_failure_states_survive_worker_state_loss() {
+        let state = Arc::new(SmartClusterWorkerState::default());
+        let retry = scheduler_task("retry_wait", true, 2, Some("temporary inference failure"));
+        let retry_value = status_value(&state, 4, Some(&retry));
+        assert_eq!(retry_value["phase"], "retrying");
+        assert_eq!(retry_value["manual_active"], true);
+        assert_eq!(retry_value["failure_count"], 2);
+        assert_eq!(retry_value["next_retry_at_ms"], 1_000);
+
+        let failed = scheduler_task(
+            "failed",
+            false,
+            MAX_SCHEDULED_FAILURES,
+            Some("rerank_failed: persistent fault"),
+        );
+        let failed_value = status_value(&state, 4, Some(&failed));
+        assert_eq!(failed_value["phase"], "failed");
+        assert_eq!(failed_value["manual_active"], false);
+        assert_eq!(failed_value["failure_kind"], "inference_failed");
+        assert_eq!(failed_value["pending_count"], 4);
     }
 
     #[test]
@@ -1973,7 +2095,7 @@ mod tests {
         let complete = ThresholdResolution {
             usable: vec![legacy_target(1, None)],
             unverifiable: 0,
-            retryable: 0,
+            retry_error: None,
             interrupted: None,
         };
         assert!(complete.interrupted.is_none());
@@ -1981,7 +2103,7 @@ mod tests {
         let stopped_early = ThresholdResolution {
             usable: vec![legacy_target(1, None)],
             unverifiable: 0,
-            retryable: 0,
+            retry_error: None,
             interrupted: Some(FOREGROUND_QUERY_STOP),
         };
         // Same non-empty `usable`, opposite handling.

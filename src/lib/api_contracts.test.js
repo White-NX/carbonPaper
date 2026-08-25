@@ -72,6 +72,11 @@ describe('API contract payloads', () => {
       phase: 'idle',
       total: 0,
       processed: 0,
+      schedulerStatus: null,
+      failureCount: 0,
+      failureKind: null,
+      lastError: null,
+      nextRetryAtMs: null,
       // M2.5 step 6: clusters skipped because their stored threshold came from
       // the retired scorer and could not be re-derived.
       unverifiableThresholds: 2,

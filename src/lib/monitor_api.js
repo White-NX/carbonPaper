@@ -668,6 +668,11 @@ export const normalizeSmartClusterWorkerStatus = (response = {}) => {
         phase,
         total: Number(response.total || 0),
         processed: Number(response.processed || 0),
+        schedulerStatus: response.scheduler_status || null,
+        failureCount: Number(response.failure_count || 0),
+        failureKind: response.failure_kind || null,
+        lastError: response.last_error || null,
+        nextRetryAtMs: response.next_retry_at_ms ? Number(response.next_retry_at_ms) : null,
         // M2.5 step 6: clusters the Rust scorer refused to score because
         // their stored threshold came from the retired Python scorer and
         // could not be re-derived from the saved calibration examples.

@@ -138,7 +138,12 @@ impl StorageState {
                         "retry_wait" | "degraded" | "parked" | "completed" | "failed"
                     )
             }
-            Some((status, _)) => matches!(status.as_str(), "parked" | "completed" | "failed"),
+            // A terminal failure is a circuit breaker, not another backlog
+            // state. Reconciliation observes the same business queue every
+            // two seconds, so letting an automatic enqueue revive `failed`
+            // would turn the terminal state straight back into an infinite
+            // retry loop. Only an explicit manual enqueue may release it.
+            Some((status, _)) => matches!(status.as_str(), "parked" | "completed"),
         };
         if !needs_write {
             return Ok(false);
@@ -157,36 +162,47 @@ impl StorageState {
                 END,
                  status = CASE
                     WHEN excluded.manual_pending = 1
-                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded')
+                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded', 'failed')
                         THEN 'queued'
                     WHEN background_scheduler_tasks.status = 'parked'
                         THEN 'queued'
-                    WHEN background_scheduler_tasks.status IN ('completed', 'failed')
+                    WHEN background_scheduler_tasks.status = 'completed'
                         THEN 'queued'
                     ELSE background_scheduler_tasks.status
                 END,
                  ready_since_ms = CASE
                     WHEN excluded.manual_pending = 1
-                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded')
+                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded', 'failed')
                         THEN excluded.ready_since_ms
                     WHEN background_scheduler_tasks.status = 'parked'
                         THEN excluded.ready_since_ms
-                    WHEN background_scheduler_tasks.status IN ('completed', 'failed')
+                    WHEN background_scheduler_tasks.status = 'completed'
                         THEN excluded.ready_since_ms
                     ELSE background_scheduler_tasks.ready_since_ms
                 END,
                  next_attempt_at_ms = CASE
                     WHEN excluded.manual_pending = 1
-                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded')
+                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded', 'failed')
                         THEN 0
                     WHEN background_scheduler_tasks.status = 'parked'
                         THEN 0
-                    WHEN background_scheduler_tasks.status IN ('completed', 'failed')
+                    WHEN background_scheduler_tasks.status = 'completed'
                         THEN 0
                     ELSE background_scheduler_tasks.next_attempt_at_ms
                 END,
+                failure_count = CASE
+                    WHEN excluded.manual_pending = 1
+                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded', 'failed')
+                        THEN 0
+                    WHEN background_scheduler_tasks.status IN ('completed', 'parked')
+                        THEN 0
+                    ELSE background_scheduler_tasks.failure_count
+                END,
                 last_error = CASE
-                    WHEN background_scheduler_tasks.status IN ('completed', 'failed', 'parked')
+                    WHEN excluded.manual_pending = 1
+                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded', 'failed')
+                        THEN NULL
+                    WHEN background_scheduler_tasks.status IN ('completed', 'parked')
                         THEN NULL
                     ELSE background_scheduler_tasks.last_error
                 END
@@ -355,6 +371,43 @@ impl StorageState {
         Ok(())
     }
 
+    /// Open the task's retry circuit after a deterministic failure or after its
+    /// consecutive retry budget is exhausted. The business queue remains
+    /// untouched, but neither timer ticks nor backlog reconciliation may claim
+    /// the scheduler row again. A fresh manual enqueue is the recovery action;
+    /// if one arrived while the failing slice was still running, it is preserved
+    /// and this method reports that the circuit was not opened.
+    pub fn mark_background_task_terminal_failure(
+        &self,
+        task_kind: &str,
+        failure_count: u32,
+        error: &str,
+    ) -> Result<bool, String> {
+        let guard = self.get_connection_named("mark_background_task_terminal_failure")?;
+        let conn = guard
+            .as_ref()
+            .ok_or_else(|| "Database not initialized".to_string())?;
+        conn.execute(
+            "UPDATE background_scheduler_tasks
+             SET status = CASE WHEN manual_pending = 1 THEN 'queued' ELSE 'failed' END,
+                 failure_count = CASE WHEN manual_pending = 1 THEN 0 ELSE ?2 END,
+                 next_attempt_at_ms = 0, last_error = CASE
+                    WHEN manual_pending = 1 THEN NULL ELSE ?3 END,
+                 manual_in_flight = 0
+             WHERE task_kind = ?1",
+            params![task_kind, failure_count as i64, error],
+        )
+        .map_err(|e| format!("Failed to record terminal background task failure: {e}"))?;
+        let status = conn
+            .query_row(
+                "SELECT status FROM background_scheduler_tasks WHERE task_kind = ?1",
+                params![task_kind],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| format!("Failed to verify terminal background task failure: {e}"))?;
+        Ok(status == "failed")
+    }
+
     pub fn defer_background_task(
         &self,
         task_kind: &str,
@@ -519,6 +572,109 @@ mod tests {
         assert_eq!(task.status, "retry_wait");
         assert_eq!(task.next_attempt_at_ms, 9_999);
         assert_eq!(task.failure_count, 2);
+    }
+
+    #[test]
+    fn terminal_failure_is_not_revived_by_backlog_reconciliation() {
+        let (_temp, storage) = test_storage();
+        storage
+            .enqueue_background_task("smart_cluster", false, 10)
+            .unwrap();
+        assert!(storage
+            .mark_background_task_terminal_failure(
+                "smart_cluster",
+                3,
+                "inference_failed: persistent reranker fault",
+            )
+            .unwrap());
+        let changes_before_enqueue = scheduler_total_change_count(&storage);
+
+        assert!(!storage
+            .enqueue_background_task_if_changed("smart_cluster", false, 20)
+            .unwrap());
+
+        let task = storage
+            .background_scheduler_task("smart_cluster")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            scheduler_total_change_count(&storage),
+            changes_before_enqueue
+        );
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.failure_count, 3);
+        assert!(!task.manual_pending);
+        assert!(!task.is_eligible(100_000));
+    }
+
+    #[test]
+    fn manual_enqueue_reopens_terminal_failure_with_a_fresh_budget() {
+        let (_temp, storage) = test_storage();
+        storage
+            .enqueue_background_task("smart_cluster", true, 10)
+            .unwrap();
+        storage
+            .mark_background_task_started("smart_cluster", 1, true, 10)
+            .unwrap();
+        assert!(storage
+            .mark_background_task_terminal_failure(
+                "smart_cluster",
+                3,
+                "model_mismatch: invalid reranker output",
+            )
+            .unwrap());
+        assert_eq!(raw_manual_flags(&storage, "smart_cluster"), (0, 0));
+
+        storage
+            .enqueue_background_task("smart_cluster", true, 20)
+            .unwrap();
+
+        let task = storage
+            .background_scheduler_task("smart_cluster")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "queued");
+        assert_eq!(task.failure_count, 0);
+        assert_eq!(task.next_attempt_at_ms, 0);
+        assert_eq!(task.last_error, None);
+        assert!(task.manual_pending);
+        assert!(task.is_eligible(20));
+    }
+
+    #[test]
+    fn a_new_manual_request_survives_an_in_flight_slice_reaching_terminal_failure() {
+        let (_temp, storage) = test_storage();
+        storage
+            .enqueue_background_task("smart_cluster", false, 10)
+            .unwrap();
+        storage
+            .mark_background_task_started("smart_cluster", 1, false, 10)
+            .unwrap();
+        // The click arrives after the automatic slice was claimed, so it is a
+        // new request and must not be consumed by that slice's failure.
+        storage
+            .enqueue_background_task("smart_cluster", true, 20)
+            .unwrap();
+
+        assert!(!storage
+            .mark_background_task_terminal_failure(
+                "smart_cluster",
+                3,
+                "rerank_failed: persistent fault",
+            )
+            .unwrap());
+
+        let task = storage
+            .background_scheduler_task("smart_cluster")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "queued");
+        assert!(task.manual_pending);
+        assert_eq!(task.failure_count, 0);
+        assert_eq!(task.last_error, None);
+        assert!(storage
+            .mark_background_task_started("smart_cluster", 2, true, 20)
+            .unwrap());
     }
 
     #[test]
@@ -694,6 +850,8 @@ mod tests {
             .unwrap();
         assert_eq!(task.status, "queued");
         assert_eq!(task.next_attempt_at_ms, 0);
+        assert_eq!(task.failure_count, 0);
+        assert_eq!(task.last_error, None);
         assert!(task.manual_pending);
     }
 

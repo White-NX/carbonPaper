@@ -39,6 +39,7 @@ export function BackgroundSchedulerCard({ enabled, saving, status, onChange, onR
     waiting_for_unlock: t('settings.advanced.background_processing.states.waiting_for_unlock', '等待解锁'),
     running: t('settings.advanced.background_processing.states.running', '执行中'),
     retry_wait: t('settings.advanced.background_processing.states.retry_wait', '失败重试'),
+    failed: t('settings.advanced.background_processing.states.failed', '处理失败'),
     monitor_unavailable: t('settings.advanced.background_processing.states.monitor_unavailable', '监控不可用'),
     disabled: t('settings.advanced.background_processing.states.disabled', '任务分组已关闭'),
     clustering_already_running: t('settings.advanced.background_processing.states.organizing', '正在整理'),

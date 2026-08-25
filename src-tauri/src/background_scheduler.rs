@@ -348,6 +348,13 @@ impl BackgroundSchedulerState {
         // already queued, a caller may be retrying after changing an admission
         // condition, so preserve the prompt wake-up semantics. The internal
         // backlog reconciliation deliberately bypasses this method.
+        if manual {
+            *self
+                .runtime
+                .blocked_reason
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
         self.wake();
         Ok(())
     }
@@ -373,7 +380,13 @@ impl BackgroundSchedulerState {
             .blocked_reason
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .clone()
+            .or_else(|| {
+                tasks
+                    .iter()
+                    .find(|task| task.status == "failed")
+                    .map(|_| "failed".to_string())
+            });
         let depths = queue_depths(app.try_state::<Arc<StorageState>>());
         let enabled = app
             .try_state::<Arc<CredentialManagerState>>()
@@ -914,9 +927,50 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                     .find(|task| task.task_kind == kind.as_str())
                     .map(|task| task.failure_count.saturating_add(1))
                     .unwrap_or(1);
+                let smart_cluster_policy = (kind == BackgroundTaskKind::SmartCluster).then(|| {
+                    crate::smart_cluster_scoring::scheduled_failure_policy(&error, failures)
+                });
+                if smart_cluster_policy.is_some_and(|policy| policy.terminal) {
+                    let failure_code = smart_cluster_policy
+                        .map(|policy| policy.code)
+                        .unwrap_or("task_failed");
+                    let terminal_failed = storage
+                        .mark_background_task_terminal_failure(kind.as_str(), failures, &error)
+                        .unwrap_or(false);
+                    *runtime
+                        .blocked_reason
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = if terminal_failed {
+                        Some("failed".to_string())
+                    } else {
+                        None
+                    };
+                    if kind == BackgroundTaskKind::SmartCluster && manual {
+                        let worker = app
+                            .state::<Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>();
+                        if terminal_failed {
+                            worker.record_scheduled_failure(&app, true);
+                        } else {
+                            worker.record_manual_requeued(&app);
+                        }
+                    }
+                    tracing::error!(
+                        "[SCHEDULER] {} slice reached terminal failure code={} after {} attempt(s): {}",
+                        kind.as_str(),
+                        failure_code,
+                        failures,
+                        error
+                    );
+                    continue;
+                }
                 let retry_at = now_ms().saturating_add(retry_delay(failures).as_millis() as i64);
                 let _ =
                     storage.mark_background_task_failed(kind.as_str(), failures, retry_at, &error);
+                if kind == BackgroundTaskKind::SmartCluster && manual {
+                    let worker =
+                        app.state::<Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>();
+                    worker.record_scheduled_failure(&app, false);
+                }
                 if !normalized.contains("monitor_unavailable")
                     && !normalized.contains("monitor not started")
                 {
@@ -1029,6 +1083,29 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::from_secs(60));
         assert_eq!(retry_delay(2), Duration::from_secs(120));
         assert_eq!(retry_delay(99), MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn smart_cluster_failure_policy_opens_on_deterministic_errors_or_budget() {
+        let mismatch = crate::smart_cluster_scoring::scheduled_failure_policy(
+            "model_mismatch: reranker returned 3 scores",
+            1,
+        );
+        assert_eq!(mismatch.code, "model_mismatch");
+        assert!(mismatch.terminal);
+
+        let first = crate::smart_cluster_scoring::scheduled_failure_policy(
+            "rerank_failed: worker returned an inference error",
+            1,
+        );
+        assert_eq!(first.code, "inference_failed");
+        assert!(!first.terminal);
+
+        let exhausted = crate::smart_cluster_scoring::scheduled_failure_policy(
+            "rerank_failed: worker returned an inference error",
+            crate::smart_cluster_scoring::MAX_SCHEDULED_FAILURES,
+        );
+        assert!(exhausted.terminal);
     }
 
     #[tokio::test]

@@ -877,21 +877,20 @@ pub async fn monitor_smart_cluster_worker_status(
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let storage = storage.inner().clone();
-    let (pending, manual_pending) = tokio::task::spawn_blocking(move || {
+    let (pending, scheduler_task) = tokio::task::spawn_blocking(move || {
         let pending = storage.count_smart_cluster_pending().unwrap_or(0);
-        let manual_pending = storage
+        let scheduler_task = storage
             .background_scheduler_task(crate::background_scheduler::TASK_SMART_CLUSTER)
             .ok()
-            .flatten()
-            .is_some_and(|task| task.manual_pending);
-        (pending, manual_pending)
+            .flatten();
+        (pending, scheduler_task)
     })
     .await
     .map_err(|error| format!("pending count task failed: {error}"))?;
     Ok(crate::smart_cluster_scoring::status_value(
         worker.inner(),
         pending,
-        manual_pending,
+        scheduler_task.as_ref(),
     ))
 }
 

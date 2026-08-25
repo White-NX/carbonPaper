@@ -164,6 +164,31 @@ describe('SmartClustersView manual drain', () => {
     expect(await screen.findByText('Background scheduler is unavailable')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'smartClusters.processNow' })).toBeInTheDocument();
   });
+
+  it('shows a terminal processing failure as retryable instead of an active drain', async () => {
+    getSmartClusterWorkerStatus.mockResolvedValue({
+      running: false,
+      forceRunning: false,
+      manualActive: false,
+      phase: 'failed',
+      schedulerStatus: 'failed',
+      pending_count: 2,
+      failureCount: 3,
+      failureKind: 'inference_failed',
+      lastError: 'persistent reranker fault',
+      unverifiableThresholds: 0,
+    });
+    const user = userEvent.setup();
+    renderView();
+
+    expect(await screen.findByText('smartClusters.processingFailed')).toBeInTheDocument();
+    const retry = await screen.findByRole('button', { name: 'smartClusters.retryFailed' });
+    expect(retry).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'smartClusters.stopDrain' })).not.toBeInTheDocument();
+
+    await user.click(retry);
+    expect(smartClusterDrainNow).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('SmartClustersView assignments pagination', () => {
