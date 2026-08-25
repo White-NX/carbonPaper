@@ -17,6 +17,15 @@ vi.mock('@tauri-apps/api/event', () => ({
 vi.mock('../lib/monitor_api', () => ({
   searchScreenshots: vi.fn(async () => []),
   fetchThumbnailBatch: vi.fn(async () => ({})),
+  getSmartClusterWorkerStatus: vi.fn(async () => ({
+    pending_count: 0,
+    running: false,
+    forceRunning: false,
+    manualActive: false,
+    phase: 'idle',
+    total: 0,
+    processed: 0,
+  })),
   fetchThumbnail: vi.fn(async () => null),
   fetchImage: vi.fn(async () => null),
   getBackgroundIndexProgress: vi.fn(async () => ({

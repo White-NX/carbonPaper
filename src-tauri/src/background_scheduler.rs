@@ -125,6 +125,38 @@ pub fn select_next_task(
     ranked.first().map(|task| task.kind)
 }
 
+/// Return the task kinds that are eligible and admitted by their current
+/// runtime gates. Keeping this filtering separate from the ordering policy lets
+/// a blocked automatic task fall through to a runnable manual request instead
+/// of holding the head of the queue hostage.
+pub fn select_next_runnable_task(
+    tasks: &[BackgroundTaskState],
+    now_ms: i64,
+    aging_limit_ms: i64,
+    mut is_runnable: impl FnMut(&BackgroundTaskState) -> bool,
+) -> Option<(BackgroundTaskKind, bool)> {
+    let runnable: Vec<BackgroundTaskState> = tasks
+        .iter()
+        .filter(|task| task.is_eligible(now_ms))
+        .filter(|task| is_runnable(task))
+        .cloned()
+        .collect();
+    // "Process now" is an explicit foreground admission. Once its gates pass,
+    // do not make the user wait behind an aged automatic index row; the latter
+    // still retains its starvation protection when no such request exists.
+    let kind = runnable
+        .iter()
+        .find(|task| task.task_kind == TASK_SMART_CLUSTER && task.manual_pending)
+        .map(|_| BackgroundTaskKind::SmartCluster)
+        .or_else(|| select_next_task(&runnable, now_ms, aging_limit_ms))?;
+    let manual = runnable
+        .iter()
+        .find(|task| task.task_kind == kind.as_str())
+        .map(|task| task.manual_pending)
+        .unwrap_or(false);
+    Some((kind, manual))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduledSliceResult {
     pub completed: bool,
@@ -733,19 +765,32 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 continue;
             }
         };
-        let Some(kind) = select_next_task(&tasks, now_ms(), AUTO_AGING_LIMIT.as_millis() as i64)
-        else {
-            *runtime
-                .blocked_reason
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = None;
-            continue;
+        let now = now_ms();
+        let selected =
+            select_next_runnable_task(&tasks, now, AUTO_AGING_LIMIT.as_millis() as i64, |task| {
+                gate_reason(&app, task.manual_pending).is_none()
+            });
+        let (kind, manual) = if let Some(selected) = selected {
+            selected
+        } else {
+            // Preserve a useful blocked reason when every eligible task is
+            // gated, while avoiding a blocked automatic row preventing a
+            // runnable manual row from being considered above.
+            let Some(kind) = select_next_task(&tasks, now, AUTO_AGING_LIMIT.as_millis() as i64)
+            else {
+                *runtime
+                    .blocked_reason
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                continue;
+            };
+            let manual = tasks
+                .iter()
+                .find(|task| task.task_kind == kind.as_str())
+                .map(|task| task.manual_pending)
+                .unwrap_or(false);
+            (kind, manual)
         };
-        let manual = tasks
-            .iter()
-            .find(|task| task.task_kind == kind.as_str())
-            .map(|task| task.manual_pending)
-            .unwrap_or(false);
         if let Some(reason) = gate_reason(&app, manual) {
             *runtime
                 .blocked_reason
@@ -946,6 +991,28 @@ mod tests {
         assert_eq!(
             select_next_task(&tasks, 1_100, 1_000),
             Some(BackgroundTaskKind::SemanticIndex)
+        );
+    }
+
+    #[test]
+    fn a_blocked_aged_automatic_task_does_not_hide_a_manual_smart_cluster_drain() {
+        let tasks = vec![
+            task(TASK_CLIP_INDEX, 0, false, 1),
+            task(TASK_SMART_CLUSTER, 900, true, 2),
+        ];
+        let selected = select_next_runnable_task(&tasks, 2_000, 1_000, |task| task.manual_pending);
+        assert_eq!(selected, Some((BackgroundTaskKind::SmartCluster, true)));
+    }
+
+    #[test]
+    fn an_explicit_smart_cluster_drain_precedes_aged_automatic_work() {
+        let tasks = vec![
+            task(TASK_CLIP_INDEX, 0, false, 1),
+            task(TASK_SMART_CLUSTER, 900, true, 2),
+        ];
+        assert_eq!(
+            select_next_runnable_task(&tasks, 2_000, 1_000, |_| true),
+            Some((BackgroundTaskKind::SmartCluster, true))
         );
     }
 

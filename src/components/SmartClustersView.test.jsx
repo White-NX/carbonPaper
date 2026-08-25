@@ -7,6 +7,10 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key) => key }),
 }));
 
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(async () => () => {}),
+}));
+
 vi.mock('../lib/task_api', () => ({
   createSmartCluster: vi.fn(),
   deleteSmartCluster: vi.fn(),
@@ -20,10 +24,15 @@ vi.mock('../lib/task_api', () => ({
 }));
 
 vi.mock('../lib/monitor_api', () => ({
+  normalizeSmartClusterWorkerStatus: (value = {}) => value,
   fetchThumbnailBatch: vi.fn(async () => ({})),
   getSmartClusterWorkerStatus: vi.fn(async () => ({
     running: false,
     forceRunning: false,
+    manualActive: false,
+    phase: 'idle',
+    total: 0,
+    processed: 0,
     pending_count: 0,
     unverifiableThresholds: 0,
   })),

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { listen } from '@tauri-apps/api/event';
 import {
   Sparkles, Plus, Loader2, RefreshCw, AlertCircle, X,
   Zap, Clock, FileText, CircleDot, PauseCircle, Inbox,
@@ -392,16 +393,65 @@ export default function SmartClustersView({
         getSmartClusterWorkerStatus(),
       ]);
       if (s.status === 'fulfilled' && s.value) setStatusData(s.value);
-      if (ws.status === 'fulfilled' && ws.value) setWorkerStatus(ws.value);
+      if (ws.status === 'fulfilled' && ws.value) {
+        setWorkerStatus(ws.value);
+        if (ws.value.phase && ws.value.phase !== 'idle') {
+          const active = Boolean(ws.value.manualActive)
+            || ['queued', 'running', 'waiting', 'stopping', 'retrying']
+              .includes(ws.value.phase);
+          setDrainRequested(active);
+        }
+      }
     } catch (err) {
       console.warn('loadStatus error:', err);
     }
   }, []);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active) return undefined;
+    let cancelled = false;
+    let unlisten = null;
+    listen('smart-cluster-progress', ({ payload }) => {
+      if (cancelled || !payload) return;
+      const phase = typeof payload.phase === 'string' ? payload.phase : 'idle';
+      setWorkerStatus((previous) => ({
+        ...(previous || {}),
+        pending_count: Number(payload.pending_count || 0),
+        running: !!payload.is_running,
+        forceRunning: !!payload.is_force_running,
+        manualActive: payload.manual_active !== undefined
+          ? !!payload.manual_active
+          : !!payload.is_force_running,
+        phase: payload.phase || previous?.phase || 'idle',
+        total: Number(payload.total || 0),
+        processed: Number(payload.processed || 0),
+      }));
+      setStatusData((previous) => (previous
+        ? {
+          ...previous,
+          pending_count: Number(payload.pending_count || 0),
+          is_running: !!payload.is_running,
+          is_force_running: !!payload.is_force_running,
+        }
+        : previous));
+      setDrainRequested(['queued', 'running', 'waiting', 'stopping', 'retrying']
+        .includes(phase));
+    }).then((dispose) => {
+      if (cancelled) dispose();
+      else unlisten = dispose;
+    }).catch((err) => console.warn('Failed to subscribe to smart-cluster-progress:', err));
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [active]);
+
+  useEffect(() => {
+    if (!active) return undefined;
     loadClusters();
     loadStatus();
+    const timer = window.setInterval(loadStatus, 4000);
+    return () => window.clearInterval(timer);
   }, [active, loadClusters, loadStatus]);
 
   const selected = useMemo(
@@ -591,10 +641,10 @@ export default function SmartClustersView({
   const unverifiableCount = statusData?.unverifiable_thresholds ?? workerStatus?.unverifiableThresholds ?? 0;
 
   const isDraining = drainRequested
+    || Boolean(workerStatus?.manualActive)
+    || ['queued', 'running', 'waiting', 'stopping', 'retrying'].includes(workerStatus?.phase)
     || Boolean(statusData?.is_force_running)
-    || Boolean(statusData?.is_running)
-    || Boolean(workerStatus?.forceRunning)
-    || Boolean(workerStatus?.running);
+    || Boolean(workerStatus?.forceRunning);
 
   const overview = useMemo(() => {
     let total = 0;

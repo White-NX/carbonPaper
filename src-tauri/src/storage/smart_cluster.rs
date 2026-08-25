@@ -988,8 +988,15 @@ impl StorageState {
     /// Remove specific pending ids — call after the batch has been
     /// scored and any matching assignments have been written.
     pub fn delete_smart_cluster_pending_ids(&self, ids: &[i64]) -> Result<(), String> {
+        self.delete_smart_cluster_pending_ids_count(ids).map(|_| ())
+    }
+
+    /// Remove pending ids and return the number of rows that were actually
+    /// deleted. The count lets the manual drain advance progress by committed
+    /// queue work rather than by assignment rows.
+    pub fn delete_smart_cluster_pending_ids_count(&self, ids: &[i64]) -> Result<usize, String> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         // SQLite parameter limit is conservatively 999; chunk to be safe
         // in case a future caller hands us a larger slice.
@@ -1001,6 +1008,7 @@ impl StorageState {
         let tx = conn
             .transaction()
             .map_err(|e| format!("Failed to begin tx: {}", e))?;
+        let mut deleted = 0usize;
         for chunk in ids.chunks(CHUNK) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             let sql = format!(
@@ -1009,12 +1017,13 @@ impl StorageState {
             );
             let bound: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-            tx.execute(&sql, bound.as_slice())
+            deleted += tx
+                .execute(&sql, bound.as_slice())
                 .map_err(|e| format!("Failed to delete pending ids: {}", e))?;
         }
         tx.commit()
             .map_err(|e| format!("Failed to commit delete pending: {}", e))?;
-        Ok(())
+        Ok(deleted)
     }
 
     pub fn count_smart_cluster_pending(&self) -> Result<i64, String> {
