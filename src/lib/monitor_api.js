@@ -651,25 +651,46 @@ export const removeLocalAnchorsByProcess = async (category, processName) => {
     return response;
 };
 
+const ACTIVE_SMART_CLUSTER_PHASES = new Set([
+    'queued', 'running', 'waiting', 'stopping', 'retrying',
+]);
+
+export const normalizeSmartClusterWorkerStatus = (response = {}) => {
+    const phase = response.phase
+        || (response.is_force_running ? 'running' : 'idle');
+    return {
+        pending_count: Number(response.pending_count || 0),
+        running: !!response.is_running,
+        forceRunning: !!response.is_force_running,
+        manualActive: response.manual_active !== undefined
+            ? !!response.manual_active
+            : ACTIVE_SMART_CLUSTER_PHASES.has(phase),
+        phase,
+        total: Number(response.total || 0),
+        processed: Number(response.processed || 0),
+        schedulerStatus: response.scheduler_status || null,
+        failureCount: Number(response.failure_count || 0),
+        failureKind: response.failure_kind || null,
+        lastError: response.last_error || null,
+        nextRetryAtMs: response.next_retry_at_ms ? Number(response.next_retry_at_ms) : null,
+        // M2.5 step 6: clusters the Rust scorer refused to score because
+        // their stored threshold came from the retired Python scorer and
+        // could not be re-derived from the saved calibration examples.
+        // Keep the default for older status payloads that lack this field.
+        unverifiableThresholds: Number(response.unverifiable_thresholds || 0),
+    };
+};
+
 export const getSmartClusterWorkerStatus = async () => {
     return withAuth(async () => {
         try {
             const response = await invoke('monitor_smart_cluster_worker_status');
             if (response?.error) {
-                return { pending_count: 0, running: false };
+                return normalizeSmartClusterWorkerStatus();
             }
-            return {
-                pending_count: response.pending_count || 0,
-                running: !!response.is_running,
-                forceRunning: !!response.is_force_running,
-                // M2.5 step 6: clusters the Rust scorer refused to score because
-                // their stored threshold came from the retired Python scorer and
-                // could not be re-derived from the saved calibration examples.
-                // Keep the default for older status payloads that lack this field.
-                unverifiableThresholds: response.unverifiable_thresholds || 0,
-            };
+            return normalizeSmartClusterWorkerStatus(response);
         } catch {
-            return { pending_count: 0, running: false };
+            return normalizeSmartClusterWorkerStatus();
         }
     });
 };

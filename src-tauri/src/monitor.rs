@@ -877,13 +877,20 @@ pub async fn monitor_smart_cluster_worker_status(
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let storage = storage.inner().clone();
-    let pending = tokio::task::spawn_blocking(move || storage.count_smart_cluster_pending())
-        .await
-        .map_err(|error| format!("pending count task failed: {error}"))?
-        .unwrap_or(0);
+    let (pending, scheduler_task) = tokio::task::spawn_blocking(move || {
+        let pending = storage.count_smart_cluster_pending().unwrap_or(0);
+        let scheduler_task = storage
+            .background_scheduler_task(crate::background_scheduler::TASK_SMART_CLUSTER)
+            .ok()
+            .flatten();
+        (pending, scheduler_task)
+    })
+    .await
+    .map_err(|error| format!("pending count task failed: {error}"))?;
     Ok(crate::smart_cluster_scoring::status_value(
         worker.inner(),
         pending,
+        scheduler_task.as_ref(),
     ))
 }
 
@@ -891,22 +898,31 @@ pub async fn monitor_smart_cluster_worker_status(
 pub async fn monitor_smart_cluster_drain_now(
     app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
+    storage: State<'_, Arc<crate::storage::StorageState>>,
     worker: State<'_, Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let scheduler = app
         .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
         .ok_or_else(|| "Background scheduler is unavailable".to_string())?;
-    let rollback = worker.request_drain_now();
+    let count_storage = storage.inner().clone();
+    let pending = tokio::task::spawn_blocking(move || count_storage.count_smart_cluster_pending())
+        .await
+        .map_err(|error| format!("pending count task failed: {error}"))??
+        .max(0) as u64;
+    let rollback = worker.request_drain_now(pending);
+    worker.emit_progress(&app);
+    tracing::info!("[SMART_CLUSTER] manual drain queued with {pending} pending snapshot(s)");
     if let Err(error) = scheduler.enqueue(
         &app,
         crate::background_scheduler::BackgroundTaskKind::SmartCluster,
         true,
     ) {
         worker.cancel_pending_drain_request(rollback);
+        worker.emit_progress(&app);
         return Err(error);
     }
-    Ok(serde_json::json!({ "status": "success" }))
+    Ok(serde_json::json!({ "status": "success", "pending_count": pending }))
 }
 
 #[tauri::command]
@@ -922,6 +938,7 @@ pub async fn monitor_smart_cluster_stop_drain(
     // the worker yet. Otherwise the durable scheduler row would run it on the
     // next idle tick despite the user's stop action.
     storage.cancel_manual_background_task(crate::background_scheduler::TASK_SMART_CLUSTER)?;
+    worker.emit_progress(&app);
     if let Some(scheduler) =
         app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
     {

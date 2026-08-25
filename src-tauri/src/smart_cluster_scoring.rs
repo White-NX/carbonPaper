@@ -66,8 +66,8 @@
 //! holding ([`crate::semantic_runtime::BACKGROUND_PASS_GUARD`] states that
 //! cost). Waiting and resuming keeps the button meaning what it says without
 //! making the query it collides with pay for it; [`stand_aside_for_foreground`]
-//! is where that happens, and [`FORCED_FOREGROUND_WAIT_BUDGET`] is what stops a
-//! drain sitting out a whole calibration session in silence.
+//! is where that happens. A manual drain stays requested while it waits, so the
+//! search box can say that work is paused and the pass can resume afterwards.
 //!
 //! **Standing down has to leave progress behind.** Every one of those checks
 //! can end a pass part-way through a batch, and the idle gate closes the moment
@@ -87,13 +87,15 @@ use crate::semantic_runtime::{SemanticRuntimeState, FOREGROUND_POLL_INTERVAL};
 use crate::storage::smart_cluster::{
     anchor_text_hash, SmartClusterScorer, SmartClusterScoringTarget,
 };
-use crate::storage::{DerivedIndexKind, StorageState};
+use crate::storage::{BackgroundTaskState, DerivedIndexKind, StorageState};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
+
+pub const SMART_CLUSTER_PROGRESS_EVENT: &str = "smart-cluster-progress";
 
 /// Snapshots drained per pass. Python used 32 idle / 128 forced; the same split
 /// is kept so a manual run still clears a visible amount in one go.
@@ -128,26 +130,47 @@ const RERANK_TIMEOUT: Duration = Duration::from_secs(300);
 /// sentences, and MiniLM is usually already resident from capture indexing.
 const ANCHOR_EMBED_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Wall-clock ceiling on one forced drain, so "run now" cannot become an
-/// unbounded foreground job on a machine with a deep queue.
-const FORCED_DEADLINE: Duration = Duration::from_secs(600);
+/// Consecutive scheduled failures allowed before Smart Cluster scoring opens
+/// its retry circuit. Unknown runtime failures get a small recovery window;
+/// deterministic contract/packaging failures open it immediately.
+pub(crate) const MAX_SCHEDULED_FAILURES: u32 = 3;
 
-/// How long a forced drain may spend, in total, standing aside for foreground
-/// queries before it gives up and says so.
-///
-/// Waiting out one query is right: a reranked calibration query is at most
-/// `MAX_RERANK_RESULTS * RERANK_OVERFETCH` documents at 0.31–1.18 s each, so a
-/// couple of minutes on the slowest machine measured, and the queue is not
-/// going anywhere. Waiting out a calibration *session* is not: the drain would
-/// spend its whole [`FORCED_DEADLINE`] never reaching the worker and then log
-/// that it ran out of time, which reads as a deep queue rather than as a run
-/// that politely never started.
-///
-/// Counted across the drain rather than per pause, because it is the total the
-/// user is unknowingly spending that decides whether their click accomplished
-/// anything. Ending here costs nothing but the button: the idle pass picks the
-/// same queue up a minute later.
-const FORCED_FOREGROUND_WAIT_BUDGET: Duration = Duration::from_secs(180);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScheduledFailurePolicy {
+    pub code: &'static str,
+    pub terminal: bool,
+}
+
+/// Classify a failed scheduled slice without relying on classification for the
+/// safety bound. Known deterministic failures stop immediately; everything
+/// else is retried a few times and then reaches the same terminal state.
+pub(crate) fn scheduled_failure_policy(
+    error: &str,
+    consecutive_failures: u32,
+) -> ScheduledFailurePolicy {
+    let lower = error.to_ascii_lowercase();
+    let (code, deterministic) = if lower.contains("model_mismatch") {
+        ("model_mismatch", true)
+    } else if lower.contains("invalid_request") {
+        ("invalid_request", true)
+    } else if lower.contains("protocol:") {
+        ("protocol_error", true)
+    } else if lower.contains("worker_stopped") && lower.contains("was not found") {
+        ("worker_missing", true)
+    } else if lower.contains("timeout:") {
+        ("timeout", false)
+    } else if lower.contains("provider_unavailable") {
+        ("provider_unavailable", false)
+    } else if lower.contains("inference:") || lower.contains("rerank_failed") {
+        ("inference_failed", false)
+    } else {
+        ("scoring_failed", false)
+    };
+    ScheduledFailurePolicy {
+        code,
+        terminal: deterministic || consecutive_failures >= MAX_SCHEDULED_FAILURES,
+    }
+}
 
 /// The one stand-down reason a forced drain resumes from instead of ending on.
 ///
@@ -158,13 +181,6 @@ const FORCED_FOREGROUND_WAIT_BUDGET: Duration = Duration::from_secs(180);
 /// minute away and nobody asked for it.
 const FOREGROUND_QUERY_STOP: &str = "a foreground query holds the semantic worker";
 
-/// Reason for a forced drain that spent [`FORCED_FOREGROUND_WAIT_BUDGET`]
-/// waiting for a worker it never got. Distinguished from the wall-clock budget
-/// because the two say different things: one queue is deep, the other machine
-/// was busy answering that same user's searches.
-const WAITED_OUT_BY_FOREGROUND: &str =
-    "foreground queries held the semantic worker for the whole wait budget";
-
 /// The stand-down reasons a pass ends on, as opposed to the one it may resume
 /// from.
 ///
@@ -174,8 +190,39 @@ const WAITED_OUT_BY_FOREGROUND: &str =
 /// is the failure the comparison cannot survive, and three copies of a string
 /// literal is how that collision gets written by accident.
 const STOP_REQUESTED: &str = "stop was requested";
-const FORCED_DEADLINE_REACHED: &str = "the forced drain reached its wall-clock budget";
 const MAY_NOT_RUN: &str = "the pass may no longer run";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartClusterDrainPhase {
+    #[default]
+    Idle,
+    Queued,
+    Running,
+    Waiting,
+    Stopping,
+    Completed,
+    Stopped,
+    Retrying,
+    Failed,
+}
+
+impl SmartClusterDrainPhase {
+    fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Running | Self::Waiting | Self::Stopping | Self::Retrying
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SmartClusterDrainProgress {
+    pub phase: SmartClusterDrainPhase,
+    pub total: u64,
+    pub processed: u64,
+    pub remaining: u64,
+}
 
 /// Worker state shared with the Tauri commands that drive it.
 #[derive(Default)]
@@ -190,6 +237,8 @@ pub struct SmartClusterWorkerState {
     /// Set by `smart_cluster_stop_drain`; the forced pass checks it between
     /// clusters and between batches.
     abort_requested: AtomicBool,
+    /// User-visible progress for the current or most recent manual drain.
+    drain_progress: Mutex<SmartClusterDrainProgress>,
     /// Assignment rows written since process start, for the status command.
     ///
     /// Counts writes, not distinct snapshots: `record_smart_cluster_assignment`
@@ -214,10 +263,11 @@ pub(crate) struct DrainRequestRollback {
     generation: u64,
     drain_was_requested: bool,
     abort_was_requested: bool,
+    progress_before: SmartClusterDrainProgress,
 }
 
 impl SmartClusterWorkerState {
-    pub(crate) fn request_drain_now(&self) -> DrainRequestRollback {
+    pub(crate) fn request_drain_now(&self, pending_count: u64) -> DrainRequestRollback {
         let abort_was_requested = self.abort_requested.swap(false, Ordering::SeqCst);
         let mut request = self
             .drain_request
@@ -226,10 +276,22 @@ impl SmartClusterWorkerState {
         request.generation = request.generation.wrapping_add(1);
         let generation = request.generation;
         let drain_was_requested = std::mem::replace(&mut request.requested, true);
+        let mut progress = self
+            .drain_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let progress_before = progress.clone();
+        *progress = SmartClusterDrainProgress {
+            phase: SmartClusterDrainPhase::Queued,
+            total: pending_count,
+            processed: 0,
+            remaining: pending_count,
+        };
         DrainRequestRollback {
             generation,
             drain_was_requested,
             abort_was_requested,
+            progress_before,
         }
     }
 
@@ -249,21 +311,44 @@ impl SmartClusterWorkerState {
                 true
             }
         };
-        if restored && rollback.abort_was_requested {
-            // Preserve a stop that predated this failed request, but never
-            // overwrite a newer stop or abort a request already consumed by
-            // the worker.
-            let _ = self.abort_requested.compare_exchange(
-                false,
-                true,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
+        if restored {
+            *self
+                .drain_progress
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = rollback.progress_before;
+            if rollback.abort_was_requested {
+                // Preserve a stop that predated this failed request, but never
+                // overwrite a newer stop or abort a request already consumed by
+                // the worker.
+                let _ = self.abort_requested.compare_exchange(
+                    false,
+                    true,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
         }
     }
 
     pub fn request_stop_drain(&self) {
         self.abort_requested.store(true, Ordering::SeqCst);
+        let running = self.force_running.load(Ordering::SeqCst);
+        // A second click may have left a request flag for a future pass while
+        // the current pass is still running. Stop cancels that queued intent as
+        // well; otherwise it can resurrect a drain after the user stopped it.
+        self.drain_request
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .requested = false;
+        let mut progress = self
+            .drain_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        progress.phase = if running {
+            SmartClusterDrainPhase::Stopping
+        } else {
+            SmartClusterDrainPhase::Stopped
+        };
     }
 
     fn take_drain_request(&self) -> bool {
@@ -278,6 +363,98 @@ impl SmartClusterWorkerState {
         self.abort_requested.load(Ordering::SeqCst)
     }
 
+    fn begin_manual_drain(&self, pending_count: u64) {
+        let mut progress = self
+            .drain_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !progress.phase.is_active() {
+            progress.total = pending_count;
+            progress.processed = 0;
+        } else {
+            progress.total = progress.total.max(progress.processed + pending_count);
+        }
+        progress.remaining = pending_count;
+        progress.phase = SmartClusterDrainPhase::Running;
+    }
+
+    fn set_manual_phase(&self, phase: SmartClusterDrainPhase, remaining: Option<u64>) {
+        let mut progress = self
+            .drain_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        progress.phase = phase;
+        if let Some(remaining) = remaining {
+            progress.remaining = remaining;
+            progress.total = progress.total.max(progress.processed + remaining);
+        }
+    }
+
+    /// Reconcile the in-memory progress state with the scheduler's durable
+    /// failure decision. This also covers failures that happen outside
+    /// `run_pass`, such as the final backlog read.
+    pub(crate) fn record_scheduled_failure(&self, app: &AppHandle, terminal: bool) {
+        self.set_manual_phase(
+            if terminal {
+                SmartClusterDrainPhase::Failed
+            } else {
+                SmartClusterDrainPhase::Retrying
+            },
+            None,
+        );
+        self.emit_progress(app);
+    }
+
+    /// A second click made a fresh manual request while the previous slice was
+    /// still settling. The durable scheduler row remains queued, so keep the
+    /// progress surface aligned with that newer request rather than publishing
+    /// the older slice's terminal verdict over it.
+    pub(crate) fn record_manual_requeued(&self, app: &AppHandle) {
+        self.set_manual_phase(SmartClusterDrainPhase::Queued, None);
+        self.emit_progress(app);
+    }
+
+    fn report_processed(&self, processed: u64, remaining: u64) {
+        let mut progress = self
+            .drain_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        progress.processed = progress.processed.saturating_add(processed);
+        progress.remaining = remaining;
+        progress.total = progress.total.max(progress.processed + remaining);
+        progress.phase = SmartClusterDrainPhase::Running;
+    }
+
+    pub fn progress(&self) -> SmartClusterDrainProgress {
+        self.drain_progress
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn emit_progress(&self, app: &AppHandle) {
+        let progress = self.progress();
+        let active = progress.phase.is_active();
+        let running = matches!(
+            progress.phase,
+            SmartClusterDrainPhase::Running
+                | SmartClusterDrainPhase::Waiting
+                | SmartClusterDrainPhase::Stopping
+        );
+        let _ = app.emit(
+            SMART_CLUSTER_PROGRESS_EVENT,
+            serde_json::json!({
+                "phase": progress.phase,
+                "total": progress.total,
+                "processed": progress.processed,
+                "pending_count": progress.remaining,
+                "manual_active": active,
+                "is_running": running,
+                "is_force_running": running,
+            }),
+        );
+    }
+
     pub fn status(&self) -> SmartClusterWorkerStatus {
         SmartClusterWorkerStatus {
             backend: "rust",
@@ -285,6 +462,7 @@ impl SmartClusterWorkerState {
             is_force_running: self.force_running.load(Ordering::SeqCst),
             assigned_total: self.assigned_total.load(Ordering::SeqCst),
             unverifiable_thresholds: self.unverifiable_thresholds.load(Ordering::SeqCst),
+            progress: self.progress(),
             scorer: ScorerIdentity::current(),
         }
     }
@@ -302,6 +480,7 @@ pub struct SmartClusterWorkerStatus {
     /// Enabled clusters whose threshold could not be verified or re-derived for
     /// the current scorer, and which were therefore not scored.
     pub unverifiable_thresholds: u64,
+    pub progress: SmartClusterDrainProgress,
     pub scorer: ScorerIdentity,
 }
 
@@ -311,34 +490,55 @@ pub async fn run_scheduled_slice(
     manual: bool,
 ) -> Result<ScheduledSliceResult, String> {
     let state = app.state::<Arc<SmartClusterWorkerState>>().inner().clone();
+    let initial_pending = if manual {
+        let storage = app.state::<Arc<StorageState>>().inner().clone();
+        tokio::task::spawn_blocking(move || storage.count_smart_cluster_pending())
+            .await
+            .map_err(|error| format!("smart cluster backlog task failed: {error}"))??
+            .max(0) as u64
+    } else {
+        0
+    };
     state.running.store(true, Ordering::SeqCst);
     state.force_running.store(manual, Ordering::SeqCst);
     if manual {
         let _ = state.take_drain_request();
+        state.begin_manual_drain(initial_pending);
+        state.emit_progress(app);
     }
-    // A scheduled manual request still runs one batch. Passing `false` keeps
-    // the business loop bounded while the scheduler has already waived the
-    // idle gate for this slice.
-    let result = if manual {
-        run_batch(
-            app,
-            &state,
-            app.state::<Arc<StorageState>>().inner().clone(),
-            true,
-            Instant::now() + FORCED_DEADLINE,
-            &mut HashSet::new(),
-        )
-        .await
-        .map(|_| ())
-    } else {
-        run_pass(app, &state, false).await
-    };
+    let mut result = run_pass(app, &state, manual).await;
     state.running.store(false, Ordering::SeqCst);
     state.force_running.store(false, Ordering::SeqCst);
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let pending = tokio::task::spawn_blocking(move || storage.count_smart_cluster_pending())
         .await
         .map_err(|error| format!("smart cluster backlog task failed: {error}"))??;
+    if manual && result.is_ok() && pending > 0 && !state.aborted() {
+        result = Err("manual smart cluster drain stopped before the queue was empty".to_string());
+    }
+    if manual {
+        match &result {
+            Ok(()) if pending == 0 => {
+                state.set_manual_phase(SmartClusterDrainPhase::Completed, Some(0));
+            }
+            Ok(()) => {
+                state
+                    .set_manual_phase(SmartClusterDrainPhase::Stopped, Some(pending.max(0) as u64));
+            }
+            Err(error) => {
+                let policy = scheduled_failure_policy(error, 1);
+                state.set_manual_phase(
+                    if policy.terminal {
+                        SmartClusterDrainPhase::Failed
+                    } else {
+                        SmartClusterDrainPhase::Retrying
+                    },
+                    Some(pending.max(0) as u64),
+                );
+            }
+        }
+        state.emit_progress(app);
+    }
     result?;
     Ok(ScheduledSliceResult::complete(pending > 0))
 }
@@ -375,10 +575,6 @@ fn may_run(app: &AppHandle, forced: bool) -> bool {
 /// re-derivations — and a check that only some of those loops perform is how a
 /// bound ends up not binding.
 ///
-/// The wall-clock deadline is forced-only. An idle pass runs a single batch and
-/// is bounded by the idle gate closing, which is the honest bound for it; a
-/// forced drain has no such gate, which is exactly why it needs a clock.
-///
 /// [`FOREGROUND_QUERY_STOP`] is the one answer that does not mean the same
 /// thing to both modes — an idle pass ends on it and a forced drain waits it
 /// out — so it is returned ahead of the idle gate rather than folded into "may
@@ -388,15 +584,9 @@ fn stand_down_reason(
     app: &AppHandle,
     state: &Arc<SmartClusterWorkerState>,
     forced: bool,
-    deadline: Instant,
 ) -> Option<&'static str> {
-    if forced {
-        if state.aborted() {
-            return Some(STOP_REQUESTED);
-        }
-        if Instant::now() >= deadline {
-            return Some(FORCED_DEADLINE_REACHED);
-        }
+    if forced && state.aborted() {
+        return Some(STOP_REQUESTED);
     }
     if app
         .state::<Arc<SemanticRuntimeState>>()
@@ -410,20 +600,13 @@ fn stand_down_reason(
     None
 }
 
-/// Wait out a foreground query rather than competing with it, and say why the
-/// drain must end if one of its own bounds expires first.
-///
-/// `None` once the worker is free. `waited` accumulates across every call in a
-/// drain, because [`FORCED_FOREGROUND_WAIT_BUDGET`] is a budget for the drain
-/// and not for any one pause.
+/// Wait out a foreground query rather than competing with it.
 ///
 /// The ways out other than the worker coming free are the ones the drain
-/// already had — the stop button, the wall-clock deadline, maintenance mode and
-/// the rest of `may_run` — checked here because a pause is exactly where a
-/// drain is most likely to be sitting when one of them fires. Nothing is held
-/// while this waits: the batch it left released its groups uncommitted and took
-/// no database lock with it, so a drain that never resumes leaves the queue
-/// exactly as it found it.
+/// already had — the stop button, maintenance mode and the rest of `may_run` —
+/// checked here because a pause is exactly where a drain is most likely to be
+/// sitting when one of them fires. Nothing is held while this waits: the batch
+/// it left released its groups uncommitted and took no database lock with it.
 ///
 /// Idle passes never call this. Standing aside costs a wait, and a wait is only
 /// worth paying for work somebody is waiting on; an idle tick that ends here
@@ -431,8 +614,6 @@ fn stand_down_reason(
 async fn stand_aside_for_foreground(
     app: &AppHandle,
     state: &Arc<SmartClusterWorkerState>,
-    deadline: Instant,
-    waited: &mut Duration,
 ) -> Option<&'static str> {
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     if !semantic.foreground_waiting() {
@@ -443,13 +624,6 @@ async fn stand_aside_for_foreground(
     let outcome = loop {
         if state.aborted() {
             break Some(STOP_REQUESTED);
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            break Some(FORCED_DEADLINE_REACHED);
-        }
-        if *waited + now.duration_since(started) >= FORCED_FOREGROUND_WAIT_BUDGET {
-            break Some(WAITED_OUT_BY_FOREGROUND);
         }
         // Maintenance mode and the queue-ownership verdict can both change
         // under a drain that is doing nothing, and neither is worth resuming
@@ -463,16 +637,14 @@ async fn stand_aside_for_foreground(
         }
         tokio::time::sleep(FOREGROUND_POLL_INTERVAL).await;
     };
-    *waited += started.elapsed();
     match outcome {
         None => tracing::info!(
             "[SMART_CLUSTER] forced drain resuming after {:.1}s; the foreground query is done",
             started.elapsed().as_secs_f64()
         ),
         Some(reason) => tracing::info!(
-            "[SMART_CLUSTER] forced drain ending while stood aside: {reason} \
-             (waited {:.1}s in total)",
-            waited.as_secs_f64()
+            "[SMART_CLUSTER] forced drain ending while stood aside after {:.1}s: {reason}",
+            started.elapsed().as_secs_f64()
         ),
     }
     outcome
@@ -486,12 +658,6 @@ async fn run_pass(
     if !may_run(app, forced) {
         return Ok(());
     }
-    // The deadline is the forced drain's runaway clock and starts at the click
-    // rather than at the first score, so a drain that spends its opening
-    // minutes waiting is honest about having spent them. An idle pass never
-    // reads it.
-    let deadline = Instant::now() + FORCED_DEADLINE;
-    let mut waited = Duration::ZERO;
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     // Unattended work must never ask Rust to decrypt protected data before the
@@ -504,12 +670,6 @@ async fn run_pass(
     }
 
     let mut scored_anything = false;
-    // Clusters whose re-derivation failed for a reason that may not repeat — a
-    // rerank error or timeout. Remembered for the length of this pass so a
-    // forced drain does not re-attempt, and re-pay for, the same failure once
-    // per batch. Deliberately not persisted: the next pass is a minute away and
-    // a transient failure deserves another try by then.
-    let mut rederive_failed_this_pass: HashSet<i64> = HashSet::new();
     let result = loop {
         // One read of the lease per iteration, and waiting is the response to
         // it rather than a separate check in front of it. A pre-check would
@@ -517,7 +677,7 @@ async fn run_pass(
         // returning and the stand-down check reading it, and a forced drain
         // that broke on that would end for the very reason it is supposed to
         // wait out — intermittently, which is the worst way for it to happen.
-        if let Some(reason) = stand_down_reason(app, state, forced, deadline) {
+        if let Some(reason) = stand_down_reason(app, state, forced) {
             if !forced || reason != FOREGROUND_QUERY_STOP {
                 if forced {
                     tracing::info!(
@@ -531,24 +691,21 @@ async fn run_pass(
             // the drain would leave its groups uncommitted one cluster later
             // anyway. Looping back rather than falling through keeps the lease
             // read in one place.
-            if let Some(reason) =
-                stand_aside_for_foreground(app, state, deadline, &mut waited).await
-            {
+            if forced {
+                state.set_manual_phase(SmartClusterDrainPhase::Waiting, None);
+                state.emit_progress(app);
+            }
+            if let Some(reason) = stand_aside_for_foreground(app, state).await {
                 tracing::info!("[SMART_CLUSTER] forced drain stopped between batches: {reason}");
                 break Ok(());
             }
+            if forced {
+                state.set_manual_phase(SmartClusterDrainPhase::Running, None);
+                state.emit_progress(app);
+            }
             continue;
         }
-        let batch = match run_batch(
-            app,
-            state,
-            storage.clone(),
-            forced,
-            deadline,
-            &mut rederive_failed_this_pass,
-        )
-        .await
-        {
+        let batch = match run_batch(app, state, storage.clone(), forced).await {
             Ok(batch) => batch,
             Err(error) => break Err(error),
         };
@@ -556,15 +713,26 @@ async fn run_pass(
         // A foreground query is the one interruption a forced drain walks back
         // into rather than ends on, and the wait at the top of the loop is what
         // makes "walks back in" mean "once it clears" instead of "immediately".
-        // The poll interval is charged to the wait budget here rather than left
-        // to the top of the loop so that a lease flapping across the batch read
-        // — back-to-back queries from a calibration session — cannot turn this
-        // into one database round trip per iteration for the length of the
-        // deadline.
+        // A lease flapping across the batch read — back-to-back queries from a
+        // calibration session — must not turn this into one database round trip
+        // per iteration, so leave a poll-sized gap before checking again.
         if forced && batch.stopped_because == Some(FOREGROUND_QUERY_STOP) {
             tokio::time::sleep(FOREGROUND_POLL_INTERVAL).await;
-            waited += FOREGROUND_POLL_INTERVAL;
             continue;
+        }
+        if forced && batch.stopped_because.is_none() {
+            if state.aborted() {
+                break Ok(());
+            }
+            if batch.deleted > 0 {
+                // Re-read once after the last committed group so captures that
+                // arrived during the batch are included before declaring the
+                // user-requested drain complete.
+                continue;
+            }
+            if batch.more {
+                break Err("smart cluster drain made no progress while work remained".to_string());
+            }
         }
         if batch.stopped_because.is_some() || !batch.more || !forced {
             // An idle pass processes one batch per tick, as Python did; the tick
@@ -609,14 +777,16 @@ fn reranker_is_resident(app: &AppHandle) -> bool {
 /// The reason is carried out rather than collapsed into "no more work" because
 /// exactly one of them — [`FOREGROUND_QUERY_STOP`] — is something a forced
 /// drain resumes from, and a caller that could not tell it apart would either
-/// end a drain the user is watching or spin re-reading the queue for the length
-/// of the deadline.
+/// end a drain the user is watching or spin re-reading the queue indefinitely.
 struct BatchProgress {
     /// Whether the queue is likely to still hold work. Meaningless when the
     /// batch stopped early, since it never got far enough to find out.
     more: bool,
     /// Why the batch stopped part-way, if it did. `None` means it finished.
     stopped_because: Option<&'static str>,
+    /// Queue entries removed by this batch. A zero-progress batch must not
+    /// spin forever when threshold re-derivation keeps failing transiently.
+    deleted: u64,
 }
 
 impl BatchProgress {
@@ -625,6 +795,7 @@ impl BatchProgress {
         Self {
             more,
             stopped_because: None,
+            deleted: 0,
         }
     }
 
@@ -634,6 +805,7 @@ impl BatchProgress {
         Self {
             more: true,
             stopped_because: Some(reason),
+            deleted: 0,
         }
     }
 }
@@ -644,8 +816,6 @@ async fn run_batch(
     state: &Arc<SmartClusterWorkerState>,
     storage: Arc<StorageState>,
     forced: bool,
-    deadline: Instant,
-    rederive_failed_this_pass: &mut HashSet<i64>,
 ) -> Result<BatchProgress, String> {
     let read = {
         let storage = storage.clone();
@@ -656,16 +826,6 @@ async fn run_batch(
             }
             let targets = storage.list_smart_cluster_scoring_targets()?;
             let batch_size = batch_size_for(forced, targets.len());
-            if targets.is_empty() {
-                // No enabled clusters. Python drained the queue anyway so it
-                // could not grow without bound while clusters are switched off,
-                // and the same reasoning applies: nothing will ever score these.
-                let stale = storage.peek_smart_cluster_pending_batch(batch_size)?;
-                if !stale.is_empty() {
-                    storage.delete_smart_cluster_pending_ids(&stale)?;
-                }
-                return Ok(None);
-            }
             let ids = storage.peek_smart_cluster_pending_batch(batch_size)?;
             if ids.is_empty() {
                 return Ok(None);
@@ -697,8 +857,6 @@ async fn run_batch(
         inputs.targets,
         &scorer,
         forced,
-        deadline,
-        rederive_failed_this_pass,
     )
     .await;
     state
@@ -713,13 +871,14 @@ async fn run_batch(
         // deleted and nothing is scored; the next pass starts over.
         return Ok(BatchProgress::stopped(reason));
     }
+    if let Some(error) = resolution.retry_error {
+        // Threshold resolution is all-or-nothing for a queue batch. Scoring
+        // against only the clusters that resolved successfully and deleting
+        // the ids would permanently skip the failed cluster.
+        return Err(error);
+    }
     let targets = resolution.usable;
     if targets.is_empty() {
-        if resolution.retryable > 0 {
-            // At least one cluster failed for a reason that may not repeat, so
-            // the ids stay queued for a pass that can score them.
-            return Ok(BatchProgress::completed(false));
-        }
         // Every enabled cluster has been given up on: its saved examples cannot
         // produce a threshold under this scorer, and nothing but a
         // recalibration will change that. Draining is the same call the
@@ -729,8 +888,10 @@ async fn run_batch(
         // and a pass that wakes to re-discover the same verdict every minute.
         // The warning banner keeps saying which clusters need attention, and a
         // rescan re-enqueues the window once they have it.
-        delete_pending(storage, &inputs.ids).await?;
-        return Ok(BatchProgress::completed(inputs.remaining > 0));
+        let remaining = commit_pending(app, state, storage, &inputs.ids, forced).await?;
+        let mut progress = BatchProgress::completed(remaining > 0);
+        progress.deleted = inputs.ids.len() as u64;
+        return Ok(progress);
     }
 
     let anchors = embed_anchors(app, &semantic, storage.clone(), &targets).await?;
@@ -755,7 +916,7 @@ async fn run_batch(
     let mut assigned = 0u64;
     let mut interrupted: Option<&'static str> = None;
     for group in inputs.ids.chunks(group_size) {
-        if let Some(reason) = stand_down_reason(app, state, forced, deadline) {
+        if let Some(reason) = stand_down_reason(app, state, forced) {
             tracing::debug!("[SMART_CLUSTER] leaving the batch before a commit group: {reason}");
             interrupted = Some(reason);
             break;
@@ -764,7 +925,7 @@ async fn run_batch(
         if documents.is_empty() {
             // Every snapshot in this group was deleted between enqueue and now;
             // the queue entries have nothing left to describe.
-            delete_pending(storage.clone(), group).await?;
+            commit_pending(app, state, storage.clone(), group, forced).await?;
             continue;
         }
         let vectors = load_prefilter_vectors(storage.clone(), documents.keys().copied()).await?;
@@ -776,7 +937,7 @@ async fn run_batch(
             // submitted. Whatever was already assigned stands and every group
             // committed before this one stays committed; only this group is
             // scored again next pass.
-            if let Some(reason) = stand_down_reason(app, state, forced, deadline) {
+            if let Some(reason) = stand_down_reason(app, state, forced) {
                 tracing::debug!("[SMART_CLUSTER] leaving the batch between clusters: {reason}");
                 interrupted = Some(reason);
                 break;
@@ -816,11 +977,13 @@ async fn run_batch(
                     break;
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        "[SMART_CLUSTER] rerank failed for cluster {}: {error}",
+                    // Assignments already written for earlier targets are
+                    // harmless upserts. Keep this whole group queued so the
+                    // failed target is never skipped when the retry succeeds.
+                    return Err(format!(
+                        "rerank_failed: cluster {} could not score its pending snapshots: {error}",
                         target.id
-                    );
-                    continue;
+                    ));
                 }
             };
             let recorded =
@@ -837,7 +1000,7 @@ async fn run_batch(
             // pass, which is the whole of what standing down now costs.
             break;
         }
-        delete_pending(storage.clone(), group).await?;
+        commit_pending(app, state, storage.clone(), group, forced).await?;
     }
 
     if assigned > 0 {
@@ -845,7 +1008,11 @@ async fn run_batch(
     }
     match interrupted {
         Some(reason) => Ok(BatchProgress::stopped(reason)),
-        None => Ok(BatchProgress::completed(inputs.remaining > 0)),
+        None => {
+            let mut progress = BatchProgress::completed(inputs.remaining > 0);
+            progress.deleted = inputs.ids.len() as u64;
+            Ok(progress)
+        }
     }
 }
 
@@ -896,10 +1063,9 @@ struct ThresholdResolution {
     usable: Vec<SmartClusterScoringTarget>,
     /// Enabled clusters that will not be scored, for the status banner.
     unverifiable: usize,
-    /// How many of those might succeed later. Zero means every unusable cluster
-    /// has been given up on, which is what lets the caller drain a queue that
-    /// nothing will ever score.
-    retryable: usize,
+    /// A runtime failure that requires the whole queue batch to remain intact.
+    /// The scheduler owns its bounded retry and terminal-failure policy.
+    retry_error: Option<String>,
     /// Why the pass stood down before every enabled cluster had been
     /// considered, if it did.
     ///
@@ -932,14 +1098,12 @@ async fn resolve_thresholds(
     targets: Vec<SmartClusterScoringTarget>,
     scorer: &ScorerIdentity,
     forced: bool,
-    deadline: Instant,
-    failed_this_pass: &mut HashSet<i64>,
 ) -> ThresholdResolution {
     let fingerprint = scorer.fingerprint();
     let mut resolution = ThresholdResolution {
         usable: Vec::with_capacity(targets.len()),
         unverifiable: 0,
-        retryable: 0,
+        retry_error: None,
         interrupted: None,
     };
     for mut target in targets {
@@ -952,11 +1116,6 @@ async fn resolve_thresholds(
             resolution.usable.push(target);
             continue;
         }
-        if failed_this_pass.contains(&target.id) {
-            resolution.unverifiable += 1;
-            resolution.retryable += 1;
-            continue;
-        }
         if target.rederive_failed_scorer.as_deref() == Some(fingerprint.as_str()) {
             // Already established, on an earlier pass, that this cluster's
             // examples cannot produce a threshold under this scorer. Re-asking
@@ -964,7 +1123,7 @@ async fn resolve_thresholds(
             resolution.unverifiable += 1;
             continue;
         }
-        if let Some(reason) = stand_down_reason(app, state, forced, deadline) {
+        if let Some(reason) = stand_down_reason(app, state, forced) {
             tracing::debug!(
                 "[SMART_CLUSTER] stopping threshold resolution before cluster {}: {reason}",
                 target.id
@@ -1026,12 +1185,15 @@ async fn resolve_thresholds(
             }
             Err(error) => {
                 resolution.unverifiable += 1;
-                resolution.retryable += 1;
-                failed_this_pass.insert(target.id);
                 tracing::warn!(
                     "[SMART_CLUSTER] could not re-derive the threshold for cluster {}: {error}",
                     target.id
                 );
+                resolution.retry_error = Some(format!(
+                    "rerank_failed: cluster {} could not re-derive its threshold: {error}",
+                    target.id
+                ));
+                break;
             }
         }
     }
@@ -1391,12 +1553,15 @@ async fn record_assignments(
     tokio::task::spawn_blocking(move || -> Result<u64, String> {
         let mut recorded = 0u64;
         for (screenshot_id, score) in matches {
-            match storage.record_smart_cluster_assignment(cluster_id, screenshot_id, score) {
-                Ok(()) => recorded += 1,
-                Err(error) => tracing::warn!(
-                    "[SMART_CLUSTER] failed to record assignment {cluster_id}/{screenshot_id}: {error}"
-                ),
-            }
+            storage
+                .record_smart_cluster_assignment(cluster_id, screenshot_id, score)
+                .map_err(|error| {
+                    format!(
+                        "assignment_write_failed: failed to record assignment \
+                         {cluster_id}/{screenshot_id}: {error}"
+                    )
+                })?;
+            recorded += 1;
         }
         Ok(recorded)
     })
@@ -1404,11 +1569,30 @@ async fn record_assignments(
     .map_err(|error| format!("assignment write task failed: {error}"))?
 }
 
-async fn delete_pending(storage: Arc<StorageState>, ids: &[i64]) -> Result<(), String> {
+async fn delete_pending(storage: Arc<StorageState>, ids: &[i64]) -> Result<(u64, u64), String> {
     let ids = ids.to_vec();
-    tokio::task::spawn_blocking(move || storage.delete_smart_cluster_pending_ids(&ids))
-        .await
-        .map_err(|error| format!("pending delete task failed: {error}"))?
+    tokio::task::spawn_blocking(move || {
+        let deleted = storage.delete_smart_cluster_pending_ids_count(&ids)? as u64;
+        let remaining = storage.count_smart_cluster_pending()?.max(0) as u64;
+        Ok((deleted, remaining))
+    })
+    .await
+    .map_err(|error| format!("pending delete task failed: {error}"))?
+}
+
+async fn commit_pending(
+    app: &AppHandle,
+    state: &Arc<SmartClusterWorkerState>,
+    storage: Arc<StorageState>,
+    ids: &[i64],
+    forced: bool,
+) -> Result<u64, String> {
+    let (deleted, remaining) = delete_pending(storage, ids).await?;
+    if forced {
+        state.report_processed(deleted, remaining);
+        state.emit_progress(app);
+    }
+    Ok(remaining)
 }
 
 // ==================== Command surface ====================
@@ -1425,14 +1609,54 @@ async fn delete_pending(storage: Arc<StorageState>, ids: &[i64]) -> Result<(), S
 /// `is_running && pending_count > 0`, so a payload that omitted the queue depth
 /// would report a worker that never runs and would never show the stop button,
 /// however busy the drain actually was.
-pub fn status_value(state: &Arc<SmartClusterWorkerState>, pending_count: i64) -> serde_json::Value {
+pub fn status_value(
+    state: &Arc<SmartClusterWorkerState>,
+    pending_count: i64,
+    scheduler_task: Option<&BackgroundTaskState>,
+) -> serde_json::Value {
     let status = state.status();
+    let mut progress = status.progress;
+    let manual_pending = scheduler_task.is_some_and(|task| task.manual_pending);
+    if scheduler_task.is_some_and(|task| task.status == "failed") {
+        let remaining = pending_count.max(0) as u64;
+        progress.phase = SmartClusterDrainPhase::Failed;
+        progress.remaining = remaining;
+        progress.total = progress.total.max(progress.processed + remaining);
+    } else if manual_pending && !progress.phase.is_active() {
+        progress = SmartClusterDrainProgress {
+            phase: if scheduler_task.is_some_and(|task| task.status == "retry_wait") {
+                SmartClusterDrainPhase::Retrying
+            } else {
+                SmartClusterDrainPhase::Queued
+            },
+            total: pending_count.max(0) as u64,
+            processed: 0,
+            remaining: pending_count.max(0) as u64,
+        };
+    }
+    let manual_active = manual_pending || status.is_force_running || progress.phase.is_active();
+    let last_error = scheduler_task.and_then(|task| task.last_error.as_deref());
+    let failure_kind = scheduler_task.and_then(|task| {
+        task.last_error
+            .as_deref()
+            .map(|error| scheduled_failure_policy(error, task.failure_count.max(1)).code)
+    });
     serde_json::json!({
         "status": "success",
         "backend": status.backend,
         "is_running": status.is_running,
         "is_force_running": status.is_force_running,
+        "manual_active": manual_active,
+        "phase": progress.phase,
+        "total": progress.total,
+        "processed": progress.processed,
         "pending_count": pending_count,
+        "scheduler_status": scheduler_task.map(|task| task.status.as_str()),
+        "failure_count": scheduler_task.map(|task| task.failure_count).unwrap_or(0),
+        "failure_kind": failure_kind,
+        "last_error": last_error,
+        "next_retry_at_ms": scheduler_task
+            .and_then(|task| (task.next_attempt_at_ms > 0).then_some(task.next_attempt_at_ms)),
         "assigned_total": status.assigned_total,
         "unverifiable_thresholds": status.unverifiable_thresholds,
         "scorer": status.scorer,
@@ -1444,6 +1668,25 @@ mod tests {
     use super::*;
     use crate::storage::smart_cluster::CachedAnchorVector;
 
+    fn scheduler_task(
+        status: &str,
+        manual_pending: bool,
+        failure_count: u32,
+        last_error: Option<&str>,
+    ) -> BackgroundTaskState {
+        BackgroundTaskState {
+            task_kind: crate::background_scheduler::TASK_SMART_CLUSTER.to_string(),
+            ready_since_ms: 0,
+            next_attempt_at_ms: if status == "retry_wait" { 1_000 } else { 0 },
+            failure_count,
+            last_served_seq: 0,
+            last_error: last_error.map(str::to_string),
+            last_completed_at_ms: None,
+            status: status.to_string(),
+            manual_pending,
+        }
+    }
+
     #[test]
     fn the_status_payload_keeps_the_two_fields_the_ui_reads() {
         // `SmartClustersView` polls `is_running` / `is_force_running` to decide
@@ -1451,7 +1694,7 @@ mod tests {
         // `pending_count > 0`, so dropping the queue depth would leave a stop
         // button that never appears.
         let state = Arc::new(SmartClusterWorkerState::default());
-        let value = status_value(&state, 4);
+        let value = status_value(&state, 4, None);
         assert_eq!(value["status"], "success");
         assert_eq!(value["is_running"], false);
         assert_eq!(value["is_force_running"], false);
@@ -1461,12 +1704,35 @@ mod tests {
     }
 
     #[test]
+    fn durable_retry_and_failure_states_survive_worker_state_loss() {
+        let state = Arc::new(SmartClusterWorkerState::default());
+        let retry = scheduler_task("retry_wait", true, 2, Some("temporary inference failure"));
+        let retry_value = status_value(&state, 4, Some(&retry));
+        assert_eq!(retry_value["phase"], "retrying");
+        assert_eq!(retry_value["manual_active"], true);
+        assert_eq!(retry_value["failure_count"], 2);
+        assert_eq!(retry_value["next_retry_at_ms"], 1_000);
+
+        let failed = scheduler_task(
+            "failed",
+            false,
+            MAX_SCHEDULED_FAILURES,
+            Some("rerank_failed: persistent fault"),
+        );
+        let failed_value = status_value(&state, 4, Some(&failed));
+        assert_eq!(failed_value["phase"], "failed");
+        assert_eq!(failed_value["manual_active"], false);
+        assert_eq!(failed_value["failure_kind"], "inference_failed");
+        assert_eq!(failed_value["pending_count"], 4);
+    }
+
+    #[test]
     fn a_drain_request_is_consumed_exactly_once() {
         // The loop polls for the flag; leaving it set would restart the forced
         // pass on every tick after the first.
         let state = SmartClusterWorkerState::default();
         assert!(!state.take_drain_request());
-        state.request_drain_now();
+        state.request_drain_now(4);
         assert!(state.take_drain_request());
         assert!(!state.take_drain_request());
     }
@@ -1478,14 +1744,14 @@ mod tests {
         let state = SmartClusterWorkerState::default();
         state.request_stop_drain();
         assert!(state.aborted());
-        state.request_drain_now();
+        state.request_drain_now(4);
         assert!(!state.aborted());
     }
 
     #[test]
     fn a_failed_enqueue_can_cancel_the_pending_drain_request() {
         let state = SmartClusterWorkerState::default();
-        let rollback = state.request_drain_now();
+        let rollback = state.request_drain_now(4);
         state.cancel_pending_drain_request(rollback);
         assert!(!state.take_drain_request());
     }
@@ -1494,7 +1760,7 @@ mod tests {
     fn a_failed_enqueue_restores_a_preexisting_stop_request() {
         let state = SmartClusterWorkerState::default();
         state.request_stop_drain();
-        let rollback = state.request_drain_now();
+        let rollback = state.request_drain_now(4);
         assert!(!state.aborted());
 
         state.cancel_pending_drain_request(rollback);
@@ -1505,8 +1771,8 @@ mod tests {
     #[test]
     fn an_old_failed_enqueue_cannot_cancel_a_newer_request() {
         let state = SmartClusterWorkerState::default();
-        let old = state.request_drain_now();
-        let _new = state.request_drain_now();
+        let old = state.request_drain_now(4);
+        let _new = state.request_drain_now(4);
 
         state.cancel_pending_drain_request(old);
         assert!(state.take_drain_request());
@@ -1569,36 +1835,18 @@ mod tests {
     }
 
     #[test]
-    fn the_reason_a_forced_drain_resumes_from_is_distinguishable() {
-        // The drain waits on exactly one of `stand_down_reason`'s answers and
-        // ends on the rest, and it tells them apart by value. Two reasons that
-        // compared equal would make it either wait out a stop button or end on
-        // a query it should have waited for.
-        //
-        // Compared against the constants the code actually returns, not against
-        // copies written here: a test holding its own copy of a string is a test
-        // that agrees with itself about a collision it cannot see.
-        for other in [
-            STOP_REQUESTED,
-            FORCED_DEADLINE_REACHED,
-            MAY_NOT_RUN,
-            WAITED_OUT_BY_FOREGROUND,
-        ] {
-            assert_ne!(other, FOREGROUND_QUERY_STOP);
-        }
-    }
-
-    #[test]
-    fn a_forced_drain_cannot_wait_out_its_own_deadline() {
-        // The wait budget has to leave time to actually score something, or the
-        // button becomes a way to spend ten minutes doing nothing and then log
-        // that the queue was deep. It also has to outlast one whole reranked
-        // calibration query, or the common collision — search, then drain —
-        // ends the drain rather than sequencing it.
-        assert!(FORCED_FOREGROUND_WAIT_BUDGET < FORCED_DEADLINE);
-        let worst_query = Duration::from_millis(1180)
-            * (crate::rerank::MAX_RERANK_RESULTS * crate::rerank::RERANK_OVERFETCH);
-        assert!(FORCED_FOREGROUND_WAIT_BUDGET > worst_query);
+    fn manual_progress_tracks_queue_work_and_can_be_stopped() {
+        let state = SmartClusterWorkerState::default();
+        state.request_drain_now(10);
+        state.begin_manual_drain(10);
+        state.report_processed(4, 6);
+        let progress = state.progress();
+        assert_eq!(progress.phase, SmartClusterDrainPhase::Running);
+        assert_eq!(progress.total, 10);
+        assert_eq!(progress.processed, 4);
+        assert_eq!(progress.remaining, 6);
+        state.request_stop_drain();
+        assert_eq!(state.progress().phase, SmartClusterDrainPhase::Stopped);
     }
 
     #[test]
@@ -1847,7 +2095,7 @@ mod tests {
         let complete = ThresholdResolution {
             usable: vec![legacy_target(1, None)],
             unverifiable: 0,
-            retryable: 0,
+            retry_error: None,
             interrupted: None,
         };
         assert!(complete.interrupted.is_none());
@@ -1855,7 +2103,7 @@ mod tests {
         let stopped_early = ThresholdResolution {
             usable: vec![legacy_target(1, None)],
             unverifiable: 0,
-            retryable: 0,
+            retry_error: None,
             interrupted: Some(FOREGROUND_QUERY_STOP),
         };
         // Same non-empty `usable`, opposite handling.

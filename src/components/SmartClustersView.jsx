@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { listen } from '@tauri-apps/api/event';
 import {
   Sparkles, Plus, Loader2, RefreshCw, AlertCircle, X,
   Zap, Clock, FileText, CircleDot, PauseCircle, Inbox,
@@ -392,16 +393,65 @@ export default function SmartClustersView({
         getSmartClusterWorkerStatus(),
       ]);
       if (s.status === 'fulfilled' && s.value) setStatusData(s.value);
-      if (ws.status === 'fulfilled' && ws.value) setWorkerStatus(ws.value);
+      if (ws.status === 'fulfilled' && ws.value) {
+        setWorkerStatus(ws.value);
+        if (ws.value.phase && ws.value.phase !== 'idle') {
+          const active = Boolean(ws.value.manualActive)
+            || ['queued', 'running', 'waiting', 'stopping', 'retrying']
+              .includes(ws.value.phase);
+          setDrainRequested(active);
+        }
+      }
     } catch (err) {
       console.warn('loadStatus error:', err);
     }
   }, []);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active) return undefined;
+    let cancelled = false;
+    let unlisten = null;
+    listen('smart-cluster-progress', ({ payload }) => {
+      if (cancelled || !payload) return;
+      const phase = typeof payload.phase === 'string' ? payload.phase : 'idle';
+      setWorkerStatus((previous) => ({
+        ...(previous || {}),
+        pending_count: Number(payload.pending_count || 0),
+        running: !!payload.is_running,
+        forceRunning: !!payload.is_force_running,
+        manualActive: payload.manual_active !== undefined
+          ? !!payload.manual_active
+          : !!payload.is_force_running,
+        phase: payload.phase || previous?.phase || 'idle',
+        total: Number(payload.total || 0),
+        processed: Number(payload.processed || 0),
+      }));
+      setStatusData((previous) => (previous
+        ? {
+          ...previous,
+          pending_count: Number(payload.pending_count || 0),
+          is_running: !!payload.is_running,
+          is_force_running: !!payload.is_force_running,
+        }
+        : previous));
+      setDrainRequested(['queued', 'running', 'waiting', 'stopping', 'retrying']
+        .includes(phase));
+    }).then((dispose) => {
+      if (cancelled) dispose();
+      else unlisten = dispose;
+    }).catch((err) => console.warn('Failed to subscribe to smart-cluster-progress:', err));
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [active]);
+
+  useEffect(() => {
+    if (!active) return undefined;
     loadClusters();
     loadStatus();
+    const timer = window.setInterval(loadStatus, 4000);
+    return () => window.clearInterval(timer);
   }, [active, loadClusters, loadStatus]);
 
   const selected = useMemo(
@@ -589,12 +639,14 @@ export default function SmartClustersView({
   const pausedCount = pausedClusters.length;
   const pendingCount = statusData?.pending_count ?? workerStatus?.pending_count ?? 0;
   const unverifiableCount = statusData?.unverifiable_thresholds ?? workerStatus?.unverifiableThresholds ?? 0;
+  const drainFailed = workerStatus?.phase === 'failed'
+    || workerStatus?.schedulerStatus === 'failed';
 
   const isDraining = drainRequested
+    || Boolean(workerStatus?.manualActive)
+    || ['queued', 'running', 'waiting', 'stopping', 'retrying'].includes(workerStatus?.phase)
     || Boolean(statusData?.is_force_running)
-    || Boolean(statusData?.is_running)
-    || Boolean(workerStatus?.forceRunning)
-    || Boolean(workerStatus?.running);
+    || Boolean(workerStatus?.forceRunning);
 
   const overview = useMemo(() => {
     let total = 0;
@@ -671,11 +723,19 @@ export default function SmartClustersView({
                 className="flex h-[22px] items-center gap-1 rounded-full bg-ide-hover px-2 text-[11px] text-ide-muted transition-colors hover:text-ide-text disabled:opacity-40"
               >
                 <Zap className="h-2.5 w-2.5" />
-                {t('smartClusters.processNow', '立即处理')}
+                {drainFailed
+                  ? t('smartClusters.retryFailed', '重试')
+                  : t('smartClusters.processNow', '立即处理')}
               </button>
             )}
           >
             {t('smartClusters.chipPending', '{{count}} 张待处理', { count: pendingCount })}
+          </StatusChip>
+        )}
+
+        {drainFailed && (
+          <StatusChip icon={<AlertCircle className="h-3 w-3" />}>
+            {t('smartClusters.processingFailed', '处理失败')}
           </StatusChip>
         )}
 
@@ -710,6 +770,18 @@ export default function SmartClustersView({
           <button onClick={() => setError(null)} className="text-red-400 hover:text-red-300">
             <X className="h-3 w-3" />
           </button>
+        </div>
+      )}
+
+      {drainFailed && (
+        <div
+          className="mx-6 mt-3 flex shrink-0 items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2"
+          title={workerStatus?.lastError || undefined}
+        >
+          <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+          <span className="flex-1 break-all text-xs text-amber-300">
+            {t('smartClusters.processingFailedDetail', '连续处理失败，自动重试已暂停。你可以重试此任务。')}
+          </span>
         </div>
       )}
 

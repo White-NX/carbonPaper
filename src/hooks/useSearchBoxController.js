@@ -6,6 +6,7 @@ import {
   fetchThumbnailBatch,
   getSoftDeleteQueueStatus,
   getSmartClusterWorkerStatus,
+  normalizeSmartClusterWorkerStatus,
   getBackgroundIndexProgress,
 } from '../lib/monitor_api';
 import { smartClusterStopDrain } from '../lib/task_api';
@@ -35,6 +36,11 @@ const EMPTY_DELETE_QUEUE_STATUS = {
 const EMPTY_CLUSTER_QUEUE_STATUS = {
   pending_count: 0,
   running: false,
+  forceRunning: false,
+  manualActive: false,
+  phase: 'idle',
+  total: 0,
+  processed: 0,
 };
 
 // A manual index run that has not been observed yet. `total` of zero means "the
@@ -258,11 +264,30 @@ export function useSearchBoxController({
     };
   }, []);
 
-  // The poll above decides whether a run is going; these keep the number moving
-  // between polls. A chunk of images takes long enough that a four-second bar
-  // sitting still reads as a stall, and the run already emits an event per
-  // chunk for the settings dialog. Only applied while the poll says the run is
-  // live, so a late event from a finished run cannot revive the display.
+  useEffect(() => {
+    let unlisten = null;
+    let cancelled = false;
+    listen('smart-cluster-progress', ({ payload }) => {
+      if (!payload || cancelled) return;
+      const normalized = typeof normalizeSmartClusterWorkerStatus === 'function'
+        ? normalizeSmartClusterWorkerStatus(payload)
+        : payload;
+      setSmartClusterQueueStatus((previous) => ({
+        ...previous,
+        ...normalized,
+      }));
+    }).then((dispose) => {
+      if (cancelled) dispose();
+      else unlisten = dispose;
+    }).catch((err) => console.warn('Failed to subscribe to smart-cluster-progress:', err));
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  // Index runs already publish chunk events. Keep the existing event-driven
+  // smoothing for those queues; Smart Cluster has its own queue event above.
   useEffect(() => {
     const subscriptions = [
       ['semantic-index-progress', 'semantic'],
@@ -300,15 +325,22 @@ export function useSearchBoxController({
     return Math.max(0, Math.min(100, ratio));
   })();
 
-  const hasClusterTask = Boolean(smartClusterQueueStatus?.running)
-    && Number(smartClusterQueueStatus?.pending_count || 0) > 0;
-  const canCancelClusterTask = hasClusterTask && Boolean(smartClusterQueueStatus?.forceRunning);
+  const clusterManualActive = Boolean(smartClusterQueueStatus?.manualActive)
+    || Boolean(smartClusterQueueStatus?.forceRunning);
+  const clusterActive = clusterManualActive || Boolean(smartClusterQueueStatus?.running);
+  const hasClusterTask = clusterActive
+    && (Number(smartClusterQueueStatus?.pending_count || 0) > 0
+      || ['queued', 'running', 'waiting', 'stopping', 'retrying']
+        .includes(smartClusterQueueStatus?.phase));
+  const canCancelClusterTask = hasClusterTask && clusterManualActive;
   const clusterProgress = (() => {
     if (!hasClusterTask) return 0;
     const pending = Number(smartClusterQueueStatus.pending_count || 0);
+    const total = Number(smartClusterQueueStatus.total || smartClusterQueuePeak || 0);
     if (pending <= 0) return 100;
-    if (smartClusterQueuePeak <= 0) return 0;
-    const ratio = ((smartClusterQueuePeak - pending) / smartClusterQueuePeak) * 100;
+    if (total <= 0) return 0;
+    const processed = Number(smartClusterQueueStatus.processed || 0);
+    const ratio = (processed / total) * 100;
     return Math.max(0, Math.min(100, ratio));
   })();
 
@@ -374,14 +406,14 @@ export function useSearchBoxController({
   }, [hasDeleteTask, pendingDeleteTotal]);
 
   useEffect(() => {
-    const running = Boolean(smartClusterQueueStatus?.running);
+    const running = clusterActive;
     const pending = Number(smartClusterQueueStatus?.pending_count || 0);
     if (!running || pending <= 0) {
       setSmartClusterQueuePeak(0);
       return;
     }
     setSmartClusterQueuePeak((prev) => Math.max(prev, pending));
-  }, [smartClusterQueueStatus?.running, smartClusterQueueStatus?.pending_count]);
+  }, [clusterActive, smartClusterQueueStatus?.pending_count]);
 
   useEffect(() => {
     handleResumeMonitorRef.current = handleResumeMonitor;
