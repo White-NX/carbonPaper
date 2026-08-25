@@ -305,7 +305,8 @@ pub fn enqueue_captured_screenshot(
     Ok(())
 }
 
-/// Execute exactly one automatic MiniLM maintenance/encode slice. Scheduling,
+/// Execute one automatic MiniLM maintenance/encode slice, or a complete manual
+/// drain after the unified scheduler admits the user's request. Scheduling,
 /// authorization, and serialization are owned by `background_scheduler`.
 pub async fn run_scheduled_slice(
     app: &AppHandle,
@@ -313,15 +314,7 @@ pub async fn run_scheduled_slice(
 ) -> Result<ScheduledSliceResult, String> {
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let _active = manual.then(|| run.begin());
-    let outcome = run_pass(
-        app,
-        if manual {
-            PassMode::ScheduledManual
-        } else {
-            PassMode::Idle
-        },
-    )
-    .await?;
+    let outcome = run_pass(app, scheduled_pass_mode(manual)).await?;
     if let Some(reason) = outcome.refused.or(outcome.stopped_because) {
         return Ok(ScheduledSliceResult::skipped(reason));
     }
@@ -357,26 +350,44 @@ pub async fn run_scheduled_slice(
     Ok(ScheduledSliceResult::complete(backlog > 0))
 }
 
+fn scheduled_pass_mode(manual: bool) -> PassMode {
+    if manual {
+        PassMode::ScheduledManual
+    } else {
+        PassMode::Idle
+    }
+}
+
 /// What is allowed to stop a pass.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PassMode {
     /// Background work: runs only inside an idle window and stands down the
     /// moment the user comes back.
     Idle,
-    /// The user asked for this run, so the idle gate does not apply. Every
-    /// other guard still does — maintenance mode, the locked session, the
-    /// ledger's retry budget — and the run stops on the user's word or on the
-    /// runaway deadline.
+    /// The user asked for this run and the scheduler admitted it, so the idle
+    /// gate does not apply and the queue drains without yielding to another
+    /// background task. Every other guard still does — maintenance mode, the
+    /// locked session, the ledger's retry budget — and the run stops on the
+    /// user's word or on the runaway deadline.
     Manual,
-    /// A user request dispatched by the unified scheduler. It ignores the
-    /// idle gate like `Manual`, but returns after one drain so other queued
-    /// tasks get a scheduling boundary.
+    /// The same complete drain after admission by the unified scheduler. This
+    /// stays distinct from `Manual` only so worker failures return to the
+    /// scheduler's durable retry/backoff policy instead of becoming a command
+    /// summary for a caller that is no longer awaiting the run.
     ScheduledManual,
 }
 
 impl PassMode {
     fn is_manual(self) -> bool {
         matches!(self, Self::Manual | Self::ScheduledManual)
+    }
+
+    fn yields_after_chunk(self) -> bool {
+        self == Self::Idle
+    }
+
+    fn reports_failure_in_summary(self) -> bool {
+        self == Self::Manual
     }
 }
 
@@ -552,7 +563,8 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
         {
             return Ok(PassOutcome::refused(FOREGROUND_QUERY_STOP));
         }
-    } else if let Some(reason) = stand_aside_for_foreground(app, deadline, &mut waited).await {
+    } else if let Some(reason) = stand_aside_for_foreground(app, mode, deadline, &mut waited).await
+    {
         // Nothing was attempted, so this is a refusal rather than a stop: the
         // summary says "skipped, and here is which guard", which is the true
         // account of a click that never reached the worker.
@@ -576,8 +588,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
 
     match mode {
         PassMode::Idle => drain_queue(app, storage, mode).await,
-        PassMode::ScheduledManual => drain_queue(app, storage, mode).await,
-        PassMode::Manual => {
+        PassMode::Manual | PassMode::ScheduledManual => {
             // The queue depth the user is about to watch drain, read once and
             // after the repair pass that can add to it. Re-reading it per chunk
             // would take the process-wide database mutex several times a second
@@ -593,7 +604,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
             .await
             .unwrap_or(0);
             run.total.store(total, Ordering::SeqCst);
-            drain_until_done(app, storage, deadline, waited).await
+            drain_until_done(app, storage, deadline, waited, mode).await
         }
     }
 }
@@ -613,9 +624,11 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
 /// resumes leaves the ledger exactly as it found it.
 async fn stand_aside_for_foreground(
     app: &AppHandle,
+    mode: PassMode,
     deadline: Instant,
     waited: &mut Duration,
 ) -> Option<&'static str> {
+    debug_assert!(mode.is_manual());
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     if !semantic.foreground_waiting() {
         return None;
@@ -671,18 +684,20 @@ async fn drain_until_done(
     storage: Arc<StorageState>,
     deadline: Instant,
     mut waited: Duration,
+    mode: PassMode,
 ) -> Result<PassOutcome, String> {
+    debug_assert!(mode.is_manual());
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let mut total = PassOutcome::default();
     loop {
         // Before claiming anything, not after: a batch claimed and then held
         // through a pause is a batch nobody else can encode, and the leases
         // would be released uncharged one chunk later anyway.
-        if let Some(reason) = stand_aside_for_foreground(app, deadline, &mut waited).await {
+        if let Some(reason) = stand_aside_for_foreground(app, mode, deadline, &mut waited).await {
             total.stopped_because = Some(reason);
             break;
         }
-        let pass = drain_queue(app, storage.clone(), PassMode::Manual).await?;
+        let pass = drain_queue(app, storage.clone(), mode).await?;
         let drained = pass.indexed + pass.failed;
         total.indexed += pass.indexed;
         total.failed += pass.failed;
@@ -934,7 +949,7 @@ async fn drain_queue(
                     run.report_chunk(app, chunk_len, encoded.len() as u64);
                 }
                 indexed.append(&mut encoded);
-                if mode != PassMode::Manual && !pending.is_empty() {
+                if mode.yields_after_chunk() && !pending.is_empty() {
                     // One scheduler slice is one worker request and commit.
                     // Return the rest of this broader database claim without
                     // charging attempts so the task can re-enter at the FIFO
@@ -980,7 +995,7 @@ async fn drain_queue(
         // A manual run reports the failure through its summary instead of
         // propagating it, so the user sees "3 indexed, 4 failed" rather than an
         // error dialog that hides the work that did land.
-        Some(error) if mode.is_manual() => {
+        Some(error) if mode.reports_failure_in_summary() => {
             outcome.stopped_because = Some("encode_failed");
             tracing::warn!("[SEMANTIC:INDEX] manual run stopped: {error}");
             Ok(outcome)
@@ -1612,6 +1627,19 @@ mod tests {
         // rewriting the same store, which consent cannot make safe.
         assert_eq!(PassMode::Manual, PassMode::Manual);
         assert_ne!(PassMode::Idle, PassMode::Manual);
+    }
+
+    #[test]
+    fn a_scheduled_manual_request_uses_the_complete_drain_mode() {
+        // The scheduler owns admission, not the meaning of the user's action.
+        // Once admitted, a manual request must keep the worker until the queue
+        // is empty (or a real manual stop condition fires).
+        let mode = scheduled_pass_mode(true);
+        assert_eq!(mode, PassMode::ScheduledManual);
+        assert!(mode.is_manual());
+        assert!(!mode.yields_after_chunk());
+        assert!(!mode.reports_failure_in_summary());
+        assert_eq!(scheduled_pass_mode(false), PassMode::Idle);
     }
 
     #[test]

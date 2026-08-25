@@ -118,6 +118,22 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       ]);
       setBackgroundProcessingEnabled(Boolean(enabled));
       setBackgroundSchedulerStatus(status);
+      if (status) {
+        const task = (kind) => status.tasks?.find((item) => item.task_kind === kind);
+        const manuallyRunning = (kind) => status.running_manual && status.running_task === kind;
+        if (!ownsRun.current) {
+          const active = Boolean(task('semantic_index')?.manual_pending)
+            || manuallyRunning('semantic_index');
+          setSemanticIndexRunning(active);
+          if (!active) setSemanticIndexStopping(false);
+        }
+        if (!ownsClipRun.current) {
+          const active = Boolean(task('clip_index')?.manual_pending)
+            || manuallyRunning('clip_index');
+          setClipIndexRunning(active);
+          if (!active) setClipIndexStopping(false);
+        }
+      }
     } catch (err) {
       console.warn('Failed to read background scheduler status:', err);
     }
@@ -326,6 +342,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
    * like it had done nothing and needed pressing dozens of times.
    */
   const handleRunSemanticIndexNow = async () => {
+    let queued = false;
     ownsRun.current = true;
     setSemanticIndexRunning(true);
     setSemanticIndexStopping(false);
@@ -335,6 +352,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       const summary = await invoke('semantic_index_run_now');
       setSemanticIndexRun(summary);
       if (summary?.queued) {
+        queued = true;
         ownsRun.current = false;
         await refreshBackgroundSchedulerStatus();
         return summary;
@@ -350,7 +368,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       // `refreshSemanticStatus` above — which ran while this hook still owned
       // the run — is not the one that decides them.
       ownsRun.current = false;
-      setSemanticIndexRunning(false);
+      if (!queued) setSemanticIndexRunning(false);
       setSemanticIndexStopping(false);
       setSemanticIndexProgress(null);
     }
@@ -379,6 +397,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
    * request just like the MiniLM one.
    */
   const handleRunClipIndexNow = async () => {
+    let queued = false;
     ownsClipRun.current = true;
     setClipIndexRunning(true);
     setClipIndexStopping(false);
@@ -388,6 +407,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       const summary = await invoke('clip_index_run_now');
       setClipIndexRun(summary);
       if (summary?.queued) {
+        queued = true;
         ownsClipRun.current = false;
         await refreshBackgroundSchedulerStatus();
         return summary;
@@ -400,7 +420,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       return null;
     } finally {
       ownsClipRun.current = false;
-      setClipIndexRunning(false);
+      if (!queued) setClipIndexRunning(false);
       setClipIndexStopping(false);
       setClipIndexProgress(null);
     }

@@ -170,4 +170,42 @@ describe('useAdvancedSectionController', () => {
     });
     expect(hook.result.current.clipAnnRetrying).toBe(false);
   });
+
+  it('keeps a queued CLIP drain stoppable while the scheduler owns it', async () => {
+    clipRunActive = false;
+    invoke.mockImplementation(async (command) => {
+      if (command === 'get_advanced_config') return {};
+      if (command === 'storage_is_startup_vacuum_in_progress') return false;
+      if (command === 'get_rust_ocr_model_status') return {};
+      if (command === 'get_ml_ocr_status') return {};
+      if (command === 'get_ml_semantic_status') {
+        return {
+          backend: { index_run_active: false },
+          clip_backend: { index_run_active: false },
+        };
+      }
+      if (command === 'credential_get_background_processing_enabled') return true;
+      if (command === 'background_scheduler_status') {
+        return {
+          running_task: null,
+          running_manual: false,
+          tasks: [{ task_kind: 'clip_index', manual_pending: true }],
+        };
+      }
+      if (command === 'clip_index_run_now') return { queued: true };
+      return undefined;
+    });
+    const hook = renderHook(() => useAdvancedSectionController({
+      monitorStatus: 'stopped',
+      t,
+    }));
+
+    await waitFor(() => expect(hook.result.current.config).toEqual({}));
+    await act(async () => {
+      await hook.result.current.handleRunClipIndexNow();
+    });
+
+    expect(hook.result.current.clipIndexRunning).toBe(true);
+    expect(hook.result.current.clipIndexRun).toEqual({ queued: true });
+  });
 });

@@ -318,7 +318,8 @@ fn indexable_hashes(
     Ok(indexable)
 }
 
-/// Execute one automatic CLIP index/repair slice. The unified scheduler owns
+/// Execute one automatic CLIP index/repair slice, or a complete manual drain
+/// after the unified scheduler admits the user's request. The scheduler owns
 /// admission and the semantic-worker guard.
 pub async fn run_scheduled_slice(
     app: &AppHandle,
@@ -326,15 +327,7 @@ pub async fn run_scheduled_slice(
 ) -> Result<ScheduledSliceResult, String> {
     let run = app.state::<Arc<ClipIndexRunState>>().inner().clone();
     let _active = manual.then(|| run.begin());
-    let outcome = run_pass(
-        app,
-        if manual {
-            PassMode::ScheduledManual
-        } else {
-            PassMode::Idle
-        },
-    )
-    .await?;
+    let outcome = run_pass(app, scheduled_pass_mode(manual)).await?;
     if let Some(reason) = outcome.refused.or(outcome.stopped_because) {
         return Ok(ScheduledSliceResult::skipped(reason));
     }
@@ -354,16 +347,34 @@ pub async fn run_scheduled_slice(
     ))
 }
 
+fn scheduled_pass_mode(manual: bool) -> PassMode {
+    if manual {
+        PassMode::ScheduledManual
+    } else {
+        PassMode::Idle
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PassMode {
     Idle,
     Manual,
+    /// A complete manual drain whose admission and failure retry are owned by
+    /// the unified scheduler.
     ScheduledManual,
 }
 
 impl PassMode {
     fn is_manual(self) -> bool {
         matches!(self, Self::Manual | Self::ScheduledManual)
+    }
+
+    fn yields_after_chunk(self) -> bool {
+        self == Self::Idle
+    }
+
+    fn reports_failure_in_summary(self) -> bool {
+        self == Self::Manual
     }
 }
 
@@ -560,7 +571,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
         {
             return Ok(PassOutcome::refused(FOREGROUND_QUERY_STOP));
         }
-    } else if let Some(reason) = stand_aside_for_foreground(app).await {
+    } else if let Some(reason) = stand_aside_for_foreground(app, mode).await {
         return Ok(PassOutcome::refused(reason));
     }
 
@@ -599,16 +610,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
             }
             drain_queue(app, storage, mode, locked).await
         }
-        PassMode::ScheduledManual => {
-            reap_orphans(storage.clone()).await?;
-            let scope_storage = storage.clone();
-            let scope = tokio::task::spawn_blocking(move || repair_scope(&scope_storage))
-                .await
-                .unwrap_or(RepairScope::Suspended);
-            reconcile_missing(storage.clone(), scope).await?;
-            drain_queue(app, storage, mode, false).await
-        }
-        PassMode::Manual => {
+        PassMode::Manual | PassMode::ScheduledManual => {
             reap_orphans(storage.clone()).await?;
             let scope_storage = storage.clone();
             let scope = tokio::task::spawn_blocking(move || repair_scope(&scope_storage))
@@ -640,7 +642,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
             .await
             .unwrap_or(0);
             run.total.store(total, Ordering::SeqCst);
-            drain_until_done(app, storage).await
+            drain_until_done(app, storage, mode).await
         }
     }
 }
@@ -651,7 +653,8 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
 /// starts again at the next, so it bounds a run that cannot make progress
 /// rather than a run that has been politely yielding for a long time — see
 /// [`MANUAL_FOREGROUND_WAIT_BUDGET`].
-async fn stand_aside_for_foreground(app: &AppHandle) -> Option<&'static str> {
+async fn stand_aside_for_foreground(app: &AppHandle, mode: PassMode) -> Option<&'static str> {
+    debug_assert!(mode.is_manual());
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut waited = Duration::ZERO;
     loop {
@@ -683,12 +686,14 @@ async fn stand_aside_for_foreground(app: &AppHandle) -> Option<&'static str> {
 async fn drain_until_done(
     app: &AppHandle,
     storage: Arc<StorageState>,
+    mode: PassMode,
 ) -> Result<PassOutcome, String> {
+    debug_assert!(mode.is_manual());
     let mut total = PassOutcome::default();
     loop {
         // Manual runs hold an authenticated session by construction:
         // `clip_index_run_now` checks it before anything else.
-        let outcome = drain_queue(app, storage.clone(), PassMode::Manual, false).await?;
+        let outcome = drain_queue(app, storage.clone(), mode, false).await?;
         total.indexed += outcome.indexed;
         total.failed += outcome.failed;
         match outcome.stopped_because {
@@ -698,7 +703,7 @@ async fn drain_until_done(
             // A foreground query took the worker: wait for it and claim again,
             // rather than ending a run somebody started.
             Some(FOREGROUND_QUERY_STOP) => {
-                if let Some(reason) = stand_aside_for_foreground(app).await {
+                if let Some(reason) = stand_aside_for_foreground(app, mode).await {
                     total.stopped_because = Some(reason);
                     return Ok(total);
                 }
@@ -771,7 +776,7 @@ async fn drain_queue(
                     run.report_chunk(app, chunk_len, encoded as u64);
                 }
                 indexed += encoded;
-                if !matches!(mode, PassMode::Manual) && !pending.is_empty() {
+                if mode.yields_after_chunk() && !pending.is_empty() {
                     // A scheduled request owns one bounded image batch. Give
                     // the remaining claimed jobs back without consuming retry
                     // budget so the unified scheduler can rotate to the next
@@ -813,7 +818,7 @@ async fn drain_queue(
         tracing::info!("[CLIP:INDEX] indexed {} image(s)", indexed);
     }
     match failure {
-        Some(error) if mode.is_manual() => {
+        Some(error) if mode.reports_failure_in_summary() => {
             outcome.stopped_because = Some("encode_failed");
             tracing::warn!("[CLIP:INDEX] manual run stopped: {error}");
             Ok(outcome)
@@ -1627,6 +1632,18 @@ mod tests {
         // chunk size *is* the worst case a search arriving mid-pass inherits.
         assert_eq!(ENCODE_CHUNK, 1);
         assert!(DRAIN_BATCH >= ENCODE_CHUNK);
+    }
+
+    #[test]
+    fn a_scheduled_manual_request_uses_the_complete_drain_mode() {
+        // The scheduler decides when this starts. It must not turn the user's
+        // complete drain into one image followed by ordinary idle work.
+        let mode = scheduled_pass_mode(true);
+        assert_eq!(mode, PassMode::ScheduledManual);
+        assert!(mode.is_manual());
+        assert!(!mode.yields_after_chunk());
+        assert!(!mode.reports_failure_in_summary());
+        assert_eq!(scheduled_pass_mode(false), PassMode::Idle);
     }
 
     #[test]

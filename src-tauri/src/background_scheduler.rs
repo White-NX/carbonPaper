@@ -186,6 +186,7 @@ impl ScheduledSliceResult {
 pub struct BackgroundSchedulerStatus {
     pub enabled: bool,
     pub running_task: Option<String>,
+    pub running_manual: bool,
     pub tasks: Vec<BackgroundTaskState>,
     pub queue_depths: serde_json::Value,
     pub blocked_reason: Option<String>,
@@ -199,6 +200,7 @@ struct SchedulerRuntime {
     wake: Notify,
     task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     running_task: Mutex<Option<String>>,
+    running_manual: AtomicBool,
     blocked_reason: Mutex<Option<String>>,
     service_seq: AtomicU64,
     worker_restart_count: AtomicU64,
@@ -216,6 +218,7 @@ impl Default for SchedulerRuntime {
             wake: Notify::new(),
             task: Mutex::new(None),
             running_task: Mutex::new(None),
+            running_manual: AtomicBool::new(false),
             blocked_reason: Mutex::new(None),
             service_seq: AtomicU64::new(0),
             worker_restart_count: AtomicU64::new(0),
@@ -395,6 +398,7 @@ impl BackgroundSchedulerState {
         BackgroundSchedulerStatus {
             enabled,
             running_task,
+            running_manual: self.runtime.running_manual.load(Ordering::Relaxed),
             tasks,
             queue_depths: depths,
             blocked_reason,
@@ -838,7 +842,9 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
             .running_task
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(kind.as_str().to_string());
+        runtime.running_manual.store(manual, Ordering::SeqCst);
         let result = execute_slice(&app, kind, manual, &runtime).await;
+        runtime.running_manual.store(false, Ordering::SeqCst);
         *runtime
             .running_task
             .lock()
