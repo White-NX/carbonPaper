@@ -44,6 +44,18 @@ describe('useAdvancedSectionController', () => {
           clip_backend: { index_run_active: clipRunActive },
         };
       }
+      if (command === 'credential_get_background_processing_enabled') return true;
+      if (command === 'background_scheduler_status') {
+        return {
+          running_task: clipRunActive ? 'clip_index' : null,
+          running_manual: clipRunActive,
+          tasks: [{
+            task_kind: 'clip_index',
+            manual_pending: clipRunActive,
+            status: clipRunActive ? 'running' : 'completed',
+          }],
+        };
+      }
       if (command === 'clip_index_stop_now') return true;
       return undefined;
     });
@@ -207,5 +219,51 @@ describe('useAdvancedSectionController', () => {
 
     expect(hook.result.current.clipIndexRunning).toBe(true);
     expect(hook.result.current.clipIndexRun).toEqual({ queued: true });
+  });
+
+  it('maps a manual scheduler retry wait to a non-running phase', async () => {
+    clipRunActive = false;
+    let schedulerReads = 0;
+    invoke.mockImplementation(async (command) => {
+      if (command === 'get_advanced_config') return {};
+      if (command === 'storage_is_startup_vacuum_in_progress') return false;
+      if (command === 'get_rust_ocr_model_status') return {};
+      if (command === 'get_ml_ocr_status') return {};
+      if (command === 'get_ml_semantic_status') {
+        return {
+          backend: { index_run_active: false },
+          clip_backend: { index_run_active: false },
+        };
+      }
+      if (command === 'credential_get_background_processing_enabled') return true;
+      if (command === 'background_scheduler_status') {
+        schedulerReads += 1;
+        if (schedulerReads > 1) return { running_task: null, running_manual: false };
+        return {
+          running_task: null,
+          running_manual: false,
+          tasks: [{
+            task_kind: 'semantic_index',
+            manual_pending: true,
+            status: 'retry_wait',
+            next_attempt_at_ms: 1_800_000_000_000,
+          }],
+        };
+      }
+      return undefined;
+    });
+
+    const hook = renderHook(() => useAdvancedSectionController({
+      monitorStatus: 'stopped',
+      t,
+    }));
+    await waitFor(() => expect(hook.result.current.config).toEqual({}));
+    await waitFor(() => expect(hook.result.current.semanticIndexPhase).toBe('retry_wait'));
+    expect(hook.result.current.semanticIndexRunning).toBe(false);
+    expect(hook.result.current.semanticIndexRetryAt).toBe(1_800_000_000_000);
+    await act(async () => {
+      await hook.result.current.refreshBackgroundSchedulerStatus();
+    });
+    expect(hook.result.current.semanticIndexPhase).toBe('retry_wait');
   });
 });

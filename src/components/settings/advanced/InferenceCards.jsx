@@ -5,6 +5,20 @@ import SettingsHelpTooltip from '../SettingsHelpTooltip';
 import { SettingsSwitch } from '../SettingsControls';
 import { formatEstimate } from '../../ClipBackfillDialog';
 
+function effectiveIndexPhase(indexPhase, indexRunning) {
+  // Keep the boolean prop as a compatibility fallback for callers/tests that
+  // predate the explicit scheduler phase. New callers should provide the
+  // phase so `retry_wait` cannot be mistaken for an active run.
+  return indexPhase || (indexRunning ? 'running' : 'idle');
+}
+
+function formatIndexRetryAt(value) {
+  if (value == null || value === '') return null;
+  const numeric = typeof value === 'number' ? value : Number(value);
+  const date = new Date(Number.isFinite(numeric) ? numeric : value);
+  return Number.isNaN(date.getTime()) ? null : date.toLocaleString();
+}
+
 function ChangedNotice({
   children,
   monitorStatus,
@@ -284,6 +298,8 @@ export function SemanticBackendCard({
   onRunIndexNow,
   onStopIndexNow,
   indexRunning,
+  indexPhase,
+  indexRetryAt,
   indexStopping,
   indexProgress,
   indexRun,
@@ -306,9 +322,21 @@ export function SemanticBackendCard({
   const progressRatio = progressTotal > 0
     ? Math.min(1, progressProcessed / progressTotal)
     : null;
+  const phase = effectiveIndexPhase(indexPhase, indexRunning);
+  const retryAt = formatIndexRetryAt(indexRetryAt);
+  const active = phase === 'running';
+  const stoppable = active || phase === 'queued';
 
   let runMessage = null;
-  if (indexRunning) {
+  if (phase === 'retry_wait') {
+    runMessage = retryAt
+      ? t('settings.advanced.semantic_backend.run_retry_wait', { retryAt })
+      : t('settings.advanced.semantic_backend.run_retry_wait_no_time');
+  } else if (phase === 'failed') {
+    runMessage = t('settings.advanced.semantic_backend.run_failed');
+  } else if (phase === 'queued') {
+    runMessage = t('settings.advanced.semantic_backend.run_queued');
+  } else if (active) {
     if (indexStopping) {
       runMessage = t('settings.advanced.semantic_backend.run_stopping');
     } else if (indexProgress) {
@@ -322,7 +350,7 @@ export function SemanticBackendCard({
       // loading a 118 MB model, which is the longest silent stretch of a run.
       runMessage = t('settings.advanced.semantic_backend.run_preparing');
     }
-  } else if (indexRun) {
+  } else if (indexRun && (!indexRun.queued || phase === 'queued' || indexPhase == null)) {
     runMessage = indexRun.queued
       ? t('settings.advanced.semantic_backend.run_queued', '已加入后台整理队列')
       : indexRun.started
@@ -403,7 +431,7 @@ export function SemanticBackendCard({
               <p className="text-[11px] text-ide-muted leading-snug">
                 {runMessage || t('settings.advanced.semantic_backend.run_now_hint')}
               </p>
-              {indexRunning && progressRatio !== null && (
+              {active && progressRatio !== null && (
                 <div className="w-full bg-ide-panel border border-ide-border rounded-full h-1.5 overflow-hidden">
                   <div
                     className="bg-ide-accent h-full transition-all duration-300 ease-out"
@@ -412,7 +440,7 @@ export function SemanticBackendCard({
                 </div>
               )}
             </div>
-            {indexRunning ? (
+            {stoppable ? (
               <button
                 onClick={onStopIndexNow}
                 disabled={indexStopping}
@@ -427,7 +455,9 @@ export function SemanticBackendCard({
                 onClick={onRunIndexNow}
                 className="shrink-0 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors"
               >
-                {t('settings.advanced.semantic_backend.run_now')}
+                {phase === 'retry_wait' || phase === 'failed'
+                  ? t('settings.advanced.semantic_backend.run_retry')
+                  : t('settings.advanced.semantic_backend.run_now')}
               </button>
             )}
           </div>
@@ -445,6 +475,8 @@ export function ClipBackendCard({
   onRunIndexNow,
   onStopIndexNow,
   indexRunning,
+  indexPhase,
+  indexRetryAt,
   indexStopping,
   indexProgress,
   indexRun,
@@ -476,9 +508,21 @@ export function ClipBackendCard({
   const progressRatio = progressTotal > 0
     ? Math.min(1, progressProcessed / progressTotal)
     : null;
+  const phase = effectiveIndexPhase(indexPhase, indexRunning);
+  const retryAt = formatIndexRetryAt(indexRetryAt);
+  const active = phase === 'running';
+  const stoppable = active || phase === 'queued';
 
   let runMessage = null;
-  if (indexRunning) {
+  if (phase === 'retry_wait') {
+    runMessage = retryAt
+      ? t('settings.advanced.clip_backend.run_retry_wait', { retryAt })
+      : t('settings.advanced.clip_backend.run_retry_wait_no_time');
+  } else if (phase === 'failed') {
+    runMessage = t('settings.advanced.clip_backend.run_failed');
+  } else if (phase === 'queued') {
+    runMessage = t('settings.advanced.clip_backend.run_queued');
+  } else if (active) {
     if (indexStopping) {
       runMessage = t('settings.advanced.clip_backend.run_stopping');
     } else if (indexProgress) {
@@ -492,7 +536,7 @@ export function ClipBackendCard({
       // 177 MB model, which is the longest silent stretch of a run.
       runMessage = t('settings.advanced.clip_backend.run_preparing');
     }
-  } else if (indexRun) {
+  } else if (indexRun && (!indexRun.queued || phase === 'queued' || indexPhase == null)) {
     runMessage = indexRun.queued
       ? t('settings.advanced.clip_backend.run_queued', '已加入后台整理队列')
       : indexRun.started
@@ -650,7 +694,7 @@ export function ClipBackendCard({
               <p className="text-[11px] text-ide-muted leading-snug">
                 {runMessage || t('settings.advanced.clip_backend.run_now_hint')}
               </p>
-              {indexRunning && progressRatio !== null && (
+              {active && progressRatio !== null && (
                 <div className="w-full bg-ide-panel border border-ide-border rounded-full h-1.5 overflow-hidden">
                   <div
                     className="bg-ide-accent h-full transition-all duration-300 ease-out"
@@ -659,7 +703,7 @@ export function ClipBackendCard({
                 </div>
               )}
             </div>
-            {indexRunning ? (
+            {stoppable ? (
               <button
                 onClick={onStopIndexNow}
                 disabled={indexStopping}
@@ -674,7 +718,9 @@ export function ClipBackendCard({
                 onClick={onRunIndexNow}
                 className="shrink-0 px-2.5 py-1.5 text-xs text-ide-text bg-ide-panel border border-ide-border rounded-lg hover:bg-ide-hover transition-colors"
               >
-                {t('settings.advanced.clip_backend.run_now')}
+                {phase === 'retry_wait' || phase === 'failed'
+                  ? t('settings.advanced.clip_backend.run_retry')
+                  : t('settings.advanced.clip_backend.run_now')}
               </button>
             )}
           </div>

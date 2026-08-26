@@ -314,15 +314,27 @@ pub async fn run_scheduled_slice(
 ) -> Result<ScheduledSliceResult, String> {
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let _active = manual.then(|| run.begin());
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    if manual {
+        // Reset at admission as well as at button-click time. A second click
+        // can arrive while an earlier slice is still running; that slice may
+        // fail after the click's reset, and the pending request must still be
+        // a fresh retry when it starts.
+        let reset_storage = storage.clone();
+        tokio::task::spawn_blocking(move || {
+            reset_storage.reset_derived_index_retries(DerivedIndexKind::SemanticText)
+        })
+        .await
+        .map_err(|error| format!("semantic retry reset task failed: {error}"))??;
+    }
     let outcome = run_pass(app, scheduled_pass_mode(manual)).await?;
     if let Some(reason) = outcome.refused.or(outcome.stopped_because) {
         return Ok(ScheduledSliceResult::skipped(reason));
     }
-    let storage = app.state::<Arc<StorageState>>().inner().clone();
     let backlog = tokio::task::spawn_blocking(move || {
         storage
             .derived_index_backlog(DerivedIndexKind::SemanticText, MAX_ATTEMPTS)
-            .map(|backlog| backlog.claimable)
+            .map(|backlog| backlog.ready)
     })
     .await
     .map_err(|error| format!("semantic backlog task failed: {error}"))??;
@@ -582,7 +594,10 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
     reconcile_missing(storage.clone()).await?;
 
     match mode {
-        PassMode::Idle => drain_queue(app, storage, mode).await,
+        PassMode::Idle => {
+            let mut fast_retry_used = false;
+            drain_queue(app, storage, mode, &mut fast_retry_used).await
+        }
         PassMode::Manual => {
             // The queue depth the user is about to watch drain, read once and
             // after the repair pass that can add to it. Re-reading it per chunk
@@ -593,7 +608,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
             let total = tokio::task::spawn_blocking(move || {
                 counting
                     .derived_index_backlog(DerivedIndexKind::SemanticText, MAX_ATTEMPTS)
-                    .map(|backlog| backlog.claimable)
+                    .map(|backlog| backlog.ready)
                     .unwrap_or(0)
             })
             .await
@@ -685,6 +700,7 @@ async fn drain_until_done(
     debug_assert!(mode.is_manual());
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let mut total = PassOutcome::default();
+    let mut fast_retry_used = false;
     loop {
         // Before claiming anything, not after: a batch claimed and then held
         // through a pause is a batch nobody else can encode, and the leases
@@ -693,7 +709,7 @@ async fn drain_until_done(
             total.stopped_because = Some(reason);
             break;
         }
-        let pass = drain_queue(app, storage.clone(), mode).await?;
+        let pass = drain_queue(app, storage.clone(), mode, &mut fast_retry_used).await?;
         let drained = pass.indexed + pass.failed;
         total.indexed += pass.indexed;
         total.failed += pass.failed;
@@ -852,11 +868,17 @@ async fn reconcile_missing(storage: Arc<StorageState>) -> Result<(), String> {
 
 /// One claimed job: its ledger identity, its model input, the metadata the
 /// mirror will need, and the lease that authorizes the commit.
+#[derive(Clone)]
 struct ClaimedJob {
     spec: DerivedIndexJobSpec,
     text: String,
     summary: BackgroundScreenshotSummary,
     lease_token: String,
+}
+
+struct EncodeChunkFailure {
+    error: String,
+    claimed: Vec<ClaimedJob>,
 }
 
 /// One screenshot that became query-visible in this pass, in the shape the
@@ -872,6 +894,7 @@ async fn drain_queue(
     app: &AppHandle,
     storage: Arc<StorageState>,
     mode: PassMode,
+    fast_retry_used: &mut bool,
 ) -> Result<PassOutcome, String> {
     let claimed = claim_batch(storage.clone()).await?;
     if claimed.is_empty() {
@@ -935,7 +958,23 @@ async fn drain_queue(
         }
         let chunk: Vec<ClaimedJob> = pending.drain(..ENCODE_CHUNK.min(pending.len())).collect();
         let chunk_len = chunk.len() as u64;
-        match encode_chunk(app, &semantic, storage.clone(), chunk).await {
+        let encoded_result = match encode_chunk(app, &semantic, storage.clone(), chunk).await {
+            Err(failure)
+                if mode.is_manual()
+                    && !*fast_retry_used
+                    && crate::semantic_runtime::is_transient_worker_failure(&failure.error) =>
+            {
+                *fast_retry_used = true;
+                tracing::warn!(
+                    "[SEMANTIC:INDEX] manual encode failed; restarting worker for one immediate retry: {}",
+                    failure.error
+                );
+                semantic.restart_for_manual_retry();
+                encode_chunk(app, &semantic, storage.clone(), failure.claimed).await
+            }
+            other => other,
+        };
+        match encoded_result {
             Ok(mut encoded) => {
                 outcome.indexed += encoded.len() as u64;
                 // The whole chunk left the queue; not all of it necessarily
@@ -960,7 +999,7 @@ async fn drain_queue(
                     break;
                 }
             }
-            Err(error) => {
+            Err(chunk_failure) => {
                 outcome.failed += chunk_len;
                 if mode.is_manual() {
                     run.report_chunk(app, chunk_len, 0);
@@ -977,7 +1016,9 @@ async fn drain_queue(
                     )
                     .await;
                 }
-                failure = Some(error);
+                settle_failed_claims(storage.clone(), chunk_failure.claimed, &chunk_failure.error)
+                    .await;
+                failure = Some(chunk_failure.error);
                 break;
             }
         }
@@ -1000,14 +1041,15 @@ async fn drain_queue(
     }
 }
 
-/// Encode and commit one chunk. The chunk's leases are consumed either way:
-/// success commits them, failure charges the retry budget with a backoff.
+/// Encode and commit one chunk. The chunk's leases are returned to the caller
+/// on worker failure so it can choose between the manual fast retry and the
+/// scheduler's durable backoff policy.
 async fn encode_chunk(
     app: &AppHandle,
     semantic: &Arc<SemanticRuntimeState>,
     storage: Arc<StorageState>,
     claimed: Vec<ClaimedJob>,
-) -> Result<Vec<IndexedSubject>, String> {
+) -> Result<Vec<IndexedSubject>, EncodeChunkFailure> {
     let texts: Vec<String> = claimed.iter().map(|job| job.text.clone()).collect();
     let embedded = semantic
         .embed_text(
@@ -1025,20 +1067,27 @@ async fn encode_chunk(
         Ok(result) if result.vectors.len() == claimed.len() => result.vectors,
         Ok(result) => {
             let error = format!(
-                "semantic worker returned {} vectors for {} inputs",
+                "protocol: semantic worker returned {} vectors for {} inputs",
                 result.vectors.len(),
                 claimed.len()
             );
-            fail_claims(storage, claimed, "embed_mismatch", &error).await;
-            return Err(error);
+            return Err(EncodeChunkFailure { error, claimed });
         }
         Err(error) => {
-            fail_claims(storage, claimed, "embed_failed", &error).await;
-            return Err(format!("embed failed: {error}"));
+            return Err(EncodeChunkFailure {
+                error: format!("embed failed: {error}"),
+                claimed,
+            });
         }
     };
 
-    commit_batch(storage, claimed, vectors).await
+    let retry_claimed = claimed.clone();
+    commit_batch(storage, claimed, vectors)
+        .await
+        .map_err(|error| EncodeChunkFailure {
+            error,
+            claimed: retry_claimed,
+        })
 }
 
 /// Claim up to one batch, rebuilding each job's source text from SQLite.
@@ -1221,6 +1270,23 @@ async fn fail_claims(
     .await;
 }
 
+/// Worker-wide failures belong to the scheduler, not to each screenshot. A
+/// deterministic contract/model failure remains on the per-subject ledger so
+/// it can be diagnosed and rebuilt explicitly.
+async fn settle_failed_claims(storage: Arc<StorageState>, claimed: Vec<ClaimedJob>, error: &str) {
+    if crate::semantic_runtime::is_deterministic_worker_failure(error) {
+        fail_claims(storage, claimed, "embed_failed", error).await;
+    } else {
+        release_claims(
+            storage,
+            claimed,
+            "worker_retry",
+            "semantic worker failure; scheduler will retry the batch",
+        )
+        .await;
+    }
+}
+
 /// Mirror newly indexed vectors into Python's Chroma hot layer.
 ///
 /// The M2.4 dual-write with its direction reversed. Milestone 4 task clustering
@@ -1323,18 +1389,23 @@ pub async fn semantic_index_run_now(
     crate::commands::check_main_window(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
-    if let Some(scheduler) =
-        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
-    {
-        scheduler.enqueue(
-            &app,
-            crate::background_scheduler::BackgroundTaskKind::SemanticIndex,
-            true,
-        )?;
-    } else {
-        return Err("Background scheduler is unavailable".to_string());
-    }
+    let scheduler = app
+        .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        .ok_or_else(|| "Background scheduler is unavailable".to_string())?;
     let storage = app.state::<Arc<StorageState>>().inner().clone();
+    // The explicit button is also the recovery action for rows that exhausted
+    // or are still waiting on their per-subject retry timestamp.
+    let _ = tokio::task::spawn_blocking({
+        let storage = storage.clone();
+        move || storage.reset_derived_index_retries(DerivedIndexKind::SemanticText)
+    })
+    .await
+    .map_err(|error| format!("semantic retry reset task failed: {error}"))??;
+    scheduler.enqueue(
+        &app,
+        crate::background_scheduler::BackgroundTaskKind::SemanticIndex,
+        true,
+    )?;
     let backlog = tokio::task::spawn_blocking(move || {
         storage
             .derived_index_backlog(DerivedIndexKind::SemanticText, MAX_ATTEMPTS)

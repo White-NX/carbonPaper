@@ -956,6 +956,15 @@ impl SemanticRuntimeState {
         }
     }
 
+    /// Restart the shared semantic worker before a user-initiated retry.
+    ///
+    /// A model-load or transport hiccup is often recoverable once the child
+    /// process is recreated. The caller owns the retry budget; this method only
+    /// resets the worker and records the restart for diagnostics.
+    pub(crate) fn restart_for_manual_retry(&self) {
+        self.restart_process("manual_index_retry");
+    }
+
     fn clear_process(&self, kind: &str, message: &str) {
         let _guard = self
             .lifecycle_lock
@@ -1212,6 +1221,43 @@ fn should_fallback_from_directml(error: &str) -> bool {
         split_error(error).0,
         "provider_unavailable" | "inference" | "timeout" | "worker_stopped" | "transport"
     )
+}
+
+/// Failures which usually describe a broken worker/provider rather than a bad
+/// screenshot. These are retried by the scheduler as a whole, so individual
+/// rows must not be put into their long per-item backoff.
+pub(crate) fn is_transient_worker_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    let lower = lower
+        .strip_prefix("embed failed: ")
+        .unwrap_or(lower.as_str());
+    [
+        "timeout:",
+        "transport:",
+        "worker_stopped:",
+        "provider_unavailable:",
+        "inference:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Failures which will not be fixed by restarting the worker. The scheduler
+/// opens its circuit immediately and waits for an explicit user action.
+pub(crate) fn is_deterministic_worker_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    let lower = lower
+        .strip_prefix("embed failed: ")
+        .unwrap_or(lower.as_str());
+    [
+        "invalid_request:",
+        "limit_exceeded:",
+        "model_missing:",
+        "model_mismatch:",
+        "protocol:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
 }
 
 /// `invalid_request` and `limit_exceeded` on this path can only come from local
@@ -1607,6 +1653,34 @@ mod tests {
             split_error("ML timeout must be within 1..=600000 ms: 600001").0,
             "protocol"
         );
+    }
+
+    #[test]
+    fn index_failure_classification_requires_a_known_error_prefix() {
+        for error in [
+            "timeout: semantic worker timed out",
+            "embed failed: transport: pipe closed",
+            "worker_stopped: process exited",
+            "embed failed: inference: provider failed",
+        ] {
+            assert!(is_transient_worker_failure(error), "{error}");
+            assert!(!is_deterministic_worker_failure(error), "{error}");
+        }
+        for error in [
+            "protocol: vector count mismatch",
+            "embed failed: model_missing: model is unavailable",
+            "invalid_request: empty batch",
+        ] {
+            assert!(is_deterministic_worker_failure(error), "{error}");
+            assert!(!is_transient_worker_failure(error), "{error}");
+        }
+        for error in [
+            "commit failed: protocol: database busy",
+            "worker reported inference: but did not provide a kind",
+        ] {
+            assert!(!is_transient_worker_failure(error), "{error}");
+            assert!(!is_deterministic_worker_failure(error), "{error}");
+        }
     }
 
     #[test]

@@ -331,7 +331,11 @@
         "run_stopping": "Stopping. The run ends once the current batch finishes.",
         "run_done": "Indexed {{indexed}} screenshot(s); {{remaining}} still waiting.",
         "run_skipped": "This run did not start: {{reason}}.",
-        "run_queued": "Added to the background organization queue."
+        "run_queued": "Added to the background organization queue.",
+        "run_retry_wait": "Indexing paused after a temporary error. It will retry at {{retryAt}}.",
+        "run_retry_wait_no_time": "Indexing paused after a temporary error and will retry automatically.",
+        "run_retry": "Retry now",
+        "run_failed": "Indexing stopped after an error that could not be recovered automatically."
       },
       "clip_backend": {
         "title": "Screenshot image search",
@@ -369,7 +373,11 @@
         "run_stop_pending": "Stopping…",
         "run_stopping": "Stopping. The run ends once the current image finishes.",
         "run_done": "Indexed {{indexed}} image(s); {{remaining}} still waiting.",
-        "run_skipped": "This run did not start: {{reason}}."
+        "run_skipped": "This run did not start: {{reason}}.",
+        "run_retry_wait": "Encoding paused after a temporary error. It will retry at {{retryAt}}.",
+        "run_retry_wait_no_time": "Encoding paused after a temporary error and will retry automatically.",
+        "run_retry": "Retry now",
+        "run_failed": "Encoding stopped after an error that could not be recovered automatically."
       },
       "classification_backend": {
         "title": "Automatic screenshot classification",
