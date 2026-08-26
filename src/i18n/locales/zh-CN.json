@@ -331,7 +331,11 @@
         "run_stopping": "正在停止，当前这一批处理完就会结束。",
         "run_done": "本次索引了 {{indexed}} 张截图，还有 {{remaining}} 张在等待。",
         "run_skipped": "这次没有开始索引：{{reason}}。",
-        "run_queued": "已加入后台整理队列。"
+        "run_queued": "已加入后台整理队列。",
+        "run_retry_wait": "索引遇到临时错误，已暂停，将于 {{retryAt}} 自动重试。",
+        "run_retry_wait_no_time": "索引遇到临时错误，已暂停并将在稍后自动重试。",
+        "run_retry": "立即重试",
+        "run_failed": "索引遇到无法自动恢复的错误，已经停止。"
       },
       "clip_backend": {
         "title": "截图画面检索（文搜图）",
@@ -369,7 +373,11 @@
         "run_stop_pending": "正在停止…",
         "run_stopping": "正在停止。当前这张画面处理完就会结束。",
         "run_done": "本次索引了 {{indexed}} 张画面，还有 {{remaining}} 张在等待。",
-        "run_skipped": "本次没有开始索引：{{reason}}。"
+        "run_skipped": "本次没有开始索引：{{reason}}。",
+        "run_retry_wait": "编码遇到临时错误，已暂停，将于 {{retryAt}} 自动重试。",
+        "run_retry_wait_no_time": "编码遇到临时错误，已暂停并将在稍后自动重试。",
+        "run_retry": "立即重试",
+        "run_failed": "编码遇到无法自动恢复的错误，已经停止。"
       },
       "classification_backend": {
         "title": "截图内容自动分类",

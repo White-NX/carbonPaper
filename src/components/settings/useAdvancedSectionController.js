@@ -23,11 +23,15 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [semanticStatus, setSemanticStatus] = useState(null);
   const [semanticStatusLoading, setSemanticStatusLoading] = useState(false);
   const [semanticIndexRunning, setSemanticIndexRunning] = useState(false);
+  const [semanticIndexPhase, setSemanticIndexPhase] = useState('idle');
+  const [semanticIndexRetryAt, setSemanticIndexRetryAt] = useState(null);
   const [semanticIndexRun, setSemanticIndexRun] = useState(null);
   // The CLIP image index has its own run and progress event. The two passes can
   // run independently, so one status line for both would report whichever
   // finished last.
   const [clipIndexRunning, setClipIndexRunning] = useState(false);
+  const [clipIndexPhase, setClipIndexPhase] = useState('idle');
+  const [clipIndexRetryAt, setClipIndexRetryAt] = useState(null);
   const [clipIndexRun, setClipIndexRun] = useState(null);
   const [clipIndexStopping, setClipIndexStopping] = useState(false);
   const [clipIndexProgress, setClipIndexProgress] = useState(null);
@@ -44,6 +48,12 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
   const [backgroundSchedulerStatus, setBackgroundSchedulerStatus] = useState(null);
   const [backgroundProcessingSaving, setBackgroundProcessingSaving] = useState(false);
   const mlOcrStatusRequestRef = useRef(null);
+
+  // These refs prevent a status poll from overwriting state while the current
+  // settings panel still owns the command promise. Once the command hands the
+  // work to the scheduler, polling becomes the source of truth again.
+  const ownsRun = useRef(false);
+  const ownsClipRun = useRef(false);
 
   const saveConfig = async (newConfig) => {
     const previousConfig = config;
@@ -110,6 +120,24 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     loadConfig();
   }, []);
 
+  const schedulerIndexPhase = (status, kind) => {
+    const tasks = Array.isArray(status?.tasks) ? status.tasks : null;
+    const running = Boolean(status?.running_manual && status.running_task === kind);
+    const row = tasks?.find((item) => item.task_kind === kind);
+    // A transient IPC/database read can return no row (the backend currently
+    // falls back to an empty task list when that read fails). Do not turn a
+    // known queued/retry state into idle on that incomplete snapshot; the
+    // durable row will reconcile on the next poll.
+    if (!row && !running) return null;
+    if (running) return { phase: 'running', retryAt: null };
+    if (row?.manual_pending && row.status === 'retry_wait') {
+      return { phase: 'retry_wait', retryAt: row.next_attempt_at_ms || null };
+    }
+    if (row?.manual_pending) return { phase: 'queued', retryAt: null };
+    if (row?.status === 'failed') return { phase: 'failed', retryAt: null };
+    return { phase: 'idle', retryAt: null };
+  };
+
   const refreshBackgroundSchedulerStatus = async () => {
     try {
       const [enabled, status] = await Promise.all([
@@ -118,6 +146,44 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       ]);
       setBackgroundProcessingEnabled(Boolean(enabled));
       setBackgroundSchedulerStatus(status);
+      if (status) {
+        const applyIndexState = ({
+          kind,
+          ownerRef,
+          setPhase,
+          setRetryAt,
+          setRunning,
+          setStopping,
+        }) => {
+          if (ownerRef.current) return;
+          const resolved = schedulerIndexPhase(status, kind);
+          if (!resolved) return;
+          const { phase, retryAt } = resolved;
+          setPhase(phase);
+          setRetryAt(retryAt);
+          // Keep the old boolean for callers that use it as a compact
+          // "active/queued" indicator. `retry_wait` and `failed` are
+          // deliberately not active: they are waiting states, not runs.
+          setRunning(phase === 'running' || phase === 'queued');
+          if (phase !== 'running' && phase !== 'queued') setStopping(false);
+        };
+        applyIndexState({
+          kind: 'semantic_index',
+          ownerRef: ownsRun,
+          setPhase: setSemanticIndexPhase,
+          setRetryAt: setSemanticIndexRetryAt,
+          setRunning: setSemanticIndexRunning,
+          setStopping: setSemanticIndexStopping,
+        });
+        applyIndexState({
+          kind: 'clip_index',
+          ownerRef: ownsClipRun,
+          setPhase: setClipIndexPhase,
+          setRetryAt: setClipIndexRetryAt,
+          setRunning: setClipIndexRunning,
+          setStopping: setClipIndexStopping,
+        });
+      }
     } catch (err) {
       console.warn('Failed to read background scheduler status:', err);
     }
@@ -207,33 +273,23 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     refreshRustOcrModelStatus();
   }, []);
 
-  /**
-   * Read the backend diagnostic, and with it whether a manual indexing run is
-   * going.
-   *
-   * A run started from this hook is tracked by its own promise. A run this
-   * hook did not start — the settings dialog was closed or switched away from
-   * mid-run, which unmounts it — has no promise to await, so the backend flag
-   * is what tells the reopened dialog that its button should say "stop". The
-   * two must not fight over the same state, hence the per-index ownership refs.
-   */
-  const ownsRun = useRef(false);
-  const ownsClipRun = useRef(false);
-
   const readSemanticStatus = async ({ quiet = false, refreshDiagnostics = false } = {}) => {
     if (!quiet) setSemanticStatusLoading(true);
     try {
       const status = await invoke('get_ml_semantic_status', { refreshDiagnostics });
       setSemanticStatus(status);
-      if (!ownsRun.current) {
-        const active = Boolean(status?.backend?.index_run_active);
-        setSemanticIndexRunning(active);
-        if (!active) setSemanticIndexStopping(false);
+      // The diagnostic endpoint can see a run that was started before this
+      // panel mounted. It is a useful positive signal, but an inactive value
+      // must not clear `retry_wait`/`queued`: those phases come from the
+      // durable scheduler and are intentionally independent of the worker's
+      // short-lived active flag.
+      if (!ownsRun.current && status?.backend?.index_run_active) {
+        setSemanticIndexPhase('running');
+        setSemanticIndexRunning(true);
       }
-      if (!ownsClipRun.current) {
-        const active = Boolean(status?.clip_backend?.index_run_active);
-        setClipIndexRunning(active);
-        if (!active) setClipIndexStopping(false);
+      if (!ownsClipRun.current && status?.clip_backend?.index_run_active) {
+        setClipIndexPhase('running');
+        setClipIndexRunning(true);
       }
     } catch (err) {
       console.warn('Failed to read semantic backend status:', err);
@@ -249,6 +305,7 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     const [status] = await Promise.all([
       readSemanticStatus({ refreshDiagnostics: true }),
       refreshClipBackfill(true),
+      refreshBackgroundSchedulerStatus(),
     ]);
     return status;
   };
@@ -259,17 +316,17 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
 
   /**
    * Notice the end of either run this dialog does not own. Two seconds is far
-   * shorter than the time it takes to wonder why a button is still disabled,
-   * and the read itself is one ledger query. Not started for an owned run:
-   * that one already refreshes when its command returns.
+   * shorter than the time it takes to wonder why a button is still disabled.
+   * The scheduler poll is the authority for clearing the phase; this read is
+   * retained as a compatibility fallback for runs that predate its row.
    */
   useEffect(() => {
-    const watchingSemantic = semanticIndexRunning && !ownsRun.current;
-    const watchingClip = clipIndexRunning && !ownsClipRun.current;
+    const watchingSemantic = semanticIndexPhase === 'running' && !ownsRun.current;
+    const watchingClip = clipIndexPhase === 'running' && !ownsClipRun.current;
     if (!watchingSemantic && !watchingClip) return undefined;
     const timer = window.setInterval(() => readSemanticStatus({ quiet: true }), 2000);
     return () => window.clearInterval(timer);
-  }, [semanticIndexRunning, clipIndexRunning]);
+  }, [semanticIndexPhase, clipIndexPhase]);
 
   /**
    * Progress of a running manual pass, one event per encoded chunk of four.
@@ -326,8 +383,11 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
    * like it had done nothing and needed pressing dozens of times.
    */
   const handleRunSemanticIndexNow = async () => {
+    let queued = false;
     ownsRun.current = true;
     setSemanticIndexRunning(true);
+    setSemanticIndexPhase('running');
+    setSemanticIndexRetryAt(null);
     setSemanticIndexStopping(false);
     setSemanticIndexRun(null);
     setSemanticIndexProgress(null);
@@ -335,7 +395,9 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       const summary = await invoke('semantic_index_run_now');
       setSemanticIndexRun(summary);
       if (summary?.queued) {
+        queued = true;
         ownsRun.current = false;
+        setSemanticIndexPhase('queued');
         await refreshBackgroundSchedulerStatus();
         return summary;
       }
@@ -350,7 +412,10 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       // `refreshSemanticStatus` above — which ran while this hook still owned
       // the run — is not the one that decides them.
       ownsRun.current = false;
-      setSemanticIndexRunning(false);
+      if (!queued) {
+        setSemanticIndexRunning(false);
+        setSemanticIndexPhase('idle');
+      }
       setSemanticIndexStopping(false);
       setSemanticIndexProgress(null);
     }
@@ -379,8 +444,11 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
    * request just like the MiniLM one.
    */
   const handleRunClipIndexNow = async () => {
+    let queued = false;
     ownsClipRun.current = true;
     setClipIndexRunning(true);
+    setClipIndexPhase('running');
+    setClipIndexRetryAt(null);
     setClipIndexStopping(false);
     setClipIndexRun(null);
     setClipIndexProgress(null);
@@ -388,7 +456,9 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       const summary = await invoke('clip_index_run_now');
       setClipIndexRun(summary);
       if (summary?.queued) {
+        queued = true;
         ownsClipRun.current = false;
+        setClipIndexPhase('queued');
         await refreshBackgroundSchedulerStatus();
         return summary;
       }
@@ -400,7 +470,10 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
       return null;
     } finally {
       ownsClipRun.current = false;
-      setClipIndexRunning(false);
+      if (!queued) {
+        setClipIndexRunning(false);
+        setClipIndexPhase('idle');
+      }
       setClipIndexStopping(false);
       setClipIndexProgress(null);
     }
@@ -575,8 +648,12 @@ export function useAdvancedSectionController({ monitorStatus, t }) {
     semanticStatus,
     semanticStatusLoading,
     semanticIndexRunning,
+    semanticIndexPhase,
+    semanticIndexRetryAt,
     semanticIndexRun,
     clipIndexRunning,
+    clipIndexPhase,
+    clipIndexRetryAt,
     clipIndexRun,
     clipIndexStopping,
     clipIndexProgress,

@@ -2,7 +2,7 @@ import React from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
-import { BackgroundSchedulerCard, ClipBackendCard } from './InferenceCards';
+import { BackgroundSchedulerCard, ClipBackendCard, SemanticBackendCard } from './InferenceCards';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -77,5 +77,80 @@ describe('BackgroundSchedulerCard status', () => {
     );
 
     expect(screen.getByText(expectedKey)).toBeInTheDocument();
+  });
+});
+
+describe('manual index phases', () => {
+  const baseStatus = {
+    backend: { index_backlog: 3, index_stalled: 0, indexed_vectors: 4, failure_count: 1 },
+  };
+
+  it('does not present retry_wait as a running job', () => {
+    const onRun = vi.fn();
+    const onStop = vi.fn();
+    render(
+      <SemanticBackendCard
+        status={baseStatus}
+        statusLoading={false}
+        onRefresh={vi.fn()}
+        onRunIndexNow={onRun}
+        onStopIndexNow={onStop}
+        indexRunning={false}
+        indexPhase="retry_wait"
+        indexRetryAt={Date.UTC(2026, 7, 26, 12, 0, 0)}
+        indexStopping={false}
+        indexProgress={null}
+        indexRun={null}
+      />,
+    );
+
+    expect(screen.getByText('settings.advanced.semantic_backend.run_retry_wait')).toBeInTheDocument();
+    expect(screen.queryByText('settings.advanced.semantic_backend.run_stop')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText('settings.advanced.semantic_backend.run_retry'));
+    expect(onRun).toHaveBeenCalledTimes(1);
+    expect(onStop).not.toHaveBeenCalled();
+  });
+
+  it('keeps queued work stoppable', () => {
+    const onStop = vi.fn();
+    render(
+      <SemanticBackendCard
+        status={baseStatus}
+        statusLoading={false}
+        onRefresh={vi.fn()}
+        onRunIndexNow={vi.fn()}
+        onStopIndexNow={onStop}
+        indexRunning={true}
+        indexPhase="queued"
+        indexRetryAt={null}
+        indexStopping={false}
+        indexProgress={null}
+        indexRun={null}
+      />,
+    );
+
+    fireEvent.click(screen.getByText('settings.advanced.semantic_backend.run_stop'));
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not keep showing a stale queued summary after the scheduler finishes', () => {
+    render(
+      <SemanticBackendCard
+        status={baseStatus}
+        statusLoading={false}
+        onRefresh={vi.fn()}
+        onRunIndexNow={vi.fn()}
+        onStopIndexNow={vi.fn()}
+        indexRunning={false}
+        indexPhase="idle"
+        indexRetryAt={null}
+        indexStopping={false}
+        indexProgress={null}
+        indexRun={{ queued: true }}
+      />,
+    );
+
+    expect(screen.queryByText('settings.advanced.semantic_backend.run_queued')).not.toBeInTheDocument();
+    expect(screen.getByText('settings.advanced.semantic_backend.run_now_hint')).toBeInTheDocument();
   });
 });

@@ -154,7 +154,13 @@ pub enum EnsureDerivedIndexJobResult {
 /// subjects stay missing from search until someone intervenes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DerivedIndexBacklog {
+    /// Rows that are still outstanding, including rows whose per-subject retry
+    /// timestamp has not elapsed yet. This is the user-visible backlog.
     pub claimable: u64,
+    /// Rows a worker can claim at this instant. The scheduler uses this value;
+    /// using `claimable` there would repeatedly admit a task whose rows are all
+    /// still in their own backoff window.
+    pub ready: u64,
     pub exhausted: u64,
     /// Age of the oldest claimable row by ledger update time. `None` when the
     /// queue is empty.
@@ -553,6 +559,26 @@ impl StorageState {
                 increment_attempts: true,
             },
         )
+    }
+
+    /// Make delayed/failed rows eligible for an explicit user retry and reset
+    /// their per-subject budget. A manual action is a new recovery decision,
+    /// not another automatic attempt against the old failure window.
+    pub fn reset_derived_index_retries(&self, index_kind: DerivedIndexKind) -> Result<u64, String> {
+        let guard = self.get_connection_named("reset_derived_index_retries")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let changed = conn
+            .execute(
+                "UPDATE derived_index_jobs
+                 SET status = 'pending', attempts = 0,
+                     error_code = NULL, error = NULL,
+                     next_retry_at = NULL, lease_token = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE index_kind = ?1 AND status = 'failed'",
+                [index_kind.as_str()],
+            )
+            .map_err(|error| format!("Failed to reset derived index retries: {error}"))?;
+        u64::try_from(changed).map_err(|_| "Invalid reset derived index row count".to_string())
     }
 
     pub fn mark_derived_index_job_discarded(
@@ -1140,6 +1166,11 @@ impl StorageState {
                 r#"
                 SELECT
                     COALESCE(SUM(CASE WHEN {CLAIMABLE_JOB_PREDICATE} THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN (
+                        (status IN ('pending', 'waiting_for_auth')
+                         OR (status = 'failed' AND attempts < ?2))
+                        AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+                    ) THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN status = 'failed' AND attempts >= ?2
                                       THEN 1 ELSE 0 END), 0),
                     CAST((julianday('now') - julianday(
@@ -1153,8 +1184,9 @@ impl StorageState {
             |row| {
                 Ok(DerivedIndexBacklog {
                     claimable: row.get::<_, i64>(0)?.max(0) as u64,
-                    exhausted: row.get::<_, i64>(1)?.max(0) as u64,
-                    oldest_claimable_age_secs: row.get::<_, Option<i64>>(2)?,
+                    ready: row.get::<_, i64>(1)?.max(0) as u64,
+                    exhausted: row.get::<_, i64>(2)?.max(0) as u64,
+                    oldest_claimable_age_secs: row.get::<_, Option<i64>>(3)?,
                 })
             },
         )
@@ -4359,6 +4391,7 @@ mod tests {
         // failures have spent it, and a spent budget is what `exhausted` counts.
         // The leased job is neither: someone is holding it right now.
         assert_eq!(backlog.claimable, 1);
+        assert_eq!(backlog.ready, 1);
         assert_eq!(backlog.exhausted, 2);
         assert!(backlog.oldest_claimable_age_secs.is_some());
 
@@ -4369,6 +4402,7 @@ mod tests {
             .derived_index_backlog(DerivedIndexKind::SemanticText, 5)
             .unwrap();
         assert_eq!(generous.claimable, 3);
+        assert_eq!(generous.ready, 2);
         assert_eq!(generous.exhausted, 0);
 
         // A different index kind must not leak into either number.
@@ -4376,6 +4410,47 @@ mod tests {
             .derived_index_backlog(DerivedIndexKind::ClipImage, 5)
             .unwrap();
         assert_eq!(clip, DerivedIndexBacklog::default());
+    }
+
+    #[test]
+    fn explicit_retry_reset_clears_failed_derived_job_state() {
+        let (_temp, storage) = test_storage();
+        let failed = job(DerivedIndexKind::SemanticText, "56");
+        ensure_active_subject(&storage, &failed);
+        storage.ensure_derived_index_job(&failed).unwrap();
+        let lease = storage.mark_derived_index_job_processing(&failed).unwrap();
+        storage
+            .mark_derived_index_job_failed(
+                &failed,
+                &lease,
+                "embed_failed",
+                "temporary worker failure",
+                Some("9999-12-31 23:59:59"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .reset_derived_index_retries(DerivedIndexKind::SemanticText)
+                .unwrap(),
+            1
+        );
+        let reset = storage
+            .get_derived_index_job(DerivedIndexKind::SemanticText, "56")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.status, DerivedIndexJobStatus::Pending);
+        assert_eq!(reset.attempts, 0);
+        assert_eq!(reset.error_code, None);
+        assert_eq!(reset.error, None);
+        assert_eq!(reset.next_retry_at, None);
+        assert_eq!(
+            storage
+                .claimable_derived_index_jobs(DerivedIndexKind::SemanticText, 5, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

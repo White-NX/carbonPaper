@@ -186,10 +186,13 @@ impl ScheduledSliceResult {
 pub struct BackgroundSchedulerStatus {
     pub enabled: bool,
     pub running_task: Option<String>,
+    pub running_manual: bool,
     pub tasks: Vec<BackgroundTaskState>,
     pub queue_depths: serde_json::Value,
     pub blocked_reason: Option<String>,
     pub next_retry_at_ms: Option<i64>,
+    /// Earliest retry timestamp among manually requested tasks.
+    pub manual_retry_at_ms: Option<i64>,
     pub worker_restart_count: u64,
     pub monitor_restart_degraded: bool,
 }
@@ -199,6 +202,7 @@ struct SchedulerRuntime {
     wake: Notify,
     task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     running_task: Mutex<Option<String>>,
+    running_manual: AtomicBool,
     blocked_reason: Mutex<Option<String>>,
     service_seq: AtomicU64,
     worker_restart_count: AtomicU64,
@@ -216,6 +220,7 @@ impl Default for SchedulerRuntime {
             wake: Notify::new(),
             task: Mutex::new(None),
             running_task: Mutex::new(None),
+            running_manual: AtomicBool::new(false),
             blocked_reason: Mutex::new(None),
             service_seq: AtomicU64::new(0),
             worker_restart_count: AtomicU64::new(0),
@@ -369,6 +374,11 @@ impl BackgroundSchedulerState {
             .filter(|task| task.status == "retry_wait")
             .map(|task| task.next_attempt_at_ms)
             .min();
+        let manual_retry_at_ms = tasks
+            .iter()
+            .filter(|task| task.manual_pending && task.status == "retry_wait")
+            .map(|task| task.next_attempt_at_ms)
+            .min();
         let running_task = self
             .runtime
             .running_task
@@ -395,10 +405,12 @@ impl BackgroundSchedulerState {
         BackgroundSchedulerStatus {
             enabled,
             running_task,
+            running_manual: self.runtime.running_manual.load(Ordering::Relaxed),
             tasks,
             queue_depths: depths,
             blocked_reason,
             next_retry_at_ms,
+            manual_retry_at_ms,
             worker_restart_count: self.runtime.worker_restart_count.load(Ordering::Relaxed),
             monitor_restart_degraded: self
                 .runtime
@@ -486,11 +498,11 @@ fn queue_depths(storage: Option<tauri::State<'_, Arc<StorageState>>>) -> serde_j
     };
     let semantic = storage
         .derived_index_backlog(DerivedIndexKind::SemanticText, 5)
-        .map(|backlog| backlog.claimable)
+        .map(|backlog| backlog.ready)
         .unwrap_or(0);
     let clip = storage
         .derived_index_backlog(DerivedIndexKind::ClipImage, 5)
-        .map(|backlog| backlog.claimable)
+        .map(|backlog| backlog.ready)
         .unwrap_or(0);
     let smart = storage.count_smart_cluster_pending().unwrap_or(0).max(0) as u64;
     serde_json::json!({
@@ -549,11 +561,11 @@ async fn refresh_backlog(app: &AppHandle) {
     let counts = tokio::task::spawn_blocking(move || {
         let semantic = count_storage
             .derived_index_backlog(DerivedIndexKind::SemanticText, 5)
-            .map(|backlog| backlog.claimable)
+            .map(|backlog| backlog.ready)
             .unwrap_or(0);
         let clip = count_storage
             .derived_index_backlog(DerivedIndexKind::ClipImage, 5)
-            .map(|backlog| backlog.claimable)
+            .map(|backlog| backlog.ready)
             .unwrap_or(0);
         let smart = count_storage
             .count_smart_cluster_pending()
@@ -838,7 +850,9 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
             .running_task
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(kind.as_str().to_string());
+        runtime.running_manual.store(manual, Ordering::SeqCst);
         let result = execute_slice(&app, kind, manual, &runtime).await;
+        runtime.running_manual.store(false, Ordering::SeqCst);
         *runtime
             .running_task
             .lock()
@@ -930,10 +944,21 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 let smart_cluster_policy = (kind == BackgroundTaskKind::SmartCluster).then(|| {
                     crate::smart_cluster_scoring::scheduled_failure_policy(&error, failures)
                 });
-                if smart_cluster_policy.is_some_and(|policy| policy.terminal) {
-                    let failure_code = smart_cluster_policy
-                        .map(|policy| policy.code)
-                        .unwrap_or("task_failed");
+                let deterministic_index_failure = matches!(
+                    kind,
+                    BackgroundTaskKind::SemanticIndex | BackgroundTaskKind::ClipIndex
+                )
+                    && crate::semantic_runtime::is_deterministic_worker_failure(&error);
+                if deterministic_index_failure
+                    || smart_cluster_policy.is_some_and(|policy| policy.terminal)
+                {
+                    let failure_code = smart_cluster_policy.map(|policy| policy.code).unwrap_or(
+                        if deterministic_index_failure {
+                            "index_worker_failure"
+                        } else {
+                            "task_failed"
+                        },
+                    );
                     let terminal_failed = storage
                         .mark_background_task_terminal_failure(kind.as_str(), failures, &error)
                         .unwrap_or(false);

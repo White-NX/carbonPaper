@@ -318,7 +318,8 @@ fn indexable_hashes(
     Ok(indexable)
 }
 
-/// Execute one automatic CLIP index/repair slice. The unified scheduler owns
+/// Execute one automatic CLIP index/repair slice, or a complete manual drain
+/// after the unified scheduler admits the user's request. The scheduler owns
 /// admission and the semantic-worker guard.
 pub async fn run_scheduled_slice(
     app: &AppHandle,
@@ -326,26 +327,28 @@ pub async fn run_scheduled_slice(
 ) -> Result<ScheduledSliceResult, String> {
     let run = app.state::<Arc<ClipIndexRunState>>().inner().clone();
     let _active = manual.then(|| run.begin());
-    let outcome = run_pass(
-        app,
-        if manual {
-            PassMode::ScheduledManual
-        } else {
-            PassMode::Idle
-        },
-    )
-    .await?;
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    if manual {
+        // See the MiniLM counterpart: a click that arrived during an earlier
+        // slice must still clear failures produced after that click.
+        let reset_storage = storage.clone();
+        tokio::task::spawn_blocking(move || {
+            reset_storage.reset_derived_index_retries(DerivedIndexKind::ClipImage)
+        })
+        .await
+        .map_err(|error| format!("clip retry reset task failed: {error}"))??;
+    }
+    let outcome = run_pass(app, scheduled_pass_mode(manual)).await?;
     if let Some(reason) = outcome.refused.or(outcome.stopped_because) {
         return Ok(ScheduledSliceResult::skipped(reason));
     }
     if let Err(error) = crate::clip_ann::maybe_rebuild(app, false).await {
         tracing::warn!("[CLIP:ANN] scheduled rebuild failed: {error}");
     }
-    let storage = app.state::<Arc<StorageState>>().inner().clone();
     let backlog = tokio::task::spawn_blocking(move || {
         storage
             .derived_index_backlog(DerivedIndexKind::ClipImage, MAX_ATTEMPTS)
-            .map(|backlog| backlog.claimable)
+            .map(|backlog| backlog.ready)
     })
     .await
     .map_err(|error| format!("clip backlog task failed: {error}"))??;
@@ -354,16 +357,32 @@ pub async fn run_scheduled_slice(
     ))
 }
 
+fn scheduled_pass_mode(manual: bool) -> PassMode {
+    if manual {
+        PassMode::Manual
+    } else {
+        PassMode::Idle
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PassMode {
     Idle,
+    /// A complete manual drain, admitted by the unified scheduler. The command
+    /// enqueues and returns, so by the time this runs nobody is awaiting it:
+    /// an encode failure propagates out of the pass rather than being folded
+    /// into a run summary, which leaves the retry to the scheduler's durable
+    /// backoff. See the failure match at the end of [`drain_queue`].
     Manual,
-    ScheduledManual,
 }
 
 impl PassMode {
     fn is_manual(self) -> bool {
-        matches!(self, Self::Manual | Self::ScheduledManual)
+        self == Self::Manual
+    }
+
+    fn yields_after_chunk(self) -> bool {
+        self == Self::Idle
     }
 }
 
@@ -574,7 +593,7 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
     // batch `waiting_for_auth` on every tick.
     let locked = match mode {
         PassMode::Idle => !storage.is_background_authorized(),
-        PassMode::Manual | PassMode::ScheduledManual => !storage.is_silent_read_authorized(),
+        PassMode::Manual => !storage.is_silent_read_authorized(),
     };
     if locked && !has_prepared_captures() {
         return Ok(PassOutcome::refused(if mode == PassMode::Idle {
@@ -597,16 +616,8 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
                     .unwrap_or(RepairScope::Suspended);
                 reconcile_missing(storage.clone(), scope).await?;
             }
-            drain_queue(app, storage, mode, locked).await
-        }
-        PassMode::ScheduledManual => {
-            reap_orphans(storage.clone()).await?;
-            let scope_storage = storage.clone();
-            let scope = tokio::task::spawn_blocking(move || repair_scope(&scope_storage))
-                .await
-                .unwrap_or(RepairScope::Suspended);
-            reconcile_missing(storage.clone(), scope).await?;
-            drain_queue(app, storage, mode, false).await
+            let mut fast_retry_used = false;
+            drain_queue(app, storage, mode, locked, &mut fast_retry_used).await
         }
         PassMode::Manual => {
             reap_orphans(storage.clone()).await?;
@@ -634,13 +645,13 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
             let total = tokio::task::spawn_blocking(move || {
                 counting
                     .derived_index_backlog(DerivedIndexKind::ClipImage, MAX_ATTEMPTS)
-                    .map(|backlog| backlog.claimable)
+                    .map(|backlog| backlog.ready)
                     .unwrap_or(0)
             })
             .await
             .unwrap_or(0);
             run.total.store(total, Ordering::SeqCst);
-            drain_until_done(app, storage).await
+            drain_until_done(app, storage, mode).await
         }
     }
 }
@@ -651,6 +662,9 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
 /// starts again at the next, so it bounds a run that cannot make progress
 /// rather than a run that has been politely yielding for a long time — see
 /// [`MANUAL_FOREGROUND_WAIT_BUDGET`].
+///
+/// Only a manual pass calls this: an idle pass yields to the foreground by
+/// ending rather than by waiting.
 async fn stand_aside_for_foreground(app: &AppHandle) -> Option<&'static str> {
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut waited = Duration::ZERO;
@@ -683,12 +697,15 @@ async fn stand_aside_for_foreground(app: &AppHandle) -> Option<&'static str> {
 async fn drain_until_done(
     app: &AppHandle,
     storage: Arc<StorageState>,
+    mode: PassMode,
 ) -> Result<PassOutcome, String> {
+    debug_assert!(mode.is_manual());
     let mut total = PassOutcome::default();
+    let mut fast_retry_used = false;
     loop {
         // Manual runs hold an authenticated session by construction:
         // `clip_index_run_now` checks it before anything else.
-        let outcome = drain_queue(app, storage.clone(), PassMode::Manual, false).await?;
+        let outcome = drain_queue(app, storage.clone(), mode, false, &mut fast_retry_used).await?;
         total.indexed += outcome.indexed;
         total.failed += outcome.failed;
         match outcome.stopped_because {
@@ -713,10 +730,16 @@ async fn drain_until_done(
 
 /// One claimed job: its ledger identity, the image to encode, and the lease
 /// that authorizes the commit.
+#[derive(Clone)]
 struct ClaimedJob {
     spec: DerivedIndexJobSpec,
     image_hash: String,
     lease_token: String,
+}
+
+struct EncodeChunkFailure {
+    error: String,
+    claimed: Vec<ClaimedJob>,
 }
 
 async fn drain_queue(
@@ -724,6 +747,7 @@ async fn drain_queue(
     storage: Arc<StorageState>,
     mode: PassMode,
     locked: bool,
+    fast_retry_used: &mut bool,
 ) -> Result<PassOutcome, String> {
     let claimed = claim_batch(storage.clone(), locked).await?;
     if claimed.is_empty() {
@@ -764,14 +788,30 @@ async fn drain_queue(
 
         let chunk: Vec<ClaimedJob> = pending.drain(..ENCODE_CHUNK.min(pending.len())).collect();
         let chunk_len = chunk.len() as u64;
-        match encode_chunk(app, &semantic, storage.clone(), chunk).await {
+        let encoded_result = match encode_chunk(app, &semantic, storage.clone(), chunk).await {
+            Err(failure)
+                if mode.is_manual()
+                    && !*fast_retry_used
+                    && crate::semantic_runtime::is_transient_worker_failure(&failure.error) =>
+            {
+                *fast_retry_used = true;
+                tracing::warn!(
+                    "[CLIP:INDEX] manual encode failed; restarting worker for one immediate retry: {}",
+                    failure.error
+                );
+                semantic.restart_for_manual_retry();
+                encode_chunk(app, &semantic, storage.clone(), failure.claimed).await
+            }
+            other => other,
+        };
+        match encoded_result {
             Ok(encoded) => {
                 outcome.indexed += encoded as u64;
                 if mode.is_manual() {
                     run.report_chunk(app, chunk_len, encoded as u64);
                 }
                 indexed += encoded;
-                if !matches!(mode, PassMode::Manual) && !pending.is_empty() {
+                if mode.yields_after_chunk() && !pending.is_empty() {
                     // A scheduled request owns one bounded image batch. Give
                     // the remaining claimed jobs back without consuming retry
                     // budget so the unified scheduler can rotate to the next
@@ -786,7 +826,7 @@ async fn drain_queue(
                     break;
                 }
             }
-            Err(error) => {
+            Err(chunk_failure) => {
                 outcome.failed += chunk_len;
                 if mode.is_manual() {
                     run.report_chunk(app, chunk_len, 0);
@@ -803,7 +843,9 @@ async fn drain_queue(
                     )
                     .await;
                 }
-                failure = Some(error);
+                settle_failed_claims(storage.clone(), chunk_failure.claimed, &chunk_failure.error)
+                    .await;
+                failure = Some(chunk_failure.error);
                 break;
             }
         }
@@ -813,11 +855,13 @@ async fn drain_queue(
         tracing::info!("[CLIP:INDEX] indexed {} image(s)", indexed);
     }
     match failure {
-        Some(error) if mode.is_manual() => {
-            outcome.stopped_because = Some("encode_failed");
-            tracing::warn!("[CLIP:INDEX] manual run stopped: {error}");
-            Ok(outcome)
-        }
+        // The failure propagates rather than being folded into the summary:
+        // the command that asked for this run enqueued it and returned, so
+        // nothing is awaiting a report and only the scheduler's durable retry
+        // and backoff can act on it. Reporting it as a pass that stopped early
+        // would have the scheduler defer by a single tick and re-enter without
+        // counting the attempt, which is a tight loop against a worker that is
+        // already down.
         Some(error) => Err(error),
         None => Ok(outcome),
     }
@@ -827,18 +871,23 @@ async fn drain_queue(
 ///
 /// An image that cannot be read or decoded is discarded rather than retried:
 /// the bytes on disk are stable, so the next attempt fails identically. An
-/// encode failure is a worker problem and does charge the retry budget.
+/// encode failure is returned with its lease so the caller can distinguish a
+/// worker-wide retry from a deterministic per-image failure.
 async fn encode_chunk(
     app: &AppHandle,
     semantic: &Arc<SemanticRuntimeState>,
     storage: Arc<StorageState>,
     claimed: Vec<ClaimedJob>,
-) -> Result<usize, String> {
+) -> Result<usize, EncodeChunkFailure> {
     let read_storage = storage.clone();
     let hashes: Vec<String> = claimed.iter().map(|job| job.image_hash.clone()).collect();
+    let retry_claimed = claimed.clone();
     let decoded = tokio::task::spawn_blocking(move || load_images(&read_storage, &hashes))
         .await
-        .map_err(|error| format!("image read task failed: {error}"))?;
+        .map_err(|error| EncodeChunkFailure {
+            error: format!("image read task failed: {error}"),
+            claimed: retry_claimed,
+        })?;
 
     // Partition before submitting: an unreadable image must not cost the
     // readable ones in the same chunk their attempt.
@@ -896,20 +945,30 @@ async fn encode_chunk(
         Ok(result) if result.vectors.len() == jobs.len() => result.vectors,
         Ok(result) => {
             let error = format!(
-                "semantic worker returned {} vectors for {} images",
+                "protocol: semantic worker returned {} vectors for {} images",
                 result.vectors.len(),
                 jobs.len()
             );
-            fail_claims(storage, jobs, "embed_mismatch", &error).await;
-            return Err(error);
+            return Err(EncodeChunkFailure {
+                error,
+                claimed: jobs,
+            });
         }
         Err(error) => {
-            fail_claims(storage, jobs, "embed_failed", &error).await;
-            return Err(format!("embed failed: {error}"));
+            return Err(EncodeChunkFailure {
+                error: format!("embed failed: {error}"),
+                claimed: jobs,
+            });
         }
     };
 
-    commit_batch(storage, jobs, vectors).await
+    let retry_jobs = jobs.clone();
+    commit_batch(storage, jobs, vectors)
+        .await
+        .map_err(|error| EncodeChunkFailure {
+            error,
+            claimed: retry_jobs,
+        })
 }
 
 /// One screenshot decoded into the packed RGB the CLIP preprocessor expects.
@@ -1156,6 +1215,20 @@ async fn fail_claims(
     .await;
 }
 
+async fn settle_failed_claims(storage: Arc<StorageState>, claimed: Vec<ClaimedJob>, error: &str) {
+    if crate::semantic_runtime::is_deterministic_worker_failure(error) {
+        fail_claims(storage, claimed, "embed_failed", error).await;
+    } else {
+        release_claims(
+            storage,
+            claimed,
+            "worker_retry",
+            "semantic worker failure; scheduler will retry the batch",
+        )
+        .await;
+    }
+}
+
 /// Drop CLIP rows with no live screenshot behind them.
 ///
 /// A safety net rather than a live path — see the module header. It also cleans
@@ -1241,18 +1314,21 @@ pub async fn clip_index_run_now(
 ) -> Result<ClipIndexRunSummary, String> {
     crate::commands::check_auth_required(&credential)?;
     let _ = run;
-    if let Some(scheduler) =
-        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
-    {
-        scheduler.enqueue(
-            &app,
-            crate::background_scheduler::BackgroundTaskKind::ClipIndex,
-            true,
-        )?;
-    } else {
-        return Err("Background scheduler is unavailable".to_string());
-    }
+    let scheduler = app
+        .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        .ok_or_else(|| "Background scheduler is unavailable".to_string())?;
     let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let _ = tokio::task::spawn_blocking({
+        let storage = storage.clone();
+        move || storage.reset_derived_index_retries(DerivedIndexKind::ClipImage)
+    })
+    .await
+    .map_err(|error| format!("clip retry reset task failed: {error}"))??;
+    scheduler.enqueue(
+        &app,
+        crate::background_scheduler::BackgroundTaskKind::ClipIndex,
+        true,
+    )?;
     let backlog = tokio::task::spawn_blocking(move || {
         storage
             .derived_index_backlog(DerivedIndexKind::ClipImage, MAX_ATTEMPTS)
@@ -1627,6 +1703,17 @@ mod tests {
         // chunk size *is* the worst case a search arriving mid-pass inherits.
         assert_eq!(ENCODE_CHUNK, 1);
         assert!(DRAIN_BATCH >= ENCODE_CHUNK);
+    }
+
+    #[test]
+    fn a_scheduled_manual_request_uses_the_complete_drain_mode() {
+        // The scheduler decides when this starts. It must not turn the user's
+        // complete drain into one image followed by ordinary idle work.
+        let mode = scheduled_pass_mode(true);
+        assert_eq!(mode, PassMode::Manual);
+        assert!(mode.is_manual());
+        assert!(!mode.yields_after_chunk());
+        assert_eq!(scheduled_pass_mode(false), PassMode::Idle);
     }
 
     #[test]

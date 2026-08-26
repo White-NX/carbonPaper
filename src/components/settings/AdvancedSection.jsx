@@ -45,8 +45,12 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
     semanticStatus,
     semanticStatusLoading,
     semanticIndexRunning,
+    semanticIndexPhase,
+    semanticIndexRetryAt,
     semanticIndexRun,
     clipIndexRunning,
+    clipIndexPhase,
+    clipIndexRetryAt,
     clipIndexRun,
     clipIndexStopping,
     clipIndexProgress,
@@ -144,6 +148,8 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         onRunIndexNow={handleRunSemanticIndexNow}
         onStopIndexNow={handleStopSemanticIndex}
         indexRunning={semanticIndexRunning}
+        indexPhase={semanticIndexPhase}
+        indexRetryAt={semanticIndexRetryAt}
         indexStopping={semanticIndexStopping}
         indexProgress={semanticIndexProgress}
         indexRun={semanticIndexRun}
@@ -158,6 +164,8 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         onRetryAnn={handleRetryClipAnn}
         annRetrying={clipAnnRetrying}
         indexRunning={clipIndexRunning}
+        indexPhase={clipIndexPhase}
+        indexRetryAt={clipIndexRetryAt}
         indexStopping={clipIndexStopping}
         indexProgress={clipIndexProgress}
         indexRun={clipIndexRun}

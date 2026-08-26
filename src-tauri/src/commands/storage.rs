@@ -174,11 +174,13 @@ mod tests {
             clip_image_rows: 9,
             semantic_index_backlog: DerivedIndexBacklog {
                 claimable: 2,
+                ready: 1,
                 exhausted: 1,
                 oldest_claimable_age_secs: Some(30),
             },
             clip_index_backlog: DerivedIndexBacklog {
                 claimable: 4,
+                ready: 2,
                 exhausted: 3,
                 oldest_claimable_age_secs: Some(60),
             },
