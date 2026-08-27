@@ -1030,6 +1030,7 @@
     "switchToNL": "切换到画面搜索",
     "switchToOCR": "切换到文字搜索",
     "selectMode": "选择搜索模式",
+    "pressEnterToViewMore": "按下 [Enter] 查看更多结果",
     "mode": {
       "ocr": {
         "title": "文字搜索",

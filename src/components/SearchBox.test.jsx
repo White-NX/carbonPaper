@@ -91,9 +91,32 @@ describe('SearchBox', () => {
       await waitFor(() => {
         expect(screen.getByText('search.searchError')).toBeInTheDocument();
       });
+      expect(
+        screen.queryByRole('button', { name: /search\.pressEnterToViewMore/i })
+      ).not.toBeInTheDocument();
       expect(consoleErrorSpy).toHaveBeenCalledWith('Search failed:', expect.any(Error));
     } finally {
       consoleErrorSpy.mockRestore();
     }
+  });
+
+  it('renders "pressEnterToViewMore" hint bar and triggers onSubmit on click', async () => {
+    const onSubmit = vi.fn();
+
+    render(
+      <SearchBox
+        onSelectResult={vi.fn()}
+        onSubmit={onSubmit}
+      />
+    );
+
+    const input = screen.getByPlaceholderText('search.placeholder.ocr');
+    await userEvent.type(input, 'deepseek');
+
+    const hintButton = await screen.findByRole('button', { name: /search\.pressEnterToViewMore/i });
+    expect(hintButton).toBeInTheDocument();
+
+    await userEvent.click(hintButton);
+    expect(onSubmit).toHaveBeenCalledWith({ query: 'deepseek', mode: 'ocr' });
   });
 });

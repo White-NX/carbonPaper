@@ -473,11 +473,16 @@ export function useSearchBoxController({
     setShowResults(false);
   };
 
+  const handleViewMore = (event) => {
+    event?.preventDefault?.();
+    setShowResults(false);
+    onSubmit?.({ query, mode });
+  };
+
   const handleSubmit = (event) => {
     if (event.key !== 'Enter') return;
     event.preventDefault();
-    setShowResults(false);
-    onSubmit?.({ query, mode });
+    handleViewMore(event);
   };
 
   const handleCancelCluster = async (event) => {
@@ -527,6 +532,7 @@ export function useSearchBoxController({
     selectMode,
     handleSelect,
     handleSubmit,
+    handleViewMore,
     handleCancelCluster,
   };
 }

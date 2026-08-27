@@ -1030,6 +1030,7 @@
     "switchToNL": "Switch to picture search",
     "switchToOCR": "Switch to text search",
     "selectMode": "Select Search Mode",
+    "pressEnterToViewMore": "Press [Enter] to view more results",
     "mode": {
       "ocr": {
         "title": "Text search",
