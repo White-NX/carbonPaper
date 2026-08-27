@@ -4,7 +4,9 @@
 //! background/foreground index workers, performs periodic repair scans, and
 //! Legacy Chroma migration export remains a separate read-only monitor path.
 
-use crate::background_scheduler::ScheduledSliceResult;
+use crate::background_scheduler::{
+    deferred_release_note, AutomaticSliceContext, AutomaticSliceStopReason, ScheduledSliceResult,
+};
 use crate::clip_migration::{
     clip_job_spec, clip_memory_uri, diagnostic_code, validate_clip_vector,
 };
@@ -320,10 +322,98 @@ fn indexable_hashes(
 
 /// Execute one automatic CLIP index/repair slice, or a complete manual drain
 /// after the unified scheduler admits the user's request. The scheduler owns
-/// admission and the semantic-worker guard.
+/// durable admission; automatic requests claim the semantic-worker guard only
+/// for the actual ONNX call so BGE work can enter between requests.
 pub async fn run_scheduled_slice(
     app: &AppHandle,
     manual: bool,
+    quantum: Option<&AutomaticSliceContext>,
+) -> Result<ScheduledSliceResult, String> {
+    if !manual && quantum.is_some() {
+        return run_automatic_quantum(app, quantum.expect("quantum context")).await;
+    }
+    run_scheduled_request(app, manual, true, true, None).await
+}
+
+async fn run_automatic_quantum(
+    app: &AppHandle,
+    quantum: &AutomaticSliceContext,
+) -> Result<ScheduledSliceResult, String> {
+    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    let mut batches = 0u32;
+    let mut has_more = true;
+    let mut run_maintenance = true;
+    loop {
+        if let Some(reason) = quantum.stop_reason(&semantic, batches > 0) {
+            if batches == 0 {
+                return Ok(
+                    if reason == AutomaticSliceStopReason::ManualRequestPending {
+                        ScheduledSliceResult::complete(true)
+                    } else {
+                        ScheduledSliceResult::skipped(reason.as_str())
+                    },
+                );
+            }
+            tracing::info!(
+                "[SCHEDULER] automatic model quantum yielded task=clip_index batches={} elapsed_ms={} reason={}",
+                batches,
+                quantum.elapsed().as_millis(),
+                reason.as_str(),
+            );
+            finish_automatic_quantum(app).await;
+            return Ok(ScheduledSliceResult::complete(has_more));
+        }
+
+        let result = run_scheduled_request(
+            app,
+            false,
+            run_maintenance,
+            false,
+            Some((quantum, batches > 0)),
+        )
+        .await;
+        run_maintenance = false;
+        let result = result?;
+        if let Some(reason) = result.skipped_reason {
+            if batches == 0 {
+                return Ok(
+                    if reason == AutomaticSliceStopReason::ManualRequestPending.as_str() {
+                        ScheduledSliceResult::complete(true)
+                    } else {
+                        ScheduledSliceResult::skipped(reason)
+                    },
+                );
+            } else {
+                finish_automatic_quantum(app).await;
+                return Ok(ScheduledSliceResult::complete(has_more));
+            }
+        }
+        batches = batches.saturating_add(1);
+        has_more = result.has_more;
+        if !has_more {
+            tracing::info!(
+                "[SCHEDULER] automatic model quantum completed task=clip_index batches={} elapsed_ms={}",
+                batches,
+                quantum.elapsed().as_millis(),
+            );
+            finish_automatic_quantum(app).await;
+            return Ok(ScheduledSliceResult::complete(false));
+        }
+    }
+}
+
+async fn finish_automatic_quantum(app: &AppHandle) {
+    if let Err(error) = crate::clip_ann::maybe_rebuild(app, false).await {
+        tracing::warn!("[CLIP:ANN] scheduled rebuild failed: {error}");
+    }
+}
+
+async fn run_scheduled_request(
+    app: &AppHandle,
+    manual: bool,
+    run_maintenance: bool,
+    run_ann_maintenance: bool,
+    automatic_context: Option<(&AutomaticSliceContext, bool)>,
 ) -> Result<ScheduledSliceResult, String> {
     let run = app.state::<Arc<ClipIndexRunState>>().inner().clone();
     let _active = manual.then(|| run.begin());
@@ -338,12 +428,18 @@ pub async fn run_scheduled_slice(
         .await
         .map_err(|error| format!("clip retry reset task failed: {error}"))??;
     }
-    let outcome = run_pass(app, scheduled_pass_mode(manual)).await?;
+    let outcome = run_pass(
+        app,
+        scheduled_pass_mode(manual),
+        run_maintenance,
+        automatic_context,
+    )
+    .await?;
     if let Some(reason) = outcome.refused.or(outcome.stopped_because) {
         return Ok(ScheduledSliceResult::skipped(reason));
     }
-    if let Err(error) = crate::clip_ann::maybe_rebuild(app, false).await {
-        tracing::warn!("[CLIP:ANN] scheduled rebuild failed: {error}");
+    if run_ann_maintenance {
+        finish_automatic_quantum(app).await;
     }
     let backlog = tokio::task::spawn_blocking(move || {
         storage
@@ -564,7 +660,12 @@ pub(crate) const BACKFILL_DECLINED: &str = "declined";
 /// forever. At `MAINTENANCE_BATCH` per pass it admits roughly a million images.
 const MAX_REPAIR_PASSES: usize = 4096;
 
-async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String> {
+async fn run_pass(
+    app: &AppHandle,
+    mode: PassMode,
+    run_maintenance: bool,
+    automatic_context: Option<(&AutomaticSliceContext, bool)>,
+) -> Result<PassOutcome, String> {
     if !may_run(app, mode) {
         return Ok(PassOutcome::refused(if mode.is_manual() {
             "maintenance_in_progress"
@@ -606,9 +707,9 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
     match mode {
         PassMode::Idle => {
             // Both of these read the encrypted store, so a locked pass skips
-            // them and does nothing but drain what is already prepared. They
-            // run on the next unlocked tick.
-            if !locked {
+            // them and does nothing but drain what is already prepared. Run
+            // them once per quantum rather than once per image request.
+            if run_maintenance && !locked {
                 reap_orphans(storage.clone()).await?;
                 let scope_storage = storage.clone();
                 let scope = tokio::task::spawn_blocking(move || repair_scope(&scope_storage))
@@ -617,7 +718,15 @@ async fn run_pass(app: &AppHandle, mode: PassMode) -> Result<PassOutcome, String
                 reconcile_missing(storage.clone(), scope).await?;
             }
             let mut fast_retry_used = false;
-            drain_queue(app, storage, mode, locked, &mut fast_retry_used).await
+            drain_queue(
+                app,
+                storage,
+                mode,
+                locked,
+                &mut fast_retry_used,
+                automatic_context,
+            )
+            .await
         }
         PassMode::Manual => {
             reap_orphans(storage.clone()).await?;
@@ -705,7 +814,15 @@ async fn drain_until_done(
     loop {
         // Manual runs hold an authenticated session by construction:
         // `clip_index_run_now` checks it before anything else.
-        let outcome = drain_queue(app, storage.clone(), mode, false, &mut fast_retry_used).await?;
+        let outcome = drain_queue(
+            app,
+            storage.clone(),
+            mode,
+            false,
+            &mut fast_retry_used,
+            None,
+        )
+        .await?;
         total.indexed += outcome.indexed;
         total.failed += outcome.failed;
         match outcome.stopped_because {
@@ -740,6 +857,7 @@ struct ClaimedJob {
 struct EncodeChunkFailure {
     error: String,
     claimed: Vec<ClaimedJob>,
+    deferred_reason: Option<&'static str>,
 }
 
 async fn drain_queue(
@@ -748,12 +866,21 @@ async fn drain_queue(
     mode: PassMode,
     locked: bool,
     fast_retry_used: &mut bool,
+    automatic_context: Option<(&AutomaticSliceContext, bool)>,
 ) -> Result<PassOutcome, String> {
+    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    if let Some((quantum, made_progress)) = automatic_context {
+        if let Some(reason) = quantum.stop_reason(&semantic, made_progress) {
+            return Ok(PassOutcome {
+                stopped_because: Some(reason.as_str()),
+                ..PassOutcome::default()
+            });
+        }
+    }
     let claimed = claim_batch(storage.clone(), locked).await?;
     if claimed.is_empty() {
         return Ok(PassOutcome::default());
     }
-    let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let run = app.state::<Arc<ClipIndexRunState>>().inner().clone();
     let mut pending: VecDeque<ClaimedJob> = claimed.into();
     let mut indexed = 0usize;
@@ -788,7 +915,25 @@ async fn drain_queue(
 
         let chunk: Vec<ClaimedJob> = pending.drain(..ENCODE_CHUNK.min(pending.len())).collect();
         let chunk_len = chunk.len() as u64;
-        let encoded_result = match encode_chunk(app, &semantic, storage.clone(), chunk).await {
+        let encoded_result =
+            encode_chunk(app, &semantic, storage.clone(), chunk, automatic_context).await;
+        let encoded_result = match encoded_result {
+            Err(failure) if failure.deferred_reason.is_some() => {
+                let reason = failure
+                    .deferred_reason
+                    .expect("deferred encode failures carry a reason");
+                let mut unattempted = failure.claimed;
+                unattempted.extend(pending.drain(..));
+                release_claims(
+                    storage.clone(),
+                    unattempted,
+                    reason,
+                    deferred_release_note(reason),
+                )
+                .await;
+                outcome.stopped_because = Some(reason);
+                break;
+            }
             Err(failure)
                 if mode.is_manual()
                     && !*fast_retry_used
@@ -800,7 +945,7 @@ async fn drain_queue(
                     failure.error
                 );
                 semantic.restart_for_manual_retry();
-                encode_chunk(app, &semantic, storage.clone(), failure.claimed).await
+                encode_chunk(app, &semantic, storage.clone(), failure.claimed, None).await
             }
             other => other,
         };
@@ -812,10 +957,10 @@ async fn drain_queue(
                 }
                 indexed += encoded;
                 if mode.yields_after_chunk() && !pending.is_empty() {
-                    // A scheduled request owns one bounded image batch. Give
-                    // the remaining claimed jobs back without consuming retry
-                    // budget so the unified scheduler can rotate to the next
-                    // task at the next admission point.
+                    // One automatic request unit is one image batch. Give the
+                    // remaining claimed jobs back without consuming retry
+                    // budget; the admitted model quantum may immediately
+                    // claim the next unit without rotating the durable row.
                     release_claims(
                         storage.clone(),
                         Vec::from(std::mem::take(&mut pending)),
@@ -878,6 +1023,7 @@ async fn encode_chunk(
     semantic: &Arc<SemanticRuntimeState>,
     storage: Arc<StorageState>,
     claimed: Vec<ClaimedJob>,
+    automatic_context: Option<(&AutomaticSliceContext, bool)>,
 ) -> Result<usize, EncodeChunkFailure> {
     let read_storage = storage.clone();
     let hashes: Vec<String> = claimed.iter().map(|job| job.image_hash.clone()).collect();
@@ -887,6 +1033,7 @@ async fn encode_chunk(
         .map_err(|error| EncodeChunkFailure {
             error: format!("image read task failed: {error}"),
             claimed: retry_claimed,
+            deferred_reason: None,
         })?;
 
     // Partition before submitting: an unreadable image must not cost the
@@ -927,6 +1074,41 @@ async fn encode_chunk(
         });
         body.extend_from_slice(&image.rgb);
     }
+    let jobs: Vec<ClaimedJob> = encodable.into_iter().map(|(job, _)| job).collect();
+
+    if let Some((quantum, made_progress)) = automatic_context {
+        if let Some(reason) = quantum.stop_reason(semantic, made_progress) {
+            return Err(EncodeChunkFailure {
+                error: reason.as_str().to_string(),
+                claimed: jobs,
+                deferred_reason: Some(reason.as_str()),
+            });
+        }
+    }
+    let worker_guard = if automatic_context.is_some() {
+        match crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                return Err(EncodeChunkFailure {
+                    error: "semantic_worker_busy".to_string(),
+                    claimed: jobs,
+                    deferred_reason: Some("semantic_worker_busy"),
+                });
+            }
+        }
+    } else {
+        None
+    };
+    if let Some((quantum, made_progress)) = automatic_context {
+        if let Some(reason) = quantum.stop_reason(semantic, made_progress) {
+            drop(worker_guard);
+            return Err(EncodeChunkFailure {
+                error: reason.as_str().to_string(),
+                claimed: jobs,
+                deferred_reason: Some(reason.as_str()),
+            });
+        }
+    }
 
     let embedded = semantic
         .embed_image(
@@ -940,7 +1122,6 @@ async fn encode_chunk(
         )
         .await;
 
-    let jobs: Vec<ClaimedJob> = encodable.into_iter().map(|(job, _)| job).collect();
     let vectors = match embedded {
         Ok(result) if result.vectors.len() == jobs.len() => result.vectors,
         Ok(result) => {
@@ -952,15 +1133,18 @@ async fn encode_chunk(
             return Err(EncodeChunkFailure {
                 error,
                 claimed: jobs,
+                deferred_reason: None,
             });
         }
         Err(error) => {
             return Err(EncodeChunkFailure {
                 error: format!("embed failed: {error}"),
                 claimed: jobs,
+                deferred_reason: None,
             });
         }
     };
+    drop(worker_guard);
 
     let retry_jobs = jobs.clone();
     commit_batch(storage, jobs, vectors)
@@ -968,6 +1152,7 @@ async fn encode_chunk(
         .map_err(|error| EncodeChunkFailure {
             error,
             claimed: retry_jobs,
+            deferred_reason: None,
         })
 }
 

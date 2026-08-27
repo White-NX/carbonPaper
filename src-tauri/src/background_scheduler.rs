@@ -14,7 +14,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 use tokio::sync::Notify;
 
@@ -26,6 +26,8 @@ pub const TASK_PYTHON_CLUSTERING: &str = "python_clustering";
 /// Automatic work may wait behind a user-requested pass for this long before
 /// becoming eligible to reclaim the head of the queue.
 pub const AUTO_AGING_LIMIT: Duration = Duration::from_secs(10 * 60);
+pub(crate) const CLIP_AUTO_QUANTUM: Duration = Duration::from_secs(60);
+pub(crate) const MINILM_AUTO_QUANTUM: Duration = Duration::from_secs(30);
 const TICK_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 
@@ -56,6 +58,105 @@ impl BackgroundTaskKind {
             TASK_PYTHON_CLUSTERING => Some(Self::PythonClustering),
             _ => None,
         }
+    }
+
+    const fn automatic_quantum(self) -> Option<Duration> {
+        match self {
+            Self::ClipIndex => Some(CLIP_AUTO_QUANTUM),
+            Self::SemanticIndex => Some(MINILM_AUTO_QUANTUM),
+            Self::SmartCluster | Self::PythonClustering => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutomaticSliceStopReason {
+    BudgetExpired,
+    ManualRequestPending,
+    ExternalBackgroundRequest,
+}
+
+impl AutomaticSliceStopReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::BudgetExpired => "quantum_expired",
+            Self::ManualRequestPending => "manual_request_pending",
+            Self::ExternalBackgroundRequest => "external_background_request",
+        }
+    }
+}
+
+/// The lease-history note recorded beside a deferred reason code when an
+/// automatic pass hands its claimed jobs back without attempting them. The
+/// code is durable machine state; this is its human-readable companion, so it
+/// must stay honest about which side asked the pass to stand down.
+pub(crate) fn deferred_release_note(reason: &str) -> &'static str {
+    match reason {
+        code if code == AutomaticSliceStopReason::BudgetExpired.as_str() => {
+            "the automatic model quantum reached its time budget"
+        }
+        code if code == AutomaticSliceStopReason::ManualRequestPending.as_str() => {
+            "a manual request is waiting for the scheduler"
+        }
+        code if code == AutomaticSliceStopReason::ExternalBackgroundRequest.as_str() => {
+            "an external background request is waiting for the semantic worker"
+        }
+        _ => "another background model request owned the semantic worker",
+    }
+}
+
+/// Process-local admission lease for one automatic single-model quantum.
+///
+/// Durable scheduler state still moves from queued to running exactly once for
+/// the whole quantum. The task implementation checks this lease between model
+/// requests, where stopping is lossless and cannot interrupt an ONNX call.
+#[derive(Clone)]
+pub(crate) struct AutomaticSliceContext {
+    started: Instant,
+    deadline: Instant,
+    manual_generation_at_admission: u64,
+    manual_generation: Arc<AtomicU64>,
+}
+
+impl AutomaticSliceContext {
+    pub(crate) fn new(
+        budget: Duration,
+        manual_generation: Arc<AtomicU64>,
+        manual_generation_at_admission: u64,
+    ) -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            deadline: started + budget,
+            manual_generation_at_admission,
+            manual_generation,
+        }
+    }
+
+    /// Return the reason no further model request should be submitted.
+    ///
+    /// The time budget is ignored until the task has made some business-queue
+    /// progress. Maintenance work may legitimately consume the initial budget,
+    /// but an admitted quantum must still get one chance to advance its queue.
+    pub(crate) fn stop_reason(
+        &self,
+        semantic: &SemanticRuntimeState,
+        made_progress: bool,
+    ) -> Option<AutomaticSliceStopReason> {
+        if self.manual_generation.load(Ordering::SeqCst) != self.manual_generation_at_admission {
+            return Some(AutomaticSliceStopReason::ManualRequestPending);
+        }
+        if semantic.external_background_waiting() {
+            return Some(AutomaticSliceStopReason::ExternalBackgroundRequest);
+        }
+        if made_progress && Instant::now() >= self.deadline {
+            return Some(AutomaticSliceStopReason::BudgetExpired);
+        }
+        None
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.started.elapsed()
     }
 }
 
@@ -205,6 +306,7 @@ struct SchedulerRuntime {
     running_manual: AtomicBool,
     blocked_reason: Mutex<Option<String>>,
     service_seq: AtomicU64,
+    manual_request_generation: Arc<AtomicU64>,
     worker_restart_count: AtomicU64,
     worker_restart_attempts: Mutex<VecDeque<i64>>,
     /// Automatic monitor recovery remains degraded until a manual start or a
@@ -223,6 +325,7 @@ impl Default for SchedulerRuntime {
             running_manual: AtomicBool::new(false),
             blocked_reason: Mutex::new(None),
             service_seq: AtomicU64::new(0),
+            manual_request_generation: Arc::new(AtomicU64::new(0)),
             worker_restart_count: AtomicU64::new(0),
             worker_restart_attempts: Mutex::new(VecDeque::new()),
             monitor_restart_degraded: AtomicBool::new(false),
@@ -349,6 +452,11 @@ impl BackgroundSchedulerState {
             tracing::debug!("[SCHEDULER] enqueue {} failed: {error}", kind.as_str());
         }
         result?;
+        if manual {
+            self.runtime
+                .manual_request_generation
+                .fetch_add(1, Ordering::SeqCst);
+        }
         // This is the externally visible admission path. Even when the row is
         // already queued, a caller may be retrying after changing an admission
         // condition, so preserve the prompt wake-up semantics. The internal
@@ -620,6 +728,7 @@ async fn execute_slice(
     kind: BackgroundTaskKind,
     manual: bool,
     runtime: &SchedulerRuntime,
+    automatic_context: Option<&AutomaticSliceContext>,
 ) -> Result<ScheduledSliceResult, String> {
     // Python's HDBSCAN run is intentionally non-preemptible, but it does not
     // own the Rust semantic model slot for the duration of that computation.
@@ -709,16 +818,34 @@ async fn execute_slice(
                 .unwrap_or("python clustering failed")
                 .to_string())
         }
+    } else if !manual
+        && matches!(
+            kind,
+            BackgroundTaskKind::SemanticIndex | BackgroundTaskKind::ClipIndex
+        )
+    {
+        let context = automatic_context.expect("automatic index tasks have a quantum context");
+        match kind {
+            BackgroundTaskKind::SemanticIndex => {
+                crate::minilm_index::run_scheduled_slice(app, false, Some(context)).await
+            }
+            BackgroundTaskKind::ClipIndex => {
+                crate::clip_index::run_scheduled_slice(app, false, Some(context)).await
+            }
+            BackgroundTaskKind::SmartCluster | BackgroundTaskKind::PythonClustering => {
+                unreachable!()
+            }
+        }
     } else {
         let Ok(_worker_guard) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
             return Ok(ScheduledSliceResult::skipped("semantic_worker_busy"));
         };
         match kind {
             BackgroundTaskKind::SemanticIndex => {
-                crate::minilm_index::run_scheduled_slice(app, manual).await
+                crate::minilm_index::run_scheduled_slice(app, manual, None).await
             }
             BackgroundTaskKind::ClipIndex => {
-                crate::clip_index::run_scheduled_slice(app, manual).await
+                crate::clip_index::run_scheduled_slice(app, manual, None).await
             }
             BackgroundTaskKind::SmartCluster => {
                 crate::smart_cluster_scoring::run_scheduled_slice(app, manual).await
@@ -767,6 +894,13 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
         if runtime.stop.load(Ordering::SeqCst) {
             break;
         }
+        // Snapshot before reading the durable queue. A manual request arriving
+        // after this point either appears in that read or changes the
+        // generation observed by an automatic quantum at its first request
+        // boundary. Taking the snapshot after the durable claim would leave a
+        // race where a just-arrived manual request looked older than the
+        // automatic work already selected from a stale queue read.
+        let manual_generation_at_scan = runtime.manual_request_generation.load(Ordering::SeqCst);
         if should_refresh_backlog(wake_reason) {
             refresh_backlog(&app).await;
         }
@@ -794,6 +928,10 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
         let selected =
             select_next_runnable_task(&tasks, now, AUTO_AGING_LIMIT.as_millis() as i64, |task| {
                 gate_reason(&app, task.manual_pending).is_none()
+                    && (task.manual_pending
+                        || !app
+                            .state::<Arc<SemanticRuntimeState>>()
+                            .external_background_waiting())
             });
         let (kind, manual) = if let Some(selected) = selected {
             selected
@@ -816,6 +954,18 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 .unwrap_or(false);
             (kind, manual)
         };
+        if !manual
+            && app
+                .state::<Arc<SemanticRuntimeState>>()
+                .external_background_waiting()
+        {
+            *runtime
+                .blocked_reason
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
+                Some("external_background_request".to_string());
+            continue;
+        }
         if let Some(reason) = gate_reason(&app, manual) {
             *runtime
                 .blocked_reason
@@ -851,7 +1001,18 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(kind.as_str().to_string());
         runtime.running_manual.store(manual, Ordering::SeqCst);
-        let result = execute_slice(&app, kind, manual, &runtime).await;
+        let automatic_context =
+            (!manual)
+                .then(|| kind.automatic_quantum())
+                .flatten()
+                .map(|budget| {
+                    AutomaticSliceContext::new(
+                        budget,
+                        runtime.manual_request_generation.clone(),
+                        manual_generation_at_scan,
+                    )
+                });
+        let result = execute_slice(&app, kind, manual, &runtime, automatic_context.as_ref()).await;
         runtime.running_manual.store(false, Ordering::SeqCst);
         *runtime
             .running_task
@@ -889,6 +1050,12 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 {
                     tracing::debug!("[SCHEDULER] completion persist failed: {error}");
                 }
+                // Completion is itself a scheduling boundary. Re-read the
+                // ledger immediately so another ready task can run without
+                // waiting for the two-second fallback tick. For an automatic
+                // quantum with remaining work this is also what applies its
+                // freshly updated `ready_since` against older tasks.
+                runtime.wake.notify_one();
             }
             Err(error) => {
                 let normalized = error.to_ascii_lowercase();
@@ -1108,6 +1275,74 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::from_secs(60));
         assert_eq!(retry_delay(2), Duration::from_secs(120));
         assert_eq!(retry_delay(99), MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn only_automatic_single_model_indexers_receive_a_quantum() {
+        assert_eq!(
+            BackgroundTaskKind::ClipIndex.automatic_quantum(),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            BackgroundTaskKind::SemanticIndex.automatic_quantum(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(BackgroundTaskKind::SmartCluster.automatic_quantum(), None);
+        assert_eq!(
+            BackgroundTaskKind::PythonClustering.automatic_quantum(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_expired_quantum_still_admits_its_first_model_batch() {
+        let generation = Arc::new(AtomicU64::new(0));
+        let mut context = AutomaticSliceContext::new(Duration::ZERO, generation, 0);
+        context.deadline = context.started;
+        let semantic = SemanticRuntimeState::new();
+
+        assert_eq!(context.stop_reason(&semantic, false), None);
+        assert_eq!(
+            context.stop_reason(&semantic, true),
+            Some(AutomaticSliceStopReason::BudgetExpired)
+        );
+    }
+
+    #[test]
+    fn a_quantum_context_uses_the_admission_generation_snapshot() {
+        let generation = Arc::new(AtomicU64::new(4));
+        let context = AutomaticSliceContext::new(Duration::from_secs(60), generation, 3);
+        let semantic = SemanticRuntimeState::new();
+        assert_eq!(
+            context.stop_reason(&semantic, false),
+            Some(AutomaticSliceStopReason::ManualRequestPending)
+        );
+    }
+
+    #[test]
+    fn a_manual_request_stops_an_admitted_automatic_quantum() {
+        let generation = Arc::new(AtomicU64::new(7));
+        let context = AutomaticSliceContext::new(Duration::from_secs(60), generation.clone(), 7);
+        let semantic = SemanticRuntimeState::new();
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(
+            context.stop_reason(&semantic, false),
+            Some(AutomaticSliceStopReason::ManualRequestPending)
+        );
+    }
+
+    #[test]
+    fn an_external_background_request_stops_before_the_next_model_batch() {
+        let generation = Arc::new(AtomicU64::new(0));
+        let context = AutomaticSliceContext::new(Duration::from_secs(60), generation, 0);
+        let semantic = Arc::new(SemanticRuntimeState::new());
+        let _lease = semantic.external_background_lease();
+
+        assert_eq!(
+            context.stop_reason(&semantic, false),
+            Some(AutomaticSliceStopReason::ExternalBackgroundRequest)
+        );
     }
 
     #[test]

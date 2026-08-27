@@ -199,6 +199,11 @@ pub struct SemanticRuntimeState {
     /// worker. Read by background callers as the signal to stand down; see
     /// [`SemanticRuntimeState::foreground_lease`].
     foreground_waiting: AtomicUsize,
+    /// Background requests outside the durable scheduler which are queued for,
+    /// or executing on, the shared worker. BGE screenshot classification uses
+    /// this to ask a long automatic model quantum to stop at its next request
+    /// boundary without becoming a durable scheduler task itself.
+    external_background_waiting: AtomicUsize,
 }
 
 impl Default for SemanticRuntimeState {
@@ -230,6 +235,7 @@ impl SemanticRuntimeState {
             request_gate: tokio::sync::Mutex::new(()),
             next_request_id: AtomicU64::new(1),
             foreground_waiting: AtomicUsize::new(0),
+            external_background_waiting: AtomicUsize::new(0),
         }
     }
 
@@ -275,6 +281,18 @@ impl SemanticRuntimeState {
     /// waiting on [`FOREGROUND_POLL_INTERVAL`] until it clears.
     pub fn foreground_waiting(&self) -> bool {
         self.foreground_waiting.load(Ordering::SeqCst) > 0
+    }
+
+    pub(crate) fn external_background_lease(self: &Arc<Self>) -> ExternalBackgroundLease {
+        self.external_background_waiting
+            .fetch_add(1, Ordering::SeqCst);
+        ExternalBackgroundLease {
+            state: self.clone(),
+        }
+    }
+
+    pub(crate) fn external_background_waiting(&self) -> bool {
+        self.external_background_waiting.load(Ordering::SeqCst) > 0
     }
 
     pub async fn embed_text(
@@ -996,6 +1014,18 @@ pub struct ForegroundLease {
     state: Arc<SemanticRuntimeState>,
 }
 
+pub(crate) struct ExternalBackgroundLease {
+    state: Arc<SemanticRuntimeState>,
+}
+
+impl Drop for ExternalBackgroundLease {
+    fn drop(&mut self) {
+        self.state
+            .external_background_waiting
+            .fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Drop for ForegroundLease {
     fn drop(&mut self) {
         self.state.foreground_waiting.fetch_sub(1, Ordering::SeqCst);
@@ -1030,12 +1060,12 @@ pub const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// they point here rather than restating it — so an engine that one day caches
 /// two models invalidates one paragraph instead of seven.
 ///
-/// Every background model batch therefore claims this before touching the
-/// worker: MiniLM capture indexing, CLIP image indexing, BGE automatic
-/// classification, and Smart Cluster scoring (MiniLM anchors followed by the
-/// cross-encoder). It lives here rather than in one of those modules because
-/// none owns the others, and a guard private to any one path would recreate the
-/// same model-thrashing bug at the next boundary.
+/// Every individual background model request therefore claims this before
+/// touching the worker: MiniLM capture indexing, CLIP image indexing, BGE
+/// automatic classification, and Smart Cluster scoring (MiniLM anchors followed
+/// by the cross-encoder). A task may retain its durable scheduler admission for
+/// a longer affinity quantum, but it releases this guard between requests so
+/// foreground work and external background work can enter at a safe boundary.
 pub static BACKGROUND_PASS_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Wait for exclusive use of the single semantic worker, inside the caller's own
@@ -1824,6 +1854,19 @@ mod tests {
         assert!(state.foreground_waiting());
         drop(second);
         assert!(!state.foreground_waiting());
+    }
+
+    #[test]
+    fn external_background_leases_are_counted_and_released_on_drop() {
+        let state = Arc::new(SemanticRuntimeState::new());
+        assert!(!state.external_background_waiting());
+        let first = state.external_background_lease();
+        let second = state.external_background_lease();
+        assert!(state.external_background_waiting());
+        drop(first);
+        assert!(state.external_background_waiting());
+        drop(second);
+        assert!(!state.external_background_waiting());
     }
 
     #[tokio::test]
