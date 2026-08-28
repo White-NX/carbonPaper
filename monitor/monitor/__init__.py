@@ -246,10 +246,23 @@ def _handle_command_impl(req: dict):
         clustering_enabled = req.get('clustering_enabled', True)
         classification_enabled = req.get('classification_enabled', True)
         update_feature_config(clustering_enabled, classification_enabled)
+        # The classification worker snapshots its feature config from the
+        # environment at startup; forward the change so jobs it dequeues from
+        # here on honour the new setting without an app restart.
+        worker_result = None
+        if _model_worker is not None and hasattr(_model_worker, 'update_feature_config'):
+            try:
+                worker_result = _model_worker.update_feature_config(
+                    clustering_enabled, classification_enabled
+                )
+            except Exception as exc:
+                logger.warning('Feature-config sync to model worker failed: %s', exc)
+                worker_result = {'status': 'deferred', 'error': str(exc)}
         return {
             'status': 'success',
             'clustering_enabled': clustering_enabled,
             'classification_enabled': classification_enabled,
+            'worker_sync': worker_result,
         }
 
     if cmd == 'enqueue_ocr_postprocess':

@@ -2051,11 +2051,21 @@ pub(crate) async fn process_ocr_inner(
     if let Some(scheduler) =
         app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
     {
-        let _ = scheduler.enqueue(
-            app,
-            crate::background_scheduler::BackgroundTaskKind::SemanticIndex,
-            false,
-        );
+        // The semantic text index feeds task clustering and smart cluster
+        // scoring. Wake the scheduler for it only when at least one consumer is
+        // enabled; the ledger row above is unconditional, so a later settings
+        // change picks the backlog back up through the scheduler's periodic
+        // reconciliation.
+        let semantic_consumers = crate::registry_config::get_bool("clustering_enabled")
+            .unwrap_or(true)
+            || crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
+        if semantic_consumers {
+            let _ = scheduler.enqueue(
+                app,
+                crate::background_scheduler::BackgroundTaskKind::SemanticIndex,
+                false,
+            );
+        }
         let _ = scheduler.enqueue(
             app,
             crate::background_scheduler::BackgroundTaskKind::ClipIndex,

@@ -89,6 +89,11 @@ class WorkerSupervisor:
         self._state = "stopped"
         self._degraded_until = 0.0
 
+    def is_running(self) -> bool:
+        """Whether a live child process is currently attached."""
+        with self._lock:
+            return self._proc is not None and self._proc.is_alive() and self._conn is not None
+
     def start(self, timeout: Optional[float] = None):
         with self._lock:
             if self._proc is not None and self._proc.is_alive() and self._conn is not None:
