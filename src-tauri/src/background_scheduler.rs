@@ -581,13 +581,21 @@ async fn refresh_backlog(app: &AppHandle) {
     // newly discovered work directly: using the public enqueue path here would
     // notify the same loop while it is running, leave a Notify permit behind,
     // and turn an admission-gated queue into a self-waking hot loop.
-    if semantic > 0 {
+    // The semantic text index only exists to feed task clustering and smart
+    // cluster scoring. When both consumers are off there is no reason to admit
+    // encoding work; the ledger rows stay pending and are picked up again the
+    // moment either switch is turned back on.
+    let semantic_consumers = crate::registry_config::get_bool("clustering_enabled").unwrap_or(true)
+        || crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
+    if semantic > 0 && semantic_consumers {
         let _ = storage.enqueue_background_task_if_changed(TASK_SEMANTIC_INDEX, false, now_ms());
     }
     if clip > 0 {
         let _ = storage.enqueue_background_task_if_changed(TASK_CLIP_INDEX, false, now_ms());
     }
-    if smart > 0 {
+    // A disabled smart cluster feature must not enqueue scoring work, even when
+    // pending rows exist. The registry is the application-side source of truth.
+    if smart > 0 && crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false) {
         let _ = storage.enqueue_background_task_if_changed(TASK_SMART_CLUSTER, false, now_ms());
     }
 
@@ -710,6 +718,29 @@ async fn execute_slice(
                 .to_string())
         }
     } else {
+        // The registry is the application-side source of truth, checked again
+        // here for the same reason as Python clustering above: a queued row can
+        // outlive a settings change. Manual slices are user-initiated
+        // maintenance requests and stay allowed.
+        if !manual {
+            match kind {
+                BackgroundTaskKind::SemanticIndex => {
+                    let semantic_consumers = crate::registry_config::get_bool("clustering_enabled")
+                        .unwrap_or(true)
+                        || crate::registry_config::get_bool("smart_cluster_enabled")
+                            .unwrap_or(false);
+                    if !semantic_consumers {
+                        return Ok(ScheduledSliceResult::skipped("disabled"));
+                    }
+                }
+                BackgroundTaskKind::SmartCluster => {
+                    if !crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false) {
+                        return Ok(ScheduledSliceResult::skipped("disabled"));
+                    }
+                }
+                BackgroundTaskKind::ClipIndex | BackgroundTaskKind::PythonClustering => {}
+            }
+        }
         let Ok(_worker_guard) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
             return Ok(ScheduledSliceResult::skipped("semantic_worker_busy"));
         };

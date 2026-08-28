@@ -305,6 +305,19 @@ def _worker_main(conn, storage_pipe: Optional[str], data_dir: str, env: Dict[str
                 send_response(
                     _enqueue_ocr_postprocess(msg.get("request", {}), postprocess_queue)
                 )
+            elif command == "update_feature_config":
+                # Runtime feature-toggle sync from the monitor process. The
+                # child snapshots its config from the environment at startup,
+                # so a settings change must be forwarded for it to take effect
+                # on jobs this process has not dequeued yet.
+                from .config import update_feature_config as _update_feature_config
+
+                args = msg.get("args", {})
+                _update_feature_config(
+                    bool(args.get("clustering_enabled", True)),
+                    bool(args.get("classification_enabled", True)),
+                )
+                send_response({"status": "success"})
             elif command == "get_stats":
                 send_response(
                     {
@@ -449,6 +462,39 @@ class RestartableModelWorker(WorkerSupervisor):
         stats = dict(self._stats)
         stats["watchdog"] = self.status_snapshot()
         return stats
+
+    def update_feature_config(self, clustering_enabled: bool, classification_enabled: bool):
+        """Propagate a runtime feature-toggle change to the child process.
+
+        The child snapshots ``monitor.config`` from its environment at startup
+        and never re-reads it, so without this forward a settings change made
+        while the app is running would not reach the process that dequeues
+        classification jobs. The environment snapshot is updated in place first
+        — it is the same dict a restart pickles into a fresh child — so the
+        change also survives worker restarts. Forwarding to a live child is
+        best-effort: a failed notify still leaves the environment correct.
+        """
+        self.env["CARBONPAPER_CLUSTERING_ENABLED"] = str(bool(clustering_enabled))
+        self.env["CARBONPAPER_CLASSIFICATION_ENABLED"] = str(bool(classification_enabled))
+        if not self.is_running():
+            return {"status": "deferred", "reason": "worker not running"}
+        try:
+            return self.request(
+                "update_feature_config",
+                {
+                    "args": {
+                        "clustering_enabled": bool(clustering_enabled),
+                        "classification_enabled": bool(classification_enabled),
+                    }
+                },
+                timeout=30,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Feature-config forward to model worker failed (env snapshot updated): %s",
+                exc,
+            )
+            return {"status": "deferred", "error": str(exc)}
 
     def pause(self):
         logger.info("Model worker proxy paused")
