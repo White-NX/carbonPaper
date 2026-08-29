@@ -12,9 +12,10 @@ use std::sync::atomic::Ordering;
 use super::types::{RawRecentCaptureRow, RawScreenshotRow};
 use super::{
     wire_time, BackgroundReadError, BackgroundScreenshotSummary, DeleteQueueStatus, DensityBucket,
-    DerivedIndexKind, IndexStorageStats, OcrResultInput, QueueScreenshotCandidate, RecentCapture,
-    SaveScreenshotRequest, SaveScreenshotResponse, ScreenshotRecord, SoftDeleteResult,
-    SoftDeleteScreenshotsResult, StorageState,
+    DerivedIndexKind, IncrementalVacuumResult, IndexStorageStats, OcrDeleteBatchResult,
+    OcrResultInput, QueueScreenshotCandidate, RecentCapture, SaveScreenshotRequest,
+    SaveScreenshotResponse, ScreenshotRecord, SoftDeleteResult, SoftDeleteScreenshotsResult,
+    StorageState,
 };
 
 const MAX_OCR_POSTPROCESS_ATTEMPTS: i64 = 5;
@@ -2598,65 +2599,13 @@ impl StorageState {
         Ok(final_map)
     }
 
-    /// Delete a screenshot by ID.
+    /// Queue a screenshot for safe physical deletion by ID.
     pub fn delete_screenshot(&self, id: i64) -> Result<bool, String> {
-        let (deleted, image_path, ocr_count) = {
-            let guard = self.get_connection_named("delete_screenshot")?;
-            let conn = guard.as_ref().unwrap();
-
-            // Get image path first
-            let image_path: Option<String> = conn
-                .query_row(
-                    "SELECT image_path FROM screenshots WHERE id = ? AND is_deleted = 0",
-                    [id],
-                    |row| row.get(0),
-                )
-                .ok();
-
-            // Count OCR rows that will be cascade-deleted
-            let ocr_count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM ocr_results WHERE screenshot_id = ? AND is_deleted = 0",
-                    [id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-
-            // Delete database record
-            let deleted = conn
-                .execute(
-                    "DELETE FROM screenshots WHERE id = ? AND is_deleted = 0",
-                    [id],
-                )
-                .map_err(|e| format!("Failed to delete screenshot: {}", e))?;
-
-            if deleted > 0 {
-                // Clean up orphaned dedup entries while the DB connection is held.
-                let _ = Self::cleanup_orphaned_dedup_entries(conn);
-            }
-            drop(guard);
-            (deleted, image_path, ocr_count)
-        };
-
-        // Try to delete image file
-        if deleted > 0 {
-            if let Some(path) = image_path {
-                let abs_path = self.resolve_image_path(&path);
-                let _ = std::fs::remove_file(&abs_path);
-                let thumb = Self::thumbnail_path_for(&abs_path);
-                let _ = std::fs::remove_file(&thumb);
-            }
-            let _ = self
-                .ocr_row_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(ocr_count as u64))
-                });
-        }
-
-        Ok(deleted > 0)
+        let result = self.soft_delete_screenshots(&[id])?;
+        Ok(result.screenshots_marked > 0)
     }
 
-    /// Delete screenshots within a time range.
+    /// Queue screenshots within a time range for safe physical deletion.
     pub fn delete_screenshots_by_time_range(
         &self,
         start_ts: f64,
@@ -2670,64 +2619,28 @@ impl StorageState {
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_default();
 
-        let (paths, deleted, ocr_count) = {
+        let ids: Vec<i64> = {
             let guard = self.get_connection_named("delete_screenshots_by_time_range")?;
             let conn = guard.as_ref().unwrap();
 
-            // Get all image paths to delete
             let mut stmt = conn
-                .prepare("SELECT image_path FROM screenshots WHERE is_deleted = 0 AND created_at BETWEEN ? AND ?")
+                .prepare(
+                    "SELECT id FROM screenshots
+                     WHERE is_deleted = 0 AND created_at BETWEEN ?1 AND ?2
+                     ORDER BY id ASC",
+                )
                 .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
-            let paths: Vec<String> = stmt
+            let rows = stmt
                 .query_map([&start_dt, &end_dt], |row| row.get(0))
                 .map_err(|e| format!("Failed to execute query: {}", e))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            // Count OCR rows that will be cascade-deleted
-            let ocr_count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM ocr_results WHERE is_deleted = 0 AND screenshot_id IN (SELECT id FROM screenshots WHERE is_deleted = 0 AND created_at BETWEEN ? AND ?)",
-                    [&start_dt, &end_dt],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-
-            // Delete database records
-            let deleted = conn
-                .execute(
-                    "DELETE FROM screenshots WHERE is_deleted = 0 AND created_at BETWEEN ? AND ?",
-                    [&start_dt, &end_dt],
-                )
-                .map_err(|e| format!("Failed to delete screenshots: {}", e))?;
-
-            if deleted > 0 {
-                // Clean up orphaned dedup entries while the DB connection is held.
-                let _ = Self::cleanup_orphaned_dedup_entries(conn);
-            }
-            drop(stmt);
-            drop(guard);
-            (paths, deleted, ocr_count)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to decode screenshot id: {}", e))?;
+            rows
         };
 
-        if deleted > 0 {
-            let _ = self
-                .ocr_row_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(ocr_count as u64))
-                });
-        }
-
-        // Try to delete image files
-        for path in paths {
-            let abs_path = self.resolve_image_path(&path);
-            let _ = std::fs::remove_file(&abs_path);
-            let thumb = Self::thumbnail_path_for(&abs_path);
-            let _ = std::fs::remove_file(&thumb);
-        }
-
-        Ok(deleted as i32)
+        let result = self.soft_delete_screenshots(&ids)?;
+        Ok(result.screenshots_marked.clamp(0, i32::MAX as i64) as i32)
     }
 
     /// Soft-delete screenshots by process (and optional month key `YYYY-MM`) and enqueue IDs.
@@ -3111,17 +3024,24 @@ impl StorageState {
     }
 
     /// Process one OCR delete queue batch and unlink each row from blind bitmap index.
-    pub fn process_ocr_delete_queue_batch(&self, batch_size: i64) -> Result<usize, String> {
+    pub fn process_ocr_delete_queue_batch(
+        &self,
+        batch_size: i64,
+    ) -> Result<OcrDeleteBatchResult, String> {
         let safe_batch_size = batch_size.clamp(1, 2000);
-        let hmac_key = self.credential_state.get_hmac_key()?;
 
-        let mut guard = self.get_connection_named("process_ocr_delete_queue_batch")?;
-        let conn = guard.as_mut().unwrap();
-
-        let rows: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> = {
+        let rows: Vec<(
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        )> = {
+            let guard = self.get_connection_named("process_ocr_delete_queue_batch_read")?;
+            let conn = guard.as_ref().unwrap();
             let mut read_stmt = conn
                 .prepare(
-                    "SELECT q.id, o.text_enc, o.text_key_encrypted
+                    "SELECT q.id, o.id, o.text, o.text_enc, o.text_key_encrypted
                      FROM delete_queue_ocr q
                      LEFT JOIN ocr_results o ON o.id = q.id
                      ORDER BY q.id ASC
@@ -3131,43 +3051,86 @@ impl StorageState {
 
             let mapped_rows = read_stmt
                 .query_map([safe_batch_size], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
                 })
                 .map_err(|e| format!("Failed to read OCR queue rows: {}", e))?;
 
-            let collected: Vec<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> =
-                mapped_rows.filter_map(|r| r.ok()).collect();
-            collected
+            mapped_rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to decode OCR queue row: {}", e))?
         };
 
         if rows.is_empty() {
-            return Ok(0);
+            return Ok(OcrDeleteBatchResult::default());
         }
 
         let mut removals: std::collections::HashMap<String, RoaringBitmap> =
             std::collections::HashMap::new();
         let mut queue_ids: Vec<i64> = Vec::with_capacity(rows.len());
+        let mut stale_queue_rows = 0usize;
 
-        for (ocr_id, text_enc, text_key_enc) in &rows {
+        let has_live_rows = rows
+            .iter()
+            .any(|(_, existing_id, _, _, _)| existing_id.is_some());
+        let hmac_key = if has_live_rows {
+            Some(self.credential_state.get_hmac_key()?)
+        } else {
+            None
+        };
+
+        for (ocr_id, existing_id, legacy_text, text_enc, text_key_enc) in &rows {
             queue_ids.push(*ocr_id);
+
+            if existing_id.is_none() {
+                stale_queue_rows += 1;
+                continue;
+            }
+
             let plaintext = match (text_enc.as_ref(), text_key_enc.as_ref()) {
-                (Some(enc), Some(key_enc)) => self
-                    .decrypt_payload_with_row_key(enc, key_enc)
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok()),
-                _ => None,
+                (Some(enc), Some(key_enc)) => match self.decrypt_payload_with_row_key(enc, key_enc)
+                {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(text) => text,
+                        Err(_) => legacy_text
+                            .clone()
+                            .ok_or_else(|| format!("OCR row {} contains invalid UTF-8", ocr_id))?,
+                    },
+                    Err(error) => legacy_text.clone().ok_or_else(|| {
+                        format!(
+                            "Failed to decrypt OCR row {} for delete cleanup: {}",
+                            ocr_id, error
+                        )
+                    })?,
+                },
+                _ => legacy_text
+                    .clone()
+                    .ok_or_else(|| format!("OCR row {} has no readable text payload", ocr_id))?,
             };
 
-            if let Some(text) = plaintext {
-                for token in Self::bigram_tokenize(&text) {
-                    let token_hash = Self::compute_hmac_hash(&token, &hmac_key);
-                    removals
-                        .entry(token_hash)
-                        .or_insert_with(RoaringBitmap::new)
-                        .insert(*ocr_id as u32);
-                }
+            let bitmap_id = u32::try_from(*ocr_id)
+                .map_err(|_| format!("OCR row {} exceeds bitmap id capacity", ocr_id))?;
+            for token in Self::bigram_tokenize(&plaintext) {
+                let token_hash = Self::compute_hmac_hash(
+                    &token,
+                    hmac_key
+                        .as_deref()
+                        .expect("live OCR rows require an HMAC key"),
+                );
+                removals
+                    .entry(token_hash)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(bitmap_id);
             }
         }
+
+        let mut guard = self.get_connection_named("process_ocr_delete_queue_batch_write")?;
+        let conn = guard.as_mut().unwrap();
 
         let tx = conn
             .transaction()
@@ -3221,13 +3184,15 @@ impl StorageState {
             }
         }
 
+        let mut deleted_rows = 0usize;
         for chunk in queue_ids.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
             let sql_delete_ocr = format!("DELETE FROM ocr_results WHERE id IN ({})", placeholders);
             let params_ocr: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-            tx.execute(&sql_delete_ocr, params_ocr.as_slice())
+            deleted_rows += tx
+                .execute(&sql_delete_ocr, params_ocr.as_slice())
                 .map_err(|e| format!("Failed to hard-delete OCR rows: {}", e))?;
 
             let sql_delete_queue = format!(
@@ -3245,7 +3210,11 @@ impl StorageState {
         // `ocr_row_count` is adjusted on soft-delete when rows become inactive.
         // Hard-delete queue processing is physical cleanup only and must not decrement again.
 
-        Ok(queue_ids.len())
+        Ok(OcrDeleteBatchResult {
+            queue_rows: queue_ids.len(),
+            deleted_rows,
+            stale_queue_rows,
+        })
     }
 
     /// Read screenshot cleanup candidates from queue (batch).
@@ -3262,6 +3231,10 @@ impl StorageState {
                 "SELECT q.id, s.image_hash, s.image_path
                  FROM delete_queue_screenshots q
                  LEFT JOIN screenshots s ON s.id = q.id
+                 WHERE s.id IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1 FROM ocr_results o WHERE o.screenshot_id = q.id
+                    )
                  ORDER BY q.id ASC
                  LIMIT ?1",
             )
@@ -3272,8 +3245,8 @@ impl StorageState {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .map_err(|e| format!("Failed to read screenshot queue rows: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to decode screenshot queue row: {}", e))?;
 
         let mut stale_ids = Vec::new();
         let mut candidates = Vec::new();
@@ -3353,41 +3326,72 @@ impl StorageState {
         &self,
         freelist_threshold: i64,
         vacuum_pages: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<IncrementalVacuumResult, String> {
         let Some(_maintenance) = self.try_database_maintenance("run_incremental_vacuum_if_idle")
         else {
-            return Ok(false);
+            return Ok(IncrementalVacuumResult::default());
         };
         let guard = self.get_connection_named("run_incremental_vacuum_if_idle")?;
         let conn = guard.as_ref().unwrap();
 
-        let pending_screenshots: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_screenshots", [], |row| {
-                row.get(0)
-            })
-            .map_err(|e| format!("Failed to count screenshot queue: {}", e))?;
-        let pending_ocr: i64 = conn
-            .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| {
-                row.get(0)
-            })
-            .map_err(|e| format!("Failed to count OCR queue: {}", e))?;
+        let queues_busy: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM delete_queue_screenshots LIMIT 1)
+                     OR EXISTS(SELECT 1 FROM delete_queue_ocr LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to inspect delete queues before vacuum: {}", e))?;
 
-        if pending_screenshots > 0 || pending_ocr > 0 {
-            return Ok(false);
+        if queues_busy != 0 {
+            return Ok(IncrementalVacuumResult::default());
         }
 
-        let freelist_count: i64 = conn
+        let freelist_before: i64 = conn
             .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
             .map_err(|e| format!("Failed to read freelist_count: {}", e))?;
 
-        if freelist_count <= freelist_threshold {
-            return Ok(false);
+        if freelist_before <= freelist_threshold {
+            return Ok(IncrementalVacuumResult::default());
         }
 
         let pages = vacuum_pages.max(1);
-        conn.execute_batch(&format!("PRAGMA incremental_vacuum({});", pages))
-            .map_err(|e| format!("Failed to run incremental_vacuum: {}", e))?;
-        Ok(true)
+        let page_count_before: i64 = conn
+            .query_row("PRAGMA page_count;", [], |row| row.get(0))
+            .map_err(|e| format!("Failed to read page_count before vacuum: {}", e))?;
+
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA incremental_vacuum({});", pages))
+            .map_err(|e| format!("Failed to prepare incremental_vacuum: {}", e))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("Failed to start incremental_vacuum: {}", e))?;
+        let mut stepped_pages = 0usize;
+        while rows
+            .next()
+            .map_err(|e| format!("Failed while stepping incremental_vacuum: {}", e))?
+            .is_some()
+        {
+            stepped_pages += 1;
+        }
+        drop(rows);
+        drop(stmt);
+
+        let freelist_after: i64 = conn
+            .query_row("PRAGMA freelist_count;", [], |row| row.get(0))
+            .map_err(|e| format!("Failed to read freelist_count after vacuum: {}", e))?;
+        let page_count_after: i64 = conn
+            .query_row("PRAGMA page_count;", [], |row| row.get(0))
+            .map_err(|e| format!("Failed to read page_count after vacuum: {}", e))?;
+
+        Ok(IncrementalVacuumResult {
+            attempted: true,
+            requested_pages: pages,
+            stepped_pages,
+            reclaimed_pages: page_count_before.saturating_sub(page_count_after),
+            freelist_before,
+            freelist_after,
+        })
     }
 
     /// Canonicalize a list of visible links into a deterministic JSON string.
@@ -3571,6 +3575,83 @@ mod ocr_lifecycle_tests {
         // h1 is one image vector despite three OCR rows; h2/h3 each contribute
         // one; h4 is deleted; h5 has no OCR row.
         assert_eq!(storage.count_expected_clip_image_rows().unwrap(), 3);
+    }
+
+    #[test]
+    fn screenshot_queue_waits_until_all_child_ocr_rows_are_gone() {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        storage.init_tables(&connection).expect("initialize schema");
+        connection
+            .execute_batch(
+                "INSERT INTO screenshots (id, image_path, image_hash, is_deleted) VALUES
+                    (1, '1.enc', 'h1', 1),
+                    (2, '2.enc', 'h2', 1);
+                 INSERT INTO ocr_results (id, screenshot_id, text_hash, is_deleted)
+                    VALUES (10, 1, 'x', 1);
+                 INSERT INTO delete_queue_screenshots (id) VALUES (1), (2);",
+            )
+            .expect("insert delete queue fixture");
+        *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
+
+        let ready = storage
+            .fetch_screenshot_delete_candidates(10)
+            .expect("read screenshot queue");
+        assert_eq!(ready.iter().map(|row| row.id).collect::<Vec<_>>(), vec![2]);
+
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            guard
+                .as_ref()
+                .unwrap()
+                .execute("DELETE FROM ocr_results WHERE id = 10", [])
+                .expect("remove final OCR row");
+        }
+        let ready = storage
+            .fetch_screenshot_delete_candidates(10)
+            .expect("read unblocked screenshot queue");
+        assert_eq!(
+            ready.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn incremental_vacuum_exhausts_more_than_one_pragma_step() {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
+        let db_path = temp.path().join("vacuum.db");
+        let connection = Connection::open(&db_path).expect("open vacuum fixture");
+        connection
+            .execute_batch(
+                "PRAGMA auto_vacuum = INCREMENTAL;
+                 VACUUM;
+                 CREATE TABLE delete_queue_screenshots (id INTEGER PRIMARY KEY);
+                 CREATE TABLE delete_queue_ocr (id INTEGER PRIMARY KEY);
+                 CREATE TABLE payloads (id INTEGER PRIMARY KEY, payload BLOB NOT NULL);
+                 WITH RECURSIVE rows(id) AS (
+                    SELECT 1 UNION ALL SELECT id + 1 FROM rows WHERE id < 800
+                 )
+                 INSERT INTO payloads (id, payload) SELECT id, zeroblob(3500) FROM rows;
+                 DELETE FROM payloads;",
+            )
+            .expect("create vacuum fixture");
+        let freelist_before: i64 = connection
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .expect("read initial freelist");
+        assert!(freelist_before > 50);
+        *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
+
+        let result = storage
+            .run_incremental_vacuum_if_idle(0, 50)
+            .expect("run incremental vacuum");
+        assert!(result.attempted);
+        assert!(result.stepped_pages > 1);
+        assert!(result.reclaimed_pages > 1);
+        assert!(result.freelist_after < result.freelist_before);
     }
 
     #[test]

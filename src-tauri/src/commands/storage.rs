@@ -714,7 +714,7 @@ pub async fn storage_get_screenshot_details(
     .map_err(|e| format!("Task join error: {:?}", e))?
 }
 
-/// Permanently deletes one screenshot and asks the vector index to remove its embedding.
+/// Queues one screenshot for safe background deletion and index cleanup.
 ///
 /// Authentication: required. `screenshot_id` identifies the record. Returns
 /// `{ "status": "success", "deleted": boolean, "vector_deleted": number | null }`.
@@ -734,7 +734,7 @@ pub async fn storage_delete_screenshot(
     }))
 }
 
-/// Permanently deletes screenshots in the requested millisecond time range.
+/// Queues screenshots in the requested millisecond time range for safe background deletion.
 ///
 /// Authentication: required. Returns `{ "status": "success", "deleted_count": number,
 /// "vector_deleted": number | null }`. Frontend: `lib/monitor_api.js`.

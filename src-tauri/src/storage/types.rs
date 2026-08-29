@@ -461,6 +461,35 @@ pub struct DeleteQueueStatus {
     pub running: bool,
 }
 
+/// Outcome of one durable OCR delete-queue batch.
+#[derive(Debug, Clone, Default)]
+pub struct OcrDeleteBatchResult {
+    pub queue_rows: usize,
+    pub deleted_rows: usize,
+    pub stale_queue_rows: usize,
+}
+
+/// Observable result of one incremental-vacuum attempt.
+#[derive(Debug, Clone, Default)]
+pub struct IncrementalVacuumResult {
+    pub attempted: bool,
+    pub requested_pages: i64,
+    pub stepped_pages: usize,
+    pub reclaimed_pages: i64,
+    pub freelist_before: i64,
+    pub freelist_after: i64,
+}
+
+/// Persisted progress emitted by the one-time blind-index repair.
+#[derive(Debug, Clone, Default)]
+pub struct BlindIndexRepairProgress {
+    pub processed_postings: u64,
+    pub total_postings: u64,
+    pub changed_postings: u64,
+    pub deleted_postings: u64,
+    pub removed_ocr_ids: u64,
+}
+
 /// Counts used by the index health panel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexStorageStats {

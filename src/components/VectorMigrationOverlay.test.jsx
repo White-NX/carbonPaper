@@ -9,6 +9,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../lib/task_api', () => ({
+  getBlindIndexRepairStatus: vi.fn(),
   getMaintenanceStatus: vi.fn(),
   getMinilmRebuildStatus: vi.fn(),
   getClipRebuildStatus: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock('../lib/auth_api', () => ({
 
 import VectorMigrationOverlay from './VectorMigrationOverlay';
 import {
+  getBlindIndexRepairStatus,
   getClipRebuildStatus,
   getMaintenanceStatus,
   getMinilmRebuildStatus,
@@ -53,6 +55,14 @@ describe('VectorMigrationOverlay', () => {
     getMaintenanceStatus.mockResolvedValue({ active: true, reason: 'minilm_migration' });
     getMinilmRebuildStatus.mockResolvedValue(runningStatus());
     getClipRebuildStatus.mockResolvedValue(runningStatus());
+    getBlindIndexRepairStatus.mockResolvedValue({
+      running: true,
+      phase: 'repairing_blind_index',
+      processed: 20,
+      total: 100,
+      failed: 0,
+      last_error: null,
+    });
   });
 
   afterEach(() => {
@@ -93,6 +103,19 @@ describe('VectorMigrationOverlay', () => {
     expect(getMinilmRebuildStatus).not.toHaveBeenCalled();
   });
 
+  it('shows blocking progress for the blind text-index repair', async () => {
+    getMaintenanceStatus.mockResolvedValue({ active: true, reason: 'blind_index_repair' });
+    render(<VectorMigrationOverlay />);
+    await pollTick();
+
+    expect(screen.getByText('vectorMigration.kinds.blindIndex.title')).toBeInTheDocument();
+    expect(screen.getByText(/20\s*\/\s*100\s*\(20%\)/)).toBeInTheDocument();
+    expect(getBlindIndexRepairStatus).toHaveBeenCalled();
+    expect(getMinilmRebuildStatus).not.toHaveBeenCalled();
+    expect(getClipRebuildStatus).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+
   it('stays hidden when the app is not in maintenance mode', async () => {
     getMaintenanceStatus.mockResolvedValue({ active: false, reason: null });
     render(<VectorMigrationOverlay />);
@@ -103,6 +126,7 @@ describe('VectorMigrationOverlay', () => {
     // No detail read is worth making when the cheap outer flag already says no.
     expect(getMinilmRebuildStatus).not.toHaveBeenCalled();
     expect(getClipRebuildStatus).not.toHaveBeenCalled();
+    expect(getBlindIndexRepairStatus).not.toHaveBeenCalled();
   });
 
   it('still explains itself when the reason is unrecognised', async () => {

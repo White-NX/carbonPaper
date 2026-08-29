@@ -1487,6 +1487,10 @@
         "title": "Migrating the image index",
         "subtitle": "Screenshot-image vectors are being moved into the local Rust index. The app is in maintenance mode while this runs."
       },
+      "blindIndex": {
+        "title": "Repairing text search",
+        "subtitle": "Search records left by deleted snapshots are being cleaned up. The app is unavailable until this finishes."
+      },
       "unknown": {
         "title": "Maintenance in progress",
         "subtitle": "The app is running a maintenance task. Some features stay unavailable until it finishes."
@@ -1497,7 +1501,7 @@
     "waitingForAuth": "Your session has expired. Complete Windows Hello authentication and the migration will continue automatically.",
     "reauth": "Authenticate",
     "errorCount": "{{count}} records could not be migrated. Details were written to the migration diagnostics.",
-    "blockedHint": "Other operations are unavailable during migration. If the app exits, migration resumes after the next launch and unlock.",
+    "blockedHint": "Other operations are unavailable during maintenance. If the app exits, the task resumes on the next launch.",
     "phases": {
       "starting": "Preparing…",
       "preflight": "Checking disk space…",
@@ -1509,7 +1513,11 @@
       "publishing_verify": "Verifying the index file…",
       "publishing_commit": "Committing the index…",
       "building_ann": "Building the accelerated image-search index…",
+      "scanning_valid_ocr": "Checking active search records…",
+      "repairing_blind_index": "Repairing text search…",
       "waiting_for_auth": "Waiting for authentication…",
+      "completed": "Repair complete",
+      "failed": "Repair incomplete",
       "working": "Working…"
     }
   },
