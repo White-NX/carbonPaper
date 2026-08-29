@@ -20,6 +20,23 @@ impl StorageState {
     const BLIND_INDEX_REPAIR_REMOVED_IDS_KEY: &'static str =
         "blind_index_repair_stale_postings_v1_removed_ids";
 
+    /// Re-arm a full stale-posting scan after cleanup had to delete an indexed
+    /// OCR row without knowing which token postings referenced it.
+    pub(crate) fn mark_blind_index_repair_needed_on_conn(conn: &Connection) -> Result<(), String> {
+        for key in [
+            Self::BLIND_INDEX_REPAIR_DONE_KEY,
+            Self::BLIND_INDEX_REPAIR_CURSOR_KEY,
+            Self::BLIND_INDEX_REPAIR_PROCESSED_KEY,
+            Self::BLIND_INDEX_REPAIR_CHANGED_KEY,
+            Self::BLIND_INDEX_REPAIR_DELETED_KEY,
+            Self::BLIND_INDEX_REPAIR_REMOVED_IDS_KEY,
+        ] {
+            conn.execute("DELETE FROM app_metadata WHERE key = ?1", [key])
+                .map_err(|error| format!("Failed to re-arm blind-index repair: {error}"))?;
+        }
+        Ok(())
+    }
+
     /// Whether this database still needs the stale-posting repair introduced
     /// after screenshot deletion could outrun OCR bitmap cleanup.
     pub fn is_blind_index_repair_needed(&self) -> Result<bool, String> {

@@ -19,6 +19,37 @@ use super::{
 };
 
 const MAX_OCR_POSTPROCESS_ATTEMPTS: i64 = 5;
+const MAX_OCR_DELETE_CLEANUP_FAILURES: i64 = 3;
+
+struct OcrDeleteQueueRow {
+    id: i64,
+    existing_id: Option<i64>,
+    failure_count: i64,
+    legacy_text: Option<String>,
+    text_hash: Option<String>,
+    text_enc: Option<Vec<u8>>,
+    text_key_encrypted: Option<Vec<u8>>,
+}
+
+impl OcrDeleteQueueRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            failure_count: row.get(1)?,
+            existing_id: row.get(2)?,
+            legacy_text: row.get(3)?,
+            text_hash: row.get(4)?,
+            text_enc: row.get(5)?,
+            text_key_encrypted: row.get(6)?,
+        })
+    }
+}
+
+struct OcrDeleteCleanupFailure {
+    id: i64,
+    failure_count: i64,
+    error: String,
+}
 
 struct EncryptedOcrResultRow {
     id: i64,
@@ -3030,18 +3061,13 @@ impl StorageState {
     ) -> Result<OcrDeleteBatchResult, String> {
         let safe_batch_size = batch_size.clamp(1, 2000);
 
-        let rows: Vec<(
-            i64,
-            Option<i64>,
-            Option<String>,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-        )> = {
+        let rows: Vec<OcrDeleteQueueRow> = {
             let guard = self.get_connection_named("process_ocr_delete_queue_batch_read")?;
             let conn = guard.as_ref().unwrap();
             let mut read_stmt = conn
                 .prepare(
-                    "SELECT q.id, o.id, o.text, o.text_enc, o.text_key_encrypted
+                    "SELECT q.id, q.failure_count, o.id, o.text, o.text_hash,
+                            o.text_enc, o.text_key_encrypted
                      FROM delete_queue_ocr q
                      LEFT JOIN ocr_results o ON o.id = q.id
                      ORDER BY q.id ASC
@@ -3050,15 +3076,7 @@ impl StorageState {
                 .map_err(|e| format!("Failed to prepare OCR queue read: {}", e))?;
 
             let mapped_rows = read_stmt
-                .query_map([safe_batch_size], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                })
+                .query_map([safe_batch_size], OcrDeleteQueueRow::from_row)
                 .map_err(|e| format!("Failed to read OCR queue rows: {}", e))?;
 
             mapped_rows
@@ -3067,61 +3085,90 @@ impl StorageState {
         };
 
         if rows.is_empty() {
-            return Ok(OcrDeleteBatchResult::default());
+            return Ok(OcrDeleteBatchResult {
+                queue_empty: true,
+                ..OcrDeleteBatchResult::default()
+            });
         }
 
         let mut removals: std::collections::HashMap<String, RoaringBitmap> =
             std::collections::HashMap::new();
-        let mut queue_ids: Vec<i64> = Vec::with_capacity(rows.len());
+        let mut delete_ids: Vec<i64> = Vec::with_capacity(rows.len());
+        let mut retry_failures: Vec<OcrDeleteCleanupFailure> = Vec::new();
+        let mut fallback_failures: Vec<OcrDeleteCleanupFailure> = Vec::new();
         let mut stale_queue_rows = 0usize;
+        let mut hmac_key: Option<Vec<u8>> = None;
 
-        let has_live_rows = rows
-            .iter()
-            .any(|(_, existing_id, _, _, _)| existing_id.is_some());
-        let hmac_key = if has_live_rows {
-            Some(self.credential_state.get_hmac_key()?)
-        } else {
-            None
-        };
-
-        for (ocr_id, existing_id, legacy_text, text_enc, text_key_enc) in &rows {
-            queue_ids.push(*ocr_id);
-
-            if existing_id.is_none() {
+        for row in &rows {
+            if row.existing_id.is_none() {
+                delete_ids.push(row.id);
                 stale_queue_rows += 1;
                 continue;
             }
 
-            let plaintext = match (text_enc.as_ref(), text_key_enc.as_ref()) {
-                (Some(enc), Some(key_enc)) => match self.decrypt_payload_with_row_key(enc, key_enc)
-                {
-                    Ok(bytes) => match String::from_utf8(bytes) {
-                        Ok(text) => text,
-                        Err(_) => legacy_text
-                            .clone()
-                            .ok_or_else(|| format!("OCR row {} contains invalid UTF-8", ocr_id))?,
-                    },
-                    Err(error) => legacy_text.clone().ok_or_else(|| {
-                        format!(
-                            "Failed to decrypt OCR row {} for delete cleanup: {}",
-                            ocr_id, error
-                        )
-                    })?,
-                },
-                _ => legacy_text
+            // An empty text hash is the durable marker for a row that never
+            // reached the bitmap index, so it has no postings to unlink.
+            if row.text_hash.as_deref().unwrap_or_default().is_empty() {
+                delete_ids.push(row.id);
+                continue;
+            }
+
+            let plaintext = match (row.text_enc.as_ref(), row.text_key_encrypted.as_ref()) {
+                (Some(enc), Some(key_enc)) => {
+                    match self.decrypt_payload_with_row_key(enc, key_enc) {
+                        Ok(bytes) => match String::from_utf8(bytes) {
+                            Ok(text) => Ok(text),
+                            Err(_) => row.legacy_text.clone().ok_or_else(|| {
+                                format!("OCR row {} contains invalid UTF-8", row.id)
+                            }),
+                        },
+                        Err(error) => row.legacy_text.clone().ok_or_else(|| {
+                            format!(
+                                "Failed to decrypt OCR row {} for delete cleanup: {}",
+                                row.id, error
+                            )
+                        }),
+                    }
+                }
+                _ => row
+                    .legacy_text
                     .clone()
-                    .ok_or_else(|| format!("OCR row {} has no readable text payload", ocr_id))?,
+                    .ok_or_else(|| format!("OCR row {} has no readable text payload", row.id)),
             };
 
-            let bitmap_id = u32::try_from(*ocr_id)
-                .map_err(|_| format!("OCR row {} exceeds bitmap id capacity", ocr_id))?;
+            let cleanup_input = plaintext.and_then(|text| {
+                u32::try_from(row.id)
+                    .map(|bitmap_id| (text, bitmap_id))
+                    .map_err(|_| format!("OCR row {} exceeds bitmap id capacity", row.id))
+            });
+
+            let (plaintext, bitmap_id) = match cleanup_input {
+                Ok(input) => input,
+                Err(error) => {
+                    let failure_count = row.failure_count.max(0).saturating_add(1);
+                    let failure = OcrDeleteCleanupFailure {
+                        id: row.id,
+                        failure_count,
+                        error,
+                    };
+                    if failure_count >= MAX_OCR_DELETE_CLEANUP_FAILURES {
+                        delete_ids.push(row.id);
+                        fallback_failures.push(failure);
+                    } else {
+                        retry_failures.push(failure);
+                    }
+                    continue;
+                }
+            };
+
+            if hmac_key.is_none() {
+                hmac_key = Some(self.credential_state.get_hmac_key()?);
+            }
+            let hmac_key = hmac_key
+                .as_deref()
+                .expect("OCR posting cleanup requires an HMAC key");
             for token in Self::bigram_tokenize(&plaintext) {
-                let token_hash = Self::compute_hmac_hash(
-                    &token,
-                    hmac_key
-                        .as_deref()
-                        .expect("live OCR rows require an HMAC key"),
-                );
+                let token_hash = Self::compute_hmac_hash(&token, hmac_key);
                 removals
                     .entry(token_hash)
                     .or_insert_with(RoaringBitmap::new)
@@ -3184,8 +3231,19 @@ impl StorageState {
             }
         }
 
+        if !retry_failures.is_empty() {
+            let mut update_stmt = tx
+                .prepare_cached("UPDATE delete_queue_ocr SET failure_count = ?2 WHERE id = ?1")
+                .map_err(|e| format!("Failed to prepare OCR retry update: {}", e))?;
+            for failure in &retry_failures {
+                update_stmt
+                    .execute(params![failure.id, failure.failure_count])
+                    .map_err(|e| format!("Failed to persist OCR cleanup retry: {}", e))?;
+            }
+        }
+
         let mut deleted_rows = 0usize;
-        for chunk in queue_ids.chunks(500) {
+        for chunk in delete_ids.chunks(500) {
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
 
             let sql_delete_ocr = format!("DELETE FROM ocr_results WHERE id IN ({})", placeholders);
@@ -3205,15 +3263,50 @@ impl StorageState {
                 .map_err(|e| format!("Failed to clear OCR queue rows: {}", e))?;
         }
 
+        let blind_index_repair_requested = !fallback_failures.is_empty();
+        if blind_index_repair_requested {
+            Self::mark_blind_index_repair_needed_on_conn(&tx)?;
+        }
+
+        let queue_empty: bool = tx
+            .query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM delete_queue_ocr LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to inspect OCR queue after cleanup: {}", e))?;
+
         tx.commit()
             .map_err(|e| format!("Failed to commit OCR cleanup: {}", e))?;
         // `ocr_row_count` is adjusted on soft-delete when rows become inactive.
         // Hard-delete queue processing is physical cleanup only and must not decrement again.
 
+        for failure in &retry_failures {
+            tracing::warn!(
+                "[DELETE_QUEUE] OCR row {} cleanup failed ({}/{}); retrying later: {}",
+                failure.id,
+                failure.failure_count,
+                MAX_OCR_DELETE_CLEANUP_FAILURES,
+                failure.error
+            );
+        }
+        for failure in &fallback_failures {
+            tracing::warn!(
+                "[DELETE_QUEUE] OCR row {} cleanup failed {} times; hard-deleted without bitmap unlink and scheduled repair: {}",
+                failure.id,
+                failure.failure_count,
+                failure.error
+            );
+        }
+
         Ok(OcrDeleteBatchResult {
-            queue_rows: queue_ids.len(),
+            queue_rows: delete_ids.len(),
             deleted_rows,
             stale_queue_rows,
+            retry_rows: retry_failures.len(),
+            fallback_deleted_rows: fallback_failures.len(),
+            blind_index_repair_requested,
+            queue_empty,
         })
     }
 
@@ -3616,6 +3709,122 @@ mod ocr_lifecycle_tests {
             ready.iter().map(|row| row.id).collect::<Vec<_>>(),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn ocr_delete_queue_isolates_unreadable_rows_and_rearms_repair() {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        storage.init_tables(&connection).expect("initialize schema");
+        connection
+            .execute_batch(
+                "INSERT INTO screenshots (id, image_path, image_hash, is_deleted) VALUES
+                    (1, '1.enc', 'h1', 1),
+                    (2, '2.enc', 'h2', 1);
+                 INSERT INTO ocr_results
+                    (id, screenshot_id, text, text_hash, text_enc, text_key_encrypted, is_deleted)
+                    VALUES
+                    (10, 1, NULL, 'indexed', NULL, NULL, 1),
+                    (20, 2, NULL, '', NULL, NULL, 1);
+                 INSERT INTO delete_queue_ocr (id) VALUES (10), (20);
+                 INSERT INTO delete_queue_screenshots (id) VALUES (1), (2);",
+            )
+            .expect("insert delete queue fixture");
+        *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
+
+        storage
+            .run_blind_index_repair(|_| {})
+            .expect("mark initial repair complete");
+        assert!(!storage.is_blind_index_repair_needed().unwrap());
+
+        let first = storage
+            .process_ocr_delete_queue_batch(10)
+            .expect("process first OCR delete batch");
+        assert_eq!(first.queue_rows, 1);
+        assert_eq!(first.deleted_rows, 1);
+        assert_eq!(first.retry_rows, 1);
+        assert_eq!(first.fallback_deleted_rows, 0);
+        assert!(!first.blind_index_repair_requested);
+        assert!(!first.queue_empty);
+
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().expect("database");
+            let failure_count: i64 = conn
+                .query_row(
+                    "SELECT failure_count FROM delete_queue_ocr WHERE id = 10",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("persist first failure");
+            assert_eq!(failure_count, 1);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM ocr_results WHERE id = 20",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+        }
+
+        let ready = storage
+            .fetch_screenshot_delete_candidates(10)
+            .expect("read partially unblocked screenshot queue");
+        assert_eq!(ready.iter().map(|row| row.id).collect::<Vec<_>>(), vec![2]);
+
+        let second = storage
+            .process_ocr_delete_queue_batch(10)
+            .expect("process second OCR delete batch");
+        assert_eq!(second.queue_rows, 0);
+        assert_eq!(second.retry_rows, 1);
+        assert!(!second.queue_empty);
+
+        let third = storage
+            .process_ocr_delete_queue_batch(10)
+            .expect("process fallback OCR delete batch");
+        assert_eq!(third.queue_rows, 1);
+        assert_eq!(third.deleted_rows, 1);
+        assert_eq!(third.retry_rows, 0);
+        assert_eq!(third.fallback_deleted_rows, 1);
+        assert!(third.blind_index_repair_requested);
+        assert!(third.queue_empty);
+        assert!(storage.is_blind_index_repair_needed().unwrap());
+
+        let ready = storage
+            .fetch_screenshot_delete_candidates(10)
+            .expect("read fully unblocked screenshot queue");
+        assert_eq!(
+            ready.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn schema_upgrade_adds_ocr_delete_failure_count() {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute("CREATE TABLE delete_queue_ocr (id INTEGER PRIMARY KEY)", [])
+            .expect("create legacy OCR queue");
+
+        storage.init_tables(&connection).expect("upgrade schema");
+
+        let failure_count_exists = connection
+            .prepare("PRAGMA table_info(delete_queue_ocr)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .any(|column| column == "failure_count");
+        assert!(failure_count_exists);
     }
 
     #[test]

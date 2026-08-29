@@ -675,7 +675,8 @@ impl StorageState {
             );
 
             CREATE TABLE IF NOT EXISTS delete_queue_ocr (
-                id INTEGER PRIMARY KEY
+                id INTEGER PRIMARY KEY,
+                failure_count INTEGER NOT NULL DEFAULT 0
             );
 
             -- Blind bigram bitmap index table (stores postings as RoaringBitmap)
@@ -967,6 +968,12 @@ impl StorageState {
             conn,
             "ocr_results",
             "is_deleted",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "delete_queue_ocr",
+            "failure_count",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
 
@@ -1339,7 +1346,8 @@ impl StorageState {
             "delete_queue_ocr",
             r#"
             CREATE TABLE IF NOT EXISTS delete_queue_ocr (
-                id INTEGER PRIMARY KEY
+                id INTEGER PRIMARY KEY,
+                failure_count INTEGER NOT NULL DEFAULT 0
             )
             "#,
         )?;

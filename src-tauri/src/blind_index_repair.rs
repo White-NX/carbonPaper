@@ -1,4 +1,4 @@
-//! One-time repair for stale OCR ids left in the blind bitmap index.
+//! Repair for stale OCR ids left in the blind bitmap index.
 
 use crate::migration_support;
 use crate::storage::{BlindIndexRepairProgress, StorageState};
@@ -103,7 +103,14 @@ pub fn spawn_blind_index_auto_repair(app: AppHandle) {
 
             let state = app.state::<Arc<BlindIndexRepairState>>().inner().clone();
             match try_start_repair(&app, &state) {
-                Ok(_) => return,
+                Ok(_) => {
+                    while state.running.load(Ordering::SeqCst) {
+                        tokio::time::sleep(RETRY_INTERVAL).await;
+                    }
+                    if state.snapshot().failed > 0 {
+                        return;
+                    }
+                }
                 Err(error) if error == crate::maintenance::MAINTENANCE_IN_PROGRESS => {
                     tokio::time::sleep(RETRY_INTERVAL).await;
                 }

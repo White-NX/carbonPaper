@@ -230,6 +230,7 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
 
     let mut last_policy_check =
         std::time::Instant::now() - std::time::Duration::from_secs(POLICY_CHECK_INTERVAL_SECS);
+    let mut blind_index_repair_deferred = false;
 
     loop {
         // Retention and delete-queue work would race the MiniLM migration's
@@ -288,6 +289,7 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
                 storage::OcrDeleteBatchResult::default()
             }
         };
+        blind_index_repair_deferred |= ocr_batch.blind_index_repair_requested;
 
         let screenshot_candidates = match tokio::task::spawn_blocking({
             let storage = storage.clone();
@@ -389,13 +391,19 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
             storage::IncrementalVacuumResult::default()
         };
 
-        if ocr_batch.queue_rows > 0 || finalized_screenshots > 0 || policy_pruned {
+        if ocr_batch.queue_rows > 0
+            || ocr_batch.retry_rows > 0
+            || finalized_screenshots > 0
+            || policy_pruned
+        {
             tracing::info!(
-                "[DELETE_QUEUE] cycle complete: policy_pruned={}, ocr_queue_processed={}, ocr_rows_deleted={}, ocr_queue_stale={}, screenshots_finalized={}",
+                "[DELETE_QUEUE] cycle complete: policy_pruned={}, ocr_queue_processed={}, ocr_rows_deleted={}, ocr_queue_stale={}, ocr_retry_rows={}, ocr_fallback_deleted={}, screenshots_finalized={}",
                 policy_pruned,
                 ocr_batch.queue_rows,
                 ocr_batch.deleted_rows,
                 ocr_batch.stale_queue_rows,
+                ocr_batch.retry_rows,
+                ocr_batch.fallback_deleted_rows,
                 finalized_screenshots
             );
         }
@@ -419,6 +427,11 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
                     vacuum.freelist_after
                 );
             }
+        }
+
+        if blind_index_repair_deferred && ocr_batch.queue_empty {
+            blind_index_repair::spawn_blind_index_auto_repair(app_handle.clone());
+            blind_index_repair_deferred = false;
         }
 
         let active = ocr_batch.queue_rows > 0 || finalized_screenshots > 0;

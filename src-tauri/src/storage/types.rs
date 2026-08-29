@@ -467,6 +467,10 @@ pub struct OcrDeleteBatchResult {
     pub queue_rows: usize,
     pub deleted_rows: usize,
     pub stale_queue_rows: usize,
+    pub retry_rows: usize,
+    pub fallback_deleted_rows: usize,
+    pub blind_index_repair_requested: bool,
+    pub queue_empty: bool,
 }
 
 /// Observable result of one incremental-vacuum attempt.
@@ -480,7 +484,7 @@ pub struct IncrementalVacuumResult {
     pub freelist_after: i64,
 }
 
-/// Persisted progress emitted by the one-time blind-index repair.
+/// Persisted progress emitted by the blind-index repair.
 #[derive(Debug, Clone, Default)]
 pub struct BlindIndexRepairProgress {
     pub processed_postings: u64,
