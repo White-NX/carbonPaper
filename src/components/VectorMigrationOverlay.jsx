@@ -1,7 +1,16 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Database, Image as ImageIcon, KeyRound, Loader2, ShieldAlert, Wrench } from 'lucide-react';
 import {
+  Database,
+  Image as ImageIcon,
+  KeyRound,
+  Loader2,
+  SearchCheck,
+  ShieldAlert,
+  Wrench,
+} from 'lucide-react';
+import {
+  getBlindIndexRepairStatus,
   getClipRebuildStatus,
   getMaintenanceStatus,
   getMinilmRebuildStatus,
@@ -19,6 +28,7 @@ const PROGRESS_SOURCES = {
   publishing_write: ['publish_current', 'publish_total'],
   publishing_sync: ['publish_current', 'publish_total'],
   publishing_verify: ['publish_current', 'publish_total'],
+  repairing_blind_index: ['processed', 'total'],
 };
 
 /**
@@ -31,6 +41,11 @@ const MIGRATION_KINDS = {
   minilm_migration: { id: 'minilm', icon: Database, read: getMinilmRebuildStatus },
   clip_migration: { id: 'clip', icon: ImageIcon, read: getClipRebuildStatus },
   clip_ann_bootstrap: { id: 'clip', icon: ImageIcon, read: null, phase: 'building_ann' },
+  blind_index_repair: {
+    id: 'blindIndex',
+    icon: SearchCheck,
+    read: getBlindIndexRepairStatus,
+  },
 };
 
 function formatEta(seconds) {
@@ -43,8 +58,8 @@ function formatEta(seconds) {
 }
 
 /**
- * Full-window, non-dismissable maintenance overlay for the sentinel-triggered
- * vector migrations. Neither run can be cancelled: closing the app merely
+ * Full-window, non-dismissable maintenance overlay for sentinel-triggered
+ * index maintenance. Runs cannot be cancelled: closing the app merely
  * interrupts it, and it resumes on the next launch/unlock.
  *
  * Visibility is decided by *maintenance mode*, not by any one migration's

@@ -163,6 +163,11 @@ export async function getClipRebuildStatus() {
   return invoke('get_clip_rebuild_status');
 }
 
+/** Read progress for the mandatory stale text-search index repair. */
+export async function getBlindIndexRepairStatus() {
+  return invoke('get_blind_index_repair_status');
+}
+
 /** List diagnostics for the CLIP migration run. */
 export async function listClipRebuildErrors(offset = 0, limit = 100) {
   return withAuth(() => invoke('list_clip_rebuild_errors', { offset, limit }));

@@ -23,6 +23,7 @@ import {
   getMinilmRebuildStatus,
   listMinilmRebuildErrors,
   getClipRebuildStatus,
+  getBlindIndexRepairStatus,
   listClipRebuildErrors,
   getMaintenanceStatus,
 } from './task_api';
@@ -113,15 +114,17 @@ describe('task_api', () => {
     invoke.mockResolvedValue({ running: true });
 
     await getMinilmRebuildStatus();
+    await getBlindIndexRepairStatus();
     await listMinilmRebuildErrors(5, 25);
     await getMaintenanceStatus();
 
     expect(invoke).toHaveBeenNthCalledWith(1, 'get_minilm_rebuild_status');
-    expect(invoke).toHaveBeenNthCalledWith(2, 'list_minilm_rebuild_errors', {
+    expect(invoke).toHaveBeenNthCalledWith(2, 'get_blind_index_repair_status');
+    expect(invoke).toHaveBeenNthCalledWith(3, 'list_minilm_rebuild_errors', {
       offset: 5,
       limit: 25,
     });
-    expect(invoke).toHaveBeenNthCalledWith(3, 'get_maintenance_status');
+    expect(invoke).toHaveBeenNthCalledWith(4, 'get_maintenance_status');
     expectWithAuth(1);
   });
 

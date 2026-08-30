@@ -1487,6 +1487,10 @@
         "title": "画面索引迁移中",
         "subtitle": "正在把截图画面的向量迁移到本地 Rust 索引。迁移期间应用处于维护模式。"
       },
+      "blindIndex": {
+        "title": "正在修复文本搜索索引",
+        "subtitle": "正在清理已删除快照留下的搜索记录。完成前应用暂不可用。"
+      },
       "unknown": {
         "title": "正在进行维护",
         "subtitle": "应用正在执行一项维护任务，完成之前部分功能不可用。"
@@ -1497,7 +1501,7 @@
     "waitingForAuth": "会话已过期。请完成 Windows Hello 认证，迁移随后会自动继续。",
     "reauth": "重新认证",
     "errorCount": "有 {{count}} 条记录无法迁移，详情已写入迁移诊断。",
-    "blockedHint": "迁移期间其它操作暂不可用；若应用退出，将在下次启动并解锁后自动继续。",
+    "blockedHint": "维护期间其它操作暂不可用；若应用退出，将在下次启动后自动继续。",
     "phases": {
       "starting": "正在准备…",
       "preflight": "正在检查磁盘空间…",
@@ -1509,7 +1513,11 @@
       "publishing_verify": "正在校验索引文件…",
       "publishing_commit": "正在提交索引…",
       "building_ann": "正在构建图片搜索加速索引…",
+      "scanning_valid_ocr": "正在检查有效搜索记录…",
+      "repairing_blind_index": "正在修复文本搜索索引…",
       "waiting_for_auth": "等待身份认证…",
+      "completed": "修复已完成",
+      "failed": "修复未完成",
       "working": "正在处理…"
     }
   },

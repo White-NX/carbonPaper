@@ -7,6 +7,7 @@ mod analysis;
 mod ann_format;
 mod autostart;
 mod background_scheduler;
+mod blind_index_repair;
 mod capture;
 mod classification_runtime;
 mod clip_ann;
@@ -224,16 +225,18 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
     const OCR_BATCH_SIZE: i64 = 500;
     const SCREENSHOT_BATCH_SIZE: i64 = 100;
     const POLICY_CHECK_INTERVAL_SECS: u64 = 60;
+    const ACTIVE_YIELD_MILLIS: u64 = 25;
+    const IDLE_SLEEP_SECS: u64 = 5;
 
     let mut last_policy_check =
         std::time::Instant::now() - std::time::Duration::from_secs(POLICY_CHECK_INTERVAL_SECS);
+    let mut blind_index_repair_deferred = false;
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
         // Retention and delete-queue work would race the MiniLM migration's
         // Chroma snapshot; stand still while maintenance mode is active.
         if maintenance::is_active() {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
 
@@ -267,22 +270,26 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
             false
         };
 
-        let ocr_processed = match tokio::task::spawn_blocking({
+        let mut ocr_failed = false;
+        let ocr_batch = match tokio::task::spawn_blocking({
             let storage = storage.clone();
             move || storage.process_ocr_delete_queue_batch(OCR_BATCH_SIZE)
         })
         .await
         {
-            Ok(Ok(count)) => count,
+            Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                tracing::debug!("[DELETE_QUEUE] OCR batch cleanup failed: {}", e);
-                0
+                tracing::warn!("[DELETE_QUEUE] OCR batch cleanup failed: {}", e);
+                ocr_failed = true;
+                storage::OcrDeleteBatchResult::default()
             }
             Err(e) => {
                 tracing::warn!("[DELETE_QUEUE] OCR cleanup join error: {:?}", e);
-                0
+                ocr_failed = true;
+                storage::OcrDeleteBatchResult::default()
             }
         };
+        blind_index_repair_deferred |= ocr_batch.blind_index_repair_requested;
 
         let screenshot_candidates = match tokio::task::spawn_blocking({
             let storage = storage.clone();
@@ -363,32 +370,77 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
             };
         }
 
-        let vacuum_ran = match tokio::task::spawn_blocking({
-            let storage = storage.clone();
-            move || storage.run_incremental_vacuum_if_idle(500, 500)
-        })
-        .await
-        {
-            Ok(Ok(ran)) => ran,
-            Ok(Err(e)) => {
-                tracing::warn!("[DELETE_QUEUE] incremental_vacuum check failed: {}", e);
-                false
+        let vacuum = if ocr_batch.queue_rows == 0 && finalized_screenshots == 0 && !ocr_failed {
+            match tokio::task::spawn_blocking({
+                let storage = storage.clone();
+                move || storage.run_incremental_vacuum_if_idle(500, 500)
+            })
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => {
+                    tracing::warn!("[DB_VACUUM] incremental vacuum failed: {}", e);
+                    storage::IncrementalVacuumResult::default()
+                }
+                Err(e) => {
+                    tracing::warn!("[DB_VACUUM] incremental vacuum join error: {:?}", e);
+                    storage::IncrementalVacuumResult::default()
+                }
             }
-            Err(e) => {
-                tracing::warn!("[DELETE_QUEUE] incremental_vacuum join error: {:?}", e);
-                false
-            }
+        } else {
+            storage::IncrementalVacuumResult::default()
         };
 
-        if ocr_processed > 0 || finalized_screenshots > 0 || vacuum_ran || policy_pruned {
+        if ocr_batch.queue_rows > 0
+            || ocr_batch.retry_rows > 0
+            || finalized_screenshots > 0
+            || policy_pruned
+        {
             tracing::info!(
-                "[DELETE_QUEUE] cycle complete: policy_pruned={}, ocr_processed={}, screenshots_finalized={}, vacuum_ran={}",
+                "[DELETE_QUEUE] cycle complete: policy_pruned={}, ocr_queue_processed={}, ocr_rows_deleted={}, ocr_queue_stale={}, ocr_retry_rows={}, ocr_fallback_deleted={}, screenshots_finalized={}",
                 policy_pruned,
-                ocr_processed,
-                finalized_screenshots,
-                vacuum_ran
+                ocr_batch.queue_rows,
+                ocr_batch.deleted_rows,
+                ocr_batch.stale_queue_rows,
+                ocr_batch.retry_rows,
+                ocr_batch.fallback_deleted_rows,
+                finalized_screenshots
             );
         }
+
+        if vacuum.attempted {
+            if vacuum.reclaimed_pages > 0 {
+                tracing::info!(
+                    "[DB_VACUUM] incremental cycle: requested_pages={}, stepped_pages={}, reclaimed_pages={}, freelist_before={}, freelist_after={}",
+                    vacuum.requested_pages,
+                    vacuum.stepped_pages,
+                    vacuum.reclaimed_pages,
+                    vacuum.freelist_before,
+                    vacuum.freelist_after
+                );
+            } else {
+                tracing::debug!(
+                    "[DB_VACUUM] incremental cycle made no progress: requested_pages={}, stepped_pages={}, freelist_before={}, freelist_after={}",
+                    vacuum.requested_pages,
+                    vacuum.stepped_pages,
+                    vacuum.freelist_before,
+                    vacuum.freelist_after
+                );
+            }
+        }
+
+        if blind_index_repair_deferred && ocr_batch.queue_empty {
+            blind_index_repair::spawn_blind_index_auto_repair(app_handle.clone());
+            blind_index_repair_deferred = false;
+        }
+
+        let active = ocr_batch.queue_rows > 0 || finalized_screenshots > 0;
+        let delay = if active && !ocr_failed {
+            std::time::Duration::from_millis(ACTIVE_YIELD_MILLIS)
+        } else {
+            std::time::Duration::from_secs(IDLE_SLEEP_SECS)
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -781,6 +833,7 @@ pub fn run() {
         .manage(Arc::new(office_runtime::OfficeRuntimeState::new()))
         .manage(Arc::new(semantic_runtime::SemanticRuntimeState::new()))
         .manage(Arc::new(background_scheduler::BackgroundSchedulerState::default()))
+        .manage(Arc::new(blind_index_repair::BlindIndexRepairState::new()))
         .manage(Arc::new(minilm_migration::MinilmMigrationState::new()))
         .manage(Arc::new(clip_migration::ClipMigrationState::new()))
         .manage(Arc::new(clip_index::ClipIndexRunState::default()))
@@ -950,6 +1003,12 @@ pub fn run() {
                         std::thread::spawn(move || {
                             StorageState::backfill_plaintext_process_names(storage_clone);
                         });
+
+                        // Repair the text-search postings before any other
+                        // sentinel-gated migration is allowed to take maintenance.
+                        blind_index_repair::spawn_blind_index_auto_repair(
+                            app.handle().clone(),
+                        );
 
                         // Sentinel-gated one-time Chroma copies; each waits for
                         // unlock internally before starting. The CLIP one also
@@ -1160,6 +1219,7 @@ pub fn run() {
             minilm_migration::list_minilm_rebuild_errors,
             clip_migration::get_clip_rebuild_status,
             clip_migration::list_clip_rebuild_errors,
+            blind_index_repair::get_blind_index_repair_status,
             maintenance::get_maintenance_status,
             monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）
