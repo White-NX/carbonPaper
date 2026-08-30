@@ -867,7 +867,6 @@ pub fn run() {
                     }
                 }
 
-                analysis::start_memory_sampler(app.handle().clone());
                 logging::spawn_maintenance_task(data_dir.clone());
 
                 let office_runtime = app
