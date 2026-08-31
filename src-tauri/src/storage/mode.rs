@@ -166,6 +166,13 @@ fn normalize_mode(mode: &str) -> Result<String, String> {
     }
 }
 
+fn is_supported_mode_conversion(current_mode: &str, target_mode: &str) -> bool {
+    matches!(
+        (current_mode, target_mode),
+        ("delete", "wal") | ("wal", "delete")
+    )
+}
+
 #[cfg(windows)]
 fn is_local_filesystem(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
@@ -245,16 +252,16 @@ fn evaluate_eligibility(
     local_filesystem: bool,
     available_free_bytes: Option<u64>,
     required_free_bytes: u64,
-    skip_stable_delete_checks: bool,
+    skip_startup_noop_checks: bool,
 ) -> DatabaseModeEligibility {
     let writable = writable_result.is_ok();
     let current = current_mode.trim().to_ascii_lowercase();
     let target = target_mode.trim().to_ascii_lowercase();
+    let same_mode = current == target;
     let free_ok = available_free_bytes
         .map(|free| free >= required_free_bytes)
         .unwrap_or(false);
-    let requires_filesystem_checks =
-        !(skip_stable_delete_checks && current == "delete" && target == "delete");
+    let requires_filesystem_checks = !(skip_startup_noop_checks && same_mode);
     let mut reasons = Vec::new();
     if requires_filesystem_checks {
         if let Err(error) = writable_result {
@@ -274,8 +281,8 @@ fn evaluate_eligibility(
 
     let checks_ok = !requires_filesystem_checks || (writable && local_filesystem && free_ok);
     let can_transition = match (current.as_str(), target.as_str()) {
-        ("delete", "delete") => true,
-        ("delete", "wal") | ("wal", "delete") | ("wal", "wal") => checks_ok,
+        ("delete", "delete") | ("wal", "wal") => true,
+        ("delete", "wal") | ("wal", "delete") => checks_ok,
         _ => false,
     };
 
@@ -455,7 +462,7 @@ impl StorageState {
         &self,
         current_mode: &str,
         target_mode: &str,
-        skip_stable_delete_checks: bool,
+        skip_startup_noop_checks: bool,
     ) -> DatabaseModeEligibility {
         let data_dir = self
             .data_dir
@@ -464,11 +471,9 @@ impl StorageState {
             .clone();
         let current = current_mode.trim().to_ascii_lowercase();
         let target = target_mode.trim().to_ascii_lowercase();
-        // A DELETE database that is already the requested default needs no
-        // filesystem probe. Every conversion and every WAL startup still has
-        // to prove that the file group can be safely rewritten.
-        let requires_checks =
-            !(skip_stable_delete_checks && current == "delete" && target == "delete");
+        // A startup no-op does not rewrite the database file group. Actual
+        // DELETE/WAL conversions still need the full filesystem preflight.
+        let requires_checks = !(skip_startup_noop_checks && current == target);
         let writable_result = if requires_checks {
             writable_probe(&data_dir)
         } else {
@@ -490,7 +495,7 @@ impl StorageState {
             local,
             available,
             required,
-            skip_stable_delete_checks,
+            skip_startup_noop_checks,
         )
     }
 
@@ -582,8 +587,50 @@ impl StorageState {
         )
     }
 
+    /// Keep startup available when an optional journal-mode conversion cannot
+    /// be completed. The effective mode is re-read because a conversion may
+    /// have changed SQLite's mode before a later cleanup step failed.
+    fn defer_startup_transition(
+        &self,
+        connection: &Connection,
+        current_status: &connection::ConnectionStatus,
+        current_mode: &str,
+        target_mode: &str,
+        id: &str,
+        started: &str,
+        error: &str,
+    ) -> Result<connection::ConnectionStatus, String> {
+        let effective_status =
+            connection::inspect_connection(connection).unwrap_or_else(|_| current_status.clone());
+        if let Err(metadata_error) = self.persist_transition_failure(
+            connection,
+            current_mode,
+            target_mode,
+            id,
+            started,
+            error,
+        ) {
+            tracing::warn!(
+                "Failed to persist deferred startup journal mode transition {} -> {}: {}",
+                current_mode,
+                target_mode,
+                metadata_error
+            );
+        }
+        tracing::warn!(
+            "Deferring startup journal mode transition {} -> {}; continuing with {}: {}",
+            current_mode,
+            target_mode,
+            effective_status.journal_mode,
+            error
+        );
+        Ok(effective_status)
+    }
+
     /// Apply the fixed process startup policy while the caller owns the
-    /// maintenance gate and before the primary connection is published.
+    /// maintenance gate and before the primary connection is published. A
+    /// supported conversion is best-effort so low disk space cannot make an
+    /// already-open database permanently unavailable at startup.
     pub(crate) fn apply_startup_database_mode(
         &self,
         connection: &Connection,
@@ -599,6 +646,17 @@ impl StorageState {
                 "Database is not eligible for startup journal mode {target}: {}",
                 eligibility.reasons.join("; ")
             );
+            if is_supported_mode_conversion(&current, target) {
+                return self.defer_startup_transition(
+                    connection,
+                    current_status,
+                    &current,
+                    target,
+                    &id,
+                    &started,
+                    &error,
+                );
+            }
             if let Err(metadata_error) =
                 self.persist_transition_failure(connection, &current, target, &id, &started, &error)
             {
@@ -664,6 +722,17 @@ impl StorageState {
                 Ok(status)
             }
             Err(error) => {
+                if is_supported_mode_conversion(&current, target) {
+                    return self.defer_startup_transition(
+                        connection,
+                        current_status,
+                        &current,
+                        target,
+                        &id,
+                        &started,
+                        &error,
+                    );
+                }
                 if let Err(metadata_error) = self
                     .persist_transition_failure(connection, &current, target, &id, &started, &error)
                 {
@@ -963,6 +1032,55 @@ mod tests {
         assert!(!unavailable.writable_filesystem);
         assert!(!unavailable.local_filesystem);
         assert!(unavailable.reasons.len() >= 3);
+    }
+
+    #[test]
+    fn same_mode_wal_startup_does_not_require_conversion_space() {
+        let eligibility = evaluate_eligibility(
+            "wal",
+            "wal",
+            Err("Filesystem is not writable".into()),
+            false,
+            Some(1),
+            64,
+            true,
+        );
+
+        assert!(eligibility.can_transition);
+        assert!(eligibility.reasons.is_empty());
+    }
+
+    #[test]
+    fn deferred_startup_transition_keeps_effective_mode_and_records_failure() {
+        let temp = tempdir().unwrap();
+        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential);
+        let connection = Connection::open(temp.path().join("deferred-transition.db")).unwrap();
+        let current_status = connection::set_journal_mode(&connection, JournalMode::Wal).unwrap();
+        ensure_mode_table(&connection).unwrap();
+
+        let status = storage
+            .defer_startup_transition(
+                &connection,
+                &current_status,
+                "wal",
+                "delete",
+                "deferred-test",
+                "started",
+                "Insufficient free space: test",
+            )
+            .unwrap();
+
+        assert_eq!(status.journal_mode, "wal");
+        let metadata = read_metadata(&connection).unwrap();
+        assert_eq!(metadata.actual_journal_mode, "wal");
+        assert_eq!(metadata.requested_journal_mode, "delete");
+        assert_eq!(metadata.transition_state, TRANSITION_FAILED);
+        assert!(metadata
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Insufficient free space"));
     }
 
     #[test]

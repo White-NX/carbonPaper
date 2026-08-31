@@ -41,10 +41,11 @@ $env:CARBONPAPER_WAL_EXPERIMENT = "1"
 npm run debug
 ```
 
-Only a debug build accepts the value `1`; the experiment also checks that the database
-directory is local and writable and has enough free space for a conversion. Removing the
-variable and restarting makes the startup policy convert the database back to DELETE.
-The application stops storage initialization if the requested mode cannot be verified.
+Only a debug build accepts the value `1`; the experiment checks that the database directory
+is local and writable and has enough free space when a conversion is needed. Removing the
+variable and restarting makes the startup policy attempt to convert the database back to
+DELETE. If a supported conversion cannot be completed, startup keeps the current journal
+mode, records the failed transition, and retries on a later startup.
 
 Every Tauri command must document its purpose, authentication requirement, parameters,
 serialized return shape, and the frontend wrapper or component that calls it. Every new

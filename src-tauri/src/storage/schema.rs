@@ -74,8 +74,9 @@ impl StorageState {
         let pragma_dur = t2.elapsed();
 
         // The mode ledger must exist before a startup conversion can record a
-        // transitioning or failed result. No primary or read-only connection
-        // is published until this policy has completed and been verified.
+        // transitioning or failed result. A supported conversion may be
+        // deferred, but no primary or read-only connection is published until
+        // the effective journal mode has been verified.
         mode::ensure_mode_table(&conn)?;
         let connection_status = self.apply_startup_database_mode(&conn, &connection_status)?;
 
