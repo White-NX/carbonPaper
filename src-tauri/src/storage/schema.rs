@@ -779,37 +779,22 @@ impl StorageState {
         Ok(())
     }
 
-    const AUTO_VACUUM_SENTINEL_PREFIX: &'static str = "auto_vacuum_incremental_done_v";
-
-    fn startup_vacuum_sentinel_key() -> String {
-        format!(
-            "{}{}",
-            Self::AUTO_VACUUM_SENTINEL_PREFIX,
-            env!("CARGO_PKG_VERSION")
-        )
-    }
-
     fn set_auto_vacuum_incremental(conn: &Connection) -> Result<(), String> {
         conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")
             .map_err(|e| format!("Failed to set PRAGMA auto_vacuum=INCREMENTAL: {}", e))
     }
 
-    fn is_startup_vacuum_pending(conn: &Connection) -> bool {
-        let sentinel_key = Self::startup_vacuum_sentinel_key();
-        let done: bool = conn
-            .query_row(
-                "SELECT 1 FROM app_metadata WHERE key = ?1",
-                params![sentinel_key],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        !done
+    fn is_startup_vacuum_pending(conn: &Connection) -> Result<bool, String> {
+        let mode: i64 = conn
+            .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+            .map_err(|e| format!("Failed to read PRAGMA auto_vacuum: {}", e))?;
+        Ok(mode != 2)
     }
 
     pub fn check_startup_vacuum_needed(&self) -> Result<bool, String> {
         let guard = self.get_connection_named("startup_vacuum_check")?;
         let conn = guard.as_ref().unwrap();
-        Ok(Self::is_startup_vacuum_pending(conn))
+        Self::is_startup_vacuum_pending(conn)
     }
 
     pub fn is_mcp_privacy_acknowledged(&self) -> Result<bool, String> {
@@ -836,7 +821,7 @@ impl StorageState {
         Ok(())
     }
 
-    /// Run the versioned one-time full VACUUM if needed.
+    /// Run the one-time full VACUUM needed to enable incremental auto-vacuum.
     pub fn run_startup_vacuum_if_needed(&self) -> Result<bool, String> {
         if self
             .startup_vacuum_in_progress
@@ -852,16 +837,12 @@ impl StorageState {
             let conn = guard.as_ref().unwrap();
             Self::set_auto_vacuum_incremental(conn)?;
 
-            if !Self::is_startup_vacuum_pending(conn) {
+            if !Self::is_startup_vacuum_pending(conn)? {
                 return Ok(false);
             }
 
-            let version = env!("CARGO_PKG_VERSION");
-            let sentinel_key = Self::startup_vacuum_sentinel_key();
-
             tracing::info!(
-                "[DB] First startup for version {}, running full VACUUM for incremental auto_vacuum",
-                version
+                "[DB] Converting database to incremental auto_vacuum with a one-time full VACUUM"
             );
             conn.execute_batch("VACUUM;").map_err(|e| {
                 format!(
@@ -869,12 +850,6 @@ impl StorageState {
                     e
                 )
             })?;
-
-            conn.execute(
-                "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, ?2)",
-                params![sentinel_key, version],
-            )
-            .map_err(|e| format!("Failed to write auto_vacuum sentinel: {}", e))?;
 
             Ok(true)
         })();
@@ -886,9 +861,6 @@ impl StorageState {
     }
 
     /// Run full VACUUM manually from UI.
-    ///
-    /// Also writes current-version sentinel so next startup does not re-run
-    /// the one-time startup VACUUM.
     pub fn run_manual_vacuum(&self) -> Result<(), String> {
         if self
             .startup_vacuum_in_progress
@@ -907,19 +879,6 @@ impl StorageState {
             tracing::info!("[DB] Manual VACUUM started from settings");
             conn.execute_batch("VACUUM;")
                 .map_err(|e| format!("Failed to run manual VACUUM: {}", e))?;
-
-            let version = env!("CARGO_PKG_VERSION");
-            let sentinel_key = Self::startup_vacuum_sentinel_key();
-            conn.execute(
-                "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
-                params![sentinel_key, version],
-            )
-            .map_err(|e| {
-                format!(
-                    "Failed to update auto_vacuum sentinel after manual VACUUM: {}",
-                    e
-                )
-            })?;
 
             Ok(())
         })();
@@ -1562,6 +1521,29 @@ mod tests {
                  ('{run_id}', 'copy_chroma_hot_layer', 'revision-1', 'completed', 'finished');"
         ))
         .expect("insert legacy run row");
+    }
+
+    #[test]
+    fn legacy_version_marker_does_not_mask_an_unmigrated_database() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch(
+            "CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO app_metadata (key, value)
+             VALUES ('auto_vacuum_incremental_done_v0.8.5', '0.8.5');",
+        )
+        .expect("install legacy auto-vacuum marker");
+
+        assert!(StorageState::is_startup_vacuum_pending(&conn).expect("inspect auto-vacuum mode"));
+    }
+
+    #[test]
+    fn incremental_auto_vacuum_mode_skips_startup_rebuild_without_a_marker() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        StorageState::set_auto_vacuum_incremental(&conn).expect("enable incremental auto-vacuum");
+        conn.execute_batch("CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT);")
+            .expect("create schema after setting auto-vacuum");
+
+        assert!(!StorageState::is_startup_vacuum_pending(&conn).expect("inspect auto-vacuum mode"));
     }
 
     /// The upgrade path a released install actually takes: MiniLM-named tables
