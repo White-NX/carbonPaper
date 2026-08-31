@@ -71,7 +71,7 @@ use power::PowerState;
 use sensitive_filter::SensitiveFilterState;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use storage::StorageState;
+use storage::{database_mode_policy_from_environment, StorageState};
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Emitter;
@@ -798,6 +798,23 @@ pub fn run() {
     let data_dir = get_data_dir();
     let _log_guard = logging::init_logging(&data_dir);
 
+    // Resolve the experiment switch once. The resulting policy is carried by
+    // StorageState so reopens after restore or directory migration cannot
+    // change mode halfway through a process.
+    let database_mode_policy = match database_mode_policy_from_environment() {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::error!("Database journal mode experiment configuration is invalid: {error}");
+            return;
+        }
+    };
+    tracing::info!(
+        "Database startup journal mode policy target={} wal_experiment={} debug_build={}",
+        database_mode_policy.as_str(),
+        database_mode_policy.is_wal(),
+        cfg!(debug_assertions)
+    );
+
     // 检查是否应该隐藏启动
     let start_hidden = std::env::var("CARBONPAPER_START_HIDDEN").is_ok()
         || registry_config::get_bool("start_with_window_hidden").unwrap_or(false);
@@ -813,9 +830,10 @@ pub fn run() {
         // state, including the interval before setup creates the tray.
         credential_state.set_foreground_state(false);
     }
-    let storage_state = Arc::new(StorageState::new(
+    let storage_state = Arc::new(StorageState::new_with_mode_policy(
         data_dir.clone(),
         credential_state.clone(),
+        database_mode_policy,
     ));
     let lightweight_state = Arc::new(LightweightModeState::new());
 
@@ -922,13 +940,6 @@ pub fn run() {
 
                 logging::spawn_maintenance_task(data_dir.clone());
 
-                let office_runtime = app
-                    .state::<Arc<office_runtime::OfficeRuntimeState>>()
-                    .inner()
-                    .clone();
-                let office_storage = app.state::<Arc<StorageState>>().inner().clone();
-                office_runtime.start(app.handle().clone(), office_storage);
-
                 tracing::info!(
                     r#"
   _____               _                    _____
@@ -987,6 +998,17 @@ pub fn run() {
                     if let Err(e) = storage.initialize() {
                         tracing::error!("Failed to initialize storage: {}", e);
                     } else {
+                        // Storage publishes its primary connection only after
+                        // the startup journal-mode policy has completed. Start
+                        // Office observation after that boundary so no worker
+                        // can create a read connection during conversion.
+                        let office_runtime = app
+                            .state::<Arc<office_runtime::OfficeRuntimeState>>()
+                            .inner()
+                            .clone();
+                        let office_storage = storage.inner().clone();
+                        office_runtime.start(app.handle().clone(), office_storage);
+
                         match storage.discard_incomplete_ocr_postprocess() {
                             Ok(discarded) if discarded > 0 => tracing::info!(
                                 "[ML:POSTPROCESS] discarded {} incomplete rows from the previous application process",

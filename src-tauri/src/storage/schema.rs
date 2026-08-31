@@ -6,7 +6,7 @@ use crate::credential_manager::{
 use rusqlite::{params, Connection};
 use std::sync::atomic::Ordering;
 
-use super::{connection, database_snapshot, StorageState};
+use super::{connection, database_snapshot, mode, StorageState};
 
 impl StorageState {
     const MCP_PRIVACY_ACKNOWLEDGED_KEY: &'static str = "mcp_privacy_acknowledged";
@@ -67,12 +67,17 @@ impl StorageState {
         let open_dur = t1.elapsed();
 
         // Set the SQLCipher key, verify it, and apply shared connection-local
-        // policy. The helper intentionally leaves journal mode unchanged;
-        // V1 remains on the existing DELETE default.
+        // policy before changing the persistent journal mode.
         let t2 = std::time::Instant::now();
         let connection_status = connection::configure_sqlcipher_connection(&conn, &db_key)
             .map_err(|e| format!("Failed to configure database connection: {}", e))?;
         let pragma_dur = t2.elapsed();
+
+        // The mode ledger must exist before a startup conversion can record a
+        // transitioning or failed result. No primary or read-only connection
+        // is published until this policy has completed and been verified.
+        mode::ensure_mode_table(&conn)?;
+        let connection_status = self.apply_startup_database_mode(&conn, &connection_status)?;
 
         // Initialize table schema
         let t3 = std::time::Instant::now();
@@ -109,15 +114,18 @@ impl StorageState {
         *initialized = true;
 
         tracing::info!(
-            "[DIAG:INIT] SQLCipher initialized in {:?} (key_derive={:?}, db_open={:?}, pragma={:?}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, journal_mode={}, synchronous={}, init_tables={:?})",
+            "[DIAG:INIT] SQLCipher initialized in {:?} (app_version={}, key_derive={:?}, db_open={:?}, pragma={:?}, requested_journal_mode={}, journal_mode={}, wal_experiment={}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, synchronous={}, init_tables={:?})",
             init_start.elapsed(),
+            env!("CARGO_PKG_VERSION"),
             key_derive_dur,
             open_dur,
             pragma_dur,
+            self.database_mode_policy.as_str(),
+            connection_status.journal_mode,
+            self.database_mode_policy.is_wal(),
             connection_status.engine.sqlite_version,
             connection_status.engine.sqlite_source_id,
             connection_status.engine.cipher_version,
-            connection_status.journal_mode,
             connection_status.synchronous,
             tables_dur
         );
@@ -160,6 +168,7 @@ impl StorageState {
         // create the new empty tables first and leave the legacy rows stranded
         // under the old names.
         Self::upgrade_migration_tables_to_derived(conn)?;
+        mode::ensure_mode_table(conn)?;
 
         conn.execute_batch(
             r#"
@@ -716,32 +725,6 @@ impl StorageState {
                 key TEXT PRIMARY KEY,
                 value TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            -- Persist the effective SQLite journal mode and the last
-            -- controlled-transition outcome.  The row is deliberately kept
-            -- in the authoritative database so a restart can diagnose an
-            -- interrupted WAL-to-DELETE request without relying on sidecars.
-            CREATE TABLE IF NOT EXISTS database_mode_metadata (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                actual_journal_mode TEXT NOT NULL CHECK (
-                    actual_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
-                ),
-                requested_journal_mode TEXT NOT NULL CHECK (
-                    requested_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
-                ),
-                transition_state TEXT NOT NULL CHECK (
-                    transition_state IN ('stable', 'transitioning', 'failed')
-                ),
-                transition_id TEXT,
-                previous_journal_mode TEXT CHECK (
-                    previous_journal_mode IS NULL OR
-                    previous_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
-                ),
-                last_error TEXT,
-                started_at TEXT,
-                completed_at TEXT,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             -- One durable row per automatic background task. The scheduler

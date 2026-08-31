@@ -431,10 +431,9 @@ pub(crate) fn preserve_wal_sidecars_on_close(conn: &Connection) -> Result<(), St
 
 /// Request a journal mode and verify SQLite's effective result.
 ///
-/// V1 does not call this during startup. Later WAL experiments can use it and
-/// receive a clear diagnostic when a read-only connection, filesystem, or
-/// SQLite build cannot establish the requested mode.
-#[allow(dead_code)]
+/// Startup and controlled mode transitions use this helper and receive a clear
+/// diagnostic when a read-only connection, filesystem, or SQLite build cannot
+/// establish the requested mode.
 pub(crate) fn set_journal_mode(
     conn: &Connection,
     requested: JournalMode,
