@@ -533,14 +533,15 @@ impl StorageState {
             ("delete", "wal") => connection::set_journal_mode(connection, JournalMode::Wal)
                 .map_err(|error| format!("Failed to switch SQLite journal mode to WAL: {error}")),
             ("wal", "delete") => {
-                let checkpointed: i64 = connection
-                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
-                    .map_err(|error| {
-                        format!("Failed to checkpoint WAL before DELETE transition: {error}")
-                    })?;
-                if checkpointed != 0 {
+                let checkpoint = connection::checkpoint_wal_truncate(connection).map_err(|error| {
+                    format!("Failed to checkpoint WAL before DELETE transition: {error}")
+                })?;
+                if checkpoint.busy != 0 {
                     return Err(format!(
-                        "WAL checkpoint reported busy status {checkpointed}"
+                        "WAL checkpoint reported busy status {} (log_frames={}, checkpointed_frames={})",
+                        checkpoint.busy,
+                        checkpoint.log_frames,
+                        checkpoint.checkpointed_frames
                     ));
                 }
                 let status = connection::set_journal_mode(connection, JournalMode::Delete)
