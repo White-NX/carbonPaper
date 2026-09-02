@@ -4,9 +4,11 @@ use crate::credential_manager::{
     derive_db_key_from_public_key, get_cached_public_key, load_public_key_from_file,
 };
 use rusqlite::{params, Connection};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use super::{connection, database_snapshot, StorageState};
+use super::policy::disk_totals_for_path;
+use super::{connection, database_snapshot, mode, StorageState};
 
 impl StorageState {
     const MCP_PRIVACY_ACKNOWLEDGED_KEY: &'static str = "mcp_privacy_acknowledged";
@@ -67,19 +69,32 @@ impl StorageState {
         let open_dur = t1.elapsed();
 
         // Set the SQLCipher key, verify it, and apply shared connection-local
-        // policy. The helper intentionally leaves journal mode unchanged;
-        // V1 remains on the existing DELETE default.
+        // policy before changing the persistent journal mode.
         let t2 = std::time::Instant::now();
         let connection_status = connection::configure_sqlcipher_connection(&conn, &db_key)
             .map_err(|e| format!("Failed to configure database connection: {}", e))?;
         let pragma_dur = t2.elapsed();
+
+        // Set the auto-vacuum capability before creating the first table. New
+        // databases then start in incremental mode and do not need a full
+        // VACUUM just to materialize the pointer-map pages.
+        Self::set_auto_vacuum_incremental(&conn)?;
+
+        // The mode ledger must exist before a startup conversion can record a
+        // transitioning or failed result. A supported conversion may be
+        // deferred, but no primary or read-only connection is published until
+        // the effective journal mode has been verified.
+        mode::ensure_mode_table(&conn)?;
+        let connection_status = self.apply_startup_database_mode(&conn, &connection_status)?;
 
         // Initialize table schema
         let t3 = std::time::Instant::now();
         self.init_tables(&conn)?;
         self.initialize_database_mode_metadata(&conn, &connection_status.journal_mode)?;
         self.cleanup_derived_index_sidecars_at_startup(&conn, &data_dir)?;
-        Self::set_auto_vacuum_incremental(&conn)?;
+        if let Err(error) = self.trim_oversized_wal_under_maintenance(&conn) {
+            tracing::warn!("[DB] Deferring oversized WAL cleanup at startup: {error}");
+        }
         database_snapshot::mark_storage_initialized(&data_dir)?;
         let tables_dur = t3.elapsed();
 
@@ -109,15 +124,18 @@ impl StorageState {
         *initialized = true;
 
         tracing::info!(
-            "[DIAG:INIT] SQLCipher initialized in {:?} (key_derive={:?}, db_open={:?}, pragma={:?}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, journal_mode={}, synchronous={}, init_tables={:?})",
+            "[DIAG:INIT] SQLCipher initialized in {:?} (app_version={}, key_derive={:?}, db_open={:?}, pragma={:?}, requested_journal_mode={}, journal_mode={}, wal_experiment={}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, synchronous={}, init_tables={:?})",
             init_start.elapsed(),
+            env!("CARGO_PKG_VERSION"),
             key_derive_dur,
             open_dur,
             pragma_dur,
+            self.database_mode_policy.as_str(),
+            connection_status.journal_mode,
+            self.database_mode_policy.is_wal(),
             connection_status.engine.sqlite_version,
             connection_status.engine.sqlite_source_id,
             connection_status.engine.cipher_version,
-            connection_status.journal_mode,
             connection_status.synchronous,
             tables_dur
         );
@@ -160,6 +178,7 @@ impl StorageState {
         // create the new empty tables first and leave the legacy rows stranded
         // under the old names.
         Self::upgrade_migration_tables_to_derived(conn)?;
+        mode::ensure_mode_table(conn)?;
 
         conn.execute_batch(
             r#"
@@ -718,32 +737,6 @@ impl StorageState {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Persist the effective SQLite journal mode and the last
-            -- controlled-transition outcome.  The row is deliberately kept
-            -- in the authoritative database so a restart can diagnose an
-            -- interrupted WAL-to-DELETE request without relying on sidecars.
-            CREATE TABLE IF NOT EXISTS database_mode_metadata (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                actual_journal_mode TEXT NOT NULL CHECK (
-                    actual_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
-                ),
-                requested_journal_mode TEXT NOT NULL CHECK (
-                    requested_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
-                ),
-                transition_state TEXT NOT NULL CHECK (
-                    transition_state IN ('stable', 'transitioning', 'failed')
-                ),
-                transition_id TEXT,
-                previous_journal_mode TEXT CHECK (
-                    previous_journal_mode IS NULL OR
-                    previous_journal_mode IN ('delete', 'truncate', 'persist', 'memory', 'wal', 'off')
-                ),
-                last_error TEXT,
-                started_at TEXT,
-                completed_at TEXT,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-
             -- One durable row per automatic background task. The scheduler
             -- owns ordering and retry state; the task-specific queues remain
             -- in their existing business tables.
@@ -795,14 +788,46 @@ impl StorageState {
         Ok(())
     }
 
-    const AUTO_VACUUM_SENTINEL_PREFIX: &'static str = "auto_vacuum_incremental_done_v";
+    const VACUUM_SAFETY_FREE_BYTES: u64 = 64 * 1024 * 1024;
 
-    fn startup_vacuum_sentinel_key() -> String {
-        format!(
-            "{}{}",
-            Self::AUTO_VACUUM_SENTINEL_PREFIX,
-            env!("CARGO_PKG_VERSION")
-        )
+    fn database_runtime_group_size(data_dir: &Path) -> u64 {
+        [
+            "screenshots.db",
+            "screenshots.db-wal",
+            "screenshots.db-shm",
+            "screenshots.db-journal",
+        ]
+        .iter()
+        .filter_map(|name| std::fs::metadata(data_dir.join(name)).ok())
+        .map(|metadata| metadata.len())
+        .sum()
+    }
+
+    fn vacuum_space_check(&self) -> Result<(), String> {
+        let data_dir = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let group_size = Self::database_runtime_group_size(&data_dir);
+        let required = group_size
+            .saturating_mul(2)
+            .saturating_add(Self::VACUUM_SAFETY_FREE_BYTES);
+        let available = disk_totals_for_path(&data_dir)
+            .map(|(_, free)| free)
+            .ok_or_else(|| {
+                format!(
+                    "Unable to determine free space on the database volume; full VACUUM requires at least {} bytes",
+                    required
+                )
+            })?;
+        if available < required {
+            return Err(format!(
+                "Insufficient free space for full VACUUM: available={} required={} database_group_size={}",
+                available, required, group_size
+            ));
+        }
+        Ok(())
     }
 
     fn set_auto_vacuum_incremental(conn: &Connection) -> Result<(), String> {
@@ -810,22 +835,116 @@ impl StorageState {
             .map_err(|e| format!("Failed to set PRAGMA auto_vacuum=INCREMENTAL: {}", e))
     }
 
-    fn is_startup_vacuum_pending(conn: &Connection) -> bool {
-        let sentinel_key = Self::startup_vacuum_sentinel_key();
-        let done: bool = conn
-            .query_row(
-                "SELECT 1 FROM app_metadata WHERE key = ?1",
-                params![sentinel_key],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        !done
+    fn auto_vacuum_mode(conn: &Connection) -> Result<i64, String> {
+        conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+            .map_err(|e| format!("Failed to read PRAGMA auto_vacuum: {}", e))
+    }
+
+    fn is_startup_vacuum_pending(conn: &Connection) -> Result<bool, String> {
+        Ok(Self::auto_vacuum_mode(conn)? != 2)
+    }
+
+    fn startup_vacuum_allowed(&self, conn: &Connection) -> Result<bool, String> {
+        let status = connection::inspect_connection(conn).map_err(|error| {
+            format!("Failed to inspect database before startup VACUUM: {error}")
+        })?;
+        let target_mode = self.database_mode_policy.as_str();
+        if status.journal_mode != target_mode {
+            tracing::warn!(
+                "[DB] Deferring startup auto-vacuum conversion because journal mode is '{}' while policy target is '{}'",
+                status.journal_mode,
+                target_mode
+            );
+            return Ok(false);
+        }
+        if !Self::is_startup_vacuum_pending(conn)? {
+            return Ok(false);
+        }
+        if let Err(error) = self.vacuum_space_check() {
+            tracing::warn!("[DB] Deferring startup auto-vacuum conversion: {error}");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn checkpoint_wal_after_vacuum(conn: &Connection) -> Result<(), String> {
+        let status = connection::inspect_connection(conn)
+            .map_err(|error| format!("Failed to inspect journal mode after VACUUM: {error}"))?;
+        if status.journal_mode != "wal" {
+            return Ok(());
+        }
+
+        let checkpoint = connection::checkpoint_wal_truncate(conn)?;
+        if checkpoint.busy != 0 {
+            return Err(format!(
+                "WAL TRUNCATE checkpoint after VACUUM was busy: status={}, log_frames={}, checkpointed_frames={}",
+                checkpoint.busy, checkpoint.log_frames, checkpoint.checkpointed_frames
+            ));
+        }
+        tracing::info!(
+            "[DB] WAL TRUNCATE checkpoint after VACUUM completed: log_frames={}, checkpointed_frames={}",
+            checkpoint.log_frames,
+            checkpoint.checkpointed_frames
+        );
+        Ok(())
+    }
+
+    /// Reclaim an oversized reusable WAL allocation while initialization holds
+    /// the exclusive database maintenance permit.
+    fn trim_oversized_wal_under_maintenance(&self, conn: &Connection) -> Result<(), String> {
+        let status = connection::inspect_connection(conn)
+            .map_err(|error| format!("Failed to inspect journal mode for WAL cleanup: {error}"))?;
+        if status.journal_mode != "wal" {
+            return Ok(());
+        }
+
+        let data_dir = self
+            .data_dir
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let wal_path = data_dir.join("screenshots.db-wal");
+        let wal_size = match std::fs::metadata(&wal_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect WAL sidecar {}: {error}",
+                    wal_path.display()
+                ));
+            }
+        };
+        let limit = connection::WAL_JOURNAL_SIZE_LIMIT_BYTES as u64;
+        if wal_size <= limit {
+            return Ok(());
+        }
+
+        let checkpoint = connection::checkpoint_wal_truncate(conn)?;
+        if checkpoint.busy != 0 {
+            tracing::warn!(
+                "[DB] WAL sidecar remains oversized after a busy checkpoint: bytes={}, limit={}, status={}, log_frames={}, checkpointed_frames={}",
+                wal_size,
+                limit,
+                checkpoint.busy,
+                checkpoint.log_frames,
+                checkpoint.checkpointed_frames
+            );
+            return Ok(());
+        }
+        tracing::info!(
+            "[DB] Truncated oversized WAL sidecar: previous_bytes={}, limit={}, log_frames={}, checkpointed_frames={}",
+            wal_size,
+            limit,
+            checkpoint.log_frames,
+            checkpoint.checkpointed_frames
+        );
+        Ok(())
     }
 
     pub fn check_startup_vacuum_needed(&self) -> Result<bool, String> {
         let guard = self.get_connection_named("startup_vacuum_check")?;
         let conn = guard.as_ref().unwrap();
-        Ok(Self::is_startup_vacuum_pending(conn))
+        self.startup_vacuum_allowed(conn)
     }
 
     pub fn is_mcp_privacy_acknowledged(&self) -> Result<bool, String> {
@@ -852,7 +971,7 @@ impl StorageState {
         Ok(())
     }
 
-    /// Run the versioned one-time full VACUUM if needed.
+    /// Run the one-time full VACUUM needed to enable incremental auto-vacuum.
     pub fn run_startup_vacuum_if_needed(&self) -> Result<bool, String> {
         if self
             .startup_vacuum_in_progress
@@ -868,16 +987,12 @@ impl StorageState {
             let conn = guard.as_ref().unwrap();
             Self::set_auto_vacuum_incremental(conn)?;
 
-            if !Self::is_startup_vacuum_pending(conn) {
+            if !self.startup_vacuum_allowed(conn)? {
                 return Ok(false);
             }
 
-            let version = env!("CARGO_PKG_VERSION");
-            let sentinel_key = Self::startup_vacuum_sentinel_key();
-
             tracing::info!(
-                "[DB] First startup for version {}, running full VACUUM for incremental auto_vacuum",
-                version
+                "[DB] Converting database to incremental auto_vacuum with a one-time full VACUUM"
             );
             conn.execute_batch("VACUUM;").map_err(|e| {
                 format!(
@@ -885,12 +1000,18 @@ impl StorageState {
                     e
                 )
             })?;
-
-            conn.execute(
-                "INSERT OR IGNORE INTO app_metadata (key, value) VALUES (?1, ?2)",
-                params![sentinel_key, version],
-            )
-            .map_err(|e| format!("Failed to write auto_vacuum sentinel: {}", e))?;
+            let mode_after = Self::auto_vacuum_mode(conn)?;
+            if mode_after != 2 {
+                return Err(format!(
+                    "Full VACUUM completed but PRAGMA auto_vacuum remained {} instead of INCREMENTAL",
+                    mode_after
+                ));
+            }
+            if let Err(error) = Self::checkpoint_wal_after_vacuum(conn) {
+                tracing::warn!(
+                    "[DB] Incremental auto-vacuum conversion completed, but WAL cleanup was deferred: {error}"
+                );
+            }
 
             Ok(true)
         })();
@@ -902,9 +1023,6 @@ impl StorageState {
     }
 
     /// Run full VACUUM manually from UI.
-    ///
-    /// Also writes current-version sentinel so next startup does not re-run
-    /// the one-time startup VACUUM.
     pub fn run_manual_vacuum(&self) -> Result<(), String> {
         if self
             .startup_vacuum_in_progress
@@ -919,23 +1037,16 @@ impl StorageState {
             let guard = self.get_connection_named("manual_vacuum_run")?;
             let conn = guard.as_ref().unwrap();
             Self::set_auto_vacuum_incremental(conn)?;
+            self.vacuum_space_check()?;
 
             tracing::info!("[DB] Manual VACUUM started from settings");
             conn.execute_batch("VACUUM;")
                 .map_err(|e| format!("Failed to run manual VACUUM: {}", e))?;
-
-            let version = env!("CARGO_PKG_VERSION");
-            let sentinel_key = Self::startup_vacuum_sentinel_key();
-            conn.execute(
-                "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?1, ?2)",
-                params![sentinel_key, version],
-            )
-            .map_err(|e| {
-                format!(
-                    "Failed to update auto_vacuum sentinel after manual VACUUM: {}",
-                    e
-                )
-            })?;
+            if let Err(error) = Self::checkpoint_wal_after_vacuum(conn) {
+                tracing::warn!(
+                    "[DB] Manual VACUUM completed, but WAL cleanup was deferred: {error}"
+                );
+            }
 
             Ok(())
         })();
@@ -1578,6 +1689,61 @@ mod tests {
                  ('{run_id}', 'copy_chroma_hot_layer', 'revision-1', 'completed', 'finished');"
         ))
         .expect("insert legacy run row");
+    }
+
+    #[test]
+    fn legacy_version_marker_does_not_mask_an_unmigrated_database() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        conn.execute_batch(
+            "CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO app_metadata (key, value)
+             VALUES ('auto_vacuum_incremental_done_v0.8.5', '0.8.5');",
+        )
+        .expect("install legacy auto-vacuum marker");
+
+        assert!(StorageState::is_startup_vacuum_pending(&conn).expect("inspect auto-vacuum mode"));
+    }
+
+    #[test]
+    fn incremental_auto_vacuum_mode_skips_startup_rebuild_without_a_marker() {
+        let conn = Connection::open_in_memory().expect("in-memory database");
+        StorageState::set_auto_vacuum_incremental(&conn).expect("enable incremental auto-vacuum");
+        conn.execute_batch("CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT);")
+            .expect("create schema after setting auto-vacuum");
+
+        assert!(!StorageState::is_startup_vacuum_pending(&conn).expect("inspect auto-vacuum mode"));
+    }
+
+    #[test]
+    fn fresh_wal_database_starts_incremental_without_a_full_vacuum() {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        crate::credential_manager::save_public_key_to_file(
+            &credential,
+            b"fresh-incremental-wal-key",
+        )
+        .expect("save public key");
+        let storage = StorageState::new_with_mode_policy(
+            temp.path().to_path_buf(),
+            credential,
+            mode::DatabaseModePolicy::Wal,
+        );
+
+        storage.initialize().expect("initialize WAL database");
+
+        let guard = storage
+            .get_connection_named("fresh_wal_auto_vacuum_test")
+            .expect("open primary connection");
+        let conn = guard.as_ref().expect("primary connection exists");
+        assert_eq!(StorageState::auto_vacuum_mode(conn).unwrap(), 2);
+        assert_eq!(
+            connection::inspect_connection(conn).unwrap().journal_mode,
+            "wal"
+        );
+        drop(guard);
+        assert!(!storage
+            .check_startup_vacuum_needed()
+            .expect("check startup vacuum"));
     }
 
     /// The upgrade path a released install actually takes: MiniLM-named tables
