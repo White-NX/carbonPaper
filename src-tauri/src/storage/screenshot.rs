@@ -3174,6 +3174,12 @@ impl StorageState {
                     .or_insert_with(RoaringBitmap::new)
                     .insert(bitmap_id);
             }
+
+            // The postings are staged for removal in the same transaction that
+            // deletes the row, so the row is now ready for physical deletion.
+            // Without this the queue would re-read the same batch forever and
+            // no OCR row -- and therefore no screenshot -- would ever be freed.
+            delete_ids.push(row.id);
         }
 
         let mut guard = self.get_connection_named("process_ocr_delete_queue_batch_write")?;
@@ -3801,6 +3807,110 @@ mod ocr_lifecycle_tests {
             ready.iter().map(|row| row.id).collect::<Vec<_>>(),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn ocr_delete_queue_drains_readable_rows_and_unblocks_screenshots() {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        credential_state.cache_master_key_for_tests(vec![9u8; 32]);
+        let storage = StorageState::new(temp.path().to_path_buf(), credential_state.clone());
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        storage.init_tables(&connection).expect("initialize schema");
+
+        // A readable, indexed row: plaintext lives in the legacy `text` column
+        // and `text_hash` is non-empty, so the batch must unlink its postings
+        // and then physically delete it.
+        connection
+            .execute_batch(
+                "INSERT INTO screenshots (id, image_path, image_hash, is_deleted) VALUES
+                    (1, '1.enc', 'h1', 1);
+                 INSERT INTO ocr_results
+                    (id, screenshot_id, text, text_hash, text_enc, text_key_encrypted, is_deleted)
+                    VALUES (10, 1, 'hello world', 'indexed', NULL, NULL, 1);
+                 INSERT INTO delete_queue_ocr (id) VALUES (10);
+                 INSERT INTO delete_queue_screenshots (id) VALUES (1);",
+            )
+            .expect("insert delete queue fixture");
+
+        let hmac_key = credential_state.get_hmac_key().expect("seeded HMAC key");
+        let tokens: Vec<String> = StorageState::bigram_tokenize("hello world")
+            .into_iter()
+            .map(|token| StorageState::compute_hmac_hash(&token, &hmac_key))
+            .collect();
+        assert!(!tokens.is_empty(), "fixture text must produce bigrams");
+        for token_hash in &tokens {
+            // Two postings per token so the row survives as a non-empty bitmap
+            // and the assertion below distinguishes "unlinked" from "dropped".
+            let mut bitmap = RoaringBitmap::new();
+            bitmap.insert(10);
+            bitmap.insert(11);
+            let mut blob = Vec::new();
+            bitmap
+                .serialize_into(&mut blob)
+                .expect("serialize postings");
+            connection
+                .execute(
+                    "INSERT INTO blind_bitmap_index (token_hash, postings_blob) VALUES (?1, ?2)",
+                    params![token_hash, &blob],
+                )
+                .expect("seed postings");
+        }
+        *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
+
+        // The screenshot stays blocked while its OCR row is still present.
+        assert!(storage
+            .fetch_screenshot_delete_candidates(10)
+            .expect("read blocked screenshot queue")
+            .is_empty());
+
+        let batch = storage
+            .process_ocr_delete_queue_batch(10)
+            .expect("process OCR delete batch");
+        assert_eq!(batch.queue_rows, 1);
+        assert_eq!(batch.deleted_rows, 1);
+        assert_eq!(batch.stale_queue_rows, 0);
+        assert_eq!(batch.retry_rows, 0);
+        assert_eq!(batch.fallback_deleted_rows, 0);
+        assert!(!batch.blind_index_repair_requested);
+        assert!(batch.queue_empty);
+
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().expect("database");
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM ocr_results", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "the readable OCR row must be hard-deleted"
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "the queue row must be cleared so the batch cannot repeat forever"
+            );
+            for token_hash in &tokens {
+                let blob: Vec<u8> = conn
+                    .query_row(
+                        "SELECT postings_blob FROM blind_bitmap_index WHERE token_hash = ?1",
+                        params![token_hash],
+                        |row| row.get(0),
+                    )
+                    .expect("postings row survives with its other id");
+                let bitmap =
+                    RoaringBitmap::deserialize_from(&blob[..]).expect("deserialize postings");
+                assert!(!bitmap.contains(10), "deleted row must be unlinked");
+                assert!(bitmap.contains(11), "unrelated posting must survive");
+            }
+        }
+
+        let ready = storage
+            .fetch_screenshot_delete_candidates(10)
+            .expect("read unblocked screenshot queue");
+        assert_eq!(ready.iter().map(|row| row.id).collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]
