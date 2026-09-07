@@ -1,6 +1,6 @@
 // Builds the isolated semantic worker and stages its pinned ONNX Runtime DLLs.
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 
@@ -22,7 +22,7 @@ const exe = path.join(workerDir, 'target', profile, 'carbonpaper-semantic-worker
 if (!existsSync(exe)) throw new Error(`Semantic worker not found at ${exe}`);
 const stagedExe = path.join(tauriDir, 'pre-bundle', 'carbonpaper-semantic-worker.exe');
 mkdirSync(path.dirname(stagedExe), { recursive: true });
-copyFileSync(exe, stagedExe);
+const stagedExeChanged = copyFileIfChanged(exe, stagedExe);
 
 const runtimeDir = path.join(tauriDir, 'pre-bundle', ...manifest.bundle_path.split('/'));
 mkdirSync(runtimeDir, { recursive: true });
@@ -35,12 +35,24 @@ function sha256(file) {
   return createHash('sha256').update(readFileSync(file)).digest('hex');
 }
 
+function copyFileIfChanged(source, destination) {
+  if (existsSync(destination)) {
+    const sourceSize = statSync(source).size;
+    const destinationSize = statSync(destination).size;
+    if (sourceSize === destinationSize && sha256(source) === sha256(destination)) {
+      return false;
+    }
+  }
+  copyFileSync(source, destination);
+  return true;
+}
+
 for (const pkg of manifest.packages) {
   for (const file of pkg.files) {
     const staged = path.join(runtimeDir, file.name);
     if (!existsSync(staged) && !isRelease && legacyRuntimeDir) {
       const legacy = path.join(legacyRuntimeDir, file.name);
-      if (existsSync(legacy)) copyFileSync(legacy, staged);
+      if (existsSync(legacy)) copyFileIfChanged(legacy, staged);
     }
     if (!existsSync(staged)) {
       throw new Error(
@@ -59,7 +71,9 @@ for (const pkg of manifest.packages) {
   }
 }
 
-// Clear any stale worker beside the standalone crate target; the bundled copy above is
-// the single resource used by Tauri/portable packaging.
-rmSync(path.join(tauriDir, 'target', profile, 'carbonpaper-semantic-worker.exe'), { force: true });
+// Clear a stale Tauri resource only when the staged worker actually changed. This
+// avoids deleting a running development resource on every startup.
+if (stagedExeChanged) {
+  rmSync(path.join(tauriDir, 'target', profile, 'carbonpaper-semantic-worker.exe'), { force: true });
+}
 console.log(`Semantic worker staged at ${stagedExe}`);
