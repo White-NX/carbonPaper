@@ -61,6 +61,25 @@ struct EncryptedOcrResultRow {
     created_at: String,
 }
 
+impl EncryptedOcrResultRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            screenshot_id: row.get(1)?,
+            text_enc: row.get(2)?,
+            text_key_encrypted: row.get(3)?,
+            confidence: row.get(4)?,
+            box_coords: vec![
+                vec![row.get::<_, f64>(5)?, row.get::<_, f64>(6)?],
+                vec![row.get::<_, f64>(7)?, row.get::<_, f64>(8)?],
+                vec![row.get::<_, f64>(9)?, row.get::<_, f64>(10)?],
+                vec![row.get::<_, f64>(11)?, row.get::<_, f64>(12)?],
+            ],
+            created_at: row.get(13)?,
+        })
+    }
+}
+
 struct EncryptedScreenshotSummaryRow {
     id: i64,
     window_title_plain: Option<String>,
@@ -1739,8 +1758,7 @@ impl StorageState {
         bucket_seconds: i64,
         bucket_offset_seconds: i64,
     ) -> Result<Vec<DensityBucket>, String> {
-        let guard = self.get_connection_named("get_screenshot_density")?;
-        let conn = guard.as_ref().unwrap();
+        let conn = self.open_read_connection_named("get_screenshot_density")?;
 
         let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -2269,24 +2287,31 @@ impl StorageState {
         &self,
         screenshot_id: i64,
     ) -> Result<Vec<super::OcrResult>, String> {
-        let guard = self.get_connection_named("get_screenshot_ocr_results")?;
-        let conn = guard.as_ref().unwrap();
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, screenshot_id, text_enc, text_key_encrypted, confidence,
+        let encrypted_rows = {
+            let conn = self.open_read_connection_named("get_screenshot_ocr_results")?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, screenshot_id, text_enc, text_key_encrypted, confidence,
                         box_x1, box_y1, box_x2, box_y2,
                         box_x3, box_y3, box_x4, box_y4, created_at
                  FROM ocr_results WHERE screenshot_id = ? AND is_deleted = 0
                  ORDER BY box_y1, box_x1",
-            )
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+                )
+                .map_err(|e| format!("Failed to prepare query: {}", e))?;
+            let rows = stmt
+                .query_map([screenshot_id], EncryptedOcrResultRow::from_row)
+                .map_err(|e| format!("Failed to execute query: {}", e))?
+                .filter_map(|row| row.ok())
+                .collect::<Vec<_>>();
+            rows
+        };
 
-        let results = stmt
-            .query_map([screenshot_id], |row| {
-                let text_enc: Option<Vec<u8>> = row.get(2)?;
-                let text_key_enc: Option<Vec<u8>> = row.get(3)?;
-                let text = match (text_enc.as_ref(), text_key_enc.as_ref()) {
+        // CNG decryption can be slow or prompt the user. Close the SQLite
+        // cursor and read connection before starting it.
+        Ok(encrypted_rows
+            .into_iter()
+            .map(|row| {
+                let text = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
                     (Some(data), Some(key)) => self
                         .decrypt_payload_with_row_key(data, key)
                         .ok()
@@ -2294,25 +2319,16 @@ impl StorageState {
                     _ => None,
                 };
 
-                Ok(super::OcrResult {
-                    id: row.get(0)?,
-                    screenshot_id: row.get(1)?,
+                super::OcrResult {
+                    id: row.id,
+                    screenshot_id: row.screenshot_id,
                     text: text.unwrap_or_default(),
-                    confidence: row.get(4)?,
-                    box_coords: vec![
-                        vec![row.get::<_, f64>(5)?, row.get::<_, f64>(6)?],
-                        vec![row.get::<_, f64>(7)?, row.get::<_, f64>(8)?],
-                        vec![row.get::<_, f64>(9)?, row.get::<_, f64>(10)?],
-                        vec![row.get::<_, f64>(11)?, row.get::<_, f64>(12)?],
-                    ],
-                    created_at: wire_time::from_sqlite_utc(&row.get::<_, String>(13)?),
-                })
+                    confidence: row.confidence,
+                    box_coords: row.box_coords,
+                    created_at: wire_time::from_sqlite_utc(&row.created_at),
+                }
             })
-            .map_err(|e| format!("Failed to execute query: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(results)
+            .collect())
     }
 
     /// Get OCR results for unattended recovery without allowing CNG to display UI.
@@ -2343,22 +2359,7 @@ impl StorageState {
                 })?;
 
             let rows = stmt
-                .query_map([screenshot_id], |row| {
-                    Ok(EncryptedOcrResultRow {
-                        id: row.get(0)?,
-                        screenshot_id: row.get(1)?,
-                        text_enc: row.get(2)?,
-                        text_key_encrypted: row.get(3)?,
-                        confidence: row.get(4)?,
-                        box_coords: vec![
-                            vec![row.get::<_, f64>(5)?, row.get::<_, f64>(6)?],
-                            vec![row.get::<_, f64>(7)?, row.get::<_, f64>(8)?],
-                            vec![row.get::<_, f64>(9)?, row.get::<_, f64>(10)?],
-                            vec![row.get::<_, f64>(11)?, row.get::<_, f64>(12)?],
-                        ],
-                        created_at: row.get(13)?,
-                    })
-                })
+                .query_map([screenshot_id], EncryptedOcrResultRow::from_row)
                 .map_err(|e| BackgroundReadError::Other(format!("Failed to execute query: {}", e)))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| {

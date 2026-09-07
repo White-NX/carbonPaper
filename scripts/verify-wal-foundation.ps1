@@ -37,6 +37,8 @@ try {
         'storage::migration::data_dir',
         'storage::connection::tests',
         'storage::mode',
+        'storage::tests',
+        'storage::screenshot::ocr_lifecycle_tests',
         'credential_manager::tests::import_snapshot_restores_cached_state_without_touching_credential_file'
     )
 
