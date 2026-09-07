@@ -181,6 +181,52 @@ function Assert-FileSize {
     }
 }
 
+function Copy-FileIfDifferent {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][long]$ExpectedSize,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $same = $false
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        try {
+            $destinationInfo = Get-Item -LiteralPath $Destination
+            if ($destinationInfo.Length -eq $ExpectedSize) {
+                $same = (Get-Sha256 -Path $Destination) -eq $ExpectedSha256.ToLowerInvariant()
+            }
+        } catch {
+            $same = $false
+        }
+    }
+
+    if (-not $same) {
+        $parent = Split-Path -Parent $Destination
+        if (-not [string]::IsNullOrWhiteSpace($parent)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        Write-Host "$Label staged: $Destination"
+    }
+}
+
+function Remove-StaleBundleFiles {
+    param(
+        [Parameter(Mandatory = $true)][string]$BundleDir,
+        [Parameter(Mandatory = $true)][string[]]$ExpectedNames
+    )
+
+    if (-not (Test-Path -LiteralPath $BundleDir -PathType Container)) {
+        return
+    }
+
+    Get-ChildItem -LiteralPath $BundleDir -File -Force |
+        Where-Object { $ExpectedNames -notcontains $_.Name } |
+        Remove-Item -Force
+}
+
 function Ensure-OcrModelAsset {
     param(
         [Parameter(Mandatory = $true)]$Asset,
@@ -259,12 +305,18 @@ function Stage-OcrModelAssets {
     }
 
     if (-not $VerifyOnly) {
-        if (Test-Path -LiteralPath $resolvedBundleDir) {
-            Remove-Item -LiteralPath $resolvedBundleDir -Recurse -Force
-        }
         New-Item -ItemType Directory -Force -Path $resolvedBundleDir | Out-Null
+        $expectedNames = @($Manifest.files | ForEach-Object { [string]$_.name })
+        Remove-StaleBundleFiles -BundleDir $resolvedBundleDir -ExpectedNames $expectedNames
         foreach ($asset in $Manifest.files) {
-            Copy-Item -LiteralPath (Join-Path $CacheDir ([string]$asset.name)) -Destination (Join-Path $resolvedBundleDir ([string]$asset.name)) -Force
+            $source = Join-Path $CacheDir ([string]$asset.name)
+            $destination = Join-Path $resolvedBundleDir ([string]$asset.name)
+            Copy-FileIfDifferent `
+                -Source $source `
+                -Destination $destination `
+                -ExpectedSize ([long]$asset.size) `
+                -ExpectedSha256 ([string]$asset.sha256) `
+                -Label "Rust OCR model asset $($asset.name)"
         }
     }
 
@@ -339,13 +391,23 @@ function Stage-SemanticRuntimeAssets {
     }
 
     if (-not $VerifyOnly) {
-        if (Test-Path -LiteralPath $resolvedBundleDir) {
-            Remove-Item -LiteralPath $resolvedBundleDir -Recurse -Force
-        }
         New-Item -ItemType Directory -Force -Path $resolvedBundleDir | Out-Null
+        $expectedNames = @(
+            $Manifest.packages | ForEach-Object {
+                $_.files | ForEach-Object { [string]$_.name }
+            }
+        )
+        Remove-StaleBundleFiles -BundleDir $resolvedBundleDir -ExpectedNames $expectedNames
         foreach ($package in $Manifest.packages) {
             foreach ($file in $package.files) {
-                Copy-Item -LiteralPath (Join-Path $CacheDir ([string]$file.name)) -Destination (Join-Path $resolvedBundleDir ([string]$file.name)) -Force
+                $source = Join-Path $CacheDir ([string]$file.name)
+                $destination = Join-Path $resolvedBundleDir ([string]$file.name)
+                Copy-FileIfDifferent `
+                    -Source $source `
+                    -Destination $destination `
+                    -ExpectedSize ([long]$file.size) `
+                    -ExpectedSha256 ([string]$file.sha256) `
+                    -Label "Semantic runtime $($file.name)"
             }
         }
     }
