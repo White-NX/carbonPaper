@@ -3055,11 +3055,43 @@ impl StorageState {
     }
 
     /// Process one OCR delete queue batch and unlink each row from blind bitmap index.
+    /// A non-empty batch returns `waiting_for_unlock` without mutation when
+    /// protected reads are not silently authorized.
     pub fn process_ocr_delete_queue_batch(
         &self,
         batch_size: i64,
     ) -> Result<OcrDeleteBatchResult, String> {
         let safe_batch_size = batch_size.clamp(1, 2000);
+
+        // Probe only queue metadata before reading any OCR payload columns.
+        // Hidden startup must not inspect protected text while locked.
+        let queue_has_rows = {
+            let guard = self.get_connection_named("process_ocr_delete_queue_batch_probe")?;
+            let conn = guard.as_ref().unwrap();
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM delete_queue_ocr LIMIT 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| format!("Failed to inspect OCR queue: {}", e))?
+        };
+
+        if !queue_has_rows {
+            return Ok(OcrDeleteBatchResult {
+                queue_empty: true,
+                ..OcrDeleteBatchResult::default()
+            });
+        }
+
+        // The maintenance loop also runs during hidden startup. Leave a
+        // non-empty batch untouched until protected reads are silently
+        // authorized, so this path can never prompt through CNG.
+        if !self.is_silent_read_authorized() {
+            return Ok(OcrDeleteBatchResult {
+                waiting_for_unlock: true,
+                ..OcrDeleteBatchResult::default()
+            });
+        }
 
         let rows: Vec<OcrDeleteQueueRow> = {
             let guard = self.get_connection_named("process_ocr_delete_queue_batch_read")?;
@@ -3100,6 +3132,16 @@ impl StorageState {
         let mut hmac_key: Option<Vec<u8>> = None;
 
         for row in &rows {
+            // Authorization can expire after the batch-level check. Abort
+            // before touching even legacy plaintext so the batch remains
+            // atomic from the caller's perspective.
+            if !self.is_silent_read_authorized() {
+                return Ok(OcrDeleteBatchResult {
+                    waiting_for_unlock: true,
+                    ..OcrDeleteBatchResult::default()
+                });
+            }
+
             if row.existing_id.is_none() {
                 delete_ids.push(row.id);
                 stale_queue_rows += 1;
@@ -3115,13 +3157,23 @@ impl StorageState {
 
             let plaintext = match (row.text_enc.as_ref(), row.text_key_encrypted.as_ref()) {
                 (Some(enc), Some(key_enc)) => {
-                    match self.decrypt_payload_with_row_key(enc, key_enc) {
+                    match self.decrypt_payload_with_row_key_silent(enc, key_enc) {
                         Ok(bytes) => match String::from_utf8(bytes) {
                             Ok(text) => Ok(text),
                             Err(_) => row.legacy_text.clone().ok_or_else(|| {
                                 format!("OCR row {} contains invalid UTF-8", row.id)
                             }),
                         },
+                        // Authorization was lost between the batch-level check
+                        // and this row. Discard all staged work and leave the
+                        // entire batch for the next unlocked pass rather than
+                        // counting a failure against any row.
+                        Err(BackgroundReadError::AuthRequired) => {
+                            return Ok(OcrDeleteBatchResult {
+                                waiting_for_unlock: true,
+                                ..OcrDeleteBatchResult::default()
+                            });
+                        }
                         Err(error) => row.legacy_text.clone().ok_or_else(|| {
                             format!(
                                 "Failed to decrypt OCR row {} for delete cleanup: {}",
@@ -3162,7 +3214,16 @@ impl StorageState {
             };
 
             if hmac_key.is_none() {
-                hmac_key = Some(self.credential_state.get_hmac_key()?);
+                hmac_key = match self.credential_state.get_hmac_key() {
+                    Ok(key) => Some(key),
+                    Err(_error) if !self.is_silent_read_authorized() => {
+                        return Ok(OcrDeleteBatchResult {
+                            waiting_for_unlock: true,
+                            ..OcrDeleteBatchResult::default()
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
             }
             let hmac_key = hmac_key
                 .as_deref()
@@ -3313,6 +3374,7 @@ impl StorageState {
             fallback_deleted_rows: fallback_failures.len(),
             blind_index_repair_requested,
             queue_empty,
+            waiting_for_unlock: false,
         })
     }
 
@@ -3721,6 +3783,10 @@ mod ocr_lifecycle_tests {
     fn ocr_delete_queue_isolates_unreadable_rows_and_rearms_repair() {
         let temp = tempfile::tempdir().expect("temp storage directory");
         let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        // Cleanup of indexed rows only runs while protected reads are
+        // authorized; model an unlocked foreground session.
+        credential_state.set_foreground_state(true);
+        credential_state.update_auth_time();
         let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
         let connection = Connection::open_in_memory().expect("in-memory database");
         storage.init_tables(&connection).expect("initialize schema");
@@ -3810,10 +3876,127 @@ mod ocr_lifecycle_tests {
     }
 
     #[test]
+    fn ocr_delete_queue_waits_while_locked_without_counting_failures() {
+        let temp = tempfile::tempdir().expect("temp storage directory");
+        // No cached master key, no session, no background lease: the state a
+        // hidden launch is in before the user unlocks.
+        let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        let storage = StorageState::new(temp.path().to_path_buf(), credential_state.clone());
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        storage.init_tables(&connection).expect("initialize schema");
+        connection
+            .execute_batch(
+                "INSERT INTO screenshots (id, image_path, image_hash, is_deleted) VALUES
+                    (1, '1.enc', 'h1', 1),
+                    (2, '2.enc', 'h2', 1),
+                    (3, '3.enc', 'h3', 1);
+                 INSERT INTO ocr_results
+                    (id, screenshot_id, text, text_hash, text_enc, text_key_encrypted, is_deleted)
+                    VALUES
+                    (10, 1, NULL, 'indexed', X'00', X'00', 1),
+                    (20, 2, NULL, '', NULL, NULL, 1);
+                 INSERT INTO delete_queue_ocr (id) VALUES (10), (20), (30);
+                 INSERT INTO delete_queue_screenshots (id) VALUES (1), (2), (3);",
+            )
+            .expect("insert delete queue fixture");
+        *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
+        storage
+            .run_blind_index_repair(|_| {})
+            .expect("mark initial repair complete");
+        assert!(!storage.is_blind_index_repair_needed().unwrap());
+        assert!(!storage.is_silent_read_authorized());
+
+        // The whole batch stays queued while locked, including rows that would
+        // otherwise be removable without decrypting their text.
+        let locked = storage
+            .process_ocr_delete_queue_batch(10)
+            .expect("process OCR delete batch while locked");
+        assert!(locked.waiting_for_unlock);
+        assert_eq!(locked.queue_rows, 0);
+        assert_eq!(locked.deleted_rows, 0);
+        assert_eq!(locked.stale_queue_rows, 0);
+        assert_eq!(locked.retry_rows, 0);
+        assert_eq!(locked.fallback_deleted_rows, 0);
+        assert!(!locked.blind_index_repair_requested);
+        assert!(!locked.queue_empty);
+
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().expect("database");
+            let remaining: i64 = conn
+                .query_row("SELECT COUNT(*) FROM delete_queue_ocr", [], |row| {
+                    row.get(0)
+                })
+                .expect("inspect queue");
+            assert_eq!(remaining, 3, "the locked batch stays queued");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT failure_count FROM delete_queue_ocr WHERE id = 10",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+                "waiting for unlock is not a failure"
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM ocr_results", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2,
+                "no OCR row is deleted while locked"
+            );
+        }
+
+        // Repeated locked passes make no progress and never consume the retry
+        // budget or re-arm a blind-index repair.
+        for _ in 0..MAX_OCR_DELETE_CLEANUP_FAILURES {
+            let again = storage
+                .process_ocr_delete_queue_batch(10)
+                .expect("process locked batch again");
+            assert!(again.waiting_for_unlock);
+            assert_eq!(again.queue_rows, 0);
+            assert_eq!(again.retry_rows, 0);
+            assert_eq!(again.fallback_deleted_rows, 0);
+        }
+        assert!(!storage.is_blind_index_repair_needed().unwrap());
+
+        // Make the encrypted fixture readable only after the locked pass has
+        // proved that it never attempted a non-silent unwrap.
+        {
+            let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
+            let conn = guard.as_ref().expect("database");
+            conn.execute(
+                "UPDATE ocr_results
+                 SET text = 'indexed text', text_enc = NULL, text_key_encrypted = NULL
+                 WHERE id = 10",
+                [],
+            )
+            .expect("prepare readable fixture");
+        }
+        credential_state.cache_master_key_for_tests(vec![9u8; 32]);
+        credential_state.set_foreground_state(true);
+        credential_state.update_auth_time();
+        let unlocked = storage
+            .process_ocr_delete_queue_batch(10)
+            .expect("process OCR delete batch after unlock");
+        assert!(!unlocked.waiting_for_unlock);
+        assert_eq!(unlocked.queue_rows, 3);
+        assert_eq!(unlocked.deleted_rows, 2);
+        assert_eq!(unlocked.stale_queue_rows, 1);
+        assert_eq!(unlocked.retry_rows, 0);
+        assert_eq!(unlocked.fallback_deleted_rows, 0);
+        assert!(unlocked.queue_empty);
+        assert!(!storage.is_blind_index_repair_needed().unwrap());
+    }
+
+    #[test]
     fn ocr_delete_queue_drains_readable_rows_and_unblocks_screenshots() {
         let temp = tempfile::tempdir().expect("temp storage directory");
         let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         credential_state.cache_master_key_for_tests(vec![9u8; 32]);
+        credential_state.set_foreground_state(true);
+        credential_state.update_auth_time();
         let storage = StorageState::new(temp.path().to_path_buf(), credential_state.clone());
         let connection = Connection::open_in_memory().expect("in-memory database");
         storage.init_tables(&connection).expect("initialize schema");

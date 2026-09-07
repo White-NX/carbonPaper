@@ -231,6 +231,8 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
     let mut last_policy_check =
         std::time::Instant::now() - std::time::Duration::from_secs(POLICY_CHECK_INTERVAL_SECS);
     let mut blind_index_repair_deferred = false;
+    // Log the locked state once per lock period rather than every idle tick.
+    let mut waiting_for_unlock_logged = false;
 
     loop {
         // Retention and delete-queue work would race the MiniLM migration's
@@ -290,6 +292,16 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
             }
         };
         blind_index_repair_deferred |= ocr_batch.blind_index_repair_requested;
+        if ocr_batch.waiting_for_unlock {
+            if !waiting_for_unlock_logged {
+                tracing::info!(
+                    "[DELETE_QUEUE] OCR delete queue is waiting for unlock before protected rows can be unlinked"
+                );
+                waiting_for_unlock_logged = true;
+            }
+        } else {
+            waiting_for_unlock_logged = false;
+        }
 
         let screenshot_candidates = match tokio::task::spawn_blocking({
             let storage = storage.clone();
@@ -370,7 +382,11 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
             };
         }
 
-        let vacuum = if ocr_batch.queue_rows == 0 && finalized_screenshots == 0 && !ocr_failed {
+        let vacuum = if ocr_batch.queue_rows == 0
+            && finalized_screenshots == 0
+            && !ocr_failed
+            && !ocr_batch.waiting_for_unlock
+        {
             match tokio::task::spawn_blocking({
                 let storage = storage.clone();
                 move || storage.run_incremental_vacuum_if_idle(500, 500)
@@ -434,7 +450,8 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
             blind_index_repair_deferred = false;
         }
 
-        let active = ocr_batch.queue_rows > 0 || finalized_screenshots > 0;
+        let active = (ocr_batch.queue_rows > 0 || finalized_screenshots > 0)
+            && !ocr_batch.waiting_for_unlock;
         let delay = if active && !ocr_failed {
             std::time::Duration::from_millis(ACTIVE_YIELD_MILLIS)
         } else {

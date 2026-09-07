@@ -471,6 +471,9 @@ pub struct OcrDeleteBatchResult {
     pub fallback_deleted_rows: usize,
     pub blind_index_repair_requested: bool,
     pub queue_empty: bool,
+    /// A non-empty OCR batch was left untouched because protected reads are
+    /// not silently authorized. This is a wait state, not a cleanup failure.
+    pub waiting_for_unlock: bool,
 }
 
 /// Observable result of one incremental-vacuum attempt.
