@@ -57,6 +57,12 @@ function assertIncludes(text, needle, label) {
   }
 }
 
+function assertNotIncludes(text, needle, label) {
+  if (text.includes(needle)) {
+    fail(`${label}: unexpected ${needle}`);
+  }
+}
+
 function assertBefore(text, first, second, label) {
   const firstIndex = text.indexOf(first);
   const secondIndex = text.indexOf(second);
@@ -121,7 +127,8 @@ assertIncludes(buildRs, 'cargo:rerun-if-changed=../aria2c.exe', 'build.rs aria2 
 const tauriConf = JSON.parse(readText(path.join('src-tauri', 'tauri.conf.json')));
 assertEqual(tauriConf.bundle?.resources?.['pre-bundle'], '.', 'Tauri pre-bundle resource mapping');
 assertIncludes(tauriConf.build?.beforeBuildCommand ?? '', 'npm run test:release-assets', 'Tauri release asset build gate');
-assertIncludes(tauriConf.build?.beforeDevCommand ?? '', 'npm run build:office', 'Tauri development Office worker build');
+assertIncludes(tauriConf.build?.beforeDevCommand ?? '', 'npm run build:dev-workers', 'Tauri development worker build');
+assertIncludes(tauriConf.build?.beforeDevCommand ?? '', 'npm run dev', 'Tauri development frontend server');
 
 const mlBuild = readText(path.join('scripts', 'build-ml.mjs'));
 assertIncludes(mlBuild, "'carbonpaper-ml.exe'", 'ML worker build output');
@@ -140,6 +147,15 @@ assertIncludes(nmhBuild, "rmSync(path.join(tauriDir, 'pre-bundle', 'carbonpaper-
 const semanticBuild = readText(path.join('scripts', 'build-semantic-ml.mjs'));
 assertIncludes(semanticBuild, "'carbonpaper-semantic-worker.exe'", 'semantic worker build output');
 assertIncludes(semanticBuild, "'onnxruntime-directml.json'", 'semantic runtime manifest');
+assertIncludes(semanticBuild, 'copyFileIfChanged', 'semantic worker idempotent staging');
+
+const devWorkersBuild = readText(path.join('scripts', 'build-dev-workers.mjs'));
+assertIncludes(devWorkersBuild, "'carbonpaper-ml'", 'development ML worker build');
+assertIncludes(devWorkersBuild, "'carbonpaper-office'", 'development Office worker build');
+assertIncludes(devWorkersBuild, "'carbonpaper-nmh'", 'development NMH worker build');
+assertIncludes(devWorkersBuild, "'--no-default-features'", 'development worker Cargo feature alignment');
+assertIncludes(devWorkersBuild, "'dev-workers-state.json'", 'development worker build state');
+assertIncludes(devWorkersBuild, 'Development workers are unchanged; skipping Cargo builds.', 'development worker skip path');
 
 const packPortable = readText(path.join('scripts', 'pack-portable.mjs'));
 assertIncludes(packPortable, "const preBundleDir = path.join(tauriDir, 'pre-bundle');", 'portable pre-bundle input');
@@ -182,11 +198,17 @@ assertIncludes(packageJson.scripts?.['prepare:release-assets'] ?? '', 'scripts/p
 assertIncludes(packageJson.scripts?.['prepare:dev-assets'] ?? '', '-DevelopmentOnly', 'development asset preparation command');
 assertIncludes(packageJson.scripts?.['prepare:ocr-assets'] ?? '', '-OcrOnly', 'OCR-only preparation command');
 assertIncludes(packageJson.scripts?.debug ?? '', 'npm run prepare:dev-assets', 'debug development asset preparation');
-assertBefore(packageJson.scripts?.debug ?? '', 'npm run prepare:dev-assets', 'npm run build:semantic-ml', 'debug semantic asset order');
+assertIncludes(packageJson.scripts?.['build:dev-workers'] ?? '', 'scripts/build-dev-workers.mjs', 'development worker build command');
+assertBefore(packageJson.scripts?.debug ?? '', 'npm run prepare:dev-assets', 'tauri dev', 'debug development asset order');
+assertNotIncludes(packageJson.scripts?.debug ?? '', 'scripts/build-ml.mjs', 'debug direct ML build');
+assertNotIncludes(packageJson.scripts?.debug ?? '', 'scripts/build-semantic-ml.mjs', 'debug direct semantic build');
 
 const prepareAssets = readText(path.join('scripts', 'prepare-release-assets.ps1'));
 assertIncludes(prepareAssets, '$includeReleaseTools = -not $OcrOnly -and -not $DevelopmentOnly', 'development asset release-tool exclusion');
 assertIncludes(prepareAssets, '$includeSemanticRuntime = -not $OcrOnly', 'development semantic runtime inclusion');
+assertIncludes(prepareAssets, 'function Copy-FileIfDifferent', 'asset idempotent staging helper');
+assertIncludes(prepareAssets, 'function Remove-StaleBundleFiles', 'asset stale-file cleanup helper');
+assertNotIncludes(prepareAssets, 'Remove-Item -LiteralPath $resolvedBundleDir -Recurse -Force', 'asset directory replacement');
 
 const gitignore = readText('.gitignore');
 for (const asset of assets) {

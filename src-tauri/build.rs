@@ -92,9 +92,29 @@ fn configure_update_public_key() {
     );
 }
 
+/// 屏蔽从源码编译的 OpenSSL 静态库引发的成片 LNK4099 警告。
+///
+/// rusqlite 的 `bundled-sqlcipher-vendored-openssl` 会在构建时从源码编译一份
+/// 静态 OpenSSL，其目标文件被打包进 `libopenssl_sys-*.rlib`，但配套的调试符号
+/// `ossl_static.pdb` 留在 openssl-sys 自己的构建输出目录里，不会跟到 rlib 旁边。
+/// MSVC 链接器于是对 libcrypto 的每个目标文件各报一条 LNK4099，单次构建刷出
+/// 上千行噪声，而且 Cargo 会缓存这些诊断并在后续构建里原样重放。
+///
+/// 缺失的只是 OpenSSL 那部分 C 代码的调试符号，Rust 侧的调试信息与程序行为都
+/// 不受影响，因此让链接器不再报告这一类警告。
+fn silence_vendored_openssl_pdb_warnings() {
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_env != "msvc" {
+        return;
+    }
+    // 只作用于本包的可执行文件与 cdylib，也就是真正执行链接步骤的那些目标。
+    println!("cargo:rustc-link-arg=/IGNORE:4099");
+}
+
 fn main() {
     generate_native_locales();
     configure_update_public_key();
+    silence_vendored_openssl_pdb_warnings();
     // --- 1. 定义路径 ---
     // 源文件夹
     let source_dir = Path::new("../monitor");
@@ -458,10 +478,24 @@ fn build_monitor_pyz(source_dir: &Path, out_pyz: &Path) -> String {
     for a in &prefix_args {
         zipapp_cmd.arg(a);
     }
+    // Generate into a temporary file first. `monitor.pyz` is also a Tauri
+    // resource input; replacing it when the bytes are unchanged makes Cargo
+    // consider the package dirty on every subsequent invocation.
+    let temporary_pyz = out_pyz.with_extension("pyz.tmp");
+    if temporary_pyz.exists() {
+        fs::remove_file(&temporary_pyz).unwrap_or_else(|e| {
+            panic!(
+                "Failed to remove stale temporary monitor archive {}: {}",
+                temporary_pyz.display(),
+                e
+            )
+        });
+    }
+
     zipapp_cmd
         .arg(helper_script)
         .arg(staging)
-        .arg(out_pyz)
+        .arg(&temporary_pyz)
         .arg("main:main");
 
     let output = zipapp_cmd
@@ -477,9 +511,44 @@ fn build_monitor_pyz(source_dir: &Path, out_pyz: &Path) -> String {
         );
     }
 
+    // Keep the existing destination untouched when the deterministic archive
+    // has not changed. This preserves its mtime and prevents a self-triggered
+    // Cargo rebuild on the next invocation.
+    let pyz_bytes = fs::read(&temporary_pyz).unwrap_or_else(|e| {
+        panic!(
+            "Failed to read freshly built temporary archive {}: {}",
+            temporary_pyz.display(),
+            e
+        )
+    });
+    let unchanged = fs::read(out_pyz)
+        .map(|existing| existing == pyz_bytes)
+        .unwrap_or(false);
+    if unchanged {
+        fs::remove_file(&temporary_pyz).unwrap_or_else(|e| {
+            panic!(
+                "Failed to remove unchanged temporary monitor archive {}: {}",
+                temporary_pyz.display(),
+                e
+            )
+        });
+        eprintln!("monitor.pyz unchanged; keeping {}", out_pyz.display());
+    } else {
+        if out_pyz.exists() {
+            fs::remove_file(out_pyz)
+                .unwrap_or_else(|e| panic!("Failed to replace {}: {}", out_pyz.display(), e));
+        }
+        fs::rename(&temporary_pyz, out_pyz).unwrap_or_else(|e| {
+            panic!(
+                "Failed to install generated monitor archive {}: {}",
+                out_pyz.display(),
+                e
+            )
+        });
+        eprintln!("monitor.pyz updated at {}", out_pyz.display());
+    }
+
     // 4. 计算 SHA-256
-    let pyz_bytes = fs::read(out_pyz)
-        .unwrap_or_else(|e| panic!("Failed to read freshly built {}: {}", out_pyz.display(), e));
     let mut hasher = Sha256::new();
     hasher.update(&pyz_bytes);
     let hash = hasher.finalize();

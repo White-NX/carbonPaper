@@ -301,8 +301,7 @@ function App() {
         <StartupVacuumDialog />
 
         {/* Top-level, non-dismissable maintenance overlay: covers the whole
-            window (TopBar included) whenever the app is in maintenance mode,
-            which currently means either vector migration. */}
+            window (TopBar included) whenever the app is in maintenance mode. */}
         <VectorMigrationOverlay />
 
         {isAuthenticated && <HmacMigrationDialog />}

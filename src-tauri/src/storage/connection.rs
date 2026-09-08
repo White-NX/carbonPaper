@@ -9,6 +9,15 @@ use std::time::{Duration, Instant};
 /// Keep lock waits bounded and explicit on every connection.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Keep SQLite's normal automatic checkpoint policy explicit across the
+/// bundled primary and independent connections.
+pub(crate) const WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
+
+/// Bound the amount of reusable WAL capacity retained after a checkpoint.
+/// This limits the physical sidecar without forcing a truncate on every small
+/// transaction.
+pub(crate) const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 /// Preserve the existing durability policy while DELETE remains the default
 /// journal mode. WAL experiments can choose a different policy explicitly.
 const SYNCHRONOUS_FULL: &str = "FULL";
@@ -35,6 +44,13 @@ pub(crate) struct ConnectionStatus {
     pub(crate) journal_mode: String,
     pub(crate) synchronous: String,
     pub(crate) engine: SqliteEngineIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalCheckpointResult {
+    pub(crate) busy: i64,
+    pub(crate) log_frames: i64,
+    pub(crate) checkpointed_frames: i64,
 }
 
 #[derive(Default)]
@@ -299,6 +315,8 @@ pub(crate) fn configure_connection_pragmas(conn: &Connection) -> Result<Connecti
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.pragma_update(None, "synchronous", SYNCHRONOUS_FULL)?;
+    conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
+    conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
     inspect_connection(conn)
 }
 
@@ -348,6 +366,21 @@ pub(crate) fn inspect_sqlite_engine(conn: &Connection) -> Result<SqliteEngineIde
         sqlite_source_id,
         cipher_version,
     })
+}
+
+/// Checkpoint and physically truncate a WAL file after all readers have been
+/// drained by the caller's maintenance gate.
+pub(crate) fn checkpoint_wal_truncate(
+    conn: &Connection,
+) -> std::result::Result<WalCheckpointResult, String> {
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok(WalCheckpointResult {
+            busy: row.get(0)?,
+            log_frames: row.get(1)?,
+            checkpointed_frames: row.get(2)?,
+        })
+    })
+    .map_err(|error| format!("Failed to run WAL TRUNCATE checkpoint: {error}"))
 }
 
 fn ensure_supported_sqlite_engine(
@@ -431,10 +464,9 @@ pub(crate) fn preserve_wal_sidecars_on_close(conn: &Connection) -> Result<(), St
 
 /// Request a journal mode and verify SQLite's effective result.
 ///
-/// V1 does not call this during startup. Later WAL experiments can use it and
-/// receive a clear diagnostic when a read-only connection, filesystem, or
-/// SQLite build cannot establish the requested mode.
-#[allow(dead_code)]
+/// Startup and controlled mode transitions use this helper and receive a clear
+/// diagnostic when a read-only connection, filesystem, or SQLite build cannot
+/// establish the requested mode.
 pub(crate) fn set_journal_mode(
     conn: &Connection,
     requested: JournalMode,
@@ -491,6 +523,14 @@ mod tests {
             .pragma_query_value(None, "busy_timeout", |row| row.get(0))
             .expect("read busy_timeout");
         assert_eq!(busy_timeout, BUSY_TIMEOUT.as_millis() as i64);
+        let wal_autocheckpoint: i64 = conn
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .expect("read wal_autocheckpoint");
+        assert_eq!(wal_autocheckpoint, WAL_AUTOCHECKPOINT_PAGES);
+        let journal_size_limit: i64 = conn
+            .pragma_query_value(None, "journal_size_limit", |row| row.get(0))
+            .expect("read journal_size_limit");
+        assert_eq!(journal_size_limit, WAL_JOURNAL_SIZE_LIMIT_BYTES);
     }
 
     #[test]
@@ -552,6 +592,34 @@ mod tests {
 
         let status = set_journal_mode(&conn, JournalMode::Delete).expect("restore DELETE");
         assert_eq!(status.journal_mode, "delete");
+    }
+
+    #[test]
+    fn wal_truncate_checkpoint_reports_progress() {
+        let temp = tempfile::tempdir().expect("create temporary directory");
+        let path = temp.path().join("checkpoint.db");
+        let wal_path = temp.path().join("checkpoint.db-wal");
+        let conn = Connection::open(&path).expect("open database");
+        conn.execute_batch(
+            "CREATE TABLE records(value TEXT);
+             PRAGMA journal_mode=WAL;
+             INSERT INTO records VALUES ('committed');",
+        )
+        .expect("create WAL fixture");
+        assert!(
+            std::fs::metadata(&wal_path)
+                .expect("inspect populated WAL")
+                .len()
+                > 0
+        );
+
+        let result = checkpoint_wal_truncate(&conn).expect("run WAL checkpoint");
+        assert_eq!(result.busy, 0);
+        assert!(result.log_frames >= result.checkpointed_frames);
+        let wal_size_after = std::fs::metadata(&wal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        assert_eq!(wal_size_after, 0);
     }
 
     #[test]

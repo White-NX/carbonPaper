@@ -1,7 +1,7 @@
 {
   "name": "carbonpaper",
   "private": true,
-  "version": "0.8.4",
+  "version": "0.8.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -22,7 +22,7 @@
     "verify:wal-foundation": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-wal-foundation.ps1",
     "test:backend:fast": "npm run test:security && npm run test:python:regression && npm run test:rust && npm run test:python:prebundle-sync",
     "tauri": "tauri",
-    "debug": "npm run prepare:dev-assets && node scripts/build-ml.mjs && npm run build:semantic-ml && tauri dev",
+    "debug": "npm run prepare:dev-assets && tauri dev",
     "i18n:extract": "i18next-scanner --config i18next-scanner.config.cjs 'src/**/*.{js,jsx,ts,tsx}'",
     "i18n:check": "node scripts/i18n-check.cjs",
     "codemod:i18n": "jscodeshift -t scripts/transforms/i18n-jscodeshift.cjs src/components --extensions=js,jsx,ts,tsx",
@@ -33,6 +33,7 @@
     "build:ml:release": "node scripts/build-ml.mjs --release",
     "build:office": "node scripts/build-office.mjs",
     "build:office:release": "node scripts/build-office.mjs --release",
+    "build:dev-workers": "node scripts/build-dev-workers.mjs",
     "test:office-nativeom": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-office-nativeom.ps1",
     "build:semantic-ml": "node scripts/build-semantic-ml.mjs",
     "build:semantic-ml:release": "node scripts/build-semantic-ml.mjs --release",

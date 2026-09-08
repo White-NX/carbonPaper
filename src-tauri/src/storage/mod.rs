@@ -37,7 +37,9 @@ pub use derived_migration::*;
 pub use document_ref::STALE_DOCUMENT_REF_GENERATION;
 #[allow(unused_imports)]
 pub use image_io::{read_encrypted_image_as_base64, read_image_as_base64};
-pub(crate) use mode::{DatabaseModeEligibility, DatabaseModeMetadata};
+pub(crate) use mode::{
+    database_mode_policy_from_environment, DatabaseModeEligibility, DatabaseModeMetadata,
+};
 pub(crate) use policy::disk_totals_for_path;
 #[allow(unused_imports)]
 pub use semantic_cache::SEMANTIC_CACHE_IDLE_TTL;
@@ -81,6 +83,9 @@ pub struct StorageState {
     pub screenshot_dir: Mutex<PathBuf>,
     /// Credential manager state for encryption key management
     credential_state: Arc<CredentialManagerState>,
+    /// Journal mode selected once for this process. The default constructor
+    /// intentionally remains DELETE for tests and all non-experimental paths.
+    database_mode_policy: mode::DatabaseModePolicy,
     initialized: Mutex<bool>,
     migration_cancel_requested: AtomicBool,
     migration_in_progress: AtomicBool,
@@ -193,6 +198,14 @@ impl Drop for NamedConnectionGuard<'_> {
 
 impl StorageState {
     pub fn new(data_dir: PathBuf, credential_state: Arc<CredentialManagerState>) -> Self {
+        Self::new_with_mode_policy(data_dir, credential_state, mode::DatabaseModePolicy::Delete)
+    }
+
+    pub(crate) fn new_with_mode_policy(
+        data_dir: PathBuf,
+        credential_state: Arc<CredentialManagerState>,
+        database_mode_policy: mode::DatabaseModePolicy,
+    ) -> Self {
         let screenshot_dir = data_dir.join("screenshots");
 
         Self {
@@ -200,6 +213,7 @@ impl StorageState {
             data_dir: Mutex::new(data_dir),
             screenshot_dir: Mutex::new(screenshot_dir),
             credential_state,
+            database_mode_policy,
             initialized: Mutex::new(false),
             migration_cancel_requested: AtomicBool::new(false),
             migration_in_progress: AtomicBool::new(false),
@@ -408,6 +422,9 @@ impl StorageState {
     ) -> Result<connection::IndependentReadConnection, String> {
         let started = std::time::Instant::now();
         let activity = self.independent_db_activity.read(caller);
+        if !self.is_initialized() {
+            return Err("Database not initialized".to_string());
+        }
         let data_dir = self
             .data_dir
             .lock()
@@ -538,5 +555,15 @@ mod tests {
         assert!(storage
             .try_database_maintenance("test_maintenance_after_reader")
             .is_some());
+    }
+
+    #[test]
+    fn independent_read_connection_cannot_open_before_storage_initializes() {
+        let (_temp, storage) = test_storage();
+        let error = match storage.open_read_connection_named("read_before_initialize") {
+            Ok(_) => panic!("startup must publish storage before independent reads"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "Database not initialized");
     }
 }

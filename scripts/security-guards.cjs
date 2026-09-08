@@ -194,6 +194,7 @@ const COMMAND_TIERS = {
   'minilm_migration::list_minilm_rebuild_errors': 'session_required',
   'clip_migration::get_clip_rebuild_status': 'public',
   'clip_migration::list_clip_rebuild_errors': 'session_required',
+  'blind_index_repair::get_blind_index_repair_status': 'public',
   'clip_ann::clip_ann_retry_now': 'session_required',
   'clip_ann::clip_ann_take_failure_notification': 'public',
   'clip_ann::clip_ann_ack_failure_notification': 'public',

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square } from 'lucide-react';
+import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square, CornerDownLeft } from 'lucide-react';
 import { fetchThumbnail } from '../lib/monitor_api';
 import { useSearchBoxController } from '../hooks/useSearchBoxController';
 
@@ -42,6 +42,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         selectMode,
         handleSelect,
         handleSubmit,
+        handleViewMore,
         handleCancelCluster,
     } = useSearchBoxController({
         onSelectResult,
@@ -236,7 +237,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                             </div>
                         </div>
                     )}
-                    <div className="overflow-y-auto custom-scrollbar">
+                    <div className="overflow-y-auto custom-scrollbar min-h-0 flex-1">
                         {error ? (
                             <div className="p-4 text-center text-red-500 text-sm">
                                 {t('search.searchError', { message: error })}
@@ -261,6 +262,16 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                                 )
                         )}
                     </div>
+                    {!error && (query.trim().length > 0 || results.length > 0) && (
+                        <button
+                            type="button"
+                            onClick={handleViewMore}
+                            className="shrink-0 flex items-center gap-2 px-3.5 py-2.5 bg-ide-panel hover:bg-ide-hover border-t border-ide-border text-xs text-ide-muted hover:text-ide-text transition-colors cursor-pointer text-left w-full select-none group"
+                        >
+                            <CornerDownLeft size={13} className="text-ide-muted group-hover:text-ide-accent transition-colors shrink-0" />
+                            <span className="truncate">{t('search.pressEnterToViewMore', '按下 [Enter] 查看更多结果')}</span>
+                        </button>
+                    )}
                 </div>
             )}
         </div>

@@ -103,6 +103,21 @@ impl CredentialManagerState {
         }
     }
 
+    /// Seed the cached master key so unit tests in other modules can exercise
+    /// code paths that derive the blind-index HMAC key.
+    #[cfg(test)]
+    pub(crate) fn cache_master_key_for_tests(&self, master_key: Vec<u8>) {
+        assert_eq!(
+            master_key.len(),
+            MASTER_KEY_LEN,
+            "test master key must match the production length"
+        );
+        *self
+            .cached_master_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(master_key);
+    }
+
     pub fn new(data_dir: PathBuf) -> Self {
         // Start with secure defaults.
         let default = DEFAULT_SESSION_TIMEOUT_SECS as i64;

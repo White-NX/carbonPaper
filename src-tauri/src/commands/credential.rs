@@ -38,6 +38,14 @@ pub async fn credential_initialize(
             .map_err(|e| format!("Failed to create master key: {}", e))?;
 
         storage_state.initialize()?;
+        // First-run initialization can happen after the Tauri setup callback
+        // failed to load/export the public key. Start Office observation at the
+        // same post-storage boundary used by the normal startup path.
+        if let Some(office_runtime) =
+            app.try_state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
+        {
+            office_runtime.start(app.clone(), storage_state.inner().clone());
+        }
         if let Some(scheduler) =
             app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
         {

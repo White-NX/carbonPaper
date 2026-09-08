@@ -1,10 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "carbonpaper",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "identifier": "com.eyling.carbonpaper",
   "build": {
-    "beforeDevCommand": "npm run build:nmh && npm run build:office && npm run dev",
+    "beforeDevCommand": "npm run build:dev-workers && npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build && npm run test:release-assets",
     "frontendDist": "../dist"
