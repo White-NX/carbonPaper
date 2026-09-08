@@ -7,8 +7,18 @@ it. These tests cover the dispatch layer and the parent-side proxy without
 spawning real child processes.
 """
 
+import pytest
+
 import monitor as mm
 from monitor.worker_process import RestartableModelWorker
+
+
+@pytest.fixture(autouse=True)
+def restore_feature_config(monkeypatch):
+    # Dispatch mutates these module globals directly. Register their original
+    # values so a disabled-feature test cannot disable later scheduler tests.
+    for name in ("CLUSTERING_ENABLED", "CLASSIFICATION_ENABLED"):
+        monkeypatch.setattr(mm.config, name, getattr(mm.config, name))
 
 
 class FeatureWorker:

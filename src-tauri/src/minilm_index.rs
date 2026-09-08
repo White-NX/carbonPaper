@@ -349,6 +349,14 @@ async fn run_automatic_quantum(
             return Ok(ScheduledSliceResult::complete(has_more));
         }
 
+        // Admission can span many requests. A settings change must stop the
+        // next batch and park the durable task even after earlier progress.
+        if !crate::background_scheduler::task_feature_enabled(
+            crate::background_scheduler::BackgroundTaskKind::SemanticIndex,
+            false,
+        ) {
+            return Ok(ScheduledSliceResult::skipped("disabled"));
+        }
         let result =
             run_scheduled_request(app, false, run_maintenance, Some((quantum, batches > 0))).await;
         run_maintenance = false;

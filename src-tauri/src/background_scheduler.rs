@@ -69,6 +69,31 @@ impl BackgroundTaskKind {
     }
 }
 
+fn task_feature_enabled_with_config(
+    kind: BackgroundTaskKind,
+    manual: bool,
+    clustering_enabled: bool,
+    smart_cluster_enabled: bool,
+) -> bool {
+    match kind {
+        // Python also enforces this flag on explicit clustering requests.
+        BackgroundTaskKind::PythonClustering => clustering_enabled,
+        _ if manual => true,
+        BackgroundTaskKind::SemanticIndex => clustering_enabled || smart_cluster_enabled,
+        BackgroundTaskKind::SmartCluster => smart_cluster_enabled,
+        BackgroundTaskKind::ClipIndex => true,
+    }
+}
+
+pub(crate) fn task_feature_enabled(kind: BackgroundTaskKind, manual: bool) -> bool {
+    task_feature_enabled_with_config(
+        kind,
+        manual,
+        crate::registry_config::get_bool("clustering_enabled").unwrap_or(true),
+        crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AutomaticSliceStopReason {
     BudgetExpired,
@@ -620,7 +645,7 @@ fn queue_depths(storage: Option<tauri::State<'_, Arc<StorageState>>>) -> serde_j
     })
 }
 
-fn gate_reason(app: &AppHandle, manual: bool) -> Option<&'static str> {
+pub(crate) fn gate_reason(app: &AppHandle, manual: bool) -> Option<&'static str> {
     let credential = app.state::<Arc<CredentialManagerState>>();
     if manual {
         if !credential.is_session_valid() && !credential.background_authorized() {
@@ -738,19 +763,18 @@ async fn execute_slice(
     runtime: &SchedulerRuntime,
     automatic_context: Option<&AutomaticSliceContext>,
 ) -> Result<ScheduledSliceResult, String> {
+    // A queued row can outlive a settings change. Check every dispatch path,
+    // including automatic model quanta, before loading a model or restarting
+    // the monitor. Explicit Rust maintenance remains available when disabled.
+    if !task_feature_enabled(kind, manual) {
+        return Ok(ScheduledSliceResult::skipped("disabled"));
+    }
     // Python's HDBSCAN run is intentionally non-preemptible, but it does not
     // own the Rust semantic model slot for the duration of that computation.
     // Holding BACKGROUND_PASS_GUARD here would make a foreground search wait
     // for the whole clustering run. The Rust adapters below still claim the
     // guard for every request that actually drives the shared semantic worker.
     if kind == BackgroundTaskKind::PythonClustering {
-        // The registry is the application-side source of truth. A queued row
-        // can outlive a settings change, and the Python config update may fail
-        // when the monitor is stopped, so reject disabled work before starting
-        // (or restarting) that process.
-        if !crate::registry_config::get_bool("clustering_enabled").unwrap_or(true) {
-            return Ok(ScheduledSliceResult::skipped("disabled"));
-        }
         let monitor_running = {
             let monitor = app.state::<MonitorState>();
             let running = monitor
@@ -845,29 +869,6 @@ async fn execute_slice(
             }
         }
     } else {
-        // The registry is the application-side source of truth, checked again
-        // here for the same reason as Python clustering above: a queued row can
-        // outlive a settings change. Manual slices are user-initiated
-        // maintenance requests and stay allowed.
-        if !manual {
-            match kind {
-                BackgroundTaskKind::SemanticIndex => {
-                    let semantic_consumers = crate::registry_config::get_bool("clustering_enabled")
-                        .unwrap_or(true)
-                        || crate::registry_config::get_bool("smart_cluster_enabled")
-                            .unwrap_or(false);
-                    if !semantic_consumers {
-                        return Ok(ScheduledSliceResult::skipped("disabled"));
-                    }
-                }
-                BackgroundTaskKind::SmartCluster => {
-                    if !crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false) {
-                        return Ok(ScheduledSliceResult::skipped("disabled"));
-                    }
-                }
-                BackgroundTaskKind::ClipIndex | BackgroundTaskKind::PythonClustering => {}
-            }
-        }
         let Ok(_worker_guard) = crate::semantic_runtime::BACKGROUND_PASS_GUARD.try_lock() else {
             return Ok(ScheduledSliceResult::skipped("semantic_worker_busy"));
         };
@@ -1306,6 +1307,66 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::from_secs(60));
         assert_eq!(retry_delay(2), Duration::from_secs(120));
         assert_eq!(retry_delay(99), MAX_RETRY_DELAY);
+    }
+
+    #[test]
+    fn automatic_semantic_index_requires_an_enabled_consumer() {
+        for (clustering, smart_cluster, expected) in [
+            (false, false, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                task_feature_enabled_with_config(
+                    BackgroundTaskKind::SemanticIndex,
+                    false,
+                    clustering,
+                    smart_cluster,
+                ),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn manual_rust_maintenance_remains_available_when_features_are_disabled() {
+        for kind in [
+            BackgroundTaskKind::SemanticIndex,
+            BackgroundTaskKind::ClipIndex,
+            BackgroundTaskKind::SmartCluster,
+        ] {
+            assert!(task_feature_enabled_with_config(kind, true, false, false));
+        }
+        // The Python service rejects disabled clustering even for manual runs.
+        assert!(!task_feature_enabled_with_config(
+            BackgroundTaskKind::PythonClustering,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn automatic_tasks_observe_their_own_feature_flags() {
+        assert!(task_feature_enabled_with_config(
+            BackgroundTaskKind::ClipIndex,
+            false,
+            false,
+            false,
+        ));
+        assert!(!task_feature_enabled_with_config(
+            BackgroundTaskKind::SmartCluster,
+            false,
+            true,
+            false,
+        ));
+        assert!(!task_feature_enabled_with_config(
+            BackgroundTaskKind::PythonClustering,
+            false,
+            false,
+            true,
+        ));
     }
 
     #[test]

@@ -360,7 +360,7 @@ async fn run_automatic_quantum(
                 quantum.elapsed().as_millis(),
                 reason.as_str(),
             );
-            finish_automatic_quantum(app).await;
+            finish_automatic_quantum(app, quantum).await;
             return Ok(ScheduledSliceResult::complete(has_more));
         }
 
@@ -384,7 +384,9 @@ async fn run_automatic_quantum(
                     },
                 );
             } else {
-                finish_automatic_quantum(app).await;
+                // The current batch refused admission or yielded. Its earlier
+                // commits remain valid, but maintenance must wait for a later
+                // idle admission too.
                 return Ok(ScheduledSliceResult::complete(has_more));
             }
         }
@@ -396,13 +398,45 @@ async fn run_automatic_quantum(
                 batches,
                 quantum.elapsed().as_millis(),
             );
-            finish_automatic_quantum(app).await;
-            return Ok(ScheduledSliceResult::complete(false));
+            let maintained = finish_automatic_quantum(app, quantum).await;
+            // Keep the task queued if its final encode lost admission. The
+            // deferred ANN check still needs an idle turn even with no images
+            // left to encode.
+            return Ok(ScheduledSliceResult::complete(!maintained));
         }
     }
 }
 
-async fn finish_automatic_quantum(app: &AppHandle) {
+fn automatic_ann_maintenance_allowed(
+    quantum: &AutomaticSliceContext,
+    semantic: &SemanticRuntimeState,
+    admission_gate: Option<&str>,
+) -> bool {
+    admission_gate.is_none()
+        && !semantic.foreground_waiting()
+        && matches!(
+            quantum.stop_reason(semantic, true),
+            None | Some(AutomaticSliceStopReason::BudgetExpired)
+        )
+}
+
+async fn finish_automatic_quantum(app: &AppHandle, quantum: &AutomaticSliceContext) -> bool {
+    let semantic = app.state::<Arc<SemanticRuntimeState>>();
+    // A search, manual task, or idle/auth change may arrive during the final
+    // encode. Re-check at the maintenance boundary even when the queue drained
+    // normally; ANN rebuilding can take much longer than one model request.
+    if !automatic_ann_maintenance_allowed(
+        quantum,
+        &semantic,
+        crate::background_scheduler::gate_reason(app, false),
+    ) {
+        return false;
+    }
+    rebuild_ann(app).await;
+    true
+}
+
+async fn rebuild_ann(app: &AppHandle) {
     if let Err(error) = crate::clip_ann::maybe_rebuild(app, false).await {
         tracing::warn!("[CLIP:ANN] scheduled rebuild failed: {error}");
     }
@@ -439,7 +473,7 @@ async fn run_scheduled_request(
         return Ok(ScheduledSliceResult::skipped(reason));
     }
     if run_ann_maintenance {
-        finish_automatic_quantum(app).await;
+        rebuild_ann(app).await;
     }
     let backlog = tokio::task::spawn_blocking(move || {
         storage
@@ -1811,6 +1845,55 @@ pub async fn set_clip_backfill_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_ann_maintenance_stands_down_for_foreground_and_admission_gates() {
+        let quantum = AutomaticSliceContext::new(
+            Duration::from_secs(60),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            0,
+        );
+        let semantic = Arc::new(SemanticRuntimeState::new());
+        let foreground = semantic.foreground_lease();
+        assert!(!automatic_ann_maintenance_allowed(
+            &quantum, &semantic, None
+        ));
+        drop(foreground);
+
+        for reason in [
+            "waiting_for_idle",
+            "waiting_for_ac_power",
+            "waiting_for_fullscreen",
+            "waiting_for_unlock",
+            "maintenance",
+        ] {
+            assert!(!automatic_ann_maintenance_allowed(
+                &quantum,
+                &semantic,
+                Some(reason),
+            ));
+        }
+        assert!(automatic_ann_maintenance_allowed(&quantum, &semantic, None));
+    }
+
+    #[test]
+    fn automatic_ann_maintenance_yields_to_pending_work_even_after_budget_expiry() {
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let quantum = AutomaticSliceContext::new(Duration::ZERO, generation.clone(), 0);
+        let semantic = Arc::new(SemanticRuntimeState::new());
+        // Budget expiry alone is a normal completion and may maintain the ANN.
+        assert!(automatic_ann_maintenance_allowed(&quantum, &semantic, None));
+
+        let external = semantic.external_background_lease();
+        assert!(!automatic_ann_maintenance_allowed(
+            &quantum, &semantic, None
+        ));
+        drop(external);
+        generation.fetch_add(1, Ordering::SeqCst);
+        assert!(!automatic_ann_maintenance_allowed(
+            &quantum, &semantic, None
+        ));
+    }
 
     fn prepared(bytes: usize, age: Duration) -> PreparedCapture {
         PreparedCapture {
