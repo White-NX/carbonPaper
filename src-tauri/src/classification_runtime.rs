@@ -273,6 +273,13 @@ pub async fn embed_bge_texts(
     let started = Instant::now();
     let deadline = started + EMBED_TIMEOUT;
     let state = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
+    let scheduler = app
+        .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        .map(|state| state.inner().clone());
+    let external_background = state.external_background_lease();
+    if let Some(scheduler) = &scheduler {
+        scheduler.wake();
+    }
     let result = async {
         // Do not claim the background scheduler while a foreground query is
         // already active. Re-checking inside `embed_bge_chunks` closes the race
@@ -287,6 +294,10 @@ pub async fn embed_bge_texts(
         embed_bge_chunks(&app, &state, &texts, deadline).await
     }
     .await;
+    drop(external_background);
+    if let Some(scheduler) = &scheduler {
+        scheduler.wake();
+    }
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     match result {
