@@ -801,13 +801,7 @@ pub fn run() {
     // Resolve the experiment switch once. The resulting policy is carried by
     // StorageState so reopens after restore or directory migration cannot
     // change mode halfway through a process.
-    let database_mode_policy = match database_mode_policy_from_environment() {
-        Ok(policy) => policy,
-        Err(error) => {
-            tracing::error!("Database journal mode experiment configuration is invalid: {error}");
-            return;
-        }
-    };
+    let database_mode_policy = database_mode_policy_from_environment();
     tracing::info!(
         "Database startup journal mode policy target={} wal_experiment={} debug_build={}",
         database_mode_policy.as_str(),

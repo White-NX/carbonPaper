@@ -12,13 +12,16 @@ impl StorageState {
     pub fn list_distinct_processes(&self) -> Result<Vec<(String, i64)>, String> {
         let fn_start = std::time::Instant::now();
 
-        // Phase 1: SQL aggregation + extract encrypted-only rows (hold mutex)
+        // Phase 1: aggregate and extract encrypted-only rows in one read
+        // snapshot, so a concurrent plaintext backfill cannot omit/double-count a row.
         let (mut counts, encrypted_rows): (
             std::collections::HashMap<String, i64>,
             Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>,
         ) = {
-            let guard = self.get_connection_named("list_distinct_processes")?;
-            let conn = guard.as_ref().unwrap();
+            let reader = self.open_read_connection_named("list_distinct_processes")?;
+            let conn = reader
+                .unchecked_transaction()
+                .map_err(|e| format!("Failed to start process statistics read: {}", e))?;
 
             // Fast path: aggregate plaintext process_name via SQL.
             //
@@ -71,12 +74,17 @@ impl StorageState {
                 .filter_map(|r| r.ok())
                 .collect();
 
+            drop(enc_stmt);
+            drop(stmt);
+            conn.commit()
+                .map_err(|e| format!("Failed to finish process statistics read: {}", e))?;
             (counts, enc_rows)
-            // guard dropped — mutex released
+            // The read connection and its maintenance permit are released here.
         };
         let query_dur = fn_start.elapsed();
 
-        // Phase 2: Decrypt old records outside mutex (only if user has authenticated)
+        // Phase 2: decrypt old records after closing the read connection
+        // (only if the user has authenticated).
         let session_valid = self.credential_state.is_session_valid();
         let skipped_encrypted = !session_valid && !encrypted_rows.is_empty();
         if session_valid {

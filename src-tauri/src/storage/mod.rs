@@ -505,6 +505,13 @@ impl StorageState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::{params, TransactionBehavior};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const READ_TEST_TIMESTAMP: i64 = 1_700_000_040;
+    const THREAD_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn test_storage() -> (tempfile::TempDir, StorageState) {
         let temp = tempfile::tempdir().expect("create temporary storage directory");
@@ -565,5 +572,230 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error, "Database not initialized");
+    }
+
+    fn initialized_read_storage(
+        policy: mode::DatabaseModePolicy,
+    ) -> (tempfile::TempDir, Arc<StorageState>) {
+        let temp = tempfile::tempdir().expect("temporary encrypted storage");
+        let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
+        // These reads need only a SQLCipher key derived from the public bytes.
+        // No test creates or unlocks the user's Windows CNG key.
+        crate::credential_manager::save_public_key_to_file(&credential, b"read-test-public-key")
+            .unwrap();
+        let storage = Arc::new(StorageState::new_with_mode_policy(
+            temp.path().to_path_buf(),
+            credential,
+            policy,
+        ));
+        storage.initialize().expect("initialize encrypted storage");
+        assert_eq!(
+            storage
+                .database_mode_metadata()
+                .unwrap()
+                .actual_journal_mode,
+            policy.as_str()
+        );
+        {
+            let guard = storage.get_connection_named("seed_read_fixture").unwrap();
+            let conn = guard.as_ref().unwrap();
+            conn.execute_batch(
+                "INSERT INTO screenshots
+                    (id, image_path, image_hash, process_name, created_at, is_deleted)
+                 VALUES
+                    (1, 'one.enc', 'one', 'Editor', '2023-11-14 22:14:00', 0),
+                    (2, 'two.enc', 'two', 'Editor', '2023-11-14 22:14:10', 0),
+                    (3, 'three.enc', 'three', 'Browser', '2023-11-14 22:15:00', 0),
+                    (4, 'deleted.enc', 'deleted', 'Deleted', '2023-11-14 22:14:00', 1);",
+            )
+            .unwrap();
+            for (id, screenshot_id, x, y, deleted) in [
+                (10, 1, 20.0, 5.0, 0),
+                (11, 1, 0.0, 5.0, 0),
+                (12, 1, 0.0, 25.0, 0),
+                (13, 1, 0.0, 0.0, 1),
+                (14, 2, 0.0, 0.0, 0),
+            ] {
+                conn.execute(
+                    "INSERT INTO ocr_results
+                        (id, screenshot_id, text_hash, text, confidence,
+                         box_x1, box_y1, box_x2, box_y2, box_x3, box_y3, box_x4, box_y4,
+                         created_at, is_deleted)
+                     VALUES (?1, ?2, '', 'legacy plaintext', 0.75,
+                             ?3, ?4, ?5, ?4, ?5, ?6, ?3, ?6,
+                             '2023-11-14 22:14:00', ?7)",
+                    params![id, screenshot_id, x, y, x + 10.0, y + 10.0, deleted],
+                )
+                .unwrap();
+            }
+        }
+        (temp, storage)
+    }
+
+    fn assert_read_fixture(storage: &StorageState, browser_process: &str) {
+        let ocr = storage.get_screenshot_ocr_results(1).expect("OCR detail");
+        assert_eq!(
+            ocr.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [11, 10, 12]
+        );
+        assert!(ocr
+            .iter()
+            .all(|row| row.screenshot_id == 1 && row.text.is_empty()));
+        assert_eq!(ocr[0].confidence, 0.75);
+        assert_eq!(
+            ocr[0].box_coords,
+            vec![
+                vec![0.0, 5.0],
+                vec![10.0, 5.0],
+                vec![10.0, 15.0],
+                vec![0.0, 15.0]
+            ]
+        );
+        assert_eq!(
+            ocr[0].created_at,
+            wire_time::from_sqlite_utc("2023-11-14 22:14:00")
+        );
+
+        let density = storage
+            .get_screenshot_density(
+                READ_TEST_TIMESTAMP as f64,
+                (READ_TEST_TIMESTAMP + 120) as f64,
+                60,
+                0,
+            )
+            .expect("timeline density");
+        assert_eq!(
+            density
+                .iter()
+                .map(|bucket| (bucket.timestamp, bucket.count))
+                .collect::<Vec<_>>(),
+            [(READ_TEST_TIMESTAMP, 2), (READ_TEST_TIMESTAMP + 60, 1)]
+        );
+        assert_eq!(
+            storage
+                .list_distinct_processes()
+                .expect("process statistics"),
+            vec![("Editor".to_string(), 2), (browser_process.to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn ui_reads_finish_while_primary_writer_is_held() {
+        for policy in [
+            mode::DatabaseModePolicy::Wal,
+            mode::DatabaseModePolicy::Delete,
+        ] {
+            let (_temp, storage) = initialized_read_storage(policy);
+            let mut primary = storage.get_connection_named("held_primary_writer").unwrap();
+            let tx = primary
+                .as_mut()
+                .unwrap()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE screenshots SET process_name = 'Updated' WHERE id = 3",
+                [],
+            )
+            .unwrap();
+
+            let reader_storage = Arc::clone(&storage);
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let reader = thread::spawn(move || {
+                // All three application entry points must finish before the
+                // writer releases its mutex, and see only committed records.
+                assert_read_fixture(&reader_storage, "Browser");
+                finished_tx.send(()).unwrap();
+            });
+            let finished = finished_rx.recv_timeout(THREAD_TIMEOUT);
+            let write_result = if finished.is_ok() {
+                tx.commit()
+            } else {
+                tx.rollback()
+            };
+            // Release the writer even on failure so a regressed reader can exit.
+            drop(primary);
+            reader.join().expect("read worker exits");
+            finished.expect("UI reads must not wait for the primary database mutex");
+            write_result.expect("writer commits after concurrent reads");
+            assert_read_fixture(&storage, "Updated");
+        }
+    }
+
+    #[test]
+    fn shutdown_drains_independent_reads_and_reopens_storage() {
+        for policy in [
+            mode::DatabaseModePolicy::Wal,
+            mode::DatabaseModePolicy::Delete,
+        ] {
+            let (_temp, storage) = initialized_read_storage(policy);
+            assert_read_fixture(&storage, "Browser");
+            drop(
+                storage
+                    .try_database_maintenance("after_ui_reads")
+                    .expect("UI reads release permits"),
+            );
+            let generation = storage.db_generation();
+            let reader = storage
+                .open_read_connection_named("held_read_transaction")
+                .unwrap();
+            reader
+                .execute_batch("BEGIN; SELECT id FROM screenshots LIMIT 1;")
+                .unwrap();
+            assert!(storage
+                .try_database_maintenance("held_reader_check")
+                .is_none());
+
+            let shutdown_storage = Arc::clone(&storage);
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let shutdown = thread::spawn(move || {
+                finished_tx.send(shutdown_storage.shutdown()).unwrap();
+            });
+            let deadline = Instant::now() + THREAD_TIMEOUT;
+            while !storage.is_database_maintenance_pending()
+                && !shutdown.is_finished()
+                && Instant::now() < deadline
+            {
+                thread::yield_now();
+            }
+            let pending = storage.is_database_maintenance_pending();
+            let early_completion = finished_rx.try_recv().ok();
+            let closed_early = early_completion.is_some();
+            drop(reader);
+            let result = early_completion.unwrap_or_else(|| {
+                finished_rx
+                    .recv_timeout(THREAD_TIMEOUT)
+                    .expect("shutdown finishes after reader closes")
+            });
+            shutdown.join().expect("shutdown worker exits");
+            result.expect("storage shutdown succeeds");
+            assert!(pending, "shutdown must wait for independent readers");
+            assert!(
+                !closed_early,
+                "shutdown must not overtake a live read connection"
+            );
+            assert!(!storage.is_initialized());
+
+            storage.initialize().expect("reopen after maintenance");
+            assert!(storage.db_generation() > generation);
+            assert_read_fixture(&storage, "Browser");
+            let committed = storage
+                .commit_screenshot(1, None, Some("work"), None)
+                .unwrap();
+            assert_eq!(committed.screenshot_id, Some(1));
+            {
+                let read = storage
+                    .open_read_connection_named("verify_reopened_write")
+                    .unwrap();
+                let record: (String, String) = read
+                    .query_row(
+                        "SELECT status, category FROM screenshots WHERE id = 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(record, ("committed".to_string(), "work".to_string()));
+            }
+            storage.shutdown().expect("subsequent shutdown succeeds");
+        }
     }
 }
