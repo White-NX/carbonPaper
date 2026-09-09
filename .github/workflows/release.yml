@@ -63,6 +63,12 @@ jobs:
       - name: Build Rust semantic worker
         run: npm run build:semantic-ml:release
 
+      - name: Build app-bound service and Python launcher
+        run: npm run build:protected:release
+
+      - name: Test app-bound lifecycle and manifest validation
+        run: npm run test:app-bound
+
       - name: Smoke test bundled Rust OCR runtime
         run: npm run verify:ml-runtime
 
@@ -79,11 +85,14 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
         with:
           tagName: ${{ github.ref_name }}
           releaseDraft: true
 
       - name: Build portable zip
+        env:
+          CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
         run: npm run pack:portable
 
       - name: Verify release assets after packaging
@@ -132,6 +141,8 @@ jobs:
 
       - name: Build forward update smoke target
         shell: pwsh
+        env:
+          CARBONPAPER_UPDATE_SIGNING_KEY: ${{ secrets.CARBONPAPER_UPDATE_SIGNING_KEY }}
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
           $core = ($version -split '[-+]')[0]
