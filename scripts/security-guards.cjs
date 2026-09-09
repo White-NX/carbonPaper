@@ -3,6 +3,11 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const COMMAND_TIERS = {
+  'app_bound::app_bound_status': 'public',
+  'app_bound::app_bound_acknowledge_offer': 'public',
+  'app_bound::app_bound_set_policy': 'session_required',
+  'app_bound::app_bound_install': 'session_required',
+  'app_bound::app_bound_uninstall': 'session_required',
   'commands::utility::close_process': 'lifecycle_public',
   'commands::utility::set_app_language': 'public',
   'monitor::start_monitor': 'runtime_public',

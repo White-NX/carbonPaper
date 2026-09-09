@@ -26,6 +26,7 @@ const rootWorkerOutputs = [
   path.join(tauriDir, 'target', profile, 'carbonpaper-ml.exe'),
   path.join(tauriDir, 'target', profile, 'carbonpaper-office.exe'),
   path.join(tauriDir, 'target', profile, 'carbonpaper-nmh.exe'),
+  path.join(tauriDir, 'target', profile, 'carbonpaper-python.exe'),
 ];
 
 const semanticOutputs = [
@@ -38,6 +39,7 @@ const rootWorkerPrebundleOutputs = [
   path.join(tauriDir, 'pre-bundle', 'carbonpaper-ml.exe'),
   path.join(tauriDir, 'pre-bundle', 'carbonpaper-office.exe'),
   path.join(tauriDir, 'pre-bundle', 'carbonpaper-nmh.exe'),
+  path.join(tauriDir, 'pre-bundle', 'carbonpaper-python.exe'),
 ];
 
 function walkRustFiles(directory) {
@@ -73,6 +75,10 @@ function rootInputFiles() {
     path.join(tauriDir, 'src', 'office_protocol.rs'),
     path.join(tauriDir, 'src', 'office_window.rs'),
     path.join(tauriDir, 'src', 'bin', 'nmh.rs'),
+    path.join(tauriDir, 'src', 'bin', 'python.rs'),
+    path.join(tauriDir, 'src', 'python_launcher.rs'),
+    ...walkRustFiles(path.join(tauriDir, 'app-bound', 'src')),
+    path.join(tauriDir, 'app-bound', 'Cargo.toml'),
   ].sort();
 }
 
@@ -258,6 +264,8 @@ if (rootChanged) {
       'carbonpaper-office',
       '--bin',
       'carbonpaper-nmh',
+      '--bin',
+      'carbonpaper-python',
     ],
     { cwd: root, stdio: 'inherit' },
   );

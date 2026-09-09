@@ -329,6 +329,19 @@ pub async fn run_scheduled_slice(
     manual: bool,
     quantum: Option<&AutomaticSliceContext>,
 ) -> Result<ScheduledSliceResult, String> {
+    if !manual
+        && app
+            .state::<Arc<StorageState>>()
+            .processing_stage
+            .has_ready(carbonpaper_app_bound::protocol::Consumer::Clip)
+    {
+        return crate::processing_stage::run_model_slice(
+            app,
+            carbonpaper_app_bound::protocol::Consumer::Clip,
+            quantum,
+        )
+        .await;
+    }
     if !manual && quantum.is_some() {
         return run_automatic_quantum(app, quantum.expect("quantum context")).await;
     }

@@ -72,6 +72,23 @@ fn write_nm_manifest(extension_ids: &[&str]) -> Result<PathBuf, String> {
 }
 
 /// Register NM host in Windows Registry for a specific browser
+pub(crate) fn refresh_protected_host_paths() -> Result<(), String> {
+    let chrome = is_nm_host_registered(CHROME_REG_KEY);
+    let edge = is_nm_host_registered(EDGE_REG_KEY);
+    if !chrome && !edge {
+        return Ok(());
+    }
+    let manifest = write_nm_manifest(&[EXTENSION_ID])?;
+    if chrome {
+        register_nm_host(CHROME_REG_KEY, &manifest)?;
+    }
+    if edge {
+        register_nm_host(EDGE_REG_KEY, &manifest)?;
+    }
+    Ok(())
+}
+
+/// Register NM host in Windows Registry for a specific browser
 fn register_nm_host(reg_key_path: &str, manifest_path: &std::path::Path) -> Result<(), String> {
     use winreg::enums::*;
     use winreg::RegKey;

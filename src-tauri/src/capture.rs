@@ -2002,7 +2002,18 @@ pub(crate) async fn process_ocr_inner(
     // ledger row is what makes a missed capture observable; the encoding itself
     // is idle-gated in `minilm_index`. A failure here is repaired by that
     // worker's reconciliation pass, so it must not fail the OCR commit.
-    if let Err(error) = crate::minilm_index::enqueue_captured_screenshot(storage, screenshot_id) {
+    let joined_ocr = ocr_results
+        .iter()
+        .map(|r| r.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Err(error) = crate::minilm_index::enqueue_captured_input(
+        storage,
+        screenshot_id,
+        process_name,
+        window_title,
+        &joined_ocr,
+    ) {
         tracing::warn!(
             "[SEMANTIC:INDEX] enqueue failed screenshot_id={}: {}",
             screenshot_id,
@@ -2019,7 +2030,50 @@ pub(crate) async fn process_ocr_inner(
     let has_ocr_text = ocr_results
         .iter()
         .any(|result| !result.text.trim().is_empty());
-    if has_ocr_text {
+    let stage_storage = app.state::<Arc<StorageState>>().inner().clone();
+    let stage_pixels = clip_pixels.clone();
+    let stage_hash = image_hash.to_string();
+    let stage_title = window_title.to_string();
+    let stage_process = process_name.to_string();
+    let staged = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        if !stage_storage.background_processing_enabled() {
+            return Ok(false);
+        }
+        if stage_storage.processing_stage.status().reason.is_none()
+            && !stage_storage.processing_stage.available()
+        {
+            let _ = stage_storage.processing_stage.refresh();
+        }
+        if !stage_storage.processing_stage.available() {
+            return Ok(false);
+        }
+        let (input, consumers) = crate::processing_stage::captured_input(
+            screenshot_id,
+            &stage_storage,
+            &stage_hash,
+            &stage_title,
+            &stage_process,
+            timestamp_ms,
+            joined_ocr,
+            &stage_pixels,
+        )?;
+        stage_storage
+            .processing_stage
+            .stage(screenshot_id, &input, consumers)
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.to_string()));
+    let staged = match staged {
+        Ok(staged) => staged,
+        Err(_) => {
+            tracing::warn!(
+                "[APP_BOUND] capture input staging deferred screenshot_id={}",
+                screenshot_id
+            );
+            false
+        }
+    };
+    if has_ocr_text && !staged {
         // Resize to the CLIP input while the plaintext is still here, so the
         // encode never has to read the encrypted file back. Blocking because
         // the resize is real CPU work — roughly 0.25 s per source megapixel —
@@ -2071,6 +2125,9 @@ pub(crate) async fn process_ocr_inner(
             crate::background_scheduler::BackgroundTaskKind::ClipIndex,
             false,
         );
+    }
+    if staged {
+        return Ok(());
     }
     match enqueue_ocr_postprocess(
         app,

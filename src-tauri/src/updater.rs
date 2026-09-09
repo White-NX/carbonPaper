@@ -643,6 +643,17 @@ async fn updater_apply_impl(
         std::env::current_exe().map_err(|e| format!("Failed to get current exe path: {}", e))?;
     let app_dir = current_exe.parent().ok_or("Failed to get app directory")?;
 
+    if crate::app_bound::uses_protected_installation() {
+        // Cancellation leaves the current application and monitor running.
+        crate::app_bound::install_runtime(extract_dir.clone(), false).await?;
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(15),
+            crate::monitor::stop_monitor_impl(monitor_state, capture_state, app.clone()),
+        )
+        .await;
+        return crate::app_bound::schedule_restart(&app);
+    }
+
     let app_dir_str = normalize_path_for_command(app_dir);
     let extract_dir_str = normalize_path_for_command(&extract_dir);
     let staging_dir_str = normalize_path_for_command(&staging);

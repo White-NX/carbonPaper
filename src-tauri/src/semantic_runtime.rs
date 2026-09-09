@@ -1319,6 +1319,9 @@ fn prepend_runtime_search_path(
 }
 
 fn resolve_semantic_executable(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(path) = crate::app_bound::protected_resource("carbonpaper-semantic-worker.exe")? {
+        return Ok(path);
+    }
     if let Some(path) = find_existing_file_in_resources(app, "carbonpaper-semantic-worker.exe") {
         return Ok(path);
     }
@@ -1342,6 +1345,14 @@ fn resolve_semantic_executable(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn resolve_ort_dylib(app: &AppHandle, executable: &std::path::Path) -> Result<PathBuf, String> {
+    if let Some(path) = crate::app_bound::protected_resource("onnxruntime/1.24.2/onnxruntime.dll")?
+    {
+        crate::app_bound::protected_resource(
+            "onnxruntime/1.24.2/onnxruntime_providers_shared.dll",
+        )?;
+        crate::app_bound::protected_resource("onnxruntime/1.24.2/DirectML.dll")?;
+        return Ok(path);
+    }
     let mut candidates = Vec::new();
     if let Ok(path) = std::env::var("CARBONPAPER_ORT_DYLIB_PATH") {
         candidates.push(PathBuf::from(path));

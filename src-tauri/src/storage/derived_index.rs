@@ -705,6 +705,33 @@ impl StorageState {
     /// If either write fails, the transaction rolls back and no partial vector
     /// becomes query-visible.
     pub fn commit_derived_embedding(&self, write: &DerivedEmbeddingWrite) -> Result<(), String> {
+        self.commit_derived_embedding_with_receipt(write, None)
+    }
+
+    pub(crate) fn commit_staged_embedding(
+        &self,
+        write: &DerivedEmbeddingWrite,
+        receipt: &crate::processing_stage::TaskReceipt,
+    ) -> Result<(), String> {
+        self.processing_stage.check_receipt(receipt)?;
+        use carbonpaper_app_bound::protocol::Consumer;
+        if !matches!(
+            (receipt.consumer, write.job.index_kind),
+            (Consumer::MiniLm, DerivedIndexKind::SemanticText)
+                | (Consumer::Clip, DerivedIndexKind::ClipImage)
+        ) || (receipt.consumer == Consumer::MiniLm
+            && write.job.subject_key != receipt.screenshot_id.to_string())
+        {
+            return Err("Staged embedding scope mismatch".into());
+        }
+        self.commit_derived_embedding_with_receipt(write, Some(receipt))
+    }
+
+    fn commit_derived_embedding_with_receipt(
+        &self,
+        write: &DerivedEmbeddingWrite,
+        receipt: Option<&crate::processing_stage::TaskReceipt>,
+    ) -> Result<(), String> {
         validate_job_spec(&write.job)?;
         validate_required_text("lease_token", &write.lease_token, MAX_METADATA_BYTES)?;
         let vector_blob = encode_vector(&write.vector)?;
@@ -715,6 +742,25 @@ impl StorageState {
         // Sampled before the write so the resident cache can tell "I was
         // current and this is my delta" from "I already missed something".
         let epoch_before = Some(read_derived_data_epoch(conn, write.job.index_kind)?);
+        if let Some(receipt) = receipt {
+            if !self.processing_stage.available()
+                || !self.staged_source_current_on_conn(conn, receipt)?
+            {
+                return Err("Staged input changed before embedding commit".into());
+            }
+            if write.job.index_kind == DerivedIndexKind::ClipImage {
+                let matches: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM screenshots WHERE id=?1 AND image_hash=?2)",
+                        params![receipt.screenshot_id, write.job.subject_key],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if !matches {
+                    return Err("Staged image scope mismatch".into());
+                }
+            }
+        }
         let tx = conn
             .transaction()
             .map_err(|error| format!("Failed to start derived embedding transaction: {error}"))?;
@@ -777,6 +823,9 @@ impl StorageState {
             ],
         )
         .map_err(|error| format!("Failed to write derived embedding: {error}"))?;
+        if let Some(receipt) = receipt {
+            Self::record_staged_receipt_on_conn(&tx, receipt)?;
+        }
         tx.commit()
             .map_err(|error| format!("Failed to commit derived embedding: {error}"))?;
         if let Some(epoch_before) = epoch_before {

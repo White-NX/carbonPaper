@@ -5,6 +5,7 @@
 
 mod analysis;
 mod ann_format;
+mod app_bound;
 mod autostart;
 mod background_scheduler;
 mod blind_index_repair;
@@ -43,8 +44,9 @@ mod office_protocol;
 mod office_runtime;
 mod office_window;
 mod power;
+mod processing_stage;
 mod python;
-mod python_launcher;
+pub use app_bound::delegate_startup as delegate_protected_runtime;
 mod registry_config;
 mod rerank;
 mod resource_utils;
@@ -795,6 +797,10 @@ fn cancel_auto_lightweight_timer(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if app_bound::is_protected_runtime() {
+        let _ = autostart::refresh_protected_autostart();
+        let _ = native_messaging::refresh_protected_host_paths();
+    }
     let data_dir = get_data_dir();
     let _log_guard = logging::init_logging(&data_dir);
 
@@ -1003,14 +1009,14 @@ pub fn run() {
                         let office_storage = storage.inner().clone();
                         office_runtime.start(app.handle().clone(), office_storage);
 
-                        match storage.discard_incomplete_ocr_postprocess() {
-                            Ok(discarded) if discarded > 0 => tracing::info!(
-                                "[ML:POSTPROCESS] discarded {} incomplete rows from the previous application process",
-                                discarded
+                        match storage.recover_incomplete_ocr_postprocess() {
+                            Ok(recovered) if recovered > 0 => tracing::info!(
+                                "[ML:POSTPROCESS] recovered {} incomplete rows from the previous application process",
+                                recovered
                             ),
                             Ok(_) => {}
                             Err(error) => tracing::warn!(
-                                "[ML:POSTPROCESS] failed to discard incomplete startup rows: {}",
+                                "[ML:POSTPROCESS] failed to recover incomplete startup rows: {}",
                                 error
                             ),
                         }
@@ -1327,6 +1333,11 @@ pub fn run() {
             commands::credential::credential_get_session_timeout,
             commands::credential::credential_get_background_processing_enabled,
             commands::credential::credential_set_background_processing_enabled,
+            app_bound::app_bound_status,
+            app_bound::app_bound_acknowledge_offer,
+            app_bound::app_bound_set_policy,
+            app_bound::app_bound_install,
+            app_bound::app_bound_uninstall,
             background_scheduler::background_scheduler_status,
             get_autostart_status,
             set_autostart,
@@ -1453,10 +1464,6 @@ mod tests {
             MouseButtonState::Up
         ));
     }
-}
-
-pub fn run_python_launcher(args: &[String]) -> i32 {
-    python_launcher::run_python_launcher(args)
 }
 
 pub fn run_cng_unlock(key_file_path: &str, owner_hwnd: Option<isize>) {

@@ -81,6 +81,7 @@ READ_RETRY_COMMANDS = {
 }
 
 IDEMPOTENT_RETRY_COMMANDS = {
+    'complete_staged_postprocess',
     'update_screenshot_category',
     'set_ocr_postprocess_status',
     'record_ocr_postprocess_retry',
@@ -788,6 +789,22 @@ class StorageClient:
         if response.get('status') == 'success':
             return bool(response.get('data', {}).get('background_authorized', False))
         return False
+
+    def complete_staged_postprocess(self, receipt: Dict[str, Any], category=None, confidence=None) -> None:
+        """Commit a single leased classification result through its Rust fence."""
+        response = self._send_request({
+            'command': 'complete_staged_postprocess', 'receipt': receipt,
+            'category': category, 'confidence': confidence,
+        })
+        if response.get('status') != 'success':
+            raise RuntimeError('Staged classification result was not accepted')
+
+    def defer_staged_postprocess(self, receipt: Dict[str, Any], failed: bool = False) -> None:
+        response = self._send_request({
+            'command': 'defer_staged_postprocess', 'receipt': receipt, 'failed': bool(failed),
+        })
+        if response.get('status') != 'success':
+            raise RuntimeError('Staged classification lease is no longer active')
 
     def set_ocr_postprocess_status(
         self,

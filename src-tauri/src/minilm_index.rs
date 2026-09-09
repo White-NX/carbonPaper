@@ -292,19 +292,57 @@ pub(crate) fn minilm_sources(
 /// A failure here is recoverable and not worth failing the capture over: the
 /// worker's reconciliation pass finds any screenshot that has an OCR row and no
 /// ledger row, which is exactly what a missed enqueue leaves behind.
-pub fn enqueue_captured_screenshot(
+///
+/// Capture already owns the plaintext; constructing its ledger contract must
+/// not pay a private-key read or depend on an unlocked UI session.
+pub(crate) fn enqueue_captured_input(
     storage: &StorageState,
-    screenshot_id: i64,
+    id: i64,
+    process: &str,
+    title: &str,
+    ocr: &str,
 ) -> Result<(), String> {
-    let sources = minilm_sources(storage, &[screenshot_id]).map_err(|error| error.to_string())?;
-    if let Some(source) = sources.indexable.get(&screenshot_id) {
-        storage.ensure_derived_index_job(&source.spec)?;
-        return Ok(());
-    }
-    if let Some(spec) = sources.excluded.get(&screenshot_id) {
-        storage.exclude_derived_index_subject(spec, EMPTY_SOURCE_CODE, EMPTY_SOURCE_REASON)?;
+    let text = build_minilm_task_text(process, title, ocr);
+    let spec = minilm_job_spec(id, &text);
+    if text.trim().is_empty() {
+        storage.exclude_derived_index_subject(&spec, EMPTY_SOURCE_CODE, EMPTY_SOURCE_REASON)?;
+    } else {
+        storage.ensure_derived_index_job(&spec)?;
     }
     Ok(())
+}
+
+pub(crate) async fn mirror_staged_result(
+    app: &AppHandle,
+    id: i64,
+    input: &crate::processing_stage::ProcessingInput,
+    text: String,
+    vector: Vec<f32>,
+) {
+    let indexed = staged_subject(id, input, text, vector);
+    let storage = app.state::<Arc<StorageState>>();
+    let _ = storage.enqueue_smart_cluster_pending(id);
+    mirror_to_chroma(app, &[indexed]).await;
+}
+
+fn staged_subject(
+    id: i64,
+    input: &crate::processing_stage::ProcessingInput,
+    text: String,
+    vector: Vec<f32>,
+) -> IndexedSubject {
+    IndexedSubject {
+        id,
+        text,
+        vector,
+        summary: BackgroundScreenshotSummary {
+            id,
+            window_title: Some(input.window_title.clone()),
+            process_name: Some(input.process_name.clone()),
+            timestamp: Some(input.timestamp_ms.div_euclid(1000)),
+            category: None,
+        },
+    }
 }
 
 /// Execute one automatic MiniLM maintenance/encode slice, or a complete manual
@@ -315,6 +353,19 @@ pub async fn run_scheduled_slice(
     manual: bool,
     quantum: Option<&AutomaticSliceContext>,
 ) -> Result<ScheduledSliceResult, String> {
+    if !manual
+        && app
+            .state::<Arc<StorageState>>()
+            .processing_stage
+            .has_ready(carbonpaper_app_bound::protocol::Consumer::MiniLm)
+    {
+        return crate::processing_stage::run_model_slice(
+            app,
+            carbonpaper_app_bound::protocol::Consumer::MiniLm,
+            quantum,
+        )
+        .await;
+    }
     if !manual && quantum.is_some() {
         return run_automatic_quantum(app, quantum.expect("quantum context")).await;
     }
@@ -1736,6 +1787,28 @@ mod tests {
                 category: Some("work".to_string()),
             },
         }
+    }
+
+    #[test]
+    fn a_staged_mirror_uses_epoch_seconds_for_the_clustering_window() {
+        let input = crate::processing_stage::ProcessingInput {
+            image_hash: "hash".into(),
+            window_title: "Title".into(),
+            process_name: "proc.exe".into(),
+            timestamp_ms: 1_700_000_000_123,
+            ocr_text: "OCR".into(),
+            source_revision: 1,
+            clip: None,
+        };
+        let record = mirror_record(&staged_subject(
+            42,
+            &input,
+            "proc.exe | Title | OCR".into(),
+            vec![0.5; crate::minilm_migration::MINILM_DIMENSIONS],
+        ));
+        assert_eq!(record["timestamp"], 1_700_000_000);
+        assert_eq!(record["id"], "42");
+        assert_eq!(record["document"], "proc.exe | Title | OCR");
     }
 
     #[test]

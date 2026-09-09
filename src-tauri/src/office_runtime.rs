@@ -1160,6 +1160,9 @@ fn persist_document_refs(
 }
 
 fn resolve_office_executable(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(path) = crate::app_bound::protected_resource("carbonpaper-office.exe")? {
+        return Ok(path);
+    }
     if let Some(path) = find_existing_file_in_resources(app, "carbonpaper-office.exe") {
         return Ok(path);
     }

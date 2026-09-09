@@ -654,6 +654,26 @@ pub(crate) fn gate_reason(app: &AppHandle, manual: bool) -> Option<&'static str>
     } else if !credential.background_authorized() {
         return Some("waiting_for_unlock");
     }
+    environment_gate_reason(app, manual)
+}
+
+pub(crate) fn gate_reason_for_kind(
+    app: &AppHandle,
+    manual: bool,
+    kind: BackgroundTaskKind,
+) -> Option<&'static str> {
+    if !manual {
+        let storage = app.state::<Arc<StorageState>>();
+        if storage.background_processing_enabled()
+            && crate::processing_stage::ready_for_kind(&storage, kind)
+        {
+            return environment_gate_reason(app, false);
+        }
+    }
+    gate_reason(app, manual)
+}
+
+pub(crate) fn environment_gate_reason(app: &AppHandle, manual: bool) -> Option<&'static str> {
     if crate::maintenance::is_active() {
         return Some("maintenance");
     }
@@ -959,11 +979,12 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
         let now = now_ms();
         let selected =
             select_next_runnable_task(&tasks, now, AUTO_AGING_LIMIT.as_millis() as i64, |task| {
-                gate_reason(&app, task.manual_pending).is_none()
-                    && (task.manual_pending
-                        || !app
-                            .state::<Arc<SemanticRuntimeState>>()
-                            .external_background_waiting())
+                BackgroundTaskKind::parse(&task.task_kind).is_some_and(|kind| {
+                    gate_reason_for_kind(&app, task.manual_pending, kind).is_none()
+                }) && (task.manual_pending
+                    || !app
+                        .state::<Arc<SemanticRuntimeState>>()
+                        .external_background_waiting())
             });
         let (kind, manual) = if let Some(selected) = selected {
             selected
@@ -998,7 +1019,7 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 Some("external_background_request".to_string());
             continue;
         }
-        if let Some(reason) = gate_reason(&app, manual) {
+        if let Some(reason) = gate_reason_for_kind(&app, manual, kind) {
             *runtime
                 .blocked_reason
                 .lock()

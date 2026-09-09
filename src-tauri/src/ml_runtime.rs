@@ -903,6 +903,9 @@ fn sha256_file(path: &std::path::Path) -> Result<String, String> {
 }
 
 fn resolve_ml_executable(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(path) = crate::app_bound::protected_resource("carbonpaper-ml.exe")? {
+        return Ok(path);
+    }
     if let Some(path) = find_existing_file_in_resources(app, "carbonpaper-ml.exe") {
         return Ok(path);
     }
@@ -1152,15 +1155,33 @@ pub async fn download_rust_ocr_model(
 }
 
 pub async fn run_postprocess_retry_loop(app: AppHandle) {
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Let storage and the Python monitor finish startup before the first pass.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut maintenance_at = std::time::Instant::now() - Duration::from_secs(30);
     loop {
         interval.tick().await;
-        if let Err(error) = drain_pending_postprocess(&app).await {
-            tracing::debug!("[ML:POSTPROCESS] retry pass deferred: {}", error);
+        if maintenance_at.elapsed() >= Duration::from_secs(30) {
+            maintenance_at = std::time::Instant::now();
+            let storage = app
+                .state::<Arc<crate::storage::StorageState>>()
+                .inner()
+                .clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if storage.background_processing_enabled() {
+                    let _ = storage.processing_stage.refresh();
+                } else {
+                    let _ = storage.processing_stage.disable_if_installed();
+                }
+                let _ = storage.processing_stage.reconcile(&storage);
+            })
+            .await;
+            if let Err(error) = drain_pending_postprocess(&app).await {
+                tracing::debug!("[ML:POSTPROCESS] retry pass deferred: {}", error);
+            }
         }
+        let _ = crate::processing_stage::dispatch_classification(&app).await;
     }
 }
 
@@ -1189,12 +1210,23 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
         .state::<Arc<crate::storage::StorageState>>()
         .inner()
         .clone();
-    if !storage.is_session_valid() {
+    if !storage.is_silent_read_authorized() {
         return Ok(());
     }
     let ids = storage.list_pending_ocr_postprocess_ids(10)?;
     for screenshot_id in ids {
-        let Some(record) = storage.get_screenshot_by_id(screenshot_id)? else {
+        if storage.processing_stage.owns_screenshot(
+            screenshot_id,
+            carbonpaper_app_bound::protocol::Consumer::Classification,
+        ) {
+            continue;
+        }
+        let Some(record) = storage
+            .get_screenshot_summaries_by_ids_silent(&[screenshot_id])
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+        else {
             continue;
         };
         let ocr_results = match storage.get_screenshot_ocr_results_silent(screenshot_id) {
@@ -1222,7 +1254,7 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
         let enqueue_result = crate::capture::enqueue_ocr_postprocess(
             app,
             screenshot_id,
-            &record.image_hash,
+            "",
             record.window_title.as_deref().unwrap_or(""),
             record.process_name.as_deref().unwrap_or(""),
             record
