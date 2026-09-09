@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 use windows::{
-    core::PCWSTR,
+    core::{PCWSTR, PWSTR},
     Win32::{
         Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
         System::Services::*,
@@ -476,7 +476,7 @@ fn configure_service(path: &Path) -> Result<()> {
             )
             .map_err(|_| BrokerError::AccessDenied)?,
         );
-        match OpenServiceW(manager.0, PCWSTR(name.as_ptr()), SERVICE_CHANGE_CONFIG) {
+        let service = match OpenServiceW(manager.0, PCWSTR(name.as_ptr()), SERVICE_CHANGE_CONFIG) {
             Ok(handle) => {
                 let handle = ServiceHandle(handle);
                 ChangeServiceConfigW(
@@ -493,9 +493,10 @@ fn configure_service(path: &Path) -> Result<()> {
                     PCWSTR(display.as_ptr()),
                 )
                 .map_err(|_| BrokerError::AccessDenied)?;
+                handle
             }
             Err(error) if error.code() == windows::core::HRESULT::from_win32(1060) => {
-                let _handle = ServiceHandle(
+                ServiceHandle(
                     CreateServiceW(
                         manager.0,
                         PCWSTR(name.as_ptr()),
@@ -512,12 +513,47 @@ fn configure_service(path: &Path) -> Result<()> {
                         PCWSTR::null(),
                     )
                     .map_err(|_| BrokerError::AccessDenied)?,
-                );
+                )
             }
             Err(_) => return Err(BrokerError::AccessDenied),
-        }
+        };
+        configure_failure_actions(&service)?;
     }
     Ok(())
+}
+
+fn configure_failure_actions(handle: &ServiceHandle) -> Result<()> {
+    let mut actions = [
+        SC_ACTION {
+            Type: SC_ACTION_RESTART,
+            Delay: 5_000,
+        },
+        SC_ACTION {
+            Type: SC_ACTION_RESTART,
+            Delay: 30_000,
+        },
+        SC_ACTION {
+            Type: SC_ACTION_RESTART,
+            Delay: 60_000,
+        },
+    ];
+    let config = SERVICE_FAILURE_ACTIONSW {
+        dwResetPeriod: 24 * 60 * 60,
+        lpRebootMsg: PWSTR::null(),
+        lpCommand: PWSTR::null(),
+        cActions: actions.len() as u32,
+        lpsaActions: actions.as_mut_ptr(),
+    };
+    // SAFETY: SCM copies the configuration synchronously. The action array and
+    // its containing structure remain alive for the duration of this call.
+    unsafe {
+        ChangeServiceConfig2W(
+            handle.0,
+            SERVICE_CONFIG_FAILURE_ACTIONS,
+            Some((&config as *const SERVICE_FAILURE_ACTIONSW).cast()),
+        )
+        .map_err(|_| BrokerError::AccessDenied)
+    }
 }
 
 pub fn stop_service() -> Result<()> {

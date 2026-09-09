@@ -35,6 +35,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static STATUS_HANDLE: AtomicIsize = AtomicIsize::new(0);
+// A task panic releases this guard instead of poisoning the shared ledger.
+type LedgerLock = tokio::sync::Mutex<Ledger>;
 
 pub struct ServiceHandle(pub SC_HANDLE);
 impl Drop for ServiceHandle {
@@ -159,7 +161,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         allow_peer_identity_queries()?;
         let directory = identity::state_root()?;
         identity::assert_protected(&directory)?;
-        let ledger = Arc::new(Mutex::new(Ledger::open(&directory.join("keys.db"))?));
+        let ledger = Arc::new(LedgerLock::new(Ledger::open(&directory.join("keys.db"))?));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -167,10 +169,14 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
             .map_err(|_| BrokerError::Unavailable)?;
         runtime.block_on(serve(ledger))
     });
-    report(
-        SERVICE_STOPPED,
-        if matches!(result, Ok(Ok(()))) { 0 } else { 1 },
-    );
+    if matches!(result, Ok(Ok(()))) || STOP.load(Ordering::SeqCst) {
+        report(SERVICE_STOPPED, 0);
+    } else {
+        // Do not report SERVICE_STOPPED for a fatal result. This lets SCM
+        // classify the process termination as a service failure and apply the
+        // configured restart action.
+        std::process::exit(1);
+    }
 }
 
 fn allow_peer_identity_queries() -> Result<()> {
@@ -278,7 +284,7 @@ fn create_pipe(first: bool) -> Result<NamedPipeServer> {
     }
 }
 
-async fn serve(ledger: Arc<Mutex<Ledger>>) -> Result<()> {
+async fn serve(ledger: Arc<LedgerLock>) -> Result<()> {
     let cache = Arc::new(Mutex::new(HashMap::<String, VerifiedCaller>::new()));
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     let mut pipe = create_pipe(true)?;
@@ -286,10 +292,8 @@ async fn serve(ledger: Arc<Mutex<Ledger>>) -> Result<()> {
     report(SERVICE_RUNNING, 0);
     while !STOP.load(Ordering::SeqCst) {
         if last_maintenance.elapsed() >= Duration::from_secs(30) {
-            ledger
-                .lock()
-                .map_err(|_| BrokerError::Unavailable)?
-                .maintenance(now_secs())?;
+            let mut ledger = ledger.lock().await;
+            ledger.maintenance(now_secs())?;
             last_maintenance = std::time::Instant::now();
         }
         match tokio::time::timeout(Duration::from_millis(500), pipe.connect()).await {
@@ -345,7 +349,7 @@ async fn write_json<T: serde::Serialize>(pipe: &mut NamedPipeServer, value: &T) 
 
 async fn handle_connection(
     mut pipe: NamedPipeServer,
-    ledger: Arc<Mutex<Ledger>>,
+    ledger: Arc<LedgerLock>,
     cache: Arc<Mutex<HashMap<String, VerifiedCaller>>>,
 ) -> Result<()> {
     let principal = {
@@ -380,18 +384,16 @@ async fn handle_connection(
         serde_json::from_slice(&bytes).map_err(|_| BrokerError::InvalidRequest)?;
     frame.validate(&challenge.nonce)?;
     let response = {
-        // No await while impersonating. The protector restores SYSTEM on this
-        // same OS thread before returning, even on an error or Rust unwind.
-        let protector = DpapiProtector {
-            pipe: HANDLE(pipe.as_raw_handle()),
-            sid: &principal.sid,
+        // Acquire the lock before constructing the protector. No await occurs
+        // while impersonating, so the protector stays on one OS thread.
+        let result = {
+            let mut ledger = ledger.lock().await;
+            let protector = DpapiProtector {
+                pipe: HANDLE(pipe.as_raw_handle()),
+                sid: &principal.sid,
+            };
+            ledger.handle(&principal, frame.request, now_secs(), &protector)
         };
-        let result = ledger.lock().map_err(|_| BrokerError::Unavailable)?.handle(
-            &principal,
-            frame.request,
-            now_secs(),
-            &protector,
-        );
         result.unwrap_or_else(Response::Error)
     };
     write_json(&mut pipe, &response).await?;
@@ -506,5 +508,31 @@ impl KeyProtector for DpapiProtector<'_> {
             return Err(BrokerError::Integrity);
         }
         Ok(TaskKey(plaintext.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ledger_lock_is_available_after_a_task_panic() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let ledger = Arc::new(LedgerLock::new(
+            Ledger::open(&directory.path().join("keys.db")).expect("open test ledger"),
+        ));
+        let task_ledger = ledger.clone();
+        let task = tokio::spawn(async move {
+            let _guard = task_ledger.lock().await;
+            panic!("intentional ledger lock panic");
+        });
+
+        assert!(task.await.expect_err("task should panic").is_panic());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), ledger.lock())
+                .await
+                .is_ok(),
+            "ledger lock remained unavailable after task panic"
+        );
     }
 }
