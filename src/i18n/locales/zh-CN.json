@@ -1,4 +1,26 @@
 {
+  "appBound": {
+    "title": "重启后继续后台整理",
+    "description": "空闲时继续整理新记录，即使重启后尚未解锁。解锁后会自动补全关键词搜索。",
+    "installHint": "启用时 Windows 会请求管理员授权，完成后应用会重新启动。",
+    "enable": "启用",
+    "disable": "关闭",
+    "later": "稍后",
+    "working": "正在处理…",
+    "active": "已开启",
+    "inactive": "未开启",
+    "waitingForRepair": "等待组件恢复",
+    "retention": "待处理内容保留天数",
+    "capacity": "暂存容量上限（MiB）",
+    "limitHint": "超出限制的内容会在解锁后继续整理，原始记录仍会保留。",
+    "saveLimits": "保存限制",
+    "repair": "修复组件",
+    "uninstall": "移除后台组件",
+    "cancelled": "已取消，当前设置保持不变。",
+    "backgroundDisabled": "请先开启后台自动整理。",
+    "packageUnavailable": "此构建暂不提供该功能，请使用正式发布的安装包。",
+    "failed": "暂时无法完成操作，请重试或修复后台组件。"
+  },
   "notifications": {
     "ocr_model_repair": {
       "title": "CarbonPaper OCR 模型需要修复",

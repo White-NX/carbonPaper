@@ -1,4 +1,26 @@
 {
+  "appBound": {
+    "title": "Continue processing after a restart",
+    "description": "Process new records while idle, even before unlocking after a restart. Keyword search is completed when you unlock.",
+    "installHint": "Windows will request administrator approval. The app will restart when setup is complete.",
+    "enable": "Enable",
+    "disable": "Turn off",
+    "later": "Later",
+    "working": "Working…",
+    "active": "Enabled",
+    "inactive": "Off",
+    "waitingForRepair": "Waiting for the component to recover",
+    "retention": "Days to keep pending content",
+    "capacity": "Temporary storage limit (MiB)",
+    "limitHint": "Content beyond these limits will be processed after you unlock. Original records are retained.",
+    "saveLimits": "Save limits",
+    "repair": "Repair component",
+    "uninstall": "Remove background component",
+    "cancelled": "Cancelled. Your current settings are unchanged.",
+    "backgroundDisabled": "Enable background processing first.",
+    "packageUnavailable": "This build does not provide this feature. Use an official release package.",
+    "failed": "Unable to complete this operation. Try again or repair the background component."
+  },
   "notifications": {
     "ocr_model_repair": {
       "title": "CarbonPaper OCR model needs repair",
