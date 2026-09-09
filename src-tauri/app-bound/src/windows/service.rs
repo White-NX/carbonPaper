@@ -1,11 +1,12 @@
 use crate::{
     crypto::KeyProtector,
-    ledger::Ledger,
+    ledger::{Ledger, Principal},
     protocol::*,
     windows::identity::{self, wide, VerifiedCaller},
 };
 use std::{
     collections::HashMap,
+    future::Future,
     os::windows::io::AsRawHandle,
     sync::{
         atomic::{AtomicBool, AtomicIsize, Ordering},
@@ -37,6 +38,10 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static STATUS_HANDLE: AtomicIsize = AtomicIsize::new(0);
 // A task panic releases this guard instead of poisoning the shared ledger.
 type LedgerLock = tokio::sync::Mutex<Ledger>;
+const ACCEPT_TIMEOUT: Duration = Duration::from_millis(500);
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(8);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct ServiceHandle(pub SC_HANDLE);
 impl Drop for ServiceHandle {
@@ -164,10 +169,17 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         let ledger = Arc::new(LedgerLock::new(Ledger::open(&directory.join("keys.db"))?));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            // Authority work is synchronous by design. Keep it on a bounded
+            // blocking lane instead of consuming scheduler workers.
+            .max_blocking_threads(1)
             .enable_all()
             .build()
             .map_err(|_| BrokerError::Unavailable)?;
-        runtime.block_on(serve(ledger))
+        let serve_result = runtime.block_on(serve(ledger));
+        // Tokio cannot cancel a blocking task after it has started. Bound runtime
+        // shutdown so a stuck DPAPI or SQLite call cannot prevent service stop.
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        serve_result
     });
     if matches!(result, Ok(Ok(()))) || STOP.load(Ordering::SeqCst) {
         report(SERVICE_STOPPED, 0);
@@ -288,36 +300,69 @@ async fn serve(ledger: Arc<LedgerLock>) -> Result<()> {
     let cache = Arc::new(Mutex::new(HashMap::<String, VerifiedCaller>::new()));
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     let mut pipe = create_pipe(true)?;
-    let mut last_maintenance = std::time::Instant::now();
+    let mut maintenance_task = tokio::spawn(maintenance_loop(ledger.clone()));
+    let mut maintenance_result_consumed = false;
     report(SERVICE_RUNNING, 0);
-    while !STOP.load(Ordering::SeqCst) {
-        if last_maintenance.elapsed() >= Duration::from_secs(30) {
-            let mut ledger = ledger.lock().await;
-            ledger.maintenance(now_secs())?;
-            last_maintenance = std::time::Instant::now();
+    let result = loop {
+        if STOP.load(Ordering::SeqCst) {
+            break Ok(());
         }
-        match tokio::time::timeout(Duration::from_millis(500), pipe.connect()).await {
-            Err(_) => continue,
-            Ok(Err(_)) => return Err(BrokerError::Unavailable),
-            Ok(Ok(())) => {}
+        tokio::select! {
+            maintenance = &mut maintenance_task => {
+                maintenance_result_consumed = true;
+                break match maintenance {
+                    Ok(result) => result,
+                    Err(_) => Err(BrokerError::Unavailable),
+                };
+            }
+            connected = tokio::time::timeout(ACCEPT_TIMEOUT, pipe.connect()) => {
+                match connected {
+                    Err(_) => continue,
+                    Ok(Err(_)) => break Err(BrokerError::Unavailable),
+                    Ok(Ok(())) => {}
+                }
+                let next_pipe = match create_pipe(false) {
+                    Ok(pipe) => pipe,
+                    Err(error) => break Err(error),
+                };
+                let accepted = std::mem::replace(&mut pipe, next_pipe);
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    drop(accepted);
+                    continue;
+                };
+                let ledger = ledger.clone();
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = handle_connection(accepted, ledger, cache).await;
+                });
+            }
         }
-        let accepted = std::mem::replace(&mut pipe, create_pipe(false)?);
-        let Ok(permit) = slots.clone().try_acquire_owned() else {
-            drop(accepted);
-            continue;
-        };
-        let ledger = ledger.clone();
-        let cache = cache.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _ = tokio::time::timeout(
-                Duration::from_secs(8),
-                handle_connection(accepted, ledger, cache),
-            )
-            .await;
-        });
+    };
+    if !maintenance_result_consumed {
+        // A running blocking operation cannot be forcefully cancelled, but the
+        // async maintenance wrapper can stop waiting for its next operation.
+        maintenance_task.abort();
+        let _ = maintenance_task.await;
     }
-    Ok(())
+    result
+}
+
+async fn maintenance_loop(ledger: Arc<LedgerLock>) -> Result<()> {
+    loop {
+        // Sleep after each completed pass so a long maintenance run does not
+        // cause an immediate burst of catch-up passes.
+        tokio::time::sleep(MAINTENANCE_INTERVAL).await;
+        if STOP.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        run_ledger_blocking(
+            ledger.clone(),
+            |ledger| ledger.maintenance(now_secs()),
+            None,
+        )
+        .await?;
+    }
 }
 
 async fn read_frame(pipe: &mut NamedPipeServer) -> Result<Zeroizing<Vec<u8>>> {
@@ -347,12 +392,78 @@ async fn write_json<T: serde::Serialize>(pipe: &mut NamedPipeServer, value: &T) 
         .map_err(|_| BrokerError::Unavailable)
 }
 
-async fn handle_connection(
-    mut pipe: NamedPipeServer,
+async fn with_deadline<F, T>(deadline: tokio::time::Instant, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| BrokerError::Unavailable)?
+}
+
+struct AbortOnDropJoinHandle<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(handle)
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        // This prevents queued blocking work from starting after its async
+        // caller has timed out. A task already running cannot be interrupted.
+        self.0.abort();
+    }
+}
+
+async fn await_blocking<T>(
+    handle: tokio::task::JoinHandle<Result<T>>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<T> {
+    let mut handle = AbortOnDropJoinHandle::new(handle);
+    let joined = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, &mut handle.0)
+            .await
+            .map_err(|_| BrokerError::Unavailable)?,
+        None => (&mut handle.0).await,
+    };
+    joined.map_err(|_| BrokerError::Unavailable)?
+}
+
+async fn run_ledger_blocking<T, F>(
     ledger: Arc<LedgerLock>,
+    operation: F,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Ledger) -> Result<T> + Send + 'static,
+{
+    let mut guard = match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, ledger.lock_owned())
+            .await
+            .map_err(|_| BrokerError::Unavailable)?,
+        None => ledger.lock_owned().await,
+    };
+    // The owned guard and operation move together. If the async caller is
+    // cancelled after this starts, the blocking closure still owns the ledger
+    // and releases it only after the synchronous operation finishes.
+    let handle = tokio::task::spawn_blocking(move || operation(&mut guard));
+    await_blocking(handle, deadline).await
+}
+
+async fn verify_caller_blocking(
+    pipe: NamedPipeServer,
     cache: Arc<Mutex<HashMap<String, VerifiedCaller>>>,
-) -> Result<()> {
-    let principal = {
+    deadline: tokio::time::Instant,
+) -> Result<(NamedPipeServer, Principal)> {
+    // Caller verification can hash a large protected executable on a cache
+    // miss, so keep it off scheduler workers alongside authority operations.
+    // Keep the pipe owned by the blocking closure. A connection deadline may
+    // drop the async future, but DPAPI/identity code must never observe a
+    // handle that was closed by that cancellation.
+    let handle = tokio::task::spawn_blocking(move || {
         let handle = HANDLE(pipe.as_raw_handle());
         let mut pid = 0;
         // SAFETY: pipe owns this handle; PID comes from the kernel.
@@ -368,39 +479,72 @@ async fn handle_connection(
             }
             cache.insert(id.clone(), identity::verify_main(process)?);
         }
-        cache
+        let principal = cache
             .get(&id)
             .ok_or(BrokerError::AccessDenied)?
             .principal
-            .clone()
-    };
-    let challenge = Challenge {
-        version: PROTOCOL_VERSION,
-        nonce: random_id(),
-    };
-    write_json(&mut pipe, &challenge).await?;
-    let bytes = read_frame(&mut pipe).await?;
-    let frame: RequestFrame =
-        serde_json::from_slice(&bytes).map_err(|_| BrokerError::InvalidRequest)?;
-    frame.validate(&challenge.nonce)?;
-    let response = {
-        // Acquire the lock before constructing the protector. No await occurs
-        // while impersonating, so the protector stays on one OS thread.
-        let result = {
-            let mut ledger = ledger.lock().await;
+            .clone();
+        Ok((pipe, principal))
+    });
+    await_blocking(handle, Some(deadline)).await
+}
+
+async fn run_request_blocking(
+    pipe: NamedPipeServer,
+    ledger: Arc<LedgerLock>,
+    principal: Principal,
+    request: Request,
+    deadline: tokio::time::Instant,
+) -> Result<(NamedPipeServer, Response)> {
+    run_ledger_blocking(
+        ledger,
+        move |ledger| {
+            // The closure owns the pipe for the full DPAPI transaction. If the
+            // deadline expires, a running job keeps the handle until it safely
+            // reverts impersonation and returns.
             let protector = DpapiProtector {
                 pipe: HANDLE(pipe.as_raw_handle()),
                 sid: &principal.sid,
             };
-            ledger.handle(&principal, frame.request, now_secs(), &protector)
-        };
-        result.unwrap_or_else(Response::Error)
+            let response = ledger
+                .handle(&principal, request, now_secs(), &protector)
+                .unwrap_or_else(Response::Error);
+            Ok((pipe, response))
+        },
+        Some(deadline),
+    )
+    .await
+}
+
+async fn handle_connection(
+    pipe: NamedPipeServer,
+    ledger: Arc<LedgerLock>,
+    cache: Arc<Mutex<HashMap<String, VerifiedCaller>>>,
+) -> Result<()> {
+    // The deadline cancels protocol waits and queued blocking jobs. A job that
+    // already entered DPAPI or SQLite is allowed to finish with its owned pipe
+    // and ledger guard, because those operations are not safely preemptible.
+    let deadline = tokio::time::Instant::now() + CONNECTION_TIMEOUT;
+    let (mut pipe, principal) = verify_caller_blocking(pipe, cache, deadline).await?;
+    let challenge = Challenge {
+        version: PROTOCOL_VERSION,
+        nonce: random_id(),
     };
-    write_json(&mut pipe, &response).await?;
+    with_deadline(deadline, write_json(&mut pipe, &challenge)).await?;
+    let bytes = with_deadline(deadline, read_frame(&mut pipe)).await?;
+    let frame: RequestFrame =
+        serde_json::from_slice(&bytes).map_err(|_| BrokerError::InvalidRequest)?;
+    frame.validate(&challenge.nonce)?;
+    let (mut pipe, response) =
+        run_request_blocking(pipe, ledger, principal, frame.request, deadline).await?;
+    with_deadline(deadline, write_json(&mut pipe, &response)).await?;
     // Keep the server handle alive until the peer has read the entire reply.
     // Closing a Windows pipe with unread buffered data can discard that data.
-    // The connection's outer timeout also bounds a missing acknowledgement.
-    if pipe.read_u8().await.map_err(|_| BrokerError::Unavailable)? != RESPONSE_ACK {
+    let ack = with_deadline(deadline, async {
+        pipe.read_u8().await.map_err(|_| BrokerError::Unavailable)
+    })
+    .await?;
+    if ack != RESPONSE_ACK {
         return Err(BrokerError::InvalidRequest);
     }
     Ok(())
@@ -534,5 +678,96 @@ mod tests {
                 .is_ok(),
             "ledger lock remained unavailable after task panic"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_ledger_work_runs_on_the_blocking_lane() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let ledger = Arc::new(LedgerLock::new(
+            Ledger::open(&directory.path().join("keys.db")).expect("open test ledger"),
+        ));
+        let scheduler_thread = std::thread::current().id();
+        let blocking_thread = run_ledger_blocking(
+            ledger,
+            |ledger| {
+                let _ = ledger.registered_owners()?;
+                Ok(std::thread::current().id())
+            },
+            None,
+        )
+        .await
+        .expect("blocking ledger operation should complete");
+
+        assert_ne!(
+            scheduler_thread, blocking_thread,
+            "synchronous ledger work must not run on the async scheduler thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_ledger_panic_releases_the_owned_lock() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let ledger = Arc::new(LedgerLock::new(
+            Ledger::open(&directory.path().join("keys.db")).expect("open test ledger"),
+        ));
+        let result = run_ledger_blocking(
+            ledger.clone(),
+            |_| -> Result<()> { panic!("intentional blocking task panic") },
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Err(BrokerError::Unavailable));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), ledger.lock())
+                .await
+                .is_ok(),
+            "blocking task panic must release the ledger lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_timeout_keeps_a_started_operation_alive_until_completion() {
+        use std::sync::atomic::AtomicBool;
+
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let started_in_job = started.clone();
+        let finished_in_job = finished.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            started_in_job.store(true, Ordering::SeqCst);
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("test must release the blocking operation");
+            finished_in_job.store(true, Ordering::SeqCst);
+            Ok::<(), BrokerError>(())
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking operation should start");
+
+        let result = await_blocking(
+            handle,
+            Some(tokio::time::Instant::now() + Duration::from_millis(10)),
+        )
+        .await;
+        assert_eq!(result, Err(BrokerError::Unavailable));
+
+        release_sender
+            .send(())
+            .expect("blocking operation should still own its release channel");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !finished.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("started blocking operation should finish after timeout");
     }
 }
