@@ -34,7 +34,12 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: './src-tauri -> target'
+          workspaces: |
+            ./src-tauri -> target
+            ./src-tauri/app-bound -> target
+
+      - name: Check app-bound before preparing and compiling release assets
+        run: npm run test:app-bound:fast
 
       - name: Install frontend dependencies
         run: npm ci
@@ -65,9 +70,6 @@ jobs:
 
       - name: Build app-bound service and Python launcher
         run: npm run build:protected:release
-
-      - name: Test app-bound lifecycle and manifest validation
-        run: npm run test:app-bound
 
       - name: Smoke test bundled Rust OCR runtime
         run: npm run verify:ml-runtime

@@ -213,6 +213,51 @@ through the existing authenticated pipe and sequence checks. The service's
 public request enum is the protocol reference; it exposes no arbitrary path,
 caller SID, private-key or unwrap request.
 
+## Fast Windows preflight
+
+Run this before spending time on a production build:
+
+```powershell
+npm run test:app-bound:fast
+```
+
+This compiles only the small `src-tauri/app-bound` crate in its test profile. It
+does not build Tauri, prepare models, install Python, build native workers or
+package the application, and it does not need the release signing key or frontend
+dependencies. Cargo reuses the native crate's normal dependency cache; the first
+run on a new machine takes longer than an incremental check.
+
+The command runs these checks and stops with a nonzero exit code on any failure:
+
+| Check | What it exercises |
+| --- | --- |
+| Native pipe regressions | Delayed/fragmented replies, deadlines, EOF and frame bounds using real Windows byte pipes |
+| Client/server round trips | The production client exchange and async service handler, including challenge, request, reply and ACK |
+| Native DPAPI and durable tasks | Pipe impersonation, real Windows protection calls, ledger reopen, all three consumers and revocation |
+| Authority rejection | An unapproved process and a mismatched pipe-token SID are rejected |
+| Existing-service repair | Real SCM creation/configuration/repair of a uniquely named temporary service |
+| Packaging and guards | Synthetic signed packages, integrity/import rejection and existing security guards |
+
+Windows requests administrator access once for the temporary-service check if
+the terminal is not elevated. That fixture never starts its service and removes
+it afterward. Cancellation, missing privileges and a selector that runs zero
+tests are failures; the command does not report a partial check as successful.
+Reports and service-test output are kept under
+`src-tauri/app-bound/target/native-checks/<run>/`.
+
+`npm run tauri:build` runs this preflight before asset preparation or release
+compilation. Pull requests and pushes to `main` also run it in a separate Windows
+CI job, and release CI runs it before its expensive build steps.
+
+The native round-trip fixtures use temporary storage and an explicitly approved
+test process in their own caller cache. The production entry point still verifies
+the SYSTEM peer; the alternate pipe entry point exists only under `cfg(test)`.
+Both DPAPI layers run under the test user's account here. Release acceptance
+additionally verifies the real LocalSystem boundary, signed installation and
+activation, protected-directory ACLs, UAC/restart handoff, actual worker loading,
+cross-user behavior and machine reboot recovery. Passing the preflight provides
+the coverage above, rather than certifying those remaining release properties.
+
 ## Validation and debugging
 
 Validation is intentionally split into two layers. The ordinary development build
@@ -233,6 +278,26 @@ These checks cover state-machine and packaging behavior, but they cannot prove t
 LocalSystem service identity, protected-directory ACLs, UAC flow, DPAPI user/SYSTEM
 wrapping, reboot recovery or cross-user rejection. Those properties require a
 signed release package on a disposable Windows installation.
+
+Transport regressions use unique local Windows byte pipes to exercise delayed and
+fragmented replies, empty-pipe deadlines, disconnections and frame size limits.
+The client reads through Win32 directly: Rust's `File::read` converts
+`ERROR_NO_DATA` on a `PIPE_NOWAIT` handle into a zero-byte read, which would
+otherwise make a healthy connection look closed before its reply arrives.
+
+The service repair regression is ignored by ordinary `cargo test` because it
+requires administrator access. The fast preflight above runs it explicitly. It
+can also be run directly from an elevated Windows test terminal:
+
+```powershell
+cargo test --manifest-path src-tauri/app-bound/Cargo.toml --lib windows::install::tests::existing_service_repair_reapplies_restart_policy -- --ignored --exact
+```
+
+It creates and removes a uniquely named test service with a nonexistent executable,
+without starting it or accessing CarbonPaper's installed service or user data. It
+checks that creation and repair both restore the restart policy, including the
+`SERVICE_START` access required to configure `SC_ACTION_RESTART` on an existing
+service handle.
 
 The protected runtime now has two complementary logs:
 

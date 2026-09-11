@@ -462,8 +462,12 @@ fn copy_trusted(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn configure_service(path: &Path) -> Result<()> {
-    let name = wide(SERVICE_NAME.as_ref());
-    let display = wide("CarbonPaper Background Processing".as_ref());
+    configure_named_service(path, SERVICE_NAME, "CarbonPaper Background Processing")
+}
+
+fn configure_named_service(path: &Path, service_name: &str, display_name: &str) -> Result<()> {
+    let name = wide(service_name.as_ref());
+    let display = wide(display_name.as_ref());
     let quoted = wide(format!("\"{}\"", path.display()).as_ref());
     // SAFETY: all SCM strings are fixed or derived from Known Folders, never a
     // request-supplied command. A null account explicitly selects LocalSystem.
@@ -476,7 +480,14 @@ fn configure_service(path: &Path) -> Result<()> {
             )
             .map_err(|_| BrokerError::AccessDenied)?,
         );
-        let service = match OpenServiceW(manager.0, PCWSTR(name.as_ptr()), SERVICE_CHANGE_CONFIG) {
+        // SC_ACTION_RESTART also requires SERVICE_START on this handle, even
+        // though configuration itself does not start the service. Repair must
+        // request it explicitly; only the creation branch has ALL_ACCESS.
+        let service = match OpenServiceW(
+            manager.0,
+            PCWSTR(name.as_ptr()),
+            SERVICE_CHANGE_CONFIG | SERVICE_START,
+        ) {
             Ok(handle) => {
                 let handle = ServiceHandle(handle);
                 ChangeServiceConfigW(
@@ -652,3 +663,6 @@ fn remove_runtime_tree(root: &Path, target: &Path) -> Result<()> {
     assert_protected(target)?;
     fs::remove_dir_all(target).map_err(|_| BrokerError::Storage)
 }
+
+#[cfg(test)]
+mod tests;

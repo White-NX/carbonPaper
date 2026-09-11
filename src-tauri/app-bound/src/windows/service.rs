@@ -741,6 +741,9 @@ impl KeyProtector for DpapiProtector<'_> {
 }
 
 #[cfg(test)]
+mod native_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

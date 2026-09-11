@@ -36,6 +36,7 @@
     "build:dev-workers": "node scripts/build-dev-workers.mjs",
     "build:protected:release": "node scripts/build-protected-runtime.mjs --release",
     "test:app-bound": "cargo test --manifest-path src-tauri/app-bound/Cargo.toml && node --test scripts/protected-runtime.test.mjs",
+    "test:app-bound:fast": "node scripts/check-app-bound.mjs",
     "test:office-nativeom": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-office-nativeom.ps1",
     "build:semantic-ml": "node scripts/build-semantic-ml.mjs",
     "build:semantic-ml:release": "node scripts/build-semantic-ml.mjs --release",
@@ -50,7 +51,7 @@
     "verify:release-bundles": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-release-bundles.ps1",
     "pack:portable": "node scripts/pack-portable.mjs",
     "generate:update-signing-key": "node scripts/generate-update-signing-key.mjs",
-    "tauri:build": "npm run prepare:release-assets && node scripts/build-nmh.mjs --release && npm run build:ml:release && npm run build:office:release && npm run build:semantic-ml:release && npm run build:protected:release && npm run verify:ml-runtime && npm run verify:office-runtime && npm run verify:semantic-runtime && tauri build && node scripts/pack-portable.mjs && npm run verify:release-bundles"
+    "tauri:build": "npm run test:app-bound:fast && npm run prepare:release-assets && node scripts/build-nmh.mjs --release && npm run build:ml:release && npm run build:office:release && npm run build:semantic-ml:release && npm run build:protected:release && npm run verify:ml-runtime && npm run verify:office-runtime && npm run verify:semantic-runtime && tauri build && node scripts/pack-portable.mjs && npm run verify:release-bundles"
   },
   "dependencies": {
     "@tauri-apps/api": "~2.9.0",
