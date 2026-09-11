@@ -240,6 +240,26 @@ impl ProcessingStaging {
         read(guard.as_ref().ok_or("staging is not initialized")?)
     }
 
+    fn call_broker_logged(
+        &self,
+        request: Request,
+        consumer: Option<Consumer>,
+    ) -> protocol::Result<Response> {
+        let operation = request.operation();
+        let result = self.broker.call(request);
+        if let Err(error) = &result {
+            if operation != "status" || *error != BrokerError::Unavailable {
+                tracing::warn!(
+                    "[APP_BOUND] broker operation={} consumer={} result=error code={}",
+                    operation,
+                    consumer.map_or("none", Consumer::name),
+                    error.code(),
+                );
+            }
+        }
+        result
+    }
+
     pub fn status(&self) -> ProcessingStatus {
         self.status
             .lock()
@@ -283,16 +303,20 @@ impl ProcessingStaging {
             return Ok(());
         }
         let result = (|| -> protocol::Result<BrokerStatus> {
-            let Response::Status(status) = self.broker.call(Request::Status {})? else {
+            let Response::Status(status) = self.call_broker_logged(Request::Status {}, None)?
+            else {
                 return Err(BrokerError::Integrity);
             };
             let dataset = self
                 .with_store(|s| Ok(s.dataset_id.clone()))
                 .map_err(|_| BrokerError::Storage)?;
             if status.dataset_id.as_deref() != Some(&dataset) {
-                self.broker.call(Request::AttachDataset {
-                    dataset_id: dataset,
-                })?;
+                self.call_broker_logged(
+                    Request::AttachDataset {
+                        dataset_id: dataset,
+                    },
+                    None,
+                )?;
             }
             Ok(status)
         })();
@@ -344,8 +368,7 @@ impl ProcessingStaging {
         if !enabled {
             self.available.store(false, Ordering::Release);
         }
-        self.broker
-            .call(Request::SetPolicy { enabled, limits })
+        self.call_broker_logged(Request::SetPolicy { enabled, limits }, None)
             .map_err(|e| e.to_string())?;
         if !enabled {
             self.issued
@@ -370,8 +393,7 @@ impl ProcessingStaging {
             .clear();
         if self.broker.supported() && self.broker.installed().map_err(|e| e.to_string())? {
             let Response::Status(status) = self
-                .broker
-                .call(Request::Status {})
+                .call_broker_logged(Request::Status {}, None)
                 .map_err(|e| e.to_string())?
             else {
                 return Err(BrokerError::Integrity.to_string());
@@ -387,15 +409,13 @@ impl ProcessingStaging {
             // Restore/switch must retire the service's actual dataset even if
             // the local staging DB is corrupt, absent, or from an old backup.
             let Response::Status(status) = self
-                .broker
-                .call(Request::Status {})
+                .call_broker_logged(Request::Status {}, None)
                 .map_err(|e| e.to_string())?
             else {
                 return Err(BrokerError::Integrity.to_string());
             };
             if let Some(dataset_id) = status.dataset_id {
-                self.broker
-                    .call(Request::RetireDataset { dataset_id })
+                self.call_broker_logged(Request::RetireDataset { dataset_id }, None)
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -423,13 +443,15 @@ impl ProcessingStaging {
         }
         self.make_local_room(bytes.len() as u64 + 28)?;
         let Response::Prepared(prepared) = self
-            .broker
-            .call(Request::PrepareTask {
-                dataset_id: dataset.clone(),
-                screenshot_id,
-                consumers,
-                payload_bytes: bytes.len() as u64 + 28,
-            })
+            .call_broker_logged(
+                Request::PrepareTask {
+                    dataset_id: dataset.clone(),
+                    screenshot_id,
+                    consumers,
+                    payload_bytes: bytes.len() as u64 + 28,
+                },
+                None,
+            )
             .map_err(|e| e.to_string())?
         else {
             return Err(BrokerError::Integrity.to_string());
@@ -449,9 +471,12 @@ impl ProcessingStaging {
             tx.commit().map_err(|e|e.to_string())
         });
         if let Err(error) = stored {
-            let _ = self.broker.call(Request::RevokeTask {
-                task_id: prepared.task.task_id,
-            });
+            let _ = self.call_broker_logged(
+                Request::RevokeTask {
+                    task_id: prepared.task.task_id,
+                },
+                None,
+            );
             return Err(error);
         }
         // A durable prepare can be activated again after an interrupted reply.
@@ -497,12 +522,14 @@ impl ProcessingStaging {
     }
 
     fn activate(&self, id: &str, digest: &str) -> Result<(), String> {
-        self.broker
-            .call(Request::ActivateTask {
+        self.call_broker_logged(
+            Request::ActivateTask {
                 task_id: id.into(),
                 ciphertext_digest: digest.into(),
-            })
-            .map_err(|e| e.to_string())?;
+            },
+            None,
+        )
+        .map_err(|e| e.to_string())?;
         self.with_store(|s| {
             s.connection
                 .execute(
@@ -581,11 +608,14 @@ impl ProcessingStaging {
                 self.retire_task(&id)?;
                 continue;
             }
-            let lease = match self.broker.call(Request::AcquireTask {
-                task_id: id.clone(),
-                consumer,
-                ciphertext_digest: digest,
-            }) {
+            let lease = match self.call_broker_logged(
+                Request::AcquireTask {
+                    task_id: id.clone(),
+                    consumer,
+                    ciphertext_digest: digest,
+                },
+                Some(consumer),
+            ) {
                 Ok(Response::Lease(lease)) => lease,
                 Err(error) => {
                     self.defer_broker_error(&id, consumer, error)?;
@@ -674,9 +704,8 @@ impl ProcessingStaging {
         error: BrokerError,
     ) -> Result<(), String> {
         if error == BrokerError::Retired {
-            if let Ok(Response::TaskState(state)) = self
-                .broker
-                .call(Request::InspectTask { task_id: id.into() })
+            if let Ok(Response::TaskState(state)) =
+                self.call_broker_logged(Request::InspectTask { task_id: id.into() }, Some(consumer))
             {
                 let terminal = state.retired
                     || (state.finished_consumers | state.abandoned_consumers) & consumer.bit() != 0;
@@ -709,12 +738,14 @@ impl ProcessingStaging {
         let exhausted=self.with_store(|s|s.connection.query_row("SELECT attempts FROM staged_work WHERE task_id=?1 AND consumer=?2 AND lease_id=?3",
             params![receipt.task_id,receipt.consumer.bit(),receipt.lease_id],|r|r.get::<_,i64>(0)).map(|attempts|attempts+i64::from(failed)>=MAX_ATTEMPTS).map_err(|e|e.to_string()))?;
         if exhausted {
-            self.broker
-                .call(Request::AbandonConsumer {
+            self.call_broker_logged(
+                Request::AbandonConsumer {
                     task_id: receipt.task_id.clone(),
                     consumer: receipt.consumer,
-                })
-                .map_err(|e| e.to_string())?;
+                },
+                Some(receipt.consumer),
+            )
+            .map_err(|e| e.to_string())?;
         }
         let _ = self.broker.call(Request::ReleaseLease {
             task_id: receipt.task_id.clone(),
@@ -826,13 +857,15 @@ impl ProcessingStaging {
     pub fn finish(&self, storage: &StorageState, receipt: &TaskReceipt) -> Result<(), String> {
         // The archive receipt is already durable. It is authoritative for retry
         // intent, but only the broker decides whether a key remains available.
-        self.broker
-            .call(Request::FinishConsumer {
+        self.call_broker_logged(
+            Request::FinishConsumer {
                 task_id: receipt.task_id.clone(),
                 consumer: receipt.consumer,
                 lease_id: receipt.lease_id.clone(),
-            })
-            .map_err(|e| e.to_string())?;
+            },
+            Some(receipt.consumer),
+        )
+        .map_err(|e| e.to_string())?;
         self.with_store(|s| {
             s.connection.execute("UPDATE staged_work SET state='completed',lease_id=NULL WHERE task_id=?1 AND consumer=?2",
                 params![receipt.task_id,receipt.consumer.bit()]).map_err(|e|e.to_string())?;
@@ -874,8 +907,7 @@ impl ProcessingStaging {
                 .cloned()
                 .collect::<Vec<_>>();
             if !valid.is_empty() {
-                self.broker
-                    .call(Request::RevokeTasks { task_ids: valid })
+                self.call_broker_logged(Request::RevokeTasks { task_ids: valid }, None)
                     .map_err(|e| e.to_string())?;
             }
             self.with_store(|s| {
@@ -929,12 +961,14 @@ impl ProcessingStaging {
         if self.broker.supported() && self.broker.installed().map_err(|e| e.to_string())? {
             let dataset = self.with_store(|s| Ok(s.dataset_id.clone()))?;
             for chunk in ids.chunks(128) {
-                self.broker
-                    .call(Request::RevokeScreenshots {
+                self.call_broker_logged(
+                    Request::RevokeScreenshots {
                         dataset_id: dataset.clone(),
                         screenshot_ids: chunk.to_vec(),
-                    })
-                    .map_err(|e| e.to_string())?;
+                    },
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
             }
         }
         let tasks=self.with_store(|s| {

@@ -2065,10 +2065,11 @@ pub(crate) async fn process_ocr_inner(
     .unwrap_or_else(|error| Err(error.to_string()));
     let staged = match staged {
         Ok(staged) => staged,
-        Err(_) => {
+        Err(error) => {
             tracing::warn!(
-                "[APP_BOUND] capture input staging deferred screenshot_id={}",
-                screenshot_id
+                "[APP_BOUND] capture input staging deferred screenshot_id={} code={}",
+                screenshot_id,
+                error
             );
             false
         }

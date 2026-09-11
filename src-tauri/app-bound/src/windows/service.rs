@@ -2,7 +2,10 @@ use crate::{
     crypto::KeyProtector,
     ledger::{Ledger, Principal},
     protocol::*,
-    windows::identity::{self, wide, VerifiedCaller},
+    windows::{
+        diagnostics,
+        identity::{self, wide, VerifiedCaller},
+    },
 };
 use std::{
     collections::HashMap,
@@ -163,8 +166,10 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         if identity::current_sid()? != "S-1-5-18" {
             return Err(BrokerError::AccessDenied);
         }
-        allow_peer_identity_queries()?;
         let directory = identity::state_root()?;
+        diagnostics::init(&directory);
+        diagnostics::event("info", "service_starting", "startup", None);
+        allow_peer_identity_queries()?;
         identity::assert_protected(&directory)?;
         let ledger = Arc::new(LedgerLock::new(Ledger::open(&directory.join("keys.db"))?));
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -181,13 +186,31 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
         serve_result
     });
-    if matches!(result, Ok(Ok(()))) || STOP.load(Ordering::SeqCst) {
-        report(SERVICE_STOPPED, 0);
-    } else {
-        // Do not report SERVICE_STOPPED for a fatal result. This lets SCM
-        // classify the process termination as a service failure and apply the
-        // configured restart action.
-        std::process::exit(1);
+    match result {
+        Ok(Ok(())) => {
+            diagnostics::event("info", "service_stopped", "shutdown", None);
+            report(SERVICE_STOPPED, 0);
+        }
+        Ok(Err(error)) if STOP.load(Ordering::SeqCst) => {
+            diagnostics::event("info", "service_stopped", "shutdown", Some(error));
+            report(SERVICE_STOPPED, 0);
+        }
+        Ok(Err(error)) => {
+            diagnostics::event("error", "service_failed", "runtime", Some(error));
+            // Do not report SERVICE_STOPPED for a fatal result. This lets SCM
+            // classify the process termination as a service failure and apply the
+            // configured restart action.
+            std::process::exit(1);
+        }
+        Err(_) => {
+            diagnostics::event(
+                "error",
+                "service_failed",
+                "panic",
+                Some(BrokerError::Unavailable),
+            );
+            std::process::exit(1);
+        }
     }
 }
 
@@ -303,6 +326,7 @@ async fn serve(ledger: Arc<LedgerLock>) -> Result<()> {
     let mut maintenance_task = tokio::spawn(maintenance_loop(ledger.clone()));
     let mut maintenance_result_consumed = false;
     report(SERVICE_RUNNING, 0);
+    diagnostics::event("info", "service_ready", "serve", None);
     let result = loop {
         if STOP.load(Ordering::SeqCst) {
             break Ok(());
@@ -311,8 +335,25 @@ async fn serve(ledger: Arc<LedgerLock>) -> Result<()> {
             maintenance = &mut maintenance_task => {
                 maintenance_result_consumed = true;
                 break match maintenance {
-                    Ok(result) => result,
-                    Err(_) => Err(BrokerError::Unavailable),
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => {
+                        diagnostics::event(
+                            "error",
+                            "maintenance_failed",
+                            "ledger_maintenance",
+                            Some(error),
+                        );
+                        Err(error)
+                    }
+                    Err(_) => {
+                        diagnostics::event(
+                            "error",
+                            "maintenance_failed",
+                            "task_join",
+                            Some(BrokerError::Unavailable),
+                        );
+                        Err(BrokerError::Unavailable)
+                    }
                 };
             }
             connected = tokio::time::timeout(ACCEPT_TIMEOUT, pipe.connect()) => {
@@ -521,33 +562,77 @@ async fn handle_connection(
     ledger: Arc<LedgerLock>,
     cache: Arc<Mutex<HashMap<String, VerifiedCaller>>>,
 ) -> Result<()> {
-    // The deadline cancels protocol waits and queued blocking jobs. A job that
-    // already entered DPAPI or SQLite is allowed to finish with its owned pipe
-    // and ledger guard, because those operations are not safely preemptible.
-    let deadline = tokio::time::Instant::now() + CONNECTION_TIMEOUT;
-    let (mut pipe, principal) = verify_caller_blocking(pipe, cache, deadline).await?;
-    let challenge = Challenge {
-        version: PROTOCOL_VERSION,
-        nonce: random_id(),
-    };
-    with_deadline(deadline, write_json(&mut pipe, &challenge)).await?;
-    let bytes = with_deadline(deadline, read_frame(&mut pipe)).await?;
-    let frame: RequestFrame =
-        serde_json::from_slice(&bytes).map_err(|_| BrokerError::InvalidRequest)?;
-    frame.validate(&challenge.nonce)?;
-    let (mut pipe, response) =
-        run_request_blocking(pipe, ledger, principal, frame.request, deadline).await?;
-    with_deadline(deadline, write_json(&mut pipe, &response)).await?;
-    // Keep the server handle alive until the peer has read the entire reply.
-    // Closing a Windows pipe with unread buffered data can discard that data.
-    let ack = with_deadline(deadline, async {
-        pipe.read_u8().await.map_err(|_| BrokerError::Unavailable)
-    })
-    .await?;
-    if ack != RESPONSE_ACK {
-        return Err(BrokerError::InvalidRequest);
+    match handle_connection_inner(pipe, ledger, cache).await {
+        Ok(()) => Ok(()),
+        Err(failure) => {
+            diagnostics::event(
+                "warn",
+                "connection_failed",
+                failure.stage,
+                Some(failure.error),
+            );
+            Err(failure.error)
+        }
     }
-    Ok(())
+}
+
+struct ConnectionFailure {
+    stage: &'static str,
+    error: BrokerError,
+}
+
+async fn handle_connection_inner(
+    pipe: NamedPipeServer,
+    ledger: Arc<LedgerLock>,
+    cache: Arc<Mutex<HashMap<String, VerifiedCaller>>>,
+) -> std::result::Result<(), ConnectionFailure> {
+    let mut stage = "verify_caller";
+    let result = async {
+        // The deadline cancels protocol waits and queued blocking jobs. A job that
+        // already entered DPAPI or SQLite is allowed to finish with its owned pipe
+        // and ledger guard, because those operations are not safely preemptible.
+        let deadline = tokio::time::Instant::now() + CONNECTION_TIMEOUT;
+        let (mut pipe, principal) = verify_caller_blocking(pipe, cache, deadline).await?;
+        stage = "write_challenge";
+        let challenge = Challenge {
+            version: PROTOCOL_VERSION,
+            nonce: random_id(),
+        };
+        with_deadline(deadline, write_json(&mut pipe, &challenge)).await?;
+        stage = "read_request";
+        let bytes = with_deadline(deadline, read_frame(&mut pipe)).await?;
+        let frame: RequestFrame =
+            serde_json::from_slice(&bytes).map_err(|_| BrokerError::InvalidRequest)?;
+        stage = "validate_request";
+        frame.validate(&challenge.nonce)?;
+        let operation = frame.request.operation();
+        let log_success = frame.request.log_success();
+        stage = operation;
+        let (mut pipe, response) =
+            run_request_blocking(pipe, ledger, principal, frame.request, deadline).await?;
+        match &response {
+            Response::Error(error) => {
+                diagnostics::event("warn", "request_completed", operation, Some(*error))
+            }
+            _ if log_success => diagnostics::event("info", "request_completed", operation, None),
+            _ => {}
+        }
+        stage = "write_response";
+        with_deadline(deadline, write_json(&mut pipe, &response)).await?;
+        // Keep the server handle alive until the peer has read the entire reply.
+        // Closing a Windows pipe with unread buffered data can discard that data.
+        stage = "read_ack";
+        let ack = with_deadline(deadline, async {
+            pipe.read_u8().await.map_err(|_| BrokerError::Unavailable)
+        })
+        .await?;
+        if ack != RESPONSE_ACK {
+            return Err(BrokerError::InvalidRequest);
+        }
+        Ok(())
+    }
+    .await;
+    result.map_err(|error| ConnectionFailure { stage, error })
 }
 
 struct Impersonation;

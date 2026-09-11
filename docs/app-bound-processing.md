@@ -213,6 +213,63 @@ through the existing authenticated pipe and sequence checks. The service's
 public request enum is the protocol reference; it exposes no arbitrary path,
 caller SID, private-key or unwrap request.
 
+## Validation and debugging
+
+Validation is intentionally split into two layers. The ordinary development build
+must not contact the production broker: `NativeBroker` rejects it, and tests inject
+an in-process broker instead. This preserves the process-identity boundary while
+making the protocol, ledger, staging and recovery logic fast to test.
+
+Run the automated layer first:
+
+```powershell
+npm run test:app-bound
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+npm run test:security
+cargo check --manifest-path src-tauri/Cargo.toml
+```
+
+These checks cover state-machine and packaging behavior, but they cannot prove the
+LocalSystem service identity, protected-directory ACLs, UAC flow, DPAPI user/SYSTEM
+wrapping, reboot recovery or cross-user rejection. Those properties require a
+signed release package on a disposable Windows installation.
+
+The protected runtime now has two complementary logs:
+
+| Process | Location | Contents |
+| --- | --- | --- |
+| Desktop application | The active data directory under `logs/<date>/carbonpaper.log` | Client-side broker operation, consumer and redacted error code |
+| Key service | `%ProgramData%/CarbonPaper/KeyService/logs/service.log` | Service lifecycle, fixed request operation, request stage and redacted error code |
+
+The service log is best-effort and rotates at 4 MiB to `service.log.1`. A logging
+failure never changes broker behavior. It deliberately excludes keys, wrapped-key
+blobs, OCR text, images, complete SIDs, task/dataset/lease identifiers, paths and
+request JSON. Fixed event and stage names are suitable for diagnosis; the log is
+not an audit ledger.
+
+For a minimal end-to-end pass in a disposable virtual machine:
+
+1. Install or activate a signed package and enable protected background processing.
+2. Confirm the service is running with `sc.exe queryex CarbonPaperKeyService`.
+3. Capture a uniquely recognizable test record and close CarbonPaper before all
+   classification, MiniLM and CLIP consumers finish.
+4. Reboot, leave the archive locked and allow the machine to become idle.
+5. Inspect the desktop and service logs. A normal task progresses through the fixed
+   operations `prepare_task`, `activate_task`, `acquire_task` and
+   `finish_consumer`; desktop completion and archive receipt handling occur between
+   acquire and finish.
+6. Unlock the archive and confirm derived results and keyword search catch up
+   without duplicate result application.
+
+A service entry such as
+`event=connection_failed stage=verify_caller error=app_bound_access_denied`
+locates an identity-boundary rejection. `stage=read_request`,
+`stage=validate_request`, a fixed operation name, `stage=write_response` and
+`stage=read_ack` distinguish transport, protocol, authority and reply failures.
+Use the broader acceptance list below for cancellation, tampering, cross-user,
+rollback, deletion and migration cases. Do not treat a development build with a
+locally copied service executable as equivalent to this signed acceptance pass.
+
 ## Build and automated checks
 
 ```powershell

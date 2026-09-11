@@ -44,6 +44,26 @@ pub enum BrokerError {
     LimitExceeded,
 }
 
+impl BrokerError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Unavailable => "app_bound_unavailable",
+            Self::AccessDenied => "app_bound_access_denied",
+            Self::InvalidRequest => "app_bound_invalid_request",
+            Self::Disabled => "app_bound_disabled",
+            Self::DatasetMismatch => "app_bound_dataset_mismatch",
+            Self::Retired => "app_bound_task_retired",
+            Self::LeaseExpired => "app_bound_lease_expired",
+            Self::Busy => "app_bound_task_busy",
+            Self::Integrity => "app_bound_integrity_failure",
+            Self::Storage => "app_bound_storage_failure",
+            Self::Protection => "app_bound_protection_failure",
+            Self::VersionMismatch => "app_bound_version_mismatch",
+            Self::LimitExceeded => "app_bound_limit_exceeded",
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, BrokerError>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -225,6 +245,38 @@ pub enum Request {
     },
 }
 
+impl Request {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Status { .. } => "status",
+            Self::AttachDataset { .. } => "attach_dataset",
+            Self::SetPolicy { .. } => "set_policy",
+            Self::RetireDataset { .. } => "retire_dataset",
+            Self::PrepareTask { .. } => "prepare_task",
+            Self::ActivateTask { .. } => "activate_task",
+            Self::InspectTask { .. } => "inspect_task",
+            Self::AcquireTask { .. } => "acquire_task",
+            Self::RenewLease { .. } => "renew_lease",
+            Self::ReleaseLease { .. } => "release_lease",
+            Self::FinishConsumer { .. } => "finish_consumer",
+            Self::AbandonConsumer { .. } => "abandon_consumer",
+            Self::RevokeTask { .. } => "revoke_task",
+            Self::RevokeTasks { .. } => "revoke_tasks",
+            Self::RevokeScreenshots { .. } => "revoke_screenshots",
+        }
+    }
+
+    pub const fn log_success(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status { .. }
+                | Self::InspectTask { .. }
+                | Self::RenewLease { .. }
+                | Self::ReleaseLease { .. }
+        )
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result", content = "data", rename_all = "snake_case")]
 pub enum Response {
@@ -292,6 +344,92 @@ pub fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn request_operation_names_are_fixed_and_redacted() {
+        let requests = [
+            Request::Status {},
+            Request::AttachDataset {
+                dataset_id: "sensitive-dataset".into(),
+            },
+            Request::SetPolicy {
+                enabled: true,
+                limits: Limits::default(),
+            },
+            Request::RetireDataset {
+                dataset_id: "sensitive-dataset".into(),
+            },
+            Request::PrepareTask {
+                dataset_id: "sensitive-dataset".into(),
+                screenshot_id: 42,
+                consumers: 7,
+                payload_bytes: 1024,
+            },
+            Request::ActivateTask {
+                task_id: "sensitive-task".into(),
+                ciphertext_digest: "sensitive-digest".into(),
+            },
+            Request::InspectTask {
+                task_id: "sensitive-task".into(),
+            },
+            Request::AcquireTask {
+                task_id: "sensitive-task".into(),
+                consumer: Consumer::Clip,
+                ciphertext_digest: "sensitive-digest".into(),
+            },
+            Request::RenewLease {
+                task_id: "sensitive-task".into(),
+                consumer: Consumer::Clip,
+                lease_id: "sensitive-lease".into(),
+            },
+            Request::ReleaseLease {
+                task_id: "sensitive-task".into(),
+                consumer: Consumer::Clip,
+                lease_id: "sensitive-lease".into(),
+            },
+            Request::FinishConsumer {
+                task_id: "sensitive-task".into(),
+                consumer: Consumer::Clip,
+                lease_id: "sensitive-lease".into(),
+            },
+            Request::AbandonConsumer {
+                task_id: "sensitive-task".into(),
+                consumer: Consumer::Clip,
+            },
+            Request::RevokeTask {
+                task_id: "sensitive-task".into(),
+            },
+            Request::RevokeTasks {
+                task_ids: vec!["sensitive-task".into()],
+            },
+            Request::RevokeScreenshots {
+                dataset_id: "sensitive-dataset".into(),
+                screenshot_ids: vec![42],
+            },
+        ];
+        let names = requests.map(|request| request.operation());
+        assert_eq!(
+            names,
+            [
+                "status",
+                "attach_dataset",
+                "set_policy",
+                "retire_dataset",
+                "prepare_task",
+                "activate_task",
+                "inspect_task",
+                "acquire_task",
+                "renew_lease",
+                "release_lease",
+                "finish_consumer",
+                "abandon_consumer",
+                "revoke_task",
+                "revoke_tasks",
+                "revoke_screenshots",
+            ]
+        );
+        assert!(names.iter().all(|name| !name.contains("sensitive")));
+    }
+
     #[test]
     fn pipe_frames_reject_old_nonces_sequences_versions_and_unknown_fields() {
         let nonce = random_id();
