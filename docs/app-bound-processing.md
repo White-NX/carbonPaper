@@ -314,6 +314,15 @@ executable lock lasts for each request so Cargo can replace the desktop after
 it exits. The development feature fails compilation when debug assertions are
 disabled; production builds accept only their existing protected release identity.
 
+The service, setup helper and smoke probe use the standalone crate's
+`dev-service` Cargo profile: optimized code with debug symbols and assertions.
+The desktop keeps Tauri's normal dev profile. `scripts/debug.mjs` includes the
+native build arguments in its cache fingerprint and uses the same profile for
+native tests. Full executable verification still runs on every development
+connection. Postprocessing maintenance and classification dispatch run
+independently; each maintenance pass finishes before its 30-second cooldown
+begins, while classification checks remain on a two-second cadence.
+
 For a small end-to-end check without starting Tauri or loading models, run from
 an ordinary, unelevated Windows terminal:
 
@@ -386,6 +395,14 @@ failure never changes broker behavior. It deliberately excludes keys, wrapped-ke
 blobs, OCR text, images, complete SIDs, task/dataset/lease identifiers, paths and
 request JSON. Fixed event and stage names are suitable for diagnosis; the log is
 not an audit ledger.
+
+Failed requests and connections include `total_ms`, `verify_ms`,
+`ledger_wait_ms`, `worker_wait_ms` and `ledger_exec_ms`. Successful connections
+taking at least one second add a `connection_slow` event with the same fields.
+Verification includes its blocking-thread scheduling; worker wait measures the
+queue after the ledger lock is acquired. For a timed-out operation, unfinished
+stages report elapsed time up to the failure snapshot, not their eventual
+completion time. The eight-second connection deadline is unchanged.
 
 For a minimal end-to-end pass in a disposable virtual machine:
 

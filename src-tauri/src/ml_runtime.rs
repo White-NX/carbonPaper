@@ -1155,34 +1155,67 @@ pub async fn download_rust_ocr_model(
 }
 
 pub async fn run_postprocess_retry_loop(app: AppHandle) {
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Let storage and the Python monitor finish startup before the first pass.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let mut maintenance_at = std::time::Instant::now() - Duration::from_secs(30);
-    loop {
-        interval.tick().await;
-        if maintenance_at.elapsed() >= Duration::from_secs(30) {
-            maintenance_at = std::time::Instant::now();
-            let storage = app
-                .state::<Arc<crate::storage::StorageState>>()
-                .inner()
-                .clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if storage.background_processing_enabled() {
-                    let _ = storage.processing_stage.refresh();
-                } else {
-                    let _ = storage.processing_stage.disable_if_installed();
-                }
-                let _ = storage.processing_stage.reconcile(&storage);
-            })
-            .await;
-            if let Err(error) = drain_pending_postprocess(&app).await {
-                tracing::debug!("[ML:POSTPROCESS] retry pass deferred: {}", error);
-            }
+    run_postprocess_tasks(
+        || postprocess_maintenance_pass(&app),
+        || async {
+            let _ = crate::processing_stage::dispatch_classification(&app).await;
+        },
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+    )
+    .await;
+}
+
+async fn postprocess_maintenance_pass(app: &AppHandle) {
+    let storage = app
+        .state::<Arc<crate::storage::StorageState>>()
+        .inner()
+        .clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if storage.background_processing_enabled() {
+            let _ = storage.processing_stage.refresh();
+        } else {
+            let _ = storage.processing_stage.disable_if_installed();
         }
-        let _ = crate::processing_stage::dispatch_classification(&app).await;
+        let _ = storage.processing_stage.reconcile(&storage);
+    })
+    .await;
+    if let Err(error) = drain_pending_postprocess(app).await {
+        tracing::debug!("[ML:POSTPROCESS] retry pass deferred: {}", error);
     }
+}
+
+async fn run_postprocess_tasks<M, MF, D, DF>(
+    mut maintenance: M,
+    mut dispatch: D,
+    maintenance_interval: Duration,
+    dispatch_interval: Duration,
+) where
+    M: FnMut() -> MF,
+    MF: std::future::Future<Output = ()>,
+    D: FnMut() -> DF,
+    DF: std::future::Future<Output = ()>,
+{
+    // Keep both futures owned by this loop. A slow maintenance pass cannot
+    // overlap the next pass or hold classification behind its broker scan.
+    tokio::join!(
+        async {
+            loop {
+                maintenance().await;
+                tokio::time::sleep(maintenance_interval).await;
+            }
+        },
+        async {
+            let mut interval = tokio::time::interval(dispatch_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                dispatch().await;
+            }
+        },
+    );
 }
 
 /// Whether an enqueue error means the Python monitor never accepted the
@@ -1289,6 +1322,67 @@ mod tests {
     use super::*;
     use rapidocr_core::config::PipelineConfig;
     use rapidocr_core::model::model_set_by_name;
+
+    #[tokio::test]
+    async fn slow_maintenance_does_not_block_dispatch_or_start_overlapping_passes() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::{mpsc, Semaphore};
+
+        let release = Arc::new(Semaphore::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(Mutex::new(None));
+        let (dispatch_sender, mut dispatch_receiver) = mpsc::unbounded_channel();
+        let (start_sender, mut start_receiver) = mpsc::unbounded_channel();
+        let cooldown = Duration::from_millis(80);
+        let runner = tokio::spawn({
+            let release = release.clone();
+            let started = started.clone();
+            let finished = finished.clone();
+            async move {
+                run_postprocess_tasks(
+                    || {
+                        let release = release.clone();
+                        let started = started.clone();
+                        let finished = finished.clone();
+                        let start_sender = start_sender.clone();
+                        async move {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            let _ = start_sender.send(Instant::now());
+                            release.acquire().await.unwrap().forget();
+                            *finished.lock().unwrap() = Some(Instant::now());
+                        }
+                    },
+                    || {
+                        let dispatch_sender = dispatch_sender.clone();
+                        async move {
+                            let _ = dispatch_sender.send(());
+                        }
+                    },
+                    cooldown,
+                    Duration::from_millis(20),
+                )
+                .await;
+            }
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            start_receiver.recv().await.unwrap();
+            // Hold maintenance across several dispatch ticks and longer than
+            // its cooldown: no second maintenance pass may start meanwhile.
+            for _ in 0..8 {
+                dispatch_receiver.recv().await.unwrap();
+            }
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+            release.add_permits(1);
+            let next_start = start_receiver.recv().await.unwrap();
+            let completed_at = finished.lock().unwrap().unwrap();
+            assert!(next_start.duration_since(completed_at) >= cooldown);
+            assert_eq!(started.load(Ordering::SeqCst), 2);
+        })
+        .await;
+        runner.abort();
+        let _ = runner.await;
+        outcome.expect("classification must keep dispatching during maintenance");
+    }
 
     #[test]
     fn release_manifest_matches_rapidocr_core_model_set() {

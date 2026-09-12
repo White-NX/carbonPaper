@@ -14,6 +14,16 @@ const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 static LOGGER: OnceLock<ServiceLogger> = OnceLock::new();
 
+/// Numeric timings only; never include caller identity, task data or keys.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct RequestTimings {
+    pub total_ms: u64,
+    pub verify_ms: u64,
+    pub ledger_wait_ms: u64,
+    pub worker_wait_ms: u64,
+    pub ledger_exec_ms: u64,
+}
+
 pub fn init(state_root: &Path) {
     let _ = LOGGER.set(ServiceLogger::new(state_root.join(LOG_DIRECTORY)));
 }
@@ -21,6 +31,18 @@ pub fn init(state_root: &Path) {
 pub fn event(level: &str, event: &str, stage: &str, error: Option<BrokerError>) {
     if let Some(logger) = LOGGER.get() {
         logger.event(level, event, stage, error);
+    }
+}
+
+pub(super) fn timed_event(
+    level: &str,
+    event: &str,
+    stage: &str,
+    error: Option<BrokerError>,
+    timings: &RequestTimings,
+) {
+    if let Some(logger) = LOGGER.get() {
+        logger.event_with_timings(level, event, stage, error, Some(timings));
     }
 }
 
@@ -38,10 +60,21 @@ impl ServiceLogger {
     }
 
     fn event(&self, level: &str, event: &str, stage: &str, error: Option<BrokerError>) {
+        self.event_with_timings(level, event, stage, error, None);
+    }
+
+    fn event_with_timings(
+        &self,
+        level: &str,
+        event: &str,
+        stage: &str,
+        error: Option<BrokerError>,
+        timings: Option<&RequestTimings>,
+    ) {
         let Ok(_guard) = self.lock.lock() else {
             return;
         };
-        let _ = self.write_event(level, event, stage, error);
+        let _ = self.write_event(level, event, stage, error, timings);
     }
 
     fn write_event(
@@ -50,6 +83,7 @@ impl ServiceLogger {
         event: &str,
         stage: &str,
         error: Option<BrokerError>,
+        timings: Option<&RequestTimings>,
     ) -> std::io::Result<()> {
         fs::create_dir_all(&self.directory)?;
         let current = self.directory.join(LOG_FILE);
@@ -59,11 +93,23 @@ impl ServiceLogger {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        writeln!(
+        write!(
             file,
             "time_unix={timestamp} level={level} event={event} stage={stage} error={}",
             error.map_or("none", BrokerError::code)
-        )
+        )?;
+        if let Some(timings) = timings {
+            write!(
+                file,
+                " total_ms={} verify_ms={} ledger_wait_ms={} worker_wait_ms={} ledger_exec_ms={}",
+                timings.total_ms,
+                timings.verify_ms,
+                timings.ledger_wait_ms,
+                timings.worker_wait_ms,
+                timings.ledger_exec_ms
+            )?;
+        }
+        writeln!(file)
     }
 }
 
@@ -124,6 +170,47 @@ mod tests {
         assert!(fs::read_to_string(current)
             .expect("read current log")
             .contains("event=service_ready"));
+    }
+
+    #[test]
+    fn timed_events_append_only_fixed_numeric_fields() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let logger = ServiceLogger::new(directory.path().join(LOG_DIRECTORY));
+        logger.event_with_timings(
+            "warn",
+            "connection_failed",
+            "finish_consumer",
+            Some(BrokerError::Unavailable),
+            Some(&RequestTimings {
+                total_ms: 8000,
+                verify_ms: 2000,
+                ledger_wait_ms: 5990,
+                worker_wait_ms: 10,
+                ledger_exec_ms: 0,
+            }),
+        );
+        let output = fs::read_to_string(directory.path().join(LOG_DIRECTORY).join(LOG_FILE))
+            .expect("read timed log");
+        assert!(output.ends_with(" error=app_bound_unavailable total_ms=8000 verify_ms=2000 ledger_wait_ms=5990 worker_wait_ms=10 ledger_exec_ms=0\n"));
+        let fields: Vec<_> = output
+            .split_whitespace()
+            .map(|field| field.split('=').next().unwrap())
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "time_unix",
+                "level",
+                "event",
+                "stage",
+                "error",
+                "total_ms",
+                "verify_ms",
+                "ledger_wait_ms",
+                "worker_wait_ms",
+                "ledger_exec_ms"
+            ]
+        );
     }
 
     #[test]

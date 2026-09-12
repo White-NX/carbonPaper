@@ -6,6 +6,12 @@ import { fileURLToPath } from 'node:url';
 import { verifyPrivilegedImports } from './privileged-imports.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
+export const DEVELOPMENT_NATIVE_PROFILE = 'dev-service';
+
+export function nativeCargoArguments(command, workspace, args = []) {
+  return [command, '--manifest-path', path.join(workspace, 'src-tauri', 'app-bound', 'Cargo.toml'),
+    '--profile', DEVELOPMENT_NATIVE_PROFILE, '--features', 'development-runtime', ...args];
+}
 
 export function tauriDevArguments(workspace, args = []) {
   return [path.join(workspace, 'node_modules', '@tauri-apps', 'cli', 'tauri.js'),
@@ -60,8 +66,11 @@ export function prepareNativeComponents(configuration) {
   const environment = { ...configuration.environment, CARGO_TARGET_DIR: target,
     RUSTFLAGS: `${configuration.environment.RUSTFLAGS || ''} -C target-feature=+crt-static`.trim() };
   delete environment.CARGO_ENCODED_RUSTFLAGS;
+  const buildArgs = nativeCargoArguments('build', configuration.workspace,
+    ['--bin', 'carbonpaper-key-service', '--bin', 'carbonpaper-protected-setup']);
   const hash = createHash('sha256').update(configuration.instance).update(configuration.publicKey)
-    .update(environment.RUSTFLAGS).update(run('rustc', ['-vV'], environment, true));
+    .update(environment.RUSTFLAGS).update(JSON.stringify(buildArgs))
+    .update(run('rustc', ['-vV'], environment, true));
   for (const file of [...rustFiles(path.join(crate, 'src')), path.join(crate, 'Cargo.toml'),
     path.join(crate, 'Cargo.lock'), path.join(crate, 'build.rs')].sort()) {
     hash.update(file).update(readFileSync(file));
@@ -72,15 +81,15 @@ export function prepareNativeComponents(configuration) {
   let previous;
   try { previous = JSON.parse(readFileSync(statePath, 'utf8')); } catch { previous = null; }
   const names = ['carbonpaper-key-service.exe', 'carbonpaper-protected-setup.exe'];
+  const outputDirectory = path.join(target, DEVELOPMENT_NATIVE_PROFILE);
   if (previous?.fingerprint !== fingerprint || names.some(name => !existsSync(path.join(components, name))
     || sha256(path.join(components, name)) !== previous.files?.[name])) {
     console.log('[app-bound dev] Building isolated service and setup helper...');
-    run('cargo', ['build', '--manifest-path', path.join(crate, 'Cargo.toml'), '--features', 'development-runtime',
-      '--bin', 'carbonpaper-key-service', '--bin', 'carbonpaper-protected-setup'], environment);
+    run('cargo', buildArgs, environment);
     mkdirSync(components, { recursive: true });
     const files = {};
     for (const name of names) {
-      const binary = path.join(target, 'debug', name);
+      const binary = path.join(outputDirectory, name);
       verifyPrivilegedImports(binary);
       files[name] = sha256(binary);
       if (!existsSync(path.join(components, name)) || sha256(path.join(components, name)) !== files[name]) {
@@ -89,7 +98,7 @@ export function prepareNativeComponents(configuration) {
     }
     writeFileSync(statePath, `${JSON.stringify({ fingerprint, files }, null, 2)}\n`);
   }
-  return { target, environment };
+  return { target, outputDirectory, environment };
 }
 
 async function main() {
@@ -103,16 +112,14 @@ async function main() {
   const native = prepareNativeComponents(configuration);
   if (mode === '--prepare-native') return;
   if (mode === '--test-core') {
-    run('cargo', ['test', '--manifest-path', path.join(root, 'src-tauri', 'app-bound', 'Cargo.toml'),
-      '--features', 'development-runtime', '--lib'], native.environment);
+    run('cargo', nativeCargoArguments('test', root, ['--lib']), native.environment);
     return;
   }
   if (mode === '--smoke') {
-    run('cargo', ['build', '--manifest-path', path.join(root, 'src-tauri', 'app-bound', 'Cargo.toml'),
-      '--features', 'development-runtime', '--bin', 'carbonpaper-development-probe'], native.environment);
+    run('cargo', nativeCargoArguments('build', root, ['--bin', 'carbonpaper-development-probe']), native.environment);
     const probe = path.join(configuration.directory, 'probe', 'carbonpaper.exe');
     mkdirSync(path.dirname(probe), { recursive: true });
-    copyFileSync(path.join(native.target, 'debug', 'carbonpaper-development-probe.exe'), probe);
+    copyFileSync(path.join(native.outputDirectory, 'carbonpaper-development-probe.exe'), probe);
     run(probe, [], configuration.environment);
     return;
   }

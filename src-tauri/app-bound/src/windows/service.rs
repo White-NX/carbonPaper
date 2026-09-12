@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, AtomicIsize, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -44,8 +44,62 @@ type LedgerLock = tokio::sync::Mutex<Ledger>;
 type CallerCache = Arc<Mutex<HashMap<String, Arc<VerifiedCaller>>>>;
 const ACCEPT_TIMEOUT: Duration = Duration::from_millis(500);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(8);
+const SLOW_CONNECTION_MILLIS: u64 = 1000;
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+struct ConnectionTiming {
+    started: Instant,
+    verify_finished: Option<Instant>,
+    ledger_wait_started: Option<Instant>,
+    ledger_acquired: Option<Instant>,
+    worker_started: Option<Instant>,
+    ledger_finished: Option<Instant>,
+}
+
+impl ConnectionTiming {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            verify_finished: None,
+            ledger_wait_started: None,
+            ledger_acquired: None,
+            worker_started: None,
+            ledger_finished: None,
+        }
+    }
+
+    fn snapshot(&self) -> diagnostics::RequestTimings {
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&self, now: Instant) -> diagnostics::RequestTimings {
+        // An unfinished stage reports time spent up to this snapshot, including
+        // a SQLite/DPAPI operation that safely continues after an IPC timeout.
+        let elapsed = |start: Option<Instant>, end: Option<Instant>| {
+            start.map_or(0, |start| {
+                end.unwrap_or(now)
+                    .saturating_duration_since(start)
+                    .as_millis() as u64
+            })
+        };
+        diagnostics::RequestTimings {
+            total_ms: elapsed(Some(self.started), Some(now)),
+            verify_ms: elapsed(Some(self.started), self.verify_finished),
+            ledger_wait_ms: elapsed(self.ledger_wait_started, self.ledger_acquired),
+            worker_wait_ms: elapsed(self.ledger_acquired, self.worker_started),
+            ledger_exec_ms: elapsed(self.worker_started, self.ledger_finished),
+        }
+    }
+}
+
+type SharedTiming = Arc<Mutex<ConnectionTiming>>;
+
+fn mark_timing(timing: &Option<SharedTiming>, mark: impl FnOnce(&mut ConnectionTiming)) {
+    if let Some(timing) = timing {
+        mark(&mut timing.lock().unwrap_or_else(|error| error.into_inner()));
+    }
+}
 
 pub struct ServiceHandle(pub SC_HANDLE);
 impl Drop for ServiceHandle {
@@ -402,6 +456,7 @@ async fn maintenance_loop(ledger: Arc<LedgerLock>) -> Result<()> {
             ledger.clone(),
             |ledger| ledger.maintenance(now_secs()),
             None,
+            None,
         )
         .await?;
     }
@@ -477,21 +532,37 @@ async fn run_ledger_blocking<T, F>(
     ledger: Arc<LedgerLock>,
     operation: F,
     deadline: Option<tokio::time::Instant>,
+    timing: Option<SharedTiming>,
 ) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&mut Ledger) -> Result<T> + Send + 'static,
 {
+    mark_timing(&timing, |timing| {
+        timing.ledger_wait_started = Some(Instant::now())
+    });
     let mut guard = match deadline {
         Some(deadline) => tokio::time::timeout_at(deadline, ledger.lock_owned())
             .await
             .map_err(|_| BrokerError::Unavailable)?,
         None => ledger.lock_owned().await,
     };
+    mark_timing(&timing, |timing| {
+        timing.ledger_acquired = Some(Instant::now())
+    });
     // The owned guard and operation move together. If the async caller is
     // cancelled after this starts, the blocking closure still owns the ledger
     // and releases it only after the synchronous operation finishes.
-    let handle = tokio::task::spawn_blocking(move || operation(&mut guard));
+    let handle = tokio::task::spawn_blocking(move || {
+        mark_timing(&timing, |timing| {
+            timing.worker_started = Some(Instant::now())
+        });
+        let result = operation(&mut guard);
+        mark_timing(&timing, |timing| {
+            timing.ledger_finished = Some(Instant::now())
+        });
+        result
+    });
     await_blocking(handle, deadline).await
 }
 
@@ -539,6 +610,7 @@ async fn run_request_blocking(
     caller: Arc<VerifiedCaller>,
     request: Request,
     deadline: tokio::time::Instant,
+    timing: SharedTiming,
 ) -> Result<(NamedPipeServer, Response)> {
     run_ledger_blocking(
         ledger,
@@ -556,6 +628,7 @@ async fn run_request_blocking(
             Ok((pipe, response))
         },
         Some(deadline),
+        Some(timing),
     )
     .await
 }
@@ -568,11 +641,12 @@ async fn handle_connection(
     match handle_connection_inner(pipe, ledger, cache).await {
         Ok(()) => Ok(()),
         Err(failure) => {
-            diagnostics::event(
+            diagnostics::timed_event(
                 "warn",
                 "connection_failed",
                 failure.stage,
                 Some(failure.error),
+                &failure.timings,
             );
             Err(failure.error)
         }
@@ -582,6 +656,7 @@ async fn handle_connection(
 struct ConnectionFailure {
     stage: &'static str,
     error: BrokerError,
+    timings: diagnostics::RequestTimings,
 }
 
 async fn handle_connection_inner(
@@ -590,12 +665,19 @@ async fn handle_connection_inner(
     cache: CallerCache,
 ) -> std::result::Result<(), ConnectionFailure> {
     let mut stage = "verify_caller";
+    let mut operation = "verify_caller";
+    let timing = Arc::new(Mutex::new(ConnectionTiming::new()));
     let result = async {
         // The deadline cancels protocol waits and queued blocking jobs. A job that
         // already entered DPAPI or SQLite is allowed to finish with its owned pipe
         // and ledger guard, because those operations are not safely preemptible.
         let deadline = tokio::time::Instant::now() + CONNECTION_TIMEOUT;
-        let (mut pipe, caller) = verify_caller_blocking(pipe, cache, deadline).await?;
+        let verified = verify_caller_blocking(pipe, cache, deadline).await;
+        timing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .verify_finished = Some(Instant::now());
+        let (mut pipe, caller) = verified?;
         stage = "write_challenge";
         let challenge = Challenge {
             version: PROTOCOL_VERSION,
@@ -608,15 +690,29 @@ async fn handle_connection_inner(
             serde_json::from_slice(&bytes).map_err(|_| BrokerError::InvalidRequest)?;
         stage = "validate_request";
         frame.validate(&challenge.nonce)?;
-        let operation = frame.request.operation();
+        operation = frame.request.operation();
         let log_success = frame.request.log_success();
         stage = operation;
-        let (mut pipe, response) =
-            run_request_blocking(pipe, ledger, caller, frame.request, deadline).await?;
+        let (mut pipe, response) = run_request_blocking(
+            pipe,
+            ledger,
+            caller,
+            frame.request,
+            deadline,
+            timing.clone(),
+        )
+        .await?;
         match &response {
-            Response::Error(error) => {
-                diagnostics::event("warn", "request_completed", operation, Some(*error))
-            }
+            Response::Error(error) => diagnostics::timed_event(
+                "warn",
+                "request_completed",
+                operation,
+                Some(*error),
+                &timing
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .snapshot(),
+            ),
             _ if log_success => diagnostics::event("info", "request_completed", operation, None),
             _ => {}
         }
@@ -635,7 +731,18 @@ async fn handle_connection_inner(
         Ok(())
     }
     .await;
-    result.map_err(|error| ConnectionFailure { stage, error })
+    let timings = timing
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .snapshot();
+    if result.is_ok() && timings.total_ms >= SLOW_CONNECTION_MILLIS {
+        diagnostics::timed_event("info", "connection_slow", operation, None, &timings);
+    }
+    result.map_err(|error| ConnectionFailure {
+        stage,
+        error,
+        timings,
+    })
 }
 
 struct Impersonation;
@@ -750,6 +857,63 @@ mod native_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn timing_snapshots_include_unfinished_phases_without_growing_completed_phases() {
+        let mut timing = ConnectionTiming::new();
+        let start = timing.started;
+        timing.verify_finished = Some(start + Duration::from_secs(2));
+        timing.ledger_wait_started = Some(start + Duration::from_secs(3));
+        let waiting = timing.snapshot_at(start + Duration::from_secs(8));
+        assert_eq!(waiting.total_ms, 8000);
+        assert_eq!(waiting.verify_ms, 2000);
+        assert_eq!(waiting.ledger_wait_ms, 5000);
+        assert_eq!(waiting.worker_wait_ms, 0);
+        assert_eq!(waiting.ledger_exec_ms, 0);
+
+        timing.ledger_acquired = Some(start + Duration::from_secs(4));
+        let queued = timing.snapshot_at(start + Duration::from_secs(8));
+        assert_eq!(queued.ledger_wait_ms, 1000);
+        assert_eq!(queued.worker_wait_ms, 4000);
+        assert_eq!(queued.ledger_exec_ms, 0);
+
+        timing.worker_started = Some(start + Duration::from_secs(5));
+        let executing = timing.snapshot_at(start + Duration::from_secs(8));
+        assert_eq!(executing.worker_wait_ms, 1000);
+        assert_eq!(executing.ledger_exec_ms, 3000);
+        timing.ledger_finished = Some(start + Duration::from_secs(7));
+        assert_eq!(
+            timing
+                .snapshot_at(start + Duration::from_secs(9))
+                .ledger_exec_ms,
+            2000
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_lock_timeout_reports_waiting_without_starting_the_operation() {
+        let directory = tempfile::tempdir().expect("create test directory");
+        let ledger = Arc::new(LedgerLock::new(
+            Ledger::open(&directory.path().join("keys.db")).expect("open test ledger"),
+        ));
+        let guard = ledger.lock().await;
+        let timing = Arc::new(Mutex::new(ConnectionTiming::new()));
+        timing.lock().unwrap().verify_finished = Some(Instant::now());
+        let result = run_ledger_blocking(
+            ledger.clone(),
+            |_| -> Result<()> { panic!("a timed-out waiter must not execute") },
+            Some(tokio::time::Instant::now() + Duration::from_millis(30)),
+            Some(timing.clone()),
+        )
+        .await;
+        assert_eq!(result, Err(BrokerError::Unavailable));
+        let snapshot = timing.lock().unwrap().snapshot();
+        assert!(snapshot.ledger_wait_ms >= 20);
+        assert_eq!(snapshot.worker_wait_ms, 0);
+        assert_eq!(snapshot.ledger_exec_ms, 0);
+        drop(guard);
+        drop(ledger);
+    }
+
     #[tokio::test]
     async fn ledger_lock_is_available_after_a_task_panic() {
         let directory = tempfile::tempdir().expect("create test directory");
@@ -785,6 +949,7 @@ mod tests {
                 Ok(std::thread::current().id())
             },
             None,
+            None,
         )
         .await
         .expect("blocking ledger operation should complete");
@@ -804,6 +969,7 @@ mod tests {
         let result = run_ledger_blocking(
             ledger.clone(),
             |_| -> Result<()> { panic!("intentional blocking task panic") },
+            None,
             None,
         )
         .await;

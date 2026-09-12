@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { developmentConfiguration, tauriDevArguments } from './debug.mjs';
+import { DEVELOPMENT_NATIVE_PROFILE, developmentConfiguration, nativeCargoArguments, tauriDevArguments } from './debug.mjs';
 
 test('development service identity is stable within a workspace and separates probes and other workspaces', (t) => {
   const parent = realpathSync(os.tmpdir());
@@ -42,4 +42,25 @@ test('the ordinary debug entry point enables app-bound with the existing Tauri c
   const args = tauriDevArguments('workspace', ['--no-watch']);
   assert.deepEqual(args.slice(1), ['dev', '--features', 'app-bound-dev', '--no-watch']);
   assert.ok(!args.includes('--config'));
+});
+
+test('native development builds and tests use an optimized profile with assertions', () => {
+  const manifest = readFileSync(new URL('../src-tauri/app-bound/Cargo.toml', import.meta.url), 'utf8');
+  const profile = manifest.split(`[profile.${DEVELOPMENT_NATIVE_PROFILE}]`)[1]?.split(/\n\[/)[0];
+  assert.ok(profile, 'native profile must exist in the standalone crate');
+  assert.match(profile, /inherits\s*=\s*"dev"/);
+  assert.match(profile, /opt-level\s*=\s*[23]/);
+  assert.match(profile, /debug\s*=\s*true/);
+  assert.match(profile, /debug-assertions\s*=\s*true/);
+  for (const [command, args] of [
+    ['build', ['--bin', 'carbonpaper-key-service', '--bin', 'carbonpaper-protected-setup']],
+    ['build', ['--bin', 'carbonpaper-development-probe']],
+    ['test', ['--lib']],
+  ]) {
+    const native = nativeCargoArguments(command, 'workspace', args);
+    assert.equal(native[native.indexOf('--profile') + 1], DEVELOPMENT_NATIVE_PROFILE);
+    assert.equal(native[native.indexOf('--features') + 1], 'development-runtime');
+    assert.deepEqual(native.slice(-args.length), args);
+  }
+  assert.ok(!tauriDevArguments('workspace').includes('--profile'));
 });
