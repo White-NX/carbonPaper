@@ -35,9 +35,16 @@ pub fn initialize() -> Result<(), String> {
     }
     windows::call(Request::Status {})
         .map_err(|e| format!("Development service handshake failed: {e}"))?;
+    let data_dir = crate::get_data_dir();
+    let ledger = identity::state_root()
+        .map_err(|e| format!("Cannot resolve development ledger directory: {e}"))?
+        .join("keys.db");
     eprintln!(
-        "[app-bound dev] Ready: {}",
-        carbonpaper_app_bound::protocol::SERVICE_NAME
+        "[app-bound dev] Ready: service={} instance={} data_dir={} ledger={}",
+        carbonpaper_app_bound::protocol::SERVICE_NAME,
+        development::INSTANCE_ID,
+        data_dir.display(),
+        ledger.display()
     );
     Ok(())
 }
