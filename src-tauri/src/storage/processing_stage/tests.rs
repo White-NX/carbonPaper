@@ -58,7 +58,39 @@ impl Broker for TestBroker {
     }
 }
 
-fn fixture() -> (tempfile::TempDir, StorageState, Arc<TestBroker>) {
+struct Fixture {
+    dir: Option<tempfile::TempDir>,
+    storage: Option<StorageState>,
+    broker: Option<Arc<TestBroker>>,
+}
+
+impl Fixture {
+    fn parts(&mut self) -> (&std::path::Path, &mut StorageState, &Arc<TestBroker>) {
+        (
+            self.dir.as_ref().unwrap().path(),
+            self.storage.as_mut().unwrap(),
+            self.broker.as_ref().unwrap(),
+        )
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let Some(storage) = self.storage.take() {
+            storage.processing_stage.shutdown();
+            drop(storage);
+        }
+        drop(self.broker.take());
+        let dir = self.dir.take().unwrap();
+        if std::thread::panicking() {
+            let _ = dir.close();
+        } else {
+            dir.close().unwrap();
+        }
+    }
+}
+
+fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let credentials = Arc::new(CredentialManagerState::new(dir.path().to_path_buf()));
     let mut storage = StorageState::new(dir.path().to_path_buf(), credentials);
@@ -94,7 +126,11 @@ fn fixture() -> (tempfile::TempDir, StorageState, Arc<TestBroker>) {
         )
         .unwrap();
     storage.processing_stage.refresh().unwrap();
-    (dir, storage, broker)
+    Fixture {
+        dir: Some(dir),
+        storage: Some(storage),
+        broker: Some(broker),
+    }
 }
 
 fn sql(storage: &StorageState, statement: &str) {
@@ -165,9 +201,10 @@ fn category(storage: &StorageState, id: i64) -> Option<String> {
 
 #[test]
 fn locked_restart_only_recovers_pending_inputs_and_never_authorizes_archive_reads() {
-    let (dir, mut storage, broker) = fixture();
+    let mut fixture = fixture();
+    let (dir, storage, broker) = fixture.parts();
     let input = insert_input(&storage, 1, 7);
-    let bytes = std::fs::read(dir.path().join(STAGING_FILE)).unwrap();
+    let bytes = std::fs::read(dir.join(STAGING_FILE)).unwrap();
     assert!(!bytes
         .windows(input.ocr_text.len())
         .any(|w| w == input.ocr_text.as_bytes()));
@@ -183,7 +220,7 @@ fn locked_restart_only_recovers_pending_inputs_and_never_authorizes_archive_read
         .processing_stage
         .finish(&storage, &work.receipt)
         .unwrap();
-    restart_stage(dir.path(), &mut storage, &broker);
+    restart_stage(dir, storage, broker);
     assert!(storage
         .processing_stage
         .claim(&storage, Consumer::Classification)
@@ -206,7 +243,8 @@ fn locked_restart_only_recovers_pending_inputs_and_never_authorizes_archive_read
 
 #[test]
 fn callback_fields_cannot_retarget_an_issued_receipt() {
-    let (dir, storage, _) = fixture();
+    let mut fixture = fixture();
+    let (dir, storage, _broker) = fixture.parts();
     insert_input(&storage, 1, 7);
     insert_input(&storage, 2, 7);
     let receipt = storage
@@ -237,7 +275,7 @@ fn callback_fields_cannot_retarget_an_issued_receipt() {
     let mut changed = receipt.clone();
     changed.lease_id = random_id();
     variants.push(changed);
-    let conn = Connection::open(dir.path().join(STAGING_FILE)).unwrap();
+    let conn = Connection::open(dir.join(STAGING_FILE)).unwrap();
     conn.execute(
         "UPDATE staged_work SET deadline=?1",
         [now_secs() + DAY_SECS],
@@ -259,10 +297,11 @@ fn callback_fields_cannot_retarget_an_issued_receipt() {
 
 #[test]
 fn malformed_input_does_not_request_a_key_or_block_the_next_task() {
-    let (dir, storage, broker) = fixture();
+    let mut fixture = fixture();
+    let (dir, storage, broker) = fixture.parts();
     insert_input(&storage, 1, 1);
     insert_input(&storage, 2, 1);
-    Connection::open(dir.path().join(STAGING_FILE))
+    Connection::open(dir.join(STAGING_FILE))
         .unwrap()
         .execute(
             "UPDATE staged_inputs SET binding='{',created=0 WHERE screenshot_id=1",
@@ -280,10 +319,11 @@ fn malformed_input_does_not_request_a_key_or_block_the_next_task() {
 
 #[test]
 fn deletion_revokes_even_when_the_user_queue_lost_its_task_row() {
-    let (dir, mut storage, broker) = fixture();
+    let mut fixture = fixture();
+    let (dir, storage, broker) = fixture.parts();
     insert_input(&storage, 1, 1);
-    let snapshot = std::fs::read(dir.path().join(STAGING_FILE)).unwrap();
-    Connection::open(dir.path().join(STAGING_FILE))
+    let snapshot = std::fs::read(dir.join(STAGING_FILE)).unwrap();
+    Connection::open(dir.join(STAGING_FILE))
         .unwrap()
         .execute("DELETE FROM staged_inputs", [])
         .unwrap();
@@ -291,8 +331,8 @@ fn deletion_revokes_even_when_the_user_queue_lost_its_task_row() {
     storage.finish_staged_deletions().unwrap();
     sql(&storage, "UPDATE screenshots SET is_deleted=0 WHERE id=1");
     storage.processing_stage.shutdown();
-    std::fs::write(dir.path().join(STAGING_FILE), snapshot).unwrap();
-    restart_stage(dir.path(), &mut storage, &broker);
+    std::fs::write(dir.join(STAGING_FILE), snapshot).unwrap();
+    restart_stage(dir, storage, broker);
     assert!(storage
         .processing_stage
         .claim(&storage, Consumer::Classification)
@@ -302,7 +342,8 @@ fn deletion_revokes_even_when_the_user_queue_lost_its_task_row() {
 
 #[test]
 fn failed_deletion_keeps_the_outbox_and_blocks_further_key_claims() {
-    let (_, storage, broker) = fixture();
+    let mut fixture = fixture();
+    let (_dir, storage, broker) = fixture.parts();
     insert_input(&storage, 1, 1);
     insert_input(&storage, 2, 1);
     sql(&storage, "UPDATE screenshots SET is_deleted=1 WHERE id=1");
@@ -340,7 +381,8 @@ fn failed_deletion_keeps_the_outbox_and_blocks_further_key_claims() {
 
 #[test]
 fn category_and_receipt_commit_atomically_and_duplicate_callback_does_not_rewrite() {
-    let (_, storage, _) = fixture();
+    let mut fixture = fixture();
+    let (_dir, storage, _broker) = fixture.parts();
     insert_input(&storage, 1, 1);
     let receipt = storage
         .processing_stage
@@ -367,7 +409,8 @@ fn category_and_receipt_commit_atomically_and_duplicate_callback_does_not_rewrit
 
 #[test]
 fn committed_result_recovers_an_expired_process_lease_without_reprocessing() {
-    let (dir, mut storage, broker) = fixture();
+    let mut fixture = fixture();
+    let (dir, storage, broker) = fixture.parts();
     insert_input(&storage, 1, 3);
     let receipt = storage
         .processing_stage
@@ -383,7 +426,7 @@ fn committed_result_recovers_an_expired_process_lease_without_reprocessing() {
     broker.online.store(true, Ordering::SeqCst);
     broker.principal.lock().unwrap().process_identity = "10:200".into();
     broker.clock.fetch_add(LEASE_TTL_SECS + 1, Ordering::SeqCst);
-    restart_stage(dir.path(), &mut storage, &broker);
+    restart_stage(dir, storage, broker);
     storage.processing_stage.reconcile(&storage).unwrap();
     assert!(storage.pending_staged_receipts().unwrap().is_empty());
     assert_eq!(category(&storage, 1).as_deref(), Some("Development"));
@@ -401,7 +444,8 @@ fn committed_result_recovers_an_expired_process_lease_without_reprocessing() {
 
 #[test]
 fn recovered_completion_does_not_revoke_other_consumers() {
-    let (dir, mut storage, broker) = fixture();
+    let mut fixture = fixture();
+    let (dir, storage, broker) = fixture.parts();
     insert_input(&storage, 1, 3);
     let receipt = storage
         .processing_stage
@@ -432,7 +476,7 @@ fn recovered_completion_does_not_revoke_other_consumers() {
             [serde_json::to_string(&old_receipt).unwrap()],
         )
         .unwrap();
-    restart_stage(dir.path(), &mut storage, &broker);
+    restart_stage(dir, storage, broker);
     storage.processing_stage.reconcile(&storage).unwrap();
     assert!(storage.pending_staged_receipts().unwrap().is_empty());
     assert!(storage
@@ -444,7 +488,8 @@ fn recovered_completion_does_not_revoke_other_consumers() {
 
 #[test]
 fn exhausted_consumer_waits_for_unlock_while_other_consumers_keep_their_grants() {
-    let (dir, storage, _) = fixture();
+    let mut fixture = fixture();
+    let (dir, storage, _broker) = fixture.parts();
     insert_input(&storage, 1, 3);
     let receipt = storage
         .processing_stage
@@ -452,7 +497,7 @@ fn exhausted_consumer_waits_for_unlock_while_other_consumers_keep_their_grants()
         .unwrap()
         .unwrap()
         .receipt;
-    let conn = Connection::open(dir.path().join(STAGING_FILE)).unwrap();
+    let conn = Connection::open(dir.join(STAGING_FILE)).unwrap();
     conn.execute("UPDATE staged_work SET attempts=4 WHERE consumer=1", [])
         .unwrap();
     storage.processing_stage.release(&receipt, true).unwrap();
@@ -472,7 +517,8 @@ fn exhausted_consumer_waits_for_unlock_while_other_consumers_keep_their_grants()
 
 #[test]
 fn source_mutation_and_database_generation_fence_archive_writes() {
-    let (_, storage, _) = fixture();
+    let mut fixture = fixture();
+    let (_dir, storage, _broker) = fixture.parts();
     insert_input(&storage, 1, 1);
     let receipt = storage
         .processing_stage
@@ -501,25 +547,26 @@ fn source_mutation_and_database_generation_fence_archive_writes() {
 
 #[test]
 fn cold_dataset_reset_revokes_old_grants_and_changes_the_identity() {
-    let (dir, mut storage, broker) = fixture();
+    let mut fixture = fixture();
+    let (dir, storage, broker) = fixture.parts();
     insert_input(&storage, 1, 1);
     let old_dataset = storage.processing_dataset_id().unwrap();
-    let snapshot = std::fs::read(dir.path().join(STAGING_FILE)).unwrap();
+    let snapshot = std::fs::read(dir.join(STAGING_FILE)).unwrap();
     storage.processing_stage.shutdown();
     storage.processing_stage = ProcessingStaging::with_test_broker(broker.clone());
     storage
         .processing_stage
-        .initialize(dir.path(), old_dataset.clone(), storage.db_generation())
+        .initialize(dir, old_dataset.clone(), storage.db_generation())
         .unwrap();
     assert!(!storage.processing_stage.status().installed);
     storage.reset_processing_dataset().unwrap();
     let new_dataset = storage.processing_dataset_id().unwrap();
     assert_ne!(old_dataset, new_dataset);
     storage.processing_stage.shutdown();
-    std::fs::write(dir.path().join(STAGING_FILE), snapshot).unwrap();
+    std::fs::write(dir.join(STAGING_FILE), snapshot).unwrap();
     storage
         .processing_stage
-        .initialize(dir.path(), old_dataset, storage.db_generation())
+        .initialize(dir, old_dataset, storage.db_generation())
         .unwrap();
     storage.processing_stage.refresh().unwrap();
     assert!(storage
@@ -531,7 +578,8 @@ fn cold_dataset_reset_revokes_old_grants_and_changes_the_identity() {
 
 #[test]
 fn disable_preserves_completed_state_and_uninstall_clears_enabled_status() {
-    let (dir, storage, broker) = fixture();
+    let mut fixture = fixture();
+    let (dir, storage, broker) = fixture.parts();
     insert_input(&storage, 1, 3);
     let receipt = storage
         .processing_stage
@@ -547,7 +595,7 @@ fn disable_preserves_completed_state_and_uninstall_clears_enabled_status() {
         .processing_stage
         .set_policy(false, Limits::default())
         .unwrap();
-    let state: String = Connection::open(dir.path().join(STAGING_FILE))
+    let state: String = Connection::open(dir.join(STAGING_FILE))
         .unwrap()
         .query_row("SELECT state FROM staged_work WHERE consumer=1", [], |r| {
             r.get(0)
@@ -571,7 +619,8 @@ fn disable_preserves_completed_state_and_uninstall_clears_enabled_status() {
 
 #[test]
 fn maintenance_visits_tasks_beyond_its_first_batch() {
-    let (_, storage, broker) = fixture();
+    let mut fixture = fixture();
+    let (_dir, storage, broker) = fixture.parts();
     for id in 1..=70 {
         insert_input(&storage, id, 1);
     }
@@ -585,7 +634,8 @@ fn maintenance_visits_tasks_beyond_its_first_batch() {
 
 #[test]
 fn malformed_durable_receipt_does_not_block_valid_completions() {
-    let (_, storage, _) = fixture();
+    let mut fixture = fixture();
+    let (_dir, storage, _broker) = fixture.parts();
     insert_input(&storage, 1, 1);
     let receipt = storage
         .processing_stage
@@ -607,7 +657,8 @@ fn malformed_durable_receipt_does_not_block_valid_completions() {
 
 #[test]
 fn missing_local_stage_cannot_skip_dataset_retirement() {
-    let (_, storage, broker) = fixture();
+    let mut fixture = fixture();
+    let (_dir, storage, broker) = fixture.parts();
     insert_input(&storage, 1, 1);
     let receipt = storage
         .processing_stage
@@ -634,7 +685,8 @@ fn missing_local_stage_cannot_skip_dataset_retirement() {
 #[test]
 fn staged_vector_and_receipt_share_a_transaction_and_an_exact_subject() {
     use crate::storage::{DerivedEmbeddingWrite, DerivedIndexJobSpec, DerivedIndexKind};
-    let (_, storage, _) = fixture();
+    let mut fixture = fixture();
+    let (_dir, storage, _broker) = fixture.parts();
     insert_input(&storage, 1, Consumer::MiniLm.bit());
     let receipt = storage
         .processing_stage
