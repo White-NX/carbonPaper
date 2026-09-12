@@ -18,8 +18,8 @@ use windows::{
         Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_READ},
         System::{Com::CoTaskMemFree, Threading::*},
         UI::Shell::{
-            FOLDERID_ProgramData, FOLDERID_ProgramFilesX64, FOLDERID_System, SHGetKnownFolderPath,
-            KF_FLAG_DEFAULT,
+            FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFilesX64, FOLDERID_System,
+            SHGetKnownFolderPath, KF_FLAG_DEFAULT,
         },
     },
 };
@@ -55,17 +55,33 @@ fn known_folder(id: &windows::core::GUID) -> Result<PathBuf> {
     }
 }
 pub fn protected_root() -> Result<PathBuf> {
+    #[cfg(feature = "development-runtime")]
+    return Ok(known_folder(&FOLDERID_ProgramFilesX64)?
+        .join(crate::development::USER_DIRECTORY_NAME)
+        .join("Protected"));
+    #[cfg(not(feature = "development-runtime"))]
     Ok(known_folder(&FOLDERID_ProgramFilesX64)?
         .join("CarbonPaper")
         .join("Protected"))
 }
+fn state_root_from(program_data: &Path) -> PathBuf {
+    #[cfg(feature = "development-runtime")]
+    return program_data
+        .join(crate::protocol::SERVICE_NAME)
+        .join("State");
+    #[cfg(not(feature = "development-runtime"))]
+    program_data.join("CarbonPaperKeyService").join("State")
+}
+
 pub fn state_root() -> Result<PathBuf> {
-    Ok(known_folder(&FOLDERID_ProgramData)?
-        .join("CarbonPaper")
-        .join("KeyService"))
+    Ok(state_root_from(&known_folder(&FOLDERID_ProgramData)?))
 }
 pub fn system_directory() -> Result<PathBuf> {
     known_folder(&FOLDERID_System)
+}
+
+pub fn local_app_data_directory() -> Result<PathBuf> {
+    known_folder(&FOLDERID_LocalAppData)
 }
 
 fn sid_string(sid: PSID) -> Result<String> {
@@ -350,7 +366,15 @@ pub struct VerifiedCaller {
     pub image_lock: File,
 }
 
-pub fn verify_main(mut process: ProcessIdentity) -> Result<VerifiedCaller> {
+pub fn verify_main(process: ProcessIdentity) -> Result<VerifiedCaller> {
+    #[cfg(feature = "development-runtime")]
+    return crate::development::verify_client(process);
+    #[cfg(not(feature = "development-runtime"))]
+    verify_protected_main(process)
+}
+
+#[cfg(not(feature = "development-runtime"))]
+fn verify_protected_main(mut process: ProcessIdentity) -> Result<VerifiedCaller> {
     let root = protected_root()?;
     let directory = process.image.parent().ok_or(BrokerError::AccessDenied)?;
     if process
@@ -414,10 +438,13 @@ pub struct Activation {
 }
 
 pub fn active_runtime() -> Result<Option<PathBuf>> {
+    active_runtime_for_sid(&current_sid()?)
+}
+
+/// The SID comes from an OS process token, never an IPC request.
+pub(crate) fn active_runtime_for_sid(sid: &str) -> Result<Option<PathBuf>> {
     let root = protected_root()?;
-    let path = root
-        .join("Activations")
-        .join(format!("{}.json", current_sid()?));
+    let path = root.join("Activations").join(format!("{sid}.json"));
     if !path.exists() {
         return Ok(None);
     }
@@ -437,4 +464,20 @@ pub fn active_runtime() -> Result<Option<PathBuf>> {
         return Err(BrokerError::Integrity);
     }
     Ok(Some(directory))
+}
+
+#[cfg(all(test, not(feature = "development-runtime")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_state_uses_a_dedicated_program_data_namespace() {
+        let program_data = Path::new(r"C:\ProgramData");
+
+        assert_eq!(
+            state_root_from(program_data),
+            program_data.join("CarbonPaperKeyService").join("State")
+        );
+        assert!(!state_root_from(program_data).starts_with(program_data.join("CarbonPaper")));
+    }
 }

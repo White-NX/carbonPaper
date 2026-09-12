@@ -34,7 +34,24 @@ fn executable_directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "Application directory is unavailable".into())
 }
 
+pub(crate) fn supported_build() -> bool {
+    !cfg!(debug_assertions) || cfg!(feature = "app-bound-dev")
+}
+
+fn installation_source() -> Result<PathBuf, String> {
+    #[cfg(feature = "app-bound-dev")]
+    return carbonpaper_app_bound::development::package_directory().map_err(|e| e.to_string());
+    #[cfg(not(feature = "app-bound-dev"))]
+    executable_directory()
+}
+
 pub(crate) fn is_protected_runtime() -> bool {
+    // The development client remains in Cargo's target directory. Its signed
+    // registration is checked by the separate service, while dev workers keep
+    // their ordinary discovery and Vite keeps control of the desktop process.
+    if cfg!(feature = "app-bound-dev") {
+        return false;
+    }
     if protected_environment_ready() {
         return true;
     }
@@ -49,6 +66,9 @@ pub(crate) fn protected_environment_ready() -> bool {
 }
 
 pub(crate) fn uses_protected_installation() -> bool {
+    if cfg!(feature = "app-bound-dev") {
+        return false;
+    }
     is_protected_runtime()
         || REPAIR_NEEDED.load(std::sync::atomic::Ordering::Acquire)
         || identity::active_runtime().ok().flatten().is_some()
@@ -83,6 +103,25 @@ pub(crate) fn protected_resource(relative: &str) -> Result<Option<PathBuf>, Stri
 /// Called before the single-instance plugin: movable portable and installer
 /// copies remain launchers for the registered protected runtime.
 pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
+    #[cfg(feature = "app-bound-dev")]
+    {
+        if !args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--cng-unlock" | "--silent-install-python"))
+        {
+            match crate::app_bound_dev::initialize() {
+                Ok(()) => {
+                    PROTECTED_ENVIRONMENT_READY.store(true, std::sync::atomic::Ordering::Release)
+                }
+                Err(error) => {
+                    eprintln!("[app-bound dev] {error}");
+                    REPAIR_NEEDED.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+        return Ok(false);
+    }
+    #[cfg(not(feature = "app-bound-dev"))]
     match try_delegate_startup(args) {
         Ok(result) => Ok(result),
         Err(_) => {
@@ -94,6 +133,7 @@ pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
     }
 }
 
+#[cfg(not(feature = "app-bound-dev"))]
 fn try_delegate_startup(args: &[String]) -> Result<bool, String> {
     if cfg!(debug_assertions)
         || args
@@ -148,6 +188,7 @@ fn try_delegate_startup(args: &[String]) -> Result<bool, String> {
     Ok(true)
 }
 
+#[cfg(not(feature = "app-bound-dev"))]
 fn sanitize_runtime_environment() -> Result<(), String> {
     for key in [
         "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
@@ -202,8 +243,8 @@ pub async fn app_bound_status(
             processing.available = false;
             processing.reason = Some("repair_required".into());
         }
-        let package_available = !cfg!(debug_assertions)
-            && executable_directory()
+        let package_available = supported_build()
+            && installation_source()
                 .ok()
                 .is_some_and(|dir| manifest::read_manifest(&dir).is_ok());
         let offer_enable = package_available
@@ -266,10 +307,14 @@ pub async fn app_bound_set_policy(
 /// Sources come only from the current package or the verified updater staging
 /// directory; no arbitrary-source installation command is exposed to the UI.
 pub(crate) async fn install_runtime(source: PathBuf, enable: bool) -> Result<(), String> {
-    if cfg!(debug_assertions) {
+    if !supported_build() {
         return Err("APP_BOUND_PACKAGE_UNAVAILABLE".into());
     }
-    tokio::task::spawn_blocking(move || {
+    #[cfg(feature = "app-bound-dev")]
+    let action =
+        move || carbonpaper_app_bound::development::install_package(&source, enable).map(|_| ());
+    #[cfg(not(feature = "app-bound-dev"))]
+    let action = move || {
         let (release, _) =
             manifest::read_manifest(&source).map_err(|_| "APP_BOUND_PACKAGE_UNAVAILABLE")?;
         let setup = source.join("carbonpaper-protected-setup.exe");
@@ -306,12 +351,18 @@ pub(crate) async fn install_runtime(source: PathBuf, enable: bool) -> Result<(),
             return Err("APP_BOUND_INSTALL_FAILED".into());
         }
         Ok(())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    };
+    tokio::task::spawn_blocking(action)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 pub(crate) fn schedule_restart(app: &AppHandle) -> Result<(), String> {
+    if cfg!(feature = "app-bound-dev") {
+        PROTECTED_ENVIRONMENT_READY.store(true, std::sync::atomic::Ordering::Release);
+        REPAIR_NEEDED.store(false, std::sync::atomic::Ordering::Release);
+        return Ok(());
+    }
     let runtime = identity::active_runtime()
         .map_err(|e| e.to_string())?
         .ok_or("Protected runtime is missing")?;
@@ -351,7 +402,7 @@ pub async fn app_bound_install(
     if enable && !credentials.background_processing_enabled() {
         return Err("BACKGROUND_PROCESSING_DISABLED".into());
     }
-    install_runtime(executable_directory()?, enable).await?;
+    install_runtime(installation_source()?, enable).await?;
     crate::registry_config::set_bool(OFFER_SEEN, true)?;
     schedule_restart(&app)
 }

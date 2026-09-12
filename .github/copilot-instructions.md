@@ -20,7 +20,7 @@ CarbonPaper is a hybrid desktop application combining text-searchable screenshot
 ## Critical Developer Workflows
 
 ### 1. Build & Run
-- **Full App**: `npm run tauri dev`
+- **Full App**: `npm run debug`
     -   Starts Vite server.
     -   Compiles Rust.
     -   Rust binary launches `monitor/main.py` automatically using found `.venv`.

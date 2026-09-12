@@ -6,6 +6,9 @@ edition = "2021"
 [lib]
 name = "carbonpaper_app_bound"
 
+[features]
+development-runtime = ["dep:runas"]
+
 [[bin]]
 name = "carbonpaper-key-service"
 path = "src/bin/service.rs"
@@ -13,6 +16,11 @@ path = "src/bin/service.rs"
 [[bin]]
 name = "carbonpaper-protected-setup"
 path = "src/bin/setup.rs"
+
+[[bin]]
+name = "carbonpaper-development-probe"
+path = "src/bin/development_probe.rs"
+required-features = ["development-runtime"]
 
 [dependencies]
 aes-gcm = "0.10"
@@ -30,6 +38,7 @@ zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
 
 [target.'cfg(windows)'.dependencies]
+runas = { version = "1.2", optional = true }
 windows = { version = "0.58", features = [
   "Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography",
   "Win32_Security_Authorization", "Win32_Storage_FileSystem",

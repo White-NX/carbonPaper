@@ -706,6 +706,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "rand 0.8.5",
+ "runas",
  "rusqlite",
  "semver",
  "serde",

@@ -52,6 +52,7 @@ const BACKGROUND_PROCESSING_ENABLED_KEY: &str = "background_processing_enabled";
 pub(crate) const MASTER_KEY_FILE_NAME: &str = "credential_master_key.bin";
 const MASTER_KEY_LEN: usize = 32;
 const MASTER_KEY_FILE_MAGIC: &[u8; 5] = b"CPMK3"; // 版本升级
+                                                  // Development and installed builds deliberately reuse the user's persisted key.
 const CNG_KEY_NAME: &str = "CarbonPaperMasterKeyV3";
 // The Software KSP supports RSA encryption and protected UI policy.
 const CNG_PROVIDER_NAME: &str = "Microsoft Software Key Storage Provider";
@@ -590,7 +591,7 @@ mod windows_impl {
             NCryptExportKey, NCryptFreeObject, NCRYPT_FLAGS, NCRYPT_HANDLE, NCRYPT_KEY_HANDLE,
         };
 
-        let key = open_or_create_cng_key()?;
+        let key = open_cng_key(CngKeyAccess::CreateIfMissing)?;
 
         let blob_type = HSTRING::from("RSAPUBLICBLOB");
         let blob_pcwstr = windows::core::PCWSTR::from_raw(blob_type.as_ptr());
@@ -1086,13 +1087,59 @@ pub fn get_or_create_master_key_sync(
 }
 
 #[cfg(windows)]
-fn open_or_create_cng_key(
+#[derive(Clone, Copy)]
+enum CngKeyAccess {
+    CreateIfMissing,
+    Existing,
+    ExistingSilent,
+}
+
+#[cfg(windows)]
+impl CngKeyAccess {
+    fn flags(self) -> windows::Win32::Security::Cryptography::NCRYPT_FLAGS {
+        use windows::Win32::Security::Cryptography::{NCRYPT_FLAGS, NCRYPT_SILENT_FLAG};
+        match self {
+            Self::ExistingSilent => NCRYPT_SILENT_FLAG,
+            _ => NCRYPT_FLAGS(0),
+        }
+    }
+
+    /// Only first-use setup may create a key, and only after confirmed absence.
+    /// Authentication, cancellation and provider failures must never replace it.
+    fn allow_creation_after(self, error: windows::core::Error) -> Result<(), CredentialError> {
+        use windows::Win32::Foundation::{
+            ERROR_CANCELLED, NTE_BAD_KEYSET, NTE_NOT_FOUND, NTE_SILENT_CONTEXT, NTE_USER_CANCELLED,
+        };
+        let code = error.code();
+        if code == NTE_BAD_KEYSET || code == NTE_NOT_FOUND {
+            return match self {
+                Self::CreateIfMissing => Ok(()),
+                _ => Err(CredentialError::KeyNotFound),
+            };
+        }
+        if code == NTE_SILENT_CONTEXT {
+            return Err(CredentialError::AuthRequired);
+        }
+        if code == NTE_USER_CANCELLED
+            || code == windows::core::HRESULT::from_win32(ERROR_CANCELLED.0)
+        {
+            return Err(CredentialError::UserCancelled);
+        }
+        Err(CredentialError::SystemError(format!(
+            "Failed to open CNG key: {error}"
+        )))
+    }
+}
+
+#[cfg(windows)]
+fn open_cng_key(
+    access: CngKeyAccess,
 ) -> Result<windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE, CredentialError> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Security::Cryptography::{
         NCryptCreatePersistedKey, NCryptFinalizeKey, NCryptFreeObject, NCryptOpenKey,
         NCryptOpenStorageProvider, NCryptSetProperty, CERT_KEY_SPEC, NCRYPT_FLAGS, NCRYPT_HANDLE,
-        NCRYPT_KEY_HANDLE, NCRYPT_OVERWRITE_KEY_FLAG, NCRYPT_PROV_HANDLE, NCRYPT_RSA_ALGORITHM,
+        NCRYPT_KEY_HANDLE, NCRYPT_PROV_HANDLE, NCRYPT_RSA_ALGORITHM,
         NCRYPT_UI_FORCE_HIGH_PROTECTION_FLAG, NCRYPT_UI_POLICY,
     };
 
@@ -1121,18 +1168,28 @@ fn open_or_create_cng_key(
             &mut key,
             key_pcwstr,
             CERT_KEY_SPEC(0),
-            NCRYPT_FLAGS(0),
+            access.flags(),
         )
     };
 
-    if open_result.is_ok() {
-        // SAFETY: the provider handle is owned here; the opened key remains independently
-        // valid after the provider reference is released.
-        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
-        return Ok(key);
+    match open_result {
+        Ok(()) => {
+            // SAFETY: the provider handle is owned here; the opened key remains independently
+            // valid after the provider reference is released.
+            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
+            return Ok(key);
+        }
+        Err(error) => {
+            if let Err(error) = access.allow_creation_after(error) {
+                // SAFETY: opening failed and this function still owns the provider.
+                let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(provider.0)) };
+                return Err(error);
+            }
+        }
     }
 
-    // Create a new persisted key when the lookup failed.
+    // Create only on first use. Never overwrite a key, including one created
+    // concurrently after the lookup above.
     let mut new_key = NCRYPT_KEY_HANDLE::default();
     // SAFETY: provider and algorithm/key-name strings are live, and `new_key` is writable
     // handle storage. Ownership of the returned key remains with this function.
@@ -1143,7 +1200,7 @@ fn open_or_create_cng_key(
             NCRYPT_RSA_ALGORITHM,
             key_pcwstr,
             CERT_KEY_SPEC(0),
-            NCRYPT_OVERWRITE_KEY_FLAG,
+            NCRYPT_FLAGS(0),
         )
     }
     .map_err(|e| {
@@ -1227,7 +1284,7 @@ fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialE
         NCryptEncrypt, NCryptFreeObject, NCRYPT_HANDLE, NCRYPT_PAD_PKCS1_FLAG,
     };
 
-    let key = open_or_create_cng_key()?;
+    let key = open_cng_key(CngKeyAccess::CreateIfMissing)?;
 
     // Use PKCS#1 v1.5 padding for compatibility and query the output size first.
     let mut out_len: u32 = 0;
@@ -1295,9 +1352,16 @@ fn decrypt_master_key_with_cng_flags(
     flags: windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
     owner_hwnd: Option<isize>,
 ) -> Result<Vec<u8>, CredentialError> {
-    use windows::Win32::Security::Cryptography::{NCryptFreeObject, NCRYPT_HANDLE};
+    use windows::Win32::Security::Cryptography::{
+        NCryptFreeObject, NCRYPT_HANDLE, NCRYPT_SILENT_FLAG,
+    };
 
-    let key = open_or_create_cng_key()?;
+    let access = if flags.contains(NCRYPT_SILENT_FLAG) {
+        CngKeyAccess::ExistingSilent
+    } else {
+        CngKeyAccess::Existing
+    };
+    let key = open_cng_key(access)?;
     if let Some(hwnd) = owner_hwnd {
         use windows::Win32::Security::Cryptography::{
             NCryptSetProperty, NCRYPT_WINDOW_HANDLE_PROPERTY,
@@ -1410,7 +1474,7 @@ impl CngKeySession {
     /// of popping system UI.
     pub fn open_silent() -> Result<Self, CredentialError> {
         Ok(Self {
-            key: open_or_create_cng_key()?,
+            key: open_cng_key(CngKeyAccess::ExistingSilent)?,
         })
     }
 
@@ -1541,6 +1605,56 @@ pub fn decrypt_row_key_with_cng_silent(_ciphertext: &[u8]) -> Result<Vec<u8>, Cr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn cng_authentication_and_provider_failures_never_allow_key_creation() {
+        use windows::Win32::Foundation::{
+            ERROR_CANCELLED, NTE_BAD_DATA, NTE_PERM, NTE_SILENT_CONTEXT, NTE_USER_CANCELLED,
+        };
+        for access in [
+            CngKeyAccess::CreateIfMissing,
+            CngKeyAccess::Existing,
+            CngKeyAccess::ExistingSilent,
+        ] {
+            assert!(matches!(
+                access.allow_creation_after(NTE_SILENT_CONTEXT.into()),
+                Err(CredentialError::AuthRequired)
+            ));
+            for code in [
+                NTE_USER_CANCELLED,
+                windows::core::HRESULT::from_win32(ERROR_CANCELLED.0),
+            ] {
+                assert!(matches!(
+                    access.allow_creation_after(code.into()),
+                    Err(CredentialError::UserCancelled)
+                ));
+            }
+            for code in [NTE_PERM, NTE_BAD_DATA] {
+                assert!(matches!(
+                    access.allow_creation_after(code.into()),
+                    Err(CredentialError::SystemError(_))
+                ));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_cng_key_can_only_be_created_during_setup() {
+        use windows::Win32::Foundation::{NTE_BAD_KEYSET, NTE_NOT_FOUND};
+        for code in [NTE_BAD_KEYSET, NTE_NOT_FOUND] {
+            assert!(CngKeyAccess::CreateIfMissing
+                .allow_creation_after(code.into())
+                .is_ok());
+            for access in [CngKeyAccess::Existing, CngKeyAccess::ExistingSilent] {
+                assert!(matches!(
+                    access.allow_creation_after(code.into()),
+                    Err(CredentialError::KeyNotFound)
+                ));
+            }
+        }
+    }
 
     #[test]
     fn locking_ui_session_preserves_background_master_key() {

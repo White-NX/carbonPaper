@@ -92,6 +92,9 @@ async function main() {
     stage('Check package signatures and privileged imports', () => run(process.execPath, [
       '--test', path.join(root, 'scripts', 'protected-runtime.test.mjs'),
     ]));
+    stage('Check the debug entry point and service configuration', () => run(process.execPath, [
+      '--test', path.join(root, 'scripts', 'debug.test.mjs'),
+    ]));
     stage('Run security guards', () => run(process.execPath, [path.join(root, 'scripts', 'security-guards.cjs')]));
     report.passed = true;
   } catch (error) {

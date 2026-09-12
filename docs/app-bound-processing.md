@@ -111,7 +111,7 @@ overrides accepted by the service.
 | `%ProgramFiles%/CarbonPaper/Protected/Runtime/<version>-<manifest-hash-prefix>/` | Signed application binaries and bundled resources; the manifest hash prefix is 16 hexadecimal characters |
 | `%ProgramFiles%/CarbonPaper/Protected/System/` | Service executable, setup helper, setup lock and machine-wide runtime registration |
 | `%ProgramFiles%/CarbonPaper/Protected/Activations/<SID>.json` | Per-user approved runtime selection |
-| `%ProgramData%/CarbonPaper/KeyService/keys.db` | Protected `owners`, `tasks`, `leases` and schema metadata; authoritative grant state |
+| `%ProgramData%/CarbonPaperKeyService/State/keys.db` | Protected `owners`, `tasks`, `leases` and schema metadata; authoritative grant state |
 | `<data_dir>/processing-staging.db` | User-writable encrypted `staged_inputs` and scheduling state in `staged_work` |
 | Existing archive database | `app_bound_dataset_id`, `screenshot_processing_revisions`, `app_bound_receipts` and `app_bound_revocations` |
 
@@ -258,12 +258,86 @@ activation, protected-directory ACLs, UAC/restart handoff, actual worker loading
 cross-user behavior and machine reboot recovery. Passing the preflight provides
 the coverage above, rather than certifying those remaining release properties.
 
+## Debug with the real Windows service
+
+```powershell
+npm run debug
+```
+
+This starts the normal Tauri development window with Vite hot reload and a real
+LocalSystem app-bound service. It builds the two small native helpers in debug
+mode; no production package or release signing key is required. The desktop and
+model workers use the ordinary development build and asset preparation paths.
+Incremental builds reuse Cargo's caches.
+
+The development window reuses the existing `CarbonPaperMasterKeyV3` CNG key. If
+CarbonPaper has already been set up for this Windows user, unlock with the
+existing password. A new CNG key is created only when none exists. Authentication
+failures and cancellation never trigger key replacement, and decryption never
+creates a missing key.
+
+The application uses the existing data-directory setting from
+`HKCU/Software/CarbonPaper`, the existing archive and credential files, and the
+normal Tauri application identifier. Settings, autostart, browser integration and
+data-directory migration follow the same configuration paths as the installed
+application. There is no separate development database or registry profile.
+
+The native service has a stable registration ID for each workspace and Windows
+user. Its component cache and protected task ledger use these locations:
+
+| Item | Development service location or name |
+| --- | --- |
+| Component cache and signing material | `%LOCALAPPDATA%/CarbonPaperDev-<instance>/` |
+| Windows service | `CarbonPaperKeyServiceDev-<instance>` |
+| Named pipe | `\\.\pipe\CarbonPaper.AppBound.Dev.<instance>.v1` |
+| Protected components | `%ProgramFiles%/CarbonPaperDev-<instance>/Protected/` |
+| Task ledger | `%ProgramData%/CarbonPaperKeyServiceDev-<instance>/State/` |
+
+The development and release services have separate signing identities and task
+grants. This allows the service to authorize the current workspace executable
+while the production service retains its signed-release requirements. Archive
+reads use the shared CNG credentials and the application's existing session checks.
+
+First startup requests UAC to register the helpers and the exact desktop executable
+path and hash. Rust changes restart the desktop through Tauri, refresh changed
+helpers and request UAC when registration needs updating. Frontend hot reload
+does not need re-registration. Enabling and repairing the component use the
+normal settings actions; repair keeps the development window running. The
+service remains installed between sessions and can be removed from development
+settings.
+
+The registration manifest uses a local development signing key, a separate
+signature context and a public key fixed at compile time. This signing key is
+unrelated to the CNG archive key and requires no password setup. The service
+verifies the actual caller's SID, executable path and registered hash. Its
+executable lock lasts for each request so Cargo can replace the desktop after
+it exits. The development feature fails compilation when debug assertions are
+disabled; production builds accept only their existing protected release identity.
+
+For a small end-to-end check without starting Tauri or loading models, run from
+an ordinary, unelevated Windows terminal:
+
+```powershell
+npm run test:app-bound:dev
+```
+
+This uses a separate probe instance and synthetic input. It requests UAC for
+installation, repair and removal, verifies the LocalSystem peer, exercises the
+real pipe and user/SYSTEM DPAPI wrapping, recovers a task after service restart,
+and completes all three consumers. It also checks that the ordinary client cannot
+read the SYSTEM ledger and that a copied executable at an unregistered path is
+rejected. It removes the probe service afterward and does not use the archive's
+CNG key. UAC cancellation is a failed check.
+
+`npm run test:app-bound:dev:core` runs the native unit tests with the development
+feature enabled. `npm run test:app-bound:fast` continues to test the production
+protocol and helper configuration before expensive release builds.
+
 ## Validation and debugging
 
-Validation is intentionally split into two layers. The ordinary development build
-must not contact the production broker: `NativeBroker` rejects it, and tests inject
-an in-process broker instead. This preserves the process-identity boundary while
-making the protocol, ledger, staging and recovery logic fast to test.
+`npm run debug` automatically configures the development service and enables the
+internal Cargo feature needed for real app-bound connections. The in-process
+broker fixtures provide fast protocol, ledger, staging and recovery tests.
 
 Run the automated layer first:
 
@@ -274,10 +348,11 @@ npm run test:security
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-These checks cover state-machine and packaging behavior, but they cannot prove the
-LocalSystem service identity, protected-directory ACLs, UAC flow, DPAPI user/SYSTEM
-wrapping, reboot recovery or cross-user rejection. Those properties require a
-signed release package on a disposable Windows installation.
+These unit checks cover state-machine and packaging behavior. The development
+probe above additionally exercises LocalSystem identity, installation, protected
+ledger access, UAC, two-context DPAPI and service restart. Production packaging,
+full worker loading, machine reboot recovery and cross-user acceptance still
+require a signed release on a disposable Windows installation.
 
 Transport regressions use unique local Windows byte pipes to exercise delayed and
 fragmented replies, empty-pipe deadlines, disconnections and frame size limits.
@@ -304,7 +379,7 @@ The protected runtime now has two complementary logs:
 | Process | Location | Contents |
 | --- | --- | --- |
 | Desktop application | The active data directory under `logs/<date>/carbonpaper.log` | Client-side broker operation, consumer and redacted error code |
-| Key service | `%ProgramData%/CarbonPaper/KeyService/logs/service.log` | Service lifecycle, fixed request operation, request stage and redacted error code |
+| Key service | `%ProgramData%/CarbonPaperKeyService/State/logs/service.log` | Service lifecycle, fixed request operation, request stage and redacted error code |
 
 The service log is best-effort and rotates at 4 MiB to `service.log.1`. A logging
 failure never changes broker behavior. It deliberately excludes keys, wrapped-key
@@ -351,10 +426,11 @@ The existing spaCy integration fixture can exceed the fifteen-second test limit
 during a cold model load. The full Python suite was also checked with
 `--timeout=60`; this changes the test invocation, not the production timeout.
 
-Debug builds do not contact the production broker. Tests inject an in-process
-broker with temporary storage; this adds no developer-path or environment-key
-override to production authorization. Signature tests generate ephemeral keys
-inside their temporary fixtures and do not replace the release public key.
+Debug builds do not contact the production broker. The normal debug command
+uses the development service and build-time trust identity; unit tests inject an
+in-process broker with temporary storage. Neither adds a developer-path or
+environment-key override to production authorization. Signature tests generate
+ephemeral keys inside their fixtures and do not replace the release public key.
 
 The release pipeline builds both helpers and the separate Python launcher before
 Tauri bundling. `beforeBundleCommand` signs the final binary/resource manifest;

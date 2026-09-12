@@ -1,11 +1,11 @@
 use super::*;
-use crate::{crypto, windows::transport};
+use crate::{crypto, ledger::Principal, windows::transport};
 use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
 
 struct NativeBrokerFixture {
     directory: tempfile::TempDir,
     ledger: Option<Arc<LedgerLock>>,
-    cache: Arc<Mutex<HashMap<String, VerifiedCaller>>>,
+    cache: CallerCache,
     principal: Principal,
     dataset: String,
 }
@@ -34,7 +34,7 @@ impl NativeBrokerFixture {
             ledger: Some(Arc::new(LedgerLock::new(ledger))),
             cache: Arc::new(Mutex::new(HashMap::from([(
                 principal.process_identity.clone(),
-                caller,
+                Arc::new(caller),
             )]))),
             principal,
             dataset: random_id(),
@@ -261,14 +261,13 @@ async fn native_dpapi_rejects_a_different_pipe_token_sid() {
         .await
         .register_owner(other_sid, &fixture.principal.runtime_id, true)
         .unwrap();
-    fixture
-        .cache
-        .lock()
-        .unwrap()
-        .get_mut(&fixture.principal.process_identity)
-        .unwrap()
-        .principal
-        .sid = other_sid.into();
+    {
+        let mut cache = fixture.cache.lock().unwrap();
+        Arc::get_mut(cache.get_mut(&fixture.principal.process_identity).unwrap())
+            .unwrap()
+            .principal
+            .sid = other_sid.into();
+    }
     fixture
         .request(Request::AttachDataset {
             dataset_id: fixture.dataset.clone(),

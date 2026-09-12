@@ -6,6 +6,9 @@ authors = ["you"]
 edition = "2021"
 default-run = "carbonpaper"
 
+[features]
+app-bound-dev = ["carbonpaper-app-bound/development-runtime"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]

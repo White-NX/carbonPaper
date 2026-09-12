@@ -11,8 +11,37 @@ use std::{
 
 pub const MANIFEST_NAME: &str = "protected-runtime.json";
 pub const SIGNATURE_NAME: &str = "protected-runtime.sig";
+#[cfg(not(feature = "development-runtime"))]
 pub const SIGNING_CONTEXT: &[u8] = b"CarbonPaper protected runtime v1\n";
+#[cfg(feature = "development-runtime")]
+pub const SIGNING_CONTEXT: &[u8] = b"CarbonPaper protected development runtime v1\n";
+#[cfg(not(feature = "development-runtime"))]
 pub const RELEASE_PUBLIC_KEY: &str = include_str!("../../update-public-key.txt");
+#[cfg(feature = "development-runtime")]
+pub const RELEASE_PUBLIC_KEY: &str = env!("CARBONPAPER_APP_BOUND_DEV_PUBLIC_KEY");
+#[cfg(not(feature = "development-runtime"))]
+pub const PRODUCT: &str = "carbonpaper";
+#[cfg(feature = "development-runtime")]
+pub const PRODUCT: &str = "carbonpaper-development";
+
+#[cfg(not(feature = "development-runtime"))]
+const REQUIRED_FILES: &[&str] = &[
+    "carbonpaper.exe",
+    "carbonpaper-python.exe",
+    "carbonpaper-key-service.exe",
+    "carbonpaper-protected-setup.exe",
+    "carbonpaper-semantic-worker.exe",
+    "carbonpaper-ml.exe",
+    "carbonpaper-office.exe",
+    "carbonpaper-nmh.exe",
+    "monitor.pyz",
+];
+#[cfg(feature = "development-runtime")]
+const REQUIRED_FILES: &[&str] = &[
+    "carbonpaper-key-service.exe",
+    "carbonpaper-protected-setup.exe",
+    "development-client.json",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,7 +57,7 @@ pub struct ReleaseManifest {
 impl ReleaseManifest {
     pub fn validate(&self) -> Result<()> {
         if self.format != 1
-            || self.product != "carbonpaper"
+            || self.product != PRODUCT
             || self.architecture != "x86_64"
             || self.service_protocol != PROTOCOL_VERSION
             || self.files.len() > 4096
@@ -37,18 +66,8 @@ impl ReleaseManifest {
         {
             return Err(BrokerError::VersionMismatch);
         }
-        for required in [
-            "carbonpaper.exe",
-            "carbonpaper-python.exe",
-            "carbonpaper-key-service.exe",
-            "carbonpaper-protected-setup.exe",
-            "carbonpaper-semantic-worker.exe",
-            "carbonpaper-ml.exe",
-            "carbonpaper-office.exe",
-            "carbonpaper-nmh.exe",
-            "monitor.pyz",
-        ] {
-            if !self.files.contains_key(required) {
+        for required in REQUIRED_FILES {
+            if !self.files.contains_key(*required) {
                 return Err(BrokerError::Integrity);
             }
         }
@@ -161,23 +180,13 @@ mod tests {
     #[test]
     fn signature_covers_all_files_and_rejects_update_manifest_reuse() {
         let key = SigningKey::from_bytes(&[7; 32]);
-        let files = [
-            "carbonpaper.exe",
-            "carbonpaper-python.exe",
-            "carbonpaper-key-service.exe",
-            "carbonpaper-protected-setup.exe",
-            "carbonpaper-semantic-worker.exe",
-            "carbonpaper-ml.exe",
-            "carbonpaper-office.exe",
-            "carbonpaper-nmh.exe",
-            "monitor.pyz",
-        ]
-        .into_iter()
-        .map(|v| (v.into(), "a".repeat(64)))
-        .collect();
+        let files = REQUIRED_FILES
+            .iter()
+            .map(|v| ((*v).into(), "a".repeat(64)))
+            .collect();
         let manifest = ReleaseManifest {
             format: 1,
-            product: "carbonpaper".into(),
+            product: PRODUCT.into(),
             version: "0.8.5".into(),
             architecture: "x86_64".into(),
             service_protocol: 1,

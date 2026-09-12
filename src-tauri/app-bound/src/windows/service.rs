@@ -1,6 +1,6 @@
 use crate::{
     crypto::KeyProtector,
-    ledger::{Ledger, Principal},
+    ledger::Ledger,
     protocol::*,
     windows::{
         diagnostics,
@@ -41,6 +41,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static STATUS_HANDLE: AtomicIsize = AtomicIsize::new(0);
 // A task panic releases this guard instead of poisoning the shared ledger.
 type LedgerLock = tokio::sync::Mutex<Ledger>;
+type CallerCache = Arc<Mutex<HashMap<String, Arc<VerifiedCaller>>>>;
 const ACCEPT_TIMEOUT: Duration = Duration::from_millis(500);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(8);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
@@ -320,7 +321,7 @@ fn create_pipe(first: bool) -> Result<NamedPipeServer> {
 }
 
 async fn serve(ledger: Arc<LedgerLock>) -> Result<()> {
-    let cache = Arc::new(Mutex::new(HashMap::<String, VerifiedCaller>::new()));
+    let cache: CallerCache = Arc::new(Mutex::new(HashMap::new()));
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     let mut pipe = create_pipe(true)?;
     let mut maintenance_task = tokio::spawn(maintenance_loop(ledger.clone()));
@@ -496,9 +497,9 @@ where
 
 async fn verify_caller_blocking(
     pipe: NamedPipeServer,
-    cache: Arc<Mutex<HashMap<String, VerifiedCaller>>>,
+    cache: CallerCache,
     deadline: tokio::time::Instant,
-) -> Result<(NamedPipeServer, Principal)> {
+) -> Result<(NamedPipeServer, Arc<VerifiedCaller>)> {
     // Caller verification can hash a large protected executable on a cache
     // miss, so keep it off scheduler workers alongside authority operations.
     // Keep the pipe owned by the blocking closure. A connection deadline may
@@ -512,20 +513,22 @@ async fn verify_caller_blocking(
             GetNamedPipeClientProcessId(handle, &mut pid).map_err(|_| BrokerError::AccessDenied)?;
         }
         let process = identity::inspect_process(pid)?;
+        // Development images are rebuilt in Cargo's output directory. Pin the
+        // registered image throughout this request, but do not retain it after
+        // disconnect and prevent the next incremental build from replacing it.
+        if cfg!(feature = "development-runtime") && !cfg!(test) {
+            return Ok((pipe, Arc::new(identity::verify_main(process)?)));
+        }
         let mut cache = cache.lock().map_err(|_| BrokerError::Unavailable)?;
         let id = process.principal.process_identity.clone();
         if !cache.contains_key(&id) {
             if cache.len() >= 32 {
                 cache.clear();
             }
-            cache.insert(id.clone(), identity::verify_main(process)?);
+            cache.insert(id.clone(), Arc::new(identity::verify_main(process)?));
         }
-        let principal = cache
-            .get(&id)
-            .ok_or(BrokerError::AccessDenied)?
-            .principal
-            .clone();
-        Ok((pipe, principal))
+        let caller = cache.get(&id).ok_or(BrokerError::AccessDenied)?.clone();
+        Ok((pipe, caller))
     });
     await_blocking(handle, Some(deadline)).await
 }
@@ -533,22 +536,22 @@ async fn verify_caller_blocking(
 async fn run_request_blocking(
     pipe: NamedPipeServer,
     ledger: Arc<LedgerLock>,
-    principal: Principal,
+    caller: Arc<VerifiedCaller>,
     request: Request,
     deadline: tokio::time::Instant,
 ) -> Result<(NamedPipeServer, Response)> {
     run_ledger_blocking(
         ledger,
         move |ledger| {
-            // The closure owns the pipe for the full DPAPI transaction. If the
+            // The closure owns the pipe and verified image for the full DPAPI transaction. If the
             // deadline expires, a running job keeps the handle until it safely
             // reverts impersonation and returns.
             let protector = DpapiProtector {
                 pipe: HANDLE(pipe.as_raw_handle()),
-                sid: &principal.sid,
+                sid: &caller.principal.sid,
             };
             let response = ledger
-                .handle(&principal, request, now_secs(), &protector)
+                .handle(&caller.principal, request, now_secs(), &protector)
                 .unwrap_or_else(Response::Error);
             Ok((pipe, response))
         },
@@ -560,7 +563,7 @@ async fn run_request_blocking(
 async fn handle_connection(
     pipe: NamedPipeServer,
     ledger: Arc<LedgerLock>,
-    cache: Arc<Mutex<HashMap<String, VerifiedCaller>>>,
+    cache: CallerCache,
 ) -> Result<()> {
     match handle_connection_inner(pipe, ledger, cache).await {
         Ok(()) => Ok(()),
@@ -584,7 +587,7 @@ struct ConnectionFailure {
 async fn handle_connection_inner(
     pipe: NamedPipeServer,
     ledger: Arc<LedgerLock>,
-    cache: Arc<Mutex<HashMap<String, VerifiedCaller>>>,
+    cache: CallerCache,
 ) -> std::result::Result<(), ConnectionFailure> {
     let mut stage = "verify_caller";
     let result = async {
@@ -592,7 +595,7 @@ async fn handle_connection_inner(
         // already entered DPAPI or SQLite is allowed to finish with its owned pipe
         // and ledger guard, because those operations are not safely preemptible.
         let deadline = tokio::time::Instant::now() + CONNECTION_TIMEOUT;
-        let (mut pipe, principal) = verify_caller_blocking(pipe, cache, deadline).await?;
+        let (mut pipe, caller) = verify_caller_blocking(pipe, cache, deadline).await?;
         stage = "write_challenge";
         let challenge = Challenge {
             version: PROTOCOL_VERSION,
@@ -609,7 +612,7 @@ async fn handle_connection_inner(
         let log_success = frame.request.log_success();
         stage = operation;
         let (mut pipe, response) =
-            run_request_blocking(pipe, ledger, principal, frame.request, deadline).await?;
+            run_request_blocking(pipe, ledger, caller, frame.request, deadline).await?;
         match &response {
             Response::Error(error) => {
                 diagnostics::event("warn", "request_completed", operation, Some(*error))

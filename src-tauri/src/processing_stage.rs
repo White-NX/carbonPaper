@@ -39,12 +39,12 @@ impl Broker for NativeBroker {
         carbonpaper_app_bound::windows::identity::active_runtime().map(|runtime| runtime.is_some())
     }
     fn supported(&self) -> bool {
-        !cfg!(debug_assertions)
+        crate::app_bound::supported_build()
     }
     fn call(&self, request: Request) -> protocol::Result<Response> {
         // Production trust never has a developer directory or environment-key
         // override. Unit tests inject an in-process broker explicitly.
-        if cfg!(debug_assertions) {
+        if !crate::app_bound::supported_build() {
             return Err(BrokerError::VersionMismatch);
         }
         if !crate::app_bound::protected_environment_ready() {
@@ -119,7 +119,7 @@ impl Default for ProcessingStatus {
     fn default() -> Self {
         Self {
             installed: false,
-            supported: !cfg!(debug_assertions),
+            supported: crate::app_bound::supported_build(),
             enabled: false,
             available: false,
             reason: None,

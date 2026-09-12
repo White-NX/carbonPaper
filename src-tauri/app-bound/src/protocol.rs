@@ -10,8 +10,28 @@ pub const PREPARE_TTL_SECS: i64 = 600;
 pub const LEASE_TTL_SECS: i64 = 300;
 pub const MAX_ACTIVE_TASKS: u64 = 100_000;
 pub const DAY_SECS: i64 = 86_400;
+#[cfg(not(feature = "development-runtime"))]
 pub const SERVICE_NAME: &str = "CarbonPaperKeyService";
+#[cfg(feature = "development-runtime")]
+pub const SERVICE_NAME: &str = concat!(
+    "CarbonPaperKeyServiceDev-",
+    env!("CARBONPAPER_APP_BOUND_DEV_INSTANCE")
+);
+#[cfg(not(feature = "development-runtime"))]
+pub const SERVICE_DISPLAY_NAME: &str = "CarbonPaper Background Processing";
+#[cfg(feature = "development-runtime")]
+pub const SERVICE_DISPLAY_NAME: &str = concat!(
+    "CarbonPaper Development ",
+    env!("CARBONPAPER_APP_BOUND_DEV_INSTANCE")
+);
+#[cfg(not(feature = "development-runtime"))]
 pub const PIPE_NAME: &str = r"\\.\pipe\CarbonPaper.AppBound.v1";
+#[cfg(feature = "development-runtime")]
+pub const PIPE_NAME: &str = concat!(
+    r"\\.\pipe\CarbonPaper.AppBound.Dev.",
+    env!("CARBONPAPER_APP_BOUND_DEV_INSTANCE"),
+    ".v1"
+);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 #[serde(rename_all = "snake_case")]

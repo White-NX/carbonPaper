@@ -6,6 +6,8 @@
 mod analysis;
 mod ann_format;
 mod app_bound;
+#[cfg(feature = "app-bound-dev")]
+mod app_bound_dev;
 mod autostart;
 mod background_scheduler;
 mod blind_index_repair;

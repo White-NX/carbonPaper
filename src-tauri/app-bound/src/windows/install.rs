@@ -92,17 +92,22 @@ pub fn install(options: InstallOptions) -> Result<PathBuf> {
     // Updates may be requested by a previously verified protected release;
     // initial activation must originate in this exact signed release folder.
     if verify_main(inspect_process(options.caller_pid)?).is_err() {
-        if !path_eq(&caller.image, &source.join("carbonpaper.exe")) {
-            return Err(BrokerError::AccessDenied);
+        #[cfg(feature = "development-runtime")]
+        crate::development::verify_bootstrap_caller(&caller, &source, &manifest)?;
+        #[cfg(not(feature = "development-runtime"))]
+        {
+            if !path_eq(&caller.image, &source.join("carbonpaper.exe")) {
+                return Err(BrokerError::AccessDenied);
+            }
+            let mut file = locked_file(&caller.image)?;
+            verify_file(
+                &mut file,
+                manifest
+                    .files
+                    .get("carbonpaper.exe")
+                    .ok_or(BrokerError::Integrity)?,
+            )?;
         }
-        let mut file = locked_file(&caller.image)?;
-        verify_file(
-            &mut file,
-            manifest
-                .files
-                .get("carbonpaper.exe")
-                .ok_or(BrokerError::Integrity)?,
-        )?;
     }
     let root = protected_root()?;
     let state = state_root()?;
@@ -462,7 +467,7 @@ fn copy_trusted(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn configure_service(path: &Path) -> Result<()> {
-    configure_named_service(path, SERVICE_NAME, "CarbonPaper Background Processing")
+    configure_named_service(path, SERVICE_NAME, SERVICE_DISPLAY_NAME)
 }
 
 fn configure_named_service(path: &Path, service_name: &str, display_name: &str) -> Result<()> {
