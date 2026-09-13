@@ -4,6 +4,7 @@
 //! owns the one decision that used to be duplicated four times: which slice is
 //! allowed to claim the single semantic worker next.
 
+use crate::background_activity::{self, WorkSource};
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
 use crate::monitor::MonitorState;
@@ -287,6 +288,7 @@ pub fn select_next_runnable_task(
 pub struct ScheduledSliceResult {
     pub completed: bool,
     pub has_more: bool,
+    pub processed: u64,
     pub skipped_reason: Option<String>,
 }
 
@@ -295,14 +297,21 @@ impl ScheduledSliceResult {
         Self {
             completed: true,
             has_more,
+            processed: 0,
             skipped_reason: None,
         }
+    }
+
+    pub(crate) fn with_processed(mut self, processed: u64) -> Self {
+        self.processed = processed;
+        self
     }
 
     pub(crate) fn skipped(reason: impl Into<String>) -> Self {
         Self {
             completed: false,
             has_more: true,
+            processed: 0,
             skipped_reason: Some(reason.into()),
         }
     }
@@ -654,35 +663,93 @@ pub(crate) fn gate_reason(app: &AppHandle, manual: bool) -> Option<&'static str>
     } else if !credential.background_authorized() {
         return Some("waiting_for_unlock");
     }
-    if crate::maintenance::is_active() {
-        return Some("maintenance");
-    }
-    if manual {
-        if app
-            .state::<Arc<SemanticRuntimeState>>()
-            .foreground_waiting()
+    environment_gate_reason(
+        app,
+        if manual {
+            EnvironmentPolicy::Immediate
+        } else {
+            EnvironmentPolicy::IdleOnly
+        },
+    )
+}
+
+pub(crate) fn gate_reason_for_kind(
+    app: &AppHandle,
+    manual: bool,
+    kind: BackgroundTaskKind,
+) -> Option<&'static str> {
+    if !manual {
+        let storage = app.state::<Arc<StorageState>>();
+        if storage.background_processing_enabled()
+            && crate::processing_stage::ready_for_kind(&storage, kind)
         {
+            return environment_gate_reason(app, EnvironmentPolicy::IdleOnly);
+        }
+        if kind == BackgroundTaskKind::SmartCluster
+            && storage.background_processing_enabled()
+            && !storage.is_background_authorized()
+        {
+            use carbonpaper_app_bound::protocol::Consumer;
+            if storage.processing_stage.has_ready(Consumer::SmartCluster) {
+                return Some("waiting_for_index");
+            }
+            if storage
+                .processing_stage
+                .owned_screenshot_ids(Consumer::SmartCluster)
+                .is_ok_and(|ids| !ids.is_empty())
+            {
+                return Some("retry_wait");
+            }
+        }
+    }
+    gate_reason(app, manual)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvironmentPolicy {
+    IdleOnly,
+    /// Capture postprocessing and explicit requests may run during user activity,
+    /// while still yielding to maintenance and foreground semantic queries.
+    Immediate,
+}
+
+impl EnvironmentPolicy {
+    fn gate_reason(
+        self,
+        maintenance_active: bool,
+        idle: &IdleState,
+        semantic: &SemanticRuntimeState,
+    ) -> Option<&'static str> {
+        if maintenance_active {
+            return Some("maintenance");
+        }
+        if self == Self::IdleOnly {
+            if !idle.ac_connected.load(Ordering::Relaxed) {
+                return Some("waiting_for_ac_power");
+            }
+            if idle.fullscreen_exclusive.load(Ordering::Relaxed) {
+                return Some("waiting_for_fullscreen");
+            }
+            if !idle.is_idle.load(Ordering::Relaxed) {
+                return Some("waiting_for_idle");
+            }
+        }
+        if semantic.foreground_waiting() {
             return Some("foreground_request");
         }
-        return None;
+        None
     }
-    let idle = app.state::<Arc<IdleState>>();
-    if !idle.ac_connected.load(Ordering::Relaxed) {
-        return Some("waiting_for_ac_power");
-    }
-    if idle.fullscreen_exclusive.load(Ordering::Relaxed) {
-        return Some("waiting_for_fullscreen");
-    }
-    if !idle.is_idle.load(Ordering::Relaxed) {
-        return Some("waiting_for_idle");
-    }
-    if app
-        .state::<Arc<SemanticRuntimeState>>()
-        .foreground_waiting()
-    {
-        return Some("foreground_request");
-    }
-    None
+}
+
+pub(crate) fn environment_gate_reason(
+    app: &AppHandle,
+    policy: EnvironmentPolicy,
+) -> Option<&'static str> {
+    policy.gate_reason(
+        crate::maintenance::is_active(),
+        &app.state::<Arc<IdleState>>(),
+        &app.state::<Arc<SemanticRuntimeState>>(),
+    )
 }
 
 async fn refresh_backlog(app: &AppHandle) {
@@ -753,6 +820,16 @@ async fn refresh_backlog(app: &AppHandle) {
             let _ =
                 storage.enqueue_background_task_if_changed(TASK_PYTHON_CLUSTERING, false, now_ms());
         }
+    }
+}
+
+fn task_source(app: &AppHandle, kind: BackgroundTaskKind, manual: bool) -> WorkSource {
+    if (!manual || kind == BackgroundTaskKind::SmartCluster)
+        && crate::processing_stage::ready_for_kind(&app.state::<Arc<StorageState>>(), kind)
+    {
+        WorkSource::Staged
+    } else {
+        WorkSource::Archive
     }
 }
 
@@ -841,7 +918,13 @@ async fn execute_slice(
                 // whole configured clustering interval.
                 Ok(ScheduledSliceResult::skipped("waiting_for_index"))
             } else {
-                Ok(ScheduledSliceResult::complete(false))
+                let processed = response
+                    .get("result")
+                    .and_then(|value| value.get("n_total"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                background_activity::index_progress(processed);
+                Ok(ScheduledSliceResult::complete(false).with_processed(processed))
             }
         } else {
             Err(response
@@ -959,11 +1042,12 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
         let now = now_ms();
         let selected =
             select_next_runnable_task(&tasks, now, AUTO_AGING_LIMIT.as_millis() as i64, |task| {
-                gate_reason(&app, task.manual_pending).is_none()
-                    && (task.manual_pending
-                        || !app
-                            .state::<Arc<SemanticRuntimeState>>()
-                            .external_background_waiting())
+                BackgroundTaskKind::parse(&task.task_kind).is_some_and(|kind| {
+                    gate_reason_for_kind(&app, task.manual_pending, kind).is_none()
+                }) && (task.manual_pending
+                    || !app
+                        .state::<Arc<SemanticRuntimeState>>()
+                        .external_background_waiting())
             });
         let (kind, manual) = if let Some(selected) = selected {
             selected
@@ -977,6 +1061,17 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                     .blocked_reason
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = None;
+                let inactive = tasks.iter().filter_map(|task| {
+                    let reason = match task.status.as_str() {
+                        "retry_wait" => "retry_wait",
+                        "degraded" => "monitor_unavailable",
+                        "failed" => "failed",
+                        "parked" => "disabled",
+                        _ => return None,
+                    };
+                    Some((task.task_kind.clone(), reason.to_string()))
+                });
+                background_activity::scheduler_no_work(inactive);
                 continue;
             };
             let manual = tasks
@@ -996,13 +1091,15 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) =
                 Some("external_background_request".to_string());
+            background_activity::blocked(kind.as_str(), "external_background_request");
             continue;
         }
-        if let Some(reason) = gate_reason(&app, manual) {
+        if let Some(reason) = gate_reason_for_kind(&app, manual, kind) {
             *runtime
                 .blocked_reason
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(reason.to_string());
+            background_activity::blocked(kind.as_str(), reason);
             continue;
         }
         // A task that was previously blocked by an admission gate is now
@@ -1012,6 +1109,7 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
             .blocked_reason
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        background_activity::clear_blocked(kind.as_str());
         let seq = runtime.service_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let claimed =
             match storage.mark_background_task_started(kind.as_str(), seq, manual, now_ms()) {
@@ -1033,6 +1131,16 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(kind.as_str().to_string());
         runtime.running_manual.store(manual, Ordering::SeqCst);
+        let source = task_source(&app, kind, manual);
+        let started = Instant::now();
+        background_activity::index_start(kind.as_str(), source);
+        tracing::info!(
+            "[BACKGROUND] event=start run={} task={} source={} mode={}",
+            seq,
+            kind.as_str(),
+            source.as_str(),
+            if manual { "manual" } else { "automatic" },
+        );
         let automatic_context =
             (!manual)
                 .then(|| kind.automatic_quantum())
@@ -1045,6 +1153,15 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                     )
                 });
         let result = execute_slice(&app, kind, manual, &runtime, automatic_context.as_ref()).await;
+        let result = result.map(|mut slice| {
+            slice.processed = slice.processed.max(background_activity::index_processed());
+            slice
+        });
+        let processed = result.as_ref().map_or_else(
+            |_| background_activity::index_processed(),
+            |slice| slice.processed,
+        );
+        background_activity::index_finish();
         runtime.running_manual.store(false, Ordering::SeqCst);
         *runtime
             .running_task
@@ -1052,16 +1169,38 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
             .unwrap_or_else(|e| e.into_inner()) = None;
         match result {
             Ok(slice) if slice.skipped_reason.as_deref() == Some("disabled") => {
+                tracing::info!(
+                    "[BACKGROUND] event=end run={} task={} processed={} has_more={} outcome=disabled elapsed_ms={}",
+                    seq,
+                    kind.as_str(),
+                    processed,
+                    slice.has_more,
+                    started.elapsed().as_millis(),
+                );
                 *runtime
                     .blocked_reason
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some("disabled".to_string());
+                background_activity::blocked(kind.as_str(), "disabled");
                 if let Err(error) = storage.park_background_task(kind.as_str(), "feature_disabled")
                 {
                     tracing::debug!("[SCHEDULER] failed to park {}: {error}", kind.as_str());
                 }
             }
             Ok(slice) if slice.skipped_reason.is_some() => {
+                tracing::info!(
+                    "[BACKGROUND] event=end run={} task={} processed={} has_more={} outcome=deferred reason={} elapsed_ms={}",
+                    seq,
+                    kind.as_str(),
+                    processed,
+                    slice.has_more,
+                    slice.skipped_reason.as_deref().unwrap_or("deferred"),
+                    started.elapsed().as_millis(),
+                );
+                background_activity::blocked(
+                    kind.as_str(),
+                    slice.skipped_reason.as_deref().unwrap_or("deferred"),
+                );
                 *runtime
                     .blocked_reason
                     .lock()
@@ -1073,6 +1212,14 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 );
             }
             Ok(slice) => {
+                tracing::info!(
+                    "[BACKGROUND] event=end run={} task={} processed={} has_more={} outcome=success elapsed_ms={}",
+                    seq,
+                    kind.as_str(),
+                    processed,
+                    slice.has_more,
+                    started.elapsed().as_millis(),
+                );
                 *runtime
                     .blocked_reason
                     .lock()
@@ -1090,6 +1237,13 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 runtime.wake.notify_one();
             }
             Err(error) => {
+                tracing::warn!(
+                    "[BACKGROUND] event=end run={} task={} processed={} has_more=true outcome=failed elapsed_ms={}",
+                    seq,
+                    kind.as_str(),
+                    processed,
+                    started.elapsed().as_millis(),
+                );
                 let normalized = error.to_ascii_lowercase();
                 if normalized.contains("clustering_already_running") {
                     *runtime
@@ -1097,6 +1251,7 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) =
                         Some("clustering_already_running".to_string());
+                    background_activity::blocked(kind.as_str(), "clustering_already_running");
                     let _ = storage.defer_background_task(
                         kind.as_str(),
                         now_ms().saturating_add(TICK_INTERVAL.as_millis() as i64),
@@ -1112,6 +1267,7 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) =
                         Some("waiting_for_unlock".to_string());
+                    background_activity::blocked(kind.as_str(), "waiting_for_unlock");
                     let _ = storage.defer_background_task(
                         kind.as_str(),
                         now_ms().saturating_add(TICK_INTERVAL.as_millis() as i64),
@@ -1127,6 +1283,7 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) =
                         Some("monitor_unavailable".to_string());
+                    background_activity::blocked(kind.as_str(), "monitor_unavailable");
                 }
                 if normalized.contains("restart limit reached") {
                     let _ = storage.mark_background_task_degraded(
@@ -1169,6 +1326,9 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                     } else {
                         None
                     };
+                    if terminal_failed {
+                        background_activity::blocked(kind.as_str(), "failed");
+                    }
                     if kind == BackgroundTaskKind::SmartCluster && manual {
                         let worker = app
                             .state::<Arc<crate::smart_cluster_scoring::SmartClusterWorkerState>>();
@@ -1202,6 +1362,7 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                         .blocked_reason
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = Some("retry_wait".to_string());
+                    background_activity::blocked(kind.as_str(), "retry_wait");
                 }
                 tracing::warn!(
                     "[SCHEDULER] {} slice failed (retry {}): {}",
@@ -1226,6 +1387,49 @@ pub async fn background_scheduler_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_postprocess_runs_during_activity_while_bulk_work_waits() {
+        let idle = IdleState::new();
+        let semantic = SemanticRuntimeState::new();
+        for (ac_connected, fullscreen, bulk_reason) in [
+            (true, false, "waiting_for_idle"),
+            (false, false, "waiting_for_ac_power"),
+            (true, true, "waiting_for_fullscreen"),
+        ] {
+            idle.ac_connected.store(ac_connected, Ordering::Relaxed);
+            idle.fullscreen_exclusive
+                .store(fullscreen, Ordering::Relaxed);
+            assert_eq!(
+                EnvironmentPolicy::Immediate.gate_reason(false, &idle, &semantic),
+                None,
+            );
+            assert_eq!(
+                EnvironmentPolicy::IdleOnly.gate_reason(false, &idle, &semantic),
+                Some(bulk_reason),
+            );
+        }
+    }
+
+    #[test]
+    fn postprocess_and_bulk_work_keep_maintenance_and_foreground_guards() {
+        let idle = IdleState::new();
+        idle.is_idle.store(true, Ordering::Relaxed);
+        let semantic = Arc::new(SemanticRuntimeState::new());
+        for policy in [EnvironmentPolicy::Immediate, EnvironmentPolicy::IdleOnly] {
+            assert_eq!(
+                policy.gate_reason(true, &idle, &semantic),
+                Some("maintenance")
+            );
+            let foreground = semantic.foreground_lease();
+            assert_eq!(
+                policy.gate_reason(false, &idle, &semantic),
+                Some("foreground_request"),
+            );
+            drop(foreground);
+            assert_eq!(policy.gate_reason(false, &idle, &semantic), None);
+        }
+    }
 
     fn task(kind: &str, ready: i64, manual: bool, seq: u64) -> BackgroundTaskState {
         BackgroundTaskState {

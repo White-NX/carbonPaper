@@ -80,7 +80,6 @@
 //! would redo the same work forever and never reach a newly captured screenshot.
 
 use crate::background_scheduler::ScheduledSliceResult;
-use crate::idle::IdleState;
 use crate::ml_protocol::MlSemanticModel;
 use crate::rerank::{build_rerank_document, ScorerIdentity, RERANK_OCR_SNIPPET_CHARS};
 use crate::semantic_runtime::{SemanticRuntimeState, FOREGROUND_POLL_INTERVAL};
@@ -94,6 +93,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
+
+pub(crate) mod staged;
 
 pub const SMART_CLUSTER_PROGRESS_EVENT: &str = "smart-cluster-progress";
 
@@ -490,15 +491,15 @@ pub async fn run_scheduled_slice(
     manual: bool,
 ) -> Result<ScheduledSliceResult, String> {
     let state = app.state::<Arc<SmartClusterWorkerState>>().inner().clone();
-    let initial_pending = if manual {
-        let storage = app.state::<Arc<StorageState>>().inner().clone();
-        tokio::task::spawn_blocking(move || storage.count_smart_cluster_pending())
-            .await
-            .map_err(|error| format!("smart cluster backlog task failed: {error}"))??
-            .max(0) as u64
-    } else {
-        0
-    };
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let pending_before = tokio::task::spawn_blocking({
+        let storage = storage.clone();
+        move || storage.count_smart_cluster_pending()
+    })
+    .await
+    .map_err(|error| format!("smart cluster backlog task failed: {error}"))??
+    .max(0) as u64;
+    let initial_pending = if manual { pending_before } else { 0 };
     state.running.store(true, Ordering::SeqCst);
     state.force_running.store(manual, Ordering::SeqCst);
     if manual {
@@ -510,18 +511,33 @@ pub async fn run_scheduled_slice(
     state.running.store(false, Ordering::SeqCst);
     state.force_running.store(false, Ordering::SeqCst);
     let storage = app.state::<Arc<StorageState>>().inner().clone();
-    let pending = tokio::task::spawn_blocking(move || storage.count_smart_cluster_pending())
-        .await
-        .map_err(|error| format!("smart cluster backlog task failed: {error}"))??;
+    let pending = tokio::task::spawn_blocking({
+        let storage = storage.clone();
+        move || storage.count_smart_cluster_pending()
+    })
+    .await
+    .map_err(|error| format!("smart cluster backlog task failed: {error}"))??;
+    if result.is_ok() && pending > 0 && (!manual || !state.aborted()) {
+        if let Some(reason) = tokio::task::spawn_blocking(move || staged::waiting_reason(&storage))
+            .await
+            .map_err(|e| e.to_string())??
+        {
+            if manual {
+                state.set_manual_phase(SmartClusterDrainPhase::Waiting, Some(pending as u64));
+                state.emit_progress(app);
+            }
+            return Ok(ScheduledSliceResult::skipped(reason).with_processed(result?));
+        }
+    }
     if manual && result.is_ok() && pending > 0 && !state.aborted() {
         result = Err("manual smart cluster drain stopped before the queue was empty".to_string());
     }
     if manual {
         match &result {
-            Ok(()) if pending == 0 => {
+            Ok(_) if pending == 0 => {
                 state.set_manual_phase(SmartClusterDrainPhase::Completed, Some(0));
             }
-            Ok(()) => {
+            Ok(_) => {
                 state
                     .set_manual_phase(SmartClusterDrainPhase::Stopped, Some(pending.max(0) as u64));
             }
@@ -539,8 +555,8 @@ pub async fn run_scheduled_slice(
         }
         state.emit_progress(app);
     }
-    result?;
-    Ok(ScheduledSliceResult::complete(pending > 0))
+    let processed = result?.max(pending_before.saturating_sub(pending.max(0) as u64));
+    Ok(ScheduledSliceResult::complete(pending > 0).with_processed(processed))
 }
 
 /// Whether a pass may run at all.
@@ -557,13 +573,17 @@ fn may_run(app: &AppHandle, forced: bool) -> bool {
     // 10 s) and the query that follows the user returning arrives well inside
     // that window.
     //
-    // Only the idle gate is asked here. The foreground lease binds a forced
-    // drain as well, but it is not a reason for one to stop existing — it is a
-    // reason to wait — so `stand_down_reason` is where both modes read it and
-    // `run_pass` is where they part ways.
-    app.state::<Arc<IdleState>>()
-        .is_idle
-        .load(Ordering::Relaxed)
+    // Automatic work rechecks power, fullscreen and idle gates between inputs.
+    // stand_down_reason checks the foreground lease first for both modes, so a
+    // manual drain can wait and resume when a query has finished.
+    app.state::<Arc<StorageState>>()
+        .background_processing_enabled()
+        && crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false)
+        && crate::background_scheduler::environment_gate_reason(
+            app,
+            crate::background_scheduler::EnvironmentPolicy::IdleOnly,
+        )
+        .is_none()
 }
 
 /// Why this pass has to stop where it is, or `None` if it may keep going.
@@ -654,22 +674,29 @@ async fn run_pass(
     app: &AppHandle,
     state: &Arc<SmartClusterWorkerState>,
     forced: bool,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     if !may_run(app, forced) {
-        return Ok(());
+        return Ok(0);
     }
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let storage = app.state::<Arc<StorageState>>().inner().clone();
-    // Unattended work must never ask Rust to decrypt protected data before the
-    // user has unlocked the session.
-    if !forced && !storage.is_background_authorized() {
-        return Ok(());
+    // Each staged read obtains a task-scoped broker lease. Archive reads keep
+    // their original process/session authorization, checked again in run_batch.
+    if !forced
+        && !storage.is_background_authorized()
+        && !crate::processing_stage::ready_for_kind(
+            &storage,
+            crate::background_scheduler::BackgroundTaskKind::SmartCluster,
+        )
+    {
+        return Ok(0);
     }
     if forced && !storage.is_session_valid() {
-        return Ok(());
+        return Ok(0);
     }
 
     let mut scored_anything = false;
+    let mut processed = 0u64;
     let result = loop {
         // One read of the lease per iteration, and waiting is the response to
         // it rather than a separate check in front of it. A pre-check would
@@ -684,7 +711,7 @@ async fn run_pass(
                         "[SMART_CLUSTER] forced drain stopped between batches: {reason}"
                     );
                 }
-                break Ok(());
+                break Ok(processed);
             }
             // Waiting before claiming a batch, not after: a batch read and then
             // held across a pause is a batch nothing else can take either, and
@@ -697,7 +724,7 @@ async fn run_pass(
             }
             if let Some(reason) = stand_aside_for_foreground(app, state).await {
                 tracing::info!("[SMART_CLUSTER] forced drain stopped between batches: {reason}");
-                break Ok(());
+                break Ok(processed);
             }
             if forced {
                 state.set_manual_phase(SmartClusterDrainPhase::Running, None);
@@ -709,6 +736,7 @@ async fn run_pass(
             Ok(batch) => batch,
             Err(error) => break Err(error),
         };
+        processed = processed.saturating_add(batch.deleted.max(batch.staged_completed));
         scored_anything = true;
         // A foreground query is the one interruption a forced drain walks back
         // into rather than ends on, and the wait at the top of the loop is what
@@ -722,22 +750,25 @@ async fn run_pass(
         }
         if forced && batch.stopped_because.is_none() {
             if state.aborted() {
-                break Ok(());
+                break Ok(processed);
             }
-            if batch.deleted > 0 {
+            if batch.deleted > 0 || batch.staged_completed > 0 {
                 // Re-read once after the last committed group so captures that
                 // arrived during the batch are included before declaring the
                 // user-requested drain complete.
                 continue;
             }
             if batch.more {
+                if staged::waiting_reason(&storage)?.is_some() {
+                    break Ok(processed);
+                }
                 break Err("smart cluster drain made no progress while work remained".to_string());
             }
         }
         if batch.stopped_because.is_some() || !batch.more || !forced {
             // An idle pass processes one batch per tick, as Python did; the tick
             // is a minute away and the queue is not going anywhere.
-            break Ok(());
+            break Ok(processed);
         }
     };
 
@@ -787,6 +818,9 @@ struct BatchProgress {
     /// Queue entries removed by this batch. A zero-progress batch must not
     /// spin forever when threshold re-derivation keeps failing transiently.
     deleted: u64,
+    /// A staged result may retain archive debt for uncalibrated clusters.
+    /// Finishing its receipt is still progress and must not trip the drain guard.
+    staged_completed: u64,
 }
 
 impl BatchProgress {
@@ -796,6 +830,7 @@ impl BatchProgress {
             more,
             stopped_because: None,
             deleted: 0,
+            staged_completed: 0,
         }
     }
 
@@ -806,6 +841,7 @@ impl BatchProgress {
             more: true,
             stopped_because: Some(reason),
             deleted: 0,
+            staged_completed: 0,
         }
     }
 }
@@ -817,6 +853,12 @@ async fn run_batch(
     storage: Arc<StorageState>,
     forced: bool,
 ) -> Result<BatchProgress, String> {
+    if let Some(progress) = staged::run_batch(app, state, storage.clone(), forced).await? {
+        return Ok(progress);
+    }
+    if !storage.is_silent_read_authorized() {
+        return Ok(BatchProgress::stopped("waiting_for_unlock"));
+    }
     let read = {
         let storage = storage.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<BatchInputs>, String> {
@@ -888,9 +930,12 @@ async fn run_batch(
         // and a pass that wakes to re-discover the same verdict every minute.
         // The warning banner keeps saying which clusters need attention, and a
         // rescan re-enqueues the window once they have it.
-        let remaining = commit_pending(app, state, storage, &inputs.ids, forced).await?;
+        let (deleted, remaining) = commit_pending(app, state, storage, &inputs.ids, forced).await?;
+        if deleted > 0 {
+            crate::background_activity::index_progress(deleted);
+        }
         let mut progress = BatchProgress::completed(remaining > 0);
-        progress.deleted = inputs.ids.len() as u64;
+        progress.deleted = deleted;
         return Ok(progress);
     }
 
@@ -914,6 +959,7 @@ async fn run_batch(
     // own, and the prefilter compares one stored vector against one anchor.
     let group_size = commit_group_size(targets.len());
     let mut assigned = 0u64;
+    let mut deleted = 0u64;
     let mut interrupted: Option<&'static str> = None;
     for group in inputs.ids.chunks(group_size) {
         if let Some(reason) = stand_down_reason(app, state, forced) {
@@ -925,7 +971,11 @@ async fn run_batch(
         if documents.is_empty() {
             // Every snapshot in this group was deleted between enqueue and now;
             // the queue entries have nothing left to describe.
-            commit_pending(app, state, storage.clone(), group, forced).await?;
+            let (committed, _) = commit_pending(app, state, storage.clone(), group, forced).await?;
+            if committed > 0 {
+                crate::background_activity::index_progress(committed);
+                deleted = deleted.saturating_add(committed);
+            }
             continue;
         }
         let vectors = load_prefilter_vectors(storage.clone(), documents.keys().copied()).await?;
@@ -1000,7 +1050,11 @@ async fn run_batch(
             // pass, which is the whole of what standing down now costs.
             break;
         }
-        commit_pending(app, state, storage.clone(), group, forced).await?;
+        let (committed, _) = commit_pending(app, state, storage.clone(), group, forced).await?;
+        if committed > 0 {
+            crate::background_activity::index_progress(committed);
+            deleted = deleted.saturating_add(committed);
+        }
     }
 
     if assigned > 0 {
@@ -1010,7 +1064,7 @@ async fn run_batch(
         Some(reason) => Ok(BatchProgress::stopped(reason)),
         None => {
             let mut progress = BatchProgress::completed(inputs.remaining > 0);
-            progress.deleted = inputs.ids.len() as u64;
+            progress.deleted = deleted;
             Ok(progress)
         }
     }
@@ -1539,14 +1593,7 @@ async fn record_assignments(
     scores: &[f32],
 ) -> Result<u64, String> {
     let cluster_id = target.id;
-    let threshold = target.threshold;
-    let matches: Vec<(i64, f64)> = candidates
-        .iter()
-        .copied()
-        .zip(scores.iter().copied())
-        .filter(|(_, score)| f64::from(*score) >= threshold)
-        .map(|(id, score)| (id, f64::from(score)))
-        .collect();
+    let matches = matching_scores(target, candidates, scores)?;
     if matches.is_empty() {
         return Ok(0);
     }
@@ -1569,6 +1616,23 @@ async fn record_assignments(
     .map_err(|error| format!("assignment write task failed: {error}"))?
 }
 
+fn matching_scores(
+    target: &SmartClusterScoringTarget,
+    candidates: &[i64],
+    scores: &[f32],
+) -> Result<Vec<(i64, f64)>, String> {
+    if scores.len() != candidates.len() || scores.iter().any(|score| !score.is_finite()) {
+        return Err("rerank_failed: invalid score batch".into());
+    }
+    Ok(candidates
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .filter(|(_, score)| f64::from(*score) >= target.threshold)
+        .map(|(id, score)| (id, f64::from(score)))
+        .collect())
+}
+
 async fn delete_pending(storage: Arc<StorageState>, ids: &[i64]) -> Result<(u64, u64), String> {
     let ids = ids.to_vec();
     tokio::task::spawn_blocking(move || {
@@ -1586,13 +1650,13 @@ async fn commit_pending(
     storage: Arc<StorageState>,
     ids: &[i64],
     forced: bool,
-) -> Result<u64, String> {
+) -> Result<(u64, u64), String> {
     let (deleted, remaining) = delete_pending(storage, ids).await?;
     if forced {
         state.report_processed(deleted, remaining);
         state.emit_progress(app);
     }
-    Ok(remaining)
+    Ok((deleted, remaining))
 }
 
 // ==================== Command surface ====================

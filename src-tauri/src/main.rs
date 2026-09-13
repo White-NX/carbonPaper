@@ -6,12 +6,17 @@
 use std::env;
 fn main() {
     let args: Vec<String> = env::args().collect();
+    match carbonpaper_lib::delegate_protected_runtime(&args) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("Cannot open protected CarbonPaper: {error}");
+            return;
+        }
+    }
     if args.len() > 1 && args[1] == "--silent-install-python" {
         carbonpaper_lib::run_silent_install();
         return;
-    }
-    if args.len() > 1 && args[1] == "--python-launcher" {
-        std::process::exit(carbonpaper_lib::run_python_launcher(&args[2..]));
     }
     if args.len() > 2 && args[1] == "--cng-unlock" {
         let owner_hwnd = args.get(3).and_then(|value| value.parse::<isize>().ok());

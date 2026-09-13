@@ -7,6 +7,7 @@ import DatabaseMaintenanceCard from './advanced/DatabaseMaintenanceCard';
 import { BackgroundSchedulerCard, ClassificationBackendCard, ClipBackendCard, DmlAccelerationCard, OcrEngineCard, SemanticBackendCard } from './advanced/InferenceCards';
 import NetworkAccessCard from './advanced/NetworkAccessCard';
 import OcrQueueCard from './advanced/OcrQueueCard';
+import ProtectedProcessingCard from './advanced/ProtectedProcessingCard';
 import { useAdvancedSectionController } from './useAdvancedSectionController';
 
 export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
@@ -140,6 +141,8 @@ export default function AdvancedSection({ monitorStatus, onRestartMonitor }) {
         onChange={handleBackgroundProcessingChange}
         onRefresh={refreshBackgroundSchedulerStatus}
       />
+
+      <ProtectedProcessingCard backgroundEnabled={backgroundProcessingEnabled} />
 
       <SemanticBackendCard
         status={semanticStatus}

@@ -48,6 +48,7 @@ tools/disk-wear-runs/
 /python-3.12.10-amd64.exe
 /.release-assets/
 /src-tauri/semantic-worker/target/
+/src-tauri/app-bound/target/
 
 # Artificial Intelligence
 CLAUDE.md

@@ -199,6 +199,15 @@ pub async fn credential_set_background_processing_enabled(
 ) -> Result<(), String> {
     crate::commands::check_auth_required(&state)?;
     state.set_background_processing_enabled(enabled)?;
+    if !enabled {
+        let storage = app
+            .state::<Arc<crate::storage::StorageState>>()
+            .inner()
+            .clone();
+        tokio::task::spawn_blocking(move || storage.processing_stage.disable_if_installed())
+            .await
+            .map_err(|error| error.to_string())??;
+    }
     if let Some(scheduler) =
         app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
     {

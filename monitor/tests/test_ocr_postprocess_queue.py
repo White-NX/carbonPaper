@@ -1,4 +1,5 @@
 import threading
+import pytest
 
 import monitor.config as config
 from monitor.worker_process import PostprocessQueue, WORKER_PROTOCOL_VERSION, _enqueue_ocr_postprocess
@@ -134,3 +135,88 @@ def test_enqueue_requires_screenshot_id_or_queue():
     assert _enqueue_ocr_postprocess({"screenshot_id": 1}, None) == {
         "error": "Classification postprocess service is unavailable"
     }
+
+
+class StagedStorageClient(DummyStorageClient):
+    def __init__(self):
+        super().__init__()
+        self.completions = []
+        self.deferrals = []
+
+    def complete_staged_postprocess(self, receipt, category=None, confidence=None):
+        self.completions.append((receipt, category, confidence))
+
+    def defer_staged_postprocess(self, receipt, failed=False):
+        self.deferrals.append((receipt, failed))
+        self.pending.set()
+
+
+def staged_receipt():
+    return {
+        "task_id": "a" * 64, "dataset_id": "b" * 64, "screenshot_id": 42,
+        "consumer": "classification", "lease_id": "c" * 64,
+        "db_generation": 1, "source_revision": 2,
+    }
+
+
+def test_staged_enqueue_preserves_scope_without_forwarding_image_or_key():
+    queue = PostprocessQueue(None, maxsize=1)
+    receipt = staged_receipt()
+    assert _enqueue_ocr_postprocess({
+        "screenshot_id": 42, "ocr_text": "newly captured text", "staged_receipt": receipt,
+        "task_key": b"must stay in Rust", "image_bytes": b"must not cross this pipe",
+    }, queue)["postprocess_enqueued"]
+    job = queue._queue.get_nowait()
+    queue._queue.task_done()
+    assert job["_staged_receipt"] == receipt
+    assert "task_key" not in job
+    assert "image_bytes" not in job
+
+
+def test_staged_result_uses_receipt_instead_of_legacy_category_write(monkeypatch):
+    storage = StagedStorageClient()
+    queue = PostprocessQueue(DummyClassifier())
+    receipt = staged_receipt()
+    monkeypatch.setattr(config, "CLASSIFICATION_ENABLED", True)
+    monkeypatch.setattr("storage_client.get_storage_client", lambda: storage)
+    queue._handle_job({"screenshot_id": 999, "ocr_text": "text", "_staged_receipt": receipt})
+    assert storage.completions == [(receipt, "Development", 0.8765)]
+    assert storage.updates == []
+    assert storage.postprocess_statuses == []
+
+
+def test_staged_scheduling_yield_releases_only_its_lease(monkeypatch):
+    storage = StagedStorageClient()
+    queue = PostprocessQueue(YieldingClassifier("foreground_busy: query active"))
+    receipt = staged_receipt()
+    monkeypatch.setattr(config, "CLASSIFICATION_ENABLED", True)
+    monkeypatch.setattr("storage_client.get_storage_client", lambda: storage)
+    queue.start()
+    try:
+        assert queue.enqueue({"screenshot_id": 42, "_staged_receipt": receipt})
+        assert storage.pending.wait(timeout=2.0)
+    finally:
+        queue.stop()
+    assert storage.deferrals == [(receipt, False)]
+    assert storage.completions == []
+    assert storage.postprocess_statuses == []
+    assert storage.postprocess_retries == []
+
+
+def test_staged_disabled_classification_finishes_without_changing_category(monkeypatch):
+    storage = StagedStorageClient()
+    receipt = staged_receipt()
+    monkeypatch.setattr(config, "CLASSIFICATION_ENABLED", False)
+    monkeypatch.setattr("storage_client.get_storage_client", lambda: storage)
+    PostprocessQueue(None)._handle_job({"_staged_receipt": receipt})
+    assert storage.completions == [(receipt, None, None)]
+    assert storage.updates == []
+
+
+def test_missing_classifier_does_not_claim_the_staged_work_completed(monkeypatch):
+    storage = StagedStorageClient()
+    monkeypatch.setattr(config, "CLASSIFICATION_ENABLED", True)
+    monkeypatch.setattr("storage_client.get_storage_client", lambda: storage)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        PostprocessQueue(None)._handle_job({"_staged_receipt": staged_receipt()})
+    assert storage.completions == []

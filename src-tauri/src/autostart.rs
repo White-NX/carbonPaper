@@ -71,6 +71,14 @@ fn set_autostart_windows(enabled: bool) -> Result<bool, String> {
     Ok(read_run_value()?.is_some())
 }
 
+pub(crate) fn refresh_protected_autostart() -> Result<(), String> {
+    #[cfg(windows)]
+    if read_run_value()?.is_some() {
+        set_autostart_windows(true)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_autostart_status() -> Result<bool, String> {
     #[cfg(windows)]

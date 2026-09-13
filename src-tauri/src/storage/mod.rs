@@ -18,6 +18,7 @@ pub mod migration;
 mod mode;
 mod policy;
 mod process;
+mod processing_stage;
 mod schema;
 mod screenshot;
 mod search;
@@ -76,6 +77,7 @@ impl From<String> for BackgroundReadError {
 /// It provides methods for initializing storage, saving/loading screenshots and OCR results,
 /// and migrating the data directory.
 pub struct StorageState {
+    pub(crate) processing_stage: crate::processing_stage::ProcessingStaging,
     /// Database connection
     db: Mutex<Option<Connection>>,
     /// Data directory (contains database, screenshots, logs, etc.)
@@ -209,6 +211,7 @@ impl StorageState {
         let screenshot_dir = data_dir.join("screenshots");
 
         Self {
+            processing_stage: crate::processing_stage::ProcessingStaging::new(),
             db: Mutex::new(None),
             data_dir: Mutex::new(data_dir),
             screenshot_dir: Mutex::new(screenshot_dir),
@@ -473,6 +476,10 @@ impl StorageState {
     /// application restart, preference disablement, or key-cache clearing.
     pub fn is_background_authorized(&self) -> bool {
         self.credential_state.background_authorized()
+    }
+
+    pub(crate) fn background_processing_enabled(&self) -> bool {
+        self.credential_state.background_processing_enabled()
     }
 
     /// Silent read helpers are also used by explicit user-initiated jobs. A

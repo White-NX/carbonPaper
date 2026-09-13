@@ -37,6 +37,38 @@ jobs:
       - name: Run frontend unit tests
         run: npm run test:frontend
 
+  app-bound-native:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache app-bound native dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri/app-bound -> target'
+
+      - name: Run app-bound checks before release builds
+        run: npm run test:app-bound:fast
+
+      - name: Preserve native check results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-bound-native-results
+          path: src-tauri/app-bound/target/native-checks/
+          if-no-files-found: ignore
+
   backend-fast:
     runs-on: windows-latest
 

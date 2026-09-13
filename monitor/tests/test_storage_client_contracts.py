@@ -1,4 +1,5 @@
 import storage_client as sc
+import pytest
 
 
 def _capture_requests(client, responses):
@@ -64,6 +65,28 @@ def test_storage_client_postprocess_payload_contract():
             "error": "failed",
         }, sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS),
     ]
+
+
+def test_staged_callbacks_preserve_receipt_and_report_rejected_scope():
+    client = sc.StorageClient("test-pipe")
+    receipt = {"task_id": "a" * 64, "lease_id": "b" * 64, "screenshot_id": 42}
+    requests = _capture_requests(client, [
+        {"status": "success"}, {"status": "success"},
+        {"status": "error", "error": "stale receipt"},
+        {"status": "error", "error": "expired lease"},
+    ])
+    client.complete_staged_postprocess(receipt, "Development", 0.9)
+    client.defer_staged_postprocess(receipt, failed=True)
+    assert requests[:2] == [
+        ({"command": "complete_staged_postprocess", "receipt": receipt, "category": "Development", "confidence": 0.9}, sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS),
+        ({"command": "defer_staged_postprocess", "receipt": receipt, "failed": True}, sc.DEFAULT_REVERSE_IPC_TIMEOUT_SECS),
+    ]
+    with pytest.raises(RuntimeError, match="not accepted"):
+        client.complete_staged_postprocess(receipt)
+    with pytest.raises(RuntimeError, match="no longer active"):
+        client.defer_staged_postprocess(receipt)
+    assert "complete_staged_postprocess" in sc.IDEMPOTENT_RETRY_COMMANDS
+    assert "defer_staged_postprocess" not in sc.IDEMPOTENT_RETRY_COMMANDS
 
 
 def test_storage_client_bge_bridge_payload_and_retry_contract():

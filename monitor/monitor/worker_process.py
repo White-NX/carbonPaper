@@ -97,6 +97,12 @@ class PostprocessQueue:
             return None
 
     def _set_status(self, job: Dict[str, Any], status: str, error: Optional[str] = None):
+        if job.get("_staged_receipt"):
+            if status == "pending":
+                storage = self._storage_client()
+                if storage:
+                    storage.defer_staged_postprocess(job["_staged_receipt"], failed=False)
+            return
         if not job.get("_persistent_postprocess"):
             return
         storage = self._storage_client()
@@ -106,6 +112,11 @@ class PostprocessQueue:
             )
 
     def _record_retry(self, job: Dict[str, Any], error: str):
+        if job.get("_staged_receipt"):
+            storage = self._storage_client()
+            if storage:
+                storage.defer_staged_postprocess(job["_staged_receipt"], failed=True)
+            return
         if not job.get("_persistent_postprocess"):
             return
         storage = self._storage_client()
@@ -164,7 +175,16 @@ class PostprocessQueue:
     def _handle_job(self, job: Dict[str, Any]):
         from . import config
 
-        if not self.classifier or not config.CLASSIFICATION_ENABLED:
+        if not config.CLASSIFICATION_ENABLED:
+            if job.get("_staged_receipt"):
+                storage = self._storage_client()
+                if not storage:
+                    raise RuntimeError("Classification storage is unavailable")
+                storage.complete_staged_postprocess(job["_staged_receipt"])
+            return
+        if not self.classifier:
+            if job.get("_staged_receipt"):
+                raise RuntimeError("Classification service is unavailable")
             return
 
         started = time.perf_counter()
@@ -179,7 +199,15 @@ class PostprocessQueue:
                 raise _PostprocessDeferred(str(exc)) from exc
             raise
 
-        if category:
+        if job.get("_staged_receipt"):
+            storage = self._storage_client()
+            if not storage:
+                raise RuntimeError("Classification storage is unavailable")
+            storage.complete_staged_postprocess(
+                job["_staged_receipt"], category,
+                round(float(confidence), 4) if confidence is not None else None,
+            )
+        elif category:
             storage = self._storage_client()
             if storage:
                 storage.update_screenshot_category(
@@ -222,16 +250,17 @@ def _enqueue_ocr_postprocess(
         return {"error": "screenshot_id is required"}
     if not postprocess_queue:
         return {"error": "Classification postprocess service is unavailable"}
-    enqueued = postprocess_queue.enqueue(
-        {
-            "screenshot_id": int(screenshot_id),
-            "window_title": req.get("window_title", ""),
-            "process_name": req.get("process_name", ""),
-            "timestamp": req.get("timestamp", 0),
-            "ocr_text": req.get("ocr_text", ""),
-            "_persistent_postprocess": True,
-        }
-    )
+    job = {
+        "screenshot_id": int(screenshot_id),
+        "window_title": req.get("window_title", ""),
+        "process_name": req.get("process_name", ""),
+        "timestamp": req.get("timestamp", 0),
+        "ocr_text": req.get("ocr_text", ""),
+        "_persistent_postprocess": True,
+    }
+    if req.get("staged_receipt") is not None:
+        job["_staged_receipt"] = req["staged_receipt"]
+    enqueued = postprocess_queue.enqueue(job)
     return {
         "status": "success",
         "postprocess_enqueued": bool(enqueued),

@@ -1,0 +1,526 @@
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+pub const PROTOCOL_VERSION: u32 = 1;
+pub const INPUT_VERSION: u32 = 1;
+pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+pub const RESPONSE_ACK: u8 = 1;
+pub const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
+pub const PREPARE_TTL_SECS: i64 = 600;
+pub const LEASE_TTL_SECS: i64 = 300;
+pub const MAX_ACTIVE_TASKS: u64 = 100_000;
+pub const DAY_SECS: i64 = 86_400;
+#[cfg(not(feature = "development-runtime"))]
+pub const SERVICE_NAME: &str = "CarbonPaperKeyService";
+#[cfg(feature = "development-runtime")]
+pub const SERVICE_NAME: &str = concat!(
+    "CarbonPaperKeyServiceDev-",
+    env!("CARBONPAPER_APP_BOUND_DEV_INSTANCE")
+);
+#[cfg(not(feature = "development-runtime"))]
+pub const SERVICE_DISPLAY_NAME: &str = "CarbonPaper Background Processing";
+#[cfg(feature = "development-runtime")]
+pub const SERVICE_DISPLAY_NAME: &str = concat!(
+    "CarbonPaper Development ",
+    env!("CARBONPAPER_APP_BOUND_DEV_INSTANCE")
+);
+#[cfg(not(feature = "development-runtime"))]
+pub const PIPE_NAME: &str = r"\\.\pipe\CarbonPaper.AppBound.v1";
+#[cfg(feature = "development-runtime")]
+pub const PIPE_NAME: &str = concat!(
+    r"\\.\pipe\CarbonPaper.AppBound.Dev.",
+    env!("CARBONPAPER_APP_BOUND_DEV_INSTANCE"),
+    ".v1"
+);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerError {
+    #[error("app_bound_unavailable")]
+    Unavailable,
+    #[error("app_bound_access_denied")]
+    AccessDenied,
+    #[error("app_bound_invalid_request")]
+    InvalidRequest,
+    #[error("app_bound_disabled")]
+    Disabled,
+    #[error("app_bound_dataset_mismatch")]
+    DatasetMismatch,
+    #[error("app_bound_task_retired")]
+    Retired,
+    #[error("app_bound_lease_expired")]
+    LeaseExpired,
+    #[error("app_bound_task_busy")]
+    Busy,
+    #[error("app_bound_integrity_failure")]
+    Integrity,
+    #[error("app_bound_storage_failure")]
+    Storage,
+    #[error("app_bound_protection_failure")]
+    Protection,
+    #[error("app_bound_version_mismatch")]
+    VersionMismatch,
+    #[error("app_bound_limit_exceeded")]
+    LimitExceeded,
+}
+
+impl BrokerError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Unavailable => "app_bound_unavailable",
+            Self::AccessDenied => "app_bound_access_denied",
+            Self::InvalidRequest => "app_bound_invalid_request",
+            Self::Disabled => "app_bound_disabled",
+            Self::DatasetMismatch => "app_bound_dataset_mismatch",
+            Self::Retired => "app_bound_task_retired",
+            Self::LeaseExpired => "app_bound_lease_expired",
+            Self::Busy => "app_bound_task_busy",
+            Self::Integrity => "app_bound_integrity_failure",
+            Self::Storage => "app_bound_storage_failure",
+            Self::Protection => "app_bound_protection_failure",
+            Self::VersionMismatch => "app_bound_version_mismatch",
+            Self::LimitExceeded => "app_bound_limit_exceeded",
+        }
+    }
+}
+
+pub type Result<T> = std::result::Result<T, BrokerError>;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    pub retention_days: u32,
+    pub capacity_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            retention_days: 30,
+            capacity_bytes: 4 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl Limits {
+    pub fn validate(self) -> Result<Self> {
+        if !(1..=30).contains(&self.retention_days)
+            || !(256 * 1024 * 1024..=4 * 1024 * 1024 * 1024).contains(&self.capacity_bytes)
+        {
+            return Err(BrokerError::InvalidRequest);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Consumer {
+    Classification,
+    MiniLm,
+    Clip,
+    SmartCluster,
+}
+
+impl Consumer {
+    pub const ALL: [Self; 4] = [
+        Self::Classification,
+        Self::MiniLm,
+        Self::Clip,
+        Self::SmartCluster,
+    ];
+    pub const ALL_MASK: u8 = 0x0f;
+    pub const LEGACY_MASK: u8 = 0x07;
+
+    pub const fn bit(self) -> u8 {
+        match self {
+            Self::Classification => 1,
+            Self::MiniLm => 2,
+            Self::Clip => 4,
+            Self::SmartCluster => 8,
+        }
+    }
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Classification => "classification",
+            Self::MiniLm => "minilm",
+            Self::Clip => "clip",
+            Self::SmartCluster => "smart_cluster",
+        }
+    }
+}
+
+/// Redacted in diagnostics and erased on drop, including decoded IPC replies.
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct TaskKey(pub Vec<u8>);
+
+impl std::fmt::Debug for TaskKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TaskKey([redacted])")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskBinding {
+    pub task_id: String,
+    pub dataset_id: String,
+    pub screenshot_id: i64,
+    pub input_version: u32,
+    pub consumers: u8,
+    pub payload_bytes: u64,
+    pub expires_at: i64,
+}
+
+impl TaskBinding {
+    pub fn aad(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|_| BrokerError::InvalidRequest)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreparedTask {
+    pub task: TaskBinding,
+    pub key: TaskKey,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TaskLease {
+    pub task: TaskBinding,
+    pub consumer: Consumer,
+    pub lease_id: String,
+    pub deadline: i64,
+    pub key: TaskKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerStatus {
+    pub enabled: bool,
+    pub limits: Limits,
+    pub dataset_id: Option<String>,
+    pub active_tasks: u64,
+    pub active_bytes: u64,
+    pub runtime_id: String,
+    /// Older v1 services support only the original three consumers. Clients
+    /// must negotiate before including a new consumer in an immutable binding.
+    #[serde(default = "legacy_consumers")]
+    pub supported_consumers: u8,
+}
+
+fn legacy_consumers() -> u8 {
+    Consumer::LEGACY_MASK
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TaskState {
+    pub task: TaskBinding,
+    pub active: bool,
+    pub retired: bool,
+    pub finished_consumers: u8,
+    pub abandoned_consumers: u8,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Request {
+    Status {},
+    AttachDataset {
+        dataset_id: String,
+    },
+    SetPolicy {
+        enabled: bool,
+        limits: Limits,
+    },
+    RetireDataset {
+        dataset_id: String,
+    },
+    PrepareTask {
+        dataset_id: String,
+        screenshot_id: i64,
+        consumers: u8,
+        payload_bytes: u64,
+    },
+    ActivateTask {
+        task_id: String,
+        ciphertext_digest: String,
+    },
+    InspectTask {
+        task_id: String,
+    },
+    AcquireTask {
+        task_id: String,
+        consumer: Consumer,
+        ciphertext_digest: String,
+    },
+    RenewLease {
+        task_id: String,
+        consumer: Consumer,
+        lease_id: String,
+    },
+    ReleaseLease {
+        task_id: String,
+        consumer: Consumer,
+        lease_id: String,
+    },
+    FinishConsumer {
+        task_id: String,
+        consumer: Consumer,
+        lease_id: String,
+    },
+    AbandonConsumer {
+        task_id: String,
+        consumer: Consumer,
+    },
+    RevokeTask {
+        task_id: String,
+    },
+    RevokeTasks {
+        task_ids: Vec<String>,
+    },
+    RevokeScreenshots {
+        dataset_id: String,
+        screenshot_ids: Vec<i64>,
+    },
+}
+
+impl Request {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Status { .. } => "status",
+            Self::AttachDataset { .. } => "attach_dataset",
+            Self::SetPolicy { .. } => "set_policy",
+            Self::RetireDataset { .. } => "retire_dataset",
+            Self::PrepareTask { .. } => "prepare_task",
+            Self::ActivateTask { .. } => "activate_task",
+            Self::InspectTask { .. } => "inspect_task",
+            Self::AcquireTask { .. } => "acquire_task",
+            Self::RenewLease { .. } => "renew_lease",
+            Self::ReleaseLease { .. } => "release_lease",
+            Self::FinishConsumer { .. } => "finish_consumer",
+            Self::AbandonConsumer { .. } => "abandon_consumer",
+            Self::RevokeTask { .. } => "revoke_task",
+            Self::RevokeTasks { .. } => "revoke_tasks",
+            Self::RevokeScreenshots { .. } => "revoke_screenshots",
+        }
+    }
+
+    pub const fn log_success(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status { .. }
+                | Self::InspectTask { .. }
+                | Self::RenewLease { .. }
+                | Self::ReleaseLease { .. }
+        )
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "result", content = "data", rename_all = "snake_case")]
+pub enum Response {
+    Ok,
+    Status(BrokerStatus),
+    TaskState(TaskState),
+    Prepared(PreparedTask),
+    Lease(TaskLease),
+    Deadline(i64),
+    Error(BrokerError),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Challenge {
+    pub version: u32,
+    pub nonce: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestFrame {
+    pub version: u32,
+    pub nonce: String,
+    pub sequence: u64,
+    pub request: Request,
+}
+
+impl RequestFrame {
+    pub fn validate(&self, nonce: &str) -> Result<()> {
+        if self.version != PROTOCOL_VERSION {
+            return Err(BrokerError::VersionMismatch);
+        }
+        // Connections are deliberately single-request; nonces are freshly minted
+        // by the service and never restored or accepted from a previous pipe.
+        if self.sequence != 1 || !valid_id(&self.nonce) || self.nonce != nonce {
+            return Err(BrokerError::AccessDenied);
+        }
+        Ok(())
+    }
+}
+
+pub fn valid_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+}
+
+pub fn random_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn consumer_capabilities_preserve_legacy_v1_status_and_bit_assignments() {
+        let legacy = serde_json::json!({
+            "enabled": true, "limits": Limits::default(), "dataset_id": null,
+            "active_tasks": 0, "active_bytes": 0, "runtime_id": "old-runtime"
+        });
+        let status: BrokerStatus = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(status.supported_consumers, Consumer::LEGACY_MASK);
+        let mut current = legacy;
+        current["supported_consumers"] = Consumer::ALL_MASK.into();
+        let status: BrokerStatus = serde_json::from_value(current).unwrap();
+        assert_eq!(status.supported_consumers, Consumer::ALL_MASK);
+        assert_eq!(Consumer::ALL.map(Consumer::bit), [1, 2, 4, 8]);
+        assert_eq!(
+            Consumer::ALL.iter().fold(0, |mask, c| mask | c.bit()),
+            Consumer::ALL_MASK
+        );
+        assert_eq!(
+            serde_json::to_string(&Consumer::SmartCluster).unwrap(),
+            "\"smart_cluster\""
+        );
+    }
+
+    #[test]
+    fn request_operation_names_are_fixed_and_redacted() {
+        let requests = [
+            Request::Status {},
+            Request::AttachDataset {
+                dataset_id: "sensitive-dataset".into(),
+            },
+            Request::SetPolicy {
+                enabled: true,
+                limits: Limits::default(),
+            },
+            Request::RetireDataset {
+                dataset_id: "sensitive-dataset".into(),
+            },
+            Request::PrepareTask {
+                dataset_id: "sensitive-dataset".into(),
+                screenshot_id: 42,
+                consumers: 7,
+                payload_bytes: 1024,
+            },
+            Request::ActivateTask {
+                task_id: "sensitive-task".into(),
+                ciphertext_digest: "sensitive-digest".into(),
+            },
+            Request::InspectTask {
+                task_id: "sensitive-task".into(),
+            },
+            Request::AcquireTask {
+                task_id: "sensitive-task".into(),
+                consumer: Consumer::Clip,
+                ciphertext_digest: "sensitive-digest".into(),
+            },
+            Request::RenewLease {
+                task_id: "sensitive-task".into(),
+                consumer: Consumer::Clip,
+                lease_id: "sensitive-lease".into(),
+            },
+            Request::ReleaseLease {
+                task_id: "sensitive-task".into(),
+                consumer: Consumer::Clip,
+                lease_id: "sensitive-lease".into(),
+            },
+            Request::FinishConsumer {
+                task_id: "sensitive-task".into(),
+                consumer: Consumer::Clip,
+                lease_id: "sensitive-lease".into(),
+            },
+            Request::AbandonConsumer {
+                task_id: "sensitive-task".into(),
+                consumer: Consumer::Clip,
+            },
+            Request::RevokeTask {
+                task_id: "sensitive-task".into(),
+            },
+            Request::RevokeTasks {
+                task_ids: vec!["sensitive-task".into()],
+            },
+            Request::RevokeScreenshots {
+                dataset_id: "sensitive-dataset".into(),
+                screenshot_ids: vec![42],
+            },
+        ];
+        let names = requests.map(|request| request.operation());
+        assert_eq!(
+            names,
+            [
+                "status",
+                "attach_dataset",
+                "set_policy",
+                "retire_dataset",
+                "prepare_task",
+                "activate_task",
+                "inspect_task",
+                "acquire_task",
+                "renew_lease",
+                "release_lease",
+                "finish_consumer",
+                "abandon_consumer",
+                "revoke_task",
+                "revoke_tasks",
+                "revoke_screenshots",
+            ]
+        );
+        assert!(names.iter().all(|name| !name.contains("sensitive")));
+    }
+
+    #[test]
+    fn pipe_frames_reject_old_nonces_sequences_versions_and_unknown_fields() {
+        let nonce = random_id();
+        let mut frame = RequestFrame {
+            version: PROTOCOL_VERSION,
+            nonce: nonce.clone(),
+            sequence: 1,
+            request: Request::Status {},
+        };
+        frame.validate(&nonce).unwrap();
+        assert_eq!(
+            frame.validate(&random_id()).unwrap_err(),
+            BrokerError::AccessDenied
+        );
+        frame.sequence = 2;
+        assert_eq!(
+            frame.validate(&nonce).unwrap_err(),
+            BrokerError::AccessDenied
+        );
+        frame.sequence = 1;
+        frame.version += 1;
+        assert_eq!(
+            frame.validate(&nonce).unwrap_err(),
+            BrokerError::VersionMismatch
+        );
+        assert!(serde_json::from_str::<Request>(r#"{"command":"status","pid":123}"#).is_err());
+        assert!(
+            serde_json::from_str::<Request>(r#"{"command":"unwrap","blob":"old-ciphertext"}"#)
+                .is_err()
+        );
+    }
+}

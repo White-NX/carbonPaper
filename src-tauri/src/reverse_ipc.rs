@@ -676,6 +676,51 @@ async fn process_request(
                 Err(e) => StorageResponse::error(&e),
             }
         }
+        "complete_staged_postprocess" | "defer_staged_postprocess" => {
+            let receipt = match req.get("receipt").cloned().and_then(|v| {
+                serde_json::from_value::<crate::processing_stage::TaskReceipt>(v).ok()
+            }) {
+                Some(receipt) => receipt,
+                None => return StorageResponse::error("Invalid staged task receipt"),
+            };
+            if receipt.consumer != carbonpaper_app_bound::protocol::Consumer::Classification {
+                return StorageResponse::error("Invalid staged consumer");
+            }
+            let result = if command == "complete_staged_postprocess" {
+                let category = req.get("category").and_then(|v| v.as_str());
+                let confidence = req.get("confidence").and_then(|v| v.as_f64());
+                storage
+                    .commit_staged_category(&receipt, category, confidence)
+                    .map(|first_commit| {
+                        // The archive commit is durable before service acknowledgement.
+                        // Keep the two states distinct so a failed acknowledgement is
+                        // visible in the periodic summary and can be reconciled later.
+                        let _ = storage.processing_stage.finish(&storage, &receipt);
+                        let ack_pending = storage
+                            .pending_staged_classification_receipt_count()
+                            .unwrap_or(u64::from(first_commit));
+                        crate::background_activity::classification_committed(
+                            first_commit,
+                            ack_pending,
+                        );
+                    })
+            } else {
+                storage
+                    .processing_stage
+                    .check_receipt(&receipt)
+                    .and_then(|_| {
+                        storage.processing_stage.release(
+                            &receipt,
+                            req.get("failed").and_then(|v| v.as_bool()).unwrap_or(false),
+                        )
+                    })
+                    .map(|_| crate::background_activity::classification_deferred())
+            };
+            match result {
+                Ok(()) => StorageResponse::success(serde_json::json!({"accepted":true})),
+                Err(error) => StorageResponse::error(&error),
+            }
+        }
         "list_screenshots_for_clustering" => {
             if !storage.is_silent_read_authorized() {
                 return StorageResponse::error("AUTH_REQUIRED");

@@ -21,11 +21,13 @@ const tauriDir = path.join(root, 'src-tauri');
 const profile = 'debug';
 const statePath = path.join(tauriDir, 'target', 'dev-workers-state.json');
 const force = process.argv.includes('--force');
+const appBoundDevelopment = process.env.CARBONPAPER_APP_BOUND_DEV === '1';
 
 const rootWorkerOutputs = [
   path.join(tauriDir, 'target', profile, 'carbonpaper-ml.exe'),
   path.join(tauriDir, 'target', profile, 'carbonpaper-office.exe'),
   path.join(tauriDir, 'target', profile, 'carbonpaper-nmh.exe'),
+  path.join(tauriDir, 'target', profile, 'carbonpaper-python.exe'),
 ];
 
 const semanticOutputs = [
@@ -38,6 +40,7 @@ const rootWorkerPrebundleOutputs = [
   path.join(tauriDir, 'pre-bundle', 'carbonpaper-ml.exe'),
   path.join(tauriDir, 'pre-bundle', 'carbonpaper-office.exe'),
   path.join(tauriDir, 'pre-bundle', 'carbonpaper-nmh.exe'),
+  path.join(tauriDir, 'pre-bundle', 'carbonpaper-python.exe'),
 ];
 
 function walkRustFiles(directory) {
@@ -73,6 +76,11 @@ function rootInputFiles() {
     path.join(tauriDir, 'src', 'office_protocol.rs'),
     path.join(tauriDir, 'src', 'office_window.rs'),
     path.join(tauriDir, 'src', 'bin', 'nmh.rs'),
+    path.join(tauriDir, 'src', 'bin', 'python.rs'),
+    path.join(tauriDir, 'src', 'python_launcher.rs'),
+    ...walkRustFiles(path.join(tauriDir, 'app-bound', 'src')),
+    path.join(tauriDir, 'app-bound', 'Cargo.toml'),
+    path.join(tauriDir, 'app-bound', 'build.rs'),
   ].sort();
 }
 
@@ -182,7 +190,9 @@ function ensureSemanticResourceCopy() {
   copyFileIfChanged(staged, target);
 }
 
-const currentRootFingerprint = fingerprint(rootInputFiles());
+const currentRootFingerprint = createHash('sha256').update(fingerprint(rootInputFiles()))
+  .update(appBoundDevelopment ? `app-bound-dev:${process.env.CARBONPAPER_APP_BOUND_DEV_INSTANCE}:${process.env.CARBONPAPER_APP_BOUND_DEV_PUBLIC_KEY}` : 'standard')
+  .digest('hex');
 const currentSemanticFingerprint = fingerprint(semanticInputFiles());
 const previousState = readState();
 const currentOutputs = [...rootWorkerOutputs, ...semanticOutputs];
@@ -252,12 +262,15 @@ if (rootChanged) {
       // both paths on the same fingerprint avoids alternating rebuilds between
       // default and no-default feature profiles on every debug startup.
       '--no-default-features',
+      ...(appBoundDevelopment ? ['--features', 'app-bound-dev'] : []),
       '--bin',
       'carbonpaper-ml',
       '--bin',
       'carbonpaper-office',
       '--bin',
       'carbonpaper-nmh',
+      '--bin',
+      'carbonpaper-python',
     ],
     { cwd: root, stdio: 'inherit' },
   );

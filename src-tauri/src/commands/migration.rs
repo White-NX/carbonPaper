@@ -688,6 +688,9 @@ pub async fn storage_import_backup(
                 &extracted.path().join(MASTER_KEY_FILE_NAME),
                 &imported_credential_file,
             )?;
+            // Retire the old dataset before replacing its user-writable files.
+            // A service failure leaves the import unapplied and repairable.
+            state.processing_stage.retire_dataset()?;
             state.shutdown_under_maintenance()?;
             let credential_snapshot = credential_state.snapshot_import_state();
             let mut file_transaction =
@@ -697,6 +700,9 @@ pub async fn storage_import_backup(
                     .activate_imported_master_key(&master_key)
                     .map_err(|error| error.to_string())?;
                 state.initialize_under_maintenance()?;
+                // Backups never restore unattended task authority or reuse a
+                // prior dataset ID, even when restored on the original PC.
+                state.reset_processing_dataset()?;
                 file_transaction.commit()?;
                 Ok::<(), String>(())
             })();

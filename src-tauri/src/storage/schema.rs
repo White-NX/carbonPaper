@@ -123,6 +123,17 @@ impl StorageState {
 
         *initialized = true;
 
+        // Staging contains only independently encrypted inputs. Failure cannot
+        // prevent the primary archive from opening or capturing new content.
+        if let Ok(dataset_id) = self.processing_dataset_id() {
+            if let Err(error) =
+                self.processing_stage
+                    .initialize(&data_dir, dataset_id, self.db_generation())
+            {
+                tracing::warn!("Processing staging is unavailable: {error}");
+            }
+        }
+
         tracing::info!(
             "[DIAG:INIT] SQLCipher initialized in {:?} (app_version={}, key_derive={:?}, db_open={:?}, pragma={:?}, requested_journal_mode={}, journal_mode={}, wal_experiment={}, sqlite_version={}, sqlite_source_id={}, cipher_version={}, synchronous={}, init_tables={:?})",
             init_start.elapsed(),
@@ -151,6 +162,7 @@ impl StorageState {
 
     /// Close the primary connection while the maintenance gate is already held.
     pub(crate) fn shutdown_under_maintenance(&self) -> Result<(), String> {
+        self.processing_stage.shutdown();
         self.lazy_indexer_shutdown.store(true, Ordering::SeqCst);
         // The resident semantic matrix belongs to the connection being closed.
         // Its freshness epoch is per-database, so carrying it into whatever
@@ -783,6 +795,7 @@ impl StorageState {
         }
 
         self.ensure_schema(conn)?;
+        self.init_processing_stage_schema(conn)?;
         self.recover_interrupted_derived_index_jobs_at_startup(conn)?;
 
         Ok(())

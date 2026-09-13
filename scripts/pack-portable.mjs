@@ -2,11 +2,14 @@ import { createWriteStream, existsSync } from 'node:fs';
 import { readFile, readdir, stat, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { createDeflateRaw } from 'node:zlib';
+import { signProtectedRuntime } from './protected-runtime.mjs';
 
 const cwd = process.cwd();
 const tauriDir = path.join(cwd, 'src-tauri');
 const releaseDir = path.join(tauriDir, 'target', 'release');
 const preBundleDir = path.join(tauriDir, 'pre-bundle');
+// Re-sign the final binaries, including forward-update smoke-test builds.
+await signProtectedRuntime(cwd, process.env.CARBONPAPER_UPDATE_SIGNING_KEY);
 const bundleOutDir = path.join(releaseDir, 'bundle', 'nsis');
 
 // Read version from tauri.conf.json
@@ -30,7 +33,7 @@ if (!existsSync(mainExe)) {
 }
 filesToPack.push({ src: mainExe, dest: `${productName}.exe` });
 
-for (const binaryName of ['carbonpaper-ml.exe', 'carbonpaper-office.exe', 'carbonpaper-nmh.exe']) {
+for (const binaryName of ['carbonpaper-ml.exe', 'carbonpaper-office.exe', 'carbonpaper-nmh.exe', 'carbonpaper-python.exe']) {
   const binaryPath = path.join(releaseDir, binaryName);
   if (!existsSync(binaryPath)) {
     console.error(`Required portable binary not found: ${binaryPath}`);

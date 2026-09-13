@@ -7,7 +7,7 @@
 //! examples. New snapshots are evaluated in a background worker; matches
 //! above the threshold are recorded in `smart_cluster_assignments`.
 
-use rusqlite::{params, Row};
+use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -211,6 +211,17 @@ pub struct SmartClusterScoringTarget {
     /// means the pass has to encode the anchor itself and write the result
     /// back; it is not an error, just a cold cache.
     pub anchor_vector: Option<CachedAnchorVector>,
+}
+
+impl SmartClusterScoringTarget {
+    pub(crate) fn same_scoring_configuration(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.anchor_text == other.anchor_text
+            && self.threshold == other.threshold
+            && self.scorer == other.scorer
+            && self.scorer_recorded == other.scorer_recorded
+            && self.rederive_failed_scorer == other.rederive_failed_scorer
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -539,6 +550,12 @@ impl StorageState {
         let conn = guard
             .as_ref()
             .ok_or_else(|| "Database connection is None".to_string())?;
+        Self::smart_cluster_scoring_targets_on_conn(conn)
+    }
+
+    pub(super) fn smart_cluster_scoring_targets_on_conn(
+        conn: &Connection,
+    ) -> Result<Vec<SmartClusterScoringTarget>, String> {
         let mut stmt = conn
             .prepare(
                 "SELECT id, anchor_text, threshold, threshold_model_id, \
@@ -901,6 +918,67 @@ impl StorageState {
     /// just waste compute on cold data.
     pub const SMART_CLUSTER_PENDING_TTL_DAYS: i64 = 30;
 
+    /// Intersect two metadata ledgers before asking the broker for any keys.
+    /// Paging past unindexed inputs prevents an older dependency from blocking
+    /// newly indexed captures. A receipt still verifies the source after claim.
+    pub(crate) fn staged_smart_cluster_pending_ids(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<i64>, String> {
+        use carbonpaper_app_bound::protocol::Consumer;
+        const PAGE: i64 = 256;
+        let mut after = 0;
+        let mut selected = Vec::new();
+        while selected.len() < limit {
+            let page =
+                self.processing_stage
+                    .ready_screenshot_page(Consumer::SmartCluster, after, PAGE)?;
+            let Some(last) = page.last().copied() else {
+                break;
+            };
+            let eligible = self.indexed_smart_cluster_pending_ids(&page)?;
+            selected.extend(eligible.into_iter().take(limit - selected.len()));
+            after = last;
+            if page.len() < PAGE as usize {
+                break;
+            }
+        }
+        Ok(selected)
+    }
+
+    fn indexed_smart_cluster_pending_ids(&self, ids: &[i64]) -> Result<Vec<i64>, String> {
+        let spec = crate::minilm_migration::minilm_job_spec(0, "");
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT CAST(e.subject_key AS INTEGER) {}
+             AND e.model_id=?2 AND e.model_revision=?3 AND e.embedding_version=?4
+             AND e.subject_key IN ({placeholders})
+             AND EXISTS(SELECT 1 FROM smart_cluster_pending p JOIN screenshots s ON s.id=p.screenshot_id
+               WHERE CAST(p.screenshot_id AS TEXT)=e.subject_key AND s.is_deleted=0 AND s.status='committed'
+                 AND p.queued_at>=datetime('now','-{} days'))
+             ORDER BY CAST(e.subject_key AS INTEGER)",
+            super::derived_index::VISIBLE_EMBEDDING_SOURCE,
+            Self::SMART_CLUSTER_PENDING_TTL_DAYS,
+        );
+        let guard = self.get_connection_named("indexed_smart_cluster_pending_ids")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let kind = spec.index_kind.as_str();
+        let subjects: Vec<String> = ids.iter().map(i64::to_string).collect();
+        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![
+            &kind,
+            &spec.model_id,
+            &spec.model_revision,
+            &spec.embedding_version,
+        ];
+        bound.extend(subjects.iter().map(|id| id as &dyn rusqlite::ToSql));
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(bound.as_slice(), |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())
+    }
+
     pub fn enqueue_smart_cluster_pending(&self, screenshot_id: i64) -> Result<(), String> {
         let guard = self.get_connection_named("enqueue_smart_cluster_pending")?;
         let conn = guard
@@ -948,6 +1026,12 @@ impl StorageState {
     /// next idle window, with `INSERT OR REPLACE` keeping assignment
     /// writes idempotent.
     pub fn peek_smart_cluster_pending_batch(&self, limit: i64) -> Result<Vec<i64>, String> {
+        // Staged work has its own receipt and must finish through that path,
+        // including during a manual drain. Scan past it to reach archive debt.
+        let staged = self
+            .processing_stage
+            .owned_screenshot_ids(carbonpaper_app_bound::protocol::Consumer::SmartCluster)?;
+        let scan_limit = limit.saturating_add(staged.len() as i64);
         let mut guard = self.get_connection_named("peek_smart_cluster_pending_batch")?;
         let conn = guard
             .as_mut()
@@ -972,11 +1056,17 @@ impl StorageState {
                 )
                 .map_err(|e| format!("Failed to prepare peek: {}", e))?;
             let rows = stmt
-                .query_map(params![limit], |row| row.get::<_, i64>(0))
+                .query_map(params![scan_limit], |row| row.get::<_, i64>(0))
                 .map_err(|e| format!("Failed to query peek: {}", e))?;
             let mut out = Vec::new();
             for r in rows {
-                out.push(r.map_err(|e| format!("Failed to read peek row: {}", e))?);
+                let id = r.map_err(|e| format!("Failed to read peek row: {}", e))?;
+                if !staged.contains(&id) {
+                    out.push(id);
+                    if out.len() >= limit.max(0) as usize {
+                        break;
+                    }
+                }
             }
             out
         };

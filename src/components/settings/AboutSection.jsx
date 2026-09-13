@@ -232,6 +232,20 @@ export default function AboutSection({
                   <Bug className="w-3.5 h-3.5" />
                   Preview Smart Cluster Setup Wizard
                 </button>
+                <button
+                  onClick={() => window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer'))}
+                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
+                >
+                  <Bug className="w-3.5 h-3.5" />
+                  {t('aboutSection.debug.preview_app_bound_offer', 'Preview App Bound Upgrade Prompt')}
+                </button>
+                <button
+                  onClick={() => window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer', { detail: { repair: true } }))}
+                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
+                >
+                  <Bug className="w-3.5 h-3.5" />
+                  {t('aboutSection.debug.preview_app_bound_repair', 'Preview App Bound Repair Prompt')}
+                </button>
               </div>
             </section>
           )}

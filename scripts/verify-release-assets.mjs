@@ -199,7 +199,7 @@ assertIncludes(packageJson.scripts?.['prepare:dev-assets'] ?? '', '-DevelopmentO
 assertIncludes(packageJson.scripts?.['prepare:ocr-assets'] ?? '', '-OcrOnly', 'OCR-only preparation command');
 assertIncludes(packageJson.scripts?.debug ?? '', 'npm run prepare:dev-assets', 'debug development asset preparation');
 assertIncludes(packageJson.scripts?.['build:dev-workers'] ?? '', 'scripts/build-dev-workers.mjs', 'development worker build command');
-assertBefore(packageJson.scripts?.debug ?? '', 'npm run prepare:dev-assets', 'tauri dev', 'debug development asset order');
+assertBefore(packageJson.scripts?.debug ?? '', 'npm run prepare:dev-assets', 'node scripts/debug.mjs', 'debug development asset order');
 assertNotIncludes(packageJson.scripts?.debug ?? '', 'scripts/build-ml.mjs', 'debug direct ML build');
 assertNotIncludes(packageJson.scripts?.debug ?? '', 'scripts/build-semantic-ml.mjs', 'debug direct semantic build');
 

@@ -43,13 +43,36 @@ function Get-PathSha256 {
 if (-not (Test-Path -LiteralPath $portableZip -PathType Leaf)) {
     throw "Portable bundle is missing: $portableZip"
 }
+$tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+$portableExtract = Join-Path $tempRoot ("carbonpaper-portable-verify-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $portableExtract | Out-Null
 $archive = [System.IO.Compression.ZipFile]::OpenRead($portableZip)
 try {
     $duplicates = $archive.Entries | Group-Object FullName | Where-Object Count -gt 1
     if ($duplicates) {
         throw "Portable bundle contains duplicate entries: $($duplicates.Name -join ', ')"
     }
-    foreach ($required in @("carbonpaper.exe", "carbonpaper-ml.exe", "carbonpaper-office.exe", "carbonpaper-nmh.exe", "carbonpaper-semantic-worker.exe")) {
+    foreach ($entry in $archive.Entries) {
+        $name = [string]$entry.FullName
+        if ([string]::IsNullOrEmpty($entry.Name)) { continue }
+        if ($name.Length -gt 240 -or $name -match '[^\x20-\x7e]|[\\:<>"|?*]' -or $name.StartsWith('/')) {
+            throw "Unsafe portable entry: $name"
+        }
+        foreach ($part in $name.Split('/')) {
+            $stem = $part.Split('.')[0]
+            if ([string]::IsNullOrEmpty($part) -or $part -in @('.', '..') -or $part -match '[. ]$' -or
+                $stem -match '^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9]|LPT[0-9])$') {
+                throw "Unsafe portable entry: $name"
+            }
+        }
+        $target = [System.IO.Path]::GetFullPath((Join-Path $portableExtract $name.Replace('/', '\')))
+        if (-not $target.StartsWith(($portableExtract + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Portable entry escaped verification directory: $name"
+        }
+        [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($target)) | Out-Null
+        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $false)
+    }
+    foreach ($required in @("carbonpaper.exe", "carbonpaper-ml.exe", "carbonpaper-office.exe", "carbonpaper-nmh.exe", "carbonpaper-python.exe", "carbonpaper-semantic-worker.exe", "carbonpaper-key-service.exe", "carbonpaper-protected-setup.exe", "protected-runtime.json", "protected-runtime.sig")) {
         if (-not $archive.GetEntry($required)) {
             throw "Portable bundle is missing $required"
         }
@@ -94,8 +117,18 @@ try {
             }
         }
     }
+    & node (Join-Path $RootDir 'scripts\verify-protected-runtime.mjs') $portableExtract (Join-Path $RootDir 'src-tauri\update-public-key.txt')
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Protected portable runtime failed signature, file or DLL import verification'
+    }
 } finally {
     $archive.Dispose()
+    $resolvedPortable = [System.IO.Path]::GetFullPath($portableExtract)
+    if ((Test-Path -LiteralPath $resolvedPortable) -and
+        [System.IO.Path]::GetDirectoryName($resolvedPortable).TrimEnd('\') -eq $tempRoot.TrimEnd('\') -and
+        [System.IO.Path]::GetFileName($resolvedPortable).StartsWith('carbonpaper-portable-verify-')) {
+        Remove-Item -LiteralPath $resolvedPortable -Recurse -Force
+    }
 }
 
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
@@ -110,7 +143,7 @@ if (-not $sevenZip) {
 }
 
 $listing = @(& $sevenZip.Source l $installer)
-foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-office.exe", "carbonpaper-nmh.exe", "carbonpaper-semantic-worker.exe")) {
+foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-office.exe", "carbonpaper-nmh.exe", "carbonpaper-python.exe", "carbonpaper-semantic-worker.exe", "carbonpaper-key-service.exe", "carbonpaper-protected-setup.exe", "protected-runtime.json", "protected-runtime.sig")) {
     $count = @($listing | Where-Object { $_ -match ("\s" + [regex]::Escape($required) + "$") }).Count
     if ($count -ne 1) {
         throw "NSIS installer must contain exactly one $required entry; found $count"
@@ -129,13 +162,16 @@ foreach ($package in $semanticManifest.packages) {
     }
 }
 
-$tempRoot = [System.IO.Path]::GetTempPath()
 $extractDir = Join-Path $tempRoot ("carbonpaper-nsis-verify-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $extractDir | Out-Null
 try {
     & $sevenZip.Source x $installer "-o$extractDir" -y | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to extract NSIS installer for verification"
+    }
+    & node (Join-Path $RootDir 'scripts\verify-protected-runtime.mjs') $extractDir (Join-Path $RootDir 'src-tauri\update-public-key.txt')
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Protected NSIS runtime failed signature or file verification'
     }
     $modelDir = Join-Path $extractDir ([string]$manifest.bundle_path).Replace('/', '\')
     foreach ($asset in $manifest.files) {
@@ -180,9 +216,11 @@ try {
     }
 } finally {
     $resolvedExtractDir = [System.IO.Path]::GetFullPath($extractDir)
-    if ((Test-Path -LiteralPath $resolvedExtractDir) -and $resolvedExtractDir.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if ((Test-Path -LiteralPath $resolvedExtractDir) -and
+        [System.IO.Path]::GetDirectoryName($resolvedExtractDir).TrimEnd('\') -eq $tempRoot.TrimEnd('\') -and
+        [System.IO.Path]::GetFileName($resolvedExtractDir).StartsWith('carbonpaper-nsis-verify-')) {
         Remove-Item -LiteralPath $resolvedExtractDir -Recurse -Force
     }
 }
 
-Write-Host "Portable and NSIS Rust OCR/Office/semantic runtime bundles verified."
+Write-Host "Portable and NSIS protected runtime signatures, files and native imports verified."

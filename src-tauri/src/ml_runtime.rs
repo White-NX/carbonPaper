@@ -903,6 +903,9 @@ fn sha256_file(path: &std::path::Path) -> Result<String, String> {
 }
 
 fn resolve_ml_executable(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(path) = crate::app_bound::protected_resource("carbonpaper-ml.exe")? {
+        return Ok(path);
+    }
     if let Some(path) = find_existing_file_in_resources(app, "carbonpaper-ml.exe") {
         return Ok(path);
     }
@@ -1151,17 +1154,132 @@ pub async fn download_rust_ocr_model(
     Ok(status)
 }
 
-pub async fn run_postprocess_retry_loop(app: AppHandle) {
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Let storage and the Python monitor finish startup before the first pass.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+async fn run_periodic_summary<F>(interval: Duration, mut emit: F)
+where
+    F: FnMut(),
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
     loop {
-        interval.tick().await;
-        if let Err(error) = drain_pending_postprocess(&app).await {
-            tracing::debug!("[ML:POSTPROCESS] retry pass deferred: {}", error);
-        }
+        ticker.tick().await;
+        emit();
     }
+}
+
+pub async fn run_postprocess_retry_loop(app: AppHandle) {
+    // Let storage and the Python monitor finish startup before the first pass.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let summary_task = tokio::spawn(run_periodic_summary(
+        crate::background_activity::SUMMARY_INTERVAL,
+        crate::background_activity::emit_summary,
+    ));
+    run_postprocess_tasks(
+        || postprocess_maintenance_pass(&app),
+        || async {
+            let _ = crate::processing_stage::dispatch_classification(&app).await;
+        },
+        Duration::from_secs(30),
+        Duration::from_secs(2),
+    )
+    .await;
+    summary_task.abort();
+}
+
+async fn postprocess_maintenance_pass(app: &AppHandle) {
+    crate::background_activity::maintenance_start("staging_reconcile");
+    tracing::info!("[BACKGROUND] event=start task=staging_reconcile source=staged mode=automatic");
+    let storage = app
+        .state::<Arc<crate::storage::StorageState>>()
+        .inner()
+        .clone();
+    let maintenance_storage = storage.clone();
+    let maintenance_result = tokio::task::spawn_blocking(move || {
+        if maintenance_storage.background_processing_enabled() {
+            let _ = maintenance_storage.processing_stage.refresh();
+        } else {
+            let _ = maintenance_storage.processing_stage.disable_if_installed();
+        }
+        maintenance_storage
+            .processing_stage
+            .reconcile(&maintenance_storage)
+    })
+    .await;
+    let (processed, outcome) = match maintenance_result {
+        Ok(Ok(processed)) => (processed, "success"),
+        Ok(Err(error)) => {
+            tracing::debug!("[ML:POSTPROCESS] staging reconcile deferred: {}", error);
+            (0, "deferred")
+        }
+        Err(error) => {
+            tracing::debug!("[ML:POSTPROCESS] staging reconcile task failed: {}", error);
+            (0, "failed")
+        }
+    };
+    let ack_pending = match storage.pending_staged_classification_receipt_count() {
+        Ok(ack_pending) => {
+            let live_classification_lease = storage.processing_stage.classification_in_flight();
+            crate::background_activity::classification_pending(
+                ack_pending,
+                live_classification_lease,
+            );
+            ack_pending
+        }
+        Err(error) => {
+            tracing::debug!(
+                "[ML:POSTPROCESS] failed to read pending classification receipts: {}",
+                error
+            );
+            0
+        }
+    };
+    let has_more = storage
+        .pending_staged_receipt_count()
+        .unwrap_or(ack_pending)
+        > 0;
+    crate::background_activity::maintenance_progress(processed);
+    if let Err(error) = drain_pending_postprocess(app).await {
+        tracing::debug!("[ML:POSTPROCESS] retry pass deferred: {}", error);
+    }
+    let (_, elapsed_ms) = crate::background_activity::maintenance_finish();
+    tracing::info!(
+        "[BACKGROUND] event=end task=staging_reconcile processed={} has_more={} outcome={} elapsed_ms={}",
+        processed,
+        has_more,
+        outcome,
+        elapsed_ms,
+    );
+}
+
+async fn run_postprocess_tasks<M, MF, D, DF>(
+    mut maintenance: M,
+    mut dispatch: D,
+    maintenance_interval: Duration,
+    dispatch_interval: Duration,
+) where
+    M: FnMut() -> MF,
+    MF: std::future::Future<Output = ()>,
+    D: FnMut() -> DF,
+    DF: std::future::Future<Output = ()>,
+{
+    // Keep both futures owned by this loop. A slow maintenance pass cannot
+    // overlap the next pass or hold classification behind its broker scan.
+    tokio::join!(
+        async {
+            loop {
+                maintenance().await;
+                tokio::time::sleep(maintenance_interval).await;
+            }
+        },
+        async {
+            let mut interval = tokio::time::interval(dispatch_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                dispatch().await;
+            }
+        },
+    );
 }
 
 /// Whether an enqueue error means the Python monitor never accepted the
@@ -1189,12 +1307,23 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
         .state::<Arc<crate::storage::StorageState>>()
         .inner()
         .clone();
-    if !storage.is_session_valid() {
+    if !storage.is_silent_read_authorized() {
         return Ok(());
     }
     let ids = storage.list_pending_ocr_postprocess_ids(10)?;
     for screenshot_id in ids {
-        let Some(record) = storage.get_screenshot_by_id(screenshot_id)? else {
+        if storage.processing_stage.owns_screenshot(
+            screenshot_id,
+            carbonpaper_app_bound::protocol::Consumer::Classification,
+        ) {
+            continue;
+        }
+        let Some(record) = storage
+            .get_screenshot_summaries_by_ids_silent(&[screenshot_id])
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+        else {
             continue;
         };
         let ocr_results = match storage.get_screenshot_ocr_results_silent(screenshot_id) {
@@ -1222,7 +1351,7 @@ async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
         let enqueue_result = crate::capture::enqueue_ocr_postprocess(
             app,
             screenshot_id,
-            &record.image_hash,
+            "",
             record.window_title.as_deref().unwrap_or(""),
             record.process_name.as_deref().unwrap_or(""),
             record
@@ -1257,6 +1386,90 @@ mod tests {
     use super::*;
     use rapidocr_core::config::PipelineConfig;
     use rapidocr_core::model::model_set_by_name;
+
+    #[tokio::test]
+    async fn periodic_summary_keeps_ticking_while_other_work_is_pending() {
+        let (emitted, mut emissions) = tokio::sync::mpsc::unbounded_channel();
+        let summary = tokio::spawn(run_periodic_summary(Duration::from_millis(5), move || {
+            let _ = emitted.send(());
+        }));
+        let long_work = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            emissions.recv().await.expect("first summary emission");
+            emissions.recv().await.expect("second summary emission");
+        })
+        .await
+        .expect("periodic summary kept ticking");
+        assert!(!summary.is_finished());
+        assert!(!long_work.is_finished());
+
+        summary.abort();
+        long_work.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_maintenance_does_not_block_dispatch_or_start_overlapping_passes() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::{mpsc, Semaphore};
+
+        let release = Arc::new(Semaphore::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(Mutex::new(None));
+        let (dispatch_sender, mut dispatch_receiver) = mpsc::unbounded_channel();
+        let (start_sender, mut start_receiver) = mpsc::unbounded_channel();
+        let cooldown = Duration::from_millis(80);
+        let runner = tokio::spawn({
+            let release = release.clone();
+            let started = started.clone();
+            let finished = finished.clone();
+            async move {
+                run_postprocess_tasks(
+                    || {
+                        let release = release.clone();
+                        let started = started.clone();
+                        let finished = finished.clone();
+                        let start_sender = start_sender.clone();
+                        async move {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            let _ = start_sender.send(Instant::now());
+                            release.acquire().await.unwrap().forget();
+                            *finished.lock().unwrap() = Some(Instant::now());
+                        }
+                    },
+                    || {
+                        let dispatch_sender = dispatch_sender.clone();
+                        async move {
+                            let _ = dispatch_sender.send(());
+                        }
+                    },
+                    cooldown,
+                    Duration::from_millis(20),
+                )
+                .await;
+            }
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+            start_receiver.recv().await.unwrap();
+            // Hold maintenance across several dispatch ticks and longer than
+            // its cooldown: no second maintenance pass may start meanwhile.
+            for _ in 0..8 {
+                dispatch_receiver.recv().await.unwrap();
+            }
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+            release.add_permits(1);
+            let next_start = start_receiver.recv().await.unwrap();
+            let completed_at = finished.lock().unwrap().unwrap();
+            assert!(next_start.duration_since(completed_at) >= cooldown);
+            assert_eq!(started.load(Ordering::SeqCst), 2);
+        })
+        .await;
+        runner.abort();
+        let _ = runner.await;
+        outcome.expect("classification must keep dispatching during maintenance");
+    }
 
     #[test]
     fn release_manifest_matches_rapidocr_core_model_set() {

@@ -9,6 +9,7 @@ import SecurityAlertMask from './components/SecurityAlertMask';
 import ExtensionSetupWizard from './components/ExtensionSetupWizard';
 import ClusteringSetupWizard from './components/ClusteringSetupWizard';
 import SmartClusterSetupWizard from './components/SmartClusterSetupWizard';
+import AppBoundUpgradePrompt from './components/AppBoundUpgradePrompt';
 import ActivityBar from './components/ActivityBar';
 import MainArea from './components/MainArea';
 import TopBar from './components/TopBar';
@@ -418,6 +419,8 @@ function App() {
         onLater={handleLater}
         onClose={() => setUpdateModalVisible(false)}
       />
+
+      <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings && !updateModalVisible && !showExtensionSetup && !showClusteringSetup && !showSmartClusterSetup} />
 
       <SettingsDialog
         isOpen={showSettings && isAuthenticated}

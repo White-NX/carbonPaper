@@ -1,0 +1,62 @@
+[package]
+name = "carbonpaper-app-bound"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "carbonpaper_app_bound"
+
+[features]
+development-runtime = ["dep:runas"]
+
+# Used only when this standalone crate builds the development service/helpers.
+# The Tauri desktop keeps its ordinary dev profile and hot-reload behavior.
+[profile.dev-service]
+inherits = "dev"
+opt-level = 2
+debug = true
+debug-assertions = true
+
+[[bin]]
+name = "carbonpaper-key-service"
+path = "src/bin/service.rs"
+
+[[bin]]
+name = "carbonpaper-protected-setup"
+path = "src/bin/setup.rs"
+
+[[bin]]
+name = "carbonpaper-development-probe"
+path = "src/bin/development_probe.rs"
+required-features = ["development-runtime"]
+
+[dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+ed25519-dalek = "2"
+hex = "0.4"
+rand = "0.8"
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+zeroize = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
+
+[target.'cfg(windows)'.dependencies]
+runas = { version = "1.2", optional = true }
+windows = { version = "0.58", features = [
+  "Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography",
+  "Win32_Security_Authorization", "Win32_Storage_FileSystem",
+  "Win32_System_Com", "Win32_System_Memory", "Win32_System_Pipes",
+  "Win32_System_Services", "Win32_System_Threading", "Win32_System_IO",
+  "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

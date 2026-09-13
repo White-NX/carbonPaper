@@ -1389,8 +1389,15 @@ pub async fn start_monitor_impl(
             ));
         }
         let python_dll = find_python_runtime_dll(&venv_canonical, &python_canonical)?;
-        let launcher_executable =
-            std::env::current_exe().map_err(|e| format!("Failed to resolve launcher: {}", e))?;
+        let launcher_executable = std::env::current_exe()
+            .map_err(|e| format!("Failed to resolve launcher: {}", e))?
+            .with_file_name("carbonpaper-python.exe");
+        if !launcher_executable.is_file() {
+            return Err(
+                "The CarbonPaper Python launcher is missing. Repair the application installation."
+                    .into(),
+            );
+        }
         let launcher_dll_dirs = python_launcher_dll_dirs(&venv_canonical, &python_dll);
         let scripts_dir = venv_canonical.join("Scripts");
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
@@ -1459,7 +1466,6 @@ pub async fn start_monitor_impl(
         // env_remove：再次确认 Python 不会读到污染过的 PYTHON* 环境变量
         // （`-I` 蕴含 `-E` 已经隔离了，这里是 belt-and-suspenders）
         cmd_proc
-            .arg("--python-launcher")
             .arg("-I")
             .arg("-B")
             .arg("-X")

@@ -225,6 +225,9 @@ impl StorageState {
         }
 
         let previous_registry = crate::registry_config::get_string("data_dir");
+        if !migrate_data_files {
+            self.processing_stage.retire_dataset()?;
+        }
         let journal_mode = if migrate_data_files {
             Some(self.prepare_database_snapshot_under_maintenance()?)
         } else {
