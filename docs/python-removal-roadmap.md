@@ -7,16 +7,13 @@ symbol names are the durable references; line numbers are intentionally omitted.
 ## Source Snapshot
 
 - Repository: `D:\projects\carbonPaper\carbonPaper`
-- Branch: `chore/v0.8.5-python-cleanup`
-- Baseline `HEAD`: `24a09f3ff0ced680ba2acdefda4a68accad27df6`
-- `v0.8.4` tag: `870deacd3aacfce950467259382476c7d93a2374`
-- Relationship: the `v0.8.4` tag is an ancestor of the baseline `HEAD`.
-- Working tree: this page is maintained against `HEAD` plus the uncommitted
-  cleanup changes on the branch. The cleanup changes must not be attributed to
-  `24a09f3` until they are committed.
-- Application manifest version: `0.8.4` in `package.json`. The `v0.8.5 Beta`
-  label below is the cleanup target, not a claim that the manifest version has
-  already been bumped.
+- Branch: `feat/rust-task-vectors-classification`
+- Implementation baseline: `49f4761a8ca4e7a89f3745f22433b0f3fe2128c2`.
+- Application manifest version: `0.8.5`; the repository also has a `v0.8.5` tag.
+- The earlier inference cleanup was committed as `62eb619`.
+- This page includes the task-vector synchronization changes in the working
+  tree following the baseline. Historical validation below belongs to its
+  recorded source snapshot and does not validate later changes.
 
 ## v0.8.4 Comparison
 
@@ -32,15 +29,15 @@ The relevant difference between the tag and the development baseline is:
 | --- | --- |
 | `870deacd` (`v0.8.4`) | Already contains the M2.5 Chinese-CLIP, bge-reranker, and BGE classification Rust cutovers. |
 | `8b64857` | Adds the persistent USearch-backed CLIP ANN index and its settings/status surface; the baseline contains this commit. |
-| `24a09f3` | Current development baseline after the v0.8.4 tag; unrelated product work also landed after the tag. |
-| Branch working tree | Removes the Python inference, queue ownership, fallback, rollback controls, migration oracles, and performance scaffolding that the earlier cutovers no longer need. |
+| `24a09f3` | Development baseline used for the August cleanup validation. |
+| `62eb619` | Commits the retired inference, queue, fallback, rollback-control and migration-oracle cleanup. |
 
-This comparison matters because a v0.8.4 gate result is evidence for deleting a
-fallback, not evidence that the uncommitted deletion has already shipped.
+The August release checks remain historical evidence for that cleanup. New
+consumer migrations require their own validation.
 
-## Current Target: v0.8.5 Beta
+## Current Target: Remaining Python Consumers
 
-The v0.8.5 Beta cleanup has four goals:
+The cleanup keeps these four goals:
 
 1. Keep production inference and derived-index ownership in Rust.
 2. Keep Python only where a live product consumer still requires it.
@@ -63,7 +60,8 @@ The following paths are implemented and scheduled by the Tauri/Rust backend:
   `src-tauri/src/bin/ml.rs`, using the pinned `rapidocr-core` model runtime.
 - MiniLM text encoding, derived semantic storage, natural-language text
   retrieval, and idle/manual indexing in `semantic_query.rs`,
-  `semantic_runtime.rs`, and `minilm_index.rs`.
+  `semantic_runtime.rs`, and `minilm_index.rs`. Historical clustering ranges and
+  Chroma consumer reconciliation are owned by `task_vector_sync.rs`.
 - Chinese-CLIP image encoding, image retrieval, persistent ANN maintenance, and
   exact-search recovery in `clip_index.rs`, `clip_query.rs`, and `clip_ann.rs`.
 - BGE text embeddings exposed by `classification_runtime.rs`. Python calls this
@@ -90,9 +88,9 @@ yet moved:
   MiniLM vectors and sends them to the Python Chroma hot layer through the
   `upsert_task_vectors` command; Python consumes those vectors for clustering.
 - Presidio and spaCy PII analysis in the Presidio worker modules.
-- Monitor lifecycle, authenticated named-pipe dispatch, clustering scheduling,
-  and storage-session gating in `monitor/monitor/__init__.py` and related IPC
-  modules.
+- Monitor lifecycle, authenticated named-pipe dispatch, and storage-session gating in `monitor/monitor/__init__.py` and related IPC
+  modules. Automatic scheduling, authorization admission and retries are owned
+  by `background_scheduler.rs`; the Python scheduler is a compatibility facade.
 - The read-only legacy CLIP exporter in `monitor/legacy_clip_export.py`, only
   for an interrupted migration of the old Chroma `screenshots` collection.
 
@@ -133,9 +131,25 @@ read-only on the Python side and uses a persisted cursor. The Rust capture/index
 worker writes current vectors through `upsert_task_vectors`; Python task
 clustering continues to read the hot layer and writes cold centroids.
 
-This is a compatibility path for the remaining task-clustering consumer. It is
-not permission for Python to resume capture-side encoding or semantic query
-serving.
+Before every clustering run, `task_vector_sync.rs` reconciles the requested
+range against the live SQLite screenshots. Current vectors are reused only
+when their model/source contract matches. Missing vectors in a manual range,
+including ranges older than 30 days, are encoded by the Rust MiniLM worker.
+Automatic runs queue missing semantic work and defer clustering until it exists.
+
+`storage/task_vector_sync.rs` stores a bounded snapshot's range, high watermark,
+Chroma collection identity and acknowledged cursor in `task_vector_sync`.
+A failed write or lost response leaves the page replayable. Recreating the
+collection resets the cursor; each completed reconciliation starts a fresh scan
+on the next run, including partial gaps. A failed immediate capture mirror wakes
+the durable clustering task. Archive authorization, database generation,
+maintenance and model arbitration still apply. `monitor_get_clustering_status`
+includes the persisted `vector_sync` state.
+
+The Python consumer has no MiniLM encoder or historical backfill. Both Chroma
+collections disable embedding functions. Python's CPU ONNX dependency remains
+for Chroma; the environment installer repairs the overlapping DirectML wheel
+left by earlier versions. Native model runtime assets are independent.
 
 ### Historical Smart Cluster thresholds
 
@@ -164,7 +178,8 @@ An unavailable Rust model or index returns a visible error/status state. It does
 not silently switch to Python. A foreground query can refuse with a reason such
 as migration or maintenance in progress; that refusal is not a fallback.
 
-Background model work remains idle-gated or explicitly user initiated. Named
+Bulk background model work remains idle-gated or explicitly user initiated.
+Capture classification uses the immediate policy and can run during user activity. Named
 pipe requests retain authentication, sequence/replay checks, bounded payloads,
 and deadlines.
 
@@ -214,6 +229,16 @@ CPU provider recovery, CLIP ANN to exact search, classification's OCR-text
 channel, Presidio service recovery, and historical Python scorer provenance.
 They do not restore a Python OCR, retrieval, embedding, rerank, or queue-drainer
 implementation.
+
+### Task-vector synchronization validation: 2026-09-13
+
+Validated against `49f4761` plus this branch's task-vector changes: Rust library
+tests passed (640 passed, 1 ignored); the CarbonPaper Python 3.12 suite passed
+(183 tests); `cargo check` and the security guards passed. The tests cover
+acknowledged cursor recovery after reopening SQLite, partial/replayed writes,
+collection replacement, stale database rejection, old date ranges, background
+authorization and absence of the Python encoder. Release packaging and a real
+legacy-data migration were not rerun for this batch.
 
 ## Later Milestones
 

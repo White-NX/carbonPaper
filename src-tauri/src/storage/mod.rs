@@ -27,6 +27,7 @@ mod search_rank;
 mod semantic_cache;
 pub mod smart_cluster;
 pub mod task;
+mod task_vector_sync;
 mod types;
 pub(crate) mod wire_time;
 

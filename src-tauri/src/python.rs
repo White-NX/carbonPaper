@@ -784,74 +784,7 @@ fn perform_install_python_venv(
         }
     }
 
-    // onnxruntime and onnxruntime-directml cannot coexist; otherwise, DmlExecutionProvider will be lost.
-    // Other dependencies (such as chromadb) may have indirectly installed onnxruntime;
-    // they need to be uninstalled and then onnxruntime-directml reinstalled.
-    {
-        if let Ok(arc_file) = log_file.lock() {
-            if let Ok(mut f) = arc_file.as_ref().lock() {
-                let _ = writeln!(
-                    &mut *f,
-                    "Fixing onnxruntime/onnxruntime-directml conflict..."
-                );
-                let _ = f.flush();
-            }
-        }
-        let _ = app_for_threads.emit("install-log", json!({"source":"installer","line": "Fixing onnxruntime/onnxruntime-directml conflict..."}));
-
-        // Step 1: uninstall onnxruntime (non-directml)
-        let mut uninstall_cmd = Command::new(&python_exec_cmd);
-        uninstall_cmd
-            .arg("-m")
-            .arg("pip")
-            .arg("uninstall")
-            .arg("onnxruntime")
-            .arg("-y");
-        #[cfg(windows)]
-        {
-            uninstall_cmd.creation_flags(0x08000000);
-        }
-        let _ = uninstall_cmd.output();
-
-        // Step 2: force-reinstall onnxruntime-directml (no-deps to avoid pulling onnxruntime back)
-        let mut reinstall_cmd = Command::new(&python_exec_cmd);
-        reinstall_cmd
-            .arg("-m")
-            .arg("pip")
-            .arg("install")
-            .arg("onnxruntime-directml==1.24.2")
-            .arg("--force-reinstall")
-            .arg("--no-deps")
-            .arg("-i")
-            .arg("https://mirrors.aliyun.com/pypi/simple/");
-        #[cfg(windows)]
-        {
-            reinstall_cmd.creation_flags(0x08000000);
-        }
-        match reinstall_cmd.output() {
-            Ok(output) => {
-                let msg = String::from_utf8_lossy(&output.stdout);
-                if let Ok(arc_file) = log_file.lock() {
-                    if let Ok(mut f) = arc_file.as_ref().lock() {
-                        let _ = writeln!(&mut *f, "onnxruntime-directml reinstall: {}", msg);
-                        let _ = f.flush();
-                    }
-                }
-            }
-            Err(e) => {
-                if let Ok(arc_file) = log_file.lock() {
-                    if let Ok(mut f) = arc_file.as_ref().lock() {
-                        let _ = writeln!(
-                            &mut *f,
-                            "Warning: failed to reinstall onnxruntime-directml: {}",
-                            e
-                        );
-                        let _ = f.flush();
-                    }
-                }
-            }
-        }
-    }
+    normalize_chroma_runtime(&python_exec_cmd)?;
 
     if let Ok(arc_file) = log_file.lock() {
         if let Ok(mut f) = arc_file.as_ref().lock() {
@@ -1009,6 +942,40 @@ pub fn check_deps_freshness(app: AppHandle) -> Result<serde_json::Value, String>
     }
 }
 
+// Chroma still depends on the CPU ONNX package, even though both collections
+// explicitly disable embedding functions. Old releases replaced its files with
+// the DirectML wheel. Remove that overlapping distribution and repair the CPU
+// package before recording a successful dependency sync. Native inference uses
+// the independently bundled Rust runtime, not either of these Python wheels.
+fn normalize_chroma_runtime(python: &str) -> io::Result<()> {
+    for args in [
+        vec!["-m", "pip", "uninstall", "onnxruntime-directml", "-y"],
+        vec![
+            "-m",
+            "pip",
+            "install",
+            "onnxruntime==1.24.2",
+            "--force-reinstall",
+            "--no-deps",
+            "-i",
+            "https://mirrors.aliyun.com/pypi/simple/",
+        ],
+    ] {
+        let mut command = Command::new(python);
+        command.args(args);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "Failed to repair clustering dependencies: {}",
+                String::from_utf8_lossy(&output.stderr),
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ==================== Dependency sync command ====================
 
 #[tauri::command]
@@ -1088,50 +1055,7 @@ pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
         return Err(format!("pip install failed (exit code {})", exit_code));
     }
 
-    let _ = app_for_emit.emit(
-        "install-log",
-        json!({"source":"installer","line": "Fixing onnxruntime/onnxruntime-directml conflict..."}),
-    );
-
-    // ONNX runtime conflict resolution
-    {
-        let mut uninstall_cmd = Command::new(&python_exec_cmd);
-        uninstall_cmd
-            .arg("-m")
-            .arg("pip")
-            .arg("uninstall")
-            .arg("onnxruntime")
-            .arg("-y");
-        #[cfg(windows)]
-        {
-            uninstall_cmd.creation_flags(0x08000000);
-        }
-        let _ = uninstall_cmd.output();
-
-        let mut reinstall_cmd = Command::new(&python_exec_cmd);
-        reinstall_cmd
-            .arg("-m")
-            .arg("pip")
-            .arg("install")
-            .arg("onnxruntime-directml==1.24.2")
-            .arg("--force-reinstall")
-            .arg("--no-deps")
-            .arg("-i")
-            .arg("https://mirrors.aliyun.com/pypi/simple/");
-        #[cfg(windows)]
-        {
-            reinstall_cmd.creation_flags(0x08000000);
-        }
-        match reinstall_cmd.output() {
-            Ok(output) => {
-                let msg = String::from_utf8_lossy(&output.stdout);
-                tracing::info!("onnxruntime-directml reinstall: {}", msg);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to reinstall onnxruntime-directml: {}", e);
-            }
-        }
-    }
+    normalize_chroma_runtime(&python_exec_cmd).map_err(|e| e.to_string())?;
 
     // Write updated hash on success
     match compute_requirements_hash(&requirements_path) {

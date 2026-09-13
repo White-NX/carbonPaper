@@ -64,6 +64,7 @@ mod semantic_runtime;
 mod sensitive_filter;
 mod smart_cluster_scoring;
 mod storage;
+mod task_vector_sync;
 mod updater;
 
 use analysis::AnalysisState;

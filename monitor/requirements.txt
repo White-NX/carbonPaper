@@ -3,8 +3,6 @@
 Pillow
 pywin32
 
-onnxruntime-directml==1.24.2
-tokenizers>=0.21.0,<0.22.0
 # Pinned: ChromaDB on-disk format is not stable across major versions and the
 # vector store is treated as a rebuildable cache keyed to this exact version.
 chromadb==1.5.1

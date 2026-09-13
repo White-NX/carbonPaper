@@ -721,6 +721,11 @@ pub async fn monitor_run_clustering(
             "task": "python_clustering",
         }));
     }
+    crate::commands::check_auth_required(&credential_state)?;
+    match crate::task_vector_sync::synchronize(&app, true, start_time, end_time).await? {
+        crate::task_vector_sync::SyncOutcome::Ready => {}
+        _ => return Err("CLUSTERING_ALREADY_RUNNING".into()),
+    }
     authenticated_monitor_command(
         &credential_state,
         &state,
@@ -768,6 +773,7 @@ pub async fn monitor_get_clustering_status(
             "last_error": task.last_error,
         })),
         "scheduler": status,
+        "vector_sync": app.state::<Arc<crate::storage::StorageState>>().task_vector_sync_status()?,
     }))
 }
 

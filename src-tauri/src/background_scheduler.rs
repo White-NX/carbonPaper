@@ -891,6 +891,15 @@ async fn execute_slice(
             runtime.worker_restart_count.fetch_add(1, Ordering::SeqCst);
             crate::monitor::start_monitor_impl(app.state::<MonitorState>(), app.clone()).await?;
         }
+        match crate::task_vector_sync::synchronize(app, manual, None, None).await? {
+            crate::task_vector_sync::SyncOutcome::More => {
+                return Ok(ScheduledSliceResult::complete(true))
+            }
+            crate::task_vector_sync::SyncOutcome::WaitingForIndex => {
+                return Ok(ScheduledSliceResult::skipped("waiting_for_index"))
+            }
+            crate::task_vector_sync::SyncOutcome::Ready => {}
+        }
         let monitor = app.state::<MonitorState>();
         let response = crate::monitor::forward_command_to_python(
             &monitor,

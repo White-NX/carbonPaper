@@ -63,7 +63,7 @@ class FakeClient:
     def __init__(self, collection):
         self._collection = collection
 
-    def get_or_create_collection(self, name, metadata=None):
+    def get_or_create_collection(self, name, metadata=None, embedding_function=None):
         return self._collection
 
 
@@ -102,9 +102,7 @@ class BlockingEngine:
 
 
 def _manager(monkeypatch, collection, engine):
-    monkeypatch.setattr(tc.TaskEmbedder, "is_model_available", staticmethod(lambda: True))
     manager = tc.HotColdManager(FakeClient(collection))
-    manager._embedder = FakeEmbedder()
     manager._engine = engine
     return manager
 
@@ -250,100 +248,6 @@ def test_compress_to_cold_holds_the_lock_across_expiry_read_and_delete(monkeypat
     )
 
 
-class _FakeTokenizer:
-    def __init__(self, seq_len=4):
-        self.seq_len = seq_len
-
-    def __call__(self, texts, **_kwargs):
-        n = len(texts)
-        # The tokenizer call is where the window has to be, not the forward
-        # pass: the old `encode` read `self._model` *after* tokenising, so an
-        # unload landing here is what turned the next line into
-        # `'NoneType' object has no attribute ...`.
-        time.sleep(0.02)
-        return {
-            "input_ids": np.zeros((n, self.seq_len), dtype=np.int64),
-            "attention_mask": np.ones((n, self.seq_len), dtype=np.int64),
-        }
-
-
-class _FakeSession:
-    def __init__(self, seq_len=4):
-        self.seq_len = seq_len
-
-    def get_inputs(self):  # pragma: no cover - build_transformer_inputs is stubbed
-        return []
-
-    def run(self, _outputs, feeds):
-        n = feeds["n"]
-        time.sleep(0.005)
-        return [np.zeros((n, self.seq_len, tc.EMBEDDING_DIM), dtype=np.float32)]
-
-
-def test_encode_survives_an_unload_landing_mid_pass(monkeypatch):
-    """`run_clustering` unloads the model in its `finally` — worth ~479 MB on
-    the ONNX backend — and that unload no longer happens behind a lock that
-    keeps other users away.
-
-    Before `_acquire_runtime`, `encode` read `_tokenizer` and `_model` as
-    separate unguarded attribute loads. Against the real model
-    an interleaved unload failed the very first encode with
-    `'NoneType' object has no attribute 'get_inputs'`.
-    """
-    monkeypatch.setattr(
-        "onnx_utils.build_transformer_inputs",
-        lambda session, encoded: {"n": len(encoded["attention_mask"])},
-    )
-
-    def fake_load(self):
-        with self._lock:
-            if self._model is None:
-                self._tokenizer = _FakeTokenizer()
-                self._model = _FakeSession()
-
-    monkeypatch.setattr(tc.TaskEmbedder, "load", fake_load)
-    monkeypatch.setattr(tc.gc, "collect", lambda *a, **k: 0)
-
-    emb = tc.TaskEmbedder()
-    emb.unload()
-
-    texts = ["code.exe | Editor | hello"] * 3
-    failures = []
-    encodes = [0]
-    stop = threading.Event()
-
-    def encoder():
-        while not stop.is_set():
-            try:
-                out = emb.encode(list(texts))
-                assert out.shape == (len(texts), tc.EMBEDDING_DIM)
-                encodes[0] += 1
-            except Exception as exc:
-                failures.append(exc)
-                return
-
-    def unloader():
-        while not stop.is_set():
-            emb.unload()
-            time.sleep(0.001)
-
-    threads = [
-        threading.Thread(target=encoder, daemon=True),
-        threading.Thread(target=unloader, daemon=True),
-    ]
-    for t in threads:
-        t.start()
-    time.sleep(1.5)
-    stop.set()
-    for t in threads:
-        t.join(timeout=5.0)
-
-    assert not failures, f"unload tore the model down under a running encode: {failures[0]!r}"
-    assert encodes[0] > 0, "the encoder never completed a pass"
-
-    emb.unload()
-
-
 def test_upsert_reports_busy_instead_of_parking_a_handler_thread(monkeypatch):
     """Belt and braces for the invariant above.
 
@@ -394,7 +298,6 @@ def test_unload_collections_drops_the_handles(monkeypatch):
 
 
 def test_scheduler_can_recover_after_failed_run(monkeypatch):
-    monkeypatch.setattr(tc.TaskEmbedder, "is_model_available", staticmethod(lambda: True))
 
     class FlakyManager:
         def __init__(self):
@@ -423,7 +326,6 @@ def test_scheduler_does_not_consume_its_interval_on_a_refused_run(monkeypatch):
     """A run refused by the clustering guard is not a completed run. Recording
     it as one would push the next scheduled attempt out by a whole interval.
     """
-    monkeypatch.setattr(tc.TaskEmbedder, "is_model_available", staticmethod(lambda: True))
 
     class RefusingManager:
         def run_clustering(self, auto_compress=True, **_kwargs):
