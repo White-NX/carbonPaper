@@ -5,19 +5,34 @@ import { getAppBoundStatus, installAppBound, dismissAppBoundOffer, appBoundError
 export default function AppBoundUpgradePrompt({ visible }) {
   const { t } = useTranslation();
   const [offered, setOffered] = useState(false);
+  const [debugPreview, setDebugPreview] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [repair, setRepair] = useState(false);
   useEffect(() => {
-    if (!visible) return undefined;
+    if (!visible || debugPreview) return undefined;
     let alive = true;
     getAppBoundStatus().then((status) => {
       if (alive) { setOffered(Boolean(status?.offer_enable)); setRepair(status?.reason === 'repair_required'); }
     }).catch(() => {});
     return () => { alive = false; };
-  }, [visible]);
-  if (!visible || !offered) return null;
+  }, [visible, debugPreview]);
+  useEffect(() => {
+    const showDebugPreview = (event) => {
+      setRepair(Boolean(event.detail?.repair));
+      setError('');
+      setBusy(false);
+      setDebugPreview(true);
+    };
+    window.addEventListener('debug-show-app-bound-offer', showDebugPreview);
+    return () => window.removeEventListener('debug-show-app-bound-offer', showDebugPreview);
+  }, []);
+  if (!(debugPreview || (visible && offered))) return null;
   const later = async () => {
+    if (debugPreview) {
+      setDebugPreview(false);
+      return;
+    }
     try { await dismissAppBoundOffer(); setOffered(false); }
     catch (failure) { setError(appBoundErrorMessage(failure, t)); }
   };

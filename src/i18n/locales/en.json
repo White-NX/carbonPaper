@@ -1475,7 +1475,9 @@
   "aboutSection": {
     "debug": {
       "trigger_security_alert": "Preview Security Alert Mask",
-      "trigger_ocr_model_repair_notification": "Test OCR Model Repair Notification"
+      "trigger_ocr_model_repair_notification": "Test OCR Model Repair Notification",
+      "preview_app_bound_offer": "Preview App Bound Upgrade Prompt",
+      "preview_app_bound_repair": "Preview App Bound Repair Prompt"
     }
   },
   "clipBackfill": {

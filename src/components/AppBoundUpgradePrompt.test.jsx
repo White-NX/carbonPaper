@@ -57,4 +57,26 @@ describe('AppBoundUpgradePrompt', () => {
     await waitFor(() => expect(getAppBoundStatus).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
+
+  it('debug preview forces the dialog over a closed UI without backend checks', async () => {
+    render(<AppBoundUpgradePrompt visible={false} />);
+    window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer'));
+    expect(await screen.findByRole('dialog')).toHaveTextContent('重启后继续后台整理');
+    expect(screen.getByRole('button', { name: '启用' })).toBeInTheDocument();
+    expect(getAppBoundStatus).not.toHaveBeenCalled();
+  });
+
+  it('debug preview can show the repair variant', async () => {
+    render(<AppBoundUpgradePrompt visible={false} />);
+    window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer', { detail: { repair: true } }));
+    expect(await screen.findByRole('button', { name: '修复组件' })).toBeInTheDocument();
+  });
+
+  it('debug preview closes without acknowledging the real offer', async () => {
+    render(<AppBoundUpgradePrompt visible={false} />);
+    window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer'));
+    fireEvent.click(await screen.findByRole('button', { name: '稍后' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(dismissAppBoundOffer).not.toHaveBeenCalled();
+  });
 });

@@ -1475,7 +1475,9 @@
   "aboutSection": {
     "debug": {
       "trigger_security_alert": "预览安全告警蒙层",
-      "trigger_ocr_model_repair_notification": "测试 OCR 模型修复通知"
+      "trigger_ocr_model_repair_notification": "测试 OCR 模型修复通知",
+      "preview_app_bound_offer": "预览后台整理升级弹窗",
+      "preview_app_bound_repair": "预览后台整理修复弹窗"
     }
   },
   "clipBackfill": {
