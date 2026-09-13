@@ -1,7 +1,7 @@
 //! Persistent inputs for newly captured work. This module never unwraps archive
 //! row keys and never changes CredentialManagerState's archive authorization.
 use crate::{
-    background_scheduler::{AutomaticSliceContext, ScheduledSliceResult},
+    background_scheduler::{AutomaticSliceContext, EnvironmentPolicy, ScheduledSliceResult},
     ml_protocol::{MlImageInput, MlSemanticModel},
     semantic_runtime::SemanticRuntimeState,
     storage::StorageState,
@@ -1273,7 +1273,12 @@ pub(crate) async fn dispatch_classification(app: &AppHandle) -> Result<(), Strin
         crate::background_activity::clear_blocked("classification");
         return Ok(());
     }
-    if let Some(reason) = crate::background_scheduler::environment_gate_reason(app, false) {
+    // Classification finishes a captured screenshot and should follow OCR within
+    // the dispatch cadence, even while the user is active. Durable staging must
+    // not give it the idle-only policy used by bulk indexing and clustering.
+    if let Some(reason) =
+        crate::background_scheduler::environment_gate_reason(app, EnvironmentPolicy::Immediate)
+    {
         if storage.processing_stage.has_ready(Consumer::Classification) {
             crate::background_activity::blocked("classification", reason);
         }
@@ -1389,7 +1394,8 @@ pub(crate) async fn run_model_slice(
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut processed = 0u64;
     for _ in 0..16 {
-        if crate::background_scheduler::environment_gate_reason(app, false).is_some()
+        if crate::background_scheduler::environment_gate_reason(app, EnvironmentPolicy::IdleOnly)
+            .is_some()
             || !storage.background_processing_enabled()
         {
             break;
@@ -1490,7 +1496,9 @@ async fn encode_staged(
         let _worker = crate::semantic_runtime::BACKGROUND_PASS_GUARD
             .try_lock()
             .map_err(|_| "deferred: model busy")?;
-        if crate::background_scheduler::environment_gate_reason(app, false).is_some() {
+        if crate::background_scheduler::environment_gate_reason(app, EnvironmentPolicy::IdleOnly)
+            .is_some()
+        {
             return Err("deferred: user active".into());
         }
         let embedded = if let Some(text) = &text {

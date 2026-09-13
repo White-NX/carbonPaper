@@ -663,7 +663,14 @@ pub(crate) fn gate_reason(app: &AppHandle, manual: bool) -> Option<&'static str>
     } else if !credential.background_authorized() {
         return Some("waiting_for_unlock");
     }
-    environment_gate_reason(app, manual)
+    environment_gate_reason(
+        app,
+        if manual {
+            EnvironmentPolicy::Immediate
+        } else {
+            EnvironmentPolicy::IdleOnly
+        },
+    )
 }
 
 pub(crate) fn gate_reason_for_kind(
@@ -676,7 +683,7 @@ pub(crate) fn gate_reason_for_kind(
         if storage.background_processing_enabled()
             && crate::processing_stage::ready_for_kind(&storage, kind)
         {
-            return environment_gate_reason(app, false);
+            return environment_gate_reason(app, EnvironmentPolicy::IdleOnly);
         }
         if kind == BackgroundTaskKind::SmartCluster
             && storage.background_processing_enabled()
@@ -698,36 +705,51 @@ pub(crate) fn gate_reason_for_kind(
     gate_reason(app, manual)
 }
 
-pub(crate) fn environment_gate_reason(app: &AppHandle, manual: bool) -> Option<&'static str> {
-    if crate::maintenance::is_active() {
-        return Some("maintenance");
-    }
-    if manual {
-        if app
-            .state::<Arc<SemanticRuntimeState>>()
-            .foreground_waiting()
-        {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvironmentPolicy {
+    IdleOnly,
+    /// Capture postprocessing and explicit requests may run during user activity,
+    /// while still yielding to maintenance and foreground semantic queries.
+    Immediate,
+}
+
+impl EnvironmentPolicy {
+    fn gate_reason(
+        self,
+        maintenance_active: bool,
+        idle: &IdleState,
+        semantic: &SemanticRuntimeState,
+    ) -> Option<&'static str> {
+        if maintenance_active {
+            return Some("maintenance");
+        }
+        if self == Self::IdleOnly {
+            if !idle.ac_connected.load(Ordering::Relaxed) {
+                return Some("waiting_for_ac_power");
+            }
+            if idle.fullscreen_exclusive.load(Ordering::Relaxed) {
+                return Some("waiting_for_fullscreen");
+            }
+            if !idle.is_idle.load(Ordering::Relaxed) {
+                return Some("waiting_for_idle");
+            }
+        }
+        if semantic.foreground_waiting() {
             return Some("foreground_request");
         }
-        return None;
+        None
     }
-    let idle = app.state::<Arc<IdleState>>();
-    if !idle.ac_connected.load(Ordering::Relaxed) {
-        return Some("waiting_for_ac_power");
-    }
-    if idle.fullscreen_exclusive.load(Ordering::Relaxed) {
-        return Some("waiting_for_fullscreen");
-    }
-    if !idle.is_idle.load(Ordering::Relaxed) {
-        return Some("waiting_for_idle");
-    }
-    if app
-        .state::<Arc<SemanticRuntimeState>>()
-        .foreground_waiting()
-    {
-        return Some("foreground_request");
-    }
-    None
+}
+
+pub(crate) fn environment_gate_reason(
+    app: &AppHandle,
+    policy: EnvironmentPolicy,
+) -> Option<&'static str> {
+    policy.gate_reason(
+        crate::maintenance::is_active(),
+        &app.state::<Arc<IdleState>>(),
+        &app.state::<Arc<SemanticRuntimeState>>(),
+    )
 }
 
 async fn refresh_backlog(app: &AppHandle) {
@@ -1365,6 +1387,49 @@ pub async fn background_scheduler_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_postprocess_runs_during_activity_while_bulk_work_waits() {
+        let idle = IdleState::new();
+        let semantic = SemanticRuntimeState::new();
+        for (ac_connected, fullscreen, bulk_reason) in [
+            (true, false, "waiting_for_idle"),
+            (false, false, "waiting_for_ac_power"),
+            (true, true, "waiting_for_fullscreen"),
+        ] {
+            idle.ac_connected.store(ac_connected, Ordering::Relaxed);
+            idle.fullscreen_exclusive
+                .store(fullscreen, Ordering::Relaxed);
+            assert_eq!(
+                EnvironmentPolicy::Immediate.gate_reason(false, &idle, &semantic),
+                None,
+            );
+            assert_eq!(
+                EnvironmentPolicy::IdleOnly.gate_reason(false, &idle, &semantic),
+                Some(bulk_reason),
+            );
+        }
+    }
+
+    #[test]
+    fn postprocess_and_bulk_work_keep_maintenance_and_foreground_guards() {
+        let idle = IdleState::new();
+        idle.is_idle.store(true, Ordering::Relaxed);
+        let semantic = Arc::new(SemanticRuntimeState::new());
+        for policy in [EnvironmentPolicy::Immediate, EnvironmentPolicy::IdleOnly] {
+            assert_eq!(
+                policy.gate_reason(true, &idle, &semantic),
+                Some("maintenance")
+            );
+            let foreground = semantic.foreground_lease();
+            assert_eq!(
+                policy.gate_reason(false, &idle, &semantic),
+                Some("foreground_request"),
+            );
+            drop(foreground);
+            assert_eq!(policy.gate_reason(false, &idle, &semantic), None);
+        }
+    }
 
     fn task(kind: &str, ready: i64, manual: bool, seq: u64) -> BackgroundTaskState {
         BackgroundTaskState {

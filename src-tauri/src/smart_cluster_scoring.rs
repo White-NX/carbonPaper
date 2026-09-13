@@ -579,7 +579,11 @@ fn may_run(app: &AppHandle, forced: bool) -> bool {
     app.state::<Arc<StorageState>>()
         .background_processing_enabled()
         && crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false)
-        && crate::background_scheduler::environment_gate_reason(app, false).is_none()
+        && crate::background_scheduler::environment_gate_reason(
+            app,
+            crate::background_scheduler::EnvironmentPolicy::IdleOnly,
+        )
+        .is_none()
 }
 
 /// Why this pass has to stop where it is, or `None` if it may keep going.
