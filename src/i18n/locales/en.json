@@ -1,6 +1,7 @@
 {
   "appBound": {
     "title": "Continue processing after a restart",
+    "subtitle": "Organizing continues after a restart, even before you unlock",
     "description": "Process new records while idle, even before unlocking after a restart. Keyword search is completed when you unlock.",
     "installHint": "Windows will request administrator approval. The app will restart when setup is complete.",
     "enable": "Enable",
