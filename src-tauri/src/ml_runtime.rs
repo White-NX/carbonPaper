@@ -1154,9 +1154,26 @@ pub async fn download_rust_ocr_model(
     Ok(status)
 }
 
+async fn run_periodic_summary<F>(interval: Duration, mut emit: F)
+where
+    F: FnMut(),
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        emit();
+    }
+}
+
 pub async fn run_postprocess_retry_loop(app: AppHandle) {
     // Let storage and the Python monitor finish startup before the first pass.
     tokio::time::sleep(Duration::from_secs(2)).await;
+    let summary_task = tokio::spawn(run_periodic_summary(
+        crate::background_activity::SUMMARY_INTERVAL,
+        crate::background_activity::emit_summary,
+    ));
     run_postprocess_tasks(
         || postprocess_maintenance_pass(&app),
         || async {
@@ -1166,25 +1183,72 @@ pub async fn run_postprocess_retry_loop(app: AppHandle) {
         Duration::from_secs(2),
     )
     .await;
+    summary_task.abort();
 }
 
 async fn postprocess_maintenance_pass(app: &AppHandle) {
+    crate::background_activity::maintenance_start("staging_reconcile");
+    tracing::info!("[BACKGROUND] event=start task=staging_reconcile source=staged mode=automatic");
     let storage = app
         .state::<Arc<crate::storage::StorageState>>()
         .inner()
         .clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        if storage.background_processing_enabled() {
-            let _ = storage.processing_stage.refresh();
+    let maintenance_storage = storage.clone();
+    let maintenance_result = tokio::task::spawn_blocking(move || {
+        if maintenance_storage.background_processing_enabled() {
+            let _ = maintenance_storage.processing_stage.refresh();
         } else {
-            let _ = storage.processing_stage.disable_if_installed();
+            let _ = maintenance_storage.processing_stage.disable_if_installed();
         }
-        let _ = storage.processing_stage.reconcile(&storage);
+        maintenance_storage
+            .processing_stage
+            .reconcile(&maintenance_storage)
     })
     .await;
+    let (processed, outcome) = match maintenance_result {
+        Ok(Ok(processed)) => (processed, "success"),
+        Ok(Err(error)) => {
+            tracing::debug!("[ML:POSTPROCESS] staging reconcile deferred: {}", error);
+            (0, "deferred")
+        }
+        Err(error) => {
+            tracing::debug!("[ML:POSTPROCESS] staging reconcile task failed: {}", error);
+            (0, "failed")
+        }
+    };
+    let ack_pending = match storage.pending_staged_classification_receipt_count() {
+        Ok(ack_pending) => {
+            let live_classification_lease = storage.processing_stage.classification_in_flight();
+            crate::background_activity::classification_pending(
+                ack_pending,
+                live_classification_lease,
+            );
+            ack_pending
+        }
+        Err(error) => {
+            tracing::debug!(
+                "[ML:POSTPROCESS] failed to read pending classification receipts: {}",
+                error
+            );
+            0
+        }
+    };
+    let has_more = storage
+        .pending_staged_receipt_count()
+        .unwrap_or(ack_pending)
+        > 0;
+    crate::background_activity::maintenance_progress(processed);
     if let Err(error) = drain_pending_postprocess(app).await {
         tracing::debug!("[ML:POSTPROCESS] retry pass deferred: {}", error);
     }
+    let (_, elapsed_ms) = crate::background_activity::maintenance_finish();
+    tracing::info!(
+        "[BACKGROUND] event=end task=staging_reconcile processed={} has_more={} outcome={} elapsed_ms={}",
+        processed,
+        has_more,
+        outcome,
+        elapsed_ms,
+    );
 }
 
 async fn run_postprocess_tasks<M, MF, D, DF>(
@@ -1322,6 +1386,29 @@ mod tests {
     use super::*;
     use rapidocr_core::config::PipelineConfig;
     use rapidocr_core::model::model_set_by_name;
+
+    #[tokio::test]
+    async fn periodic_summary_keeps_ticking_while_other_work_is_pending() {
+        let (emitted, mut emissions) = tokio::sync::mpsc::unbounded_channel();
+        let summary = tokio::spawn(run_periodic_summary(Duration::from_millis(5), move || {
+            let _ = emitted.send(());
+        }));
+        let long_work = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            emissions.recv().await.expect("first summary emission");
+            emissions.recv().await.expect("second summary emission");
+        })
+        .await
+        .expect("periodic summary kept ticking");
+        assert!(!summary.is_finished());
+        assert!(!long_work.is_finished());
+
+        summary.abort();
+        long_work.abort();
+    }
 
     #[tokio::test]
     async fn slow_maintenance_does_not_block_dispatch_or_start_overlapping_passes() {

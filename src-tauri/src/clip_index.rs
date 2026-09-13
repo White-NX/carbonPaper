@@ -482,6 +482,7 @@ async fn run_scheduled_request(
         automatic_context,
     )
     .await?;
+    crate::background_activity::index_progress(outcome.indexed);
     if let Some(reason) = outcome.refused.or(outcome.stopped_because) {
         return Ok(ScheduledSliceResult::skipped(reason));
     }
@@ -495,9 +496,10 @@ async fn run_scheduled_request(
     })
     .await
     .map_err(|error| format!("clip backlog task failed: {error}"))??;
-    Ok(ScheduledSliceResult::complete(
-        backlog > 0 || has_prepared_captures(),
-    ))
+    Ok(
+        ScheduledSliceResult::complete(backlog > 0 || has_prepared_captures())
+            .with_processed(outcome.indexed),
+    )
 }
 
 fn scheduled_pass_mode(manual: bool) -> PassMode {

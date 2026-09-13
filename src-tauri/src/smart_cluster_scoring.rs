@@ -490,15 +490,15 @@ pub async fn run_scheduled_slice(
     manual: bool,
 ) -> Result<ScheduledSliceResult, String> {
     let state = app.state::<Arc<SmartClusterWorkerState>>().inner().clone();
-    let initial_pending = if manual {
-        let storage = app.state::<Arc<StorageState>>().inner().clone();
-        tokio::task::spawn_blocking(move || storage.count_smart_cluster_pending())
-            .await
-            .map_err(|error| format!("smart cluster backlog task failed: {error}"))??
-            .max(0) as u64
-    } else {
-        0
-    };
+    let storage = app.state::<Arc<StorageState>>().inner().clone();
+    let pending_before = tokio::task::spawn_blocking({
+        let storage = storage.clone();
+        move || storage.count_smart_cluster_pending()
+    })
+    .await
+    .map_err(|error| format!("smart cluster backlog task failed: {error}"))??
+    .max(0) as u64;
+    let initial_pending = if manual { pending_before } else { 0 };
     state.running.store(true, Ordering::SeqCst);
     state.force_running.store(manual, Ordering::SeqCst);
     if manual {
@@ -540,7 +540,8 @@ pub async fn run_scheduled_slice(
         state.emit_progress(app);
     }
     result?;
-    Ok(ScheduledSliceResult::complete(pending > 0))
+    let processed = pending_before.saturating_sub(pending.max(0) as u64);
+    Ok(ScheduledSliceResult::complete(pending > 0).with_processed(processed))
 }
 
 /// Whether a pass may run at all.
@@ -888,9 +889,12 @@ async fn run_batch(
         // and a pass that wakes to re-discover the same verdict every minute.
         // The warning banner keeps saying which clusters need attention, and a
         // rescan re-enqueues the window once they have it.
-        let remaining = commit_pending(app, state, storage, &inputs.ids, forced).await?;
+        let (deleted, remaining) = commit_pending(app, state, storage, &inputs.ids, forced).await?;
+        if deleted > 0 {
+            crate::background_activity::index_progress(deleted);
+        }
         let mut progress = BatchProgress::completed(remaining > 0);
-        progress.deleted = inputs.ids.len() as u64;
+        progress.deleted = deleted;
         return Ok(progress);
     }
 
@@ -914,6 +918,7 @@ async fn run_batch(
     // own, and the prefilter compares one stored vector against one anchor.
     let group_size = commit_group_size(targets.len());
     let mut assigned = 0u64;
+    let mut deleted = 0u64;
     let mut interrupted: Option<&'static str> = None;
     for group in inputs.ids.chunks(group_size) {
         if let Some(reason) = stand_down_reason(app, state, forced) {
@@ -925,7 +930,11 @@ async fn run_batch(
         if documents.is_empty() {
             // Every snapshot in this group was deleted between enqueue and now;
             // the queue entries have nothing left to describe.
-            commit_pending(app, state, storage.clone(), group, forced).await?;
+            let (committed, _) = commit_pending(app, state, storage.clone(), group, forced).await?;
+            if committed > 0 {
+                crate::background_activity::index_progress(committed);
+                deleted = deleted.saturating_add(committed);
+            }
             continue;
         }
         let vectors = load_prefilter_vectors(storage.clone(), documents.keys().copied()).await?;
@@ -1000,7 +1009,11 @@ async fn run_batch(
             // pass, which is the whole of what standing down now costs.
             break;
         }
-        commit_pending(app, state, storage.clone(), group, forced).await?;
+        let (committed, _) = commit_pending(app, state, storage.clone(), group, forced).await?;
+        if committed > 0 {
+            crate::background_activity::index_progress(committed);
+            deleted = deleted.saturating_add(committed);
+        }
     }
 
     if assigned > 0 {
@@ -1010,7 +1023,7 @@ async fn run_batch(
         Some(reason) => Ok(BatchProgress::stopped(reason)),
         None => {
             let mut progress = BatchProgress::completed(inputs.remaining > 0);
-            progress.deleted = inputs.ids.len() as u64;
+            progress.deleted = deleted;
             Ok(progress)
         }
     }
@@ -1586,13 +1599,13 @@ async fn commit_pending(
     storage: Arc<StorageState>,
     ids: &[i64],
     forced: bool,
-) -> Result<u64, String> {
+) -> Result<(u64, u64), String> {
     let (deleted, remaining) = delete_pending(storage, ids).await?;
     if forced {
         state.report_processed(deleted, remaining);
         state.emit_progress(app);
     }
-    Ok(remaining)
+    Ok((deleted, remaining))
 }
 
 // ==================== Command surface ====================

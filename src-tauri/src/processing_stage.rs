@@ -553,7 +553,7 @@ impl ProcessingStaging {
             params![id,consumer.bit()],|r|r.get(0)).map_err(|e|e.to_string())).unwrap_or(false)
     }
 
-    fn classification_in_flight(&self) -> bool {
+    pub(crate) fn classification_in_flight(&self) -> bool {
         self.with_store(|s|s.connection.query_row("SELECT EXISTS(SELECT 1 FROM staged_work WHERE consumer=1 AND state='processing' AND deadline>?1)",
             [protocol::now_secs()],|r|r.get(0)).map_err(|e|e.to_string())).unwrap_or(true)
     }
@@ -988,10 +988,11 @@ impl ProcessingStaging {
         })
     }
 
-    pub fn reconcile(&self, storage: &StorageState) -> Result<(), String> {
+    pub fn reconcile(&self, storage: &StorageState) -> Result<u64, String> {
         if !self.available() {
-            return Ok(());
+            return Ok(0);
         }
+        let mut processed = 0u64;
         storage.finish_staged_deletions()?;
         self.renew_live_leases()?;
         let preparing = self.with_store(|s| {
@@ -1020,6 +1021,10 @@ impl ProcessingStaging {
         }
         for receipt in storage.pending_staged_receipts()? {
             if self.finish(storage, &receipt).is_ok() {
+                if receipt.consumer == Consumer::Classification {
+                    crate::background_activity::classification_acknowledged(1);
+                }
+                processed = processed.saturating_add(1);
                 continue;
             }
             match self.broker.call(Request::InspectTask {
@@ -1033,17 +1038,29 @@ impl ProcessingStaging {
                             != 0
                     {
                         storage.clear_staged_receipt(&receipt)?;
+                        if receipt.consumer == Consumer::Classification {
+                            crate::background_activity::classification_acknowledged(1);
+                        }
+                        processed = processed.saturating_add(1);
                         continue;
                     }
                     if state.task.dataset_id != receipt.dataset_id
                         || state.task.screenshot_id != receipt.screenshot_id
                     {
                         storage.clear_staged_receipt(&receipt)?;
+                        if receipt.consumer == Consumer::Classification {
+                            crate::background_activity::classification_acknowledged(1);
+                        }
+                        processed = processed.saturating_add(1);
                         continue;
                     }
                 }
                 Err(BrokerError::Retired | BrokerError::DatasetMismatch) => {
                     storage.clear_staged_receipt(&receipt)?;
+                    if receipt.consumer == Consumer::Classification {
+                        crate::background_activity::classification_acknowledged(1);
+                    }
+                    processed = processed.saturating_add(1);
                     continue;
                 }
                 Err(BrokerError::Unavailable) => return Err(BrokerError::Unavailable.to_string()),
@@ -1069,7 +1086,12 @@ impl ProcessingStaging {
                     Ok(Response::Lease(lease)) => {
                         let mut recovered = receipt.clone();
                         recovered.lease_id = lease.lease_id;
-                        let _ = self.finish(storage, &recovered);
+                        if self.finish(storage, &recovered).is_ok() {
+                            if receipt.consumer == Consumer::Classification {
+                                crate::background_activity::classification_acknowledged(1);
+                            }
+                            processed = processed.saturating_add(1);
+                        }
                     }
                     Err(BrokerError::Retired) => {
                         // Another consumer can still have a live grant.
@@ -1079,6 +1101,10 @@ impl ProcessingStaging {
                             BrokerError::Retired,
                         )?;
                         storage.clear_staged_receipt(&receipt)?;
+                        if receipt.consumer == Consumer::Classification {
+                            crate::background_activity::classification_acknowledged(1);
+                        }
+                        processed = processed.saturating_add(1);
                     }
                     _ => {}
                 }
@@ -1133,7 +1159,8 @@ impl ProcessingStaging {
             s.connection.execute("UPDATE staged_work SET state='pending',lease_id=NULL WHERE state='processing' AND deadline<=?1",[protocol::now_secs()]).map_err(|e|e.to_string())?;
             s.connection.execute("DELETE FROM staged_inputs WHERE state='retired' AND expires<?1",[protocol::now_secs()-60*protocol::DAY_SECS]).map_err(|e|e.to_string())?;
             s.connection.execute_batch("PRAGMA incremental_vacuum(256);").map_err(|e|e.to_string())
-        })
+        })?;
+        Ok(processed)
     }
 }
 
@@ -1151,13 +1178,23 @@ pub(crate) fn ready_for_kind(
 
 pub(crate) async fn dispatch_classification(app: &AppHandle) -> Result<(), String> {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
-    if !storage.background_processing_enabled()
-        || !storage.processing_stage.has_ready(Consumer::Classification)
-        || storage.processing_stage.classification_in_flight()
-        || crate::background_scheduler::environment_gate_reason(app, false).is_some()
-    {
+    if !storage.background_processing_enabled() {
+        crate::background_activity::clear_blocked("classification");
         return Ok(());
     }
+    if let Some(reason) = crate::background_scheduler::environment_gate_reason(app, false) {
+        if storage.processing_stage.has_ready(Consumer::Classification) {
+            crate::background_activity::blocked("classification", reason);
+        }
+        return Ok(());
+    }
+    if !storage.processing_stage.has_ready(Consumer::Classification)
+        || storage.processing_stage.classification_in_flight()
+    {
+        crate::background_activity::clear_classification_blocked_if_idle();
+        return Ok(());
+    }
+    crate::background_activity::clear_blocked("classification");
     let claim_storage = storage.clone();
     let Some(work) = tokio::task::spawn_blocking(move || {
         claim_storage
@@ -1174,6 +1211,8 @@ pub(crate) async fn dispatch_classification(app: &AppHandle) -> Result<(), Strin
         "window_title":work.input.window_title,"process_name":work.input.process_name,
         "ocr_text":work.input.ocr_text,"timestamp":work.input.timestamp_ms,"staged_receipt":work.receipt,
     });
+    crate::background_activity::classification_started();
+    tracing::debug!("[BACKGROUND] event=classification_dispatched source=staged");
     let monitor = app.state::<crate::monitor::MonitorState>();
     let accepted = crate::monitor::forward_command_to_python(&monitor, request)
         .await
@@ -1181,6 +1220,7 @@ pub(crate) async fn dispatch_classification(app: &AppHandle) -> Result<(), Strin
         .and_then(|value| value.get("postprocess_enqueued").and_then(|v| v.as_bool()))
         .unwrap_or(false);
     if !accepted {
+        crate::background_activity::classification_dispatch_rejected();
         let receipt = work.receipt;
         tokio::task::spawn_blocking(move || storage.processing_stage.release(&receipt, false))
             .await
@@ -1250,14 +1290,14 @@ pub(crate) async fn run_model_slice(
 ) -> Result<ScheduledSliceResult, String> {
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
-    let mut progressed = false;
+    let mut processed = 0u64;
     for _ in 0..16 {
         if crate::background_scheduler::environment_gate_reason(app, false).is_some()
             || !storage.background_processing_enabled()
         {
             break;
         }
-        if quantum.is_some_and(|q| q.stop_reason(&semantic, progressed).is_some()) {
+        if quantum.is_some_and(|q| q.stop_reason(&semantic, processed > 0).is_some()) {
             break;
         }
         let claim_storage = storage.clone();
@@ -1274,7 +1314,8 @@ pub(crate) async fn run_model_slice(
         let result = encode_staged(app, &storage, &semantic, &work).await;
         match result {
             Ok(()) => {
-                progressed = true;
+                processed = processed.saturating_add(1);
+                crate::background_activity::index_progress(1);
                 let finish_storage = storage.clone();
                 let receipt = work.receipt.clone();
                 let _ = tokio::task::spawn_blocking(move || {
@@ -1301,9 +1342,10 @@ pub(crate) async fn run_model_slice(
             }
         }
     }
-    Ok(ScheduledSliceResult::complete(
-        storage.processing_stage.has_ready(consumer),
-    ))
+    Ok(
+        ScheduledSliceResult::complete(storage.processing_stage.has_ready(consumer))
+            .with_processed(processed),
+    )
 }
 
 async fn encode_staged(

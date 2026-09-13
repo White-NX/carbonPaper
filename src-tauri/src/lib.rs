@@ -9,6 +9,7 @@ mod app_bound;
 #[cfg(feature = "app-bound-dev")]
 mod app_bound_dev;
 mod autostart;
+mod background_activity;
 mod background_scheduler;
 mod blind_index_repair;
 mod capture;

@@ -466,6 +466,7 @@ async fn run_scheduled_request(
         automatic_context,
     )
     .await?;
+    crate::background_activity::index_progress(outcome.indexed);
     if let Some(reason) = outcome.refused.or(outcome.stopped_because) {
         return Ok(ScheduledSliceResult::skipped(reason));
     }
@@ -497,7 +498,7 @@ async fn run_scheduled_request(
             }
         }
     }
-    Ok(ScheduledSliceResult::complete(backlog > 0))
+    Ok(ScheduledSliceResult::complete(backlog > 0).with_processed(outcome.indexed))
 }
 
 fn scheduled_pass_mode(manual: bool) -> PassMode {

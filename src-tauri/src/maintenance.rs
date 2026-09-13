@@ -19,15 +19,27 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static REASON: Mutex<Option<String>> = Mutex::new(None);
 
 /// RAII guard: maintenance mode ends when the guard drops, so a panicking or
-/// early-returning worker cannot leave the app locked.
+/// early-returning worker cannot leave the app locked. The generic end event is
+/// neutral because callers own the operation-specific success or failure state.
 pub struct MaintenanceGuard {
     _private: (),
 }
 
 impl Drop for MaintenanceGuard {
     fn drop(&mut self) {
+        let reason = REASON
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .unwrap_or_else(|| "unknown".to_string());
         ACTIVE.store(false, Ordering::SeqCst);
-        *REASON.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        let (processed, elapsed_ms) = crate::background_activity::global_maintenance_finish();
+        tracing::info!(
+            "[BACKGROUND] event=end task=maintenance kind={} processed={} has_more=false outcome=ended elapsed_ms={}",
+            reason,
+            processed,
+            elapsed_ms,
+        );
     }
 }
 
@@ -41,6 +53,11 @@ pub fn enter(reason: &str) -> Option<MaintenanceGuard> {
         return None;
     }
     *REASON.lock().unwrap_or_else(|error| error.into_inner()) = Some(reason.to_string());
+    crate::background_activity::global_maintenance_start(reason);
+    tracing::info!(
+        "[BACKGROUND] event=start task=maintenance kind={} source=archive",
+        reason
+    );
     Some(MaintenanceGuard { _private: () })
 }
 

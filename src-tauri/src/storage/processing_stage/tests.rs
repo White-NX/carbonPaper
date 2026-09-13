@@ -397,13 +397,29 @@ fn category_and_receipt_commit_atomically_and_duplicate_callback_does_not_rewrit
     assert_eq!(category(&storage, 1), None);
     assert!(storage.pending_staged_receipts().unwrap().is_empty());
     sql(&storage, "DROP TRIGGER reject_receipt");
-    storage
+    let first_commit = storage
         .commit_staged_category(&receipt, Some("Development"), Some(0.9))
         .unwrap();
+    assert!(first_commit);
+    assert_eq!(storage.pending_staged_receipt_count().unwrap(), 1);
+    assert_eq!(
+        storage
+            .pending_staged_classification_receipt_count()
+            .unwrap(),
+        1
+    );
     storage.processing_stage.finish(&storage, &receipt).unwrap();
-    storage
+    let duplicate_commit = storage
         .commit_staged_category(&receipt, Some("Changed by replay"), Some(1.0))
         .unwrap();
+    assert!(!duplicate_commit);
+    assert_eq!(storage.pending_staged_receipt_count().unwrap(), 0);
+    assert_eq!(
+        storage
+            .pending_staged_classification_receipt_count()
+            .unwrap(),
+        0
+    );
     assert_eq!(category(&storage, 1).as_deref(), Some("Development"));
 }
 

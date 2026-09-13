@@ -246,6 +246,34 @@ impl StorageState {
         Ok(receipts)
     }
 
+    pub(crate) fn pending_staged_receipt_count(&self) -> Result<u64, String> {
+        let guard = self.get_connection_named("pending_staged_receipt_count")?;
+        let count: i64 = guard
+            .as_ref()
+            .ok_or("Database not initialized")?
+            .query_row(
+                "SELECT COUNT(*) FROM app_bound_receipts WHERE acknowledged=0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(count.max(0) as u64)
+    }
+
+    pub(crate) fn pending_staged_classification_receipt_count(&self) -> Result<u64, String> {
+        let guard = self.get_connection_named("pending_staged_classification_receipt_count")?;
+        let count: i64 = guard
+            .as_ref()
+            .ok_or("Database not initialized")?
+            .query_row(
+                "SELECT COUNT(*) FROM app_bound_receipts WHERE acknowledged=0 AND consumer=?1",
+                [carbonpaper_app_bound::protocol::Consumer::Classification.bit()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(count.max(0) as u64)
+    }
+
     pub(crate) fn clear_staged_receipt(&self, receipt: &TaskReceipt) -> Result<(), String> {
         let guard = self.get_connection_named("clear_staged_receipt")?;
         guard.as_ref().ok_or("Database not initialized")?.execute("UPDATE app_bound_receipts SET acknowledged=1 WHERE task_id=?1 AND consumer=?2 AND dataset_id=?3",
@@ -257,7 +285,7 @@ impl StorageState {
         receipt: &TaskReceipt,
         category: Option<&str>,
         confidence: Option<f64>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if receipt.consumer != carbonpaper_app_bound::protocol::Consumer::Classification {
             return Err("invalid staged consumer".into());
         }
@@ -275,7 +303,7 @@ impl StorageState {
                 params![receipt.task_id,receipt.consumer.bit(),receipt.dataset_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
             if prior.as_deref() == Some(&serde_json::to_string(receipt).map_err(|e| e.to_string())?)
             {
-                return Ok(());
+                return Ok(false);
             }
         }
         self.processing_stage.check_receipt(receipt)?;
@@ -293,13 +321,14 @@ impl StorageState {
             )
             .map_err(|e| e.to_string())?;
         if already_committed {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(category) = category {
             tx.execute("UPDATE screenshots SET category=?2,category_confidence=?3 WHERE id=?1 AND is_deleted=0",params![receipt.screenshot_id,category,confidence]).map_err(|e|e.to_string())?;
         }
         tx.execute("UPDATE screenshot_ocr_status SET postprocess_status='completed',postprocess_error=NULL WHERE screenshot_id=?1",[receipt.screenshot_id]).map_err(|e|e.to_string())?;
         Self::record_staged_receipt_on_conn(&tx, receipt)?;
-        tx.commit().map_err(|e| e.to_string())
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 }

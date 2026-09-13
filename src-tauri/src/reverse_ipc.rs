@@ -691,9 +691,18 @@ async fn process_request(
                 let confidence = req.get("confidence").and_then(|v| v.as_f64());
                 storage
                     .commit_staged_category(&receipt, category, confidence)
-                    .map(|_| {
-                        // A durable receipt remains if service communication fails.
+                    .map(|first_commit| {
+                        // The archive commit is durable before service acknowledgement.
+                        // Keep the two states distinct so a failed acknowledgement is
+                        // visible in the periodic summary and can be reconciled later.
                         let _ = storage.processing_stage.finish(&storage, &receipt);
+                        let ack_pending = storage
+                            .pending_staged_classification_receipt_count()
+                            .unwrap_or(u64::from(first_commit));
+                        crate::background_activity::classification_committed(
+                            first_commit,
+                            ack_pending,
+                        );
                     })
             } else {
                 storage
@@ -705,6 +714,7 @@ async fn process_request(
                             req.get("failed").and_then(|v| v.as_bool()).unwrap_or(false),
                         )
                     })
+                    .map(|_| crate::background_activity::classification_deferred())
             };
             match result {
                 Ok(()) => StorageResponse::success(serde_json::json!({"accepted":true})),
