@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "smart_cluster_tests.rs"]
+mod smart_cluster_tests;
 use crate::{
     credential_manager::{get_cached_master_key, CredentialManagerState},
     processing_stage::{Broker, ProcessingInput, ProcessingStaging, STAGING_FILE},
@@ -9,7 +12,7 @@ use carbonpaper_app_bound::{
     protocol::*,
 };
 use std::sync::{
-    atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -29,6 +32,7 @@ struct TestBroker {
     clock: AtomicI64,
     online: AtomicBool,
     installed: AtomicBool,
+    supported_consumers: AtomicU8,
     acquisitions: AtomicUsize,
     inspected: Mutex<Vec<String>>,
 }
@@ -49,12 +53,21 @@ impl Broker for TestBroker {
         if let Request::InspectTask { task_id } = &request {
             self.inspected.lock().unwrap().push(task_id.clone());
         }
-        self.ledger.lock().unwrap().handle(
+        let supported = self.supported_consumers.load(Ordering::SeqCst);
+        if matches!(&request, Request::PrepareTask { consumers, .. } if consumers & !supported != 0)
+        {
+            return Err(BrokerError::InvalidRequest);
+        }
+        let mut response = self.ledger.lock().unwrap().handle(
             &self.principal.lock().unwrap(),
             request,
             self.clock.load(Ordering::SeqCst),
             &TestProtection,
-        )
+        )?;
+        if let Response::Status(status) = &mut response {
+            status.supported_consumers = supported;
+        }
+        Ok(response)
     }
 }
 
@@ -113,6 +126,7 @@ fn fixture() -> Fixture {
         clock: AtomicI64::new(now_secs()),
         online: AtomicBool::new(true),
         installed: AtomicBool::new(true),
+        supported_consumers: AtomicU8::new(Consumer::ALL_MASK),
         acquisitions: AtomicUsize::new(0),
         inspected: Mutex::new(Vec::new()),
     });

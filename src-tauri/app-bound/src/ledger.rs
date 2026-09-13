@@ -335,7 +335,7 @@ impl Ledger {
                 if !valid_id(&dataset_id)
                     || screenshot_id <= 0
                     || consumers == 0
-                    || consumers & !7 != 0
+                    || consumers & !Consumer::ALL_MASK != 0
                     || !(28..=MAX_INPUT_BYTES + 28).contains(&payload_bytes)
                 {
                     return Err(BrokerError::InvalidRequest);
@@ -584,6 +584,7 @@ impl Ledger {
             active_tasks: count,
             active_bytes: used,
             runtime_id: who.runtime_id.clone(),
+            supported_consumers: Consumer::ALL_MASK,
         })
     }
 
@@ -787,7 +788,7 @@ mod tests {
     #[test]
     fn consumers_finish_independently_and_replays_never_resurrect_keys() {
         let (mut ledger, who, ds) = fixture();
-        let task = prepare(&mut ledger, &who, &ds, 1, 7);
+        let task = prepare(&mut ledger, &who, &ds, 1, Consumer::ALL_MASK);
         for consumer in Consumer::ALL {
             let lease = acquire(&mut ledger, &who, &task.task.task_id, consumer, 102).unwrap();
             assert_eq!(lease.key.0, task.key.0);
@@ -818,6 +819,58 @@ mod tests {
                 &TestProtection
             )
             .is_err());
+    }
+
+    #[test]
+    fn old_bindings_do_not_acquire_new_consumers_and_unknown_bits_are_rejected() {
+        let (mut ledger, who, ds) = fixture();
+        let task = prepare(&mut ledger, &who, &ds, 1, Consumer::LEGACY_MASK);
+        assert_eq!(
+            acquire(
+                &mut ledger,
+                &who,
+                &task.task.task_id,
+                Consumer::SmartCluster,
+                102
+            )
+            .unwrap_err(),
+            BrokerError::AccessDenied
+        );
+        for consumer in [Consumer::Classification, Consumer::MiniLm, Consumer::Clip] {
+            let lease = acquire(&mut ledger, &who, &task.task.task_id, consumer, 102).unwrap();
+            finish(&mut ledger, &who, &lease, 103).unwrap();
+        }
+        let Response::TaskState(state) = ledger
+            .handle(
+                &who,
+                Request::InspectTask {
+                    task_id: task.task.task_id,
+                },
+                104,
+                &TestProtection,
+            )
+            .unwrap()
+        else {
+            panic!("expected task state")
+        };
+        assert!(state.retired);
+        assert_eq!(state.finished_consumers, Consumer::LEGACY_MASK);
+        assert_eq!(
+            ledger
+                .handle(
+                    &who,
+                    Request::PrepareTask {
+                        dataset_id: ds,
+                        screenshot_id: 2,
+                        consumers: 16,
+                        payload_bytes: 100,
+                    },
+                    104,
+                    &TestProtection
+                )
+                .unwrap_err(),
+            BrokerError::InvalidRequest
+        );
     }
     #[test]
     fn leases_are_fenced_by_kernel_process_identity_and_expiry() {

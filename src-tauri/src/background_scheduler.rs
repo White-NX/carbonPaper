@@ -678,6 +678,22 @@ pub(crate) fn gate_reason_for_kind(
         {
             return environment_gate_reason(app, false);
         }
+        if kind == BackgroundTaskKind::SmartCluster
+            && storage.background_processing_enabled()
+            && !storage.is_background_authorized()
+        {
+            use carbonpaper_app_bound::protocol::Consumer;
+            if storage.processing_stage.has_ready(Consumer::SmartCluster) {
+                return Some("waiting_for_index");
+            }
+            if storage
+                .processing_stage
+                .owned_screenshot_ids(Consumer::SmartCluster)
+                .is_ok_and(|ids| !ids.is_empty())
+            {
+                return Some("retry_wait");
+            }
+        }
     }
     gate_reason(app, manual)
 }
@@ -786,21 +802,8 @@ async fn refresh_backlog(app: &AppHandle) {
 }
 
 fn task_source(app: &AppHandle, kind: BackgroundTaskKind, manual: bool) -> WorkSource {
-    if !manual
-        && matches!(
-            kind,
-            BackgroundTaskKind::SemanticIndex | BackgroundTaskKind::ClipIndex
-        )
-        && app
-            .state::<Arc<StorageState>>()
-            .processing_stage
-            .has_ready(match kind {
-                BackgroundTaskKind::SemanticIndex => {
-                    carbonpaper_app_bound::protocol::Consumer::MiniLm
-                }
-                BackgroundTaskKind::ClipIndex => carbonpaper_app_bound::protocol::Consumer::Clip,
-                _ => unreachable!(),
-            })
+    if (!manual || kind == BackgroundTaskKind::SmartCluster)
+        && crate::processing_stage::ready_for_kind(&app.state::<Arc<StorageState>>(), kind)
     {
         WorkSource::Staged
     } else {

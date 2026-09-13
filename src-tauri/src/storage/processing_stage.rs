@@ -179,22 +179,86 @@ impl StorageState {
     pub(super) fn record_staged_receipt_on_conn(
         conn: &Connection,
         receipt: &TaskReceipt,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let json = serde_json::to_string(receipt).map_err(|e| e.to_string())?;
         conn.execute("INSERT INTO app_bound_receipts(task_id,consumer,dataset_id,receipt_json,recorded_at) VALUES(?1,?2,?3,?4,?5)
             ON CONFLICT(task_id,consumer) DO NOTHING",
-            params![receipt.task_id,receipt.consumer.bit(),receipt.dataset_id,json,carbonpaper_app_bound::protocol::now_secs()]).map_err(|e|e.to_string())?;
-        Ok(())
+            params![receipt.task_id,receipt.consumer.bit(),receipt.dataset_id,json,carbonpaper_app_bound::protocol::now_secs()])
+            .map(|changed| changed > 0).map_err(|e|e.to_string())
     }
 
-    pub(crate) fn record_staged_receipt(&self, receipt: &TaskReceipt) -> Result<(), String> {
+    pub(crate) fn record_staged_embedding_receipt(
+        &self,
+        receipt: &TaskReceipt,
+        expected: &super::DerivedIndexJobSpec,
+    ) -> Result<(), String> {
         self.processing_stage.check_receipt(receipt)?;
-        let guard = self.get_connection_named("record_staged_receipt")?;
-        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        use carbonpaper_app_bound::protocol::Consumer;
+        if !matches!(
+            (receipt.consumer, expected.index_kind),
+            (Consumer::MiniLm, super::DerivedIndexKind::SemanticText)
+                | (Consumer::Clip, super::DerivedIndexKind::ClipImage)
+        ) || (receipt.consumer == Consumer::MiniLm
+            && expected.subject_key != receipt.screenshot_id.to_string())
+        {
+            return Err("Staged embedding scope mismatch".into());
+        }
+        let mut guard = self.get_connection_named("record_staged_receipt")?;
+        let conn = guard.as_mut().ok_or("Database not initialized")?;
         if !self.staged_source_current_on_conn(conn, receipt)? {
             return Err("staged source changed".into());
         }
-        Self::record_staged_receipt_on_conn(conn, receipt)
+        if receipt.consumer == Consumer::Clip {
+            let matches: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM screenshots WHERE id=?1 AND image_hash=?2)",
+                    params![receipt.screenshot_id, expected.subject_key],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !matches {
+                return Err("Staged image scope mismatch".into());
+            }
+        }
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let sql = format!("SELECT EXISTS(SELECT 1 {} AND e.subject_key=?2
+            AND e.model_id=?3 AND e.model_revision=?4 AND e.embedding_version=?5 AND e.source_fingerprint=?6)",
+            super::derived_index::VISIBLE_EMBEDDING_SOURCE);
+        let current: bool = tx
+            .query_row(
+                &sql,
+                params![
+                    expected.index_kind.as_str(),
+                    expected.subject_key,
+                    expected.model_id,
+                    expected.model_revision,
+                    expected.embedding_version,
+                    expected.source_fingerprint
+                ],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !current {
+            return Err("deferred: staged embedding changed".into());
+        }
+        if Self::record_staged_receipt_on_conn(&tx, receipt)? {
+            Self::enqueue_staged_semantic_completion_on_conn(&tx, receipt)?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(super) fn enqueue_staged_semantic_completion_on_conn(
+        conn: &Connection,
+        receipt: &TaskReceipt,
+    ) -> Result<(), String> {
+        if receipt.consumer == carbonpaper_app_bound::protocol::Consumer::MiniLm {
+            conn.execute(
+                "INSERT OR IGNORE INTO smart_cluster_pending(screenshot_id) VALUES(?1)",
+                [receipt.screenshot_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn pending_staged_receipts(&self) -> Result<Vec<TaskReceipt>, String> {
@@ -278,6 +342,87 @@ impl StorageState {
         let guard = self.get_connection_named("clear_staged_receipt")?;
         guard.as_ref().ok_or("Database not initialized")?.execute("UPDATE app_bound_receipts SET acknowledged=1 WHERE task_id=?1 AND consumer=?2 AND dataset_id=?3",
             params![receipt.task_id,receipt.consumer.bit(),receipt.dataset_id]).map(|_|()).map_err(|e|e.to_string())
+    }
+
+    /// The task receipt, all assignments, and the remaining archive debt are
+    /// one durable result. Broker acknowledgement can then be retried alone.
+    pub(crate) fn commit_staged_smart_cluster(
+        &self,
+        receipt: &TaskReceipt,
+        targets: &[super::smart_cluster::SmartClusterScoringTarget],
+        assignments: &[(i64, f64)],
+        needs_archive: bool,
+    ) -> Result<bool, String> {
+        if receipt.consumer != carbonpaper_app_bound::protocol::Consumer::SmartCluster
+            || assignments.iter().any(|(id, score)| {
+                !score.is_finite() || !targets.iter().any(|t| t.id == *id && *score >= t.threshold)
+            })
+        {
+            return Err("invalid staged smart cluster result".into());
+        }
+        {
+            let guard = self.get_connection_named("staged_smart_cluster_receipt")?;
+            let prior: Option<String> = guard.as_ref().ok_or("Database not initialized")?
+                .query_row(
+                    "SELECT receipt_json FROM app_bound_receipts WHERE task_id=?1 AND consumer=?2 AND dataset_id=?3",
+                    params![receipt.task_id, receipt.consumer.bit(), receipt.dataset_id], |r| r.get(0),
+                ).optional().map_err(|e| e.to_string())?;
+            if prior.as_deref() == Some(&serde_json::to_string(receipt).map_err(|e| e.to_string())?)
+            {
+                return Ok(false);
+            }
+        }
+        self.processing_stage.check_receipt(receipt)?;
+        let mut guard = self.get_connection_named("commit_staged_smart_cluster")?;
+        let conn = guard.as_mut().ok_or("Database not initialized")?;
+        if !self.staged_source_current_on_conn(conn, receipt)? {
+            return Err("deferred: staged source changed".into());
+        }
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let already: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM app_bound_receipts WHERE task_id=?1 AND consumer=?2)",
+                params![receipt.task_id, receipt.consumer.bit()],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if already {
+            return Ok(false);
+        }
+        let current = Self::smart_cluster_scoring_targets_on_conn(&tx)?;
+        if current.len() != targets.len()
+            || !current
+                .iter()
+                .zip(targets)
+                .all(|(a, b)| a.same_scoring_configuration(b))
+        {
+            return Err("deferred: smart cluster configuration changed".into());
+        }
+        for (cluster, score) in assignments {
+            tx.execute(
+                "INSERT INTO smart_cluster_assignments(smart_cluster_id,screenshot_id,rerank_score)
+                 VALUES(?1,?2,?3) ON CONFLICT(smart_cluster_id,screenshot_id)
+                 DO UPDATE SET rerank_score=excluded.rerank_score",
+                params![cluster, receipt.screenshot_id, score],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if needs_archive {
+            tx.execute(
+                "INSERT OR IGNORE INTO smart_cluster_pending(screenshot_id) VALUES(?1)",
+                [receipt.screenshot_id],
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            tx.execute(
+                "DELETE FROM smart_cluster_pending WHERE screenshot_id=?1",
+                [receipt.screenshot_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Self::record_staged_receipt_on_conn(&tx, receipt)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(true)
     }
 
     pub(crate) fn commit_staged_category(

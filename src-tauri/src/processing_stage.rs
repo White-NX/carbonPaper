@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -135,6 +135,7 @@ pub(crate) struct ProcessingStaging {
     store: Mutex<Option<Store>>,
     status: Mutex<ProcessingStatus>,
     available: AtomicBool,
+    supported_consumers: AtomicU8,
     broker: Arc<dyn Broker>,
     // Only receipts issued by this process can authorize a new archive write.
     // Python and user-writable SQLite rows cannot change their screenshot scope.
@@ -149,6 +150,7 @@ impl ProcessingStaging {
             store: Mutex::new(None),
             status: Mutex::new(ProcessingStatus::default()),
             available: AtomicBool::new(false),
+            supported_consumers: AtomicU8::new(Consumer::LEGACY_MASK),
             broker: Arc::new(NativeBroker),
             issued: Mutex::new(HashMap::new()),
             scan_cursor: Mutex::new(String::new()),
@@ -270,6 +272,10 @@ impl ProcessingStaging {
         self.available.load(Ordering::Acquire)
     }
 
+    pub(crate) fn supports(&self, consumer: Consumer) -> bool {
+        self.available() && self.supported_consumers.load(Ordering::Acquire) & consumer.bit() != 0
+    }
+
     pub fn refresh(&self) -> Result<(), String> {
         let supported = self.broker.supported();
         let installed = match self.broker.installed() {
@@ -322,6 +328,10 @@ impl ProcessingStaging {
         })();
         match result {
             Ok(broker) => {
+                self.supported_consumers.store(
+                    broker.supported_consumers & Consumer::ALL_MASK,
+                    Ordering::Release,
+                );
                 self.available.store(broker.enabled, Ordering::Release);
                 let waiting = self
                     .with_store(|s| {
@@ -432,6 +442,10 @@ impl ProcessingStaging {
             .capture_lock
             .lock()
             .map_err(|_| "staging lock poisoned")?;
+        if consumers & !Consumer::ALL_MASK != 0 {
+            return Err(BrokerError::InvalidRequest.to_string());
+        }
+        let consumers = consumers & self.supported_consumers.load(Ordering::Acquire);
         if !self.available() || consumers == 0 {
             return Ok(false);
         }
@@ -542,15 +556,70 @@ impl ProcessingStaging {
     }
 
     pub fn has_ready(&self, consumer: Consumer) -> bool {
-        self.available() && self.with_store(|s|s.connection.query_row("SELECT EXISTS(SELECT 1 FROM staged_work w JOIN staged_inputs i USING(task_id)
+        self.supports(consumer) && self.with_store(|s|s.connection.query_row("SELECT EXISTS(SELECT 1 FROM staged_work w JOIN staged_inputs i USING(task_id)
             WHERE w.consumer=?1 AND w.state='pending' AND w.next_attempt<=?2 AND i.state='active' AND i.payload IS NOT NULL)",
             params![consumer.bit(),protocol::now_secs()],|r|r.get(0)).map_err(|e|e.to_string())).unwrap_or(false)
     }
 
     pub fn owns_screenshot(&self, id: i64, consumer: Consumer) -> bool {
-        self.available() && self.with_store(|s|s.connection.query_row("SELECT EXISTS(SELECT 1 FROM staged_inputs i JOIN staged_work w USING(task_id)
+        self.supports(consumer) && self.with_store(|s|s.connection.query_row("SELECT EXISTS(SELECT 1 FROM staged_inputs i JOIN staged_work w USING(task_id)
             WHERE i.screenshot_id=?1 AND w.consumer=?2 AND w.state IN ('pending','processing') AND i.state IN ('active','preparing'))",
             params![id,consumer.bit()],|r|r.get(0)).map_err(|e|e.to_string())).unwrap_or(false)
+    }
+
+    /// Metadata only. Selected rows still require AcquireTask and binding checks.
+    pub(crate) fn ready_screenshot_page(
+        &self,
+        consumer: Consumer,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<i64>, String> {
+        if !self.supports(consumer) {
+            return Ok(Vec::new());
+        }
+        self.with_store(|s| {
+            let mut stmt = s
+                .connection
+                .prepare(
+                    "SELECT i.screenshot_id FROM staged_work w JOIN staged_inputs i USING(task_id)
+                 WHERE w.consumer=?1 AND w.state='pending' AND w.next_attempt<=?2
+                   AND i.state='active' AND i.payload IS NOT NULL AND i.screenshot_id>?3
+                 ORDER BY i.screenshot_id LIMIT ?4",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    params![consumer.bit(), protocol::now_secs(), after, limit],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    pub(crate) fn owned_screenshot_ids(
+        &self,
+        consumer: Consumer,
+    ) -> Result<std::collections::HashSet<i64>, String> {
+        if !self.supports(consumer) {
+            return Ok(Default::default());
+        }
+        self.with_store(|s| {
+            let mut stmt = s
+                .connection
+                .prepare(
+                    "SELECT i.screenshot_id FROM staged_inputs i JOIN staged_work w USING(task_id)
+                 WHERE w.consumer=?1 AND w.state IN ('pending','processing')
+                   AND i.state IN ('active','preparing')",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([consumer.bit()], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<rusqlite::Result<_>>()
+                .map_err(|e| e.to_string())
+        })
     }
 
     pub(crate) fn classification_in_flight(&self) -> bool {
@@ -563,7 +632,25 @@ impl ProcessingStaging {
         storage: &StorageState,
         consumer: Consumer,
     ) -> Result<Option<StagedWork>, String> {
-        if !self.available() {
+        self.claim_selected(storage, consumer, None)
+    }
+
+    pub(crate) fn claim_screenshot(
+        &self,
+        storage: &StorageState,
+        consumer: Consumer,
+        screenshot_id: i64,
+    ) -> Result<Option<StagedWork>, String> {
+        self.claim_selected(storage, consumer, Some(screenshot_id))
+    }
+
+    fn claim_selected(
+        &self,
+        storage: &StorageState,
+        consumer: Consumer,
+        screenshot_id: Option<i64>,
+    ) -> Result<Option<StagedWork>, String> {
+        if !self.supports(consumer) {
             return Ok(None);
         }
         // Drain deletion intent before any key request, including after a crash.
@@ -574,7 +661,8 @@ impl ProcessingStaging {
                 CASE WHEN length(i.payload) BETWEEN 28 AND ?3 THEN i.payload ELSE NULL END,i.digest,i.screenshot_id
                 FROM staged_work w JOIN staged_inputs i USING(task_id)
                 WHERE w.consumer=?1 AND w.state='pending' AND w.next_attempt<=?2 AND i.state='active'
-                ORDER BY i.created,i.task_id LIMIT 1",params![consumer.bit(),protocol::now_secs(),protocol::MAX_INPUT_BYTES as i64+28],
+                AND (?4 IS NULL OR i.screenshot_id=?4)
+                ORDER BY i.created,i.task_id LIMIT 1",params![consumer.bit(),protocol::now_secs(),protocol::MAX_INPUT_BYTES as i64+28,screenshot_id],
                 |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<Vec<u8>>>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?)))
                 .optional().map_err(|e|e.to_string())?;
             Ok((row,s.dataset_id.clone(),s.generation))
@@ -1172,6 +1260,9 @@ pub(crate) fn ready_for_kind(
     match kind {
         BackgroundTaskKind::SemanticIndex => storage.processing_stage.has_ready(Consumer::MiniLm),
         BackgroundTaskKind::ClipIndex => storage.processing_stage.has_ready(Consumer::Clip),
+        BackgroundTaskKind::SmartCluster => storage
+            .staged_smart_cluster_pending_ids(1)
+            .is_ok_and(|ids| !ids.is_empty()),
         _ => false,
     }
 }
@@ -1239,8 +1330,9 @@ pub(crate) fn captured_input(
     ocr_text: String,
     image: &image::RgbImage,
 ) -> Result<(ProcessingInput, u8), String> {
-    let semantic_enabled = crate::registry_config::get_bool("clustering_enabled").unwrap_or(true)
-        || crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
+    let smart_enabled = crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
+    let semantic_enabled =
+        crate::registry_config::get_bool("clustering_enabled").unwrap_or(true) || smart_enabled;
     let classification = crate::registry_config::get_bool("classification_enabled").unwrap_or(true);
     let has_ocr = !ocr_text.trim().is_empty();
     let semantic_text = crate::minilm_migration::build_minilm_task_text(process, title, &ocr_text);
@@ -1266,7 +1358,12 @@ pub(crate) fn captured_input(
         Consumer::MiniLm.bit()
     } else {
         0
-    } | if has_ocr { Consumer::Clip.bit() } else { 0 };
+    } | if has_ocr { Consumer::Clip.bit() } else { 0 }
+        | if smart_enabled && !semantic_text.trim().is_empty() {
+            Consumer::SmartCluster.bit()
+        } else {
+            0
+        };
     Ok((
         ProcessingInput {
             image_hash: image_hash.into(),
@@ -1371,7 +1468,9 @@ async fn encode_staged(
             crate::clip_migration::clip_job_spec(&input.image_hash),
             None,
         ),
-        Consumer::Classification => return Err("invalid model consumer".into()),
+        Consumer::Classification | Consumer::SmartCluster => {
+            return Err("invalid model consumer".into())
+        }
     };
     if !storage.staged_source_is_current(&work.receipt)? {
         return Err("deferred: source changed".into());
@@ -1380,7 +1479,7 @@ async fn encode_staged(
         storage.get_query_visible_embedding(spec.index_kind, &spec.subject_key)?
     {
         if existing.job == spec {
-            return storage.record_staged_receipt(&work.receipt);
+            return storage.record_staged_embedding_receipt(&work.receipt, &spec);
         }
     }
     storage.ensure_derived_index_job(&spec)?;

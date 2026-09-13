@@ -119,15 +119,25 @@ pub enum Consumer {
     Classification,
     MiniLm,
     Clip,
+    SmartCluster,
 }
 
 impl Consumer {
-    pub const ALL: [Self; 3] = [Self::Classification, Self::MiniLm, Self::Clip];
+    pub const ALL: [Self; 4] = [
+        Self::Classification,
+        Self::MiniLm,
+        Self::Clip,
+        Self::SmartCluster,
+    ];
+    pub const ALL_MASK: u8 = 0x0f;
+    pub const LEGACY_MASK: u8 = 0x07;
+
     pub const fn bit(self) -> u8 {
         match self {
             Self::Classification => 1,
             Self::MiniLm => 2,
             Self::Clip => 4,
+            Self::SmartCluster => 8,
         }
     }
     pub const fn name(self) -> &'static str {
@@ -135,6 +145,7 @@ impl Consumer {
             Self::Classification => "classification",
             Self::MiniLm => "minilm",
             Self::Clip => "clip",
+            Self::SmartCluster => "smart_cluster",
         }
     }
 }
@@ -190,6 +201,14 @@ pub struct BrokerStatus {
     pub active_tasks: u64,
     pub active_bytes: u64,
     pub runtime_id: String,
+    /// Older v1 services support only the original three consumers. Clients
+    /// must negotiate before including a new consumer in an immutable binding.
+    #[serde(default = "legacy_consumers")]
+    pub supported_consumers: u8,
+}
+
+fn legacy_consumers() -> u8 {
+    Consumer::LEGACY_MASK
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -364,6 +383,29 @@ pub fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn consumer_capabilities_preserve_legacy_v1_status_and_bit_assignments() {
+        let legacy = serde_json::json!({
+            "enabled": true, "limits": Limits::default(), "dataset_id": null,
+            "active_tasks": 0, "active_bytes": 0, "runtime_id": "old-runtime"
+        });
+        let status: BrokerStatus = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(status.supported_consumers, Consumer::LEGACY_MASK);
+        let mut current = legacy;
+        current["supported_consumers"] = Consumer::ALL_MASK.into();
+        let status: BrokerStatus = serde_json::from_value(current).unwrap();
+        assert_eq!(status.supported_consumers, Consumer::ALL_MASK);
+        assert_eq!(Consumer::ALL.map(Consumer::bit), [1, 2, 4, 8]);
+        assert_eq!(
+            Consumer::ALL.iter().fold(0, |mask, c| mask | c.bit()),
+            Consumer::ALL_MASK
+        );
+        assert_eq!(
+            serde_json::to_string(&Consumer::SmartCluster).unwrap(),
+            "\"smart_cluster\""
+        );
+    }
+
     #[test]
     fn request_operation_names_are_fixed_and_redacted() {
         let requests = [

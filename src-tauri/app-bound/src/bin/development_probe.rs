@@ -4,6 +4,12 @@ use carbonpaper_app_bound::{
     windows::{self, identity},
 };
 
+#[allow(dead_code)]
+#[path = "../../../src/ml_protocol.rs"]
+mod ml_protocol;
+#[path = "development_probe/semantic_smoke.rs"]
+mod semantic_smoke;
+
 fn main() {
     if std::env::args().any(|arg| arg == "--expect-rejection") {
         if windows::call(Request::Status {}).is_ok() {
@@ -86,7 +92,7 @@ fn exercise(package: &std::path::Path) -> std::result::Result<(), String> {
     let Response::Prepared(prepared) = call(Request::PrepareTask {
         dataset_id,
         screenshot_id: 1,
-        consumers: 7,
+        consumers: Consumer::ALL_MASK,
         payload_bytes: plaintext.len() as u64 + 28,
     })?
     else {
@@ -100,7 +106,8 @@ fn exercise(package: &std::path::Path) -> std::result::Result<(), String> {
     })?;
     println!("[app-bound dev] Repairing the running service and recovering its persisted task...");
     development::install_package(package, false)?;
-    for consumer in [Consumer::Classification, Consumer::MiniLm, Consumer::Clip] {
+    let mut semantic = semantic_smoke::SemanticSmoke::from_environment()?;
+    for consumer in Consumer::ALL {
         let Response::Lease(lease) = call(Request::AcquireTask {
             task_id: prepared.task.task_id.clone(),
             consumer,
@@ -114,11 +121,17 @@ fn exercise(package: &std::path::Path) -> std::result::Result<(), String> {
         if decoded.as_slice() != plaintext {
             return Err("Recovered input differs".into());
         }
+        if let Some(semantic) = &mut semantic {
+            semantic.consume(consumer, &decoded)?;
+        }
         call(Request::FinishConsumer {
             task_id: lease.task.task_id,
             consumer,
             lease_id: lease.lease_id,
         })?;
+    }
+    if let Some(semantic) = semantic {
+        semantic.finish()?;
     }
     let Response::TaskState(completed) = call(Request::InspectTask {
         task_id: prepared.task.task_id,
@@ -126,7 +139,7 @@ fn exercise(package: &std::path::Path) -> std::result::Result<(), String> {
     else {
         return Err("Expected completion state".into());
     };
-    if !completed.retired || completed.finished_consumers != 7 {
+    if !completed.retired || completed.finished_consumers != Consumer::ALL_MASK {
         return Err("Task did not complete".into());
     }
     let unregistered = development::user_root()

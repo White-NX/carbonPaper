@@ -824,7 +824,9 @@ impl StorageState {
         )
         .map_err(|error| format!("Failed to write derived embedding: {error}"))?;
         if let Some(receipt) = receipt {
-            Self::record_staged_receipt_on_conn(&tx, receipt)?;
+            if Self::record_staged_receipt_on_conn(&tx, receipt)? {
+                Self::enqueue_staged_semantic_completion_on_conn(&tx, receipt)?;
+            }
         }
         tx.commit()
             .map_err(|error| format!("Failed to commit derived embedding: {error}"))?;
@@ -2957,7 +2959,7 @@ pub(super) fn read_derived_data_epoch(
 /// Single definition of "query-visible": a completed ledger row whose model
 /// contract and fingerprint still match the stored vector. Every projection
 /// below shares it so the resident cache cannot drift from the SQL readers.
-const VISIBLE_EMBEDDING_SOURCE: &str = r#"
+pub(super) const VISIBLE_EMBEDDING_SOURCE: &str = r#"
         FROM derived_embeddings e
         INNER JOIN derived_index_jobs j
           ON j.index_kind = e.index_kind AND j.subject_key = e.subject_key

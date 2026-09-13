@@ -320,8 +320,7 @@ pub(crate) async fn mirror_staged_result(
     vector: Vec<f32>,
 ) {
     let indexed = staged_subject(id, input, text, vector);
-    let storage = app.state::<Arc<StorageState>>();
-    let _ = storage.enqueue_smart_cluster_pending(id);
+    // The staged embedding transaction already published Smart Cluster debt.
     mirror_to_chroma(app, &[indexed]).await;
 }
 

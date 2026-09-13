@@ -96,7 +96,7 @@ impl NativeBrokerFixture {
             .request(Request::PrepareTask {
                 dataset_id: self.dataset.clone(),
                 screenshot_id: 1,
-                consumers: 7,
+                consumers: Consumer::ALL_MASK,
                 payload_bytes: plaintext.len() as u64 + 28,
             })
             .await
@@ -161,7 +161,7 @@ async fn native_dpapi_keys_survive_ledger_reopen_and_finish_all_consumers() {
     let (task, ciphertext) = fixture.prepare(plaintext).await;
     fixture.reopen_ledger();
 
-    for consumer in [Consumer::Classification, Consumer::MiniLm, Consumer::Clip] {
+    for consumer in Consumer::ALL {
         let Response::Lease(lease) = fixture
             .request(Request::AcquireTask {
                 task_id: task.task_id.clone(),
@@ -199,7 +199,7 @@ async fn native_dpapi_keys_survive_ledger_reopen_and_finish_all_consumers() {
         panic!("expected task state");
     };
     assert!(state.retired);
-    assert_eq!(state.finished_consumers, 7);
+    assert_eq!(state.finished_consumers, Consumer::ALL_MASK);
     assert_eq!(
         fixture
             .request(Request::AcquireTask {
