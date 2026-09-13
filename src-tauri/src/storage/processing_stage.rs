@@ -289,8 +289,10 @@ impl StorageState {
         if receipt.consumer != carbonpaper_app_bound::protocol::Consumer::Classification {
             return Err("invalid staged consumer".into());
         }
+        // Classification returns a weighted score, which can exceed 1 after
+        // anchor and process-prior bonuses, rather than a probability.
         if category.is_some_and(|s| s.len() > 256)
-            || confidence.is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
+            || confidence.is_some_and(|v| !v.is_finite() || v < 0.0)
         {
             return Err("invalid classification result".into());
         }

@@ -424,6 +424,113 @@ fn category_and_receipt_commit_atomically_and_duplicate_callback_does_not_rewrit
 }
 
 #[test]
+fn weighted_classification_scores_complete_without_exhausting_retries() {
+    let mut fixture = fixture();
+    let (dir, storage, broker) = fixture.parts();
+    let stage = Connection::open(dir.join(STAGING_FILE)).unwrap();
+    for (id, score, failures) in [(1, 1.2196, 0), (2, 1.1574, 4)] {
+        insert_input(&storage, id, Consumer::Classification.bit());
+        for _ in 0..failures {
+            let work = storage
+                .processing_stage
+                .claim(&storage, Consumer::Classification)
+                .unwrap()
+                .unwrap();
+            storage
+                .processing_stage
+                .release(&work.receipt, true)
+                .unwrap();
+            // Exercise real failure accounting without sleeping through backoff.
+            stage
+                .execute(
+                    "UPDATE staged_work SET next_attempt=0 WHERE task_id=?1 AND consumer=1",
+                    [&work.receipt.task_id],
+                )
+                .unwrap();
+        }
+        let receipt = storage
+            .processing_stage
+            .claim(&storage, Consumer::Classification)
+            .unwrap()
+            .unwrap()
+            .receipt;
+        assert_eq!(receipt.screenshot_id, id);
+        assert!(storage
+            .commit_staged_category(&receipt, Some("Development"), Some(score))
+            .unwrap());
+        assert_eq!(
+            storage.pending_staged_receipts().unwrap(),
+            vec![receipt.clone()]
+        );
+        storage.processing_stage.finish(&storage, &receipt).unwrap();
+
+        let (status, attempts): (String, i64) = stage
+            .query_row(
+                "SELECT state,attempts FROM staged_work WHERE task_id=?1 AND consumer=1",
+                [&receipt.task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(attempts, failures);
+        let (stored_score, postprocess_status): (f64, String) = storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row(
+                "SELECT s.category_confidence,o.postprocess_status FROM screenshots s
+                 JOIN screenshot_ocr_status o ON o.screenshot_id=s.id WHERE s.id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_score, score);
+        assert_eq!(postprocess_status, "completed");
+        assert!(storage.pending_staged_receipts().unwrap().is_empty());
+        let Response::TaskState(state) = broker
+            .call(Request::InspectTask {
+                task_id: receipt.task_id,
+            })
+            .unwrap()
+        else {
+            panic!("expected task state");
+        };
+        assert_eq!(state.finished_consumers, Consumer::Classification.bit());
+        assert_eq!(state.abandoned_consumers, 0);
+    }
+}
+
+#[test]
+fn invalid_classification_scores_do_not_commit_or_consume_the_lease() {
+    let mut fixture = fixture();
+    let (_dir, storage, _broker) = fixture.parts();
+    insert_input(&storage, 1, Consumer::Classification.bit());
+    let receipt = storage
+        .processing_stage
+        .claim(&storage, Consumer::Classification)
+        .unwrap()
+        .unwrap()
+        .receipt;
+    for score in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(
+            storage
+                .commit_staged_category(&receipt, Some("Development"), Some(score))
+                .unwrap_err(),
+            "invalid classification result"
+        );
+        assert_eq!(category(&storage, 1), None);
+        assert!(storage.pending_staged_receipts().unwrap().is_empty());
+        storage.processing_stage.check_receipt(&receipt).unwrap();
+    }
+    storage
+        .commit_staged_category(&receipt, Some("Unclassified"), Some(0.0))
+        .unwrap();
+    storage.processing_stage.finish(&storage, &receipt).unwrap();
+}
+
+#[test]
 fn committed_result_recovers_an_expired_process_lease_without_reprocessing() {
     let mut fixture = fixture();
     let (dir, storage, broker) = fixture.parts();
@@ -524,6 +631,33 @@ fn exhausted_consumer_waits_for_unlock_while_other_consumers_keep_their_grants()
         })
         .unwrap();
     assert_eq!(state, "waiting_for_auth");
+    assert!(!storage
+        .processing_stage
+        .owns_screenshot(1, Consumer::Classification));
+    assert_eq!(storage.recover_incomplete_ocr_postprocess().unwrap(), 1);
+    assert_eq!(
+        storage.list_pending_ocr_postprocess_ids(10).unwrap(),
+        vec![1]
+    );
+
+    // The archive fallback has its own retry budget and can persist the same
+    // weighted score through the ordinary postprocess completion callbacks.
+    assert!(storage
+        .update_screenshot_category(1, "Development", Some(1.2196))
+        .unwrap());
+    storage
+        .set_ocr_postprocess_status(1, "completed", None)
+        .unwrap();
+    assert_eq!(category(&storage, 1).as_deref(), Some("Development"));
+    assert!(storage
+        .list_pending_ocr_postprocess_ids(10)
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .processing_stage
+        .claim(&storage, Consumer::Classification)
+        .unwrap()
+        .is_none());
     assert!(storage
         .processing_stage
         .claim(&storage, Consumer::MiniLm)
