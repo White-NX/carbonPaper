@@ -1302,22 +1302,15 @@ pub(crate) async fn dispatch_classification(app: &AppHandle) -> Result<(), Strin
     else {
         return Ok(());
     };
-    let request = serde_json::json!({
-        "command":"enqueue_ocr_postprocess","screenshot_id":work.receipt.screenshot_id,
-        "window_title":work.input.window_title,"process_name":work.input.process_name,
-        "ocr_text":work.input.ocr_text,"timestamp":work.input.timestamp_ms,"staged_receipt":work.receipt,
-    });
+    let receipt = work.receipt.clone();
     crate::background_activity::classification_started();
     tracing::debug!("[BACKGROUND] event=classification_dispatched source=staged");
-    let monitor = app.state::<crate::monitor::MonitorState>();
-    let accepted = crate::monitor::forward_command_to_python(&monitor, request)
-        .await
-        .ok()
-        .and_then(|value| value.get("postprocess_enqueued").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
+    let accepted = crate::classification::enqueue_staged(app, work).unwrap_or_else(|error| {
+        tracing::debug!("[CLASSIFICATION] staged dispatch deferred: {error}");
+        false
+    });
     if !accepted {
         crate::background_activity::classification_dispatch_rejected();
-        let receipt = work.receipt;
         tokio::task::spawn_blocking(move || storage.processing_stage.release(&receipt, false))
             .await
             .map_err(|e| e.to_string())??;

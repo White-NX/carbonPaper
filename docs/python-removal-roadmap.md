@@ -8,11 +8,11 @@ symbol names are the durable references; line numbers are intentionally omitted.
 
 - Repository: `D:\projects\carbonPaper\carbonPaper`
 - Branch: `feat/rust-task-vectors-classification`
-- Implementation baseline: `49f4761a8ca4e7a89f3745f22433b0f3fe2128c2`.
+- Implementation baseline: `693d45a` (task-vector synchronization).
 - Application manifest version: `0.8.5`; the repository also has a `v0.8.5` tag.
 - The earlier inference cleanup was committed as `62eb619`.
-- This page includes the task-vector synchronization changes in the working
-  tree following the baseline. Historical validation below belongs to its
+- This page includes the native classification changes committed alongside this
+  revision of the page, following the baseline. Historical validation below belongs to its
   recorded source snapshot and does not validate later changes.
 
 ## v0.8.4 Comparison
@@ -64,8 +64,9 @@ The following paths are implemented and scheduled by the Tauri/Rust backend:
   Chroma consumer reconciliation are owned by `task_vector_sync.rs`.
 - Chinese-CLIP image encoding, image retrieval, persistent ANN maintenance, and
   exact-search recovery in `clip_index.rs`, `clip_query.rs`, and `clip_ann.rs`.
-- BGE text embeddings exposed by `classification_runtime.rs`. Python calls this
-  authenticated Rust contract; Python does not run a second BGE encoder.
+- Category scoring, scoped anchors, correction learning and postprocessing in
+  `classification/`, with BGE embeddings from `classification_runtime.rs`.
+  Anchor migration and durable feedback are stored in `storage/classification.rs`.
 - Cross-encoder reranking in `rerank.rs` and the Smart Cluster scoring worker
   in `smart_cluster_scoring.rs`. The queue is drained by the Rust worker only.
 - Screenshot, OCR, vector, Smart Cluster, MCP, lifecycle, and index-health
@@ -80,9 +81,6 @@ Python fallback counter.
 Python remains a deliberately smaller service for live consumers that have not
 yet moved:
 
-- Anchor loading, learned-anchor persistence, category scoring, and OCR
-  post-processing orchestration in `monitor/classifier.py` and
-  `monitor/monitor/worker_process.py`.
 - HDBSCAN/PaCMAP task clustering in `monitor/task_clustering.py`, including the
   `task_vectors` hot layer and `task_centroids` cold layer. Rust produces new
   MiniLM vectors and sends them to the Python Chroma hot layer through the
@@ -95,7 +93,7 @@ yet moved:
   for an interrupted migration of the old Chroma `screenshots` collection.
 
 Python must not regain OCR, Chinese-CLIP inference, semantic retrieval,
-reranking, BGE inference, or Smart Cluster queue-write/drain ownership as a
+reranking, classification or BGE inference, or Smart Cluster queue-write/drain ownership as a
 side effect of a restart, missing model, or ordinary Rust error.
 
 ## Data and Migration Contracts
@@ -150,6 +148,36 @@ The Python consumer has no MiniLM encoder or historical backfill. Both Chroma
 collections disable embedding functions. Python's CPU ONNX dependency remains
 for Chroma; the environment installer repairs the overlapping DirectML wheel
 left by earlier versions. Native model runtime assets are independent.
+
+### Classification anchors and feedback
+
+`classification/scoring.rs` owns title/OCR blending, local/global anchor scopes,
+weighted cosine scores, browser-title cleanup, process priors, deduplication and
+negative feedback. Synthetic fixtures in `classification/fixtures/parity.json`
+record outputs from the retired classifier at `693d45a`, including its distinct
+production and diagnostic title-channel behavior.
+
+`load_classification_anchors` imports the data directory's `anchors.json` into
+the versioned `classification_anchors` SQLite row. Both legacy string entries and
+structured entries are accepted; scope, process, source, weight, date and extra
+metadata are retained. Invalid input leaves the source file and database import
+state unchanged. The original file is retained, and later loads use SQLite.
+
+A user category update writes a `classification_feedback` intent in the same
+transaction. The intent holds screenshot/category references and a source
+revision. Native learning reads the archive only with silent-read authorization,
+then commits changed anchors and removes the intent together. Inference errors
+retain the intent with bounded retries. Old database generations, anchor revisions
+and changed screenshot sources cannot commit stale learning results.
+
+The native queue admits up to eight capture/staged jobs. Ordinary work uses
+`postprocess_lease` plus source and user-correction revisions; staged work retains
+the broker receipt and transactional completion contract. Queue backpressure and
+foreground scheduling deferrals preserve the retry budget. A classification or
+feedback operation shares a two-minute embedding deadline across its requests.
+Classification runs during user activity and yields to foreground model work.
+The Python classification worker, BGE reverse-IPC bridge and category/staged-result
+callback commands have been removed.
 
 ### Historical Smart Cluster thresholds
 
@@ -240,14 +268,30 @@ collection replacement, stale database rejection, old date ranges, background
 authorization and absence of the Python encoder. Release packaging and a real
 legacy-data migration were not rerun for this batch.
 
+### Native classification validation: 2026-09-14
+
+Source: the native classification change following `693d45a`, recorded with this
+revision of the page. Rust formatting and `cargo check` passed. Rust library
+tests passed (658 passed, 1 ignored), including 40 frozen classification cases,
+three feedback sequences, anchor import, transactional feedback, result leases,
+user-correction precedence and staged completion. The Python suite passed
+(132 tests), frontend tests passed (43 files, 305 tests), and i18n validation,
+the production frontend build and security guards passed.
+
+`npm run test:app-bound` passed 39 Rust tests and nine packaging/signature tests;
+the administrator-only service-repair test remained ignored. A disposable Chroma
+1.5.1 database verified compatibility with an existing default-embedding
+collection, partial repair, replay, collection replacement and stale-target
+rejection. Classification parity uses synthetic embeddings. A full signed
+release build and end-to-end classification against existing user archives were
+not run for these changes.
+
 ## Later Milestones
 
 The following work is intentionally not part of the v0.8.5 Beta cleanup:
 
 - Move task clustering's HDBSCAN/PaCMAP orchestration and its Chroma hot/cold
   consumer only after a replacement consumer and data migration are accepted.
-- Keep the Python classification orchestration until category anchors,
-  feedback, persistence, and user-visible behavior have a Rust owner.
 - Keep Presidio/spaCy until the MCP PII contract has a replacement with the same
   language/model behavior and an explicit resource policy.
 - After those consumers are gone, remove the Python monitor process, its named
@@ -270,7 +314,8 @@ The current implementation is backed by these source areas:
 | Semantic indexing and query | `src-tauri/src/semantic_query.rs`, `src-tauri/src/minilm_index.rs`, `src-tauri/src/semantic_runtime.rs` |
 | CLIP indexing, ANN, and migration | `src-tauri/src/clip_index.rs`, `src-tauri/src/clip_ann.rs`, `src-tauri/src/clip_migration.rs`, `src-tauri/src/clip_query.rs` |
 | Rerank and Smart Cluster scoring | `src-tauri/src/rerank.rs`, `src-tauri/src/smart_cluster_scoring.rs`, `src-tauri/src/commands/smart_cluster.rs` |
-| Python retained service | `monitor/monitor/__init__.py`, `monitor/monitor/worker_process.py`, `monitor/classifier.py`, `monitor/task_clustering.py` |
+| Native classification | `src-tauri/src/classification/`, `src-tauri/src/storage/classification.rs`, `src-tauri/src/classification_runtime.rs` |
+| Python retained service | `monitor/monitor/__init__.py`, `monitor/task_clustering.py`, `monitor/monitor/presidio_service.py` |
 | Legacy export and task-vector IPC | `monitor/legacy_clip_export.py`, `monitor/monitor/clustering_commands.py`, `monitor/storage_client.py`, `monitor/tests/test_legacy_clip_export.py` |
 | Frontend status and controls | `src/components/settings/advanced/InferenceCards.jsx`, `src/components/settings/useAdvancedSectionController.js`, `src/lib/monitor_api.js` |
 | Security and contract tests | `scripts/security-guards.cjs`, `monitor/tests/`, `src/lib/api_contracts.test.js`, Rust module tests |
@@ -280,3 +325,4 @@ The current implementation is backed by these source areas:
 | Date | Source | Maintenance |
 | --- | --- | --- |
 | 2026-08-20 | `24a09f3` plus the dirty branch working tree | Rebased the roadmap on the passed v0.8.4 gates, documented the v0.8.5 Beta ownership boundary, recorded the successful Rust, Python, frontend, security, and release-build checks, and limited the migration claim to the automated contracts that were actually run. |
+| 2026-09-14 | `693d45a` plus the native classification change committed with this page | Recorded Rust task-vector reconciliation, native classification and feedback ownership, retained Python consumers, and the validation for both batches. |

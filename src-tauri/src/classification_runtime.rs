@@ -1,8 +1,7 @@
 //! BGE classification inference and its diagnostic.
 //!
-//! Classification orchestration and learned anchors remain in the Python
-//! post-process worker for now. The expensive text embedding call is served by
-//! the shared Rust semantic worker by default, over authenticated reverse IPC.
+//! Native classification and learned anchors call the shared Rust semantic
+//! worker directly. Python has no classification contract.
 
 use crate::ml_protocol::{
     MlSemanticModel, MAX_SEMANTIC_BATCH, MAX_SEMANTIC_TEXT_BYTES, MAX_SEMANTIC_TEXT_ITEM_BYTES,
@@ -87,6 +86,10 @@ fn record_rust_failure(error: &str, elapsed_ms: f64) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     inner.record_rust_failure(error, elapsed_ms);
+}
+
+pub(crate) fn record_pipeline_error(error: &str) {
+    record_rust_failure(error, 0.0);
 }
 
 fn truncate_error(error: &str) -> String {

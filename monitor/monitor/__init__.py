@@ -33,8 +33,6 @@ logger = logging.getLogger(__name__)
 AUTH_STATUS_CACHE_INTERVAL_SECS = 2.0
 
 _server = None
-_model_worker = None        # Classification/postprocess worker proxy
-_classifier = None           # ClassificationService instance
 _clip_exporter = None        # Read-only legacy Chroma exporter
 _clustering_manager = None   # HotColdManager instance
 _clustering_scheduler = None # compatibility facade; no background timer
@@ -189,21 +187,15 @@ def _handle_command_impl(req: dict):
     # ----- Lifecycle commands -----
     if cmd == 'pause':
         paused_event.set()
-        if _model_worker:
-            _model_worker.pause()
         return {'status': 'paused'}
 
     if cmd in ('resume', 'continue'):
         paused_event.clear()
-        if _model_worker:
-            _model_worker.resume()
         return {'status': 'resumed'}
 
     if cmd == 'stop':
         stop_event.set()
         paused_event.clear()
-        if _model_worker:
-            _model_worker.stop()
         return {'status': 'stopped'}
 
     if cmd == 'status':
@@ -214,8 +206,6 @@ def _handle_command_impl(req: dict):
             'clustering_auth_unlocked': _cached_clustering_session_valid(),
             'clustering_scheduler_active': _clustering_scheduler_active,
         }
-        if _model_worker:
-            status['postprocess_stats'] = _model_worker.get_stats()
         return status
 
     # ----- Configuration commands -----
@@ -243,153 +233,9 @@ def _handle_command_impl(req: dict):
         }
 
     if cmd == 'update_feature_config':
-        clustering_enabled = req.get('clustering_enabled', True)
-        classification_enabled = req.get('classification_enabled', True)
-        update_feature_config(clustering_enabled, classification_enabled)
-        # The classification worker snapshots its feature config from the
-        # environment at startup; forward the change so jobs it dequeues from
-        # here on honour the new setting without an app restart.
-        worker_result = None
-        if _model_worker is not None and hasattr(_model_worker, 'update_feature_config'):
-            try:
-                worker_result = _model_worker.update_feature_config(
-                    clustering_enabled, classification_enabled
-                )
-            except Exception as exc:
-                logger.warning('Feature-config sync to model worker failed: %s', exc)
-                worker_result = {'status': 'deferred', 'error': str(exc)}
-        return {
-            'status': 'success',
-            'clustering_enabled': clustering_enabled,
-            'classification_enabled': classification_enabled,
-            'worker_sync': worker_result,
-        }
-
-    if cmd == 'enqueue_ocr_postprocess':
-        screenshot_id = req.get('screenshot_id')
-        if screenshot_id is None:
-            return {'error': 'screenshot_id is required'}
-        if not _model_worker or not hasattr(_model_worker, 'request'):
-            return {'error': 'Classification postprocess service is not initialised'}
-        timeout_secs = int(req.get('timeout_secs', 120) or 120)
-        try:
-            # Sensitive-content filtering and classification only. The semantic
-            # index used to be fed from here too, by handing the same payload to
-            # the clustering ingest queue; M2.5 step 5 moved that to the Rust
-            # capture path, which enqueues the screenshot the moment its OCR row
-            # commits and encodes it while the machine is idle.
-            return _model_worker.request(
-                'enqueue_ocr_postprocess',
-                {'request': req},
-                timeout=max(30, min(600, timeout_secs)),
-            )
-        except Exception as e:
-            logger.error(
-                '[DIAG:enqueue_ocr_postprocess] failed screenshot_id=%s error=%s',
-                screenshot_id,
-                e,
-                exc_info=True,
-            )
-            return {'error': str(e)}
-
-    # ----- Classification commands -----
-    if cmd == 'classify':
-        title = req.get('title', '')
-        ocr_text = req.get('ocr_text', '')
-        process_name = req.get('process_name', '')
-        if not _classifier or not hasattr(_classifier, 'classify'):
-            return {'error': 'Classification service not initialised'}
-        try:
-            category, confidence = _classifier.classify(
-                title=title,
-                ocr_text=ocr_text,
-                process_name=process_name,
-            )
-            return {
-                'status': 'success',
-                'category': category,
-                'category_confidence': round(confidence, 4),
-            }
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'classify_debug':
-        title = req.get('title', '')
-        ocr_text = req.get('ocr_text', '')
-        process_name = req.get('process_name', '')
-        if not _classifier:
-            return {'error': 'Classification service not initialised'}
-        try:
-            debug = _classifier.classify_debug(
-                title=title,
-                ocr_text=ocr_text,
-                process_name=process_name,
-            )
-            return {'status': 'success', **debug}
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'add_anchor':
-        category = req.get('category', '')
-        title = req.get('title', '')
-        ocr_text = req.get('ocr_text', '')
-        old_category = req.get('old_category')  # None or string
-        process_name = req.get('process_name', '')
-        if not _classifier:
-            return {'error': 'Classification service not initialised'}
-        if not category or not title:
-            return {'error': 'category and title are required'}
-        try:
-            result = _classifier.add_anchor(
-                category=category,
-                title=title,
-                ocr_text=ocr_text,
-                old_category=old_category,
-                process_name=process_name,
-            )
-            return {'status': 'success', **result}
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'remove_anchor':
-        category = req.get('category', '')
-        title = req.get('title', '')
-        if not _classifier:
-            return {'error': 'Classification service not initialised'}
-        try:
-            removed = _classifier.remove_anchor(category, title)
-            return {'status': 'success', 'removed': removed}
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'remove_local_anchors_by_process':
-        category = req.get('category', '')
-        process_name = req.get('process_name', '')
-        if not _classifier:
-            return {'error': 'Classification service not initialised'}
-        if not category or not process_name:
-            return {'error': 'category and process_name are required'}
-        try:
-            removed_count = _classifier.remove_local_anchors_by_process(category, process_name)
-            return {'status': 'success', 'removed_count': removed_count}
-        except Exception as e:
-            return {'error': str(e)}
-
-    if cmd == 'get_categories':
-        if not _classifier:
-            return {'error': 'Classification service not initialised'}
-        return {
-            'status': 'success',
-            'categories': _classifier.get_categories(),
-        }
-
-    if cmd == 'get_anchors':
-        if not _classifier:
-            return {'error': 'Classification service not initialised'}
-        return {
-            'status': 'success',
-            'anchors': _classifier.get_anchors(),
-        }
+        clustering_enabled = bool(req.get('clustering_enabled', True))
+        update_feature_config(clustering_enabled)
+        return {'status': 'success', 'clustering_enabled': clustering_enabled}
 
     # ----- Presidio PII detection commands -----
     if cmd == 'presidio_analyze':
@@ -522,7 +368,7 @@ def _handle_command_impl(req: dict):
 # ---------------------------------------------------------------------------
 
 def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: str = None):
-    """Start the IPC server and initialise classification/postprocess services.
+    """Start the IPC server and initialise the remaining clustering/export services.
 
     Args:
         _debug: Debug mode flag.
@@ -530,7 +376,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         auth_token: Authentication token for IPC validation.
         storage_pipe: Storage service pipe name (Rust reverse IPC).
     """
-    global _server, _model_worker, _classifier, _clip_exporter, _storage_pipe, _clustering_manager, _clustering_scheduler, _clustering_scheduler_active, _auth_token, _last_seq_no, _last_clustering_auth_check, _last_clustering_session_valid
+    global _server, _clip_exporter, _storage_pipe, _clustering_manager, _clustering_scheduler, _clustering_scheduler_active, _auth_token, _last_seq_no, _last_clustering_auth_check, _last_clustering_session_valid
 
     _auth_token = auth_token
     with _seq_lock:
@@ -573,26 +419,11 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         logger.error("Failed to initialize shared ChromaDB client: %s", e)
         shared_chroma_client = None
 
-    from .worker_process import RestartableModelWorker
-
     try:
         _clip_exporter = LegacyClipVectorExporter(shared_chroma_client)
     except Exception as exc:
         logger.warning('Legacy CLIP export unavailable (non-fatal): %s', exc)
         _clip_exporter = None
-
-    worker_env = {
-        'CARBONPAPER_CLUSTERING_ENABLED': str(config.CLUSTERING_ENABLED),
-        'CARBONPAPER_CLASSIFICATION_ENABLED': str(config.CLASSIFICATION_ENABLED),
-        'CARBONPAPER_CLUSTERING_ALLOW_FULL_LOW_MEMORY': str(config.CLUSTERING_ALLOW_FULL_LOW_MEMORY),
-    }
-    _model_worker = RestartableModelWorker(
-        storage_pipe=storage_pipe,
-        data_dir=get_data_dir(),
-        env=worker_env,
-    )
-    _classifier = _model_worker
-    logger.info('Restartable model worker proxy initialised')
 
     # Initialise task clustering service (MiniLM + HDBSCAN). Rust owns all
     # periodic scheduling; Python only executes an explicit IPC request.
@@ -618,25 +449,20 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         _clustering_scheduler = None
 
     # Screenshot capture, OCR, semantic/CLIP inference, and Smart Cluster
-    # scoring are handled by Rust. Python provides classification orchestration,
+    # scoring and category classification are handled by Rust. Python provides
     # task clustering, Presidio, and legacy read-only migration export.
 
     return _server
 
 
 def stop():
-    """Shut down classification/postprocess services and the IPC server."""
+    """Shut down the Presidio worker and IPC server."""
     stop_event.set()
     try:
         from .presidio_worker import get_presidio_worker
         get_presidio_worker().stop()
     except Exception:
         pass
-    if _model_worker:
-        try:
-            _model_worker.stop()
-        except Exception:
-            pass
     if _server:
         try:
             _server.shutdown()

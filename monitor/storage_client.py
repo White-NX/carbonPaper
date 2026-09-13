@@ -77,15 +77,9 @@ READ_RETRY_COMMANDS = {
     'list_screenshots_for_clustering',
     'get_idle_state',
     'get_auth_status',
-    'bge_embed_texts',
 }
 
-IDEMPOTENT_RETRY_COMMANDS = {
-    'complete_staged_postprocess',
-    'update_screenshot_category',
-    'set_ocr_postprocess_status',
-    'record_ocr_postprocess_retry',
-}
+IDEMPOTENT_RETRY_COMMANDS = set()
 
 SAFE_RETRY_AFTER_SEND_COMMANDS = READ_RETRY_COMMANDS | IDEMPOTENT_RETRY_COMMANDS
 
@@ -730,38 +724,6 @@ class StorageClient:
             'limit': limit,
         })
 
-    def update_screenshot_category(
-        self,
-        screenshot_id: int,
-        category: str,
-        category_confidence: Optional[float] = None,
-    ) -> bool:
-        """Update a screenshot category after asynchronous classification."""
-        request = {
-            'command': 'update_screenshot_category',
-            'screenshot_id': int(screenshot_id),
-            'category': category,
-        }
-        if category_confidence is not None:
-            request['category_confidence'] = float(category_confidence)
-        response = self._send_request(request)
-        return response.get('status') == 'success'
-
-    def embed_bge_texts(self, texts: List[str]) -> Dict[str, Any]:
-        """Run BGE text embedding in the shared Rust semantic worker."""
-        response = self._send_request(
-            {
-                'command': 'bge_embed_texts',
-                'texts': [str(text) for text in texts],
-            },
-            timeout=150,
-        )
-        if response.get('status') == 'success':
-            data = response.get('data')
-            if isinstance(data, dict):
-                return data
-        raise RuntimeError(response.get('error', 'Rust BGE inference failed'))
-
     def get_idle_state(self) -> Dict[str, Any]:
         """Read the current system idle state from Rust.
 
@@ -789,44 +751,6 @@ class StorageClient:
         if response.get('status') == 'success':
             return bool(response.get('data', {}).get('background_authorized', False))
         return False
-
-    def complete_staged_postprocess(self, receipt: Dict[str, Any], category=None, confidence=None) -> None:
-        """Commit a single leased classification result through its Rust fence."""
-        response = self._send_request({
-            'command': 'complete_staged_postprocess', 'receipt': receipt,
-            'category': category, 'confidence': confidence,
-        })
-        if response.get('status') != 'success':
-            raise RuntimeError('Staged classification result was not accepted')
-
-    def defer_staged_postprocess(self, receipt: Dict[str, Any], failed: bool = False) -> None:
-        response = self._send_request({
-            'command': 'defer_staged_postprocess', 'receipt': receipt, 'failed': bool(failed),
-        })
-        if response.get('status') != 'success':
-            raise RuntimeError('Staged classification lease is no longer active')
-
-    def set_ocr_postprocess_status(
-        self,
-        screenshot_id: int,
-        status: str,
-        error: Optional[str] = None,
-    ) -> bool:
-        response = self._send_request({
-            'command': 'set_ocr_postprocess_status',
-            'screenshot_id': int(screenshot_id),
-            'status': status,
-            'error': error,
-        })
-        return response.get('status') == 'success'
-
-    def record_ocr_postprocess_retry(self, screenshot_id: int, error: str) -> bool:
-        response = self._send_request({
-            'command': 'record_ocr_postprocess_retry',
-            'screenshot_id': int(screenshot_id),
-            'error': str(error or 'OCR postprocess failed'),
-        })
-        return response.get('status') == 'success'
 
 # Global storage client instance
 _storage_client: Optional[StorageClient] = None

@@ -517,6 +517,45 @@ fn weighted_classification_scores_complete_without_exhausting_retries() {
 }
 
 #[test]
+fn native_staged_classification_keeps_a_newer_user_correction() {
+    let mut fixture = fixture();
+    let (_, storage, _) = fixture.parts();
+    insert_input(storage, 1, Consumer::Classification.bit());
+    let work = storage
+        .processing_stage
+        .claim(storage, Consumer::Classification)
+        .unwrap()
+        .unwrap();
+    let user_revision = storage.classification_user_revision(1).unwrap();
+    storage
+        .update_category_with_feedback(1, "User choice")
+        .unwrap();
+    assert!(storage
+        .commit_staged_category_if_user_unchanged(
+            &work.receipt,
+            Some("Automatic"),
+            Some(1.3),
+            Some(user_revision)
+        )
+        .unwrap());
+    let category: String = storage
+        .db
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .query_row("SELECT category FROM screenshots WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(category, "User choice");
+    storage
+        .processing_stage
+        .finish(storage, &work.receipt)
+        .unwrap();
+}
+
+#[test]
 fn invalid_classification_scores_do_not_commit_or_consume_the_lease() {
     let mut fixture = fixture();
     let (_dir, storage, _broker) = fixture.parts();

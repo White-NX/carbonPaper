@@ -2141,19 +2141,10 @@ pub(crate) async fn process_ocr_inner(
     )
     .await
     {
-        Ok(true) => {
-            if let Err(error) = storage.set_ocr_postprocess_status(screenshot_id, "queued", None) {
-                tracing::warn!(
-                    "OCR postprocess was queued but status update failed screenshot_id={}: {}",
-                    screenshot_id,
-                    error
-                );
-            }
-        }
+        Ok(true) => {}
         Ok(false) => {
-            let error = "Postprocess queue is full";
-            let _ = storage.record_ocr_postprocess_retry(screenshot_id, error);
-            tracing::warn!("[ML:POSTPROCESS] {} screenshot_id={}", error, screenshot_id);
+            // The durable pending row will be retried; backpressure is not an
+            // inference failure and must not spend its retry budget.
         }
         Err(error) => {
             let _ = storage.record_ocr_postprocess_retry(screenshot_id, &error);
@@ -2211,36 +2202,22 @@ fn convert_ml_ocr_blocks(
 pub(crate) async fn enqueue_ocr_postprocess(
     app: &tauri::AppHandle,
     screenshot_id: i64,
-    image_hash: &str,
+    _image_hash: &str,
     window_title: &str,
     process_name: &str,
-    timestamp_ms: i64,
+    _timestamp_ms: i64,
     ocr_results: &[OcrResultInput],
 ) -> Result<bool, String> {
-    let monitor_state = app.state::<MonitorState>();
-    let ocr_text = ocr_results
-        .iter()
-        .map(|result| result.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let payload = serde_json::json!({
-        "command": "enqueue_ocr_postprocess",
-        "screenshot_id": screenshot_id,
-        "image_hash": image_hash,
-        "window_title": window_title,
-        "process_name": process_name,
-        "timestamp": timestamp_ms,
-        "ocr_text": ocr_text,
-        "rust_provider_active": true,
-    });
-    let response = crate::monitor::forward_command_to_python(&monitor_state, payload).await?;
-    if let Some(error) = response.get("error").and_then(|value| value.as_str()) {
-        return Err(error.to_string());
-    }
-    Ok(response
-        .get("postprocess_enqueued")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false))
+    let input = crate::classification::scoring::Input {
+        title: window_title.to_string(),
+        process_name: process_name.to_string(),
+        ocr_text: ocr_results
+            .iter()
+            .map(|result| result.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    crate::classification::enqueue_capture(app, screenshot_id, input)
 }
 
 // ==================== Utility ====================

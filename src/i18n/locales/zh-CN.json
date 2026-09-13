@@ -142,7 +142,7 @@
       },
       "monitor": {
         "title": "Python 子服务",
-        "tooltip": "Python 子服务负责截图编排，以及仍保留的分类、任务聚类和隐私分析流程。关闭后 Rust 仍负责 OCR、向量索引和搜索。",
+        "tooltip": "用于任务整理和隐私检测。",
         "status": "状态：{{status}}",
         "status_label": "状态：",
         "description": "控制后台的 Python 子服务。",
@@ -405,7 +405,7 @@
       "classification_backend": {
         "title": "截图内容自动分类",
         "label": "Rust BGE 分类推理",
-        "description": "Rust 提供 BGE-small-zh 嵌入，Python 保留分类编排和锚点学习。",
+        "description": "根据窗口标题、文字内容和你的纠正记录进行分类。",
         "successes": "Rust 成功次数",
         "failures": "Rust 失败次数",
         "last_elapsed": "最近一次推理",

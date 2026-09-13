@@ -425,11 +425,22 @@ impl StorageState {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_staged_category(
         &self,
         receipt: &TaskReceipt,
         category: Option<&str>,
         confidence: Option<f64>,
+    ) -> Result<bool, String> {
+        self.commit_staged_category_if_user_unchanged(receipt, category, confidence, None)
+    }
+
+    pub(crate) fn commit_staged_category_if_user_unchanged(
+        &self,
+        receipt: &TaskReceipt,
+        category: Option<&str>,
+        confidence: Option<f64>,
+        user_revision: Option<i64>,
     ) -> Result<bool, String> {
         if receipt.consumer != carbonpaper_app_bound::protocol::Consumer::Classification {
             return Err("invalid staged consumer".into());
@@ -470,6 +481,13 @@ impl StorageState {
         if already_committed {
             return Ok(false);
         }
+        let current_user_revision: i64 = tx.query_row(
+            "SELECT COALESCE((SELECT revision FROM classification_user_revisions WHERE screenshot_id=?1),0)",
+            [receipt.screenshot_id], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        let category = category.filter(|_| {
+            user_revision.is_none_or(|expected| expected == 0 && expected == current_user_revision)
+        });
         if let Some(category) = category {
             tx.execute("UPDATE screenshots SET category=?2,category_confidence=?3 WHERE id=?1 AND is_deleted=0",params![receipt.screenshot_id,category,confidence]).map_err(|e|e.to_string())?;
         }

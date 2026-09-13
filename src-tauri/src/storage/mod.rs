@@ -6,6 +6,7 @@
 //! 3. OCR data storage and search
 
 mod background_scheduler;
+mod classification;
 mod connection;
 pub(crate) mod database_snapshot;
 mod derived_index;
@@ -32,6 +33,7 @@ mod types;
 pub(crate) mod wire_time;
 
 pub use background_scheduler::BackgroundTaskState;
+pub(crate) use classification::{ClassificationFeedback, ClassificationLease};
 #[allow(unused_imports)]
 pub use derived_index::*;
 #[allow(unused_imports)]

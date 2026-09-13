@@ -683,13 +683,14 @@ pub async fn monitor_update_feature_config(
     clustering_enabled: bool,
     classification_enabled: bool,
 ) -> Result<Value, String> {
+    crate::commands::check_auth_required(&credential_state)?;
+    crate::registry_config::set_bool("classification_enabled", classification_enabled)?;
     authenticated_monitor_command(
         &credential_state,
         &state,
         serde_json::json!({
             "command": "update_feature_config",
             "clustering_enabled": clustering_enabled,
-            "classification_enabled": classification_enabled,
         }),
     )
     .await
@@ -969,42 +970,36 @@ pub async fn monitor_presidio_set_language(
 
 #[tauri::command]
 pub async fn monitor_classify_debug(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     title: Option<String>,
     ocr_text: Option<String>,
     process_name: Option<String>,
 ) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({
-            "command": "classify_debug",
-            "title": title.unwrap_or_default(),
-            "ocr_text": ocr_text.unwrap_or_default(),
-            "process_name": process_name.unwrap_or_default(),
-        }),
+    crate::commands::check_auth_required(&credential_state)?;
+    let result = crate::classification::debug(
+        &app,
+        crate::classification::scoring::Input {
+            title: title.unwrap_or_default(),
+            ocr_text: ocr_text.unwrap_or_default(),
+            process_name: process_name.unwrap_or_default(),
+        },
     )
-    .await
+    .await?;
+    crate::commands::check_auth_required(&credential_state)?;
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn monitor_remove_local_anchors_by_process(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     category: String,
     process_name: String,
 ) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({
-            "command": "remove_local_anchors_by_process",
-            "category": category,
-            "process_name": process_name,
-        }),
-    )
-    .await
+    crate::commands::check_auth_required(&credential_state)?;
+    let removed = crate::classification::remove_local(&app, &category, &process_name).await?;
+    Ok(serde_json::json!({"status":"success","removed_count":removed}))
 }
 
 // 内部函数：发送仅包含 command 的 IPC 命令 (兼容旧接口)
@@ -1529,12 +1524,6 @@ pub async fn start_monitor_impl(
             .env(
                 "CARBONPAPER_CLUSTERING_ENABLED",
                 crate::registry_config::get_bool("clustering_enabled")
-                    .unwrap_or(true)
-                    .to_string(),
-            )
-            .env(
-                "CARBONPAPER_CLASSIFICATION_ENABLED",
-                crate::registry_config::get_bool("classification_enabled")
                     .unwrap_or(true)
                     .to_string(),
             )

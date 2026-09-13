@@ -1234,6 +1234,9 @@ impl StorageState {
         )
         .map_err(|e| format!("Failed to create task vector synchronization state: {e}"))?;
 
+        self.init_classification_schema(conn)?;
+        Self::add_column_if_missing(conn, "screenshot_ocr_status", "postprocess_lease", "TEXT")?;
+
         // Task clustering tables
         Self::create_table_if_missing(
             conn,
