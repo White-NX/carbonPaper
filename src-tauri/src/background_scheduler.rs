@@ -19,6 +19,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 use tokio::sync::Notify;
 
+mod adaptive;
+use crate::background_policy::{
+    self, ExecutionProfile, PauseStatistics, Qualification, SchedulingMode,
+};
+use adaptive::AdaptiveRuntime;
+
 pub const TASK_SEMANTIC_INDEX: &str = "semantic_index";
 pub const TASK_CLIP_INDEX: &str = "clip_index";
 pub const TASK_SMART_CLUSTER: &str = "smart_cluster";
@@ -330,9 +336,16 @@ pub struct BackgroundSchedulerStatus {
     pub manual_retry_at_ms: Option<i64>,
     pub worker_restart_count: u64,
     pub monitor_restart_degraded: bool,
+    pub execution_profile: ExecutionProfile,
+    pub scheduling_mode: SchedulingMode,
+    pub qualifications: Vec<Qualification>,
+    pub task_background_eligible: std::collections::BTreeMap<String, bool>,
+    pub backlog_age_ms: std::collections::BTreeMap<String, i64>,
+    pub pauses: PauseStatistics,
 }
 
 struct SchedulerRuntime {
+    adaptive: AdaptiveRuntime,
     stop: AtomicBool,
     wake: Notify,
     task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -352,6 +365,7 @@ struct SchedulerRuntime {
 impl Default for SchedulerRuntime {
     fn default() -> Self {
         Self {
+            adaptive: AdaptiveRuntime::default(),
             stop: AtomicBool::new(false),
             wake: Notify::new(),
             task: Mutex::new(None),
@@ -431,6 +445,7 @@ impl BackgroundSchedulerState {
             }
         }
         let runtime = self.runtime.clone();
+        AdaptiveRuntime::start(runtime.clone(), app.clone());
         *task = Some(tauri::async_runtime::spawn(async move {
             scheduler_loop(app, runtime).await;
         }));
@@ -438,6 +453,7 @@ impl BackgroundSchedulerState {
 
     pub fn stop(&self) {
         self.runtime.stop.store(true, Ordering::SeqCst);
+        self.runtime.adaptive.cancel_active("shutdown");
         self.runtime.wake.notify_waiters();
         if let Some(handle) = self
             .runtime
@@ -548,6 +564,16 @@ impl BackgroundSchedulerState {
             enabled,
             running_task,
             running_manual: self.runtime.running_manual.load(Ordering::Relaxed),
+            backlog_age_ms: tasks
+                .iter()
+                .filter(|task| task.status != "completed")
+                .map(|task| {
+                    (
+                        task.task_kind.clone(),
+                        now_ms().saturating_sub(task.ready_since_ms).max(0),
+                    )
+                })
+                .collect(),
             tasks,
             queue_depths: depths,
             blocked_reason,
@@ -558,6 +584,20 @@ impl BackgroundSchedulerState {
                 .runtime
                 .monitor_restart_degraded
                 .load(Ordering::Relaxed),
+            execution_profile: self
+                .runtime
+                .adaptive
+                .profile(self.runtime.running_manual.load(Ordering::Relaxed)),
+            scheduling_mode: adaptive::configured_mode(),
+            qualifications: self.qualifications(),
+            task_background_eligible: self.qualification_summary(),
+            pauses: self
+                .runtime
+                .adaptive
+                .pauses
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         }
     }
 }
@@ -678,8 +718,27 @@ pub(crate) fn gate_reason_for_kind(
     manual: bool,
     kind: BackgroundTaskKind,
 ) -> Option<&'static str> {
+    if let Some(lease) = background_policy::current_execution() {
+        if lease.task == kind.as_str() {
+            return lease.reason();
+        }
+    }
     if !manual {
         let storage = app.state::<Arc<StorageState>>();
+        let staged = storage.background_processing_enabled()
+            && crate::processing_stage::ready_for_kind(&storage, kind);
+        if let Some(scheduler) = app.try_state::<Arc<BackgroundSchedulerState>>() {
+            // Staging authorization is scoped again by the broker at claim and
+            // commit. Only its ready work can use this admission exception.
+            let reason = scheduler
+                .runtime
+                .adaptive
+                .admission(app, kind, staged)
+                .err();
+            if reason != Some("waiting_for_unlock") || kind != BackgroundTaskKind::SmartCluster {
+                return reason;
+            }
+        }
         if storage.background_processing_enabled()
             && crate::processing_stage::ready_for_kind(&storage, kind)
         {
@@ -708,6 +767,8 @@ pub(crate) fn gate_reason_for_kind(
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnvironmentPolicy {
     IdleOnly,
+    /// Resumable work admitted through a profile-specific scheduler lease.
+    Automatic,
     /// Capture postprocessing and explicit requests may run during user activity,
     /// while still yielding to maintenance and foreground semantic queries.
     Immediate,
@@ -723,14 +784,17 @@ impl EnvironmentPolicy {
         if maintenance_active {
             return Some("maintenance");
         }
-        if self == Self::IdleOnly {
+        if self != Self::Immediate {
             if !idle.ac_connected.load(Ordering::Relaxed) {
                 return Some("waiting_for_ac_power");
             }
             if idle.fullscreen_exclusive.load(Ordering::Relaxed) {
                 return Some("waiting_for_fullscreen");
             }
-            if !idle.is_idle.load(Ordering::Relaxed) {
+            if (self == Self::IdleOnly && !idle.is_idle.load(Ordering::Relaxed))
+                || (self == Self::Automatic
+                    && idle.idle_secs.load(Ordering::Relaxed) < background_policy::SHORT_IDLE_SECS)
+            {
                 return Some("waiting_for_idle");
             }
         }
@@ -745,6 +809,17 @@ pub(crate) fn environment_gate_reason(
     app: &AppHandle,
     policy: EnvironmentPolicy,
 ) -> Option<&'static str> {
+    if policy == EnvironmentPolicy::Automatic {
+        if let Some(lease) = background_policy::current_execution() {
+            return lease.reason().or_else(|| {
+                EnvironmentPolicy::Immediate.gate_reason(
+                    crate::maintenance::is_active(),
+                    &app.state::<Arc<IdleState>>(),
+                    &app.state::<Arc<SemanticRuntimeState>>(),
+                )
+            });
+        }
+    }
     policy.gate_reason(
         crate::maintenance::is_active(),
         &app.state::<Arc<IdleState>>(),
@@ -1056,6 +1131,12 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
             }
         };
         let now = now_ms();
+        runtime.adaptive.pending.store(
+            tasks
+                .iter()
+                .any(|t| matches!(t.status.as_str(), "queued" | "running" | "retry_wait")),
+            Ordering::Relaxed,
+        );
         let selected =
             select_next_runnable_task(&tasks, now, AUTO_AGING_LIMIT.as_millis() as i64, |task| {
                 BackgroundTaskKind::parse(&task.task_kind).is_some_and(|kind| {
@@ -1168,7 +1249,53 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                         manual_generation_at_scan,
                     )
                 });
-        let result = execute_slice(&app, kind, manual, &runtime, automatic_context.as_ref()).await;
+        let lease = if manual {
+            None
+        } else {
+            match runtime.adaptive.begin(
+                &app,
+                kind,
+                source == WorkSource::Staged,
+                manual_generation_at_scan,
+            ) {
+                Ok(lease) => Some(lease),
+                Err(reason) => {
+                    let _ = storage.defer_background_task(
+                        kind.as_str(),
+                        now_ms().saturating_add(250),
+                        reason,
+                    );
+                    background_activity::index_finish();
+                    *runtime
+                        .running_task
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = None;
+                    continue;
+                }
+            }
+        };
+        let execution = execute_slice(&app, kind, manual, &runtime, automatic_context.as_ref());
+        let result = if let Some(lease) = &lease {
+            let result = background_policy::EXECUTION
+                .scope(lease.clone(), execution)
+                .await;
+            if lease.profile == ExecutionProfile::Background {
+                let _ = lease.rest(started.elapsed()).await;
+            }
+            runtime.adaptive.finish(lease);
+            if let Some(reason) = lease
+                .reason()
+                .filter(|_| kind != BackgroundTaskKind::PythonClustering)
+            {
+                // A revoked slice may have committed earlier records; leave
+                // their progress intact without advancing business completion.
+                Ok(ScheduledSliceResult::skipped(reason))
+            } else {
+                result
+            }
+        } else {
+            execution.await
+        };
         let result = result.map(|mut slice| {
             slice.processed = slice.processed.max(background_activity::index_processed());
             slice
@@ -1253,6 +1380,14 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 runtime.wake.notify_one();
             }
             Err(error) => {
+                if background_policy::is_pause(&error) {
+                    let _ = storage.defer_background_task(
+                        kind.as_str(),
+                        now_ms().saturating_add(250),
+                        "background_paused",
+                    );
+                    continue;
+                }
                 tracing::warn!(
                     "[BACKGROUND] event=end run={} task={} processed={} has_more=true outcome=failed elapsed_ms={}",
                     seq,

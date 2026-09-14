@@ -10,6 +10,8 @@ mod app_bound;
 mod app_bound_dev;
 mod autostart;
 mod background_activity;
+mod background_policy;
+mod background_resources;
 mod background_scheduler;
 mod blind_index_repair;
 mod capture;

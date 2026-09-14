@@ -38,7 +38,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINF
 pub const IDLE_THRESHOLD_SECS: u64 = 1800;
 
 /// Polling cadence for the idle monitor loop.
-const POLL_INTERVAL_SECS: u64 = 10;
+const POLL_INTERVAL_SECS: u64 = 2;
 
 pub struct IdleState {
     /// Last computed idle time in seconds (best-effort, updated every POLL_INTERVAL_SECS).
@@ -155,7 +155,15 @@ pub fn start_idle_monitor(app: AppHandle) {
         let mut last_scheduler_gate: Option<(bool, bool, bool)> = None;
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+            let pending = app_clone
+                .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+                .is_some_and(|scheduler| scheduler.has_pending_work());
+            tokio::time::sleep(if pending {
+                std::time::Duration::from_millis(250)
+            } else {
+                std::time::Duration::from_secs(POLL_INTERVAL_SECS)
+            })
+            .await;
 
             if composite_shutdown.load(Ordering::SeqCst) {
                 tracing::info!("Idle monitor exiting on shutdown flag");
@@ -210,7 +218,11 @@ pub fn start_idle_monitor(app: AppHandle) {
             // changes. The ten-second probe remains the source of truth, but
             // a scheduler waiting on a retry or unlock should not wait for its
             // own two-second fallback tick after the gate opens.
-            let scheduler_gate = (is_idle, fullscreen, ac_connected);
+            let scheduler_gate = (
+                idle_secs >= crate::background_policy::SHORT_IDLE_SECS,
+                fullscreen,
+                ac_connected,
+            );
             if last_scheduler_gate != Some(scheduler_gate) {
                 if let Some(scheduler) = app_clone
                     .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()

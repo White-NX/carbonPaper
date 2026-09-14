@@ -43,6 +43,34 @@ fn row_to_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackgroundTaskState
 }
 
 impl StorageState {
+    pub(crate) fn background_performance_history(&self) -> Result<Option<String>, String> {
+        let guard = self.get_connection_named("background_performance_history")?;
+        guard
+            .as_ref()
+            .ok_or("Database not initialized")?
+            .query_row(
+                "SELECT value FROM app_metadata WHERE key='background_performance_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn save_background_performance_history(&self, history: &str) -> Result<(), String> {
+        let guard = self.get_connection_named("save_background_performance_history")?;
+        guard
+            .as_ref()
+            .ok_or("Database not initialized")?
+            .execute(
+                "INSERT INTO app_metadata(key,value) VALUES('background_performance_v1',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [history],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn recover_background_scheduler_tasks(&self) -> Result<(), String> {
         let guard = self.get_connection_named("recover_background_scheduler_tasks")?;
         let conn = guard
