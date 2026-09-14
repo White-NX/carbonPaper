@@ -99,6 +99,7 @@ pub struct MonitorState {
     pub migration_lock: AtomicBool,
     recovery: Mutex<MonitorRecoveryState>,
     python_ipc_client: AsyncMutex<Option<PersistentIpcClient>>,
+    command_budget_gate: AsyncMutex<()>,
 }
 
 struct PersistentIpcClient {
@@ -124,6 +125,7 @@ impl MonitorState {
             migration_lock: AtomicBool::new(false),
             recovery: Mutex::new(MonitorRecoveryState::default()),
             python_ipc_client: AsyncMutex::new(None),
+            command_budget_gate: AsyncMutex::new(()),
         }
     }
 
@@ -1041,6 +1043,33 @@ pub async fn forward_command_to_python(
     state: &MonitorState,
     payload: Value,
 ) -> Result<Value, String> {
+    let automatic = crate::background_policy::current_execution().is_some();
+    let command = payload
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let needs_full_cpu = command == "search_nl";
+    let limited = automatic && command != "run_scheduled_clustering";
+    // Status, pause, and stop must remain responsive during long clustering.
+    // Serialize computations that own the process budget, not control traffic.
+    let _budget_gate = if limited {
+        Some(
+            state
+                .command_budget_gate
+                .try_lock()
+                .map_err(|_| "background_paused: monitor request pending")?,
+        )
+    } else if needs_full_cpu
+        || matches!(
+            command,
+            "run_scheduled_clustering" | "upsert_task_vectors" | "get_task_vector_sync_target"
+        )
+    {
+        Some(state.command_budget_gate.lock().await)
+    } else {
+        None
+    };
+    crate::background_policy::check_current()?;
     let (pipe_name, auth_token) = {
         let pipe_guard = state.pipe_name.lock().unwrap_or_else(|e| e.into_inner());
         let token_guard = state.auth_token.lock().unwrap_or_else(|e| e.into_inner());
@@ -1052,20 +1081,17 @@ pub async fn forward_command_to_python(
 
     let seq_no = state.request_counter.fetch_add(1, Ordering::SeqCst);
 
-    let command = payload
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let needs_full_cpu = command == "search_nl";
-
-    let _cpu_guard = if needs_full_cpu {
+    let _cpu_guard = if needs_full_cpu || limited {
         let guard = state.job_handle.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref job) = *guard {
-            let _ = set_job_cpu_limit(**job, false, 0);
+            set_job_cpu_limit(**job, limited, crate::background_policy::CPU_RATE_PERCENT)?;
             Some(CpuLimitGuard {
                 job_handle_raw: (**job).0 as isize,
             })
         } else {
+            if limited {
+                return Err("background_paused: monitor CPU budget unavailable".into());
+            }
             None
         }
     } else {

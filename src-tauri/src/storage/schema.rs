@@ -364,6 +364,16 @@ impl StorageState {
                 PRIMARY KEY (index_kind, subject_key)
             );
 
+            CREATE TABLE IF NOT EXISTS ann_build_checkpoints (
+                index_kind TEXT PRIMARY KEY, generation INTEGER NOT NULL,
+                dataset_id TEXT NOT NULL, state_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ann_build_inputs (
+                generation INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+                subject_key TEXT NOT NULL, vector_f32 BLOB NOT NULL,
+                PRIMARY KEY(generation,ordinal)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_derived_ann_changes_epoch
                 ON derived_ann_changes(index_kind, change_epoch, subject_key);
 
@@ -755,6 +765,7 @@ impl StorageState {
             CREATE TABLE IF NOT EXISTS background_scheduler_tasks (
                 task_kind TEXT PRIMARY KEY,
                 ready_since_ms INTEGER NOT NULL,
+                backlog_since_ms INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
                 failure_count INTEGER NOT NULL DEFAULT 0,
                 last_served_seq INTEGER NOT NULL DEFAULT 0,
@@ -1140,6 +1151,13 @@ impl StorageState {
             "manual_in_flight",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        Self::add_column_if_missing(
+            conn,
+            "background_scheduler_tasks",
+            "backlog_since_ms",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        conn.execute("UPDATE background_scheduler_tasks SET backlog_since_ms=ready_since_ms WHERE backlog_since_ms=0 AND status!='completed'", []).map_err(|e| e.to_string())?;
 
         // `derived_migration_runs.index_kind` is deliberately not here: the
         // CREATE batch indexes over it, so it has to be in place before that
@@ -1234,6 +1252,25 @@ impl StorageState {
         )
         .map_err(|e| format!("Failed to create task vector synchronization state: {e}"))?;
 
+        Self::add_column_if_missing(
+            conn,
+            "task_vector_sync",
+            "needs_rescan",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // Producer commits and the rescan marker share the transaction. A
+        // process exit before the in-memory scheduler wake cannot lose debt.
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS task_vector_sync_embedding_insert
+                AFTER INSERT ON derived_embeddings WHEN NEW.index_kind='semantic_text'
+                BEGIN UPDATE task_vector_sync SET needs_rescan=1 WHERE id=1 AND needs_rescan=0; END;
+             CREATE TRIGGER IF NOT EXISTS task_vector_sync_embedding_update
+                AFTER UPDATE ON derived_embeddings WHEN NEW.index_kind='semantic_text'
+                BEGIN UPDATE task_vector_sync SET needs_rescan=1 WHERE id=1 AND needs_rescan=0; END;
+             CREATE TRIGGER IF NOT EXISTS task_vector_sync_embedding_delete
+                AFTER DELETE ON derived_embeddings WHEN OLD.index_kind='semantic_text'
+                BEGIN UPDATE task_vector_sync SET needs_rescan=1 WHERE id=1 AND needs_rescan=0; END;",
+        ).map_err(|e| format!("Failed to create vector synchronization markers: {e}"))?;
         self.init_classification_schema(conn)?;
         Self::add_column_if_missing(conn, "screenshot_ocr_status", "postprocess_lease", "TEXT")?;
 

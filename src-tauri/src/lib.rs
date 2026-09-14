@@ -5,6 +5,7 @@
 
 mod analysis;
 mod ann_format;
+mod ann_protocol;
 mod app_bound;
 #[cfg(feature = "app-bound-dev")]
 mod app_bound_dev;

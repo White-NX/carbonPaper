@@ -5,6 +5,7 @@
 //! 2. Screenshot metadata and OCR results
 //! 3. OCR data storage and search
 
+mod ann_build;
 mod background_scheduler;
 mod classification;
 mod connection;
@@ -32,6 +33,7 @@ mod task_vector_sync;
 mod types;
 pub(crate) mod wire_time;
 
+pub(crate) use ann_build::{AnnBuildCheckpoint, AnnCheckpointFile};
 pub use background_scheduler::BackgroundTaskState;
 pub(crate) use classification::{ClassificationFeedback, ClassificationLease};
 #[allow(unused_imports)]

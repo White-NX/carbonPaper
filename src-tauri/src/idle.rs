@@ -215,9 +215,8 @@ pub fn start_idle_monitor(app: AppHandle) {
             st.is_idle.store(is_idle, Ordering::SeqCst);
 
             // Wake the unified scheduler as soon as any admission signal
-            // changes. The ten-second probe remains the source of truth, but
-            // a scheduler waiting on a retry or unlock should not wait for its
-            // own two-second fallback tick after the gate opens.
+            // changes. Pending work uses a 250 ms activity probe; do not add
+            // another scheduler polling interval before revoking an A lease.
             let scheduler_gate = (
                 idle_secs >= crate::background_policy::SHORT_IDLE_SECS,
                 fullscreen,
@@ -227,6 +226,7 @@ pub fn start_idle_monitor(app: AppHandle) {
                 if let Some(scheduler) = app_clone
                     .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
                 {
+                    scheduler.observe_activity(&app_clone);
                     scheduler.wake();
                 }
                 last_scheduler_gate = Some(scheduler_gate);

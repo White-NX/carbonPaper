@@ -579,6 +579,7 @@ pub async fn rerank_documents(
     let clock = RerankClock::start(budget, Instant::now());
     let mut scores = Vec::with_capacity(documents.len());
     for chunk in documents.chunks(priority.chunk_size()) {
+        crate::background_policy::check_current()?;
         if let Some(watcher) = watcher {
             if watcher.cancelled() {
                 return Err(format!(
@@ -623,6 +624,7 @@ pub async fn rerank_documents(
                 chunk.len()
             ));
         }
+        crate::background_policy::check_current()?;
         scores.extend(result.scores);
         if let Some(watcher) = watcher {
             watcher.report_chunk(app, chunk.len() as u64, documents.len() as u64);

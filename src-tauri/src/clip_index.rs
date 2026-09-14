@@ -330,10 +330,11 @@ pub async fn run_scheduled_slice(
     quantum: Option<&AutomaticSliceContext>,
 ) -> Result<ScheduledSliceResult, String> {
     if !manual
-        && app
-            .state::<Arc<StorageState>>()
-            .processing_stage
-            .has_ready(carbonpaper_app_bound::protocol::Consumer::Clip)
+        && crate::background_scheduler::prefer_staged(
+            app,
+            crate::background_scheduler::BackgroundTaskKind::ClipIndex,
+            false,
+        )
     {
         return crate::processing_stage::run_model_slice(
             app,
@@ -355,7 +356,7 @@ async fn run_automatic_quantum(
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut batches = 0u32;
     let mut has_more = true;
-    let mut run_maintenance = true;
+    let mut run_maintenance = !crate::background_policy::is_background();
     loop {
         if let Some(reason) = quantum.stop_reason(&semantic, batches > 0) {
             if batches == 0 {
@@ -405,6 +406,9 @@ async fn run_automatic_quantum(
         }
         batches = batches.saturating_add(1);
         has_more = result.has_more;
+        if crate::background_policy::is_background() {
+            return Ok(ScheduledSliceResult::complete(has_more));
+        }
         if !has_more {
             tracing::info!(
                 "[SCHEDULER] automatic model quantum completed task=clip_index batches={} elapsed_ms={}",
@@ -420,31 +424,7 @@ async fn run_automatic_quantum(
     }
 }
 
-fn automatic_ann_maintenance_allowed(
-    quantum: &AutomaticSliceContext,
-    semantic: &SemanticRuntimeState,
-    admission_gate: Option<&str>,
-) -> bool {
-    admission_gate.is_none()
-        && !semantic.foreground_waiting()
-        && matches!(
-            quantum.stop_reason(semantic, true),
-            None | Some(AutomaticSliceStopReason::BudgetExpired)
-        )
-}
-
-async fn finish_automatic_quantum(app: &AppHandle, quantum: &AutomaticSliceContext) -> bool {
-    let semantic = app.state::<Arc<SemanticRuntimeState>>();
-    // A search, manual task, or idle/auth change may arrive during the final
-    // encode. Re-check at the maintenance boundary even when the queue drained
-    // normally; ANN rebuilding can take much longer than one model request.
-    if !automatic_ann_maintenance_allowed(
-        quantum,
-        &semantic,
-        crate::background_scheduler::gate_reason(app, false),
-    ) {
-        return false;
-    }
+async fn finish_automatic_quantum(app: &AppHandle, _quantum: &AutomaticSliceContext) -> bool {
     rebuild_ann(app).await;
     true
 }
@@ -459,7 +439,7 @@ async fn run_scheduled_request(
     app: &AppHandle,
     manual: bool,
     run_maintenance: bool,
-    run_ann_maintenance: bool,
+    _run_ann_maintenance: bool,
     automatic_context: Option<(&AutomaticSliceContext, bool)>,
 ) -> Result<ScheduledSliceResult, String> {
     let run = app.state::<Arc<ClipIndexRunState>>().inner().clone();
@@ -486,7 +466,7 @@ async fn run_scheduled_request(
     if let Some(reason) = outcome.refused.or(outcome.stopped_because) {
         return Ok(ScheduledSliceResult::skipped(reason));
     }
-    if run_ann_maintenance {
+    if outcome.indexed > 0 {
         rebuild_ann(app).await;
     }
     let backlog = tokio::task::spawn_blocking(move || {
@@ -625,9 +605,11 @@ fn may_run(app: &AppHandle, mode: PassMode) -> bool {
     if mode.is_manual() {
         return true;
     }
-    app.state::<Arc<IdleState>>()
-        .is_idle
-        .load(Ordering::Relaxed)
+    crate::background_scheduler::environment_gate_reason(
+        app,
+        crate::background_scheduler::EnvironmentPolicy::Automatic,
+    )
+    .is_none()
 }
 
 #[derive(Default)]
@@ -898,6 +880,7 @@ async fn drain_until_done(
 /// that authorizes the commit.
 #[derive(Clone)]
 struct ClaimedJob {
+    generation: u64,
     spec: DerivedIndexJobSpec,
     image_hash: String,
     lease_token: String,
@@ -1074,16 +1057,79 @@ async fn encode_chunk(
     claimed: Vec<ClaimedJob>,
     automatic_context: Option<(&AutomaticSliceContext, bool)>,
 ) -> Result<usize, EncodeChunkFailure> {
+    if let Err(error) = crate::background_policy::check_current() {
+        return Err(EncodeChunkFailure {
+            error,
+            claimed,
+            deferred_reason: Some("background_paused"),
+        });
+    }
     let read_storage = storage.clone();
     let hashes: Vec<String> = claimed.iter().map(|job| job.image_hash.clone()).collect();
+    let mut preparation = None;
+    if let Some(lease) = crate::background_policy::current_execution() {
+        let pixels = hashes
+            .iter()
+            .map(|hash| {
+                prepared_image(hash)
+                    .map(|p| u64::from(p.width) * u64::from(p.height))
+                    .or_else(|| storage.clip_input_pixels(hash).ok().flatten())
+            })
+            .collect::<Option<Vec<_>>>();
+        if pixels.is_none() && crate::background_policy::is_background() {
+            lease.revoke("waiting_for_evaluation");
+            return Err(EncodeChunkFailure {
+                error: "background_paused: unknown image size".into(),
+                claimed,
+                deferred_reason: Some("background_paused"),
+            });
+        }
+        if let Some(pixels) = pixels {
+            preparation = app
+                .state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+                .inner()
+                .clone()
+                .unit(
+                    "image_prepare",
+                    crate::clip_migration::CLIP_VECTOR_SPACE_REVISION,
+                    pixels.iter().sum(),
+                    "one-image:decode-rgb",
+                )
+                .map_err(|error| EncodeChunkFailure {
+                    error,
+                    claimed: claimed.clone(),
+                    deferred_reason: Some("background_paused"),
+                })?;
+        }
+    }
     let retry_claimed = claimed.clone();
-    let decoded = tokio::task::spawn_blocking(move || load_images(&read_storage, &hashes))
-        .await
-        .map_err(|error| EncodeChunkFailure {
-            error: format!("image read task failed: {error}"),
-            claimed: retry_claimed,
-            deferred_reason: None,
-        })?;
+    let execution = crate::background_policy::current_execution();
+    let decoded = tokio::task::spawn_blocking(move || {
+        if execution
+            .as_ref()
+            .is_some_and(|lease| lease.check().is_err())
+        {
+            return Vec::new();
+        }
+        load_images(&read_storage, &hashes)
+    })
+    .await
+    .map_err(|error| EncodeChunkFailure {
+        error: format!("image read task failed: {error}"),
+        claimed: retry_claimed,
+        deferred_reason: None,
+    })?;
+    if let Err(error) = crate::background_policy::check_current() {
+        return Err(EncodeChunkFailure {
+            error,
+            claimed,
+            deferred_reason: Some("background_paused"),
+        });
+    }
+
+    if let Some(preparation) = preparation {
+        preparation.complete();
+    }
 
     // Partition before submitting: an unreadable image must not cost the
     // readable ones in the same chunk their attempt.
@@ -1187,13 +1233,22 @@ async fn encode_chunk(
         }
         Err(error) => {
             return Err(EncodeChunkFailure {
+                deferred_reason: crate::background_policy::is_pause(&error)
+                    .then_some("background_paused"),
                 error: format!("embed failed: {error}"),
                 claimed: jobs,
-                deferred_reason: None,
             });
         }
     };
     drop(worker_guard);
+
+    if let Err(error) = crate::background_policy::check_current() {
+        return Err(EncodeChunkFailure {
+            error,
+            claimed: jobs,
+            deferred_reason: Some("background_paused"),
+        });
+    }
 
     let retry_jobs = jobs.clone();
     commit_batch(storage, jobs, vectors)
@@ -1268,11 +1323,21 @@ fn load_images(storage: &StorageState, hashes: &[String]) -> Vec<Result<DecodedI
 /// reads `is_deleted` and decrypts nothing. Everything else stays queued rather
 /// than being excluded on a guess.
 async fn claim_batch(storage: Arc<StorageState>, locked: bool) -> Result<Vec<ClaimedJob>, String> {
+    let execution = crate::background_policy::current_execution();
+    let limit = if execution.is_some() {
+        1
+    } else {
+        DRAIN_BATCH as u32
+    };
     tokio::task::spawn_blocking(move || -> Result<Vec<ClaimedJob>, String> {
+        let generation = storage.db_generation();
+        if let Some(lease) = &execution {
+            lease.check()?;
+        }
         let jobs = storage.claimable_derived_index_jobs(
             DerivedIndexKind::ClipImage,
             MAX_ATTEMPTS,
-            DRAIN_BATCH as u32,
+            limit,
         )?;
         if jobs.is_empty() {
             return Ok(Vec::new());
@@ -1315,6 +1380,7 @@ async fn claim_batch(storage: Arc<StorageState>, locked: bool) -> Result<Vec<Cla
                 }
                 match storage.mark_derived_index_job_processing(&job.spec) {
                     Ok(lease_token) => claimed.push(ClaimedJob {
+                        generation,
                         image_hash: job.spec.subject_key.clone(),
                         spec: job.spec,
                         lease_token,
@@ -1349,6 +1415,7 @@ async fn claim_batch(storage: Arc<StorageState>, locked: bool) -> Result<Vec<Cla
             };
             match storage.mark_derived_index_job_processing(&job.spec) {
                 Ok(lease_token) => claimed.push(ClaimedJob {
+                    generation,
                     image_hash: job.spec.subject_key.clone(),
                     spec: job.spec,
                     lease_token,
@@ -1370,6 +1437,7 @@ async fn commit_batch(
     claimed: Vec<ClaimedJob>,
     vectors: Vec<Vec<f32>>,
 ) -> Result<usize, String> {
+    let execution = crate::background_policy::current_execution();
     tokio::task::spawn_blocking(move || {
         let mut indexed = 0usize;
         for (job, vector) in claimed.into_iter().zip(vectors) {
@@ -1392,16 +1460,32 @@ async fn commit_batch(
                 lease_token: job.lease_token.clone(),
                 vector: vector.clone(),
             };
-            match storage.commit_derived_embedding(&write) {
+            match storage.commit_archive_embedding(
+                &write,
+                job.generation,
+                &[],
+                execution.as_deref(),
+            ) {
                 Ok(()) => {
                     // The encode this capture was held for is done.
                     forget_prepared(&job.image_hash);
                     indexed += 1;
                 }
-                Err(error) => tracing::warn!(
-                    "[CLIP:INDEX] commit failed for {}: {error}",
-                    job.spec.subject_key
-                ),
+                Err(error) => {
+                    let _ = storage.requeue_derived_index_job(
+                        &job.spec,
+                        &job.lease_token,
+                        "commit_deferred",
+                        &error,
+                    );
+                    if !crate::background_policy::is_pause(&error) {
+                        tracing::warn!(
+                            "[CLIP:INDEX] commit failed for {}: {error}",
+                            job.spec.subject_key
+                        );
+                    }
+                    return Err(error);
+                }
             }
         }
         Ok(indexed)
@@ -1860,55 +1944,6 @@ pub async fn set_clip_backfill_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn automatic_ann_maintenance_stands_down_for_foreground_and_admission_gates() {
-        let quantum = AutomaticSliceContext::new(
-            Duration::from_secs(60),
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            0,
-        );
-        let semantic = Arc::new(SemanticRuntimeState::new());
-        let foreground = semantic.foreground_lease();
-        assert!(!automatic_ann_maintenance_allowed(
-            &quantum, &semantic, None
-        ));
-        drop(foreground);
-
-        for reason in [
-            "waiting_for_idle",
-            "waiting_for_ac_power",
-            "waiting_for_fullscreen",
-            "waiting_for_unlock",
-            "maintenance",
-        ] {
-            assert!(!automatic_ann_maintenance_allowed(
-                &quantum,
-                &semantic,
-                Some(reason),
-            ));
-        }
-        assert!(automatic_ann_maintenance_allowed(&quantum, &semantic, None));
-    }
-
-    #[test]
-    fn automatic_ann_maintenance_yields_to_pending_work_even_after_budget_expiry() {
-        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let quantum = AutomaticSliceContext::new(Duration::ZERO, generation.clone(), 0);
-        let semantic = Arc::new(SemanticRuntimeState::new());
-        // Budget expiry alone is a normal completion and may maintain the ANN.
-        assert!(automatic_ann_maintenance_allowed(&quantum, &semantic, None));
-
-        let external = semantic.external_background_lease();
-        assert!(!automatic_ann_maintenance_allowed(
-            &quantum, &semantic, None
-        ));
-        drop(external);
-        generation.fetch_add(1, Ordering::SeqCst);
-        assert!(!automatic_ann_maintenance_allowed(
-            &quantum, &semantic, None
-        ));
-    }
 
     fn prepared(bytes: usize, age: Duration) -> PreparedCapture {
         PreparedCapture {

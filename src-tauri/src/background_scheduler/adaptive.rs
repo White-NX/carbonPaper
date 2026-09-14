@@ -20,6 +20,7 @@ pub(super) struct AdaptiveRuntime {
     pub pending: AtomicBool,
     sampler_generation: AtomicU64,
     dirty: AtomicBool,
+    waiting_for_idle: Mutex<std::collections::HashSet<String>>,
     clock: Instant,
 }
 
@@ -33,6 +34,7 @@ impl Default for AdaptiveRuntime {
             pending: AtomicBool::new(false),
             sampler_generation: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
+            waiting_for_idle: Mutex::new(std::collections::HashSet::new()),
             clock: Instant::now(),
         }
     }
@@ -55,7 +57,10 @@ fn signals(app: &AppHandle, staged: bool) -> AdmissionSignals {
         protected_session: idle.fullscreen_exclusive.load(Ordering::Relaxed)
             || app
                 .try_state::<Arc<crate::capture::CaptureState>>()
-                .is_some_and(|s| s.game_mode_capture_paused.load(Ordering::Relaxed)),
+                .is_some_and(|s| s.game_mode_capture_paused.load(Ordering::Relaxed))
+            || app
+                .try_state::<crate::monitor::MonitorState>()
+                .is_some_and(|s| s.is_dml_suppressed()),
         maintenance: crate::maintenance::is_active(),
         foreground: app
             .state::<Arc<SemanticRuntimeState>>()
@@ -100,7 +105,7 @@ impl AdaptiveRuntime {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) =
                     Some(PerformanceBook::restore(environment, json.as_deref()));
-                let mut sampled_at = Instant::now() - Duration::from_secs(1);
+                let mut sampled_at = Instant::now();
                 let mut flushed_at = Instant::now();
                 while !runtime.stop.load(Ordering::SeqCst)
                     && runtime.adaptive.sampler_generation.load(Ordering::SeqCst) == generation
@@ -151,6 +156,20 @@ impl AdaptiveRuntime {
         kind: BackgroundTaskKind,
         staged: bool,
     ) -> Result<ExecutionProfile, &'static str> {
+        let activity = signals(app, staged);
+        if activity.idle_secs >= SHORT_IDLE_SECS {
+            self.waiting_for_idle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(kind.as_str());
+        } else if self
+            .waiting_for_idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(kind.as_str())
+        {
+            return Err(activity.hard_gate().unwrap_or("waiting_for_evaluation"));
+        }
         let qualified = self
             .book
             .lock()
@@ -158,7 +177,7 @@ impl AdaptiveRuntime {
             .as_ref()
             .is_some_and(|b| b.task_eligible(kind.as_str()));
         choose_profile(
-            signals(app, staged),
+            activity,
             configured_mode(),
             kind == BackgroundTaskKind::PythonClustering,
             qualified,
@@ -181,6 +200,10 @@ impl AdaptiveRuntime {
                 .unwrap_or_else(|e| e.into_inner())
                 .duty_percent(self.now())
         } else {
+            self.resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset_duty();
             100
         };
         let lease = ExecutionLease::new(kind.as_str(), profile, duty);
@@ -243,8 +266,34 @@ impl AdaptiveRuntime {
     pub(super) fn finish(&self, lease: &ExecutionLease) {
         self.active.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(reason) = lease.reason() {
+            if matches!(
+                reason,
+                "waiting_for_memory" | "waiting_for_disk" | "resource_pressure"
+            ) {
+                self.resources
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .defer_after_pressure(self.now());
+            }
+            if matches!(
+                reason,
+                "waiting_for_evaluation"
+                    | "waiting_for_resident_model"
+                    | "cost_overrun"
+                    | "waiting_for_idle"
+            ) {
+                self.waiting_for_idle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(lease.task.clone());
+            }
+            self.resources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset_duty();
             let mut pauses = self.pauses.lock().unwrap_or_else(|e| e.into_inner());
             pauses.total += 1;
+            pauses.last_yield_ms = lease.yield_latency_ms();
             *pauses.reasons.entry(reason.to_string()).or_default() += 1;
         }
     }
@@ -263,6 +312,40 @@ impl AdaptiveRuntime {
 }
 
 impl BackgroundSchedulerState {
+    pub(crate) fn observe_activity(&self, app: &AppHandle) {
+        self.runtime.adaptive.poll_active(app, &self.runtime);
+    }
+    pub(crate) fn unit(
+        self: &Arc<Self>,
+        operation: &str,
+        model: &str,
+        size: u64,
+        parameters: &str,
+    ) -> Result<Option<UnitMeasurement>, String> {
+        let Some(lease) = policy::current_execution() else {
+            return Ok(None);
+        };
+        let key = CostKey::new(&lease.task, operation, model, size, parameters);
+        self.admit_operation(&key, false, false)?;
+        if lease.profile == ExecutionProfile::Background {
+            lease.limit_unit(Some(Duration::from_secs(1)));
+        }
+        // Host preparation is bounded to one record. Its CPU measurement is
+        // conservative when unrelated host work overlaps this interval.
+        // SAFETY: the pseudo-handle is borrowed and process_usage only reads it.
+        let usage = unsafe {
+            crate::background_resources::process_usage(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+            )
+        };
+        Ok(Some(UnitMeasurement {
+            scheduler: self.clone(),
+            key,
+            lease,
+            start: Instant::now(),
+            before: usage,
+        }))
+    }
     pub(crate) fn has_pending_work(&self) -> bool {
         self.runtime.adaptive.pending.load(Ordering::Relaxed)
     }
@@ -318,6 +401,9 @@ impl BackgroundSchedulerState {
                 lease.revoke(reason);
                 return lease.check();
             }
+            if cold {
+                lease.allow_cold_load();
+            }
         }
         drop(book);
         if let Some(active) = self
@@ -372,17 +458,6 @@ impl BackgroundSchedulerState {
             .map_or_else(Vec::new, PerformanceBook::qualifications)
     }
 
-    pub(crate) fn low_memory(&self) -> bool {
-        self.runtime
-            .adaptive
-            .resources
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .latest
-            .available_memory_bytes
-            .is_some_and(|bytes| !memory_admits(bytes, 0))
-    }
-
     pub(crate) fn qualification_summary(&self) -> BTreeMap<String, bool> {
         let book = self
             .runtime
@@ -395,6 +470,8 @@ impl BackgroundSchedulerState {
             TASK_CLIP_INDEX,
             TASK_SMART_CLUSTER,
             TASK_PYTHON_CLUSTERING,
+            TASK_VECTOR_SYNC,
+            TASK_ANN_BUILD,
         ]
         .into_iter()
         .map(|task| {
@@ -404,5 +481,59 @@ impl BackgroundSchedulerState {
             )
         })
         .collect()
+    }
+}
+
+pub(crate) struct UnitMeasurement {
+    scheduler: Arc<BackgroundSchedulerState>,
+    key: CostKey,
+    lease: Arc<ExecutionLease>,
+    start: Instant,
+    before: Option<crate::background_resources::ProcessUsage>,
+}
+
+impl UnitMeasurement {
+    pub(crate) fn complete(self) {
+        if self.lease.check().is_err() {
+            return;
+        }
+        // SAFETY: the pseudo-handle is borrowed and process_usage only reads it.
+        let after = unsafe {
+            crate::background_resources::process_usage(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+            )
+        };
+        if let (Some(before), Some(after)) = (self.before, after) {
+            self.scheduler.record_cost(
+                self.key.clone(),
+                CostSample {
+                    elapsed_ms: self.start.elapsed().as_secs_f64() * 1000.0,
+                    cpu_ms: (after.cpu_ms - before.cpu_ms).max(0.0),
+                    peak_private_bytes: if after.peak_private_bytes > before.peak_private_bytes {
+                        after.peak_private_bytes
+                    } else {
+                        after.private_bytes.max(before.private_bytes)
+                    },
+                    additional_peak_bytes: (if after.peak_private_bytes > before.peak_private_bytes
+                    {
+                        after.peak_private_bytes
+                    } else {
+                        after.private_bytes
+                    })
+                    .saturating_sub(before.private_bytes),
+                    cpu_rate_percent: CPU_RATE_PERCENT,
+                },
+                self.lease.profile,
+            );
+        }
+    }
+}
+
+impl Drop for UnitMeasurement {
+    fn drop(&mut self) {
+        if self.lease.reason() == Some("cost_overrun") {
+            self.scheduler.revoke_cost(&self.key);
+        }
+        self.lease.limit_unit(None);
     }
 }

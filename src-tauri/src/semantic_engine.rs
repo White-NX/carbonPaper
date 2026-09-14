@@ -536,6 +536,13 @@ fn load_session(
     let builder = builder
         .with_memory_pattern(false)
         .map_err(|error| format!("provider_unavailable: failed to set memory pattern: {error}"))?;
+    // Completed requests must release CPU before their job cap is restored.
+    let builder = builder
+        .with_config_entry("session.intra_op.allow_spinning", "0")
+        .and_then(|builder| builder.with_config_entry("session.inter_op.allow_spinning", "0"))
+        .map_err(|error| {
+            format!("provider_unavailable: failed to disable pool spinning: {error}")
+        })?;
     let builder = builder
         .with_config_entry("session.use_device_allocator_for_initializers", "0")
         .map_err(|error| {

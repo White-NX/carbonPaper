@@ -36,12 +36,18 @@ impl ResourceSampler {
             logical_cores: self.system.cpus().len(),
             physical_memory_bytes: self.system.total_memory(),
             runtime: format!(
-                "{}:{}:{}:ml{}:ort1.24.2:budget-v1:{}",
+                "{}:{}:{}:ml{}:ort1.24.2:budget-v2:spin0:{}:{}:{}",
                 std::env::consts::OS,
                 std::env::consts::ARCH,
                 sysinfo::System::os_version().unwrap_or_default(),
                 crate::ml_protocol::ML_PROTOCOL_VERSION,
-                std::env::var("CARBONPAPER_ONNX_INTRA_THREADS").unwrap_or_default()
+                std::env::var("CARBONPAPER_ONNX_INTRA_THREADS").unwrap_or_default(),
+                self.system
+                    .cpus()
+                    .first()
+                    .map(|cpu| format!("{}:{}", cpu.vendor_id(), cpu.brand()))
+                    .unwrap_or_default(),
+                env!("CARGO_PKG_VERSION")
             ),
         }
     }
@@ -148,6 +154,20 @@ pub fn set_cpu_rate(job: HANDLE, percent: Option<u32>) -> Result<(), String> {
 pub struct ProcessUsage {
     pub cpu_ms: f64,
     pub private_bytes: u64,
+    pub peak_private_bytes: u64,
+}
+
+impl ProcessUsage {
+    /// A previous model's lifetime peak is not this operation's extra memory.
+    /// Include the OS peak only when this interval advanced it; otherwise use
+    /// the private samples collected while the operation is executing.
+    pub fn peak_since(self, before: Option<Self>) -> u64 {
+        if before.is_none_or(|before| self.peak_private_bytes > before.peak_private_bytes) {
+            self.peak_private_bytes
+        } else {
+            self.private_bytes
+        }
+    }
 }
 
 pub fn process_usage(process: HANDLE) -> Option<ProcessUsage> {
@@ -168,5 +188,6 @@ pub fn process_usage(process: HANDLE) -> Option<ProcessUsage> {
     Some(ProcessUsage {
         cpu_ms: (ticks(kernel) + ticks(user)) as f64 / 10_000.0,
         private_bytes: memory.PrivateUsage as u64,
+        peak_private_bytes: memory.PrivateUsage.max(memory.PeakPagefileUsage) as u64,
     })
 }

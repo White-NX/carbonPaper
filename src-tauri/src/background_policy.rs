@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -176,7 +177,9 @@ impl PerformanceBook {
                     && book.histories.len() <= 512
                     && book.histories.iter().all(|(_, history)| {
                         history.samples.len() <= SAMPLE_LIMIT
-                            && history.samples.iter().all(CostSample::valid)
+                            && history.samples.iter().all(|sample| {
+                                sample.valid() && sample.cpu_rate_percent == CPU_RATE_PERCENT
+                            })
                     })
             })
             .unwrap_or_else(|| Self::new(environment))
@@ -242,6 +245,27 @@ impl PerformanceBook {
     }
 
     pub fn task_eligible(&self, task: &str) -> bool {
+        if task == "smart_cluster" {
+            return self.histories.iter().any(|(key, h)| {
+                key.task == task && key.operation == "scoring_unit" && h.eligible(false)
+            });
+        }
+        if task == "ann_build" {
+            return [
+                "ann_insert",
+                "ann_serialize",
+                "ann_restore",
+                "ann_validate",
+                "ann_checksum",
+                "ann_io",
+            ]
+            .iter()
+            .all(|op| {
+                self.histories
+                    .iter()
+                    .any(|(key, h)| key.task == task && key.operation == *op && h.eligible(false))
+            });
+        }
         self.histories
             .iter()
             .any(|(key, h)| key.task == task && key.operation != "cold_load" && h.eligible(false))
@@ -302,7 +326,7 @@ pub struct ResourcePolicy {
 }
 
 impl ResourcePolicy {
-    pub fn observe(&mut self, sample: ResourceSample) {
+    pub fn observe(&mut self, mut sample: ResourceSample) {
         let now = sample.at_ms;
         if now.saturating_sub(self.latest.at_ms) > 2000 {
             self.low_since = None;
@@ -314,6 +338,11 @@ impl ResourcePolicy {
         let core = sample
             .busiest_core_percent
             .filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
+        sample.total_cpu_percent = cpu;
+        sample.busiest_core_percent = core;
+        sample.disk_latency_ms = sample
+            .disk_latency_ms
+            .filter(|d| d.is_finite() && *d >= 0.0);
         self.busy_core_samples = if core.is_some_and(|c| c >= 85.0) {
             self.busy_core_samples.saturating_add(1)
         } else {
@@ -422,6 +451,15 @@ impl ResourcePolicy {
         let since = *self.stable_since.get_or_insert(now);
         (20 + (now.saturating_sub(since) / 60_000) as u32 * 10).min(50)
     }
+    pub fn reset_duty(&mut self) {
+        self.stable_since = None;
+    }
+    pub fn defer_after_pressure(&mut self, now: u64) {
+        self.cooldown_until = self.cooldown_until.max(now.saturating_add(15_000));
+        self.low_since = None;
+        self.disk_low_since = None;
+        self.stable_since = None;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -495,7 +533,9 @@ pub struct ExecutionLease {
     pub profile: ExecutionProfile,
     pub duty_percent: u32,
     reason: Mutex<Option<&'static str>>,
-    pub started: Instant,
+    revoked_at: Mutex<Option<Instant>>,
+    unit_deadline: Mutex<Option<Instant>>,
+    cpu_micros: AtomicU64,
 }
 
 impl ExecutionLease {
@@ -505,26 +545,69 @@ impl ExecutionLease {
             profile,
             duty_percent,
             reason: Mutex::new(None),
-            started: Instant::now(),
+            revoked_at: Mutex::new(None),
+            unit_deadline: Mutex::new(None),
+            cpu_micros: AtomicU64::new(0),
         })
     }
     pub fn revoke(&self, reason: &'static str) {
-        self.reason
+        let mut current = self.reason.lock().unwrap_or_else(|e| e.into_inner());
+        if current.is_none() {
+            *current = Some(reason);
+            *self.revoked_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        }
+    }
+    pub fn yield_latency_ms(&self) -> Option<f64> {
+        self.revoked_at
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert(reason);
+            .map(|at| at.elapsed().as_secs_f64() * 1000.0)
     }
     pub fn reason(&self) -> Option<&'static str> {
         *self.reason.lock().unwrap_or_else(|e| e.into_inner())
     }
     pub fn check(&self) -> Result<(), String> {
+        if self
+            .unit_deadline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.revoke("cost_overrun");
+        }
         self.reason()
             .map_or(Ok(()), |reason| Err(format!("background_paused: {reason}")))
     }
+    pub fn limit_unit(&self, budget: Option<Duration>) {
+        *self.unit_deadline.lock().unwrap_or_else(|e| e.into_inner()) =
+            budget.map(|budget| Instant::now() + budget);
+    }
+    pub fn allow_cold_load(&self) {
+        if let Some(deadline) = self
+            .unit_deadline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            *deadline += Duration::from_secs(1);
+        }
+    }
     pub async fn rest(&self, execution: Duration) -> Result<(), String> {
         if self.profile == ExecutionProfile::Background {
-            let rest =
+            let duty_rest =
                 execution.mul_f64((100 - self.duty_percent) as f64 / self.duty_percent as f64);
+            // Short requests can burst within a Windows quota period. Account
+            // actual CPU time too, so toggling a job limit at handoff cannot
+            // turn many tiny requests into more than 5% of the machine.
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1) as f64;
+            let cpu_window = Duration::from_secs_f64(
+                self.cpu_micros.load(Ordering::Relaxed) as f64
+                    / 1_000_000.0
+                    / (cores * CPU_RATE_PERCENT as f64 / 100.0),
+            );
+            let rest = duty_rest.max(cpu_window.saturating_sub(execution));
             let end = Instant::now() + rest;
             while Instant::now() < end {
                 self.check()?;
@@ -536,6 +619,12 @@ impl ExecutionLease {
             }
         }
         self.check()
+    }
+    pub fn account_cpu(&self, cpu_ms: f64) {
+        if cpu_ms.is_finite() && cpu_ms > 0.0 {
+            self.cpu_micros
+                .fetch_add((cpu_ms * 1000.0).ceil() as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -554,6 +643,16 @@ pub fn is_pause(error: &str) -> bool {
     error.contains("background_paused:")
         || error.starts_with("cancelled:")
         || error.contains("embed failed: cancelled:")
+        || matches!(
+            error,
+            "app_bound_disabled"
+                | "app_bound_lease_expired"
+                | "app_bound_task_retired"
+                | "app_bound_dataset_mismatch"
+                | "staging generation changed"
+                | "staged source changed"
+                | "Staged input changed before embedding commit"
+        )
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -614,12 +713,62 @@ mod tests {
     }
 
     #[test]
+    fn revoked_staged_leases_are_pauses_while_integrity_and_model_errors_are_failures() {
+        use carbonpaper_app_bound::protocol::BrokerError;
+        for error in [
+            BrokerError::Disabled.code(),
+            BrokerError::LeaseExpired.code(),
+            BrokerError::Retired.code(),
+            BrokerError::DatasetMismatch.code(),
+            "staging generation changed",
+            "Staged input changed before embedding commit",
+        ] {
+            assert!(is_pause(error), "{error}");
+        }
+        assert!(!is_pause("app_bound_access_denied"));
+        assert!(!is_pause(BrokerError::Integrity.code()));
+        assert!(!is_pause("model_mismatch: invalid tensor"));
+    }
+
+    #[test]
     fn revised_memory_rule_has_fifteen_percent_margin_and_fixed_point_eight_gib_floor() {
         assert!(memory_admits(MEMORY_RESERVE_BYTES, 0));
         assert!(!memory_admits(MEMORY_RESERVE_BYTES - 1, 0));
         assert!(memory_admits(MEMORY_RESERVE_BYTES + 1150, 1000));
         assert!(!memory_admits(MEMORY_RESERVE_BYTES + 1149, 1000));
         assert!(!memory_admits(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn missing_metrics_and_load_flapping_cannot_keep_b_admitted() {
+        let mut policy = stable();
+        let mut missing = sample_resources(11_000, 10.0, 20.0);
+        missing.total_cpu_percent = Some(f32::NAN);
+        policy.observe(missing);
+        assert_eq!(
+            policy.retain(11_000, 0, false),
+            Some("resource_metrics_unavailable")
+        );
+        for i in 12..42 {
+            policy.observe(sample_resources(
+                i * 1000,
+                if i % 5 == 0 { 40.0 } else { 10.0 },
+                40.0,
+            ));
+            assert!(policy.admit(i * 1000, 0, false).is_some());
+        }
+    }
+
+    #[test]
+    fn duty_ramps_only_until_a_pause_resets_the_run() {
+        let mut policy = stable();
+        assert_eq!(policy.duty_percent(10_000), 20);
+        assert_eq!(policy.duty_percent(70_000), 30);
+        assert_eq!(policy.duty_percent(130_000), 40);
+        assert_eq!(policy.duty_percent(190_000), 50);
+        assert_eq!(policy.duty_percent(900_000), 50);
+        policy.reset_duty();
+        assert_eq!(policy.duty_percent(901_000), 20);
     }
     #[test]
     fn only_capped_valid_samples_qualify_and_input_scales_do_not_transfer() {
@@ -747,6 +896,19 @@ mod tests {
             Some("resource_metrics_unavailable")
         );
     }
+    #[test]
+    fn memory_pressure_requires_a_fresh_cooldown_and_admission_window() {
+        let mut resources = stable();
+        assert!(resources.retain(10_000, 4 << 30, false).is_some());
+        resources.defer_after_pressure(10_000);
+        for second in 11..35 {
+            resources.observe(sample_resources(second * 1000, 5.0, 10.0));
+            assert!(resources.admit(second * 1000, 0, false).is_some());
+        }
+        resources.observe(sample_resources(35_000, 5.0, 10.0));
+        assert!(resources.admit(35_000, 0, false).is_none());
+    }
+
     #[test]
     fn busy_single_core_and_a_to_b_transition_are_not_hidden_by_low_total_cpu() {
         let mut r = stable();

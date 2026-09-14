@@ -374,6 +374,10 @@ impl StorageState {
         }
         self.processing_stage.check_receipt(receipt)?;
         let mut guard = self.get_connection_named("commit_staged_smart_cluster")?;
+        let execution = crate::background_policy::current_execution();
+        if let Some(execution) = &execution {
+            execution.check()?;
+        }
         let conn = guard.as_mut().ok_or("Database not initialized")?;
         if !self.staged_source_current_on_conn(conn, receipt)? {
             return Err("deferred: staged source changed".into());
@@ -421,6 +425,9 @@ impl StorageState {
             .map_err(|e| e.to_string())?;
         }
         Self::record_staged_receipt_on_conn(&tx, receipt)?;
+        if let Some(execution) = &execution {
+            execution.check()?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(true)
     }

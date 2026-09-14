@@ -7,7 +7,7 @@
 //! examples. New snapshots are evaluated in a background worker; matches
 //! above the threshold are recorded in `smart_cluster_assignments`.
 
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -336,6 +336,100 @@ fn read_summary_from_row(
 }
 
 impl StorageState {
+    pub(crate) fn archive_scoring_source_revisions(
+        &self,
+        generation: u64,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, Option<i64>)>, String> {
+        let guard = self.get_connection_named("archive_scoring_source_revisions")?;
+        if self.db_generation() != generation {
+            return Err("background_paused: database changed".into());
+        }
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        ids.iter()
+            .map(|id| {
+                let revision = conn
+                    .query_row(
+                        "SELECT COALESCE(r.revision,0) FROM screenshots s
+                    LEFT JOIN screenshot_processing_revisions r ON r.screenshot_id=s.id
+                    WHERE s.id=?1 AND s.is_deleted=0",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                Ok((*id, revision))
+            })
+            .collect()
+    }
+
+    /// Publish a fully scored group and remove its queue entries atomically.
+    /// A pause, changed OCR, edited cluster, or replaced database keeps the
+    /// entire uncommitted group available for a later pass.
+    pub(crate) fn commit_archive_scoring_group(
+        &self,
+        generation: u64,
+        revisions: &[(i64, Option<i64>)],
+        targets: &[SmartClusterScoringTarget],
+        assignments: &[(i64, i64, f64)],
+        execution: Option<&crate::background_policy::ExecutionLease>,
+    ) -> Result<(u64, u64), String> {
+        let guard = self.get_connection_named("commit_archive_scoring_group")?;
+        if let Some(execution) = execution {
+            execution.check()?;
+        }
+        if self.db_generation() != generation {
+            return Err("background_paused: database changed".into());
+        }
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let current = Self::smart_cluster_scoring_targets_on_conn(&tx)?;
+        if current.len() != targets.len()
+            || !current
+                .iter()
+                .zip(targets)
+                .all(|(a, b)| a.same_scoring_configuration(b))
+        {
+            return Err("background_paused: smart cluster configuration changed".into());
+        }
+        for (id, revision) in revisions {
+            let current: Option<i64> = tx.query_row("SELECT COALESCE(r.revision,0) FROM screenshots s
+                LEFT JOIN screenshot_processing_revisions r ON r.screenshot_id=s.id WHERE s.id=?1 AND s.is_deleted=0", [id], |r| r.get(0))
+                .optional().map_err(|e| e.to_string())?;
+            if current != *revision {
+                return Err("background_paused: scoring source changed".into());
+            }
+        }
+        for (cluster, id, score) in assignments {
+            if !score.is_finite()
+                || !revisions
+                    .iter()
+                    .any(|(source, revision)| source == id && revision.is_some())
+                || !targets
+                    .iter()
+                    .any(|t| t.id == *cluster && *score >= t.threshold)
+            {
+                return Err("invalid archive scoring result".into());
+            }
+            tx.execute("INSERT INTO smart_cluster_assignments(smart_cluster_id,screenshot_id,rerank_score)
+                VALUES(?1,?2,?3) ON CONFLICT(smart_cluster_id,screenshot_id) DO UPDATE SET rerank_score=excluded.rerank_score",
+                params![cluster,id,score]).map_err(|e| e.to_string())?;
+        }
+        let mut deleted = 0;
+        for (id, _) in revisions {
+            deleted += tx
+                .execute(
+                    "DELETE FROM smart_cluster_pending WHERE screenshot_id=?1",
+                    [id],
+                )
+                .map_err(|e| e.to_string())? as u64;
+        }
+        if let Some(execution) = execution {
+            execution.check()?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((deleted, assignments.len() as u64))
+    }
     // ------------------------------------------------------------------
     // CRUD on smart_clusters
     // ------------------------------------------------------------------
@@ -1201,6 +1295,127 @@ mod tests {
             ],
         )
         .expect("insert screenshot");
+    }
+
+    #[test]
+    fn archive_group_commit_fences_changed_sources_and_retries_the_whole_group() {
+        let (_temp, storage) = test_storage();
+        let cluster = insert_cluster(&storage, "receipts");
+        for id in [1, 2] {
+            insert_screenshot(&storage, id, "editor", "document");
+            storage.enqueue_smart_cluster_pending(id).unwrap();
+        }
+        let generation = storage.db_generation();
+        let targets = storage.list_smart_cluster_scoring_targets().unwrap();
+        let revisions = storage
+            .archive_scoring_source_revisions(generation, &[1, 2])
+            .unwrap();
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute(
+                "INSERT INTO screenshot_processing_revisions(screenshot_id,revision) VALUES(2,1)
+             ON CONFLICT(screenshot_id) DO UPDATE SET revision=revision+1",
+                [],
+            )
+            .unwrap();
+        let assignments = [(cluster, 1, 0.9), (cluster, 2, 0.8)];
+        assert!(storage
+            .commit_archive_scoring_group(generation, &revisions, &targets, &assignments, None)
+            .unwrap_err()
+            .contains("source changed"));
+        assert_eq!(storage.count_smart_cluster_pending().unwrap(), 2);
+        let assigned: i64 = storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM smart_cluster_assignments", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(assigned, 0);
+        let fresh = storage
+            .archive_scoring_source_revisions(generation, &[1, 2])
+            .unwrap();
+        assert_eq!(
+            storage
+                .commit_archive_scoring_group(generation, &fresh, &targets, &assignments, None)
+                .unwrap(),
+            (2, 2)
+        );
+        assert_eq!(storage.count_smart_cluster_pending().unwrap(), 0);
+    }
+
+    #[test]
+    fn empty_scoring_results_still_check_configuration_generation_and_cancellation() {
+        let (_temp, storage) = test_storage();
+        insert_screenshot(&storage, 1, "editor", "document");
+        storage.enqueue_smart_cluster_pending(1).unwrap();
+        let generation = storage.db_generation();
+        let revisions = storage
+            .archive_scoring_source_revisions(generation, &[1])
+            .unwrap();
+        let empty_targets = storage.list_smart_cluster_scoring_targets().unwrap();
+        insert_cluster(&storage, "added during scoring");
+        assert!(storage
+            .commit_archive_scoring_group(generation, &revisions, &empty_targets, &[], None)
+            .unwrap_err()
+            .contains("configuration changed"));
+        let current = storage.list_smart_cluster_scoring_targets().unwrap();
+        let lease = crate::background_policy::ExecutionLease::new(
+            "smart_cluster",
+            crate::background_policy::ExecutionProfile::Background,
+            20,
+        );
+        lease.revoke("foreground_request");
+        assert!(storage
+            .commit_archive_scoring_group(generation, &revisions, &current, &[], Some(&lease))
+            .unwrap_err()
+            .contains("foreground_request"));
+        storage.bump_db_generation();
+        assert!(storage
+            .commit_archive_scoring_group(generation, &revisions, &current, &[], None)
+            .unwrap_err()
+            .contains("database changed"));
+        assert_eq!(storage.count_smart_cluster_pending().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_restored_source_cannot_be_drained_as_an_empty_document() {
+        let (_temp, storage) = test_storage();
+        insert_screenshot(&storage, 1, "editor", "document");
+        storage.enqueue_smart_cluster_pending(1).unwrap();
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute("UPDATE screenshots SET is_deleted=1 WHERE id=1", [])
+            .unwrap();
+        let generation = storage.db_generation();
+        let revisions = storage
+            .archive_scoring_source_revisions(generation, &[1])
+            .unwrap();
+        assert_eq!(revisions, vec![(1, None)]);
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute("UPDATE screenshots SET is_deleted=0 WHERE id=1", [])
+            .unwrap();
+        assert!(storage
+            .commit_archive_scoring_group(generation, &revisions, &[], &[], None)
+            .unwrap_err()
+            .contains("source changed"));
+        assert_eq!(storage.count_smart_cluster_pending().unwrap(), 1);
     }
 
     #[test]

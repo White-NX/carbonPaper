@@ -452,6 +452,7 @@ class HotColdManager:
             raise ValueError("task vector upsert batch exceeds 128 records")
 
         ids, embeddings, metadatas, documents = [], [], [], []
+        revisions = []
         for record in records:
             doc_id = str(record.get("id", ""))
             if not doc_id.isdigit() or int(doc_id) <= 0 or str(int(doc_id)) != doc_id:
@@ -466,6 +467,10 @@ class HotColdManager:
             window_title = str(record.get("window_title", "") or "")
             category = str(record.get("category", "") or "")
             document = str(record.get("document", "") or "")
+            revision = record.get("source_revision")
+            if revision is not None and (type(revision) is not int or revision < 0):
+                raise ValueError("invalid task vector source revision")
+            revisions.append(revision)
             ids.append(doc_id)
             embeddings.append(vector.tolist())
             metadatas.append({
@@ -476,6 +481,8 @@ class HotColdManager:
                 "category": category,
                 "layer": "hot",
             })
+            if revision is not None:
+                metadatas[-1]["source_revision"] = revision
             documents.append(self._encrypt(document))
 
         # Bounded acquisition, on purpose. This method runs inside a named-pipe
@@ -494,12 +501,23 @@ class HotColdManager:
         try:
             if target is not None and str(self.hot_collection.id) != target:
                 raise RuntimeError("task vector collection changed; restart synchronization")
-            self.hot_collection.upsert(
-                ids=ids,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                documents=documents,
-            )
+            keep = list(range(len(ids)))
+            if any(revision is not None for revision in revisions):
+                # A delayed page may arrive after a newer MiniLM result. Check
+                # and upsert under the same manager lock; acknowledging an
+                # already superseded row is safe and lets the cursor advance.
+                existing = self.hot_collection.get(ids=ids, include=["metadatas"])
+                saved = dict(zip(existing.get("ids", []), existing.get("metadatas", [])))
+                keep = [i for i, doc_id in enumerate(ids)
+                        if revisions[i] is None or
+                        (saved.get(doc_id) or {}).get("source_revision", -1) <= revisions[i]]
+            if keep:
+                self.hot_collection.upsert(
+                    ids=[ids[i] for i in keep],
+                    embeddings=[embeddings[i] for i in keep],
+                    metadatas=[metadatas[i] for i in keep],
+                    documents=[documents[i] for i in keep],
+                )
         finally:
             self._lock.release()
         return len(ids)

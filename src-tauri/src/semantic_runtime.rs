@@ -155,6 +155,13 @@ unsafe impl Send for SemanticJobHandle {}
 unsafe impl Sync for SemanticJobHandle {}
 
 impl SemanticMlChild {
+    fn is_running(&self) -> bool {
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_wait()
+            .is_ok_and(|status| status.is_none())
+    }
     fn kill(&self) {
         let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
         let _ = child.kill();
@@ -198,7 +205,14 @@ impl SemanticMlChild {
 struct RequestCpuBudget(Arc<SemanticMlChild>);
 impl RequestCpuBudget {
     fn apply(process: Arc<SemanticMlChild>, percent: Option<u32>) -> Result<Self, String> {
-        set_cpu_rate(process._job.0, percent)?;
+        if let Err(error) = set_cpu_rate(process._job.0, percent) {
+            process.kill();
+            return Err(if percent.is_some() {
+                format!("background_paused: CPU budget unavailable: {error}")
+            } else {
+                error
+            });
+        }
         Ok(Self(process))
     }
 }
@@ -208,6 +222,21 @@ impl Drop for RequestCpuBudget {
             // A worker with an unknown execution configuration cannot be
             // handed to a foreground request.
             self.0.kill();
+        }
+    }
+}
+
+struct InFlightSemanticRequest {
+    process: Arc<SemanticMlChild>,
+    completed: bool,
+}
+
+impl Drop for InFlightSemanticRequest {
+    fn drop(&mut self) {
+        // Shutdown can drop the async supervisor while its blocking pipe reader
+        // is waiting. Stop that child before returning the slot to a successor.
+        if !self.completed {
+            self.process.kill();
         }
     }
 }
@@ -306,21 +335,9 @@ impl SemanticRuntimeState {
     /// Announce that a user-facing request wants the worker, for the whole of
     /// its queue-and-execute window.
     ///
-    /// The idle gate cannot serve this purpose. `idle.rs` polls
-    /// `GetLastInputInfo` every 10 s, so "the user came back" reaches a
-    /// background loop up to ten seconds late, while the search that follows
-    /// them coming back arrives within a second or two and has a 5 s budget
-    /// (`semantic_query.rs::QUERY_EMBED_TIMEOUT`) that starts counting the
-    /// moment it queues. Background work therefore needs a signal that a
-    /// foreground request exists *now*, which is what this is.
-    ///
-    /// Standing down is advisory and cooperative: the request in flight when the
-    /// lease is taken still runs to completion, because the worker executes a
-    /// request synchronously and nothing can interrupt it mid-inference. What
-    /// the lease buys is that no *further* background request is submitted, so
-    /// the longest a foreground caller waits is one background chunk rather than
-    /// a whole batch — which is why the background rerank chunk is small
-    /// ([`crate::rerank::BACKGROUND_RERANK_CHUNK`]).
+    /// Ordinary input leaves B eligible, while a foreground model request must
+    /// preempt either automatic profile. The request supervisor sends a scoped
+    /// cancellation immediately and enforces its 500 ms termination grace.
     ///
     /// **Every pass that drives the worker observes this, including the two the
     /// user started.** The idle loops were the obvious readers, but a manual
@@ -328,10 +345,8 @@ impl SemanticRuntimeState {
     /// requests against a single slot, so interleaving a reranked query with
     /// either of them buys a model eviction per chunk rather than a share of
     /// the worker — [`BACKGROUND_PASS_GUARD`] is where that cost is stated.
-    /// What differs between the readers is only what they do about it: an idle
-    /// pass ends, because its next tick is a minute away and nobody asked for
-    /// it; a user-initiated pass waits and resumes, because somebody pressed a
-    /// button. Neither of them keeps submitting.
+    /// Automatic passes return to the scheduler; user-initiated passes wait and
+    /// resume after the foreground request. Neither keeps submitting.
     pub fn foreground_lease(self: &Arc<Self>) -> ForegroundLease {
         self.foreground_waiting.fetch_add(1, Ordering::SeqCst);
         ForegroundLease {
@@ -643,7 +658,7 @@ impl SemanticRuntimeState {
                 expected_model_fingerprint(model),
                 size,
                 &format!(
-                    "cpu:batch={batch}:threads={}:opt={}:load={}",
+                    "cpu:spin0:batch={batch}:threads={}:opt={}:load={}",
                     std::env::var("CARBONPAPER_ONNX_INTRA_THREADS").unwrap_or_default(),
                     std::env::var("CARBONPAPER_ONNX_OPT_LEVEL").unwrap_or_default(),
                     std::env::var("CARBONPAPER_ONNX_LOAD_MODE").unwrap_or_default()
@@ -699,9 +714,13 @@ impl SemanticRuntimeState {
         let expected = expected_response(&request);
         let started = Instant::now();
         let process_for_request = process.clone();
+        let usage_before = process.usage();
+        let mut in_flight = InFlightSemanticRequest {
+            process: process.clone(),
+            completed: false,
+        };
         let mut task =
             tokio::task::spawn_blocking(move || process_for_request.request(&request, &body));
-        let usage_before = process.usage();
         let mut peak_private = usage_before.map_or(0, |u| u.private_bytes);
         let mut cancellation: Option<(Instant, String)> = None;
         let mut probe = tokio::time::interval(Duration::from_millis(25));
@@ -711,7 +730,7 @@ impl SemanticRuntimeState {
                     break result.map_err(|e| format!("worker_stopped: semantic request task failed: {e}"))?;
                 }
                 _ = probe.tick() => {
-                    if let Some(usage) = process.usage() { peak_private = peak_private.max(usage.private_bytes); }
+                    if let Some(usage) = process.usage() { peak_private = peak_private.max(usage.peak_since(usage_before)); }
                     if cancellation.is_none() {
                         let overrun = watch.lease.as_ref().is_some_and(|lease| lease.profile == ExecutionProfile::Background)
                             && started.elapsed() > Duration::from_millis(1500);
@@ -737,8 +756,9 @@ impl SemanticRuntimeState {
                 }
             }
         };
+        in_flight.completed = true;
         if let Some(usage) = process.usage() {
-            peak_private = peak_private.max(usage.private_bytes);
+            peak_private = peak_private.max(usage.peak_since(usage_before));
         }
         if let Some((_, error)) = cancellation {
             return Err(error);
@@ -748,6 +768,7 @@ impl SemanticRuntimeState {
             (&scheduler, cost_key, &watch.lease, &response)
         {
             if let Some(timings) = semantic_timings(response) {
+                lease.account_cpu(timings.cpu_ms);
                 let sample = CostSample {
                     elapsed_ms: (timings.request_total_ms - timings.model_load_ms).max(0.001),
                     cpu_ms: (timings.cpu_ms - timings.model_load_cpu_ms).max(0.0),
@@ -943,7 +964,7 @@ impl SemanticRuntimeState {
         {
             let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(process) = &inner.process {
-                if process.provider == provider {
+                if process.provider == provider && process.is_running() {
                     return Ok(process.clone());
                 }
             }
@@ -1158,14 +1179,16 @@ impl SemanticRuntimeState {
         {
             // Never wait behind an active request just to reclaim its model.
             if let Ok(_guard) = self.request_gate.try_lock() {
-                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if inner.process.is_none() || inner.loaded_model.is_none() {
-                    return;
-                }
-                let process = inner.process.take();
-                inner.loaded_model = None;
-                inner.state = "stopped".into();
-                drop(inner);
+                let process = {
+                    let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if inner.process.is_none() || inner.loaded_model.is_none() {
+                        return;
+                    }
+                    let process = inner.process.take();
+                    inner.loaded_model = None;
+                    inner.state = "stopped".into();
+                    process
+                };
                 if let Some(process) = process {
                     let _ = tokio::task::spawn_blocking(move || process.kill()).await;
                 }
@@ -1321,14 +1344,21 @@ async fn acquire_request_slot(
     deadline: Instant,
     request_id: u64,
 ) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
-    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), gate.lock())
-        .await
-        .map_err(|_| {
-            format!(
-                "timeout: semantic request {request_id} gave up waiting for the semantic worker \
+    let wait = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), gate.lock());
+    tokio::pin!(wait);
+    let result = loop {
+        background_policy::check_current()?;
+        tokio::select! {
+            result = &mut wait => break result,
+            _ = tokio::time::sleep(Duration::from_millis(25)), if background_policy::current_execution().is_some() => {}
+        }
+    };
+    result.map_err(|_| {
+        format!(
+            "timeout: semantic request {request_id} gave up waiting for the semantic worker \
                  to finish another request"
-            )
-        })
+        )
+    })
 }
 
 fn request_model(request: &MlRequest) -> Option<MlSemanticModel> {
@@ -1572,7 +1602,10 @@ pub(crate) fn is_deterministic_worker_failure(error: &str) -> bool {
 /// warm model. Worker-reported errors of the same kinds arrive as
 /// `MlResponse::Error` and never reach this classification.
 fn request_failure_requires_restart(kind: &str) -> bool {
-    !matches!(kind, "invalid_request" | "limit_exceeded")
+    !matches!(
+        kind,
+        "invalid_request" | "limit_exceeded" | "cancelled" | "background_paused"
+    )
 }
 
 fn truncate_error(error: &str) -> String {
@@ -1843,6 +1876,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_foreground_successor_observes_the_restored_native_job_budget() {
+        use windows::Win32::System::JobObjects::{
+            JobObjectCpuRateControlInformation, QueryInformationJobObject,
+            JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+        };
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Threading.Thread]::Sleep(10000)",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let job = assign_kill_on_close_job(&child).unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let process = Arc::new(SemanticMlChild {
+            provider: MlProvider::Cpu,
+            supported_models: Vec::new(),
+            child: Mutex::new(child),
+            stdin: Mutex::new(BufWriter::new(stdin)),
+            stdout: Mutex::new(BufReader::new(stdout)),
+            request_lock: Mutex::new(()),
+            _job: job,
+        });
+        let read_budget = || {
+            let mut info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+            // SAFETY: the live job and correctly sized output structure remain
+            // owned by this test for the duration of the query.
+            unsafe {
+                QueryInformationJobObject(
+                    process._job.0,
+                    JobObjectCpuRateControlInformation,
+                    &mut info as *mut _ as *mut _,
+                    std::mem::size_of_val(&info) as u32,
+                    None,
+                )
+                .unwrap();
+            }
+            info
+        };
+        let limited = RequestCpuBudget::apply(process.clone(), Some(5)).unwrap();
+        assert_ne!(read_budget().ControlFlags.0, 0);
+        // SAFETY: HARD_CAP uses the CpuRate member of this Win32 union.
+        assert_eq!(unsafe { read_budget().Anonymous.CpuRate }, 500);
+        drop(limited);
+        assert_eq!(read_budget().ControlFlags.0, 0);
+        assert!(!request_failure_requires_restart("cancelled"));
+        assert!(process.is_running());
+        drop(InFlightSemanticRequest {
+            process: process.clone(),
+            completed: false,
+        });
+        assert!(!process.is_running());
+    }
+
+    #[test]
     fn new_runtime_is_stopped_and_does_not_claim_a_provider() {
         let runtime = SemanticRuntimeState::new();
         let status = runtime.status();
@@ -2091,6 +2186,29 @@ mod tests {
         // A free gate is handed over without consuming any of the budget.
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(acquire_request_slot(&gate, deadline, 8).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_queued_request_leaves_the_slot_available_to_its_successor() {
+        let gate = tokio::sync::Mutex::new(());
+        let held = gate.lock().await;
+        let lease = ExecutionLease::new("semantic_index", ExecutionProfile::Background, 20);
+        let cancel = lease.clone();
+        let future = background_policy::EXECUTION.scope(
+            lease,
+            acquire_request_slot(&gate, Instant::now() + Duration::from_secs(30), 123),
+        );
+        let (result, ()) = tokio::join!(future, async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            cancel.revoke("foreground_request");
+        });
+        assert!(result.unwrap_err().contains("foreground_request"));
+        drop(held);
+        assert!(
+            acquire_request_slot(&gate, Instant::now() + Duration::from_secs(1), 124)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
