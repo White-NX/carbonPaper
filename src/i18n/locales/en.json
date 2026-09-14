@@ -1467,6 +1467,7 @@
     "noScreenshots": "No screenshots assigned",
     "noData": "Not enough data for clustering. Accumulate more snapshots and try again.",
     "modelMissing": "Clustering model (MiniLM-L12) not downloaded. Please download it in Settings > About.",
+    "clusteringFailed": "Could not organize tasks. Please try again.",
     "clusteringRangeScope": "The selected range",
     "clusteringAllScope": "All clusterable snapshots",
     "clusteringLargeRangeReason": "the clustering input contains many snapshots",

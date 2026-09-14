@@ -1467,6 +1467,7 @@
     "noScreenshots": "暂无关联快照",
     "noData": "没有足够的数据用于聚类，请积累更多快照后再试",
     "modelMissing": "聚类模型 (MiniLM-L12) 未下载，请在 设置 > 关于 中下载模型",
+    "clusteringFailed": "任务整理失败，请重试。",
     "clusteringRangeScope": "所选范围",
     "clusteringAllScope": "全部可聚类快照",
     "clusteringLargeRangeReason": "可聚类快照数量较多",

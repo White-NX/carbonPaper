@@ -134,11 +134,14 @@ export function useDelayedClusteringSetupRunner({
         });
       } catch (err) {
         console.error('Background clustering failed:', err);
+        const message = typeof err === 'string' ? err : err?.message;
         pushNotification({
           id: `clustering-error-${Date.now()}`,
           type: 'error',
           title: '任务聚类失败',
-          message: typeof err === 'string' ? err : (err?.message || '聚类过程中发生错误，请稍后在"任务"面板手动重试。'),
+          message: message && message !== 'CLUSTERING_FAILED'
+            ? message
+            : '聚类过程中发生错误，请稍后在"任务"面板手动重试。',
           details: typeof err === 'string' ? '' : (err?.stack || ''),
           timestamp: Date.now(),
         });

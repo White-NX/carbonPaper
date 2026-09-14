@@ -122,8 +122,10 @@ export async function runClustering({ startTime, endTime, clusteringMode, manual
     clusteringMode: clusteringMode || 'auto',
     manual,
   }), { autoPrompt: manual });
-  if (result && result.error) {
-    throw new Error(result.error);
+  // Python exceptions such as MemoryError can have an empty message.
+  if (result && Object.prototype.hasOwnProperty.call(result, 'error')) {
+    const message = typeof result.error === 'string' ? result.error : '';
+    throw new Error(message.trim() ? message : 'CLUSTERING_FAILED');
   }
   return result;
 }

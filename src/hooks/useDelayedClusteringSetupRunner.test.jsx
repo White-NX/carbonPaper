@@ -15,6 +15,7 @@ describe('useDelayedClusteringSetupRunner', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it('prompts for resource mode and reports degraded saved results', async () => {
@@ -132,6 +133,28 @@ describe('useDelayedClusteringSetupRunner', () => {
     expect(pushNotification).toHaveBeenCalledWith(expect.objectContaining({
       type: 'info',
       message: expect.stringContaining('后台整理队列'),
+    }));
+  });
+
+  it('shows a readable fallback when clustering has no error message', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    runClustering.mockRejectedValueOnce(new Error('CLUSTERING_FAILED'));
+    const pushNotification = vi.fn();
+    const { result } = renderHook(() => useDelayedClusteringSetupRunner({
+      delayMs: 10,
+      onClose: vi.fn(),
+      pushNotification,
+    }));
+
+    act(() => result.current(true));
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    expect(saveClusteringResults).not.toHaveBeenCalled();
+    expect(pushNotification).toHaveBeenLastCalledWith(expect.objectContaining({
+      type: 'error',
+      message: '聚类过程中发生错误，请稍后在"任务"面板手动重试。',
     }));
   });
 });

@@ -229,7 +229,9 @@ export function useFeaturesController({
       clusteringRetryOptions.current = null;
     } catch (err) {
       const msg = String(err?.message || err);
-      if (msg.includes('not found') || msg.includes('ModelNotAvailable') || msg.includes('not downloaded')) {
+      if (msg === 'CLUSTERING_FAILED') {
+        setClusteringError(t('tasks.clusteringFailed'));
+      } else if (msg.includes('not found') || msg.includes('ModelNotAvailable') || msg.includes('not downloaded')) {
         setClusteringError(t('tasks.modelMissing'));
       } else if (msg.includes('retry to resume') || msg.includes('retry clustering to resume')) {
         setClusteringError(t('settings.features.management.clustering.progress.interrupted'));
