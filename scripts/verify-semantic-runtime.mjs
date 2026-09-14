@@ -92,7 +92,7 @@ const expectedModels = ['bge_reranker_v2_m3', 'bge_small_zh', 'chinese_clip', 'm
 const supportedModels = [...(ready.supported_models ?? [])].sort();
 if (
   ready.status !== 'semantic_ready'
-  || ready.protocol_version !== 3
+  || ready.protocol_version !== 4
   || JSON.stringify(supportedModels) !== JSON.stringify(expectedModels)
 ) {
   child.kill();

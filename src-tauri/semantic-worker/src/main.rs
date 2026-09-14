@@ -1,13 +1,17 @@
 //! Isolated Rust semantic ONNX worker.
 
 #[allow(dead_code)]
-#[path = "../../src/ml_protocol.rs"]
-mod ml_protocol;
-#[allow(dead_code)]
 #[path = "../../src/clip_preprocess.rs"]
 mod clip_preprocess;
+#[allow(dead_code)]
+#[path = "../../src/ml_protocol.rs"]
+mod ml_protocol;
+#[path = "../../src/semantic_cancellation.rs"]
+mod semantic_cancellation;
 #[path = "../../src/semantic_engine.rs"]
 mod semantic_engine;
+#[path = "../../src/semantic_metrics.rs"]
+mod semantic_metrics;
 #[allow(dead_code)]
 #[path = "../../src/semantic_models.rs"]
 mod semantic_models;
@@ -18,6 +22,7 @@ use ml_protocol::{
 };
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 fn main() {
@@ -62,10 +67,28 @@ fn run() -> Result<(), String> {
         args.models_root,
         args.onnx_models_root,
     );
-    let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
     let mut writer = BufWriter::new(stdout.lock());
+    let registry = Arc::new(semantic_cancellation::CancellationRegistry::default());
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let controls = registry.clone();
+    std::thread::Builder::new()
+        .name("semantic-control-reader".into())
+        .spawn(move || {
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            while let Ok((request, body)) = read_request(&mut reader) {
+                if let MlRequest::Cancel { request_id } = request {
+                    controls.cancel(request_id);
+                    continue;
+                }
+                let control = controls.register(request.request_id());
+                if sender.send((request, body, control)).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| format!("failed to start semantic control reader: {e}"))?;
     write_response(
         &mut writer,
         &MlResponse::SemanticReady {
@@ -83,7 +106,7 @@ fn run() -> Result<(), String> {
     );
 
     loop {
-        let (request, body) = match read_request(&mut reader) {
+        let (request, body, control) = match receiver.recv() {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("[ML:SEMANTIC] request stream closed: {error}");
@@ -92,7 +115,15 @@ fn run() -> Result<(), String> {
         };
         let request_id = request.request_id();
         let request_started = Instant::now();
+        let cpu_started = semantic_metrics::cpu_ms();
+        engine.begin_request(control.clone());
+        if let Err(error) = control.check() {
+            write_semantic_error(&mut writer, request_id, error)?;
+            registry.finish(request_id);
+            continue;
+        }
         match request {
+            MlRequest::Cancel { .. } => unreachable!("control requests stay on the reader thread"),
             MlRequest::Ping { request_id } => {
                 write_response(&mut writer, &MlResponse::Pong { request_id })?;
             }
@@ -136,7 +167,9 @@ fn run() -> Result<(), String> {
                         token_type_ids: tokens.token_type_ids,
                     },
                 )?,
-                Err(error) => write_semantic_error(&mut writer, request_id, error)?,
+                Err(error) => {
+                    write_semantic_error(&mut writer, request_id, engine.request_error(error))?
+                }
             },
             MlRequest::EmbedText {
                 request_id,
@@ -145,7 +178,12 @@ fn run() -> Result<(), String> {
                 ..
             } => match engine.embed_text(model, &texts) {
                 Ok(result) => {
-                    let response_timings = timings(&result, request_started);
+                    if let Err(error) = control.check() {
+                        write_semantic_error(&mut writer, request_id, error)?;
+                        registry.finish(request_id);
+                        continue;
+                    }
+                    let response_timings = timings(&result, request_started, cpu_started);
                     write_response(
                         &mut writer,
                         &MlResponse::EmbeddingComplete {
@@ -157,7 +195,9 @@ fn run() -> Result<(), String> {
                         },
                     )?
                 }
-                Err(error) => write_semantic_error(&mut writer, request_id, error)?,
+                Err(error) => {
+                    write_semantic_error(&mut writer, request_id, engine.request_error(error))?
+                }
             },
             MlRequest::EmbedImage {
                 request_id,
@@ -166,7 +206,12 @@ fn run() -> Result<(), String> {
                 ..
             } => match engine.embed_image(model, &images, &body) {
                 Ok(result) => {
-                    let response_timings = timings(&result, request_started);
+                    if let Err(error) = control.check() {
+                        write_semantic_error(&mut writer, request_id, error)?;
+                        registry.finish(request_id);
+                        continue;
+                    }
+                    let response_timings = timings(&result, request_started, cpu_started);
                     write_response(
                         &mut writer,
                         &MlResponse::EmbeddingComplete {
@@ -178,7 +223,9 @@ fn run() -> Result<(), String> {
                         },
                     )?
                 }
-                Err(error) => write_semantic_error(&mut writer, request_id, error)?,
+                Err(error) => {
+                    write_semantic_error(&mut writer, request_id, engine.request_error(error))?
+                }
             },
             MlRequest::Rerank {
                 request_id,
@@ -188,7 +235,12 @@ fn run() -> Result<(), String> {
                 ..
             } => match engine.rerank(model, &query, &documents) {
                 Ok(result) => {
-                    let response_timings = timings(&result, request_started);
+                    if let Err(error) = control.check() {
+                        write_semantic_error(&mut writer, request_id, error)?;
+                        registry.finish(request_id);
+                        continue;
+                    }
+                    let response_timings = timings(&result, request_started, cpu_started);
                     write_response(
                         &mut writer,
                         &MlResponse::RerankComplete {
@@ -199,7 +251,9 @@ fn run() -> Result<(), String> {
                         },
                     )?
                 }
-                Err(error) => write_semantic_error(&mut writer, request_id, error)?,
+                Err(error) => {
+                    write_semantic_error(&mut writer, request_id, engine.request_error(error))?
+                }
             },
             MlRequest::Ocr { .. } => write_semantic_error(
                 &mut writer,
@@ -207,6 +261,7 @@ fn run() -> Result<(), String> {
                 "invalid_request: OCR request was sent to the semantic worker".to_string(),
             )?,
         }
+        registry.finish(request_id);
     }
     engine.unload();
     eprintln!("[ML:SEMANTIC] worker stopped");
@@ -216,12 +271,15 @@ fn run() -> Result<(), String> {
 fn timings<T>(
     result: &semantic_engine::SemanticInference<T>,
     request_started: Instant,
+    cpu_started: f64,
 ) -> MlSemanticTimings {
     MlSemanticTimings {
         model_load_ms: result.model_load_ms,
         preprocess_ms: result.preprocess_ms,
         inference_ms: result.inference_ms,
         request_total_ms: request_started.elapsed().as_secs_f64() * 1000.0,
+        cpu_ms: semantic_metrics::cpu_ms() - cpu_started,
+        model_load_cpu_ms: result.model_load_cpu_ms,
     }
 }
 

@@ -11,6 +11,7 @@ hex = "0.4"
 image = { version = "0.25", default-features = false }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "directml", "api-24"] }
 tokenizers = { version = "=0.21.4", default-features = false, features = ["fancy-regex"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "warn"

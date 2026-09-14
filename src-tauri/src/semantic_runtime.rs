@@ -3,6 +3,11 @@
 //! This state is intentionally separate from `MlRuntimeState`: semantic inference never
 //! shares the OCR queue, process, watchdog, or failure domain.
 
+use crate::background_policy::{
+    self, CostSample, ExecutionLease, ExecutionProfile, CPU_RATE_PERCENT,
+};
+use crate::background_resources::{process_usage, set_cpu_rate};
+use crate::background_scheduler::BackgroundSchedulerState;
 use crate::ml_protocol::{
     read_response, write_request, MlImageInput, MlProvider, MlRequest, MlResponse, MlSemanticModel,
     MlSemanticTimings, ML_PROTOCOL_VERSION,
@@ -30,7 +35,7 @@ use windows::Win32::System::JobObjects::{
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const CANCEL_GRACE: Duration = Duration::from_secs(2);
+const CANCEL_GRACE: Duration = Duration::from_millis(500);
 /// Deadline for releasing the resident model. Short on purpose: the worker only
 /// has to drop a session, and a background pass that has already finished its
 /// work must not sit waiting on the cleanup.
@@ -171,6 +176,63 @@ impl SemanticMlChild {
             .unwrap_or_else(|error| error.into_inner());
         read_response(&mut *stdout)
     }
+
+    fn cancel(&self, request_id: u64) -> Result<(), String> {
+        // Control writes deliberately bypass request_lock and stdout. The
+        // worker's reader consumes them while the execution thread is in ORT.
+        write_request(
+            &mut *self.stdin.lock().unwrap_or_else(|e| e.into_inner()),
+            &MlRequest::Cancel { request_id },
+            &[],
+        )
+    }
+
+    fn usage(&self) -> Option<crate::background_resources::ProcessUsage> {
+        let child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        process_usage(HANDLE(child.as_raw_handle()))
+    }
+}
+
+/// This guard lives inside the request gate, including the cancel grace period.
+/// Foreground and capture-classification requests always see the restored cap.
+struct RequestCpuBudget(Arc<SemanticMlChild>);
+impl RequestCpuBudget {
+    fn apply(process: Arc<SemanticMlChild>, percent: Option<u32>) -> Result<Self, String> {
+        set_cpu_rate(process._job.0, percent)?;
+        Ok(Self(process))
+    }
+}
+impl Drop for RequestCpuBudget {
+    fn drop(&mut self) {
+        if set_cpu_rate(self.0._job.0, None).is_err() {
+            // A worker with an unknown execution configuration cannot be
+            // handed to a foreground request.
+            self.0.kill();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RequestWatch {
+    deadline: Instant,
+    lease: Option<Arc<ExecutionLease>>,
+}
+impl RequestWatch {
+    fn check(&self, runtime: &SemanticRuntimeState) -> Result<(), String> {
+        if let Some(lease) = &self.lease {
+            if runtime.foreground_waiting() {
+                lease.revoke("foreground_request");
+            }
+            if runtime.external_background_waiting() {
+                lease.revoke("external_background_request");
+            }
+            lease.check()?;
+        }
+        if Instant::now() >= self.deadline {
+            return Err("timeout: semantic request deadline reached".into());
+        }
+        Ok(())
+    }
 }
 
 struct SemanticRuntimeInner {
@@ -188,6 +250,7 @@ struct SemanticRuntimeInner {
     last_error: Option<String>,
     last_elapsed_ms: Option<f64>,
     directml_disabled_for_session: bool,
+    last_used: Instant,
 }
 
 pub struct SemanticRuntimeState {
@@ -230,6 +293,7 @@ impl SemanticRuntimeState {
                 last_error: None,
                 last_elapsed_ms: None,
                 directml_disabled_for_session: false,
+                last_used: Instant::now(),
             }),
             lifecycle_lock: Mutex::new(()),
             request_gate: tokio::sync::Mutex::new(()),
@@ -464,13 +528,16 @@ impl SemanticRuntimeState {
         // materially longer than its own timeout. It is computed before the gate
         // is taken because the wait for the gate is the longest of those steps.
         let deadline = Instant::now() + timeout;
+        background_policy::check_current()?;
         let _request_guard =
             acquire_request_slot(&self.request_gate, deadline, request.request_id()).await?;
         // Re-read game mode after waiting for the single request slot. A BGE
         // chunk can queue while another model is running, and suppression may
         // begin during that wait. Using the earlier value here could start a
         // fresh DirectML worker after game mode had already taken the GPU back.
-        let prefer_directml = directml_allowed_for_request(&app, prefer_directml);
+        background_policy::check_current()?;
+        let prefer_directml = background_policy::current_execution().is_none()
+            && directml_allowed_for_request(&app, prefer_directml);
         let model = request_model(&request);
         let mut provider = match self.select_provider(&app, prefer_directml, model).await {
             Ok(provider) => provider,
@@ -562,6 +629,37 @@ impl SemanticRuntimeState {
         deadline: Instant,
     ) -> Result<MlResponse, String> {
         let request_id = request.request_id();
+        let watch = RequestWatch {
+            deadline,
+            lease: background_policy::current_execution(),
+        };
+        watch.check(self)?;
+        let scheduler = app.try_state::<Arc<BackgroundSchedulerState>>();
+        let cost_key = scheduler.as_ref().and_then(|scheduler| {
+            let model = request_model(&request)?;
+            let (operation, size, batch) = request_work_size(&request)?;
+            scheduler.operation_key(
+                operation,
+                expected_model_fingerprint(model),
+                size,
+                &format!(
+                    "cpu:batch={batch}:threads={}:opt={}:load={}",
+                    std::env::var("CARBONPAPER_ONNX_INTRA_THREADS").unwrap_or_default(),
+                    std::env::var("CARBONPAPER_ONNX_OPT_LEVEL").unwrap_or_default(),
+                    std::env::var("CARBONPAPER_ONNX_LOAD_MODE").unwrap_or_default()
+                ),
+            )
+        });
+        if let (Some(scheduler), Some(key)) = (&scheduler, &cost_key) {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let cold = inner.loaded_model != request_model(&request)
+                || inner
+                    .process
+                    .as_ref()
+                    .is_none_or(|p| p.provider != provider);
+            drop(inner);
+            scheduler.admit_operation(key, cold, false)?;
+        }
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Err(format!(
                 "timeout: semantic request {request_id} has no remaining budget for {provider:?}"
@@ -569,11 +667,17 @@ impl SemanticRuntimeState {
         }
         let state_for_start = self.clone();
         let app_for_start = app.clone();
+        let startup_watch = watch.clone();
         let process = tokio::task::spawn_blocking(move || {
-            state_for_start.ensure_process(&app_for_start, provider)
+            state_for_start.ensure_process_watched(&app_for_start, provider, Some(&startup_watch))
         })
         .await
         .map_err(|error| format!("worker_stopped: semantic startup task failed: {error}"))??;
+        watch.check(self)?;
+        let _cpu_budget = RequestCpuBudget::apply(
+            process.clone(),
+            watch.lease.as_ref().map(|_| CPU_RATE_PERCENT),
+        )?;
         let request_model = request_model(&request);
         if let Some(model) = request_model {
             if !process.supported_models.contains(&model) {
@@ -595,22 +699,77 @@ impl SemanticRuntimeState {
         let expected = expected_response(&request);
         let started = Instant::now();
         let process_for_request = process.clone();
-        let task =
+        let mut task =
             tokio::task::spawn_blocking(move || process_for_request.request(&request, &body));
-        let response = match tokio::time::timeout(remaining + CANCEL_GRACE, task).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => Err(format!(
-                "worker_stopped: semantic request task failed: {error}"
-            )),
-            Err(_) => {
-                process.kill();
-                self.clear_process("timeout", "semantic worker exceeded deadline");
-                Err(format!(
-                    "timeout: semantic request {request_id} exceeded {} ms plus grace",
-                    remaining.as_millis()
-                ))
+        let usage_before = process.usage();
+        let mut peak_private = usage_before.map_or(0, |u| u.private_bytes);
+        let mut cancellation: Option<(Instant, String)> = None;
+        let mut probe = tokio::time::interval(Duration::from_millis(25));
+        let response = loop {
+            tokio::select! {
+                result = &mut task => {
+                    break result.map_err(|e| format!("worker_stopped: semantic request task failed: {e}"))?;
+                }
+                _ = probe.tick() => {
+                    if let Some(usage) = process.usage() { peak_private = peak_private.max(usage.private_bytes); }
+                    if cancellation.is_none() {
+                        let overrun = watch.lease.as_ref().is_some_and(|lease| lease.profile == ExecutionProfile::Background)
+                            && started.elapsed() > Duration::from_millis(1500);
+                        let error = watch.check(self).err().or_else(|| overrun.then(|| {
+                            if let (Some(scheduler), Some(key)) = (&scheduler, &cost_key) { scheduler.revoke_cost(key); }
+                            if let Some(lease) = &watch.lease { lease.revoke("cost_overrun"); }
+                            "background_paused: cost_overrun".into()
+                        }));
+                        if let Some(error) = error {
+                            cancellation = Some((Instant::now(), error));
+                            let target = process.clone();
+                            tokio::task::spawn_blocking(move || { let _ = target.cancel(request_id); });
+                        }
+                    }
+                    if cancellation.as_ref().is_some_and(|(at, _)| at.elapsed() >= CANCEL_GRACE) {
+                        process.kill();
+                        self.clear_cancelled_process(&process);
+                        // Drain the exact request's reader before releasing the
+                        // slot. Late cancellation never owns a later request.
+                        let _ = (&mut task).await;
+                        break Err(cancellation.as_ref().unwrap().1.clone());
+                    }
+                }
             }
         };
+        if let Some(usage) = process.usage() {
+            peak_private = peak_private.max(usage.private_bytes);
+        }
+        if let Some((_, error)) = cancellation {
+            return Err(error);
+        }
+        watch.check(self)?;
+        if let (Some(scheduler), Some(key), Some(lease), Ok(response)) =
+            (&scheduler, cost_key, &watch.lease, &response)
+        {
+            if let Some(timings) = semantic_timings(response) {
+                let sample = CostSample {
+                    elapsed_ms: (timings.request_total_ms - timings.model_load_ms).max(0.001),
+                    cpu_ms: (timings.cpu_ms - timings.model_load_cpu_ms).max(0.0),
+                    peak_private_bytes: peak_private,
+                    additional_peak_bytes: peak_private
+                        .saturating_sub(usage_before.map_or(0, |u| u.private_bytes)),
+                    cpu_rate_percent: CPU_RATE_PERCENT,
+                };
+                if timings.model_load_ms > 0.0 {
+                    scheduler.record_cost(
+                        key.cold(),
+                        CostSample {
+                            elapsed_ms: timings.model_load_ms,
+                            cpu_ms: timings.model_load_cpu_ms,
+                            ..sample.clone()
+                        },
+                        lease.profile,
+                    );
+                }
+                scheduler.record_cost(key, sample, lease.profile);
+            }
+        }
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         match response {
             Ok(MlResponse::Error {
@@ -619,7 +778,9 @@ impl SemanticRuntimeState {
                 message,
             }) if response_id == request_id => {
                 let error = format!("{kind}: {message}");
-                self.record_failure(&kind, &message, elapsed_ms);
+                if kind != "cancelled" {
+                    self.record_failure(&kind, &message, elapsed_ms);
+                }
                 Err(error)
             }
             Ok(response)
@@ -753,6 +914,18 @@ impl SemanticRuntimeState {
         app: &AppHandle,
         requested_provider: MlProvider,
     ) -> Result<Arc<SemanticMlChild>, String> {
+        self.ensure_process_watched(app, requested_provider, None)
+    }
+
+    fn ensure_process_watched(
+        &self,
+        app: &AppHandle,
+        requested_provider: MlProvider,
+        watch: Option<&RequestWatch>,
+    ) -> Result<Arc<SemanticMlChild>, String> {
+        if let Some(watch) = watch {
+            watch.check(self)?;
+        }
         let _guard = self
             .lifecycle_lock
             .lock()
@@ -776,20 +949,25 @@ impl SemanticRuntimeState {
             }
         }
         self.stop_locked();
-        self.start_process(app, provider)
+        self.start_process(app, provider, watch)
     }
 
     fn start_process(
         &self,
         app: &AppHandle,
         provider: MlProvider,
+        watch: Option<&RequestWatch>,
     ) -> Result<Arc<SemanticMlChild>, String> {
         self.inner
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .state = "starting".to_string();
-        let result = self.start_process_inner(app, provider);
+        let result = self.start_process_inner(app, provider, watch);
         if let Err(error) = &result {
+            if background_policy::is_pause(error) {
+                self.inner.lock().unwrap_or_else(|e| e.into_inner()).state = "stopped".into();
+                return result;
+            }
             let (kind, message) = split_error(error);
             let mut inner = self
                 .inner
@@ -809,6 +987,7 @@ impl SemanticRuntimeState {
         &self,
         app: &AppHandle,
         provider: MlProvider,
+        watch: Option<&RequestWatch>,
     ) -> Result<Arc<SemanticMlChild>, String> {
         let executable = resolve_semantic_executable(app)?;
         let ort_dylib = resolve_ort_dylib(app, &executable)?;
@@ -850,6 +1029,9 @@ impl SemanticRuntimeState {
             .map_err(|error| format!("worker_stopped: failed to start semantic worker: {error}"))?;
         let mut pending = PendingSemanticChild::new(child);
         let job = assign_kill_on_close_job(pending.child())?;
+        if watch.is_some_and(|w| w.lease.is_some()) {
+            set_cpu_rate(job.0, Some(CPU_RATE_PERCENT))?;
+        }
         let stdin = pending
             .child_mut()
             .stdin
@@ -881,9 +1063,20 @@ impl SemanticRuntimeState {
                 let _ = sender.send((ready, reader));
             })
             .map_err(|error| format!("worker_stopped: failed to start handshake: {error}"))?;
-        let (ready, stdout) = receiver
-            .recv_timeout(STARTUP_TIMEOUT)
-            .map_err(|_| "timeout: semantic worker startup timed out".to_string())?;
+        let started = Instant::now();
+        let (ready, stdout) = loop {
+            if let Some(watch) = watch {
+                watch.check(self)?;
+            }
+            if started.elapsed() >= STARTUP_TIMEOUT {
+                return Err("timeout: semantic worker startup timed out".into());
+            }
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(ready) => break ready,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => return Err("worker_stopped: semantic handshake disconnected".into()),
+            }
+        };
         match ready {
             Ok(MlResponse::SemanticReady {
                 protocol_version,
@@ -935,6 +1128,50 @@ impl SemanticRuntimeState {
         inner.last_error_kind = None;
         inner.last_error = None;
         inner.last_elapsed_ms = Some(elapsed_ms);
+        inner.last_used = Instant::now();
+    }
+
+    fn clear_cancelled_process(&self, target: &Arc<SemanticMlChild>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner
+            .process
+            .as_ref()
+            .is_some_and(|process| Arc::ptr_eq(process, target))
+        {
+            inner.process = None;
+            inner.loaded_model = None;
+            inner.state = "stopped".into();
+        }
+    }
+
+    pub async fn reclaim_idle_model(self: &Arc<Self>, app: AppHandle, memory_pressure: bool) {
+        let idle = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_used
+            .elapsed()
+            >= Duration::from_secs(300);
+        if (idle || memory_pressure)
+            && !self.foreground_waiting()
+            && !self.external_background_waiting()
+        {
+            // Never wait behind an active request just to reclaim its model.
+            if let Ok(_guard) = self.request_gate.try_lock() {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if inner.process.is_none() || inner.loaded_model.is_none() {
+                    return;
+                }
+                let process = inner.process.take();
+                inner.loaded_model = None;
+                inner.state = "stopped".into();
+                drop(inner);
+                if let Some(process) = process {
+                    let _ = tokio::task::spawn_blocking(move || process.kill()).await;
+                }
+            }
+        }
+        let _ = app;
     }
 
     fn record_failure(&self, kind: &str, message: &str, elapsed_ms: f64) {
@@ -1105,13 +1342,51 @@ fn request_model(request: &MlRequest) -> Option<MlSemanticModel> {
     }
 }
 
+fn request_work_size(request: &MlRequest) -> Option<(&'static str, u64, usize)> {
+    match request {
+        MlRequest::EmbedText { texts, .. } => Some((
+            "embed_text",
+            texts.iter().map(|t| t.len() as u64).sum(),
+            texts.len(),
+        )),
+        MlRequest::EmbedImage { images, .. } => Some((
+            "embed_image",
+            images
+                .iter()
+                .map(|i| u64::from(i.width) * u64::from(i.height))
+                .sum(),
+            images.len(),
+        )),
+        MlRequest::Rerank {
+            query, documents, ..
+        } => Some((
+            "rerank",
+            documents
+                .iter()
+                .map(|d| (d.len() + query.len()) as u64)
+                .sum(),
+            documents.len(),
+        )),
+        _ => None,
+    }
+}
+
+fn semantic_timings(response: &MlResponse) -> Option<&MlSemanticTimings> {
+    match response {
+        MlResponse::EmbeddingComplete { timings, .. }
+        | MlResponse::RerankComplete { timings, .. } => Some(timings),
+        _ => None,
+    }
+}
+
 fn set_request_timeout(request: &mut MlRequest, timeout: Duration) {
     match request {
         MlRequest::Ocr { timeout_ms, .. }
         | MlRequest::EmbedText { timeout_ms, .. }
         | MlRequest::EmbedImage { timeout_ms, .. }
         | MlRequest::Rerank { timeout_ms, .. } => *timeout_ms = duration_ms(timeout),
-        MlRequest::Ping { .. }
+        MlRequest::Cancel { .. }
+        | MlRequest::Ping { .. }
         | MlRequest::InspectTokenization { .. }
         | MlRequest::SemanticStatus { .. }
         | MlRequest::Unload { .. }
@@ -1133,6 +1408,7 @@ enum ExpectedResponse {
 
 fn expected_response(request: &MlRequest) -> ExpectedResponse {
     match request {
+        MlRequest::Cancel { .. } => unreachable!("control requests have no response frame"),
         MlRequest::Ping { .. } => ExpectedResponse::Pong,
         MlRequest::Ocr { .. } => ExpectedResponse::Ocr,
         MlRequest::EmbedText { .. } | MlRequest::EmbedImage { .. } => ExpectedResponse::Embedding,
@@ -1739,6 +2015,8 @@ mod tests {
             preprocess_ms: 0.0,
             inference_ms: 0.0,
             request_total_ms: 0.0,
+            cpu_ms: 0.0,
+            model_load_cpu_ms: 0.0,
         };
 
         let matching = MlResponse::EmbeddingComplete {
