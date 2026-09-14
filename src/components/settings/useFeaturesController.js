@@ -14,6 +14,8 @@ export function useFeaturesController({
 }) {
   const [config, setConfig] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [backgroundTimingSaving, setBackgroundTimingSaving] = useState(false);
+  const [backgroundTimingError, setBackgroundTimingError] = useState(false);
   const [clusteringDropdownOpen, setClusteringDropdownOpen] = useState(false);
   const [clusteringAdvancedOpen, setClusteringAdvancedOpen] = useState(false);
   const [clusteringRunning, setClusteringRunning] = useState(false);
@@ -118,6 +120,23 @@ export function useFeaturesController({
       ...config,
       [key]: !config[key],
     });
+  };
+
+  const handleBackgroundTimingChange = async (mode) => {
+    if (!config || backgroundTimingSaving || !['auto', 'idle_only'].includes(mode)) return;
+    setBackgroundTimingSaving(true);
+    setBackgroundTimingError(false);
+    try {
+      await withAuth(() => invoke('set_advanced_config', {
+        config: { background_scheduling_mode: mode },
+      }), { autoPrompt: true });
+      setConfig((current) => ({ ...current, background_scheduling_mode: mode }));
+    } catch (error) {
+      setBackgroundTimingError(true);
+      console.warn('Failed to save background timing:', error);
+    } finally {
+      setBackgroundTimingSaving(false);
+    }
   };
 
   const handleClusteringIntervalChange = async (interval) => {
@@ -334,6 +353,9 @@ export function useFeaturesController({
     handleFeatureModeChange,
     handleCustomFeatureToggle,
     handleClusteringIntervalChange,
+    handleBackgroundTimingChange,
+    backgroundTimingSaving,
+    backgroundTimingError,
     handleRunClustering,
     clearClusteringError: () => setClusteringError(null),
     clearClusteringNotice: () => setClusteringNotice(null),

@@ -7,8 +7,8 @@ symbol names are the durable references; line numbers are intentionally omitted.
 ## Source Snapshot
 
 - Repository: `D:\projects\carbonPaper\carbonPaper`
-- Branch: `feat/rust-task-vectors-classification`
-- Implementation baseline: `693d45a` (task-vector synchronization).
+- Branch: `feat/adaptive-background-scheduling`
+- Implementation baseline: `ed55d73` (merged Rust task-vector synchronization and classification).
 - Application manifest version: `0.8.5`; the repository also has a `v0.8.5` tag.
 - The earlier inference cleanup was committed as `62eb619`.
 - This page includes the native classification changes committed alongside this
@@ -36,6 +36,19 @@ The August release checks remain historical evidence for that cleanup. New
 consumer migrations require their own validation.
 
 ## Current Target: Remaining Python Consumers
+
+Rust automatic work now uses A (60 seconds without input) and locally qualified,
+CPU-budgeted B during ordinary use. MiniLM, CLIP, Smart Cluster, task-vector
+projection and the resumable ANN task use independent admission and cancellation
+boundaries. ANN input pages and complete checkpoints survive restarts without a
+long capture-pause window. Details and repeatable checks are in
+[Adaptive background scheduling](adaptive-background-scheduling.md).
+
+Python still owns full task clustering and its remaining Chroma consumer. Its
+automatic full-clustering entrance remains **1800 seconds** of idle time; it has
+not become a preemptible B task. Rust projects one acknowledged vector unit at a
+time before that consumer runs. ML worker protocol 4 supplies request-level
+cancellation and uses the same shared semantic worker for foreground requests.
 
 The cleanup keeps these four goals:
 
@@ -326,3 +339,4 @@ The current implementation is backed by these source areas:
 | --- | --- | --- |
 | 2026-08-20 | `24a09f3` plus the dirty branch working tree | Rebased the roadmap on the passed v0.8.4 gates, documented the v0.8.5 Beta ownership boundary, recorded the successful Rust, Python, frontend, security, and release-build checks, and limited the migration claim to the automated contracts that were actually run. |
 | 2026-09-14 | `693d45a` plus the native classification change committed with this page | Recorded Rust task-vector reconciliation, native classification and feedback ownership, retained Python consumers, and the validation for both batches. |
+| 2026-09-15 | `feat/adaptive-background-scheduling` | Added A/B scheduling, task-specific local qualification, request cancellation, resumable ANN checkpoints and source-versioned vector projection. Retained the 1800-second Python full-clustering gate. See [adaptive scheduling](adaptive-background-scheduling.md) for measurements and acceptance limits. |

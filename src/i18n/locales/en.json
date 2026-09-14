@@ -311,7 +311,17 @@
           "disabled": "Task grouping is off",
           "organizing": "Organizing",
           "preparing": "Preparing records"
-        }
+        },
+        "diagnostics": "Scheduling diagnostics",
+        "profile": "Execution profile",
+        "waitReason": "Waiting reason",
+        "pauses": "Pauses",
+        "yieldLatency": "Last yield latency",
+        "task": "Task",
+        "eligible": "Run during use",
+        "backlogAge": "Backlog age",
+        "verified": "Verified",
+        "pendingEvaluation": "Awaiting evaluation"
       },
       "clustering": {
         "title": "Task Clustering",
@@ -923,6 +933,14 @@
           "ocr": "Text recognition (OCR)",
           "legacy_ocr_cache": "Legacy OCR cache"
         }
+      },
+      "backgroundTiming": {
+        "title": "Background processing",
+        "auto": "Automatic",
+        "idleOnly": "Only when idle",
+        "autoDescription": "Organize records while connected to power, based on available resources.",
+        "idleDescription": "Organize records after one minute without input while connected to power.",
+        "saveError": "Could not save. Please try again."
       }
     }
   },

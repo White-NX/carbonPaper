@@ -162,6 +162,9 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let clustering_allow_full_low_memory =
         registry_config::get_bool("clustering_allow_full_low_memory").unwrap_or(false);
     let network_enabled = registry_config::get_bool("network_enabled").unwrap_or(true);
+    let background_scheduling_mode = registry_config::get_string("background_scheduling_mode")
+        .filter(|v| matches!(v.as_str(), "auto" | "idle_only"))
+        .unwrap_or_else(|| "auto".into());
 
     let config = serde_json::json!({
         "cpu_limit_enabled": cpu_limit_enabled,
@@ -176,6 +179,7 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "smart_cluster_enabled": smart_cluster_enabled,
         "clustering_allow_full_low_memory": clustering_allow_full_low_memory,
         "network_enabled": network_enabled,
+        "background_scheduling_mode": background_scheduling_mode,
     });
     Ok(config)
 }
@@ -186,10 +190,19 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
 /// Frontend: settings controllers.
 #[tauri::command]
 pub fn set_advanced_config(
+    app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     config: serde_json::Value,
 ) -> Result<(), String> {
     crate::commands::check_auth_required(&credential_state)?;
+    // Validate the whole new field before applying any partial configuration.
+    if let Some(value) = config.get("background_scheduling_mode") {
+        let value = value
+            .as_str()
+            .ok_or("background_scheduling_mode must be a string")?;
+        crate::background_policy::SchedulingMode::parse(value)?;
+        registry_config::set_string("background_scheduling_mode", value)?;
+    }
     if let Some(v) = config.get("cpu_limit_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("cpu_limit_enabled", v)?;
     }
@@ -235,6 +248,11 @@ pub fn set_advanced_config(
     }
     if let Some(v) = config.get("network_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("network_enabled", v)?;
+    }
+    if let Some(scheduler) =
+        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+    {
+        scheduler.wake();
     }
     Ok(())
 }
