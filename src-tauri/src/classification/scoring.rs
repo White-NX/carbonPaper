@@ -507,6 +507,14 @@ impl Classifier {
         })
     }
 
+    fn matches_text(anchor: &Anchor, text: &str, scope: &str, process: &str) -> bool {
+        anchor.text == text
+            && anchor.scope.to_lowercase() == scope
+            && (scope != "local"
+                || normalize_process(anchor.process_name.as_deref().unwrap_or(""))
+                    == normalize_process(process))
+    }
+
     fn remove_text(
         anchors: &mut Anchors,
         category: &str,
@@ -518,18 +526,30 @@ impl Classifier {
             return false;
         };
         let before = rows.len();
-        rows.retain(|a| {
-            !(a.text == text
-                && a.scope.to_lowercase() == scope
-                && (scope != "local"
-                    || normalize_process(a.process_name.as_deref().unwrap_or(""))
-                        == normalize_process(process)))
-        });
+        rows.retain(|a| !Self::matches_text(a, text, scope, process));
         let removed = rows.len() != before;
         if rows.is_empty() {
             anchors.shift_remove(category);
         }
         removed
+    }
+
+    fn add_anchor(
+        anchors: &mut Anchors,
+        additions: &mut Vec<IndexedAnchor>,
+        category: &str,
+        anchor: Anchor,
+        vector: Vec<f32>,
+    ) {
+        anchors
+            .entry(category.into())
+            .or_default()
+            .push(anchor.clone());
+        additions.push(IndexedAnchor {
+            category: category.into(),
+            anchor,
+            vector,
+        });
     }
 
     pub async fn learn<E: TextEncoder>(
@@ -547,12 +567,21 @@ impl Classifier {
         }
         self.ensure_index(encoder).await?;
         let mut anchors = self.anchors.clone();
+        let mut additions = Vec::new();
         let process = input.process_name.trim();
+        let mut removed = None;
         if let Some(old) = old_category.filter(|old| *old != category && *old != "未分类") {
-            let removed = (!process.is_empty()
-                && Self::remove_text(&mut anchors, old, &input.title, "local", process))
-                || Self::remove_text(&mut anchors, old, &input.title, "global", process);
-            result["negative_removed"] = json!(removed);
+            let scope = if !process.is_empty()
+                && Self::remove_text(&mut anchors, old, &input.title, "local", process)
+            {
+                Some("local")
+            } else if Self::remove_text(&mut anchors, old, &input.title, "global", process) {
+                Some("global")
+            } else {
+                None
+            };
+            removed = scope.map(|scope| (old, scope));
+            result["negative_removed"] = json!(removed.is_some());
         }
         let title_vector = self.encode_one(encoder, &input.title).await?;
         let clean_title = strip_app_suffix(&input.title, process);
@@ -565,16 +594,19 @@ impl Classifier {
             if self.duplicate(category, &title_vector, true, process) {
                 result["title_local_dedup"] = json!(true);
             } else {
-                anchors
-                    .entry(category.into())
-                    .or_default()
-                    .push(Anchor::new(
+                Self::add_anchor(
+                    &mut anchors,
+                    &mut additions,
+                    category,
+                    Anchor::new(
                         input.title.clone(),
                         "user_feedback",
                         2.0,
                         "local",
                         Some(process.into()),
-                    ));
+                    ),
+                    title_vector.clone(),
+                );
                 result["title_local_added"] = json!(true);
             }
         }
@@ -582,16 +614,13 @@ impl Classifier {
             if self.duplicate(category, &clean_vector, false, "") {
                 result["title_global_dedup"] = json!(true);
             } else {
-                anchors
-                    .entry(category.into())
-                    .or_default()
-                    .push(Anchor::new(
-                        clean_title,
-                        "user_feedback",
-                        2.0,
-                        "global",
-                        None,
-                    ));
+                Self::add_anchor(
+                    &mut anchors,
+                    &mut additions,
+                    category,
+                    Anchor::new(clean_title, "user_feedback", 2.0, "global", None),
+                    clean_vector,
+                );
                 result["title_global_added"] = json!(true);
             }
         }
@@ -607,23 +636,46 @@ impl Classifier {
                 if self.duplicate(category, &vector, true, process) {
                     result["ocr_local_dedup"] = json!(true);
                 } else {
-                    anchors
-                        .entry(category.into())
-                        .or_default()
-                        .push(Anchor::new(
-                            snippet,
-                            "ocr_feedback",
-                            1.5,
-                            "local",
-                            Some(process.into()),
-                        ));
+                    Self::add_anchor(
+                        &mut anchors,
+                        &mut additions,
+                        category,
+                        Anchor::new(snippet, "ocr_feedback", 1.5, "local", Some(process.into())),
+                        vector,
+                    );
                     result["ocr_local_added"] = json!(true);
                 }
             }
         }
         validate_anchors(&anchors)?;
+        let index = self.index.as_mut().expect("built anchor index");
+        let dimensions = index
+            .first()
+            .or_else(|| additions.first())
+            .map(|row| row.vector.len());
+        for row in &additions {
+            validate_vectors(std::slice::from_ref(&row.vector), 1, dimensions)?;
+        }
+        // Apply the index changes only after all inference and validation succeed.
+        if let Some((old, scope)) = removed {
+            index.retain(|row| {
+                row.category != old
+                    || !Self::matches_text(&row.anchor, &input.title, scope, process)
+            });
+        }
+        if !additions.is_empty() {
+            // Keep category and anchor order identical to a full index rebuild:
+            // scoring gives equal-cosine ties to the first indexed anchor.
+            let category_order = anchors.get_index_of(category).expect("learned category");
+            let position = index.partition_point(|row| {
+                anchors
+                    .get_index_of(&row.category)
+                    .expect("indexed category")
+                    <= category_order
+            });
+            index.splice(position..position, additions);
+        }
         self.anchors = anchors;
-        self.index = None;
         Ok(result)
     }
 
