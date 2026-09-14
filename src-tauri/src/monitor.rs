@@ -683,13 +683,14 @@ pub async fn monitor_update_feature_config(
     clustering_enabled: bool,
     classification_enabled: bool,
 ) -> Result<Value, String> {
+    crate::commands::check_auth_required(&credential_state)?;
+    crate::registry_config::set_bool("classification_enabled", classification_enabled)?;
     authenticated_monitor_command(
         &credential_state,
         &state,
         serde_json::json!({
             "command": "update_feature_config",
             "clustering_enabled": clustering_enabled,
-            "classification_enabled": classification_enabled,
         }),
     )
     .await
@@ -721,7 +722,19 @@ pub async fn monitor_run_clustering(
             "task": "python_clustering",
         }));
     }
-    authenticated_monitor_command(
+    crate::commands::check_auth_required(&credential_state)?;
+    let progress = match crate::task_vector_sync::synchronize(&app, true, start_time, end_time)
+        .await?
+    {
+        crate::task_vector_sync::SyncOutcome::Ready(progress) => progress,
+        crate::task_vector_sync::SyncOutcome::Busy | crate::task_vector_sync::SyncOutcome::More => {
+            return Err("CLUSTERING_ALREADY_RUNNING".into())
+        }
+        crate::task_vector_sync::SyncOutcome::WaitingForIndex => {
+            return Err("CLUSTERING_WAITING_FOR_INDEX".into())
+        }
+    };
+    let response = authenticated_monitor_command(
         &credential_state,
         &state,
         serde_json::json!({
@@ -732,7 +745,17 @@ pub async fn monitor_run_clustering(
             "manual": manual.unwrap_or(false),
         }),
     )
-    .await
+    .await?;
+    if response.get("error").is_none() {
+        use crate::task_vector_sync::ClusteringPhase;
+        progress.finish(match response.get("status").and_then(Value::as_str) {
+            Some("needs_user_choice") => ClusteringPhase::AwaitingChoice,
+            // The frontend still needs to save the returned clusters.
+            Some("success" | "empty") => ClusteringPhase::ResultsReady,
+            _ => ClusteringPhase::Paused,
+        });
+    }
+    Ok(response)
 }
 
 #[tauri::command]
@@ -743,6 +766,8 @@ pub async fn monitor_get_clustering_status(
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let status = scheduler.status(&app);
+    let storage = app.state::<Arc<StorageState>>();
+    let progress = crate::task_vector_sync::progress_status(&storage);
     let task = status
         .tasks
         .iter()
@@ -761,13 +786,16 @@ pub async fn monitor_get_clustering_status(
             "interval": interval,
             "interval_secs": interval_secs,
             "last_run": task.and_then(|task| task.last_completed_at_ms).map(|ms| ms as f64 / 1000.0),
-            "running": status.running_task.as_deref() == Some(crate::background_scheduler::TASK_PYTHON_CLUSTERING),
+            "running": progress.as_ref().is_some_and(|progress| progress.active)
+                || status.running_task.as_deref() == Some(crate::background_scheduler::TASK_PYTHON_CLUSTERING),
         },
         "last_result": task.map(|task| serde_json::json!({
             "status": task.status,
             "last_error": task.last_error,
         })),
         "scheduler": status,
+        "vector_sync": storage.task_vector_sync_status()?,
+        "clustering_progress": progress,
     }))
 }
 
@@ -963,42 +991,36 @@ pub async fn monitor_presidio_set_language(
 
 #[tauri::command]
 pub async fn monitor_classify_debug(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     title: Option<String>,
     ocr_text: Option<String>,
     process_name: Option<String>,
 ) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({
-            "command": "classify_debug",
-            "title": title.unwrap_or_default(),
-            "ocr_text": ocr_text.unwrap_or_default(),
-            "process_name": process_name.unwrap_or_default(),
-        }),
+    crate::commands::check_auth_required(&credential_state)?;
+    let result = crate::classification::debug(
+        &app,
+        crate::classification::scoring::Input {
+            title: title.unwrap_or_default(),
+            ocr_text: ocr_text.unwrap_or_default(),
+            process_name: process_name.unwrap_or_default(),
+        },
     )
-    .await
+    .await?;
+    crate::commands::check_auth_required(&credential_state)?;
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn monitor_remove_local_anchors_by_process(
+    app: tauri::AppHandle,
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     category: String,
     process_name: String,
 ) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({
-            "command": "remove_local_anchors_by_process",
-            "category": category,
-            "process_name": process_name,
-        }),
-    )
-    .await
+    crate::commands::check_auth_required(&credential_state)?;
+    let removed = crate::classification::remove_local(&app, &category, &process_name).await?;
+    Ok(serde_json::json!({"status":"success","removed_count":removed}))
 }
 
 // 内部函数：发送仅包含 command 的 IPC 命令 (兼容旧接口)
@@ -1523,12 +1545,6 @@ pub async fn start_monitor_impl(
             .env(
                 "CARBONPAPER_CLUSTERING_ENABLED",
                 crate::registry_config::get_bool("clustering_enabled")
-                    .unwrap_or(true)
-                    .to_string(),
-            )
-            .env(
-                "CARBONPAPER_CLASSIFICATION_ENABLED",
-                crate::registry_config::get_bool("classification_enabled")
                     .unwrap_or(true)
                     .to_string(),
             )

@@ -18,6 +18,7 @@ HANDLED_CLUSTERING_COMMANDS = {
     "export_task_vectors_page",
     "finish_task_vectors_export",
     "upsert_task_vectors",
+    "get_task_vector_sync_target",
     "get_task_vectors_count",
 }
 
@@ -233,15 +234,25 @@ def handle_clustering_command(
         released = manager.finish_task_vectors_export(req.get("export_id", ""))
         return {"status": "success", "released": released}
 
-    if cmd == "upsert_task_vectors":
+    if cmd in {"upsert_task_vectors", "get_task_vector_sync_target"}:
         service_error = _requires_service(manager=manager)
         if service_error:
             return service_error
-        auth_error = _requires_auth(auth_gate)
-        if auth_error:
-            return auth_error
+        if req.get("background"):
+            storage = getattr(manager, "_storage_client", None)
+            if storage is None or not storage.is_background_authorized():
+                return {"error": "AUTH_REQUIRED"}
+        else:
+            auth_error = _requires_auth(auth_gate)
+            if auth_error:
+                return auth_error
         try:
-            count = manager.upsert_task_vectors(req.get("records", []))
+            if cmd == "get_task_vector_sync_target":
+                return {"status": "success", "target": manager.task_vector_sync_target()}
+            if "target" in req:
+                count = manager.upsert_task_vectors(req.get("records", []), target=req["target"])
+            else:
+                count = manager.upsert_task_vectors(req.get("records", []))
             return {"status": "success", "upserted": count}
         except Exception as e:
             logger.exception("upsert_task_vectors failed")

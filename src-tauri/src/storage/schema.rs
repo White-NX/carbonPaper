@@ -1220,6 +1220,23 @@ impl StorageState {
             "#,
         )?;
 
+        // Acknowledged progress for rebuilding the Python clustering consumer.
+        // Contains identifiers only; plaintext inputs never enter this ledger.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_vector_sync (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                scope TEXT NOT NULL, target TEXT NOT NULL,
+                start_time REAL NOT NULL, end_time REAL NOT NULL,
+                upper_id INTEGER NOT NULL, cursor INTEGER NOT NULL DEFAULT 0,
+                synced_count INTEGER NOT NULL DEFAULT 0,
+                complete INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .map_err(|e| format!("Failed to create task vector synchronization state: {e}"))?;
+
+        self.init_classification_schema(conn)?;
+        Self::add_column_if_missing(conn, "screenshot_ocr_status", "postprocess_lease", "TEXT")?;
+
         // Task clustering tables
         Self::create_table_if_missing(
             conn,

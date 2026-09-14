@@ -142,7 +142,7 @@
       },
       "monitor": {
         "title": "Python 子服务",
-        "tooltip": "Python 子服务负责截图编排，以及仍保留的分类、任务聚类和隐私分析流程。关闭后 Rust 仍负责 OCR、向量索引和搜索。",
+        "tooltip": "用于任务整理和隐私检测。",
         "status": "状态：{{status}}",
         "status_label": "状态：",
         "description": "控制后台的 Python 子服务。",
@@ -405,7 +405,7 @@
       "classification_backend": {
         "title": "截图内容自动分类",
         "label": "Rust BGE 分类推理",
-        "description": "Rust 提供 BGE-small-zh 嵌入，Python 保留分类编排和锚点学习。",
+        "description": "根据窗口标题、文字内容和你的纠正记录进行分类。",
         "successes": "Rust 成功次数",
         "failures": "Rust 失败次数",
         "last_elapsed": "最近一次推理",
@@ -859,7 +859,20 @@
           "advanced_label": "高级",
           "run_now": "立即运行聚类",
           "queued": "已加入后台整理队列",
-          "completed": "聚类完成：已保存 {{count}} 个活动"
+          "completed": "聚类完成：已保存 {{count}} 个活动",
+          "progress": {
+            "preparing": "正在准备历史记录",
+            "waiting": "暂时等待，稍后继续",
+            "clustering": "正在整理任务",
+            "saving": "正在保存整理结果",
+            "waiting_for_records": "正在等待记录准备完成",
+            "awaiting_choice": "准备就绪，请选择处理方式",
+            "retry_wait": "整理暂时中断，稍后自动重试",
+            "interrupted": "本次整理已中断，可重新运行以继续处理",
+            "completed": "整理完成",
+            "already_running": "已有整理任务正在运行",
+            "prepared_count": "已准备 {{count}} 条记录"
+          }
         },
         "classification": {
           "label": "内容分类",
@@ -1454,6 +1467,7 @@
     "noScreenshots": "暂无关联快照",
     "noData": "没有足够的数据用于聚类，请积累更多快照后再试",
     "modelMissing": "聚类模型 (MiniLM-L12) 未下载，请在 设置 > 关于 中下载模型",
+    "clusteringFailed": "任务整理失败，请重试。",
     "clusteringRangeScope": "所选范围",
     "clusteringAllScope": "全部可聚类快照",
     "clusteringLargeRangeReason": "可聚类快照数量较多",

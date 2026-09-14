@@ -142,7 +142,7 @@
       },
       "monitor": {
         "title": "Monitor Service",
-        "tooltip": "The Python service coordinates screenshot capture and the remaining classification, task-clustering, and privacy workflows. Rust continues to own OCR, vector indexing, and search when this service is stopped.",
+        "tooltip": "Runs task organization and privacy detection.",
         "status": "Status: {{status}}",
         "status_label": "Status:",
         "description": "Control the background screenshot & OCR service.",
@@ -405,7 +405,7 @@
       "classification_backend": {
         "title": "Automatic screenshot classification",
         "label": "Rust BGE classification inference",
-        "description": "Rust provides the BGE-small-zh embeddings; Python keeps the classification workflow and anchors.",
+        "description": "Classifies activity using window titles, text, and your corrections.",
         "successes": "Rust successes",
         "failures": "Rust failures",
         "last_elapsed": "Last inference",
@@ -859,7 +859,20 @@
           "advanced_label": "Advanced",
           "run_now": "Run clustering now",
           "queued": "Added to the background organization queue",
-          "completed": "Clustering complete: saved {{count}} activities"
+          "completed": "Clustering complete: saved {{count}} activities",
+          "progress": {
+            "preparing": "Preparing history",
+            "waiting": "Waiting to continue",
+            "clustering": "Organizing tasks",
+            "saving": "Saving results",
+            "waiting_for_records": "Waiting for records to be prepared",
+            "awaiting_choice": "Ready. Choose how to continue",
+            "retry_wait": "Processing was interrupted. Retrying shortly",
+            "interrupted": "Processing was interrupted. Run again to continue",
+            "completed": "Organization complete",
+            "already_running": "An organization task is already running",
+            "prepared_count": "Records prepared: {{count}}"
+          }
         },
         "classification": {
           "label": "Content Classification",
@@ -1454,6 +1467,7 @@
     "noScreenshots": "No screenshots assigned",
     "noData": "Not enough data for clustering. Accumulate more snapshots and try again.",
     "modelMissing": "Clustering model (MiniLM-L12) not downloaded. Please download it in Settings > About.",
+    "clusteringFailed": "Could not organize tasks. Please try again.",
     "clusteringRangeScope": "The selected range",
     "clusteringAllScope": "All clusterable snapshots",
     "clusteringLargeRangeReason": "the clustering input contains many snapshots",

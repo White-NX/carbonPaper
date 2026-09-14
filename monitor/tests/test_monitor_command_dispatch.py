@@ -1,35 +1,6 @@
 import monitor as mm
 
 
-class DummyWorker:
-    def __init__(self):
-        self.calls = []
-
-    def request(self, command, payload=None, timeout=120.0):
-        self.calls.append((command, payload, timeout))
-        if command == "enqueue_ocr_postprocess":
-            return {"status": "success", "postprocess_enqueued": True, "worker_protocol": 3}
-        if command == "classify":
-            return {"status": "success", "category": "Development", "confidence": 0.9}
-        return {"status": "success"}
-
-    def get_stats(self):
-        return {"processed_count": 1}
-
-    def classify(self, title, ocr_text, process_name=""):
-        self.calls.append(("classify", {"title": title, "ocr_text": ocr_text, "process_name": process_name}, 30))
-        return "Development", 0.9
-
-    def pause(self):
-        self.calls.append(("pause", None, None))
-
-    def resume(self):
-        self.calls.append(("resume", None, None))
-
-    def stop(self):
-        self.calls.append(("stop", None, None))
-
-
 class DummyScheduler:
     def __init__(self):
         self.last_args = None
@@ -49,8 +20,6 @@ def _snapshot_globals():
         "_auth_token": mm._auth_token,
         "_last_seq_no": mm._last_seq_no,
         "_seen_seq_nos": set(mm._seen_seq_nos),
-        "_model_worker": mm._model_worker,
-        "_classifier": mm._classifier,
         "_clustering_scheduler": mm._clustering_scheduler,
         "_clustering_manager": mm._clustering_manager,
         "_clustering_scheduler_active": mm._clustering_scheduler_active,
@@ -68,57 +37,15 @@ def _restore_globals(snapshot):
     mm.stop_event.clear()
 
 
-def test_enqueue_postprocess_dispatches_to_model_worker():
+def test_classification_dispatch_is_retired():
     snapshot = _snapshot_globals()
-    worker = DummyWorker()
     try:
         mm._auth_token = None
-        mm._last_seq_no = -1
-        mm._model_worker = worker
-        result = mm._handle_command_impl({
-            "command": "enqueue_ocr_postprocess",
-            "screenshot_id": 7,
-            "window_title": "Editor",
-            "ocr_text": "text",
-        })
+        for command in ("enqueue_ocr_postprocess", "classify", "classify_debug", "add_anchor", "get_anchors", "remove_local_anchors_by_process"):
+            result = mm._handle_command_impl({"command": command})
+            assert "unknown command" in result["error"].lower()
     finally:
         _restore_globals(snapshot)
-
-    assert result["postprocess_enqueued"] is True
-    assert worker.calls == [
-        (
-            "enqueue_ocr_postprocess",
-            {"request": {
-                "command": "enqueue_ocr_postprocess",
-                "screenshot_id": 7,
-                "window_title": "Editor",
-                "ocr_text": "text",
-            }},
-            120,
-        )
-    ]
-
-
-def test_classification_dispatch_returns_normalized_confidence():
-    snapshot = _snapshot_globals()
-    worker = DummyWorker()
-    try:
-        mm._model_worker = worker
-        mm._classifier = worker
-        result = mm._handle_command_impl({
-            "command": "classify",
-            "title": "Editor",
-            "ocr_text": "text",
-            "process_name": "code.exe",
-        })
-    finally:
-        _restore_globals(snapshot)
-
-    assert result == {
-        "status": "success",
-        "category": "Development",
-        "category_confidence": 0.9,
-    }
 
 
 def test_run_clustering_requires_unlocked_session(monkeypatch):

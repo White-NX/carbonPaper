@@ -3,7 +3,6 @@ import logging
 import threading
 import time
 
-from monitor.worker_process import RestartableModelWorker
 from monitor.worker_supervisor import (
     WorkerBackoffError,
     WorkerProtocolError,
@@ -172,22 +171,22 @@ def test_supervisor_stop_does_not_count_as_restart_churn():
     assert snapshot["state"] == "stopped"
 
 
-def test_model_worker_status_does_not_send_pipe_request():
-    worker = RestartableModelWorker(storage_pipe=None, data_dir="unused", env={})
+def test_supervisor_status_does_not_send_pipe_request():
+    worker = _ready_supervisor(EchoConn())
     conn = EchoConn()
     worker._proc = FakeProc()
     worker._conn = conn
     worker._state = "ready"
 
-    stats = worker.get_stats()
+    stats = worker.status_snapshot()
 
     assert conn.sent == []
-    assert stats["watchdog"]["name"] == "CarbonModelWorker"
-    assert stats["watchdog"]["alive"] is True
+    assert stats["name"] == "TestWorker"
+    assert stats["alive"] is True
 
 
-def test_model_worker_status_snapshot_does_not_wait_for_busy_lock():
-    worker = RestartableModelWorker(storage_pipe=None, data_dir="unused", env={})
+def test_supervisor_status_snapshot_does_not_wait_for_busy_lock():
+    worker = _ready_supervisor(EchoConn())
     worker._proc = FakeProc()
     worker._conn = EchoConn()
     worker._state = "busy"
@@ -207,13 +206,13 @@ def test_model_worker_status_snapshot_does_not_wait_for_busy_lock():
 
     started = time.perf_counter()
     try:
-        stats = worker.get_stats()
+        stats = worker.status_snapshot()
     finally:
         release.set()
         thread.join(timeout=1)
 
     assert time.perf_counter() - started < 0.2
-    assert stats["watchdog"]["name"] == "CarbonModelWorker"
-    assert stats["watchdog"]["state"] == "busy"
-    assert stats["watchdog"]["current_command"] == "enqueue_ocr_postprocess"
-    assert stats["watchdog"]["lock_contended"] is True
+    assert stats["name"] == "TestWorker"
+    assert stats["state"] == "busy"
+    assert stats["current_command"] == "enqueue_ocr_postprocess"
+    assert stats["lock_contended"] is True

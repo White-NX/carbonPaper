@@ -6,9 +6,10 @@ MiniLM and CLIP inputs. Existing screenshots and OCR rows keep their CNG
 encryption and authorization rules; keyword HMAC indexing resumes through the
 existing unlock path without waiting for an idle window.
 
-Source snapshot: application version `0.8.5`, branch `feat/app-bound-processing`,
-implementation commit `2c0329acfa533edec24c6bd0e5cd77eb8dbcf6ef`. This page was
-written after that source commit; it does not describe an already published release.
+Source snapshot: application version `0.8.5`, branch
+`feat/rust-task-vectors-classification`, baseline `693d45a` plus the native
+classification changes committed with this revision. Historical acceptance notes below do not
+claim validation of a subsequently published release.
 
 ## Components and data flow
 
@@ -17,7 +18,8 @@ written after that source commit; it does not describe an already published rele
 | Desktop process | Capture, staging encryption, model dispatch, scoped result commits | [processing_stage.rs](../src-tauri/src/processing_stage.rs), [capture.rs](../src-tauri/src/capture.rs) |
 | `carbonpaper-key-service.exe` | LocalSystem service, caller verification, task keys and grant lifecycle | [service.rs](../src-tauri/app-bound/src/windows/service.rs), [ledger.rs](../src-tauri/app-bound/src/ledger.rs) |
 | `carbonpaper-protected-setup.exe` | UAC installation, repair, registration and service removal | [install.rs](../src-tauri/app-bound/src/windows/install.rs) |
-| `carbonpaper-python.exe` | Separate, unprivileged Python host; classification orchestration | [python.rs](../src-tauri/src/bin/python.rs), [worker_process.py](../monitor/monitor/worker_process.py) |
+| Native classification | Anchor scoring, learning and scoped result completion | [classification/mod.rs](../src-tauri/src/classification/mod.rs), [storage/classification.rs](../src-tauri/src/storage/classification.rs) |
+| `carbonpaper-python.exe` | Separate, unprivileged host for task clustering, Presidio and legacy export | [python.rs](../src-tauri/src/bin/python.rs), [monitor entry point](../monitor/monitor/__init__.py) |
 | Native model worker | MiniLM, CLIP and BGE inference with the existing scheduler | [semantic_runtime.rs](../src-tauri/src/semantic_runtime.rs), [classification_runtime.rs](../src-tauri/src/classification_runtime.rs) |
 | Archive storage | Source revisions, deletion outbox and transactional completion receipts | [storage/processing_stage.rs](../src-tauri/src/storage/processing_stage.rs), [derived_index.rs](../src-tauri/src/storage/derived_index.rs) |
 
@@ -44,9 +46,10 @@ buffers use `zeroize`; inference processes necessarily receive the particular
 plaintext input they are processing.
 
 Classification, MiniLM and CLIP have separate consumer bits and completion
-states. Classification orchestration still runs in Python; its BGE embeddings
-run in Rust. Idle, power, foreground and background-enable checks continue to
-control automatic dispatch. Only staged inputs receive admission without archive
+states. Classification orchestration and BGE embeddings run in Rust. Capture
+classification uses the immediate scheduling policy and can run during user
+activity; bulk indexing remains idle-gated. Existing foreground and
+background-enable checks continue to control dispatch. Only staged inputs receive admission without archive
 authorization. History reads, search and manual archive operations retain their
 existing session checks.
 
@@ -89,10 +92,10 @@ fallbacks into developer folders or the Python environment.
 The Python interpreter and `.venv` dependencies are deliberately outside the
 protected runtime. Their modification and a compromised Python process can
 expose inputs legitimately delivered to Python. The separate Python executable
-cannot acquire service keys as the desktop image. Callback authorization also
-compares every field against an immutable receipt kept in the desktop process;
-changing a screenshot ID, dataset, revision, consumer or lease cannot authorize a
-different archive write.
+cannot acquire service keys as the desktop image. Python receives no staged
+classification input and exposes no category or staged-result callback command.
+Native completion compares scope against the immutable receipt kept in the
+desktop process. It also preserves a newer user category correction.
 
 This feature does not prevent full compromise of an approved process, recover
 plaintext or keys already disclosed to a process, or protect against an
@@ -207,11 +210,11 @@ and [app_bound.rs](../src-tauri/src/app_bound.rs):
 | `app_bound_install` | Main window and session; validate signed package, request UAC, activate or repair, restart unelevated |
 | `app_bound_uninstall` | Main window and session; request UAC, revoke/unregister, discard local staged inputs |
 
-None of these commands returns task keys or staged plaintext. Python completion
-and deferral use `complete_staged_postprocess` and `defer_staged_postprocess`
-through the existing authenticated pipe and sequence checks. The service's
-public request enum is the protocol reference; it exposes no arbitrary path,
-caller SID, private-key or unwrap request.
+None of these commands returns task keys or staged plaintext. Native
+classification completes or releases its scoped receipt directly; the former
+Python completion and deferral commands are retired. Remaining Python IPC
+retains authentication and sequence checks. The service's public request enum
+exposes no arbitrary path, caller SID, private-key or unwrap request.
 
 ## Fast Windows preflight
 
@@ -466,7 +469,7 @@ rows, and UI activation/repair/cancellation/limits. Sources:
 [broker tests](../src-tauri/app-bound/src/ledger.rs),
 [staging tests](../src-tauri/src/storage/processing_stage/tests.rs),
 [package tests](../scripts/protected-runtime.test.mjs),
-[Python callbacks](../monitor/tests/test_ocr_postprocess_queue.py), and
+[native classification commits](../src-tauri/src/storage/classification/tests.rs), and
 [settings tests](../src/components/settings/advanced/ProtectedProcessingCard.test.jsx).
 
 ## Isolated Windows acceptance

@@ -1,0 +1,2139 @@
+{
+  "source": "monitor/classifier.py at 693d45a; synthetic vectors only",
+  "classification": [
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "0:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "0:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "0:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "0:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "0:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "0:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "",
+      "ocr_text": "详细截图文字内容0 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "0:编程开发:global": [-0.2534853518009186, 0.6297553181648254, -0.7316461205482483, 0.06202715262770653],
+        "0:编程开发:local": [0.8951348066329956, -0.3791235387325287, -0.007350546773523092, -0.23440368473529816],
+        "0:编程开发:other": [-0.5904805660247803, 0.33252477645874023, 0.730801522731781, -0.08178703486919403],
+        "0:社交通讯:global": [-0.2913672626018524, -0.5550176501274109, -0.7154006958007812, -0.30864596366882324],
+        "0:社交通讯:local": [-0.6581457257270813, 0.5554880499839783, -0.18838779628276825, -0.4720034599304199],
+        "0:社交通讯:other": [0.06400369107723236, 0.09564051032066345, -0.9178287386894226, -0.3799301087856293],
+        "详细截图文字内容0 123:45 unrelated words 内容线索": [-0.7258903980255127, -0.48693710565567017, -0.19856508076190948, -0.4433365762233734]
+      },
+      "category": "社交通讯",
+      "score": 0.9562346884608269,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.9562,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "详细截图文字内容0 123:45 unrelated words 内容线索",
+        "top_scores": [{"category": "社交通讯", "score": 0.9562}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.5039}, {"category": "编程开发", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.7606}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "1:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "1:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "1:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "1:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "1:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "1:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "1:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "1:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "1:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "",
+      "ocr_text": "",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "1:编程开发:global": [-0.49107497930526733, -0.514091968536377, 0.2710428535938263, -0.6489149332046509],
+        "1:编程开发:local": [0.8616247773170471, 0.28318333625793457, -0.4182969629764557, 0.04937182366847992],
+        "1:编程开发:other": [0.6550500392913818, 0.5737332701683044, -0.15063565969467163, -0.46802616119384766],
+        "1:社交通讯:global": [0.1016249805688858, 0.7284981608390808, 0.38473567366600037, 0.5576211214065552],
+        "1:社交通讯:local": [0.1043589785695076, -0.9754222631454468, 0.17015421390533447, -0.09331778436899185],
+        "1:社交通讯:other": [0.7207354307174683, 0.19982682168483734, 0.6573906540870667, -0.0919087678194046],
+        "1:影音娱乐:global": [-0.5028014779090881, -0.7377215623855591, 0.44683313369750977, -0.05742562562227249],
+        "1:影音娱乐:local": [-0.6762464046478271, -0.021584482863545418, -0.008092829957604408, 0.7363147735595703],
+        "1:影音娱乐:other": [-0.9342398047447205, -0.16752828657627106, -0.2556079626083374, 0.18383346498012543]
+      },
+      "category": "未分类",
+      "score": 0.0,
+      "debug": {"category": "未分类", "category_confidence": 0.0, "reason": "empty_input"}
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "2:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "2:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "2:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "2:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "2:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "2:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "2:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "2:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "2:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "2:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "2:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "2:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题 - 个人 - Microsoft​ Edge Beta",
+      "ocr_text": "详细截图文字内容2 123:45 unrelated words 内容线索",
+      "process_name": "msedge.exe",
+      "vectors": {
+        "2:编程开发:global": [-0.2546749711036682, -0.2122819572687149, 0.22375287115573883, -0.9165214896202087],
+        "2:编程开发:local": [-0.19475050270557404, -0.9395808577537537, -0.10863061994314194, 0.25972938537597656],
+        "2:编程开发:other": [-0.617069661617279, 0.6258605718612671, 0.09155654907226562, 0.4681248962879181],
+        "2:社交通讯:global": [-0.48715272545814514, -0.45505958795547485, 0.7085500359535217, 0.23143020272254944],
+        "2:社交通讯:local": [-0.061330102384090424, 0.6578394770622253, -0.39954835176467896, -0.6354895830154419],
+        "2:社交通讯:other": [-0.6153458952903748, -0.7181257605552673, -0.00017979733820538968, -0.3250303566455841],
+        "2:影音娱乐:global": [-0.19738486409187317, 0.35741937160491943, -0.7190541625022888, -0.5623627305030823],
+        "2:影音娱乐:local": [0.36232852935791016, -0.4104582667350769, 0.5213008522987366, 0.6545895338058472],
+        "2:影音娱乐:other": [0.6571800708770752, 0.0178573876619339, 0.2822914123535156, -0.698646605014801],
+        "2:办公文档:global": [-0.323840469121933, 0.513045072555542, 0.20159165561199188, 0.7689427137374878],
+        "2:办公文档:local": [-0.5900291800498962, -0.39599353075027466, -0.5998584032058716, 0.3677288591861725],
+        "2:办公文档:other": [-0.523037314414978, 0.7792410254478455, 0.2547716200351715, -0.23303833603858948],
+        "测试标题": [-0.7286162376403809, 0.19649483263492584, 0.5323361158370972, 0.38357067108154297],
+        "测试标题 - 个人 - Microsoft​ Edge Beta": [-0.7121145129203796, -0.10853185504674911, 0.647783637046814, 0.24797208607196808]
+      },
+      "category": "办公文档",
+      "score": 0.7390245199203491,
+      "debug": {
+        "category": "办公文档",
+        "category_confidence": 0.739,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "msedge.exe",
+        "cleaned_title": "测试标题",
+        "top_scores": [{"category": "办公文档", "score": 0.739}, {"category": "社交通讯", "score": 0.7315}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "办公文档", "score": 0.739}, {"category": "社交通讯", "score": 0.7315}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "3:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "3:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "3:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "3:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "3:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "3:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "3:社交通讯:local",
+      "ocr_text": "详细截图文字内容3 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "3:社交通讯:local": [1, 0, 0, 0],
+        "3:社交通讯:global": [1, 0, 0, 0],
+        "3:编程开发:global": [-0.18948253989219666, 0.8801127076148987, -0.4115101099014282, -0.14197686314582825],
+        "3:编程开发:local": [0.7061762809753418, 0.0868314579129219, -0.6137535572052002, 0.3421723246574402],
+        "3:编程开发:other": [0.5096608996391296, -0.286614328622818, -0.8084675669670105, 0.0669192373752594],
+        "3:社交通讯:other": [0.7563680410385132, 0.4629303216934204, -0.06651611626148224, 0.45736029744148254]
+      },
+      "category": "社交通讯",
+      "score": 1.12,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 1.12,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "3:社交通讯:local",
+        "top_scores": [{"category": "社交通讯", "score": 1.12}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 1.0}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "4:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "4:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "4:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "4:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "4:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "4:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "4:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "4:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "4:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题4 - Google Chrome",
+      "ocr_text": "详细截图文字内容4 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "4:编程开发:global": [-0.23184822499752045, -0.8516483306884766, 0.2620339095592499, -0.3902304768562317],
+        "4:编程开发:local": [0.7681208848953247, 0.40191397070884705, 0.43471887707710266, -0.24387489259243011],
+        "4:编程开发:other": [0.8889102935791016, 0.1856640875339508, -0.3414365351200104, -0.24246343970298767],
+        "4:社交通讯:global": [-0.8235911726951599, -0.1579723060131073, -0.40585702657699585, 0.36334890127182007],
+        "4:社交通讯:local": [-0.5097295641899109, 0.019760044291615486, -0.22003556787967682, -0.8314864635467529],
+        "4:社交通讯:other": [-0.8774138689041138, 0.19864459335803986, -0.3791191577911377, 0.21668846905231476],
+        "4:影音娱乐:global": [-0.05108043551445007, 0.9173373579978943, -0.3844444155693054, -0.08991942554712296],
+        "4:影音娱乐:local": [-0.8195579648017883, -0.2728360891342163, 0.47530612349510193, 0.16724014282226562],
+        "4:影音娱乐:other": [0.4568265378475189, -0.1942243129014969, -0.8679121136665344, -0.01774909906089306],
+        "测试标题4 - Google Chrome": [-0.20427094399929047, 0.21527838706970215, -0.7836053967475891, -0.5457940697669983]
+      },
+      "category": "影音娱乐",
+      "score": 0.5582473874092102,
+      "debug": {
+        "category": "影音娱乐",
+        "category_confidence": 0.5582,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题4 - Google Chrome",
+        "top_scores": [{"category": "影音娱乐", "score": 0.5582}, {"category": "社交通讯", "score": 0.2377}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.7846}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "影音娱乐", "score": 0.5582}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "5:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "5:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "5:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "5:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "5:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "5:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "5:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "5:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "5:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "5:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "5:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "5:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题5 - Google Chrome",
+      "ocr_text": "详细截图文字内容5 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "5:编程开发:global": [-0.3472162187099457, 0.37692901492118835, -0.0748719647526741, -0.855429470539093],
+        "5:编程开发:local": [-0.33762872219085693, -0.16289624571800232, -0.680562436580658, 0.6295287013053894],
+        "5:编程开发:other": [0.7479908466339111, -0.47815749049186707, 0.3487737774848938, -0.3003862798213959],
+        "5:社交通讯:global": [-0.9095322489738464, -0.17452998459339142, -0.3764496445655823, -0.024000301957130432],
+        "5:社交通讯:local": [-0.7595648169517517, -0.39919498562812805, 0.33678069710731506, -0.3876640200614929],
+        "5:社交通讯:other": [0.8388566374778748, -0.3530505299568176, 0.4011121094226837, 0.10384561121463776],
+        "5:影音娱乐:global": [-0.2098139077425003, 0.6544176936149597, -0.6598179936408997, -0.3039011061191559],
+        "5:影音娱乐:local": [-0.3516390323638916, 0.6662856340408325, -0.4755234122276306, 0.4541926085948944],
+        "5:影音娱乐:other": [0.7050380706787109, -0.021413778886198997, 0.41186589002609253, 0.5769135355949402],
+        "5:办公文档:global": [0.16095449030399323, 0.9130182266235352, -0.29340389370918274, -0.2332497388124466],
+        "5:办公文档:local": [-0.291896253824234, -0.09306591749191284, -0.6315169334411621, 0.712265133857727],
+        "5:办公文档:other": [-0.37283334136009216, 0.045645203441381454, -0.8801712989807129, -0.2901899516582489],
+        "测试标题5": [-0.7680837512016296, -0.551687479019165, 0.19842910766601562, 0.2575155794620514],
+        "测试标题5 - Google Chrome": [-0.0012939568841829896, 0.8996630907058716, 0.1927640736103058, 0.3917226493358612]
+      },
+      "category": "社交通讯",
+      "score": 0.9601952636241913,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.714,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题5",
+        "top_scores": [{"category": "社交通讯", "score": 0.714}, {"category": "影音娱乐", "score": 0.1104}, {"category": "编程开发", "score": 0.0}, {"category": "办公文档", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["影音娱乐"],
+        "local_top": [{"category": "影音娱乐", "score": 0.7361}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.714}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "6:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "6:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "6:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "6:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "6:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "6:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容6",
+      "ocr_text": "详细截图文字内容6 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "6:编程开发:global": [0.816116452217102, 0.36730632185935974, -0.44257545471191406, -0.05627642944455147],
+        "6:编程开发:local": [0.8523315787315369, 0.4247603714466095, 0.30337274074554443, 0.03277813270688057],
+        "6:编程开发:other": [-0.88014817237854, 0.4106748700141907, -0.12305295467376709, 0.2038220912218094],
+        "6:社交通讯:global": [0.16462771594524384, -0.2798639237880707, 0.9298304319381714, -0.17317384481430054],
+        "6:社交通讯:local": [0.6357336044311523, -0.44485971331596375, 0.392062246799469, -0.4941961467266083],
+        "6:社交通讯:other": [0.7667337656021118, 0.4690861999988556, -0.3377131223678589, -0.27933382987976074],
+        "聊天内容6": [0.17228063941001892, 0.4026862680912018, 0.6446643471717834, -0.6265547871589661]
+      },
+      "category": "社交通讯",
+      "score": 0.9064288115501403,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.9064,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "聊天内容6",
+        "top_scores": [{"category": "社交通讯", "score": 0.9064}, {"category": "编程开发", "score": 0.1629}],
+        "local_diversity": 2,
+        "local_categories": ["编程开发", "社交通讯"],
+        "local_top": [{"category": "编程开发", "score": 0.5429}, {"category": "社交通讯", "score": 0.5428}],
+        "global_top": [{"category": "社交通讯", "score": 0.6236}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "7:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "7:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "7:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "7:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "7:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "7:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "7:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "7:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "7:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题7 - Google Chrome",
+      "ocr_text": "详细截图文字内容7 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "7:编程开发:global": [0.05620771273970604, 0.9672016501426697, -0.24709543585777283, 0.017475681379437447],
+        "7:编程开发:local": [0.17857517302036285, -0.12881828844547272, -0.6432449221611023, -0.7333163022994995],
+        "7:编程开发:other": [0.068511001765728, 0.28949612379074097, 0.6331396698951721, -0.7145854830741882],
+        "7:社交通讯:global": [-0.45255792140960693, 0.19858990609645844, 0.6061663627624512, 0.6231497526168823],
+        "7:社交通讯:local": [0.7784479856491089, -0.4129062592983246, 0.42441460490226746, -0.2083250880241394],
+        "7:社交通讯:other": [-0.4688844382762909, -0.5280145406723022, 0.6654958724975586, 0.24179182946681976],
+        "7:影音娱乐:global": [-0.3507001996040344, -0.30039799213409424, -0.39382582902908325, -0.7947776913642883],
+        "7:影音娱乐:local": [-0.13510988652706146, -0.5785965919494629, -0.27860352396965027, 0.7545537352561951],
+        "7:影音娱乐:other": [-0.2255851775407791, -0.24127507209777832, -0.5986297130584717, 0.7297534942626953],
+        "测试标题7": [0.5369803309440613, -0.47138920426368713, 0.6788051724433899, 0.16931580007076263],
+        "测试标题7 - Google Chrome": [0.14471930265426636, 0.9745945334434509, -0.0360916443169117, 0.1670902520418167],
+        "详细截图文字内容7 unrelated words 内容线索": [0.48177847266197205, -0.5799460411071777, -0.3040187656879425, 0.5823441743850708]
+      },
+      "category": "未分类",
+      "score": 0.13732093691825867,
+      "debug": {
+        "category": "未分类",
+        "category_confidence": 0.0507,
+        "used_ocr": true,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题7",
+        "top_scores": [{"category": "影音娱乐", "score": 0.0507}, {"category": "社交通讯", "score": 0.0248}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "8:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "8:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "8:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "8:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "8:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "8:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "8:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "8:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "8:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "8:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "8:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "8:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题8 - Google Chrome",
+      "ocr_text": "详细截图文字内容8 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "8:编程开发:global": [0.8025591373443604, 0.17644484341144562, 0.5680578351020813, 0.04556719958782196],
+        "8:编程开发:local": [0.6459011435508728, 0.18821772933006287, -0.4065704345703125, 0.6181313395500183],
+        "8:编程开发:other": [-0.15720544755458832, -0.7972225546836853, -0.5377616882324219, -0.22479988634586334],
+        "8:社交通讯:global": [0.5857353806495667, 0.19059233367443085, 0.29428932070732117, -0.7307409644126892],
+        "8:社交通讯:local": [0.5902735590934753, 0.7193290591239929, 0.17213746905326843, 0.32328248023986816],
+        "8:社交通讯:other": [-0.8699023723602295, 0.0010267478646710515, 0.4242786765098572, 0.2515081465244293],
+        "8:影音娱乐:global": [0.27056053280830383, 0.1348952054977417, -0.8778127431869507, 0.37154409289360046],
+        "8:影音娱乐:local": [0.8678303956985474, 0.11283683031797409, -0.48361459374427795, 0.015975553542375565],
+        "8:影音娱乐:other": [-0.24849601089954376, 0.7105726003646851, -0.4447546899318695, -0.48531386256217957],
+        "8:办公文档:global": [-0.8734305500984192, -0.054590363055467606, 0.20830242335796356, -0.43674835562705994],
+        "8:办公文档:local": [-0.23073126375675201, 0.6437177062034607, 0.09123881906270981, -0.7239241003990173],
+        "8:办公文档:other": [-0.42692774534225464, 0.6928495168685913, 0.5715028643608093, -0.1052456796169281],
+        "测试标题8 - Google Chrome": [-0.29926905035972595, 0.02852558344602585, -0.6061949133872986, -0.7363097667694092]
+      },
+      "category": "办公文档",
+      "score": 0.5474142652750016,
+      "debug": {
+        "category": "办公文档",
+        "category_confidence": 0.5474,
+        "used_ocr": false,
+        "local_veto_active": true,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题8 - Google Chrome",
+        "top_scores": [{"category": "办公文档", "score": 0.5474}, {"category": "社交通讯", "score": 0.12}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["办公文档"],
+        "local_top": [{"category": "办公文档", "score": 0.6151}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "办公文档", "score": 0.4551}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "9:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "9:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "9:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "9:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "9:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "9:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容9",
+      "ocr_text": "详细截图文字内容9 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "9:编程开发:global": [0.7401878833770752, 0.0252714641392231, -0.04227674379944801, -0.6705936789512634],
+        "9:编程开发:local": [-0.43849533796310425, -0.8111808896064758, 0.1344028115272522, 0.3628268241882324],
+        "9:编程开发:other": [-0.4057709872722626, -0.6225020289421082, -0.033141300082206726, -0.6683882474899292],
+        "9:社交通讯:global": [0.20521120727062225, 0.6830806136131287, 0.6857510805130005, 0.14503316581249237],
+        "9:社交通讯:local": [-0.7384747862815857, -0.5740665793418884, 0.2700243592262268, -0.22845019400119781],
+        "9:社交通讯:other": [-0.7871828079223633, 0.36976370215415955, -0.48367366194725037, 0.09837594628334045],
+        "聊天内容9": [-0.21845528483390808, -0.5537792444229126, 0.7080366015434265, -0.37985530495643616]
+      },
+      "category": "未分类",
+      "score": 0.24215849876403808,
+      "debug": {
+        "category": "未分类",
+        "category_confidence": 0.2422,
+        "used_ocr": false,
+        "local_veto_active": true,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "聊天内容9",
+        "top_scores": [{"category": "社交通讯", "score": 0.2422}, {"category": "编程开发", "score": 0.1657}],
+        "local_diversity": 2,
+        "local_categories": ["编程开发", "社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.8072}, {"category": "编程开发", "score": 0.5523}],
+        "global_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "10:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "10:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "10:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "10:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "10:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "10:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "10:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "10:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "10:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题10 - Google Chrome",
+      "ocr_text": "详细截图文字内容10 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "10:编程开发:global": [-0.5573810935020447, 0.30875808000564575, -0.40968024730682373, 0.6528069376945496],
+        "10:编程开发:local": [-0.3012387752532959, 0.5942334532737732, -0.24519586563110352, -0.7042874097824097],
+        "10:编程开发:other": [0.14761236310005188, 0.1608496457338333, -0.5763941407203674, -0.787469208240509],
+        "10:社交通讯:global": [0.5169270634651184, 0.7373895645141602, 0.12696421146392822, -0.4158402979373932],
+        "10:社交通讯:local": [0.027396569028496742, -0.3716132938861847, 0.45916223526000977, -0.8064260482788086],
+        "10:社交通讯:other": [-0.7154456377029419, 0.5486040115356445, -0.2608809471130371, -0.3451264500617981],
+        "10:影音娱乐:global": [-0.09371683746576309, -0.3682822287082672, -0.9246901869773865, 0.02309544011950493],
+        "10:影音娱乐:local": [0.1148429811000824, 0.0032398353796452284, 0.015013227239251137, -0.9932648539543152],
+        "10:影音娱乐:other": [-0.5154870748519897, -0.20471616089344025, -0.7274158596992493, 0.40401801466941833],
+        "测试标题10 - Google Chrome": [-0.5969412326812744, 0.6879387497901917, 0.25588351488113403, 0.32392141222953796]
+      },
+      "category": "编程开发",
+      "score": 0.6517581343650818,
+      "debug": {
+        "category": "编程开发",
+        "category_confidence": 0.6518,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题10 - Google Chrome",
+        "top_scores": [{"category": "编程开发", "score": 0.6518}, {"category": "社交通讯", "score": 0.12}, {"category": "影音娱乐", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.6518}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "11:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "11:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "11:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "11:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "11:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "11:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "11:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "11:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "11:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "11:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "11:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "11:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题11 - Google Chrome",
+      "ocr_text": "详细截图文字内容11 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "11:编程开发:global": [-0.009991445578634739, -0.8949541449546814, 0.4276464283466339, -0.12679043412208557],
+        "11:编程开发:local": [0.08143727481365204, -0.34303078055381775, 0.004374600946903229, -0.9357770681381226],
+        "11:编程开发:other": [-0.21371187269687653, 0.9519586563110352, 0.05915813893079758, 0.21119248867034912],
+        "11:社交通讯:global": [0.09741339832544327, -0.8543853163719177, -0.49419522285461426, -0.1277001053094864],
+        "11:社交通讯:local": [0.45464250445365906, 0.4045013189315796, -0.5155240297317505, -0.6032527089118958],
+        "11:社交通讯:other": [0.8091202974319458, -0.4942776560783386, 0.123807393014431, 0.2927212715148926],
+        "11:影音娱乐:global": [0.3155951201915741, -0.6295250654220581, 0.5829513072967529, -0.40529704093933105],
+        "11:影音娱乐:local": [0.9206005334854126, -0.2802901268005371, -0.2373521476984024, -0.13265028595924377],
+        "11:影音娱乐:other": [0.3760944604873657, -0.25095492601394653, -0.5333391427993774, -0.7149293422698975],
+        "11:办公文档:global": [-0.10326685011386871, 0.5204718708992004, -0.8292139768600464, -0.17563919723033905],
+        "11:办公文档:local": [-0.021776791661977768, -0.012829970568418503, -0.8621060848236084, 0.5060970187187195],
+        "11:办公文档:other": [0.5038931369781494, -0.22981040179729462, -0.5780525207519531, 0.5992779731750488],
+        "测试标题11": [-0.41207361221313477, -0.3411361277103424, -0.8406257629394531, 0.08467492461204529],
+        "测试标题11 - Google Chrome": [-0.2010858654975891, -0.02042396366596222, 0.9227011203765869, -0.3282833993434906]
+      },
+      "category": "办公文档",
+      "score": 0.6718250674009323,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.6559,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题11",
+        "top_scores": [{"category": "社交通讯", "score": 0.6559}, {"category": "办公文档", "score": 0.5472}, {"category": "编程开发", "score": 0.0528}, {"category": "影音娱乐", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["编程开发"],
+        "local_top": [{"category": "编程开发", "score": 0.3519}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.6559}, {"category": "办公文档", "score": 0.5472}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "12:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "12:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "12:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "12:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "12:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "12:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容12",
+      "ocr_text": "详细截图文字内容12 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "12:编程开发:global": [-0.024368690326809883, 0.2507881820201874, 0.7894583344459534, -0.559702455997467],
+        "12:编程开发:local": [-0.24509035050868988, -0.8204789757728577, 0.5148587226867676, 0.04081137478351593],
+        "12:编程开发:other": [0.4897567927837372, -0.5946875810623169, 0.5654574632644653, -0.2945214509963989],
+        "12:社交通讯:global": [0.8352072834968567, -0.029953958466649055, 0.08490738272666931, 0.5425148010253906],
+        "12:社交通讯:local": [-0.7694694399833679, 0.44787323474884033, -0.4292389452457428, -0.15192227065563202],
+        "12:社交通讯:other": [-0.3548504114151001, -0.3055003583431244, 0.5586881041526794, -0.6845570802688599],
+        "聊天内容12": [0.4255254566669464, -0.1875849962234497, -0.8846886157989502, -0.03264976292848587],
+        "详细截图文字内容12 unrelated words 内容线索": [-0.9154887795448303, 0.3013695776462555, -0.08678100258111954, -0.2520429193973541]
+      },
+      "category": "未分类",
+      "score": 0.14894870245456696,
+      "debug": {
+        "category": "未分类",
+        "category_confidence": 0.1489,
+        "used_ocr": true,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "聊天内容12",
+        "top_scores": [{"category": "社交通讯", "score": 0.1489}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "13:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "13:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "13:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "13:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "13:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "13:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "13:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "13:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "13:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题13 - Google Chrome",
+      "ocr_text": "详细截图文字内容13 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "13:编程开发:global": [-0.9149218797683716, -0.21927058696746826, -0.07860154658555984, 0.3296365439891815],
+        "13:编程开发:local": [-0.5157809853553772, 0.18619149923324585, -0.5597071051597595, 0.6213135719299316],
+        "13:编程开发:other": [-0.5544862747192383, -0.4625839293003082, 0.6692572236061096, 0.1750880777835846],
+        "13:社交通讯:global": [-0.5862783193588257, -0.7733632326126099, 0.07730647176504135, -0.22849634289741516],
+        "13:社交通讯:local": [0.4625609815120697, -0.8358731269836426, -0.1325131356716156, 0.2641851305961609],
+        "13:社交通讯:other": [-0.1822759211063385, -0.918746292591095, 0.12805043160915375, -0.3260120153427124],
+        "13:影音娱乐:global": [0.33868974447250366, 0.09276759624481201, -0.49278995394706726, 0.7961416244506836],
+        "13:影音娱乐:local": [-0.3032244145870209, -0.838297963142395, -0.35569968819618225, 0.28069406747817993],
+        "13:影音娱乐:other": [-0.4681903123855591, 0.22717729210853577, -0.4247492551803589, 0.7407943606376648],
+        "测试标题13": [0.2525731921195984, 0.6112714409828186, -0.7466904520988464, 0.07076273113489151],
+        "测试标题13 - Google Chrome": [-0.20227627456188202, 0.15886461734771729, 0.8050381541252136, 0.5345651507377625]
+      },
+      "category": "影音娱乐",
+      "score": 0.5665488243103027,
+      "debug": {
+        "category": "影音娱乐",
+        "category_confidence": 0.5665,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题13",
+        "top_scores": [{"category": "影音娱乐", "score": 0.5665}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "影音娱乐", "score": 0.5665}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "14:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "14:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "14:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "14:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "14:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "14:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "14:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "14:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "14:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "14:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "14:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "14:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题14 - Google Chrome",
+      "ocr_text": "详细截图文字内容14 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "14:编程开发:global": [-0.46396660804748535, 0.6170689463615417, -0.4342454969882965, 0.4641030728816986],
+        "14:编程开发:local": [-0.1017223373055458, 0.3781575560569763, 0.042418573051691055, 0.9191573262214661],
+        "14:编程开发:other": [-0.685032069683075, -0.018252892419695854, -0.07628364115953445, 0.7242780327796936],
+        "14:社交通讯:global": [-0.05593942478299141, 0.23603695631027222, 0.3663407862186432, 0.8983049392700195],
+        "14:社交通讯:local": [-0.0994214192032814, 0.5921467542648315, 0.5260114073753357, -0.6023201942443848],
+        "14:社交通讯:other": [-0.42218104004859924, -0.36652672290802, -0.31995639204978943, -0.7648850679397583],
+        "14:影音娱乐:global": [-0.9491015076637268, -0.02698826789855957, 0.2605117857456207, 0.1749616265296936],
+        "14:影音娱乐:local": [-0.17734664678573608, 0.5772991180419922, 0.6424156427383423, -0.4717797338962555],
+        "14:影音娱乐:other": [0.8008369207382202, -0.3752775490283966, 0.4631923735141754, -0.0572691448032856],
+        "14:办公文档:global": [-0.005911631044000387, -0.13390424847602844, -0.8877103924751282, -0.4404599964618683],
+        "14:办公文档:local": [0.18702152371406555, -0.25272488594055176, -0.5419976115226746, 0.7793533802032471],
+        "14:办公文档:other": [-0.7333946824073792, 0.4471364915370941, -0.0787678211927414, -0.5059614181518555],
+        "测试标题14 - Google Chrome": [0.6538299918174744, 0.0323595367372036, -0.41417503356933594, -0.6323908567428589]
+      },
+      "category": "办公文档",
+      "score": 0.6380121111869812,
+      "debug": {
+        "category": "办公文档",
+        "category_confidence": 0.638,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题14 - Google Chrome",
+        "top_scores": [{"category": "办公文档", "score": 0.638}, {"category": "社交通讯", "score": 0.12}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "办公文档", "score": 0.638}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "15:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "15:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "15:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "15:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "15:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "15:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容15",
+      "ocr_text": "详细截图文字内容15 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "15:编程开发:global": [-0.33755454421043396, -0.5189208984375, 0.5534436106681824, 0.5572056770324707],
+        "15:编程开发:local": [-0.06639225035905838, -0.8312671184539795, 0.5281947255134583, -0.15999165177345276],
+        "15:编程开发:other": [0.4155896306037903, 0.6743105053901672, 0.17146140336990356, -0.585825502872467],
+        "15:社交通讯:global": [-0.6303153038024902, 0.7007653117179871, 0.2245836853981018, -0.24737179279327393],
+        "15:社交通讯:local": [-0.937201738357544, -0.05847271531820297, 0.2944655120372772, -0.17754963040351868],
+        "15:社交通讯:other": [-0.5751464366912842, -0.6571708917617798, 0.09197692573070526, 0.4784071743488312],
+        "聊天内容15": [0.03555211424827576, 0.7391977310180664, 0.6700683236122131, 0.057717278599739075]
+      },
+      "category": "社交通讯",
+      "score": 0.6318038702011108,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.6318,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "聊天内容15",
+        "top_scores": [{"category": "社交通讯", "score": 0.6318}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.6318}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "16:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "16:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "16:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "16:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "16:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "16:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "16:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "16:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "16:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题16 - Google Chrome",
+      "ocr_text": "详细截图文字内容16 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "16:编程开发:global": [-0.08911270648241043, -0.8253533244132996, -0.24791616201400757, 0.49938806891441345],
+        "16:编程开发:local": [0.2753143012523651, 0.17240384221076965, 0.6640431880950928, 0.6734431982040405],
+        "16:编程开发:other": [0.2339755892753601, -0.7376517653465271, 0.17812339961528778, -0.6077807545661926],
+        "16:社交通讯:global": [0.39049232006073, 0.27078062295913696, -0.3230257034301758, -0.8184424638748169],
+        "16:社交通讯:local": [-0.6476457118988037, -0.6990516781806946, -0.2723577916622162, -0.1330530196428299],
+        "16:社交通讯:other": [0.8323764204978943, 0.3786461055278778, 0.30976787209510803, -0.2604236304759979],
+        "16:影音娱乐:global": [0.5154709815979004, -0.27939969301223755, -0.4815494418144226, 0.6514105200767517],
+        "16:影音娱乐:local": [-0.37423253059387207, -0.5475109219551086, 0.5334899425506592, -0.5249479413032532],
+        "16:影音娱乐:other": [0.06743540614843369, -0.22222104668617249, -0.9025276303291321, -0.36264875531196594],
+        "测试标题16 - Google Chrome": [0.006356492638587952, -0.09330730140209198, -0.6830189824104309, 0.7243883013725281]
+      },
+      "category": "影音娱乐",
+      "score": 0.8301281929016113,
+      "debug": {
+        "category": "影音娱乐",
+        "category_confidence": 0.8301,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题16 - Google Chrome",
+        "top_scores": [{"category": "影音娱乐", "score": 0.8301}, {"category": "编程开发", "score": 0.6075}, {"category": "社交通讯", "score": 0.12}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "影音娱乐", "score": 0.8301}, {"category": "编程开发", "score": 0.6075}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "17:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "17:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "17:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "17:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "17:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "17:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "17:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "17:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "17:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "17:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "17:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "17:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题17 - Google Chrome",
+      "ocr_text": "详细截图文字内容17 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "17:编程开发:global": [0.34399497509002686, -0.20528991520404816, -0.7004601955413818, 0.5906597375869751],
+        "17:编程开发:local": [0.6122119426727295, 0.3889990746974945, -0.42237117886543274, 0.5435796976089478],
+        "17:编程开发:other": [-0.5822798609733582, 0.14196529984474182, 0.43990451097488403, 0.6687899827957153],
+        "17:社交通讯:global": [0.5591489672660828, 0.2008342146873474, -0.7239895462989807, -0.3505099415779114],
+        "17:社交通讯:local": [0.4959757328033447, 0.777239978313446, 0.3683305084705353, 0.11932622641324997],
+        "17:社交通讯:other": [-0.2277587205171585, -0.48285165429115295, -0.7195839881896973, -0.4440484642982483],
+        "17:影音娱乐:global": [-0.3122609555721283, -0.9024129509925842, 0.2815413177013397, -0.09422567486763],
+        "17:影音娱乐:local": [-0.7957550883293152, 0.3275381326675415, 0.3792955279350281, 0.3400404453277588],
+        "17:影音娱乐:other": [0.2525496482849121, -0.8299506306648254, 0.3991962671279907, -0.2967205047607422],
+        "17:办公文档:global": [-0.7888360619544983, 0.38458961248397827, -0.18219879269599915, 0.44343215227127075],
+        "17:办公文档:local": [-0.6811814308166504, 0.25115570425987244, 0.6809296607971191, -0.09616386145353317],
+        "17:办公文档:other": [-0.23778121173381805, 0.7154921293258667, 0.38912683725357056, -0.5292556285858154],
+        "测试标题17": [-0.17089098691940308, -0.4899379312992096, 0.771177351474762, 0.3688395917415619],
+        "测试标题17 - Google Chrome": [0.7645338177680969, 0.039034295827150345, -0.5344130992889404, 0.35828346014022827]
+      },
+      "category": "影音娱乐",
+      "score": 0.8108846032619477,
+      "debug": {
+        "category": "影音娱乐",
+        "category_confidence": 0.6779,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题17",
+        "top_scores": [{"category": "影音娱乐", "score": 0.6779}, {"category": "编程开发", "score": 0.1431}, {"category": "社交通讯", "score": 0.0}, {"category": "办公文档", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["编程开发"],
+        "local_top": [{"category": "编程开发", "score": 0.9537}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "影音娱乐", "score": 0.6779}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "18:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "18:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "18:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "18:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "18:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "18:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容18",
+      "ocr_text": "详细截图文字内容18 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "18:编程开发:global": [0.21848589181900024, 0.07687442004680634, -0.07879577577114105, -0.9696109890937805],
+        "18:编程开发:local": [-0.6719645857810974, 0.0666952058672905, -0.7021259069442749, 0.22590844333171844],
+        "18:编程开发:other": [-0.471088171005249, 0.5356376767158508, -0.6797099113464355, -0.17077086865901947],
+        "18:社交通讯:global": [0.31187111139297485, -0.8779211044311523, 0.3312513530254364, 0.14920936524868011],
+        "18:社交通讯:local": [-0.7676436901092529, 0.37778252363204956, -0.36098119616508484, -0.37107425928115845],
+        "18:社交通讯:other": [0.6502341628074646, -0.3808407485485077, 0.5281583070755005, -0.3914136588573456],
+        "聊天内容18": [0.05454584211111069, -0.8829995393753052, -0.4657342731952667, -0.020690608769655228]
+      },
+      "category": "社交通讯",
+      "score": 0.7548528861999512,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.7549,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "聊天内容18",
+        "top_scores": [{"category": "社交通讯", "score": 0.7549}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.6349}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "19:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "19:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "19:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "19:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "19:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "19:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "19:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "19:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "19:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题19 - Google Chrome",
+      "ocr_text": "详细截图文字内容19 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "19:编程开发:global": [-0.45997506380081177, 0.3930722177028656, -0.38305503129959106, -0.6979871392250061],
+        "19:编程开发:local": [-0.2694505751132965, 0.8358446359634399, -0.1792229264974594, 0.4434402585029602],
+        "19:编程开发:other": [-0.696169912815094, -0.1179111897945404, -0.6491585373878479, -0.28290918469429016],
+        "19:社交通讯:global": [0.5902884602546692, -0.11373161524534225, 0.7673727869987488, 0.2230777144432068],
+        "19:社交通讯:local": [0.000855680787935853, -0.01233622245490551, 0.4119255542755127, -0.9111335873603821],
+        "19:社交通讯:other": [-0.7414124011993408, 0.025142474099993706, -0.575694739818573, -0.3438766896724701],
+        "19:影音娱乐:global": [0.686369001865387, 0.18014778196811676, 0.46990668773651123, -0.5250067114830017],
+        "19:影音娱乐:local": [0.3820919990539551, -0.8644036650657654, -0.21912890672683716, 0.24247576296329498],
+        "19:影音娱乐:other": [0.3154408931732178, 0.7498923540115356, -0.4155571460723877, -0.4067811071872711],
+        "测试标题19": [0.3837882876396179, -0.8756587505340576, 0.10213396698236465, 0.2747672498226166],
+        "详细截图文字内容19 unrelated words 内容线索": [0.05469752103090286, 0.41272321343421936, 0.9091604948043823, -0.009740264154970646],
+        "测试标题19 - Google Chrome": [-0.056578848510980606, -0.8153433203697205, -0.4145236909389496, 0.4002302885055542]
+      },
+      "category": "社交通讯",
+      "score": 0.52166217648983,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.5217,
+        "used_ocr": true,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题19",
+        "top_scores": [{"category": "社交通讯", "score": 0.5217}, {"category": "影音娱乐", "score": 0.2194}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["影音娱乐"],
+        "local_top": [{"category": "影音娱乐", "score": 0.921}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.4658}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "20:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "20:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "20:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "20:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "20:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "20:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "20:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "20:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "20:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "20:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "20:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "20:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题20 - Google Chrome",
+      "ocr_text": "详细截图文字内容20 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "20:编程开发:global": [-0.2010827213525772, -0.665489673614502, 0.35382530093193054, 0.6256970763206482],
+        "20:编程开发:local": [0.5863390564918518, 0.6901853680610657, -0.2782622277736664, 0.32003241777420044],
+        "20:编程开发:other": [0.27413496375083923, -0.8750494718551636, -0.37290239334106445, 0.14171217381954193],
+        "20:社交通讯:global": [0.9129607081413269, 0.08247030526399612, -0.3879085183143616, -0.0960647389292717],
+        "20:社交通讯:local": [-0.45775938034057617, -0.38536199927330017, -0.7356845140457153, 0.3173653483390808],
+        "20:社交通讯:other": [0.6418541669845581, -0.03157162666320801, 0.2597283124923706, 0.7208104133605957],
+        "20:影音娱乐:global": [0.5032134652137756, -0.5726251602172852, -0.05997118353843689, -0.6444222331047058],
+        "20:影音娱乐:local": [0.588176429271698, -0.20275327563285828, -0.7009063959121704, 0.34881189465522766],
+        "20:影音娱乐:other": [0.8965035080909729, -0.389553964138031, 0.21086958050727844, -0.007956433109939098],
+        "20:办公文档:global": [0.5488498210906982, 0.38835594058036804, -0.02217475138604641, -0.7398998141288757],
+        "20:办公文档:local": [0.6323478817939758, -0.09464885294437408, 0.490307092666626, -0.5922641158103943],
+        "20:办公文档:other": [-0.8411294221878052, -0.37441062927246094, -0.38881468772888184, -0.03377970680594444],
+        "测试标题20 - Google Chrome": [-0.41813257336616516, 0.24321812391281128, -0.6523770093917847, -0.5834503173828125],
+        "详细截图文字内容20 unrelated words 内容线索": [0.4851948022842407, 0.6070640683174133, -0.5825390815734863, -0.23813343048095703]
+      },
+      "category": "办公文档",
+      "score": 0.3871331214904785,
+      "debug": {
+        "category": "办公文档",
+        "category_confidence": 0.3871,
+        "used_ocr": true,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题20 - Google Chrome",
+        "top_scores": [{"category": "办公文档", "score": 0.3871}, {"category": "社交通讯", "score": 0.3215}, {"category": "编程开发", "score": 0.0504}, {"category": "影音娱乐", "score": 0.0323}],
+        "local_diversity": 1,
+        "local_categories": ["社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.4425}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "办公文档", "score": 0.3111}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "21:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "21:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "21:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "21:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "21:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "21:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容21",
+      "ocr_text": "详细截图文字内容21 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "21:编程开发:global": [0.7147015929222107, 0.09993548691272736, 0.5242576599121094, 0.45207127928733826],
+        "21:编程开发:local": [0.12183131277561188, 0.3541947603225708, 0.024921447038650513, 0.9268668293952942],
+        "21:编程开发:other": [0.7119060158729553, -0.08190897852182388, -0.6753618717193604, 0.1742611974477768],
+        "21:社交通讯:global": [0.6407635807991028, -0.30372098088264465, -0.595234215259552, 0.37798401713371277],
+        "21:社交通讯:local": [0.059218183159828186, 0.006191217340528965, 0.3000800609588623, 0.9520540237426758],
+        "21:社交通讯:other": [-0.23444032669067383, 0.11591856181621552, 0.9061387777328491, -0.33243513107299805],
+        "聊天内容21": [0.8605791926383972, 0.20091423392295837, -0.4152071475982666, -0.2159627079963684]
+      },
+      "category": "社交通讯",
+      "score": 0.6559209823608398,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.6559,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "聊天内容21",
+        "top_scores": [{"category": "社交通讯", "score": 0.6559}, {"category": "编程开发", "score": 0.3198}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.6559}, {"category": "编程开发", "score": 0.3198}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "22:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "22:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "22:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "22:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "22:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "22:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "22:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "22:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "22:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题22 - Google Chrome",
+      "ocr_text": "详细截图文字内容22 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "22:编程开发:global": [0.21446505188941956, -0.7082663774490356, 0.6553914546966553, 0.15108124911785126],
+        "22:编程开发:local": [-0.7542662024497986, 0.20429185032844543, -0.521721363067627, 0.3422779440879822],
+        "22:编程开发:other": [-0.40934404730796814, 0.5494463443756104, -0.6745792627334595, -0.2747526168823242],
+        "22:社交通讯:global": [0.04811586067080498, 0.28005093336105347, 0.9246353507041931, -0.25358572602272034],
+        "22:社交通讯:local": [-0.32197725772857666, 0.5498983860015869, -0.010305306874215603, 0.7706077694892883],
+        "22:社交通讯:other": [-0.031685952097177505, 0.1615886241197586, -0.6845794320106506, 0.7100958824157715],
+        "22:影音娱乐:global": [0.40848201513290405, 0.6025067567825317, 0.5840433239936829, 0.35919544100761414],
+        "22:影音娱乐:local": [-0.4599822163581848, 0.8759620785713196, 0.024585507810115814, -0.14318633079528809],
+        "22:影音娱乐:other": [-0.24110807478427887, 0.6392800211906433, -0.15970171988010406, -0.7125189900398254],
+        "测试标题22 - Google Chrome": [-0.1600695550441742, -0.1981746256351471, 0.3449678122997284, -0.9033834934234619],
+        "详细截图文字内容22 unrelated words 内容线索": [0.3768082559108734, 0.3387802541255951, 0.8238538503646851, 0.2539846897125244]
+      },
+      "category": "社交通讯",
+      "score": 0.6699557137489319,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.67,
+        "used_ocr": true,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题22 - Google Chrome",
+        "top_scores": [{"category": "社交通讯", "score": 0.67}, {"category": "影音娱乐", "score": 0.1861}, {"category": "编程开发", "score": 0.0838}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.4849}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "23:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "23:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "23:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "23:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "23:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "23:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "23:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "23:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "23:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "23:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "23:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "23:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题23 - Google Chrome",
+      "ocr_text": "详细截图文字内容23 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "23:编程开发:global": [-0.6569899320602417, -0.7311417460441589, -0.17744843661785126, -0.04804118722677231],
+        "23:编程开发:local": [0.658797562122345, -0.2960686683654785, -0.3040277659893036, 0.6212054491043091],
+        "23:编程开发:other": [-0.12082326412200928, 0.6459727883338928, 0.4304112195968628, -0.6187624931335449],
+        "23:社交通讯:global": [-0.3676888048648834, -0.14158670604228973, 0.8145893812179565, -0.42567870020866394],
+        "23:社交通讯:local": [0.7175657749176025, 0.041926369071006775, -0.5667268633842468, 0.40269365906715393],
+        "23:社交通讯:other": [-0.5247500538825989, 0.7752828001976013, 0.2706570327281952, -0.22431835532188416],
+        "23:影音娱乐:global": [-0.08936108648777008, -0.8782424926757812, -0.46718791127204895, 0.049398474395275116],
+        "23:影音娱乐:local": [-0.6193392276763916, 0.16678225994110107, 0.5191109776496887, -0.5649126768112183],
+        "23:影音娱乐:other": [-0.6246147751808167, -0.2236650437116623, 0.028342142701148987, -0.7476810812950134],
+        "23:办公文档:global": [-0.24341024458408356, -0.9633431434631348, 0.07869618386030197, 0.08079790323972702],
+        "23:办公文档:local": [0.005327513907104731, -0.19302982091903687, -0.8312699198722839, 0.5212497115135193],
+        "23:办公文档:other": [-0.3025093376636505, 0.08502515405416489, -0.8564760088920593, 0.4095211327075958],
+        "测试标题23": [-0.7172054648399353, 0.5503429770469666, 0.031024709343910217, -0.42635250091552734],
+        "详细截图文字内容23 unrelated words 内容线索": [-0.783898115158081, -0.14055830240249634, 0.03387808799743652, -0.6038206815719604],
+        "测试标题23 - Google Chrome": [-0.30972546339035034, 0.7295585870742798, -0.6033177971839905, 0.08844227343797684]
+      },
+      "category": "社交通讯",
+      "score": 0.4325914144515991,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.4326,
+        "used_ocr": true,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题23",
+        "top_scores": [{"category": "社交通讯", "score": 0.4326}, {"category": "编程开发", "score": 0.1282}, {"category": "办公文档", "score": 0.0546}, {"category": "影音娱乐", "score": 0.0261}],
+        "local_diversity": 1,
+        "local_categories": ["办公文档"],
+        "local_top": [{"category": "办公文档", "score": 0.4551}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.3925}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "24:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "24:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "24:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "24:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "24:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "24:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容24",
+      "ocr_text": "详细截图文字内容24 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "24:编程开发:global": [-0.07692670077085495, 0.5464928150177002, -0.8338964581489563, -0.006671674083918333],
+        "24:编程开发:local": [0.8173051476478577, 0.10761379450559616, -0.5406002998352051, 0.16787706315517426],
+        "24:编程开发:other": [-0.11422169953584671, -0.443643718957901, 0.8215702176094055, 0.33934667706489563],
+        "24:社交通讯:global": [0.022341415286064148, 0.2899668514728546, -0.9095624685287476, 0.2968440055847168],
+        "24:社交通讯:local": [-0.05462164431810379, -0.7063207626342773, -0.3322809338569641, -0.6226690411567688],
+        "24:社交通讯:other": [-0.21600928902626038, -0.3345422148704529, 0.9038345813751221, 0.15653924643993378],
+        "聊天内容24": [-0.20114491879940033, -0.4752058684825897, -0.5306754112243652, -0.672386646270752]
+      },
+      "category": "未分类",
+      "score": 0.26874634265899655,
+      "debug": {
+        "category": "未分类",
+        "category_confidence": 0.2687,
+        "used_ocr": false,
+        "local_veto_active": true,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "聊天内容24",
+        "top_scores": [{"category": "社交通讯", "score": 0.2687}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.9916}, {"category": "编程开发", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "25:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "25:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "25:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "25:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "25:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "25:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "25:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "25:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "25:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题25 - Google Chrome",
+      "ocr_text": "详细截图文字内容25 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "25:编程开发:global": [0.48257890343666077, 0.8631505370140076, 0.01770290732383728, 0.14756500720977783],
+        "25:编程开发:local": [-0.19080671668052673, 0.8160143494606018, 0.08364629000425339, 0.5391815304756165],
+        "25:编程开发:other": [0.8766900300979614, -0.3103887736797333, -0.34930419921875, -0.1142805814743042],
+        "25:社交通讯:global": [-0.2688713073730469, -0.5568238496780396, -0.6652735471725464, -0.41840946674346924],
+        "25:社交通讯:local": [-0.5777551531791687, 0.3641427457332611, 0.014376692473888397, -0.7303370833396912],
+        "25:社交通讯:other": [0.1384417712688446, 0.8198187947273254, 0.4271965026855469, -0.3552945852279663],
+        "25:影音娱乐:global": [-0.5445756912231445, -0.5635156035423279, -0.5890804529190063, -0.19715887308120728],
+        "25:影音娱乐:local": [-0.3237050175666809, 0.3932029902935028, -0.7494980096817017, 0.4229176342487335],
+        "25:影音娱乐:other": [-0.6487205624580383, -0.23623399436473846, -0.7191322445869446, 0.07876469194889069],
+        "测试标题25": [-0.14291684329509735, 0.2599915564060211, -0.9058982133865356, -0.302204430103302],
+        "测试标题25 - Google Chrome": [0.09347697347402573, -0.4890183210372925, -0.3344549536705017, -0.8001643419265747]
+      },
+      "category": "社交通讯",
+      "score": 0.7532517129182815,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.6824,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题25",
+        "top_scores": [{"category": "社交通讯", "score": 0.6824}, {"category": "影音娱乐", "score": 0.5245}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.3975}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.6228}, {"category": "影音娱乐", "score": 0.5245}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "26:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "26:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "26:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "26:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "26:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "26:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "26:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "26:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "26:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "26:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "26:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "26:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题26 - Google Chrome",
+      "ocr_text": "详细截图文字内容26 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "26:编程开发:global": [0.35829848051071167, 0.26063576340675354, 0.616933286190033, 0.6504495143890381],
+        "26:编程开发:local": [0.7767536044120789, -0.5832894444465637, 0.22105874121189117, 0.08694992959499359],
+        "26:编程开发:other": [0.09558705240488052, 0.8713488578796387, -0.32325106859207153, 0.35654324293136597],
+        "26:社交通讯:global": [-0.4029093384742737, -0.24443212151527405, -0.23574137687683105, -0.8499076962471008],
+        "26:社交通讯:local": [0.23730257153511047, 0.002790229395031929, 0.7327428460121155, 0.637783408164978],
+        "26:社交通讯:other": [-0.34147965908050537, 0.693996012210846, -0.4600295126438141, -0.4360435903072357],
+        "26:影音娱乐:global": [0.12572713196277618, -0.8052548766136169, -0.08183460682630539, -0.573637843132019],
+        "26:影音娱乐:local": [-0.33868691325187683, -0.9320843815803528, -0.033697888255119324, 0.1239929348230362],
+        "26:影音娱乐:other": [-0.1748238205909729, 0.940647542476654, 0.19646045565605164, -0.21452797949314117],
+        "26:办公文档:global": [-0.2664165198802948, 0.9122369885444641, 0.27001628279685974, 0.15471622347831726],
+        "26:办公文档:local": [-0.8232704997062683, 0.2618104815483093, 0.09916958212852478, -0.4938080906867981],
+        "26:办公文档:other": [-0.04915853217244148, -0.40264835953712463, 0.6331759691238403, -0.6592009663581848],
+        "测试标题26 - Google Chrome": [0.9098401665687561, 0.34648674726486206, 0.2272125631570816, -0.022630352526903152]
+      },
+      "category": "编程开发",
+      "score": 0.7226200187206269,
+      "debug": {
+        "category": "编程开发",
+        "category_confidence": 0.7226,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题26 - Google Chrome",
+        "top_scores": [{"category": "编程开发", "score": 0.7226}, {"category": "社交通讯", "score": 0.2457}, {"category": "影音娱乐", "score": 0.0}, {"category": "办公文档", "score": 0.0}],
+        "local_diversity": 2,
+        "local_categories": ["编程开发", "社交通讯"],
+        "local_top": [{"category": "编程开发", "score": 0.6029}, {"category": "社交通讯", "score": 0.4189}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.5418}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "27:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "27:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "27:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "27:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "27:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "27:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容27",
+      "ocr_text": "详细截图文字内容27 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "27:编程开发:global": [0.11394061893224716, -0.48049452900886536, -0.11083783954381943, -0.8624718189239502],
+        "27:编程开发:local": [-0.22319431602954865, 0.09193848073482513, -0.5322054624557495, -0.8114734292030334],
+        "27:编程开发:other": [0.9499411582946777, -0.20632950961589813, 0.03956478089094162, 0.23124562203884125],
+        "27:社交通讯:global": [0.9793503284454346, 0.06293545663356781, 0.12581397593021393, 0.145199716091156],
+        "27:社交通讯:local": [0.24853576719760895, 0.11554644256830215, 0.23650451004505157, -0.9321720004081726],
+        "27:社交通讯:other": [0.4700123369693756, 0.1827559769153595, -0.6136080622673035, -0.6075966954231262],
+        "聊天内容27": [0.9015786647796631, 0.011404466815292835, -0.414058119058609, -0.12482678145170212]
+      },
+      "category": "社交通讯",
+      "score": 0.8134599924087524,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.8135,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "聊天内容27",
+        "top_scores": [{"category": "社交通讯", "score": 0.8135}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.8135}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "28:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "28:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "28:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "28:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "28:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "28:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "28:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "28:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "28:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题28 - Google Chrome",
+      "ocr_text": "详细截图文字内容28 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "28:编程开发:global": [0.7311829924583435, 0.43832919001579285, -0.35948866605758667, 0.37948229908943176],
+        "28:编程开发:local": [-0.23392559587955475, 0.8441407084465027, 0.06289210915565491, 0.47827792167663574],
+        "28:编程开发:other": [-0.3623976707458496, 0.7766190767288208, -0.44845205545425415, -0.25381383299827576],
+        "28:社交通讯:global": [-0.7726725935935974, 0.6095554828643799, 0.17119812965393066, 0.04593857750296593],
+        "28:社交通讯:local": [0.145048588514328, 0.536946713924408, 0.10945319384336472, 0.8238137364387512],
+        "28:社交通讯:other": [-0.671065092086792, 0.5340291261672974, 0.5142799615859985, -0.0008327575633302331],
+        "28:影音娱乐:global": [-0.6760945320129395, 0.17963401973247528, 0.03976782411336899, -0.7134747505187988],
+        "28:影音娱乐:local": [0.6797239184379578, -0.6168527007102966, -0.02873813360929489, 0.3957805931568146],
+        "28:影音娱乐:other": [-0.3318282663822174, 0.14124447107315063, -0.30258914828300476, -0.8822583556175232],
+        "测试标题28 - Google Chrome": [0.6333225965499878, -0.6504469513893127, -0.1300104409456253, -0.3986458480358124]
+      },
+      "category": "未分类",
+      "score": 0.12,
+      "debug": {
+        "category": "未分类",
+        "category_confidence": 0.12,
+        "used_ocr": false,
+        "local_veto_active": true,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题28 - Google Chrome",
+        "top_scores": [{"category": "社交通讯", "score": 0.12}, {"category": "影音娱乐", "score": 0.1092}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["影音娱乐"],
+        "local_top": [{"category": "影音娱乐", "score": 0.7277}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "29:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "29:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "29:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "29:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "29:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "29:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "29:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "29:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "29:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "29:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "29:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "29:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题29 - Google Chrome",
+      "ocr_text": "详细截图文字内容29 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "29:编程开发:global": [0.34497693181037903, 0.913692831993103, 0.023151522502303123, 0.2135891169309616],
+        "29:编程开发:local": [-0.4617995321750641, 0.4770700931549072, -0.6494101285934448, 0.3706909716129303],
+        "29:编程开发:other": [0.9834331274032593, -0.023969219997525215, 0.007850748486816883, -0.17950773239135742],
+        "29:社交通讯:global": [0.052605923265218735, -0.12915687263011932, -0.7790920734405518, -0.6112011075019836],
+        "29:社交通讯:local": [0.1471869796514511, -0.7467788457870483, 0.24890869855880737, 0.5989172458648682],
+        "29:社交通讯:other": [0.6792405247688293, 0.20580138266086578, 0.31557363271713257, 0.6298344135284424],
+        "29:影音娱乐:global": [-0.3306185007095337, -0.14431649446487427, 0.8868494629859924, -0.2887251675128937],
+        "29:影音娱乐:local": [-0.6429378390312195, 0.16893276572227478, 0.088230200111866, 0.7418276071548462],
+        "29:影音娱乐:other": [0.08755706995725632, 0.053432367742061615, 0.7799680829048157, -0.6173560619354248],
+        "29:办公文档:global": [0.036820605397224426, -0.6910028457641602, -0.4918197691440582, 0.5284625291824341],
+        "29:办公文档:local": [0.4822210371494293, 0.5174264311790466, -0.14284078776836395, 0.6923360824584961],
+        "29:办公文档:other": [0.3011667728424072, -0.5249271988868713, -0.795734167098999, 0.023601500317454338],
+        "测试标题29": [-0.3774438798427582, 0.0008449041051790118, -0.9240239858627319, -0.0609506294131279],
+        "测试标题29 - Google Chrome": [0.0450267568230629, -0.24897873401641846, 0.967263400554657, 0.01959078572690487]
+      },
+      "category": "社交通讯",
+      "score": 0.737187922000885,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.8114,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题29",
+        "top_scores": [{"category": "社交通讯", "score": 0.8114}, {"category": "办公文档", "score": 0.4078}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.4951}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.7372}, {"category": "办公文档", "score": 0.4078}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "30:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "30:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "30:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "30:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "30:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "30:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容30",
+      "ocr_text": "详细截图文字内容30 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "30:编程开发:global": [0.5657311081886292, 0.39935997128486633, 0.6656128168106079, -0.2782435119152069],
+        "30:编程开发:local": [0.1116802841424942, 0.8862335681915283, -0.35289013385772705, -0.2785428762435913],
+        "30:编程开发:other": [-0.3061412572860718, 0.5099081993103027, 0.8038989305496216, 0.004192167893052101],
+        "30:社交通讯:global": [-0.49875080585479736, 0.697665274143219, 0.5135997533798218, 0.02694622613489628],
+        "30:社交通讯:local": [0.8846221566200256, 0.07937347888946533, 0.3180442452430725, -0.33164945244789124],
+        "30:社交通讯:other": [0.3533462882041931, 0.763097882270813, 0.21349160373210907, 0.4972417652606964],
+        "聊天内容30": [0.537033200263977, -0.2669004797935486, 0.7694020867347717, -0.21995441615581512]
+      },
+      "category": "编程开发",
+      "score": 0.7705518007278442,
+      "debug": {
+        "category": "编程开发",
+        "category_confidence": 0.7706,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "聊天内容30",
+        "top_scores": [{"category": "编程开发", "score": 0.7706}, {"category": "社交通讯", "score": 0.2432}],
+        "local_diversity": 1,
+        "local_categories": ["社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.8215}, {"category": "编程开发", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.7706}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "31:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "31:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "31:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "31:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "31:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "31:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "31:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "31:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "31:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题31 - Google Chrome",
+      "ocr_text": "详细截图文字内容31 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "31:编程开发:global": [-0.07033898681402206, 0.7825180888175964, -0.43843990564346313, -0.43644967675209045],
+        "31:编程开发:local": [-0.5296545028686523, -0.45493283867836, -0.30218884348869324, 0.6489870548248291],
+        "31:编程开发:other": [0.5634914636611938, 0.3122607469558716, 0.42045843601226807, 0.6388937830924988],
+        "31:社交通讯:global": [0.4586070477962494, 0.07825826108455658, 0.6786219477653503, -0.5683550238609314],
+        "31:社交通讯:local": [-0.1517055630683899, -0.5192763209342957, 0.0735931545495987, -0.8378076553344727],
+        "31:社交通讯:other": [0.5340107083320618, -0.8097955584526062, 0.21859396994113922, 0.10620971024036407],
+        "31:影音娱乐:global": [-0.05960143730044365, 0.6496263742446899, 0.46191760897636414, -0.6008872389793396],
+        "31:影音娱乐:local": [0.681402325630188, -0.6886215209960938, -0.05979475751519203, 0.24065746366977692],
+        "31:影音娱乐:other": [0.4698532223701477, -0.3098495602607727, -0.5460244417190552, -0.6205549836158752],
+        "测试标题31": [0.7970976233482361, -0.34659624099731445, -0.3861734867095947, 0.3088309168815613],
+        "测试标题31 - Google Chrome": [0.6525232791900635, -0.06195966899394989, -0.3105190098285675, 0.6884418725967407]
+      },
+      "category": "未分类",
+      "score": 0.13938470900058747,
+      "debug": {
+        "category": "未分类",
+        "category_confidence": 0.1082,
+        "used_ocr": false,
+        "local_veto_active": true,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题31",
+        "top_scores": [{"category": "影音娱乐", "score": 0.1082}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["影音娱乐"],
+        "local_top": [{"category": "影音娱乐", "score": 0.7215}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "32:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "32:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "32:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "32:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "32:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "32:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "32:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "32:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "32:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "32:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "32:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "32:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题32 - Google Chrome",
+      "ocr_text": "详细截图文字内容32 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "32:编程开发:global": [-0.6971899271011353, -0.09123124927282333, 0.44012388586997986, 0.5584747195243835],
+        "32:编程开发:local": [-0.5951398611068726, 0.7686557769775391, 0.15814460813999176, -0.1731102466583252],
+        "32:编程开发:other": [0.4063507914543152, -0.16536200046539307, -0.8927499651908875, -0.10262513160705566],
+        "32:社交通讯:global": [0.030980175361037254, -0.37936297059059143, 0.8105682730674744, -0.4450874924659729],
+        "32:社交通讯:local": [-0.6003172397613525, -0.43728014826774597, 0.6696272492408752, -0.0021666681859642267],
+        "32:社交通讯:other": [-0.3101975917816162, -0.8909878134727478, -0.10407065600156784, 0.3147815763950348],
+        "32:影音娱乐:global": [0.23342779278755188, -0.26943549513816833, 0.7686901092529297, -0.5310662388801575],
+        "32:影音娱乐:local": [-0.05404651537537575, -0.5171164274215698, -0.12005628645420074, -0.8457281589508057],
+        "32:影音娱乐:other": [0.011384891346096992, -0.6035398840904236, 0.7908226847648621, 0.10104218870401382],
+        "32:办公文档:global": [-0.3876495063304901, 0.39429083466529846, -0.554145336151123, -0.6222423911094666],
+        "32:办公文档:local": [-0.4347076416015625, -0.12997424602508545, -0.7407907843589783, -0.495343416929245],
+        "32:办公文档:other": [-0.6049824357032776, -0.5541567802429199, -0.27102863788604736, 0.5034381747245789],
+        "测试标题32 - Google Chrome": [0.21739673614501953, -0.3083937466144562, 0.21224157512187958, 0.9014352560043335],
+        "详细截图文字内容32 unrelated words 内容线索": [-0.4671686887741089, -0.04672211781144142, -0.8157108426094055, -0.3379145562648773]
+      },
+      "category": "未分类",
+      "score": 0.3787277698516846,
+      "debug": {
+        "category": "未分类",
+        "category_confidence": 0.3787,
+        "used_ocr": true,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题32 - Google Chrome",
+        "top_scores": [{"category": "编程开发", "score": 0.3787}, {"category": "办公文档", "score": 0.2268}, {"category": "社交通讯", "score": 0.12}, {"category": "影音娱乐", "score": 0.029}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.4734}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "33:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "33:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "33:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "33:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "33:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "33:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容33",
+      "ocr_text": "详细截图文字内容33 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "33:编程开发:global": [-0.30428096652030945, 0.08254823088645935, 0.5775083899497986, -0.7530490756034851],
+        "33:编程开发:local": [-0.5063509941101074, -0.6822653412818909, -0.24213209748268127, 0.4685027301311493],
+        "33:编程开发:other": [-0.5579039454460144, 0.030146649107336998, 0.4331599175930023, -0.7072529792785645],
+        "33:社交通讯:global": [-0.4377443790435791, 0.40393561124801636, -0.5931470394134521, 0.5416572690010071],
+        "33:社交通讯:local": [-0.5832588076591492, 0.3866705000400543, 0.6527456641197205, 0.2902037501335144],
+        "33:社交通讯:other": [0.6502730250358582, -0.4979242980480194, 0.5675268769264221, -0.08443717658519745],
+        "聊天内容33": [0.08047796785831451, 0.9757344722747803, -0.1933428943157196, 0.06390675157308578],
+        "详细截图文字内容33 unrelated words 内容线索": [0.314963161945343, 0.8297358155250549, 0.4586527943611145, 0.044433239847421646]
+      },
+      "category": "社交通讯",
+      "score": 0.4215433653593063,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.4215,
+        "used_ocr": true,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "聊天内容33",
+        "top_scores": [{"category": "社交通讯", "score": 0.4215}, {"category": "编程开发", "score": 0.0}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.5082}, {"category": "编程开发", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "34:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "34:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "34:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "34:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "34:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "34:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "34:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "34:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "34:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题34 - Google Chrome",
+      "ocr_text": "详细截图文字内容34 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "34:编程开发:global": [-0.25190046429634094, 0.8549036383628845, 0.049226246774196625, -0.45084676146507263],
+        "34:编程开发:local": [0.18168261647224426, -0.3552234470844269, 0.33981767296791077, 0.8516640663146973],
+        "34:编程开发:other": [0.589621365070343, 0.14022938907146454, 0.09293173253536224, -0.789965808391571],
+        "34:社交通讯:global": [-0.935789942741394, 0.04824778065085411, 0.20548021793365479, 0.2823953926563263],
+        "34:社交通讯:local": [0.24216759204864502, -0.878587543964386, 0.24523498117923737, -0.33060339093208313],
+        "34:社交通讯:other": [-0.8255987763404846, -0.2672593295574188, -0.43964874744415283, -0.23166373372077942],
+        "34:影音娱乐:global": [-0.29323163628578186, -0.28114503622055054, -0.7898678779602051, 0.45943599939346313],
+        "34:影音娱乐:local": [0.6682273745536804, 0.4402922987937927, 0.37605583667755127, -0.4671156108379364],
+        "34:影音娱乐:other": [0.14275223016738892, -0.8778592944145203, 0.19406549632549286, -0.41391247510910034],
+        "测试标题34 - Google Chrome": [-0.10295628756284714, -0.6614453792572021, 0.6625137329101562, -0.3361034691333771]
+      },
+      "category": "未分类",
+      "score": 0.25196901798248295,
+      "debug": {
+        "category": "未分类",
+        "category_confidence": 0.252,
+        "used_ocr": false,
+        "local_veto_active": true,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题34 - Google Chrome",
+        "top_scores": [{"category": "社交通讯", "score": 0.252}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.8798}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "35:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "35:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "35:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "35:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "35:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "35:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "35:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "35:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "35:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "35:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "35:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "35:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题35 - Google Chrome",
+      "ocr_text": "详细截图文字内容35 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "35:编程开发:global": [-0.784176230430603, 0.35007649660110474, 0.25569307804107666, 0.44399911165237427],
+        "35:编程开发:local": [0.114787258207798, 0.09717065840959549, -0.9755569100379944, -0.16022035479545593],
+        "35:编程开发:other": [0.8619592785835266, -0.2209692746400833, 0.3622031807899475, 0.2775023579597473],
+        "35:社交通讯:global": [0.9139756560325623, -0.1516752392053604, -0.3670245409011841, 0.08328327536582947],
+        "35:社交通讯:local": [-0.3375798761844635, -0.37621748447418213, 0.4378422200679779, 0.7435014247894287],
+        "35:社交通讯:other": [0.20941399037837982, 0.2544878125190735, -0.8960573077201843, -0.29742732644081116],
+        "35:影音娱乐:global": [0.07079343497753143, -0.4565918743610382, 0.26186537742614746, 0.8473125696182251],
+        "35:影音娱乐:local": [0.14483070373535156, -0.9850858449935913, -0.06105775386095047, -0.07001326978206635],
+        "35:影音娱乐:other": [0.3247096538543701, -0.15585333108901978, -0.5510796904563904, -0.7527180910110474],
+        "35:办公文档:global": [0.12548792362213135, -0.5736514925956726, 0.6777157783508301, -0.44258108735084534],
+        "35:办公文档:local": [-0.5458441376686096, 0.40234750509262085, -0.06870454549789429, -0.7317448258399963],
+        "35:办公文档:other": [0.4738670885562897, 0.5909649729728699, -0.392778217792511, 0.5214744806289673],
+        "测试标题35": [-0.571433424949646, 0.6975759267807007, -0.07324884086847305, -0.4260120689868927],
+        "详细截图文字内容35 unrelated words 内容线索": [-0.47634515166282654, 0.10370854288339615, 0.5788047313690186, -0.6537009477615356],
+        "测试标题35 - Google Chrome": [0.43781641125679016, 0.23076973855495453, 0.4163748025894165, 0.7626887559890747]
+      },
+      "category": "编程开发",
+      "score": 0.38754498958587646,
+      "debug": {
+        "category": "编程开发",
+        "category_confidence": 0.3875,
+        "used_ocr": true,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题35",
+        "top_scores": [{"category": "编程开发", "score": 0.3875}, {"category": "办公文档", "score": 0.1362}, {"category": "社交通讯", "score": 0.0678}, {"category": "影音娱乐", "score": 0.0}],
+        "local_diversity": 1,
+        "local_categories": ["社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.5647}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.4844}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "36:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "36:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "36:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "36:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "36:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "36:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容36",
+      "ocr_text": "详细截图文字内容36 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "36:编程开发:global": [-0.5266480445861816, 0.6492918729782104, -0.05666147172451019, -0.545757532119751],
+        "36:编程开发:local": [-0.28115537762641907, 0.5088058710098267, -0.3158658444881439, 0.7498646974563599],
+        "36:编程开发:other": [0.908300518989563, 0.02055477537214756, 0.4019630253314972, 0.1139882430434227],
+        "36:社交通讯:global": [0.42632827162742615, 0.16666154563426971, -0.131646528840065, 0.8792822957038879],
+        "36:社交通讯:local": [0.036520183086395264, -0.1482197344303131, 0.6882057189941406, 0.709274411201477],
+        "36:社交通讯:other": [-0.599589467048645, 0.5584705471992493, -0.5116587281227112, 0.2584734261035919],
+        "聊天内容36": [0.1607511192560196, 0.9822748303413391, 0.0034683793783187866, -0.09634935110807419]
+      },
+      "category": "编程开发",
+      "score": 0.670197646021843,
+      "debug": {
+        "category": "编程开发",
+        "category_confidence": 0.6702,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "聊天内容36",
+        "top_scores": [{"category": "编程开发", "score": 0.6702}, {"category": "社交通讯", "score": 0.12}],
+        "local_diversity": 1,
+        "local_categories": ["编程开发"],
+        "local_top": [{"category": "编程开发", "score": 0.4312}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.6055}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "37:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "37:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "37:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "37:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "37:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "37:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "37:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "37:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "37:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题37 - Google Chrome",
+      "ocr_text": "详细截图文字内容37 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "37:编程开发:global": [-0.5843639373779297, -0.20702844858169556, -0.5808091759681702, 0.5275591611862183],
+        "37:编程开发:local": [0.667320191860199, 0.2637466490268707, -0.4950959384441376, 0.4898993968963623],
+        "37:编程开发:other": [0.5773754119873047, 0.4473726451396942, -0.6828681230545044, -0.013659937307238579],
+        "37:社交通讯:global": [0.7176509499549866, -0.10720912367105484, -0.6158373951911926, -0.3069652020931244],
+        "37:社交通讯:local": [-0.2530779540538788, 0.7437796592712402, 0.2981046736240387, 0.542104184627533],
+        "37:社交通讯:other": [0.8900504112243652, 0.10813485831022263, 0.06185560300946236, -0.4385100305080414],
+        "37:影音娱乐:global": [0.22075727581977844, -0.8633919954299927, 0.392208456993103, -0.22801968455314636],
+        "37:影音娱乐:local": [0.17236293852329254, -0.366639107465744, 0.9070864915847778, -0.11428402364253998],
+        "37:影音娱乐:other": [-0.697054386138916, 0.3653417229652405, -0.13674688339233398, 0.6016152501106262],
+        "测试标题37": [-0.4445458650588989, -0.10938502103090286, -0.42240381240844727, -0.7822971940040588],
+        "详细截图文字内容37 unrelated words 内容线索": [-0.6449023485183716, -0.7167418599128723, 0.19765964150428772, -0.1769537627696991],
+        "测试标题37 - Google Chrome": [-0.9949096441268921, 0.07216743379831314, 0.06285906583070755, -0.03154890984296799]
+      },
+      "category": "未分类",
+      "score": 0.13090137445926664,
+      "debug": {
+        "category": "未分类",
+        "category_confidence": 0.1309,
+        "used_ocr": true,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "测试标题37",
+        "top_scores": [{"category": "影音娱乐", "score": 0.1309}, {"category": "编程开发", "score": 0.0634}, {"category": "社交通讯", "score": 0.0429}],
+        "local_diversity": 1,
+        "local_categories": ["社交通讯"],
+        "local_top": [{"category": "社交通讯", "score": 0.3571}, {"category": "编程开发", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}, {"category": "影音娱乐", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "38:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "38:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "38:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "38:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "38:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "38:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "影音娱乐": [
+          {"text": "38:影音娱乐:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "38:影音娱乐:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "38:影音娱乐:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "办公文档": [
+          {"text": "38:办公文档:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "38:办公文档:local", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "38:办公文档:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "测试标题38 - Google Chrome",
+      "ocr_text": "详细截图文字内容38 123:45 unrelated words 内容线索",
+      "process_name": "qq.exe",
+      "vectors": {
+        "38:编程开发:global": [0.5326513648033142, 0.5117656588554382, -0.6703147888183594, 0.07110880315303802],
+        "38:编程开发:local": [-0.04019671306014061, 0.48264989256858826, 0.40671610832214355, -0.7746065258979797],
+        "38:编程开发:other": [-0.9135019183158875, -0.021724866703152657, -0.23213844001293182, -0.33339744806289673],
+        "38:社交通讯:global": [0.31569504737854004, -0.4200136065483093, -0.10299638658761978, 0.844580888748169],
+        "38:社交通讯:local": [-0.07731208950281143, -0.3232439160346985, 0.8918312191963196, 0.3068767189979553],
+        "38:社交通讯:other": [-0.09756049513816833, -0.5545912981033325, -0.06368055194616318, 0.8239267468452454],
+        "38:影音娱乐:global": [-0.20211513340473175, -0.2814550995826721, 0.5152062773704529, -0.783897340297699],
+        "38:影音娱乐:local": [-0.36259928345680237, 0.30147019028663635, -0.6751884818077087, -0.5672371983528137],
+        "38:影音娱乐:other": [0.08649957180023193, 0.1801750659942627, 0.8630200028419495, -0.46395179629325867],
+        "38:办公文档:global": [0.15690772235393524, 0.7993461489677429, -0.23567122220993042, -0.5299856662750244],
+        "38:办公文档:local": [0.5301380753517151, -0.055246755480766296, 0.5529548525810242, -0.6404235363006592],
+        "38:办公文档:other": [0.09524346143007278, 0.18840807676315308, 0.4465758204460144, 0.8694831728935242],
+        "测试标题38 - Google Chrome": [-0.008967112749814987, 0.5041576027870178, -0.8274491429328918, -0.247128427028656]
+      },
+      "category": "编程开发",
+      "score": 0.7903125286102295,
+      "debug": {
+        "category": "编程开发",
+        "category_confidence": 0.7903,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": "社交通讯",
+        "process_name": "qq.exe",
+        "cleaned_title": "测试标题38 - Google Chrome",
+        "top_scores": [{"category": "编程开发", "score": 0.7903}, {"category": "办公文档", "score": 0.7276}, {"category": "影音娱乐", "score": 0.1356}, {"category": "社交通讯", "score": 0.12}],
+        "local_diversity": 1,
+        "local_categories": ["影音娱乐"],
+        "local_top": [{"category": "影音娱乐", "score": 0.9041}, {"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "编程开发", "score": 0.7903}, {"category": "办公文档", "score": 0.7276}, {"category": "社交通讯", "score": 0.0}]
+      }
+    },
+    {
+      "anchors": {
+        "编程开发": [
+          {"text": "39:编程开发:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "39:编程开发:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "39:编程开发:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ],
+        "社交通讯": [
+          {"text": "39:社交通讯:global", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"},
+          {"text": "39:社交通讯:local", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "39:社交通讯:other", "source": "default", "weight": 1.5, "scope": "local", "process_name": "other.exe", "added_at": "2026-01-01T00:00:00"}
+        ]
+      },
+      "title": "聊天内容39",
+      "ocr_text": "详细截图文字内容39 123:45 unrelated words 内容线索",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "39:编程开发:global": [-0.4507952630519867, 0.7320618033409119, 0.4854552149772644, -0.15875230729579926],
+        "39:编程开发:local": [-0.21045732498168945, -0.19870926439762115, -0.7424179911613464, -0.6041837334632874],
+        "39:编程开发:other": [0.49019670486450195, -0.857285737991333, -0.11375823616981506, -0.10875371098518372],
+        "39:社交通讯:global": [-0.5662777423858643, 0.5641471743583679, -0.5018419623374939, -0.3304877281188965],
+        "39:社交通讯:local": [-0.6771864891052246, 0.22975264489650726, 0.12096119672060013, -0.6884770393371582],
+        "39:社交通讯:other": [0.3072528839111328, 0.5005388259887695, 0.7406293153762817, 0.3263813555240631],
+        "聊天内容39": [-0.18621928989887238, 0.8929393291473389, -0.3812240660190582, 0.15049892663955688]
+      },
+      "category": "社交通讯",
+      "score": 0.7507771849632263,
+      "debug": {
+        "category": "社交通讯",
+        "category_confidence": 0.7508,
+        "used_ocr": false,
+        "local_veto_active": false,
+        "process_prior_applied": null,
+        "process_name": "chrome.exe",
+        "cleaned_title": "聊天内容39",
+        "top_scores": [{"category": "社交通讯", "score": 0.7508}, {"category": "编程开发", "score": 0.5287}],
+        "local_diversity": 0,
+        "local_categories": [],
+        "local_top": [{"category": "编程开发", "score": 0.0}, {"category": "社交通讯", "score": 0.0}],
+        "global_top": [{"category": "社交通讯", "score": 0.7508}, {"category": "编程开发", "score": 0.5287}]
+      }
+    }
+  ],
+  "learning": [
+    {
+      "anchors": {
+        "旧类别": [
+          {"text": "关于项目进展的讨论窗口", "source": "default", "weight": 2, "scope": "local", "process_name": "chat.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "关于项目进展的讨论窗口", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"}
+        ],
+        "新类别": [{"text": "已有示例", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"}]
+      },
+      "title": "关于项目进展的讨论窗口",
+      "ocr_text": "截图内容足够长且与标题语义不同 supplementary OCR words",
+      "process_name": "chat.exe",
+      "vectors": {"关于项目进展的讨论窗口": [1, 0, 0, 0], "已有示例": [0, 0, 0, 1], "截图内容足够长且与标题语义不同 supplementary OCR words": [0, 1, 0, 0]},
+      "first": {
+        "title_local_added": true,
+        "title_global_added": true,
+        "title_local_dedup": false,
+        "title_global_dedup": false,
+        "ocr_local_added": true,
+        "ocr_global_added": false,
+        "ocr_local_dedup": false,
+        "ocr_global_dedup": false,
+        "negative_removed": true
+      },
+      "second": {
+        "title_local_added": false,
+        "title_global_added": false,
+        "title_local_dedup": true,
+        "title_global_dedup": true,
+        "ocr_local_added": false,
+        "ocr_global_added": false,
+        "ocr_local_dedup": true,
+        "ocr_global_dedup": false,
+        "negative_removed": true
+      },
+      "result": {
+        "新类别": [
+          {"text": "已有示例", "source": "default", "weight": 1, "scope": "global", "process_name": null},
+          {"text": "关于项目进展的讨论窗口", "source": "user_feedback", "weight": 2.0, "scope": "local", "process_name": "chat.exe"},
+          {"text": "关于项目进展的讨论窗口", "source": "user_feedback", "weight": 2.0, "scope": "global", "process_name": null},
+          {"text": "截图内容足够长且与标题语义不同 supplementary OCR words", "source": "ocr_feedback", "weight": 1.5, "scope": "local", "process_name": "chat.exe"}
+        ]
+      }
+    },
+    {
+      "anchors": {
+        "旧类别": [
+          {"text": "QQ", "source": "default", "weight": 2, "scope": "local", "process_name": "qq.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "QQ", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"}
+        ],
+        "新类别": [{"text": "已有示例", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"}]
+      },
+      "title": "QQ",
+      "ocr_text": "",
+      "process_name": "qq.exe",
+      "vectors": {"QQ": [1, 0, 0, 0], "已有示例": [0, 0, 0, 1], "": [0, 1, 0, 0]},
+      "first": {
+        "title_local_added": true,
+        "title_global_added": false,
+        "title_local_dedup": false,
+        "title_global_dedup": false,
+        "ocr_local_added": false,
+        "ocr_global_added": false,
+        "ocr_local_dedup": false,
+        "ocr_global_dedup": false,
+        "negative_removed": true
+      },
+      "second": {
+        "title_local_added": false,
+        "title_global_added": false,
+        "title_local_dedup": true,
+        "title_global_dedup": false,
+        "ocr_local_added": false,
+        "ocr_global_added": false,
+        "ocr_local_dedup": false,
+        "ocr_global_dedup": false,
+        "negative_removed": true
+      },
+      "result": {
+        "新类别": [
+          {"text": "已有示例", "source": "default", "weight": 1, "scope": "global", "process_name": null},
+          {"text": "QQ", "source": "user_feedback", "weight": 2.0, "scope": "local", "process_name": "qq.exe"}
+        ]
+      }
+    },
+    {
+      "anchors": {
+        "旧类别": [
+          {"text": "工程配置操作指南 - Google Chrome", "source": "default", "weight": 2, "scope": "local", "process_name": "chrome.exe", "added_at": "2026-01-01T00:00:00"},
+          {"text": "工程配置操作指南 - Google Chrome", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"}
+        ],
+        "新类别": [{"text": "已有示例", "source": "default", "weight": 1, "scope": "global", "process_name": null, "added_at": "2026-01-01T00:00:00"}]
+      },
+      "title": "工程配置操作指南 - Google Chrome",
+      "ocr_text": "包含大量界面信息与菜单选项的内容 OCR details",
+      "process_name": "chrome.exe",
+      "vectors": {
+        "工程配置操作指南 - Google Chrome": [1, 0, 0, 0],
+        "已有示例": [0, 0, 0, 1],
+        "包含大量界面信息与菜单选项的内容 OCR details": [0, 1, 0, 0],
+        "工程配置操作指南": [0.3087506890296936, -0.202201709151268, -0.927760124206543, 0.0552138090133667]
+      },
+      "first": {
+        "title_local_added": true,
+        "title_global_added": true,
+        "title_local_dedup": false,
+        "title_global_dedup": false,
+        "ocr_local_added": true,
+        "ocr_global_added": false,
+        "ocr_local_dedup": false,
+        "ocr_global_dedup": false,
+        "negative_removed": true
+      },
+      "second": {
+        "title_local_added": false,
+        "title_global_added": false,
+        "title_local_dedup": true,
+        "title_global_dedup": true,
+        "ocr_local_added": false,
+        "ocr_global_added": false,
+        "ocr_local_dedup": true,
+        "ocr_global_dedup": false,
+        "negative_removed": true
+      },
+      "result": {
+        "新类别": [
+          {"text": "已有示例", "source": "default", "weight": 1, "scope": "global", "process_name": null},
+          {"text": "工程配置操作指南 - Google Chrome", "source": "user_feedback", "weight": 2.0, "scope": "local", "process_name": "chrome.exe"},
+          {"text": "工程配置操作指南", "source": "user_feedback", "weight": 2.0, "scope": "global", "process_name": null},
+          {"text": "包含大量界面信息与菜单选项的内容 OCR details", "source": "ocr_feedback", "weight": 1.5, "scope": "local", "process_name": "chrome.exe"}
+        ]
+      }
+    }
+  ]
+}

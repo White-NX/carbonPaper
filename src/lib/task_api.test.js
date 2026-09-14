@@ -92,6 +92,13 @@ describe('task_api', () => {
     expectWithAuth(1, { autoPrompt: false });
   });
 
+  it.each(['', ' \n ', null])('throws a fallback for a blank clustering error: %j', async (error) => {
+    invoke.mockResolvedValue({ error });
+
+    await expect(runClustering({ manual: true })).rejects.toThrow('CLUSTERING_FAILED');
+    expectWithAuth(1, { autoPrompt: true });
+  });
+
   it('sends clustering commands with provided params', async () => {
     invoke.mockResolvedValue({ status: 'success' });
 

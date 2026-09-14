@@ -507,30 +507,6 @@ async fn process_request(
     }
 
     let response = match command {
-        "bge_embed_texts" => {
-            let texts = match req.get("texts").and_then(|value| value.as_array()) {
-                Some(values) => {
-                    let mut texts = Vec::with_capacity(values.len());
-                    for (index, value) in values.iter().enumerate() {
-                        let Some(text) = value.as_str() else {
-                            return StorageResponse::error(&format!(
-                                "texts[{index}] must be a string"
-                            ));
-                        };
-                        texts.push(text.to_string());
-                    }
-                    texts
-                }
-                None => return StorageResponse::error("texts must be an array"),
-            };
-            match crate::classification_runtime::embed_bge_texts(app_handle.clone(), texts).await {
-                Ok(result) => StorageResponse::success(
-                    serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})),
-                ),
-                Err(error) => StorageResponse::error(&error),
-            }
-        }
-
         "get_public_key" => match storage.get_public_key() {
             Ok(key) => {
                 let encoded =
@@ -621,106 +597,6 @@ async fn process_request(
             "background_authorized": storage.is_background_authorized()
         })),
 
-        "set_ocr_postprocess_status" => {
-            let screenshot_id = req
-                .get("screenshot_id")
-                .and_then(|value| value.as_i64())
-                .unwrap_or(-1);
-            let status = req
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let error = req.get("error").and_then(|value| value.as_str());
-            if screenshot_id < 0 {
-                return StorageResponse::error("Invalid screenshot_id");
-            }
-            match storage.set_ocr_postprocess_status(screenshot_id, status, error) {
-                Ok(()) => StorageResponse::success(serde_json::json!({ "updated": true })),
-                Err(error) => StorageResponse::error(&error),
-            }
-        }
-        "record_ocr_postprocess_retry" => {
-            let screenshot_id = req
-                .get("screenshot_id")
-                .and_then(|value| value.as_i64())
-                .unwrap_or(-1);
-            let error = req
-                .get("error")
-                .and_then(|value| value.as_str())
-                .unwrap_or("OCR postprocess failed");
-            if screenshot_id < 0 {
-                return StorageResponse::error("Invalid screenshot_id");
-            }
-            match storage.record_ocr_postprocess_retry(screenshot_id, error) {
-                Ok(()) => StorageResponse::success(serde_json::json!({ "updated": true })),
-                Err(error) => StorageResponse::error(&error),
-            }
-        }
-        "update_screenshot_category" => {
-            let screenshot_id = req
-                .get("screenshot_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(-1);
-            let category = req.get("category").and_then(|v| v.as_str()).unwrap_or("");
-            let category_confidence = req.get("category_confidence").and_then(|v| v.as_f64());
-
-            if screenshot_id < 0 {
-                return StorageResponse::error("Invalid screenshot_id");
-            }
-            if category.trim().is_empty() {
-                return StorageResponse::error("category is required");
-            }
-
-            match storage.update_screenshot_category(screenshot_id, category, category_confidence) {
-                Ok(updated) => StorageResponse::success(serde_json::json!({"updated": updated})),
-                Err(e) => StorageResponse::error(&e),
-            }
-        }
-        "complete_staged_postprocess" | "defer_staged_postprocess" => {
-            let receipt = match req.get("receipt").cloned().and_then(|v| {
-                serde_json::from_value::<crate::processing_stage::TaskReceipt>(v).ok()
-            }) {
-                Some(receipt) => receipt,
-                None => return StorageResponse::error("Invalid staged task receipt"),
-            };
-            if receipt.consumer != carbonpaper_app_bound::protocol::Consumer::Classification {
-                return StorageResponse::error("Invalid staged consumer");
-            }
-            let result = if command == "complete_staged_postprocess" {
-                let category = req.get("category").and_then(|v| v.as_str());
-                let confidence = req.get("confidence").and_then(|v| v.as_f64());
-                storage
-                    .commit_staged_category(&receipt, category, confidence)
-                    .map(|first_commit| {
-                        // The archive commit is durable before service acknowledgement.
-                        // Keep the two states distinct so a failed acknowledgement is
-                        // visible in the periodic summary and can be reconciled later.
-                        let _ = storage.processing_stage.finish(&storage, &receipt);
-                        let ack_pending = storage
-                            .pending_staged_classification_receipt_count()
-                            .unwrap_or(u64::from(first_commit));
-                        crate::background_activity::classification_committed(
-                            first_commit,
-                            ack_pending,
-                        );
-                    })
-            } else {
-                storage
-                    .processing_stage
-                    .check_receipt(&receipt)
-                    .and_then(|_| {
-                        storage.processing_stage.release(
-                            &receipt,
-                            req.get("failed").and_then(|v| v.as_bool()).unwrap_or(false),
-                        )
-                    })
-                    .map(|_| crate::background_activity::classification_deferred())
-            };
-            match result {
-                Ok(()) => StorageResponse::success(serde_json::json!({"accepted":true})),
-                Err(error) => StorageResponse::error(&error),
-            }
-        }
         "list_screenshots_for_clustering" => {
             if !storage.is_silent_read_authorized() {
                 return StorageResponse::error("AUTH_REQUIRED");

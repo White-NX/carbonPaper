@@ -263,7 +263,9 @@ fn assemble_ocr_text_prefixes<E>(
         .collect())
 }
 
-fn ocr_postprocess_retry_decision(current_attempts: i64) -> (&'static str, Option<i64>, i64) {
+pub(super) fn ocr_postprocess_retry_decision(
+    current_attempts: i64,
+) -> (&'static str, Option<i64>, i64) {
     let next_attempts = current_attempts.saturating_add(1);
     if next_attempts >= MAX_OCR_POSTPROCESS_ATTEMPTS {
         ("failed", None, next_attempts)
@@ -400,6 +402,7 @@ impl StorageState {
         conn.execute(
             "UPDATE screenshot_ocr_status
              SET postprocess_status = ?2,
+                 postprocess_lease = NULL,
                  postprocess_error = ?3,
                  postprocess_attempts = CASE
                     WHEN ?2 IN ('none', 'pending', 'completed') THEN 0
@@ -459,7 +462,7 @@ impl StorageState {
             .ok_or("Database not initialized")?
             .execute(
                 "UPDATE screenshot_ocr_status SET postprocess_status='waiting_for_auth',
-             postprocess_error=NULL, postprocess_next_retry_at=NULL
+             postprocess_error=NULL, postprocess_next_retry_at=NULL, postprocess_lease=NULL
              WHERE postprocess_status IN ('pending','queued','processing')",
                 [],
             )
@@ -473,6 +476,7 @@ impl StorageState {
             .prepare(
                 "SELECT screenshot_id FROM screenshot_ocr_status
                  WHERE postprocess_status IN ('pending', 'waiting_for_auth')
+                   AND EXISTS(SELECT 1 FROM screenshots WHERE screenshots.id=screenshot_id AND is_deleted=0)
                    AND postprocess_attempts < 5
                    AND (postprocess_next_retry_at IS NULL OR postprocess_next_retry_at <= CURRENT_TIMESTAMP)
                  ORDER BY updated_at ASC LIMIT ?1",
@@ -1132,6 +1136,7 @@ impl StorageState {
     }
 
     /// Update the category of a screenshot.
+    #[cfg(test)]
     pub fn update_screenshot_category(
         &self,
         screenshot_id: i64,
@@ -4107,27 +4112,17 @@ mod ocr_lifecycle_tests {
         let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
         let connection = Connection::open_in_memory().expect("in-memory database");
-        connection
-            .execute_batch(
-                "CREATE TABLE screenshot_ocr_status (
-                    screenshot_id INTEGER PRIMARY KEY,
-                    postprocess_status TEXT NOT NULL,
-                    postprocess_error TEXT,
-                    postprocess_attempts INTEGER NOT NULL DEFAULT 0,
-                    postprocess_next_retry_at TEXT,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                 );
-                 INSERT INTO screenshot_ocr_status (
-                    screenshot_id, postprocess_status, postprocess_attempts
-                 ) VALUES
-                    (41, 'pending', 1),
-                    (42, 'queued', 2),
-                    (43, 'processing', 3),
-                    (44, 'waiting_for_auth', 4),
-                    (45, 'completed', 0),
-                    (46, 'failed', 5);",
-            )
-            .expect("OCR lifecycle fixture");
+        storage
+            .init_tables(&connection)
+            .expect("current OCR lifecycle schema");
+        connection.execute_batch(
+            "INSERT INTO screenshots(id,image_path,image_hash) VALUES
+                (41,'41','hash41'),(42,'42','hash42'),(43,'43','hash43'),
+                (44,'44','hash44'),(45,'45','hash45'),(46,'46','hash46');
+             INSERT INTO screenshot_ocr_status(screenshot_id,postprocess_status,postprocess_attempts,postprocess_lease)
+             VALUES (41,'pending',1,NULL),(42,'queued',2,'old-queued'),(43,'processing',3,'old-processing'),
+                    (44,'waiting_for_auth',4,NULL),(45,'completed',0,NULL),(46,'failed',5,NULL);"
+        ).expect("OCR lifecycle fixture");
         *storage.db.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection);
 
         assert_eq!(

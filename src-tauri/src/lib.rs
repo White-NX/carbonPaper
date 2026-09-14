@@ -13,6 +13,7 @@ mod background_activity;
 mod background_scheduler;
 mod blind_index_repair;
 mod capture;
+mod classification;
 mod classification_runtime;
 mod clip_ann;
 mod clip_index;
@@ -64,6 +65,7 @@ mod semantic_runtime;
 mod sensitive_filter;
 mod smart_cluster_scoring;
 mod storage;
+mod task_vector_sync;
 mod updater;
 
 use analysis::AnalysisState;
@@ -853,6 +855,7 @@ pub fn run() {
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(office_runtime::OfficeRuntimeState::new()))
         .manage(Arc::new(semantic_runtime::SemanticRuntimeState::new()))
+        .manage(Arc::new(classification::ClassificationState::default()))
         .manage(Arc::new(background_scheduler::BackgroundSchedulerState::default()))
         .manage(Arc::new(blind_index_repair::BlindIndexRepairState::new()))
         .manage(Arc::new(minilm_migration::MinilmMigrationState::new()))

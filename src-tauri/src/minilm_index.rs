@@ -38,13 +38,10 @@
 //! so both stores are behind by exactly the same screenshots. Refusing the Rust
 //! query would recover nothing. See `semantic_query.rs`.
 //!
-//! **The Chroma mirror is best-effort and a lost row is not re-sent.** Rust
-//! holds the authoritative copy, so a mirror that fails while the monitor is
-//! down costs that screenshot its place in unsupervised task clustering — not
-//! its findability by search. Python's `_backfill_from_screenshots` only rebuilds
-//! the hot layer when it is found *entirely* empty, so a partial gap is not
-//! repaired. Closing that gap belongs with Milestone 4, which is where
-//! `task_vectors` is actually consumed.
+//! **The immediate Chroma mirror is an optimization.** A failed delivery queues
+//! the clustering consumer for repair. `task_vector_sync` reconciles the whole
+//! requested range before clustering, reuses current Rust vectors, and persists
+//! acknowledged progress. Python never encodes missing vectors itself.
 //!
 //! **This pass is one of two background users of a single-slot worker.** Smart
 //! Cluster scoring (`smart_cluster_scoring.rs`) polls on the same 60-second
@@ -210,6 +207,7 @@ const EMPTY_SOURCE_REASON: &str =
 
 /// One screenshot's MiniLM model input, the ledger identity derived from it,
 /// and the metadata the Chroma mirror has to carry.
+#[derive(Clone)]
 pub(crate) struct MinilmSource {
     pub text: String,
     pub spec: DerivedIndexJobSpec,
@@ -1524,9 +1522,8 @@ async fn settle_failed_claims(storage: Arc<StorageState>, claimed: Vec<ClaimedJo
 /// text. Python encrypts the process name, window title, and document on its
 /// side exactly as it did when it built them itself.
 ///
-/// Best-effort on purpose: Rust holds the authoritative copy, and a mirror lost
-/// here degrades unsupervised clustering rather than making a screenshot
-/// unfindable by search.
+/// Delivery failures schedule durable reconciliation before the next clustering
+/// run. Rust keeps the authoritative copy throughout recovery.
 async fn mirror_to_chroma(app: &AppHandle, indexed: &[IndexedSubject]) {
     if indexed.is_empty() {
         return;
@@ -1546,6 +1543,7 @@ async fn mirror_to_chroma(app: &AppHandle, indexed: &[IndexedSubject]) {
             // locked, or the monitor still starting.
             Ok(response) => {
                 if let Some(error) = response.get("error").and_then(|value| value.as_str()) {
+                    crate::task_vector_sync::schedule_repair(app);
                     tracing::debug!(
                         "[SEMANTIC:INDEX] chroma mirror rejected {} vector(s): {error}",
                         chunk.len()
@@ -1553,6 +1551,7 @@ async fn mirror_to_chroma(app: &AppHandle, indexed: &[IndexedSubject]) {
                 }
             }
             Err(error) => {
+                crate::task_vector_sync::schedule_repair(app);
                 tracing::debug!(
                     "[SEMANTIC:INDEX] chroma mirror deferred for {} vector(s): {error}",
                     chunk.len()

@@ -1,8 +1,7 @@
 """
 Long-term task clustering module.
 
-Uses paraphrase-multilingual-MiniLM-L12-v2 to encode OCR text + process metadata,
-PaCMAP for dimensionality reduction, and HDBSCAN for density-based clustering.
+Consumes Rust-produced MiniLM vectors. Uses PaCMAP for dimensionality reduction, and HDBSCAN for density-based clustering.
 
 Architecture:
     Hot Layer (recent 30 days)  — participates in HDBSCAN, re-run periodically.
@@ -38,11 +37,6 @@ from clustering_resources import (
 logger = logging.getLogger(__name__)
 
 
-class ModelNotAvailableError(Exception):
-    """Raised when the MiniLM model files are not downloaded yet."""
-    pass
-
-
 class ManagerBusyError(Exception):
     """Raised when the hot-layer manager lock could not be taken in time.
 
@@ -73,194 +67,6 @@ CENTROID_MATCH_THRESHOLD = 0.55   # cosine similarity threshold for assigning to
 MIN_CLUSTER_SIZE = 5
 MIN_SAMPLES = 3
 PACMAP_N_COMPONENTS = 15          # target dims for PaCMAP reduction
-
-
-# ---------------------------------------------------------------------------
-# TaskEmbedder — singleton, loadable / unloadable
-# ---------------------------------------------------------------------------
-
-class TaskEmbedder:
-    """Singleton for the ONNX MiniLM task-clustering encoder.
-
-    The model is loaded only for a clustering pass and unloaded afterwards.
-    Task clustering is still Python-owned, but its model format is fixed to the
-    reviewed ONNX artifact; there is no PyTorch runtime fallback.
-    """
-
-    _instance = None
-    _lock = threading.Lock()
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._model = None
-            cls._instance._tokenizer = None
-        return cls._instance
-
-    # ---- lifecycle -------------------------------------------------------
-
-    @staticmethod
-    def _model_path() -> str:
-        """Return the first configured MiniLM directory with an ONNX file."""
-        explicit = os.environ.get("MINILM_MODEL_PATH")
-        local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-        candidates = [
-            explicit,
-            os.path.join(
-                local_appdata,
-                "CarbonPaper",
-                "models-onnx",
-                "paraphrase-multilingual-MiniLM-L12-v2",
-            ),
-            os.path.join(
-                local_appdata,
-                "carbonpaper",
-                "models-onnx",
-                "paraphrase-multilingual-MiniLM-L12-v2",
-            ),
-            os.path.join(
-                local_appdata,
-                "CarbonPaper",
-                "models",
-                "paraphrase-multilingual-MiniLM-L12-v2",
-            ),
-        ]
-        from onnx_utils import get_onnx_model_path
-
-        for candidate in candidates:
-            if candidate and (
-                get_onnx_model_path(candidate, "model_int8.onnx")
-                or get_onnx_model_path(candidate, os.path.join("onnx", "model_quantized.onnx"))
-            ):
-                return candidate
-        return next((candidate for candidate in candidates if candidate), candidates[-1])
-
-    @staticmethod
-    def is_model_available() -> bool:
-        """Check whether the MiniLM model files exist on disk."""
-        model_path = TaskEmbedder._model_path()
-        from onnx_utils import get_onnx_model_path
-
-        onnx_file = get_onnx_model_path(model_path, "model_int8.onnx") or get_onnx_model_path(
-            model_path, os.path.join("onnx", "model_quantized.onnx")
-        )
-        required_files = ["config.json", "tokenizer.json"]
-        return bool(onnx_file) and all(
-            os.path.isfile(os.path.join(model_path, filename)) for filename in required_files
-        )
-
-    def is_loaded(self) -> bool:
-        return self._model is not None
-
-    def load(self):
-        """Load model & tokenizer (idempotent)."""
-        if self._model is not None:
-            return
-
-        with self._lock:
-            if self._model is not None:
-                return
-
-            model_path = self._model_path()
-            from onnx_utils import get_onnx_model_path, create_onnx_session
-            from logging_config import log_model_loading
-            onnx_file = get_onnx_model_path(model_path, "model_int8.onnx") or get_onnx_model_path(
-                model_path, os.path.join("onnx", "model_quantized.onnx")
-            )
-            if not onnx_file:
-                raise ModelNotAvailableError(
-                    f"MiniLM ONNX model is missing from {model_path}"
-                )
-            log_model_loading("MiniLM-L12-v2 (ONNX)")
-            logger.info("Loading MiniLM-L12-v2 from ONNX: %s ...", onnx_file)
-            from numpy_tokenizer import NumpyTokenizer
-
-            self._tokenizer = NumpyTokenizer(model_path)
-            self._model = create_onnx_session(onnx_file)
-            logger.info("MiniLM-L12-v2 loaded successfully via ONNX")
-
-    def _acquire_runtime(self, attempts: int = 3):
-        """Return a consistent ``(model, tokenizer)`` snapshot.
-
-        The three pieces are read together under ``_lock`` so a concurrent
-        :meth:`unload` cannot null one of them between the reads. The caller
-        then runs its forward pass against these local references: an unload
-        landing mid-pass drops the singleton's handles while the objects
-        themselves stay alive until that pass returns.
-
-        The snapshot is what lets ``run_clustering`` keep unloading the model in
-        its ``finally``, worth ~479 MB resident on the ONNX backend, while no
-        longer holding the manager lock across the whole run. Without this
-        snapshot, an interleaved unload could turn the third attribute read
-        into ``'NoneType' object has no attribute 'get_inputs'``.
-        """
-        for _ in range(max(1, attempts)):
-            self.load()
-            with self._lock:
-                # `load` assigns the tokenizer before the model, so a non-None
-                # model implies a usable tokenizer.
-                if self._model is not None:
-                    return self._model, self._tokenizer
-        raise ModelNotAvailableError(
-            "MiniLM was unloaded repeatedly while a caller was trying to use it"
-        )
-
-    def unload(self):
-        """Release model & tokenizer to free memory."""
-        with self._lock:
-            self._model = None
-            self._tokenizer = None
-        gc.collect()
-        logger.info("MiniLM-L12-v2 unloaded — memory released")
-
-    # ---- encoding --------------------------------------------------------
-
-    def encode(self, texts: List[str]) -> np.ndarray:
-        """Batch-encode texts → (N, 384) L2-normalised numpy array."""
-        # One consistent snapshot, then a forward pass on local references only:
-        # a concurrent unload() must not be able to null the model out from
-        # under a pass that has already started. See _acquire_runtime.
-        model, tokenizer = self._acquire_runtime()
-        encoded = tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=256,
-            return_tensors="np",
-        )
-        from onnx_utils import build_transformer_inputs
-
-        inputs = build_transformer_inputs(model, encoded)
-        token_embeddings = model.run(None, inputs)[0]
-        attention_mask = encoded["attention_mask"]
-        input_mask_expanded = np.expand_dims(attention_mask, axis=-1).astype(np.float32)
-        sum_embeddings = np.sum(token_embeddings * input_mask_expanded, axis=1)
-        sum_mask = np.clip(np.sum(input_mask_expanded, axis=1), a_min=1e-9, a_max=None)
-        emb = sum_embeddings / sum_mask
-        norm = np.linalg.norm(emb, axis=1, keepdims=True)
-        return emb / np.clip(norm, a_min=1e-9, a_max=None)
-
-    def encode_single(self, text: str) -> np.ndarray:
-        """Encode one text → (384,) vector."""
-        return self.encode([text])[0]
-
-
-# ---------------------------------------------------------------------------
-# Helper: build combined text for embedding
-# ---------------------------------------------------------------------------
-
-def build_task_text(process_name: str, window_title: str, ocr_text: str, max_ocr_len: int = 200) -> str:
-    """Combine process + title + OCR snippet into a single embedding input."""
-    parts = []
-    if process_name:
-        parts.append(process_name)
-    if window_title:
-        parts.append(window_title)
-    if ocr_text:
-        snippet = ocr_text[:max_ocr_len].strip()
-        if snippet:
-            parts.append(snippet)
-    return " | ".join(parts) if parts else ""
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +303,6 @@ class HotColdManager:
     def __init__(self, chroma_client, storage_client=None):
         self._client = chroma_client
         self._storage_client = storage_client
-        self._embedder = TaskEmbedder()
         self._engine = ClusteringEngine()
         # The snapshot mechanics live in `collection_export`, shared with the
         # CLIP image collection's own migration. The hot layer is keyed by
@@ -526,10 +331,6 @@ class HotColdManager:
         logger.info("[task_clustering] HotColdManager ready (lazy loading collections)")
 
     @property
-    def embedder(self):
-        return self._embedder
-
-    @property
     def hot_collection(self):
         if self._client is None:
             return None
@@ -538,6 +339,7 @@ class HotColdManager:
                 self._hot_collection = self._client.get_or_create_collection(
                     name="task_vectors",
                     metadata={"hnsw:space": "cosine"},
+                    embedding_function=None,
                 )
             return self._hot_collection
 
@@ -550,6 +352,7 @@ class HotColdManager:
                 self._cold_collection = self._client.get_or_create_collection(
                     name="task_centroids",
                     metadata={"hnsw:space": "cosine"},
+                    embedding_function=None,
                 )
             return self._cold_collection
 
@@ -632,7 +435,16 @@ class HotColdManager:
         return self._task_vector_exporter.finish(export_id)
 
 
-    def upsert_task_vectors(self, records: List[Dict[str, Any]]) -> int:
+    def task_vector_sync_target(self) -> str:
+        """Collection identity invalidates an interrupted cursor after a rebuild."""
+        with self._lock:
+            # Re-resolve after a failed page: a cached Chroma handle can outlive
+            # deletion/recreation of its collection while retaining the old UUID.
+            if hasattr(self, "_hot_collection"):
+                del self._hot_collection
+            return str(self.hot_collection.id)
+
+    def upsert_task_vectors(self, records: List[Dict[str, Any]], target: Optional[str] = None) -> int:
         """Write Rust-generated MiniLM vectors to the authoritative hot layer."""
         if not isinstance(records, list) or not records:
             return 0
@@ -680,6 +492,8 @@ class HotColdManager:
                 f"{MANAGER_LOCK_BUSY_TIMEOUT_SECS:g}s"
             )
         try:
+            if target is not None and str(self.hot_collection.id) != target:
+                raise RuntimeError("task vector collection changed; restart synchronization")
             self.hot_collection.upsert(
                 ids=ids,
                 embeddings=embeddings,
@@ -698,8 +512,7 @@ class HotColdManager:
     # it belongs next to whoever wrote the vector the prefilter reads.
     #
     # What is left here is the hot layer as a *consumer*: clustering reads it,
-    # `compress_to_cold` ages it, and `_backfill_from_screenshots` still rebuilds
-    # it from SQLite when it is found empty.
+    # `compress_to_cold` ages it. Rust reconciles missing vectors before each run.
 
     def get_hot_vectors(self, days: int = HOT_LAYER_DAYS) -> Tuple[np.ndarray, List[str], List[Dict]]:
         """Retrieve hot-layer vectors within the time window.
@@ -885,126 +698,6 @@ class HotColdManager:
 
         return None
 
-    # ---- Backfill from screenshot_embeddings ------------------------------
-
-    def _backfill_from_screenshots(self, start_time: Optional[float] = None, end_time: Optional[float] = None) -> int:
-        """Read historical screenshots from SQLite (via Rust reverse IPC) and
-        encode them into the hot layer so that old data participates in clustering.
-
-        Returns the number of snapshots added.
-        """
-        if not self._storage_client:
-            logger.warning("Backfill skipped: no storage client available")
-            return 0
-
-        PAGE = 500
-        added = 0
-        offset = 0
-
-        # start_time / end_time are in seconds (Unix epoch), same as Rust expects
-        start_s = start_time if start_time else 0.0
-        end_s = end_time if end_time else 0.0
-
-        # First call to get total count
-        try:
-            first_page = self._storage_client.list_screenshots_for_clustering(
-                start_ts=start_s, end_ts=end_s, offset=0, limit=1,
-            )
-            # storage_client returns errors as {'status': 'error', 'error': '...'} (no exception)
-            if first_page.get("status") == "error" or first_page.get("error"):
-                logger.warning("Backfill query failed: %s", first_page.get("error", first_page))
-                return 0
-            # Rust wraps response in {"status": "success", "data": {...}}
-            payload = first_page.get("data", first_page)
-            total = payload.get("total", 0)
-        except Exception as e:
-            logger.warning("Cannot query SQLite for backfill: %s", e)
-            return 0
-
-        if total == 0:
-            logger.warning("Backfill: no screenshots found in SQLite (start=%.0f end=%.0f)", start_s, end_s)
-            return 0
-
-        logger.warning("Backfilling hot layer from SQLite (%d screenshots) …", total)
-
-        while offset < total:
-            try:
-                page = self._storage_client.list_screenshots_for_clustering(
-                    start_ts=start_s, end_ts=end_s, offset=offset, limit=PAGE,
-                )
-                if page.get("status") == "error" or page.get("error"):
-                    logger.warning("Backfill page fetch error at offset %d: %s", offset, page.get("error"))
-                    break
-                # Unwrap 'data' envelope
-                page = page.get("data", page)
-            except Exception as e:
-                logger.warning("Backfill page fetch failed at offset %d: %s", offset, e)
-                break
-
-            screenshots = page.get("screenshots", [])
-            if not screenshots:
-                break
-
-            # Build string IDs and deduplicate
-            str_ids = [str(s["id"]) for s in screenshots]
-            try:
-                existing = self.hot_collection.get(ids=str_ids)
-                existing_set = set(existing["ids"]) if existing and existing.get("ids") else set()
-            except Exception:
-                existing_set = set()
-
-            texts_to_encode = []
-            entries = []
-
-            for s in screenshots:
-                doc_id = str(s["id"])
-                if doc_id in existing_set:
-                    continue
-
-                process_name = s.get("process_name", "")
-                window_title = s.get("window_title", "")
-                ocr_text = s.get("ocr_text", "")
-                timestamp = s.get("timestamp", 0)
-                category = s.get("category", "")
-
-                combined = build_task_text(process_name, window_title, ocr_text)
-                if not combined.strip():
-                    continue
-
-                texts_to_encode.append(combined)
-                entries.append((doc_id, {
-                    "screenshot_id": int(s["id"]),
-                    "timestamp": float(timestamp) if timestamp else 0.0,
-                    "process_name": self._encrypt(process_name) if process_name else "",
-                    "window_title": self._encrypt(window_title) if window_title else "",
-                    "category": category,
-                    "layer": "hot",
-                }))
-
-            if texts_to_encode:
-                try:
-                    vectors = self._embedder.encode(texts_to_encode)
-                    batch_ids = [e[0] for e in entries]
-                    batch_metas = [e[1] for e in entries]
-                    # upsert, not add: a Rust mirror for one of these ids can now
-                    # interleave with the backfill, and `add` would fail the whole
-                    # page on the duplicate. That also demotes the dedupe `get`
-                    # above from a correctness requirement to an optimisation.
-                    self.hot_collection.upsert(
-                        ids=batch_ids,
-                        embeddings=vectors.tolist(),
-                        metadatas=batch_metas,
-                    )
-                    added += len(batch_ids)
-                    logger.info("Backfilled %d/%d (page offset %d)", added, total, offset)
-                except Exception as e:
-                    logger.warning("Backfill encode/upsert failed at offset %d: %s", offset, e)
-
-            offset += PAGE
-
-        logger.info("Backfill complete: %d snapshots added to hot layer", added)
-        return added
-
     # ---- Full clustering run ---------------------------------------------
 
     def run_clustering(
@@ -1106,41 +799,11 @@ class HotColdManager:
                 else:
                     vectors, ids, metas = self.get_hot_vectors()
 
-                # If hot layer is empty, try backfilling from screenshot_embeddings
                 if len(ids) == 0:
-                    # Automatic clustering must never become a second MiniLM
-                    # worker. Rust owns semantic indexing and mirrors completed
-                    # vectors into this collection; while that queue is still
-                    # catching up, leave the scheduled task for a later pass
-                    # instead of loading Python's legacy encoder concurrently.
-                    if background:
-                        logger.info(
-                            "Hot layer empty during scheduled clustering; waiting for Rust semantic indexing"
-                        )
-                        return {
-                            "clusters": [],
-                            "noise_ids": [],
-                            "n_clusters": 0,
-                            "n_noise": 0,
-                            "n_total": 0,
-                            "status": "waiting_for_index",
-                        }
-                    logger.warning("Hot layer empty — attempting backfill from SQLite")
-                    self._embedder.load()
-                    backfilled = self._backfill_from_screenshots(start_time, end_time)
-                    if backfilled > 0:
-                        # Re-fetch after backfill — use get_all to avoid 30-day cutoff
-                        # filtering out old backfilled data
-                        if start_time is not None and end_time is not None:
-                            vectors, ids, metas = self.get_hot_vectors_in_range(start_time, end_time)
-                        else:
-                            vectors, ids, metas = self.get_all_hot_vectors()
-                    else:
-                        logger.warning("Backfill returned 0 snapshots")
-
-                if len(ids) == 0:
-                    logger.warning("No vectors in hot layer for clustering (even after backfill)")
-                    return {"clusters": [], "noise_ids": [], "status": "empty"}
+                    # Rust reconciles and encodes the requested range before
+                    # dispatch. Python has no model-loading or backfill path.
+                    return {"clusters": [], "noise_ids": [], "n_total": 0,
+                            "status": "empty"}
 
                 n_total = len(ids)
                 memory_status = memory_status_for_clustering(n_total)
@@ -1215,14 +878,6 @@ class HotColdManager:
                     "clustering_mode": "batched" if use_approximate else "full",
                 }
             finally:
-                # Reclaims ~479 MB on the ONNX backend, measured 2026-07-30, so
-                # this stays even though the run no longer holds a lock that
-                # would keep other users away. TaskEmbedder._acquire_runtime is
-                # what makes it safe: an in-flight encode holds its own
-                # references and finishes on them.
-                self._embedder.unload()
-                # Frees no memory — see unload_collections. Kept because the
-                # next access should start from a fresh handle.
                 self.unload_collections()
         finally:
             self._clustering_lock.release()
@@ -1389,9 +1044,6 @@ class ClusteringScheduler:
                     idle.get("fullscreen_exclusive"),
                 )
                 return False
-        if not TaskEmbedder.is_model_available():
-            logger.debug("Skipping scheduled clustering: MiniLM model not downloaded")
-            return False
         self._running = True
         success = False
         try:

@@ -4,32 +4,6 @@ import task_clustering as tc
 from monitor import config
 
 
-def test_scheduler_skips_when_model_not_available(monkeypatch):
-    class Manager:
-        def __init__(self):
-            self.calls = 0
-
-        def run_clustering(
-            self,
-            auto_compress=True,
-            clustering_mode="auto",
-            manual=False,
-            allow_full_low_memory=False,
-        ):
-            self.calls += 1
-            return {"status": "success"}
-
-    manager = Manager()
-    scheduler = tc.ClusteringScheduler(manager)
-    monkeypatch.setattr(tc.TaskEmbedder, "is_model_available", staticmethod(lambda: False))
-
-    result = scheduler._do_run()
-
-    assert result is False
-    assert manager.calls == 0
-    assert scheduler.get_config()["running"] is False
-
-
 def test_scheduler_skips_when_system_not_idle_before_model_check(monkeypatch):
     class Manager:
         def __init__(self):
@@ -56,11 +30,6 @@ def test_scheduler_skips_when_system_not_idle_before_model_check(monkeypatch):
     manager = Manager()
     storage_client = StorageClient()
     scheduler = tc.ClusteringScheduler(manager, storage_client=storage_client)
-    monkeypatch.setattr(
-        tc.TaskEmbedder,
-        "is_model_available",
-        staticmethod(lambda: (_ for _ in ()).throw(AssertionError("model check should wait for idle"))),
-    )
 
     result = scheduler._do_run()
 
@@ -91,11 +60,6 @@ def test_scheduler_skips_when_idle_state_is_malformed(monkeypatch):
 
     manager = Manager()
     scheduler = tc.ClusteringScheduler(manager, storage_client=StorageClient())
-    monkeypatch.setattr(
-        tc.TaskEmbedder,
-        "is_model_available",
-        staticmethod(lambda: (_ for _ in ()).throw(AssertionError("model check should wait for valid idle state"))),
-    )
 
     result = scheduler._do_run()
 
@@ -227,7 +191,7 @@ def test_manual_auto_clustering_without_range_prompts_for_large_input(monkeypatc
     assert result["reason"] == "large_range"
 
 
-def test_manual_auto_clustering_rechecks_prompt_after_backfill(monkeypatch):
+def test_manual_auto_clustering_rechecks_prompt_after_rust_sync(monkeypatch):
     manager = tc.HotColdManager(None)
     threshold = 3
     vectors = np.zeros((threshold + 1, tc.EMBEDDING_DIM), dtype=np.float32)
@@ -258,10 +222,7 @@ def test_manual_auto_clustering_rechecks_prompt_after_backfill(monkeypatch):
             "memory": {"low_memory": False},
         },
     )
-    monkeypatch.setattr(manager, "get_hot_vectors", lambda: (vectors[:0], [], []))
-    monkeypatch.setattr(manager, "_backfill_from_screenshots", lambda start_time=None, end_time=None: threshold + 1)
-    monkeypatch.setattr(manager, "get_all_hot_vectors", lambda: (vectors, ids, metas))
-    manager._embedder = Embedder()
+    monkeypatch.setattr(manager, "get_hot_vectors", lambda: (vectors, ids, metas))
     manager._engine = Engine()
 
     result = manager.run_clustering(clustering_mode="auto", manual=True)

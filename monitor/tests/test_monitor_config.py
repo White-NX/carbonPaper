@@ -10,7 +10,7 @@ def test_feature_toggles_initialize_from_environment(monkeypatch):
     reloaded = importlib.reload(config)
 
     assert reloaded.CLUSTERING_ENABLED is False
-    assert reloaded.CLASSIFICATION_ENABLED is False
+    assert not hasattr(reloaded, "CLASSIFICATION_ENABLED")
 
     monkeypatch.delenv("CARBONPAPER_CLUSTERING_ENABLED", raising=False)
     monkeypatch.delenv("CARBONPAPER_CLASSIFICATION_ENABLED", raising=False)
@@ -24,4 +24,4 @@ def test_feature_toggles_default_enabled_without_environment(monkeypatch):
     reloaded = importlib.reload(config)
 
     assert reloaded.CLUSTERING_ENABLED is True
-    assert reloaded.CLASSIFICATION_ENABLED is True
+    assert not hasattr(reloaded, "CLASSIFICATION_ENABLED")

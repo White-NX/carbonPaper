@@ -1008,62 +1008,24 @@ pub async fn storage_decrypt_from_chromadb(
     state.decrypt_from_chromadb(&encrypted)
 }
 
-/// Updates a screenshot category and forwards a learning anchor to the monitor.
+/// Updates a screenshot category and records durable native learning feedback.
 ///
 /// Authentication: required. Returns `{ "status": "success", "updated": boolean }`.
 /// Frontend: `lib/monitor_api.js`.
 #[tauri::command]
 pub async fn storage_update_category(
+    app: tauri::AppHandle,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     state: tauri::State<'_, Arc<StorageState>>,
-    monitor_state: tauri::State<'_, MonitorState>,
     screenshot_id: i64,
     category: String,
 ) -> Result<serde_json::Value, String> {
     check_auth_required(&credential_state)?;
-
-    let old_category = state
-        .get_screenshot_by_id(screenshot_id)
-        .ok()
-        .flatten()
-        .and_then(|r| r.category.clone());
-
-    let updated = state.update_screenshot_category(screenshot_id, &category, Some(1.0))?;
-
+    let updated = state.update_category_with_feedback(screenshot_id, &category)?;
     if updated {
-        if let Ok(Some(record)) = state.get_screenshot_by_id(screenshot_id) {
-            let title = record.window_title.clone().unwrap_or_default();
-            let process_name = record.process_name.clone().unwrap_or_default();
-
-            let ocr_text = match state.get_screenshot_ocr_results(screenshot_id) {
-                Ok(results) => {
-                    let texts: Vec<String> = results.iter().map(|r| r.text.clone()).collect();
-                    texts.join(" ")
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get OCR results for learning: {}", e);
-                    String::new()
-                }
-            };
-
-            let payload = serde_json::json!({
-                "command": "add_anchor",
-                "category": category,
-                "title": title,
-                "ocr_text": ocr_text,
-                "old_category": old_category,
-                "process_name": process_name
-            });
-            if let Err(e) = monitor::forward_command_to_python(&monitor_state, payload).await {
-                tracing::error!("Failed to forward add_anchor command to python: {}", e);
-            }
-        }
+        crate::classification::start_feedback(&app);
     }
-
-    Ok(serde_json::json!({
-        "status": "success",
-        "updated": updated
-    }))
+    Ok(serde_json::json!({"status": "success", "updated": updated}))
 }
 
 /// Returns monitor-defined category metadata.
