@@ -859,7 +859,20 @@
           "advanced_label": "高级",
           "run_now": "立即运行聚类",
           "queued": "已加入后台整理队列",
-          "completed": "聚类完成：已保存 {{count}} 个活动"
+          "completed": "聚类完成：已保存 {{count}} 个活动",
+          "progress": {
+            "preparing": "正在准备历史记录",
+            "waiting": "暂时等待，稍后继续",
+            "clustering": "正在整理任务",
+            "saving": "正在保存整理结果",
+            "waiting_for_records": "正在等待记录准备完成",
+            "awaiting_choice": "准备就绪，请选择处理方式",
+            "retry_wait": "整理暂时中断，稍后自动重试",
+            "interrupted": "本次整理已中断，可重新运行以继续处理",
+            "completed": "整理完成",
+            "already_running": "已有整理任务正在运行",
+            "prepared_count": "已准备 {{count}} 条记录"
+          }
         },
         "classification": {
           "label": "内容分类",

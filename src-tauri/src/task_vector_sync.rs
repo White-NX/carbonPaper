@@ -11,14 +11,130 @@ use crate::minilm_migration::validate_minilm_vector;
 use crate::ml_protocol::MlSemanticModel;
 use crate::semantic_runtime::{SemanticRuntimeState, BACKGROUND_PASS_GUARD};
 use crate::storage::{DerivedEmbeddingWrite, DerivedIndexKind, StorageState};
+use serde::Serialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static PROGRESS: Mutex<Option<ClusteringProgress>> = Mutex::new(None);
+static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 const PAGE_SIZE: u32 = 32;
 const AUTO_PAGES: usize = 8;
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ClusteringPhase {
+    Preparing,
+    WaitingForWorker,
+    Clustering,
+    WaitingForIndex,
+    Paused,
+    AwaitingChoice,
+    ResultsReady,
+    Completed,
+    Interrupted,
+}
+
+/// Live progress is separate from the acknowledged, durable page cursor.
+/// Preparing a record is visible immediately, but only an acknowledged page
+/// advances the checkpoint used when retrying an interrupted run.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ClusteringProgress {
+    run_id: u64,
+    #[serde(skip)]
+    generation: u64,
+    manual: bool,
+    scope: String,
+    start_time: f64,
+    end_time: f64,
+    pub active: bool,
+    phase: ClusteringPhase,
+    prepared_count: u64,
+}
+
+pub(crate) fn progress_status(storage: &StorageState) -> Option<ClusteringProgress> {
+    PROGRESS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|progress| progress.generation == storage.db_generation())
+        .cloned()
+}
+
+#[derive(Debug)]
+pub(crate) struct ClusteringRun {
+    // Serialize the whole clustering request, without holding the semantic
+    // worker slot during Python clustering. This also keeps one run's progress
+    // from being replaced while its caller is still waiting for results.
+    _sync: tokio::sync::MutexGuard<'static, ()>,
+    run_id: u64,
+}
+
+impl ClusteringRun {
+    fn new(
+        sync: tokio::sync::MutexGuard<'static, ()>,
+        generation: u64,
+        manual: bool,
+        scope: &str,
+        start_time: f64,
+        end_time: f64,
+    ) -> Self {
+        let run_id = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
+        *PROGRESS.lock().unwrap_or_else(|e| e.into_inner()) = Some(ClusteringProgress {
+            run_id,
+            generation,
+            manual,
+            scope: scope.to_string(),
+            start_time,
+            end_time,
+            active: true,
+            phase: ClusteringPhase::Preparing,
+            prepared_count: 0,
+        });
+        Self {
+            _sync: sync,
+            run_id,
+        }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut ClusteringProgress)) {
+        if let Some(progress) = PROGRESS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .filter(|progress| progress.run_id == self.run_id)
+        {
+            update(progress);
+        }
+    }
+
+    fn phase(&self, phase: ClusteringPhase) {
+        self.update(|progress| progress.phase = phase);
+    }
+
+    pub(crate) fn finish(&self, phase: ClusteringPhase) {
+        self.update(|progress| {
+            progress.active = false;
+            progress.phase = phase;
+        });
+    }
+}
+
+impl Drop for ClusteringRun {
+    fn drop(&mut self) {
+        // All early returns, errors and cancelled futures must stop looking
+        // active, even though an unfinished checkpoint remains in the database.
+        self.update(|progress| {
+            if progress.active {
+                progress.active = false;
+                progress.phase = ClusteringPhase::Interrupted;
+            }
+        });
+    }
+}
 
 pub(crate) fn schedule_repair(app: &AppHandle) {
     if let Some(scheduler) = app.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
@@ -29,9 +145,10 @@ pub(crate) fn schedule_repair(app: &AppHandle) {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum SyncOutcome {
-    Ready,
+    Ready(ClusteringRun),
+    Busy,
     More,
     WaitingForIndex,
 }
@@ -78,8 +195,8 @@ pub(crate) async fn synchronize(
     start: Option<f64>,
     end: Option<f64>,
 ) -> Result<SyncOutcome, String> {
-    let Ok(_sync) = SYNC_LOCK.try_lock() else {
-        return Ok(SyncOutcome::More);
+    let Ok(sync) = SYNC_LOCK.try_lock() else {
+        return Ok(SyncOutcome::Busy);
     };
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let generation = storage.db_generation();
@@ -99,6 +216,7 @@ pub(crate) async fn synchronize(
     if !begin.is_finite() || !finish.is_finite() || begin < 0.0 || finish < begin {
         return Err("invalid clustering time range".into());
     }
+    let progress = ClusteringRun::new(sync, generation, manual, &scope, begin, finish);
     let target = request(
         app,
         json!({"command":"get_task_vector_sync_target"}),
@@ -111,6 +229,11 @@ pub(crate) async fn synchronize(
     .ok_or("missing task vector synchronization target")?
     .to_string();
     let mut state = storage.begin_task_vector_sync(generation, &scope, &target, begin, finish)?;
+    progress.update(|progress| {
+        progress.start_time = state.start_time;
+        progress.end_time = state.end_time;
+        progress.prepared_count = state.synced_count;
+    });
     let deadline = Instant::now() + Duration::from_secs(1800);
     let mut pages = 0;
     loop {
@@ -127,15 +250,18 @@ pub(crate) async fn synchronize(
         let ids = storage.task_vector_sync_page(generation, &selection, PAGE_SIZE)?;
         if ids.is_empty() {
             storage.acknowledge_task_vector_sync(generation, &state, state.upper_id, 0, true)?;
-            return Ok(SyncOutcome::Ready);
+            progress.phase(ClusteringPhase::Clustering);
+            return Ok(SyncOutcome::Ready(progress));
         }
-        let Some(records) = prepare_page(app, storage.clone(), generation, &ids, manual).await?
+        let Some(records) =
+            prepare_page(app, storage.clone(), generation, &ids, manual, &progress).await?
         else {
             if let Some(scheduler) =
                 app.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
             {
                 scheduler.enqueue(app, BackgroundTaskKind::SemanticIndex, false)?;
             }
+            progress.finish(ClusteringPhase::WaitingForIndex);
             return Ok(SyncOutcome::WaitingForIndex);
         };
         check_access(app, &storage, generation, manual)?;
@@ -163,6 +289,7 @@ pub(crate) async fn synchronize(
         state.synced_count += records.len() as u64;
         pages += 1;
         if !manual && pages >= AUTO_PAGES {
+            progress.finish(ClusteringPhase::Paused);
             return Ok(SyncOutcome::More);
         }
     }
@@ -174,6 +301,7 @@ async fn prepare_page(
     generation: u64,
     ids: &[i64],
     manual: bool,
+    progress: &ClusteringRun,
 ) -> Result<Option<Vec<Value>>, String> {
     let read_storage = storage.clone();
     let ids = ids.to_vec();
@@ -214,7 +342,7 @@ async fn prepare_page(
             vector
         } else {
             check_access(app, &storage, generation, manual)?;
-            encode_source(app, storage.clone(), generation, &source).await?
+            encode_source(app, storage.clone(), generation, &source, progress).await?
         };
         records.push(json!({
             "id":source.spec.subject_key, "embedding":vector,
@@ -223,6 +351,7 @@ async fn prepare_page(
             "window_title":source.summary.window_title.unwrap_or_default(),
             "category":source.summary.category.unwrap_or_default(), "document":source.text,
         }));
+        progress.update(|progress| progress.prepared_count += 1);
     }
     Ok(Some(records))
 }
@@ -232,12 +361,14 @@ async fn encode_source(
     storage: Arc<StorageState>,
     generation: u64,
     source: &MinilmSource,
+    progress: &ClusteringRun,
 ) -> Result<Vec<f32>, String> {
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let deadline = Instant::now() + Duration::from_secs(120);
     // Manual history rebuilding participates in the existing worker arbitration.
     // Drop the slot after every record so foreground search and classification
     // can proceed between requests, rather than after an entire history range.
+    let mut waiting = false;
     let guard = loop {
         check_access(app, &storage, generation, true)?;
         if Instant::now() >= deadline {
@@ -248,8 +379,13 @@ async fn encode_source(
                 break guard;
             }
         }
+        if !waiting {
+            progress.phase(ClusteringPhase::WaitingForWorker);
+            waiting = true;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
+    progress.phase(ClusteringPhase::Preparing);
     let result = semantic
         .embed_text(
             app.clone(),

@@ -21,6 +21,7 @@ export default function FeaturesSection({ monitorStatus }) {
     clusteringAdvancedOpen,
     setClusteringAdvancedOpen,
     clusteringRunning,
+    clusteringProgress,
     clusteringError,
     clusteringNotice,
     rangeStart,
@@ -94,6 +95,7 @@ export default function FeaturesSection({ monitorStatus }) {
             clusteringDropdownOpen={clusteringDropdownOpen}
             clusteringAdvancedOpen={clusteringAdvancedOpen}
             clusteringRunning={clusteringRunning}
+            clusteringProgress={clusteringProgress}
             clusteringError={clusteringError}
             clusteringNotice={clusteringNotice}
             rangeStart={rangeStart}

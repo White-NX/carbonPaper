@@ -129,8 +129,8 @@ export async function runClustering({ startTime, endTime, clusteringMode, manual
 }
 
 /**
- * Get the current clustering scheduler status.
- * @returns {Promise<Object>} { config, last_result }
+ * Read clustering activity, per-record preparation progress and its durable checkpoint.
+ * @returns {Promise<Object>} { config, last_result, scheduler, vector_sync, clustering_progress }
  */
 export async function getClusteringStatus() {
   return withAuth(() => invoke('monitor_get_clustering_status'));

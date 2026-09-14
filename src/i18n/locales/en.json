@@ -859,7 +859,20 @@
           "advanced_label": "Advanced",
           "run_now": "Run clustering now",
           "queued": "Added to the background organization queue",
-          "completed": "Clustering complete: saved {{count}} activities"
+          "completed": "Clustering complete: saved {{count}} activities",
+          "progress": {
+            "preparing": "Preparing history",
+            "waiting": "Waiting to continue",
+            "clustering": "Organizing tasks",
+            "saving": "Saving results",
+            "waiting_for_records": "Waiting for records to be prepared",
+            "awaiting_choice": "Ready. Choose how to continue",
+            "retry_wait": "Processing was interrupted. Retrying shortly",
+            "interrupted": "Processing was interrupted. Run again to continue",
+            "completed": "Organization complete",
+            "already_running": "An organization task is already running",
+            "prepared_count": "Records prepared: {{count}}"
+          }
         },
         "classification": {
           "label": "Content Classification",

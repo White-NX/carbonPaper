@@ -891,15 +891,18 @@ async fn execute_slice(
             runtime.worker_restart_count.fetch_add(1, Ordering::SeqCst);
             crate::monitor::start_monitor_impl(app.state::<MonitorState>(), app.clone()).await?;
         }
-        match crate::task_vector_sync::synchronize(app, manual, None, None).await? {
+        let progress = match crate::task_vector_sync::synchronize(app, manual, None, None).await? {
+            crate::task_vector_sync::SyncOutcome::Busy => {
+                return Ok(ScheduledSliceResult::skipped("clustering_already_running"))
+            }
             crate::task_vector_sync::SyncOutcome::More => {
                 return Ok(ScheduledSliceResult::complete(true))
             }
             crate::task_vector_sync::SyncOutcome::WaitingForIndex => {
                 return Ok(ScheduledSliceResult::skipped("waiting_for_index"))
             }
-            crate::task_vector_sync::SyncOutcome::Ready => {}
-        }
+            crate::task_vector_sync::SyncOutcome::Ready(progress) => progress,
+        };
         let monitor = app.state::<MonitorState>();
         let response = crate::monitor::forward_command_to_python(
             &monitor,
@@ -916,8 +919,10 @@ async fn execute_slice(
                 .and_then(|value| value.get("status"))
                 .and_then(|value| value.as_str());
             if result_status == Some("already_running") {
+                progress.finish(crate::task_vector_sync::ClusteringPhase::Paused);
                 Ok(ScheduledSliceResult::skipped("clustering_already_running"))
             } else if result_status == Some("disabled") {
+                progress.finish(crate::task_vector_sync::ClusteringPhase::Paused);
                 Ok(ScheduledSliceResult::skipped("disabled"))
             } else if result_status == Some("waiting_for_index") {
                 // Python deliberately leaves the work untouched until the
@@ -925,6 +930,7 @@ async fn execute_slice(
                 // deferred slice, not a completed interval run; otherwise a
                 // fresh `last_completed_at` would hide the backlog for the
                 // whole configured clustering interval.
+                progress.finish(crate::task_vector_sync::ClusteringPhase::WaitingForIndex);
                 Ok(ScheduledSliceResult::skipped("waiting_for_index"))
             } else {
                 let processed = response
@@ -933,6 +939,7 @@ async fn execute_slice(
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0);
                 background_activity::index_progress(processed);
+                progress.finish(crate::task_vector_sync::ClusteringPhase::Completed);
                 Ok(ScheduledSliceResult::complete(false).with_processed(processed))
             }
         } else {

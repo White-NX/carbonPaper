@@ -723,16 +723,18 @@ pub async fn monitor_run_clustering(
         }));
     }
     crate::commands::check_auth_required(&credential_state)?;
-    match crate::task_vector_sync::synchronize(&app, true, start_time, end_time).await? {
-        crate::task_vector_sync::SyncOutcome::Ready => {}
-        crate::task_vector_sync::SyncOutcome::More => {
+    let progress = match crate::task_vector_sync::synchronize(&app, true, start_time, end_time)
+        .await?
+    {
+        crate::task_vector_sync::SyncOutcome::Ready(progress) => progress,
+        crate::task_vector_sync::SyncOutcome::Busy | crate::task_vector_sync::SyncOutcome::More => {
             return Err("CLUSTERING_ALREADY_RUNNING".into())
         }
         crate::task_vector_sync::SyncOutcome::WaitingForIndex => {
             return Err("CLUSTERING_WAITING_FOR_INDEX".into())
         }
-    }
-    authenticated_monitor_command(
+    };
+    let response = authenticated_monitor_command(
         &credential_state,
         &state,
         serde_json::json!({
@@ -743,7 +745,17 @@ pub async fn monitor_run_clustering(
             "manual": manual.unwrap_or(false),
         }),
     )
-    .await
+    .await?;
+    if response.get("error").is_none() {
+        use crate::task_vector_sync::ClusteringPhase;
+        progress.finish(match response.get("status").and_then(Value::as_str) {
+            Some("needs_user_choice") => ClusteringPhase::AwaitingChoice,
+            // The frontend still needs to save the returned clusters.
+            Some("success" | "empty") => ClusteringPhase::ResultsReady,
+            _ => ClusteringPhase::Paused,
+        });
+    }
+    Ok(response)
 }
 
 #[tauri::command]
@@ -754,6 +766,8 @@ pub async fn monitor_get_clustering_status(
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let status = scheduler.status(&app);
+    let storage = app.state::<Arc<StorageState>>();
+    let progress = crate::task_vector_sync::progress_status(&storage);
     let task = status
         .tasks
         .iter()
@@ -772,14 +786,16 @@ pub async fn monitor_get_clustering_status(
             "interval": interval,
             "interval_secs": interval_secs,
             "last_run": task.and_then(|task| task.last_completed_at_ms).map(|ms| ms as f64 / 1000.0),
-            "running": status.running_task.as_deref() == Some(crate::background_scheduler::TASK_PYTHON_CLUSTERING),
+            "running": progress.as_ref().is_some_and(|progress| progress.active)
+                || status.running_task.as_deref() == Some(crate::background_scheduler::TASK_PYTHON_CLUSTERING),
         },
         "last_result": task.map(|task| serde_json::json!({
             "status": task.status,
             "last_error": task.last_error,
         })),
         "scheduler": status,
-        "vector_sync": app.state::<Arc<crate::storage::StorageState>>().task_vector_sync_status()?,
+        "vector_sync": storage.task_vector_sync_status()?,
+        "clustering_progress": progress,
     }))
 }
 
