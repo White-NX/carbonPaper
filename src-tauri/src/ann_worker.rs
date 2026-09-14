@@ -484,3 +484,206 @@ pub fn run() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cancel_is_scoped_to_the_request_id() {
+        let c = Control::default();
+        c.begin(10);
+        c.cancel(10);
+        assert!(c.check().is_err());
+        c.begin(11);
+        c.cancel(10);
+        assert!(c.check().is_ok());
+    }
+
+    fn input(directory: &Path, rows: usize) -> PathBuf {
+        let path = directory.join("input.cpdvec");
+        let keys: Vec<String> = (0..rows).map(|i| format!("v{i:05}")).collect();
+        let header = Header::for_snapshot(
+            1,
+            7,
+            rows as u64,
+            8,
+            "clip_image",
+            "model",
+            "revision",
+            96,
+            keys.iter().map(|k| k.len() as u64).sum(),
+        )
+        .unwrap();
+        let mut writer = ann_format::FlatFileWriter::create(&path, header).unwrap();
+        for (i, key) in keys.iter().enumerate() {
+            writer.push_key(key).unwrap();
+            let mut vector = vec![0.0f32; 8];
+            vector[i % 8] = 1.0;
+            writer.push_vector(&vector).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    fn reply() -> AnnReply {
+        AnnReply {
+            request_id: 1,
+            phase: String::new(),
+            built: 0,
+            graph_bytes: 0,
+            checkpoint: None,
+            checksum: None,
+            samples: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn checkpoint(session: &mut Session, control: &Control) -> AnnReply {
+        for _ in 0..10_000 {
+            let mut reply = reply();
+            session.step(false, control, &mut reply).unwrap();
+            if reply.checkpoint.is_some() {
+                return reply;
+            }
+        }
+        panic!("checkpoint did not complete")
+    }
+
+    #[test]
+    fn complete_checkpoint_restores_and_replays_only_the_uncommitted_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = input(directory.path(), 5100);
+        let control = Control::default();
+        control.begin(1);
+        let mut session = Session::new(path.to_string_lossy().into_owned(), None, None, 0);
+        let first = checkpoint(&mut session, &control);
+        assert_eq!(first.built, CHECKPOINT_ROWS);
+        let first_path = first.checkpoint.clone().unwrap();
+        let first_digest = first.checksum.clone().unwrap();
+        // Build more in RAM, then exit before another complete checkpoint.
+        session.step(false, &control, &mut reply()).unwrap();
+        assert_eq!(session.built, 5100);
+        drop(session);
+        let mut resumed = Session::new(
+            path.to_string_lossy().into_owned(),
+            Some(first_path.clone()),
+            Some(first_digest.clone()),
+            CHECKPOINT_ROWS,
+        );
+        let final_checkpoint = checkpoint(&mut resumed, &control);
+        assert_eq!(final_checkpoint.built, 5100);
+        assert_eq!(resumed.index.as_ref().unwrap().size(), 5100);
+        assert_eq!(
+            hex::encode(Sha256::digest(std::fs::read(first_path).unwrap())),
+            first_digest
+        );
+        for ordinal in [0, 4999, 5099] {
+            let mut recovered = vec![0.0f32; 8];
+            let found = resumed
+                .index
+                .as_ref()
+                .unwrap()
+                .get(ordinal + 1, &mut recovered)
+                .unwrap();
+            ann_format::validate_ann_recovered_probe(
+                resumed.vector(ordinal as usize).unwrap().as_ref(),
+                &recovered,
+                found,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn losing_process_memory_in_each_phase_resumes_the_last_complete_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = input(directory.path(), 5020);
+        let control = Control::default();
+        control.begin(1);
+        let mut first = Session::new(path.to_string_lossy().into_owned(), None, None, 0);
+        let committed = checkpoint(&mut first, &control);
+        drop(first);
+        let checkpoint_path = committed.checkpoint.unwrap();
+        let checksum = committed.checksum.unwrap();
+        for phase in [
+            Phase::Flat,
+            Phase::ReadCheckpoint,
+            Phase::Restore,
+            Phase::Build,
+            Phase::Serialize,
+            Phase::Write,
+            Phase::ReadBack,
+            Phase::VerifyRestore,
+            Phase::Validate,
+        ] {
+            let reopen = || {
+                Session::new(
+                    path.to_string_lossy().into_owned(),
+                    Some(checkpoint_path.clone()),
+                    Some(checksum.clone()),
+                    CHECKPOINT_ROWS,
+                )
+            };
+            let mut interrupted = reopen();
+            for _ in 0..1000 {
+                if interrupted.phase == phase {
+                    break;
+                }
+                interrupted.step(false, &control, &mut reply()).unwrap();
+            }
+            assert_eq!(interrupted.phase, phase);
+            // Exiting here loses buffers, the in-memory graph and partial I/O;
+            // none of those has been acknowledged as a durable checkpoint.
+            drop(interrupted);
+            let mut recovered = reopen();
+            assert_eq!(checkpoint(&mut recovered, &control).built, 5020);
+            let index = recovered.index.as_ref().unwrap();
+            assert_eq!(index.size(), 5020);
+            assert!((1..=5020).all(|id| index.contains(id)), "{phase:?}");
+            assert_eq!(
+                hex::encode(Sha256::digest(std::fs::read(&checkpoint_path).unwrap())),
+                checksum
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_save_cannot_replace_a_complete_checkpoint_and_corruption_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = input(directory.path(), 5050);
+        let control = Control::default();
+        control.begin(1);
+        let mut session = Session::new(path.to_string_lossy().into_owned(), None, None, 0);
+        let first = checkpoint(&mut session, &control);
+        session.step(false, &control, &mut reply()).unwrap(); // insert suffix
+        session.step(false, &control, &mut reply()).unwrap(); // serialize scratch
+        control.cancel(1);
+        assert!(session
+            .step(false, &control, &mut reply())
+            .unwrap_err()
+            .starts_with("background_paused:"));
+        assert_eq!(
+            hex::encode(Sha256::digest(
+                std::fs::read(first.checkpoint.as_ref().unwrap()).unwrap()
+            )),
+            first.checksum.as_ref().unwrap().as_str()
+        );
+        drop(session);
+        std::fs::write(first.checkpoint.as_ref().unwrap(), b"incomplete checkpoint").unwrap();
+        let mut bad = Session::new(
+            path.to_string_lossy().into_owned(),
+            first.checkpoint,
+            first.checksum,
+            first.built,
+        );
+        control.begin(2);
+        let mut failure = None;
+        for _ in 0..100 {
+            if let Err(error) = bad.step(false, &control, &mut reply()) {
+                failure = Some(error);
+                break;
+            }
+        }
+        assert!(failure.unwrap().contains("checksum mismatch"));
+    }
+}
