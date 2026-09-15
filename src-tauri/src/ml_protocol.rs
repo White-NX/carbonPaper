@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const ML_PROTOCOL_VERSION: u32 = 3;
+pub const ML_PROTOCOL_VERSION: u32 = 4;
 pub const MAX_ML_HEADER_BYTES: usize = 1024 * 1024;
 pub const MAX_ML_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SEMANTIC_BATCH: usize = 32;
@@ -48,6 +48,11 @@ pub struct MlImageInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum MlRequest {
+    /// Out-of-band control. Produces no response frame; the target request
+    /// produces its normal terminal frame with kind `cancelled`.
+    Cancel {
+        request_id: u64,
+    },
     Ping {
         request_id: u64,
     },
@@ -99,7 +104,8 @@ pub enum MlRequest {
 impl MlRequest {
     pub fn request_id(&self) -> u64 {
         match self {
-            Self::Ping { request_id }
+            Self::Cancel { request_id }
+            | Self::Ping { request_id }
             | Self::Ocr { request_id, .. }
             | Self::EmbedText { request_id, .. }
             | Self::EmbedImage { request_id, .. }
@@ -132,6 +138,10 @@ pub struct MlSemanticTimings {
     pub preprocess_ms: f64,
     pub inference_ms: f64,
     pub request_total_ms: f64,
+    #[serde(default)]
+    pub cpu_ms: f64,
+    #[serde(default)]
+    pub model_load_cpu_ms: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

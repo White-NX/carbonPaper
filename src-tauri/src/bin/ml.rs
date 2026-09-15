@@ -8,9 +8,15 @@
 #[path = "../ann_format.rs"]
 mod ann_format;
 // This worker uses the server half of the shared bidirectional protocol.
+#[path = "../ann_protocol.rs"]
+mod ann_protocol;
+#[path = "../ann_worker.rs"]
+mod ann_worker;
 #[allow(dead_code)]
 #[path = "../ml_protocol.rs"]
 mod ml_protocol;
+#[path = "../semantic_metrics.rs"]
+mod semantic_metrics;
 
 use memmap2::MmapOptions;
 use ml_protocol::{
@@ -39,6 +45,9 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("--ann-session") {
+        return ann_worker::run();
+    }
     if std::env::args().nth(1).as_deref() == Some("--build-ann") {
         return run_ann_builder();
     }

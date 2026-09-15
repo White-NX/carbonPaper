@@ -64,7 +64,6 @@ use crate::background_scheduler::{
     deferred_release_note, AutomaticSliceContext, AutomaticSliceStopReason, ScheduledSliceResult,
 };
 use crate::credential_manager::CredentialManagerState;
-use crate::idle::IdleState;
 use crate::minilm_migration::{
     build_minilm_task_text, minilm_job_spec, validate_minilm_vector, MINILM_OCR_SNIPPET_CHARS,
 };
@@ -330,6 +329,7 @@ fn staged_subject(
 ) -> IndexedSubject {
     IndexedSubject {
         id,
+        source_revision: input.source_revision,
         text,
         vector,
         summary: BackgroundScreenshotSummary {
@@ -351,10 +351,11 @@ pub async fn run_scheduled_slice(
     quantum: Option<&AutomaticSliceContext>,
 ) -> Result<ScheduledSliceResult, String> {
     if !manual
-        && app
-            .state::<Arc<StorageState>>()
-            .processing_stage
-            .has_ready(carbonpaper_app_bound::protocol::Consumer::MiniLm)
+        && crate::background_scheduler::prefer_staged(
+            app,
+            crate::background_scheduler::BackgroundTaskKind::SemanticIndex,
+            false,
+        )
     {
         return crate::processing_stage::run_model_slice(
             app,
@@ -376,7 +377,7 @@ async fn run_automatic_quantum(
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut batches = 0u32;
     let mut has_more = true;
-    let mut run_maintenance = true;
+    let mut run_maintenance = !crate::background_policy::is_background();
     loop {
         if let Some(reason) = quantum.stop_reason(&semantic, batches > 0) {
             if batches == 0 {
@@ -424,6 +425,9 @@ async fn run_automatic_quantum(
         }
         batches = batches.saturating_add(1);
         has_more = result.has_more;
+        if crate::background_policy::is_background() {
+            return Ok(ScheduledSliceResult::complete(has_more));
+        }
         if !has_more {
             tracing::info!(
                 "[SCHEDULER] automatic model quantum completed task=semantic_index batches={} elapsed_ms={}",
@@ -672,9 +676,11 @@ fn may_run(app: &AppHandle, mode: PassMode) -> bool {
     if mode.is_manual() {
         return true;
     }
-    app.state::<Arc<IdleState>>()
-        .is_idle
-        .load(Ordering::Relaxed)
+    crate::background_scheduler::environment_gate_reason(
+        app,
+        crate::background_scheduler::EnvironmentPolicy::Automatic,
+    )
+    .is_none()
 }
 
 /// One pass: expire, repair, then drain as much of the queue as the mode allows.
@@ -1015,6 +1021,8 @@ async fn reconcile_missing(storage: Arc<StorageState>) -> Result<(), String> {
 /// mirror will need, and the lease that authorizes the commit.
 #[derive(Clone)]
 struct ClaimedJob {
+    generation: u64,
+    source_revision: Option<i64>,
     spec: DerivedIndexJobSpec,
     text: String,
     summary: BackgroundScreenshotSummary,
@@ -1035,6 +1043,7 @@ struct EncodeChunkSuccess {
 /// Chroma mirror sends.
 struct IndexedSubject {
     id: i64,
+    source_revision: i64,
     vector: Vec<f32>,
     text: String,
     summary: BackgroundScreenshotSummary,
@@ -1291,13 +1300,22 @@ async fn encode_chunk(
         }
         Err(error) => {
             return Err(EncodeChunkFailure {
+                deferred_reason: crate::background_policy::is_pause(&error)
+                    .then_some("background_paused"),
                 error: format!("embed failed: {error}"),
                 claimed,
-                deferred_reason: None,
             });
         }
     };
     drop(worker_guard);
+
+    if let Err(error) = crate::background_policy::check_current() {
+        return Err(EncodeChunkFailure {
+            error,
+            claimed,
+            deferred_reason: Some("background_paused"),
+        });
+    }
 
     let retry_claimed = claimed.clone();
     commit_batch(storage, claimed, vectors)
@@ -1317,11 +1335,21 @@ async fn encode_chunk(
 /// would then describe text that no longer exists. Such a job is re-queued
 /// against the current source instead of being encoded against a stale one.
 async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, String> {
+    let execution = crate::background_policy::current_execution();
+    let limit = if execution.is_some() {
+        1
+    } else {
+        DRAIN_BATCH as u32
+    };
     tokio::task::spawn_blocking(move || -> Result<Vec<ClaimedJob>, String> {
+        let generation = storage.db_generation();
+        if let Some(lease) = &execution {
+            lease.check()?;
+        }
         let jobs = storage.claimable_derived_index_jobs(
             DerivedIndexKind::SemanticText,
             MAX_ATTEMPTS,
-            DRAIN_BATCH as u32,
+            limit,
         )?;
         if jobs.is_empty() {
             return Ok(Vec::new());
@@ -1336,10 +1364,17 @@ async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, Stri
                 ),
             }
         }
+        let revisions: HashMap<_, _> = storage
+            .archive_scoring_source_revisions(generation, &ids)?
+            .into_iter()
+            .collect();
         let sources = minilm_sources(&storage, &ids).map_err(|error| error.to_string())?;
 
         let mut claimed = Vec::with_capacity(jobs.len());
         for job in jobs {
+            if let Some(lease) = &execution {
+                lease.check()?;
+            }
             let Ok(id) = job.spec.subject_key.parse::<i64>() else {
                 continue;
             };
@@ -1370,6 +1405,8 @@ async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, Stri
             }
             match storage.mark_derived_index_job_processing(&job.spec) {
                 Ok(lease_token) => claimed.push(ClaimedJob {
+                    generation,
+                    source_revision: revisions.get(&id).copied().flatten(),
                     spec: job.spec,
                     text: source.text.clone(),
                     summary: source.summary.clone(),
@@ -1394,6 +1431,7 @@ async fn commit_batch(
     claimed: Vec<ClaimedJob>,
     vectors: Vec<Vec<f32>>,
 ) -> Result<Vec<IndexedSubject>, String> {
+    let execution = crate::background_policy::current_execution();
     tokio::task::spawn_blocking(move || {
         let mut indexed = Vec::with_capacity(claimed.len());
         for (job, vector) in claimed.into_iter().zip(vectors) {
@@ -1418,7 +1456,12 @@ async fn commit_batch(
                 lease_token: job.lease_token.clone(),
                 vector: vector.clone(),
             };
-            match storage.commit_derived_embedding(&write) {
+            match storage.commit_archive_embedding(
+                &write,
+                job.generation,
+                &[(job.summary.id, job.source_revision)],
+                execution.as_deref(),
+            ) {
                 Ok(()) => {
                     let id = job.summary.id;
                     // Smart Cluster scoring used to be queued by Python's
@@ -1432,15 +1475,30 @@ async fn commit_batch(
                     }
                     indexed.push(IndexedSubject {
                         id,
+                        source_revision: job.source_revision.unwrap_or(0),
                         vector,
                         text: job.text,
                         summary: job.summary,
                     });
                 }
-                Err(error) => tracing::warn!(
-                    "[SEMANTIC:INDEX] commit failed for {}: {error}",
-                    job.spec.subject_key
-                ),
+                Err(error) => {
+                    // A completed inference is disposable until its short
+                    // transaction commits. Keep the queue retryable on pauses
+                    // and source changes, including a wait for the DB mutex.
+                    let _ = storage.requeue_derived_index_job(
+                        &job.spec,
+                        &job.lease_token,
+                        "commit_deferred",
+                        &error,
+                    );
+                    if !crate::background_policy::is_pause(&error) {
+                        tracing::warn!(
+                            "[SEMANTIC:INDEX] commit failed for {}: {error}",
+                            job.spec.subject_key
+                        );
+                    }
+                    return Err(error);
+                }
             }
         }
         Ok(indexed)
@@ -1528,6 +1586,11 @@ async fn mirror_to_chroma(app: &AppHandle, indexed: &[IndexedSubject]) {
     if indexed.is_empty() {
         return;
     }
+    if crate::background_policy::current_execution().is_some() {
+        // The vector is durable; its consumer has its own qualification/cursor.
+        crate::task_vector_sync::schedule_repair(app);
+        return;
+    }
     let credential = app.state::<Arc<CredentialManagerState>>();
     let monitor = app.state::<MonitorState>();
     for chunk in indexed.chunks(MIRROR_BATCH) {
@@ -1569,6 +1632,7 @@ async fn mirror_to_chroma(app: &AppHandle, indexed: &[IndexedSubject]) {
 fn mirror_record(subject: &IndexedSubject) -> serde_json::Value {
     serde_json::json!({
         "id": subject.id.to_string(),
+        "source_revision": subject.source_revision,
         "embedding": subject.vector,
         // Seconds since the epoch, which is what `screenshots.created_at`
         // yields here and what Chroma's `timestamp` metadata has always held.
@@ -1776,6 +1840,7 @@ mod tests {
     fn indexed(id: i64) -> IndexedSubject {
         IndexedSubject {
             id,
+            source_revision: 1,
             vector: vec![0.5; crate::minilm_migration::MINILM_DIMENSIONS],
             text: "proc.exe | Title | OCR".to_string(),
             summary: BackgroundScreenshotSummary {
@@ -1832,6 +1897,7 @@ mod tests {
                 "embedding",
                 "id",
                 "process_name",
+                "source_revision",
                 "timestamp",
                 "window_title",
             ]

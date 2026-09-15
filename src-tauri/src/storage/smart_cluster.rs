@@ -7,7 +7,7 @@
 //! examples. New snapshots are evaluated in a background worker; matches
 //! above the threshold are recorded in `smart_cluster_assignments`.
 
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -336,6 +336,100 @@ fn read_summary_from_row(
 }
 
 impl StorageState {
+    pub(crate) fn archive_scoring_source_revisions(
+        &self,
+        generation: u64,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, Option<i64>)>, String> {
+        let guard = self.get_connection_named("archive_scoring_source_revisions")?;
+        if self.db_generation() != generation {
+            return Err("background_paused: database changed".into());
+        }
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        ids.iter()
+            .map(|id| {
+                let revision = conn
+                    .query_row(
+                        "SELECT COALESCE(r.revision,0) FROM screenshots s
+                    LEFT JOIN screenshot_processing_revisions r ON r.screenshot_id=s.id
+                    WHERE s.id=?1 AND s.is_deleted=0",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                Ok((*id, revision))
+            })
+            .collect()
+    }
+
+    /// Publish a fully scored group and remove its queue entries atomically.
+    /// A pause, changed OCR, edited cluster, or replaced database keeps the
+    /// entire uncommitted group available for a later pass.
+    pub(crate) fn commit_archive_scoring_group(
+        &self,
+        generation: u64,
+        revisions: &[(i64, Option<i64>)],
+        targets: &[SmartClusterScoringTarget],
+        assignments: &[(i64, i64, f64)],
+        execution: Option<&crate::background_policy::ExecutionLease>,
+    ) -> Result<(u64, u64), String> {
+        let guard = self.get_connection_named("commit_archive_scoring_group")?;
+        if let Some(execution) = execution {
+            execution.check()?;
+        }
+        if self.db_generation() != generation {
+            return Err("background_paused: database changed".into());
+        }
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let current = Self::smart_cluster_scoring_targets_on_conn(&tx)?;
+        if current.len() != targets.len()
+            || !current
+                .iter()
+                .zip(targets)
+                .all(|(a, b)| a.same_scoring_configuration(b))
+        {
+            return Err("background_paused: smart cluster configuration changed".into());
+        }
+        for (id, revision) in revisions {
+            let current: Option<i64> = tx.query_row("SELECT COALESCE(r.revision,0) FROM screenshots s
+                LEFT JOIN screenshot_processing_revisions r ON r.screenshot_id=s.id WHERE s.id=?1 AND s.is_deleted=0", [id], |r| r.get(0))
+                .optional().map_err(|e| e.to_string())?;
+            if current != *revision {
+                return Err("background_paused: scoring source changed".into());
+            }
+        }
+        for (cluster, id, score) in assignments {
+            if !score.is_finite()
+                || !revisions
+                    .iter()
+                    .any(|(source, revision)| source == id && revision.is_some())
+                || !targets
+                    .iter()
+                    .any(|t| t.id == *cluster && *score >= t.threshold)
+            {
+                return Err("invalid archive scoring result".into());
+            }
+            tx.execute("INSERT INTO smart_cluster_assignments(smart_cluster_id,screenshot_id,rerank_score)
+                VALUES(?1,?2,?3) ON CONFLICT(smart_cluster_id,screenshot_id) DO UPDATE SET rerank_score=excluded.rerank_score",
+                params![cluster,id,score]).map_err(|e| e.to_string())?;
+        }
+        let mut deleted = 0;
+        for (id, _) in revisions {
+            deleted += tx
+                .execute(
+                    "DELETE FROM smart_cluster_pending WHERE screenshot_id=?1",
+                    [id],
+                )
+                .map_err(|e| e.to_string())? as u64;
+        }
+        if let Some(execution) = execution {
+            execution.check()?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok((deleted, assignments.len() as u64))
+    }
     // ------------------------------------------------------------------
     // CRUD on smart_clusters
     // ------------------------------------------------------------------
@@ -936,8 +1030,8 @@ impl StorageState {
             let Some(last) = page.last().copied() else {
                 break;
             };
-            let eligible = self.indexed_smart_cluster_pending_ids(&page)?;
-            selected.extend(eligible.into_iter().take(limit - selected.len()));
+            let eligible = self.indexed_smart_cluster_pending_ids(&page, limit - selected.len())?;
+            selected.extend(eligible);
             after = last;
             if page.len() < PAGE as usize {
                 break;
@@ -946,37 +1040,64 @@ impl StorageState {
         Ok(selected)
     }
 
-    fn indexed_smart_cluster_pending_ids(&self, ids: &[i64]) -> Result<Vec<i64>, String> {
-        let spec = crate::minilm_migration::minilm_job_spec(0, "");
-        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT CAST(e.subject_key AS INTEGER) {}
+    fn indexed_smart_cluster_pending_id_sql() -> String {
+        // A single subject uses the unique (index_kind, subject_key) index.
+        // An IN page can instead scan every vector for the model when SQLite
+        // has no ANALYZE statistics. Keep the integer primary key bare in the
+        // pending join too: casting it to text caused a screenshot-history
+        // scan for each candidate while the primary database mutex was held.
+        format!(
+            "SELECT 1 {}
              AND e.model_id=?2 AND e.model_revision=?3 AND e.embedding_version=?4
-             AND e.subject_key IN ({placeholders})
+             AND e.subject_key=?5
              AND EXISTS(SELECT 1 FROM smart_cluster_pending p JOIN screenshots s ON s.id=p.screenshot_id
-               WHERE CAST(p.screenshot_id AS TEXT)=e.subject_key AND s.is_deleted=0 AND s.status='committed'
-                 AND p.queued_at>=datetime('now','-{} days'))
-             ORDER BY CAST(e.subject_key AS INTEGER)",
+               WHERE p.screenshot_id=CAST(e.subject_key AS INTEGER) AND s.is_deleted=0 AND s.status='committed'
+                 AND p.queued_at>=datetime('now','-{} days'))",
             super::derived_index::VISIBLE_EMBEDDING_SOURCE,
             Self::SMART_CLUSTER_PENDING_TTL_DAYS,
-        );
+        )
+    }
+
+    /// Candidates come from an ordered staging page. Stop as soon as the
+    /// caller's remaining limit is met, including one-item readiness checks.
+    fn indexed_smart_cluster_pending_ids(
+        &self,
+        ids: &[i64],
+        limit: usize,
+    ) -> Result<Vec<i64>, String> {
+        if ids.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let spec = crate::minilm_migration::minilm_job_spec(0, "");
+        let sql = Self::indexed_smart_cluster_pending_id_sql();
         let guard = self.get_connection_named("indexed_smart_cluster_pending_ids")?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
         let kind = spec.index_kind.as_str();
-        let subjects: Vec<String> = ids.iter().map(i64::to_string).collect();
-        let mut bound: Vec<&dyn rusqlite::ToSql> = vec![
-            &kind,
-            &spec.model_id,
-            &spec.model_revision,
-            &spec.embedding_version,
-        ];
-        bound.extend(subjects.iter().map(|id| id as &dyn rusqlite::ToSql));
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(bound.as_slice(), |r| r.get(0))
-            .map_err(|e| e.to_string())?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| e.to_string())
+        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+        let mut selected = Vec::with_capacity(limit.min(ids.len()));
+        for id in ids {
+            let eligible = stmt
+                .query_row(
+                    params![
+                        kind,
+                        spec.model_id,
+                        spec.model_revision,
+                        spec.embedding_version,
+                        id.to_string(),
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .is_some();
+            if eligible {
+                selected.push(*id);
+                if selected.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(selected)
     }
 
     pub fn enqueue_smart_cluster_pending(&self, screenshot_id: i64) -> Result<(), String> {
@@ -1201,6 +1322,194 @@ mod tests {
             ],
         )
         .expect("insert screenshot");
+    }
+
+    #[test]
+    fn pending_id_lookup_does_not_scan_unrelated_history() {
+        let (_temp, storage) = test_storage();
+        let guard = storage.db.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+        let spec = crate::minilm_migration::minilm_job_spec(0, "");
+        conn.execute_batch(
+            "WITH RECURSIVE ids(id) AS (
+                 SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<10000
+             )
+             INSERT INTO screenshots(id,image_path,image_hash,status)
+             SELECT id,'test.enc',CAST(id AS TEXT),'committed' FROM ids;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO derived_embeddings
+             (index_kind,subject_key,dimensions,vector_f32,model_id,model_revision,
+              embedding_version,source_fingerprint)
+             SELECT ?1,CAST(id AS TEXT),384,zeroblob(1536),?2,?3,?4,'test-source'
+             FROM screenshots",
+            params![
+                spec.index_kind.as_str(),
+                spec.model_id,
+                spec.model_revision,
+                spec.embedding_version,
+            ],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO derived_index_jobs
+             (index_kind,subject_key,status,model_id,model_revision,embedding_version,source_fingerprint)
+             SELECT index_kind,subject_key,'completed',model_id,model_revision,
+                    embedding_version,source_fingerprint FROM derived_embeddings;
+             INSERT INTO smart_cluster_pending(screenshot_id) VALUES(10000);",
+        )
+        .unwrap();
+        let mut stmt = conn
+            .prepare(&StorageState::indexed_smart_cluster_pending_id_sql())
+            .unwrap();
+        // Exercise a hit, an indexed screenshot outside the pending queue,
+        // and a missing vector. VM work is deterministic even on a slow CI
+        // host; the old cast forced tens of thousands of steps per candidate.
+        for (id, expected) in [(10000, true), (9999, false), (10001, false)] {
+            stmt.reset_status(rusqlite::StatementStatus::VmStep);
+            let eligible = stmt
+                .query_row(
+                    params![
+                        spec.index_kind.as_str(),
+                        spec.model_id,
+                        spec.model_revision,
+                        spec.embedding_version,
+                        id.to_string(),
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some();
+            assert_eq!(eligible, expected);
+            let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+            assert!(
+                steps < 256,
+                "pending lookup for {id} scanned unrelated history: {steps} VM steps"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_group_commit_fences_changed_sources_and_retries_the_whole_group() {
+        let (_temp, storage) = test_storage();
+        let cluster = insert_cluster(&storage, "receipts");
+        for id in [1, 2] {
+            insert_screenshot(&storage, id, "editor", "document");
+            storage.enqueue_smart_cluster_pending(id).unwrap();
+        }
+        let generation = storage.db_generation();
+        let targets = storage.list_smart_cluster_scoring_targets().unwrap();
+        let revisions = storage
+            .archive_scoring_source_revisions(generation, &[1, 2])
+            .unwrap();
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute(
+                "INSERT INTO screenshot_processing_revisions(screenshot_id,revision) VALUES(2,1)
+             ON CONFLICT(screenshot_id) DO UPDATE SET revision=revision+1",
+                [],
+            )
+            .unwrap();
+        let assignments = [(cluster, 1, 0.9), (cluster, 2, 0.8)];
+        assert!(storage
+            .commit_archive_scoring_group(generation, &revisions, &targets, &assignments, None)
+            .unwrap_err()
+            .contains("source changed"));
+        assert_eq!(storage.count_smart_cluster_pending().unwrap(), 2);
+        let assigned: i64 = storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM smart_cluster_assignments", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(assigned, 0);
+        let fresh = storage
+            .archive_scoring_source_revisions(generation, &[1, 2])
+            .unwrap();
+        assert_eq!(
+            storage
+                .commit_archive_scoring_group(generation, &fresh, &targets, &assignments, None)
+                .unwrap(),
+            (2, 2)
+        );
+        assert_eq!(storage.count_smart_cluster_pending().unwrap(), 0);
+    }
+
+    #[test]
+    fn empty_scoring_results_still_check_configuration_generation_and_cancellation() {
+        let (_temp, storage) = test_storage();
+        insert_screenshot(&storage, 1, "editor", "document");
+        storage.enqueue_smart_cluster_pending(1).unwrap();
+        let generation = storage.db_generation();
+        let revisions = storage
+            .archive_scoring_source_revisions(generation, &[1])
+            .unwrap();
+        let empty_targets = storage.list_smart_cluster_scoring_targets().unwrap();
+        insert_cluster(&storage, "added during scoring");
+        assert!(storage
+            .commit_archive_scoring_group(generation, &revisions, &empty_targets, &[], None)
+            .unwrap_err()
+            .contains("configuration changed"));
+        let current = storage.list_smart_cluster_scoring_targets().unwrap();
+        let lease = crate::background_policy::ExecutionLease::new(
+            "smart_cluster",
+            crate::background_policy::ExecutionProfile::Background,
+            20,
+        );
+        lease.revoke("foreground_request");
+        assert!(storage
+            .commit_archive_scoring_group(generation, &revisions, &current, &[], Some(&lease))
+            .unwrap_err()
+            .contains("foreground_request"));
+        storage.bump_db_generation();
+        assert!(storage
+            .commit_archive_scoring_group(generation, &revisions, &current, &[], None)
+            .unwrap_err()
+            .contains("database changed"));
+        assert_eq!(storage.count_smart_cluster_pending().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_restored_source_cannot_be_drained_as_an_empty_document() {
+        let (_temp, storage) = test_storage();
+        insert_screenshot(&storage, 1, "editor", "document");
+        storage.enqueue_smart_cluster_pending(1).unwrap();
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute("UPDATE screenshots SET is_deleted=1 WHERE id=1", [])
+            .unwrap();
+        let generation = storage.db_generation();
+        let revisions = storage
+            .archive_scoring_source_revisions(generation, &[1])
+            .unwrap();
+        assert_eq!(revisions, vec![(1, None)]);
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute("UPDATE screenshots SET is_deleted=0 WHERE id=1", [])
+            .unwrap();
+        assert!(storage
+            .commit_archive_scoring_group(generation, &revisions, &[], &[], None)
+            .unwrap_err()
+            .contains("source changed"));
+        assert_eq!(storage.count_smart_cluster_pending().unwrap(), 1);
     }
 
     #[test]

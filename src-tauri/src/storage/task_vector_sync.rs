@@ -39,6 +39,33 @@ fn read_state(conn: &rusqlite::Connection) -> Result<Option<TaskVectorSync>, Str
 }
 
 impl StorageState {
+    pub(crate) fn task_vector_sync_pending(&self) -> Result<bool, String> {
+        let guard = self.get_connection_named("task_vector_sync_pending")?;
+        guard
+            .as_ref()
+            .ok_or("Database not initialized")?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_vector_sync WHERE complete=0 OR needs_rescan=1)
+                OR (NOT EXISTS(SELECT 1 FROM task_vector_sync)
+                    AND EXISTS(SELECT 1 FROM derived_embeddings WHERE index_kind='semantic_text'))",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn mark_task_vector_sync_dirty(&self) -> Result<(), String> {
+        let guard = self.get_connection_named("mark_task_vector_sync_dirty")?;
+        guard
+            .as_ref()
+            .ok_or("Database not initialized")?
+            .execute(
+                "UPDATE task_vector_sync SET needs_rescan=1 WHERE id=1 AND needs_rescan=0",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
     pub(crate) fn task_vector_sync_status(&self) -> Result<Option<TaskVectorSync>, String> {
         let guard = self.get_connection_named("task_vector_sync_status")?;
         read_state(guard.as_ref().ok_or("Database not initialized")?)
@@ -84,7 +111,7 @@ impl StorageState {
              VALUES(1,?1,?2,?3,?4,?5,0,0,0)
              ON CONFLICT(id) DO UPDATE SET scope=excluded.scope,target=excluded.target,
              start_time=excluded.start_time,end_time=excluded.end_time,upper_id=excluded.upper_id,
-             cursor=0,synced_count=0,complete=0",
+             cursor=0,synced_count=0,complete=0,needs_rescan=0",
             params![scope,target,start,end,upper_id],
         ).map_err(|e| e.to_string())?;
         read_state(conn)?.ok_or_else(|| "missing task vector synchronization state".into())
@@ -133,7 +160,7 @@ impl StorageState {
         cursor: i64,
         count: usize,
         complete: bool,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if cursor < state.cursor || cursor > state.upper_id {
             return Err("invalid sync cursor".into());
         }
@@ -142,7 +169,8 @@ impl StorageState {
         if self.db_generation() != generation {
             return Err("database changed".into());
         }
-        let changed = conn
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let changed = tx
             .execute(
                 "UPDATE task_vector_sync SET cursor=?1,synced_count=synced_count+?2,complete=?3
              WHERE id=1 AND scope=?4 AND target=?5 AND cursor=?6 AND upper_id=?7 AND complete=0",
@@ -160,7 +188,18 @@ impl StorageState {
         if changed != 1 {
             return Err("stale task vector synchronization cursor".into());
         }
-        Ok(())
+        // Observe the dirty marker inside the same transaction as completion.
+        // A producer racing the final page cannot disappear between the read
+        // and the acknowledgement.
+        let rescan: bool = tx
+            .query_row(
+                "SELECT needs_rescan FROM task_vector_sync WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(rescan)
     }
 }
 
@@ -186,6 +225,59 @@ mod tests {
         .unwrap();
         *storage.db.lock().unwrap() = Some(conn);
         (dir, storage)
+    }
+
+    #[test]
+    fn updates_during_a_pass_survive_restart_and_require_a_new_pass() {
+        let (dir, storage) = storage();
+        let first = storage
+            .begin_task_vector_sync(0, "recent", "target", 0.0, 2_000_000_000.0)
+            .unwrap();
+        storage
+            .acknowledge_task_vector_sync(0, &first, 2, 2, false)
+            .unwrap();
+        storage.mark_task_vector_sync_dirty().unwrap();
+        *storage.db.lock().unwrap() = None;
+        *storage.db.lock().unwrap() =
+            Some(rusqlite::Connection::open(dir.path().join("sync.db")).unwrap());
+        let resumed = storage
+            .begin_task_vector_sync(0, "recent", "target", 0.0, 2_000_000_000.0)
+            .unwrap();
+        assert_eq!(resumed.cursor, 2);
+        assert!(storage
+            .acknowledge_task_vector_sync(0, &resumed, 3, 1, true)
+            .unwrap());
+        let next = storage
+            .begin_task_vector_sync(0, "recent", "target", 0.0, 2_000_000_000.0)
+            .unwrap();
+        assert_eq!(next.cursor, 0);
+        assert!(!storage
+            .acknowledge_task_vector_sync(0, &next, 3, 3, true)
+            .unwrap());
+    }
+
+    #[test]
+    fn updates_after_last_ack_cannot_be_lost_at_scheduler_completion() {
+        let (_dir, storage) = storage();
+        let kind = crate::background_scheduler::TASK_VECTOR_SYNC;
+        storage.enqueue_background_task(kind, false, 100).unwrap();
+        storage
+            .mark_background_task_started(kind, 1, false, 200)
+            .unwrap();
+        let pass = storage
+            .begin_task_vector_sync(0, "recent", "target", 0.0, 2_000_000_000.0)
+            .unwrap();
+        assert!(!storage
+            .acknowledge_task_vector_sync(0, &pass, 3, 3, true)
+            .unwrap());
+        storage.mark_task_vector_sync_dirty().unwrap();
+        storage.enqueue_background_task(kind, false, 300).unwrap();
+        storage
+            .mark_background_task_succeeded(kind, false, 400)
+            .unwrap();
+        let task = storage.background_scheduler_task(kind).unwrap().unwrap();
+        assert_eq!(task.status, "queued");
+        assert_eq!(task.last_completed_at_ms, None);
     }
 
     #[test]

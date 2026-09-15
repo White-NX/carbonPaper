@@ -43,6 +43,52 @@ fn row_to_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackgroundTaskState
 }
 
 impl StorageState {
+    pub(crate) fn background_backlog_ages(
+        &self,
+        now_ms: i64,
+    ) -> Result<std::collections::BTreeMap<String, i64>, String> {
+        let guard = self.get_connection_named("background_backlog_ages")?;
+        let conn = guard.as_ref().ok_or("Database not initialized")?;
+        let mut stmt = conn.prepare("SELECT task_kind,backlog_since_ms FROM background_scheduler_tasks WHERE status!='completed'").map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    now_ms.saturating_sub(row.get::<_, i64>(1)?).max(0),
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<rusqlite::Result<_>>()
+            .map_err(|e| e.to_string())
+    }
+    pub(crate) fn background_performance_history(&self) -> Result<Option<String>, String> {
+        let guard = self.get_connection_named("background_performance_history")?;
+        guard
+            .as_ref()
+            .ok_or("Database not initialized")?
+            .query_row(
+                "SELECT value FROM app_metadata WHERE key='background_performance_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn save_background_performance_history(&self, history: &str) -> Result<(), String> {
+        let guard = self.get_connection_named("save_background_performance_history")?;
+        guard
+            .as_ref()
+            .ok_or("Database not initialized")?
+            .execute(
+                "INSERT INTO app_metadata(key,value) VALUES('background_performance_v1',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [history],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn recover_background_scheduler_tasks(&self) -> Result<(), String> {
         let guard = self.get_connection_named("recover_background_scheduler_tasks")?;
         let conn = guard
@@ -153,9 +199,10 @@ impl StorageState {
             .execute(
                 r#"
             INSERT INTO background_scheduler_tasks
-                (task_kind, ready_since_ms, next_attempt_at_ms, status, manual_pending)
-            VALUES (?1, ?2, 0, 'queued', ?3)
+                (task_kind, ready_since_ms, backlog_since_ms, next_attempt_at_ms, status, manual_pending)
+            VALUES (?1, ?2, ?2, 0, 'queued', ?3)
             ON CONFLICT(task_kind) DO UPDATE SET
+                backlog_since_ms = CASE WHEN background_scheduler_tasks.status='completed' OR background_scheduler_tasks.backlog_since_ms=0 THEN excluded.backlog_since_ms ELSE background_scheduler_tasks.backlog_since_ms END,
                 manual_pending = CASE
                     WHEN excluded.manual_pending = 1 THEN 1
                     ELSE background_scheduler_tasks.manual_pending
@@ -319,13 +366,24 @@ impl StorageState {
         let conn = guard
             .as_ref()
             .ok_or_else(|| "Database not initialized".to_string())?;
+        // Producers mark vector debt before enqueueing. A notification arriving
+        // while this task is running is otherwise a no-op, so check the durable
+        // marker under the same DB lock as scheduler completion.
+        let has_more = has_more
+            || (task_kind == crate::background_scheduler::TASK_VECTOR_SYNC
+                && conn
+                    .query_row(
+                        "SELECT COALESCE((SELECT needs_rescan FROM task_vector_sync WHERE id=1),0)",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|e| e.to_string())?);
         if has_more {
             conn.execute(
                 "UPDATE background_scheduler_tasks
                  SET status = 'queued',
                      ready_since_ms = ?2, next_attempt_at_ms = 0,
                      failure_count = 0, last_error = NULL,
-                     last_completed_at_ms = ?2,
                      manual_in_flight = 0
                  WHERE task_kind = ?1",
                 params![task_kind, completed_at_ms],
@@ -502,6 +560,41 @@ mod tests {
     fn scheduler_total_change_count(storage: &StorageState) -> u64 {
         let guard = storage.db.lock().unwrap_or_else(|error| error.into_inner());
         guard.as_ref().unwrap().total_changes()
+    }
+
+    #[test]
+    fn rotation_and_pause_preserve_backlog_age_and_business_completion() {
+        let (_dir, storage) = test_storage();
+        let task = "semantic_index";
+        storage.enqueue_background_task(task, false, 100).unwrap();
+        storage
+            .mark_background_task_succeeded(task, false, 200)
+            .unwrap();
+        storage.enqueue_background_task(task, false, 1_000).unwrap();
+        storage
+            .mark_background_task_succeeded(task, true, 2_000)
+            .unwrap();
+        storage
+            .defer_background_task(task, 3_000, "foreground_request")
+            .unwrap();
+        let state = storage.background_scheduler_task(task).unwrap().unwrap();
+        assert_eq!(state.last_completed_at_ms, Some(200));
+        assert_eq!(state.failure_count, 0);
+        assert_eq!(storage.background_backlog_ages(5_000).unwrap()[task], 4_000);
+        storage.recover_background_scheduler_tasks().unwrap();
+        assert_eq!(storage.background_backlog_ages(6_000).unwrap()[task], 5_000);
+        storage
+            .mark_background_task_succeeded(task, false, 7_000)
+            .unwrap();
+        assert!(!storage
+            .background_backlog_ages(8_000)
+            .unwrap()
+            .contains_key(task));
+        storage.enqueue_background_task(task, false, 9_000).unwrap();
+        assert_eq!(
+            storage.background_backlog_ages(10_000).unwrap()[task],
+            1_000
+        );
     }
 
     #[test]

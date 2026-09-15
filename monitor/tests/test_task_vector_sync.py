@@ -13,9 +13,16 @@ class Collection:
 
     def __init__(self):
         self.rows = {"1": [1.0] + [0.0] * (EMBEDDING_DIM - 1)}
+        self.metadatas = {}
 
-    def upsert(self, ids, embeddings, **_kwargs):
+    def upsert(self, ids, embeddings, metadatas, **_kwargs):
         self.rows.update(zip(ids, embeddings))
+        self.metadatas.update(zip(ids, metadatas))
+
+    def get(self, ids, include):
+        assert include == ["metadatas"]
+        present = [sid for sid in ids if sid in self.rows]
+        return {"ids": present, "metadatas": [self.metadatas.get(sid, {}) for sid in present]}
 
 
 class Client:
@@ -58,6 +65,20 @@ def test_recreated_collection_rejects_old_cursor_before_writing():
     with pytest.raises(RuntimeError, match="collection changed"):
         manager.upsert_task_vectors([record(2)], target=old_target)
     assert set(client.collection.rows) == {"1"}
+
+
+def test_late_page_acknowledges_but_never_overwrites_a_newer_source():
+    client = Client()
+    manager = HotColdManager(client)
+    newer = {**record(2), "source_revision": 4}
+    older = {**record(2), "source_revision": 3,
+             "embedding": [0.0, 1.0] + [0.0] * (EMBEDDING_DIM - 2)}
+    assert manager.upsert_task_vectors([newer], target="collection-one") == 1
+    assert manager.upsert_task_vectors([older], target="collection-one") == 1
+    assert client.collection.rows["2"] == newer["embedding"]
+    assert client.collection.metadatas["2"]["source_revision"] == 4
+    assert manager.upsert_task_vectors([{**older, "source_revision": 5}], target="collection-one") == 1
+    assert client.collection.rows["2"] == older["embedding"]
 
 
 @pytest.mark.parametrize("command", ["get_task_vector_sync_target", "upsert_task_vectors"])

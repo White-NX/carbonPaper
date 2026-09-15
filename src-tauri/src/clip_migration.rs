@@ -562,18 +562,14 @@ async fn run_clip_migration(
 
             publish_generation(&app, &state, &mut run).await?;
 
-            // Reuse the maintenance/capture-pause window for the initial ANN
-            // generation. This reads the vectors just copied into SQLite; it
-            // does not revisit Chroma and it leaves pending Rust backfill rows
-            // as the bounded exact tail.
-            run.phase = "building_ann".to_string();
-            persist_run(&storage, &state, &mut run)?;
+            // ANN freezes its own input and resumes independently after this
+            // migration releases maintenance. Exact queries remain available.
             if let Err(error) = crate::clip_ann::bootstrap_in_maintenance(&app).await {
                 // ANN is rebuildable acceleration. A failure must not turn a
                 // successful authoritative Chroma -> SQLite migration into an
                 // endlessly repeated data copy; startup will retry bootstrap
                 // from SQLite after the migration sentinel settles.
-                tracing::warn!("[CLIP:ANN] migration-window bootstrap failed: {error}");
+                tracing::warn!("[CLIP:ANN] could not enqueue bootstrap: {error}");
             }
             Ok(())
         }

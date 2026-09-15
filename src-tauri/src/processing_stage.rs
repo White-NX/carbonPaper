@@ -1386,8 +1386,12 @@ pub(crate) async fn run_model_slice(
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     let semantic = app.state::<Arc<SemanticRuntimeState>>().inner().clone();
     let mut processed = 0u64;
-    for _ in 0..16 {
-        if crate::background_scheduler::environment_gate_reason(app, EnvironmentPolicy::IdleOnly)
+    for _ in 0..if crate::background_policy::is_background() {
+        1
+    } else {
+        16
+    } {
+        if crate::background_scheduler::environment_gate_reason(app, EnvironmentPolicy::Automatic)
             .is_some()
             || !storage.background_processing_enabled()
         {
@@ -1422,7 +1426,8 @@ pub(crate) async fn run_model_slice(
                 .await;
             }
             Err(error) => {
-                let deferred = error.starts_with("deferred:");
+                let deferred =
+                    error.starts_with("deferred:") || crate::background_policy::is_pause(&error);
                 let release_storage = storage.clone();
                 let receipt = work.receipt.clone();
                 let _ = tokio::task::spawn_blocking(move || {
@@ -1450,6 +1455,7 @@ async fn encode_staged(
     semantic: &Arc<SemanticRuntimeState>,
     work: &StagedWork,
 ) -> Result<(), String> {
+    crate::background_policy::check_current()?;
     let input = &work.input;
     let (spec, text) = match work.receipt.consumer {
         Consumer::MiniLm => {
@@ -1489,7 +1495,7 @@ async fn encode_staged(
         let _worker = crate::semantic_runtime::BACKGROUND_PASS_GUARD
             .try_lock()
             .map_err(|_| "deferred: model busy")?;
-        if crate::background_scheduler::environment_gate_reason(app, EnvironmentPolicy::IdleOnly)
+        if crate::background_scheduler::environment_gate_reason(app, EnvironmentPolicy::Automatic)
             .is_some()
         {
             return Err("deferred: user active".into());
@@ -1542,6 +1548,7 @@ async fn encode_staged(
             _ => unreachable!(),
         }
         storage.processing_stage.check_receipt(&work.receipt)?;
+        crate::background_policy::check_current()?;
         storage.commit_staged_embedding(
             &crate::storage::DerivedEmbeddingWrite {
                 job: spec.clone(),
@@ -1555,6 +1562,9 @@ async fn encode_staged(
     .await;
     match result {
         Ok(vector) => {
+            if work.receipt.consumer == Consumer::Clip {
+                let _ = crate::clip_ann::maybe_rebuild(app, false).await;
+            }
             if work.receipt.consumer == Consumer::MiniLm {
                 crate::minilm_index::mirror_staged_result(
                     app,

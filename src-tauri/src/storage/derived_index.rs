@@ -25,6 +25,14 @@ const SIDECAR_PAGE_SIZE: u32 = 512;
 const LEASE_TOKEN_BYTES: usize = 16;
 pub const DERIVED_GENERATION_CANCELLED: &str = "DERIVED_GENERATION_CANCELLED";
 
+#[derive(Default)]
+struct EmbeddingCommitContext<'a> {
+    receipt: Option<&'a crate::processing_stage::TaskReceipt>,
+    generation: Option<u64>,
+    revisions: &'a [(i64, Option<i64>)],
+    execution: Option<&'a crate::background_policy::ExecutionLease>,
+}
+
 fn sqlite_i64(value: u64, field: &str) -> Result<i64, String> {
     i64::try_from(value).map_err(|_| format!("{field} exceeds SQLite INTEGER range: {value}"))
 }
@@ -282,6 +290,21 @@ struct DerivedWorkerJobUpdate<'a> {
 }
 
 impl StorageState {
+    pub(crate) fn clip_input_pixels(&self, hash: &str) -> Result<Option<u64>, String> {
+        let guard = self.get_connection_named("clip_input_pixels")?;
+        guard
+            .as_ref()
+            .ok_or("Database not initialized")?
+            .query_row(
+                "SELECT CAST(width AS INTEGER)*CAST(height AS INTEGER) FROM screenshots
+             WHERE image_hash=?1 AND is_deleted=0 AND width>0 AND height>0 LIMIT 1",
+                [hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|pixels| pixels.and_then(|p| u64::try_from(p).ok()))
+            .map_err(|e| e.to_string())
+    }
     /// Ensure one subject has a ledger entry without reviving a current result.
     /// A changed model/source contract queues fresh work; a matching completed
     /// result is always reused so migration cannot accidentally recompute it.
@@ -705,7 +728,25 @@ impl StorageState {
     /// If either write fails, the transaction rolls back and no partial vector
     /// becomes query-visible.
     pub fn commit_derived_embedding(&self, write: &DerivedEmbeddingWrite) -> Result<(), String> {
-        self.commit_derived_embedding_with_receipt(write, None)
+        self.commit_derived_embedding_with_receipt(write, EmbeddingCommitContext::default())
+    }
+
+    pub(crate) fn commit_archive_embedding(
+        &self,
+        write: &DerivedEmbeddingWrite,
+        generation: u64,
+        revisions: &[(i64, Option<i64>)],
+        execution: Option<&crate::background_policy::ExecutionLease>,
+    ) -> Result<(), String> {
+        self.commit_derived_embedding_with_receipt(
+            write,
+            EmbeddingCommitContext {
+                generation: Some(generation),
+                revisions,
+                execution,
+                ..Default::default()
+            },
+        )
     }
 
     pub(crate) fn commit_staged_embedding(
@@ -724,14 +765,23 @@ impl StorageState {
         {
             return Err("Staged embedding scope mismatch".into());
         }
-        self.commit_derived_embedding_with_receipt(write, Some(receipt))
+        let execution = crate::background_policy::current_execution();
+        self.commit_derived_embedding_with_receipt(
+            write,
+            EmbeddingCommitContext {
+                receipt: Some(receipt),
+                execution: execution.as_deref(),
+                ..Default::default()
+            },
+        )
     }
 
     fn commit_derived_embedding_with_receipt(
         &self,
         write: &DerivedEmbeddingWrite,
-        receipt: Option<&crate::processing_stage::TaskReceipt>,
+        context: EmbeddingCommitContext<'_>,
     ) -> Result<(), String> {
+        let receipt = context.receipt;
         validate_job_spec(&write.job)?;
         validate_required_text("lease_token", &write.lease_token, MAX_METADATA_BYTES)?;
         let vector_blob = encode_vector(&write.vector)?;
@@ -739,6 +789,30 @@ impl StorageState {
             .map_err(|_| "Derived embedding dimensions exceed SQLite range".to_string())?;
         let mut guard = self.get_connection_named("commit_derived_embedding")?;
         let conn = guard.as_mut().ok_or("Database not initialized")?;
+        if let Some(execution) = context.execution {
+            execution.check()?;
+        }
+        if context
+            .generation
+            .is_some_and(|g| g != self.db_generation())
+        {
+            return Err("background_paused: embedding database changed".into());
+        }
+        for (id, expected) in context.revisions {
+            let current: Option<i64> = conn
+                .query_row(
+                    "SELECT COALESCE(r.revision,0) FROM screenshots s
+                 LEFT JOIN screenshot_processing_revisions r ON r.screenshot_id=s.id
+                 WHERE s.id=?1 AND s.is_deleted=0",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if current != *expected {
+                return Err("background_paused: embedding source changed".into());
+            }
+        }
         // Sampled before the write so the resident cache can tell "I was
         // current and this is my delta" from "I already missed something".
         let epoch_before = Some(read_derived_data_epoch(conn, write.job.index_kind)?);
@@ -827,6 +901,9 @@ impl StorageState {
             if Self::record_staged_receipt_on_conn(&tx, receipt)? {
                 Self::enqueue_staged_semantic_completion_on_conn(&tx, receipt)?;
             }
+        }
+        if let Some(execution) = context.execution {
+            execution.check()?;
         }
         tx.commit()
             .map_err(|error| format!("Failed to commit derived embedding: {error}"))?;
@@ -2431,37 +2508,9 @@ impl StorageState {
         })
     }
 
-    /// Read one raw-vector page using a short-lived independent connection.
-    /// Background ANN rebuilds use this form so the rollback-journal SHARED
-    /// lock is released between pages; maintenance bootstrap uses the
-    /// single-connection stream below because capture and derived writes are
-    /// paused for that window.
-    pub(crate) fn list_query_visible_ann_snapshot_page_for_ann(
-        &self,
-        index_kind: DerivedIndexKind,
-        after_subject_key: Option<&str>,
-        limit: u32,
-    ) -> Result<Vec<DerivedAnnSnapshotRow>, String> {
-        self.with_vector_scan_connection("list_query_visible_ann_snapshot_page_for_ann", |conn| {
-            list_query_visible_ann_snapshot_page_from_conn(
-                conn,
-                index_kind,
-                after_subject_key,
-                limit,
-            )
-        })
-    }
-
-    /// Stream the query-visible embedding snapshot through one independent
-    /// read connection. The callback is invoked once per keyset-paginated
-    /// page, so callers can write/process a page before the next one is
-    /// materialized without repeatedly opening and keying SQLCipher.
-    ///
-    /// SQLite remains authoritative; this streams the same query-visible set
-    /// used by the exact scorer. Callers that need a
-    /// stable point-in-time view must hold their own maintenance boundary (the
-    /// ANN bootstrap does); ordinary background rebuilds still verify the row
-    /// count and publication epoch before committing the generation.
+    /// Test oracle for paged ANN input visibility. Production builds freeze
+    /// each page and its cursor in the resumable builder's short transaction.
+    #[cfg(test)]
     pub(crate) fn for_each_query_visible_embedding_page_for_ann(
         &self,
         index_kind: DerivedIndexKind,
@@ -2732,6 +2781,7 @@ fn list_query_visible_embedding_page_from_conn(
     .collect()
 }
 
+#[cfg(test)]
 fn list_query_visible_ann_snapshot_page_from_conn(
     conn: &rusqlite::Connection,
     index_kind: DerivedIndexKind,
@@ -3506,6 +3556,259 @@ mod tests {
             read_derived_data_epoch(guard.as_ref().unwrap(), DerivedIndexKind::ClipImage).unwrap(),
         )
         .unwrap()
+    }
+
+    fn ann_checkpoint(storage: &StorageState, generation: u64) -> super::super::AnnBuildCheckpoint {
+        super::super::AnnBuildCheckpoint {
+            runtime_generation: Some(storage.db_generation()),
+            generation,
+            dataset_id: storage.processing_dataset_id().unwrap(),
+            model_fingerprint: "revision-1".into(),
+            covered_epoch: current_epoch(storage),
+            scan_upper: String::new(),
+            scan_cursor: String::new(),
+            expected_rows: 3,
+            frozen_rows: 0,
+            key_bytes: 0,
+            phase: "freeze".into(),
+            materialized_rows: 0,
+            materialized_key_bytes: 0,
+            flat_checksum: None,
+            graph_bytes: 0,
+            complete: None,
+            previous: None,
+            copy_offset: 0,
+        }
+    }
+
+    fn ann_vector(axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0; 512];
+        v[axis] = 1.0;
+        v
+    }
+
+    #[test]
+    fn archive_embedding_commit_cancels_without_spending_attempts_or_replacing_new_sources() {
+        let (_temp, storage) = test_storage();
+        let spec = job(DerivedIndexKind::SemanticText, "901");
+        let lease_token = queue_and_claim(&storage, &spec);
+        let generation = storage.db_generation();
+        let revisions = storage
+            .archive_scoring_source_revisions(generation, &[901])
+            .unwrap();
+        let write = DerivedEmbeddingWrite {
+            job: spec.clone(),
+            lease_token: lease_token.clone(),
+            vector: vec![1.0, 0.0],
+        };
+        let execution = crate::background_policy::ExecutionLease::new(
+            "semantic_index",
+            crate::background_policy::ExecutionProfile::Background,
+            20,
+        );
+        execution.revoke("input_resumed");
+        assert!(storage
+            .commit_archive_embedding(&write, generation, &revisions, Some(&execution))
+            .unwrap_err()
+            .contains("input_resumed"));
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute(
+                "INSERT INTO screenshot_processing_revisions(screenshot_id,revision) VALUES(901,99)
+             ON CONFLICT(screenshot_id) DO UPDATE SET revision=99",
+                [],
+            )
+            .unwrap();
+        assert!(storage
+            .commit_archive_embedding(&write, generation, &revisions, None)
+            .unwrap_err()
+            .contains("source changed"));
+        storage.bump_db_generation();
+        assert!(storage
+            .commit_archive_embedding(&write, generation, &[], None)
+            .unwrap_err()
+            .contains("database changed"));
+        storage
+            .requeue_derived_index_job(&spec, &lease_token, "paused", "try next pass")
+            .unwrap();
+        let row = storage
+            .get_derived_index_job(DerivedIndexKind::SemanticText, "901")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.status, DerivedIndexJobStatus::Pending);
+        assert!(storage
+            .get_query_visible_embedding(DerivedIndexKind::SemanticText, "901")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_committed_vector_marks_rescan_even_before_the_scheduler_wakes() {
+        let (_temp, storage) = test_storage();
+        let pass = storage
+            .begin_task_vector_sync(0, "recent", "test", 0.0, 2_000_000_000.0)
+            .unwrap();
+        storage
+            .acknowledge_task_vector_sync(0, &pass, pass.upper_id, 0, true)
+            .unwrap();
+        assert!(!storage.task_vector_sync_pending().unwrap());
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::SemanticText, "902"),
+            vec![1.0, 0.0],
+        )
+        .unwrap();
+        assert!(storage.task_vector_sync_pending().unwrap());
+        let resumed = storage
+            .begin_task_vector_sync(0, "recent", "test", 0.0, 2_000_000_000.0)
+            .unwrap();
+        assert_eq!(resumed.cursor, 0);
+        assert_eq!(resumed.upper_id, 902);
+    }
+
+    #[test]
+    fn ann_generation_zero_is_a_real_fence_and_stale_builds_cannot_write() {
+        let (_temp, storage) = test_storage();
+        let mut state = ann_checkpoint(&storage, 78);
+        assert_eq!(state.runtime_generation, Some(0));
+        storage.begin_ann_build(&mut state).unwrap();
+        storage.bump_db_generation();
+        assert!(storage
+            .save_ann_build_checkpoint(&state)
+            .unwrap_err()
+            .contains("generation changed"));
+        assert!(storage
+            .freeze_ann_page(&mut state, 1)
+            .unwrap_err()
+            .contains("generation changed"));
+        assert!(storage
+            .cleanup_ann_inputs(&state)
+            .unwrap_err()
+            .contains("generation changed"));
+        // The runtime token is refreshed only after reading a durable state in
+        // the new process; it is intentionally absent from the serialized form.
+        let restored = storage.ann_build_checkpoint().unwrap().unwrap();
+        assert_eq!(restored.runtime_generation, None);
+    }
+
+    #[test]
+    fn resumed_ann_freezing_keeps_its_bound_and_concurrent_changes_in_the_tail() {
+        let (_temp, storage) = test_storage();
+        for key in ["a", "c", "z"] {
+            commit_vector(
+                &storage,
+                job(DerivedIndexKind::ClipImage, key),
+                ann_vector(0),
+            )
+            .unwrap();
+        }
+        let mut state = ann_checkpoint(&storage, 77);
+        storage.begin_ann_build(&mut state).unwrap();
+        storage.freeze_ann_page(&mut state, 1).unwrap();
+        assert_eq!(state.scan_cursor, "a");
+        let covered = state.covered_epoch;
+        let mut changed = job(DerivedIndexKind::ClipImage, "a");
+        changed.source_fingerprint = "new a".into();
+        commit_vector(&storage, changed, ann_vector(1)).unwrap();
+        storage
+            .delete_derived_index_subject(DerivedIndexKind::ClipImage, "c")
+            .unwrap();
+        for key in ["b", "zz"] {
+            commit_vector(
+                &storage,
+                job(DerivedIndexKind::ClipImage, key),
+                ann_vector(2),
+            )
+            .unwrap();
+        }
+        state = storage.ann_build_checkpoint().unwrap().unwrap();
+        while state.phase == "freeze" {
+            storage.freeze_ann_page(&mut state, 1).unwrap();
+        }
+        let rows = storage.frozen_ann_page(&state, 0, 10).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.subject_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "z"]
+        );
+        assert_eq!(rows[0].vector_f32[..4], 1.0f32.to_le_bytes());
+        let mut manifest = ann_manifest(covered);
+        manifest.dimensions = 512;
+        manifest.row_count = state.frozen_rows;
+        storage.record_derived_ann_generation(&manifest).unwrap();
+        let tail = storage
+            .list_derived_ann_tail(DerivedIndexKind::ClipImage, covered, 100)
+            .unwrap();
+        assert!(tail
+            .iter()
+            .any(|row| row.subject_key == "zz" && row.vector.is_some()));
+        assert!(tail
+            .iter()
+            .any(|row| row.subject_key == "c" && row.vector.is_none()));
+        assert_eq!(
+            tail.iter()
+                .find(|row| row.subject_key == "a")
+                .unwrap()
+                .vector
+                .as_ref()
+                .unwrap()[1],
+            1.0
+        );
+    }
+
+    #[test]
+    fn ann_frozen_pages_survive_connection_restart_and_reject_a_replaced_dataset() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("ann-checkpoint.db");
+        let open = || {
+            let credential = Arc::new(CredentialManagerState::new(directory.path().to_path_buf()));
+            let storage = StorageState::new(directory.path().to_path_buf(), credential);
+            let connection = Connection::open(&database).unwrap();
+            storage.init_tables(&connection).unwrap();
+            *storage.db.lock().unwrap() = Some(connection);
+            storage
+        };
+        let storage = open();
+        commit_vector(
+            &storage,
+            job(DerivedIndexKind::ClipImage, "a"),
+            ann_vector(0),
+        )
+        .unwrap();
+        let mut state = ann_checkpoint(&storage, 42);
+        storage.begin_ann_build(&mut state).unwrap();
+        storage.freeze_ann_page(&mut state, 1).unwrap();
+        drop(storage);
+        let storage = open();
+        let restored = storage.ann_build_checkpoint().unwrap().unwrap();
+        assert_eq!(restored.scan_cursor, "a");
+        assert_eq!(restored.frozen_rows, 1);
+        assert_eq!(storage.frozen_ann_page(&restored, 0, 1).unwrap().len(), 1);
+        storage
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute(
+                "UPDATE app_metadata SET value='new-dataset' WHERE key='app_bound_dataset_id'",
+                [],
+            )
+            .unwrap();
+        assert!(storage
+            .save_ann_build_checkpoint(&restored)
+            .unwrap_err()
+            .contains("database changed"));
+        assert!(storage
+            .frozen_ann_page(&restored, 0, 1)
+            .unwrap_err()
+            .contains("database changed"));
     }
 
     #[test]

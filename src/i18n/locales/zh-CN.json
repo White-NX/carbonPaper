@@ -311,7 +311,17 @@
           "disabled": "任务分组已关闭",
           "organizing": "正在整理",
           "preparing": "正在准备记录"
-        }
+        },
+        "diagnostics": "调度诊断",
+        "profile": "执行档",
+        "waitReason": "等待原因",
+        "pauses": "暂停次数",
+        "yieldLatency": "最近退让耗时",
+        "task": "任务",
+        "eligible": "使用期间处理",
+        "backlogAge": "积压时间",
+        "verified": "已验证",
+        "pendingEvaluation": "等待评估"
       },
       "clustering": {
         "title": "任务聚类",
@@ -923,6 +933,14 @@
           "ocr": "文字识别 (OCR)",
           "legacy_ocr_cache": "旧版 OCR 缓存"
         }
+      },
+      "backgroundTiming": {
+        "title": "后台处理时机",
+        "auto": "自动",
+        "idleOnly": "仅空闲",
+        "autoDescription": "接通电源时，根据电脑的可用资源自动整理记录。",
+        "idleDescription": "接通电源且停止操作一分钟后，开始整理记录。",
+        "saveError": "保存失败，请重试。"
       }
     }
   },

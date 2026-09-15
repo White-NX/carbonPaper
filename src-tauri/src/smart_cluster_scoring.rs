@@ -500,6 +500,17 @@ pub async fn run_scheduled_slice(
     .map_err(|error| format!("smart cluster backlog task failed: {error}"))??
     .max(0) as u64;
     let initial_pending = if manual { pending_before } else { 0 };
+    let targets = storage.list_smart_cluster_scoring_targets()?;
+    let measurement = app
+        .state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        .inner()
+        .clone()
+        .unit(
+            "scoring_unit",
+            &ScorerIdentity::current().fingerprint(),
+            targets.len() as u64,
+            "one-screenshot:all-clusters",
+        )?;
     state.running.store(true, Ordering::SeqCst);
     state.force_running.store(manual, Ordering::SeqCst);
     if manual {
@@ -508,6 +519,11 @@ pub async fn run_scheduled_slice(
         state.emit_progress(app);
     }
     let mut result = run_pass(app, &state, manual).await;
+    if result.as_ref().is_ok_and(|processed| *processed > 0) {
+        if let Some(measurement) = measurement {
+            measurement.complete();
+        }
+    }
     state.running.store(false, Ordering::SeqCst);
     state.force_running.store(false, Ordering::SeqCst);
     let storage = app.state::<Arc<StorageState>>().inner().clone();
@@ -581,7 +597,7 @@ fn may_run(app: &AppHandle, forced: bool) -> bool {
         && crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false)
         && crate::background_scheduler::environment_gate_reason(
             app,
-            crate::background_scheduler::EnvironmentPolicy::IdleOnly,
+            crate::background_scheduler::EnvironmentPolicy::Automatic,
         )
         .is_none()
 }
@@ -605,6 +621,11 @@ fn stand_down_reason(
     state: &Arc<SmartClusterWorkerState>,
     forced: bool,
 ) -> Option<&'static str> {
+    if let Some(reason) =
+        crate::background_policy::current_execution().and_then(|lease| lease.reason())
+    {
+        return Some(reason);
+    }
     if forced && state.aborted() {
         return Some(STOP_REQUESTED);
     }
@@ -787,7 +808,7 @@ async fn run_pass(
     // would land *behind* the query it was meant to help and then free the
     // MiniLM session that query had just paid to load. The next pass is a
     // minute away and will release it then.
-    if scored_anything && !semantic.foreground_waiting() && reranker_is_resident(app) {
+    if scored_anything && forced && !semantic.foreground_waiting() && reranker_is_resident(app) {
         if let Err(error) = semantic.unload_model(app.clone()).await {
             tracing::debug!("[SMART_CLUSTER] reranker unload after the pass failed: {error}");
         }
@@ -859,6 +880,7 @@ async fn run_batch(
     if !storage.is_silent_read_authorized() {
         return Ok(BatchProgress::stopped("waiting_for_unlock"));
     }
+    let generation = storage.db_generation();
     let read = {
         let storage = storage.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<BatchInputs>, String> {
@@ -867,7 +889,11 @@ async fn run_batch(
                 return Ok(None);
             }
             let targets = storage.list_smart_cluster_scoring_targets()?;
-            let batch_size = batch_size_for(forced, targets.len());
+            let batch_size = if forced {
+                batch_size_for(true, targets.len())
+            } else {
+                1
+            };
             let ids = storage.peek_smart_cluster_pending_batch(batch_size)?;
             if ids.is_empty() {
                 return Ok(None);
@@ -920,6 +946,7 @@ async fn run_batch(
         return Err(error);
     }
     let targets = resolution.usable;
+    let scoring_configuration = resolution.configuration;
     if targets.is_empty() {
         // Every enabled cluster has been given up on: its saved examples cannot
         // produce a threshold under this scorer, and nothing but a
@@ -930,7 +957,17 @@ async fn run_batch(
         // and a pass that wakes to re-discover the same verdict every minute.
         // The warning banner keeps saying which clusters need attention, and a
         // rescan re-enqueues the window once they have it.
-        let (deleted, remaining) = commit_pending(app, state, storage, &inputs.ids, forced).await?;
+        let revisions = storage.archive_scoring_source_revisions(generation, &inputs.ids)?;
+        let (deleted, remaining) = commit_pending(
+            app,
+            state,
+            storage,
+            generation,
+            revisions,
+            scoring_configuration,
+            forced,
+        )
+        .await?;
         if deleted > 0 {
             crate::background_activity::index_progress(deleted);
         }
@@ -962,6 +999,8 @@ async fn run_batch(
     let mut deleted = 0u64;
     let mut interrupted: Option<&'static str> = None;
     for group in inputs.ids.chunks(group_size) {
+        let revisions = storage.archive_scoring_source_revisions(generation, group)?;
+        let mut group_assignments = Vec::new();
         if let Some(reason) = stand_down_reason(app, state, forced) {
             tracing::debug!("[SMART_CLUSTER] leaving the batch before a commit group: {reason}");
             interrupted = Some(reason);
@@ -971,7 +1010,16 @@ async fn run_batch(
         if documents.is_empty() {
             // Every snapshot in this group was deleted between enqueue and now;
             // the queue entries have nothing left to describe.
-            let (committed, _) = commit_pending(app, state, storage.clone(), group, forced).await?;
+            let (committed, _) = commit_pending(
+                app,
+                state,
+                storage.clone(),
+                generation,
+                revisions,
+                scoring_configuration.clone(),
+                forced,
+            )
+            .await?;
             if committed > 0 {
                 crate::background_activity::index_progress(committed);
                 deleted = deleted.saturating_add(committed);
@@ -981,12 +1029,8 @@ async fn run_batch(
         let vectors = load_prefilter_vectors(storage.clone(), documents.keys().copied()).await?;
 
         for target in &targets {
-            // Checked before every cross-encoder call rather than once per
-            // group, because one call is the granularity at which this pass can
-            // actually be stopped: the request cannot be interrupted once it is
-            // submitted. Whatever was already assigned stands and every group
-            // committed before this one stays committed; only this group is
-            // scored again next pass.
+            // Requests can be cancelled in flight. Completed groups stay
+            // committed; an interrupted group is scored again on the next pass.
             if let Some(reason) = stand_down_reason(app, state, forced) {
                 tracing::debug!("[SMART_CLUSTER] leaving the batch between clusters: {reason}");
                 interrupted = Some(reason);
@@ -1027,30 +1071,48 @@ async fn run_batch(
                     break;
                 }
                 Err(error) => {
-                    // Assignments already written for earlier targets are
-                    // harmless upserts. Keep this whole group queued so the
-                    // failed target is never skipped when the retry succeeds.
+                    // Keep this whole group queued so the failed target is
+                    // never skipped when the retry succeeds.
                     return Err(format!(
                         "rerank_failed: cluster {} could not score its pending snapshots: {error}",
                         target.id
                     ));
                 }
             };
-            let recorded =
-                record_assignments(storage.clone(), target, &candidates, &scores).await?;
-            if recorded > 0 {
-                // Published as it happens rather than at the end of the batch,
-                // so an interrupted pass reports the work it actually did.
-                state.assigned_total.fetch_add(recorded, Ordering::SeqCst);
-                assigned += recorded;
-            }
+            group_assignments.extend(
+                matching_scores(target, &candidates, &scores)?
+                    .into_iter()
+                    .map(|(id, score)| (target.id, id, score)),
+            );
         }
         if interrupted.is_some() {
             // Committed groups stay committed; this one is scored again next
             // pass, which is the whole of what standing down now costs.
             break;
         }
-        let (committed, _) = commit_pending(app, state, storage.clone(), group, forced).await?;
+        crate::background_policy::check_current()?;
+        if stand_down_reason(app, state, forced).is_some() {
+            return Err("background_paused: scoring pass stopped".into());
+        }
+        let write_storage = storage.clone();
+        let configuration = scoring_configuration.clone();
+        let execution = crate::background_policy::current_execution();
+        let (committed, recorded) = tokio::task::spawn_blocking(move || {
+            if let Some(lease) = &execution {
+                lease.check()?;
+            }
+            write_storage.commit_archive_scoring_group(
+                generation,
+                &revisions,
+                &configuration,
+                &group_assignments,
+                execution.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        state.assigned_total.fetch_add(recorded, Ordering::SeqCst);
+        assigned += recorded;
         if committed > 0 {
             crate::background_activity::index_progress(committed);
             deleted = deleted.saturating_add(committed);
@@ -1113,6 +1175,9 @@ fn batch_size_for(forced: bool, cluster_count: usize) -> i64 {
 
 /// What one pass over the enabled clusters concluded about their thresholds.
 struct ThresholdResolution {
+    /// All enabled configurations, including unavailable targets, after this
+    /// pass's own threshold updates. The commit compares this exact snapshot.
+    configuration: Vec<SmartClusterScoringTarget>,
     /// Clusters that may be scored this pass.
     usable: Vec<SmartClusterScoringTarget>,
     /// Enabled clusters that will not be scored, for the status banner.
@@ -1155,6 +1220,7 @@ async fn resolve_thresholds(
 ) -> ThresholdResolution {
     let fingerprint = scorer.fingerprint();
     let mut resolution = ThresholdResolution {
+        configuration: Vec::with_capacity(targets.len()),
         usable: Vec::with_capacity(targets.len()),
         unverifiable: 0,
         retry_error: None,
@@ -1167,6 +1233,7 @@ async fn resolve_thresholds(
             Some(&target.scorer.variant),
             Some(&target.scorer.provider),
         ) {
+            resolution.configuration.push(target.clone());
             resolution.usable.push(target);
             continue;
         }
@@ -1175,7 +1242,15 @@ async fn resolve_thresholds(
             // examples cannot produce a threshold under this scorer. Re-asking
             // would load the cross-encoder to reach the same answer.
             resolution.unverifiable += 1;
+            resolution.configuration.push(target);
             continue;
+        }
+        if crate::background_policy::is_background() {
+            if let Some(lease) = crate::background_policy::current_execution() {
+                lease.revoke("waiting_for_idle");
+            }
+            resolution.interrupted = Some("waiting_for_idle");
+            return resolution;
         }
         if let Some(reason) = stand_down_reason(app, state, forced) {
             tracing::debug!(
@@ -1201,6 +1276,7 @@ async fn resolve_thresholds(
                 };
                 target.scorer_recorded = true;
                 target.rederive_failed_scorer = None;
+                resolution.configuration.push(target.clone());
                 resolution.usable.push(target);
             }
             Ok(None) => {
@@ -1209,17 +1285,19 @@ async fn resolve_thresholds(
                     "[SMART_CLUSTER] cluster {} has no usable calibration examples; giving up on its threshold until it is recalibrated",
                     target.id
                 );
-                if let Err(error) =
-                    mark_unverifiable(storage.clone(), target.id, fingerprint.clone()).await
-                {
-                    // The verdict is a cost optimization, not a correctness
-                    // requirement: without it the cluster is simply re-examined
-                    // next pass. Worth a line in the log, not a failed pass.
-                    tracing::warn!(
+                match mark_unverifiable(storage.clone(), target.id, fingerprint.clone()).await {
+                    Ok(()) => target.rederive_failed_scorer = Some(fingerprint.clone()),
+                    Err(error) => {
+                        // The verdict is a cost optimization, not a correctness
+                        // requirement: without it the cluster is simply re-examined
+                        // next pass. Worth a line in the log, not a failed pass.
+                        tracing::warn!(
                         "[SMART_CLUSTER] could not record the unverifiable verdict for cluster {}: {error}",
                         target.id
                     );
+                    }
                 }
+                resolution.configuration.push(target);
             }
             Err(error) if crate::rerank::is_yield(&error) => {
                 // A foreground query took the worker before this cluster was
@@ -1507,6 +1585,7 @@ async fn embed_anchors(
     }
 
     for chunk in cold.chunks(crate::ml_protocol::MAX_SEMANTIC_BATCH) {
+        crate::background_policy::check_current()?;
         let texts: Vec<String> = chunk.iter().map(|(_, text, _)| text.clone()).collect();
         let embedded = semantic
             .embed_text(
@@ -1525,6 +1604,7 @@ async fn embed_anchors(
             ));
         }
         for ((id, _, hash), vector) in chunk.iter().zip(embedded.vectors) {
+            crate::background_policy::check_current()?;
             let write = {
                 let storage = storage.clone();
                 let vector = vector.clone();
@@ -1586,36 +1666,6 @@ fn cosine(left: &[f32], right: &[f32]) -> f32 {
     left.iter().zip(right).map(|(a, b)| a * b).sum::<f32>()
 }
 
-async fn record_assignments(
-    storage: Arc<StorageState>,
-    target: &SmartClusterScoringTarget,
-    candidates: &[i64],
-    scores: &[f32],
-) -> Result<u64, String> {
-    let cluster_id = target.id;
-    let matches = matching_scores(target, candidates, scores)?;
-    if matches.is_empty() {
-        return Ok(0);
-    }
-    tokio::task::spawn_blocking(move || -> Result<u64, String> {
-        let mut recorded = 0u64;
-        for (screenshot_id, score) in matches {
-            storage
-                .record_smart_cluster_assignment(cluster_id, screenshot_id, score)
-                .map_err(|error| {
-                    format!(
-                        "assignment_write_failed: failed to record assignment \
-                         {cluster_id}/{screenshot_id}: {error}"
-                    )
-                })?;
-            recorded += 1;
-        }
-        Ok(recorded)
-    })
-    .await
-    .map_err(|error| format!("assignment write task failed: {error}"))?
-}
-
 fn matching_scores(
     target: &SmartClusterScoringTarget,
     candidates: &[i64],
@@ -1633,25 +1683,30 @@ fn matching_scores(
         .collect())
 }
 
-async fn delete_pending(storage: Arc<StorageState>, ids: &[i64]) -> Result<(u64, u64), String> {
-    let ids = ids.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let deleted = storage.delete_smart_cluster_pending_ids_count(&ids)? as u64;
-        let remaining = storage.count_smart_cluster_pending()?.max(0) as u64;
-        Ok((deleted, remaining))
-    })
-    .await
-    .map_err(|error| format!("pending delete task failed: {error}"))?
-}
-
 async fn commit_pending(
     app: &AppHandle,
     state: &Arc<SmartClusterWorkerState>,
     storage: Arc<StorageState>,
-    ids: &[i64],
+    generation: u64,
+    revisions: Vec<(i64, Option<i64>)>,
+    configuration: Vec<SmartClusterScoringTarget>,
     forced: bool,
 ) -> Result<(u64, u64), String> {
-    let (deleted, remaining) = delete_pending(storage, ids).await?;
+    crate::background_policy::check_current()?;
+    let execution = crate::background_policy::current_execution();
+    let (deleted, remaining) = tokio::task::spawn_blocking(move || {
+        let (deleted, _) = storage.commit_archive_scoring_group(
+            generation,
+            &revisions,
+            &configuration,
+            &[],
+            execution.as_deref(),
+        )?;
+        let remaining = storage.count_smart_cluster_pending()?.max(0) as u64;
+        Ok::<_, String>((deleted, remaining))
+    })
+    .await
+    .map_err(|error| format!("pending commit task failed: {error}"))??;
     if forced {
         state.report_processed(deleted, remaining);
         state.emit_progress(app);
@@ -2157,6 +2212,7 @@ mod tests {
         // view of those screenshots — and unlike a skipped batch, nothing would
         // ever bring them back.
         let complete = ThresholdResolution {
+            configuration: Vec::new(),
             usable: vec![legacy_target(1, None)],
             unverifiable: 0,
             retry_error: None,
@@ -2165,6 +2221,7 @@ mod tests {
         assert!(complete.interrupted.is_none());
 
         let stopped_early = ThresholdResolution {
+            configuration: Vec::new(),
             usable: vec![legacy_target(1, None)],
             unverifiable: 0,
             retry_error: None,

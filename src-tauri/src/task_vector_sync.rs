@@ -137,9 +137,12 @@ impl Drop for ClusteringRun {
 }
 
 pub(crate) fn schedule_repair(app: &AppHandle) {
+    if let Some(storage) = app.try_state::<Arc<StorageState>>() {
+        let _ = storage.mark_task_vector_sync_dirty();
+    }
     if let Some(scheduler) = app.try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
     {
-        if let Err(error) = scheduler.enqueue(app, BackgroundTaskKind::PythonClustering, false) {
+        if let Err(error) = scheduler.enqueue(app, BackgroundTaskKind::TaskVectorSync, false) {
             tracing::warn!("Could not schedule task vector repair: {error}");
         }
     }
@@ -159,6 +162,7 @@ fn check_access(
     generation: u64,
     manual: bool,
 ) -> Result<(), String> {
+    crate::background_policy::check_current()?;
     crate::maintenance::guard()?;
     if !background_scheduler::task_feature_enabled(BackgroundTaskKind::PythonClustering, manual) {
         return Err("disabled".into());
@@ -169,22 +173,78 @@ fn check_access(
     if let Some(reason) = background_scheduler::gate_reason_for_kind(
         app,
         manual,
-        BackgroundTaskKind::PythonClustering,
+        if crate::background_policy::current_execution()
+            .is_some_and(|lease| lease.task == background_scheduler::TASK_VECTOR_SYNC)
+        {
+            BackgroundTaskKind::TaskVectorSync
+        } else {
+            BackgroundTaskKind::PythonClustering
+        },
     ) {
-        return Err(reason.into());
+        return Err(format!("background_paused: {reason}"));
     }
     Ok(())
 }
 
 async fn request(app: &AppHandle, mut payload: Value, manual: bool) -> Result<Value, String> {
+    crate::background_policy::check_current()?;
     payload["background"] = json!(!manual);
     let monitor = app.state::<crate::monitor::MonitorState>();
+    let lease = crate::background_policy::current_execution();
+    let scheduler = app.state::<Arc<background_scheduler::BackgroundSchedulerState>>();
+    let key = lease.as_ref().map(|lease| {
+        crate::background_policy::CostKey::new(
+            &lease.task,
+            payload
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("vector_sync"),
+            crate::semantic_models::expected_model_fingerprint(MlSemanticModel::MinilmL12),
+            payload.to_string().len() as u64,
+            "one-record:source-revision:python-cpu5:v2",
+        )
+    });
+    if let Some(key) = &key {
+        scheduler.admit_operation(key, false, false)?;
+    }
+    let usage = || {
+        use std::os::windows::io::AsRawHandle;
+        monitor
+            .process
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|child| {
+                crate::background_resources::process_usage(windows::Win32::Foundation::HANDLE(
+                    child.as_raw_handle(),
+                ))
+            })
+    };
+    let before = usage();
+    let started = Instant::now();
     let response = crate::monitor::forward_command_to_python(&monitor, payload).await?;
+    crate::background_policy::check_current()?;
     if let Some(error) = response.get("error").and_then(Value::as_str) {
         return Err(error.into());
     }
     if response.get("status").and_then(Value::as_str) != Some("success") {
         return Err("invalid task vector synchronization response".into());
+    }
+    if let (Some(key), Some(lease), Some(before), Some(after)) = (key, lease, before, usage()) {
+        lease.account_cpu((after.cpu_ms - before.cpu_ms).max(0.0));
+        scheduler.record_cost(
+            key,
+            crate::background_policy::CostSample {
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                cpu_ms: (after.cpu_ms - before.cpu_ms).max(0.0),
+                peak_private_bytes: after.peak_since(Some(before)).max(before.private_bytes),
+                additional_peak_bytes: after
+                    .peak_since(Some(before))
+                    .saturating_sub(before.private_bytes),
+                cpu_rate_percent: crate::background_policy::CPU_RATE_PERCENT,
+            },
+            lease.profile,
+        );
     }
     Ok(response)
 }
@@ -247,9 +307,23 @@ pub(crate) async fn synchronize(
                 .start_time
                 .max(chrono::Utc::now().timestamp() as f64 - 30.0 * 86400.0);
         }
-        let ids = storage.task_vector_sync_page(generation, &selection, PAGE_SIZE)?;
+        let ids = storage.task_vector_sync_page(
+            generation,
+            &selection,
+            if manual { PAGE_SIZE } else { 1 },
+        )?;
         if ids.is_empty() {
-            storage.acknowledge_task_vector_sync(generation, &state, state.upper_id, 0, true)?;
+            let changed_during_pass = storage.acknowledge_task_vector_sync(
+                generation,
+                &state,
+                state.upper_id,
+                0,
+                true,
+            )?;
+            if changed_during_pass {
+                progress.finish(ClusteringPhase::Paused);
+                return Ok(SyncOutcome::More);
+            }
             progress.phase(ClusteringPhase::Clustering);
             return Ok(SyncOutcome::Ready(progress));
         }
@@ -278,6 +352,7 @@ pub(crate) async fn synchronize(
                 return Err("task vector synchronization page was not fully acknowledged".into());
             }
         }
+        check_access(app, &storage, generation, manual)?;
         storage.acknowledge_task_vector_sync(
             generation,
             &state,
@@ -288,10 +363,33 @@ pub(crate) async fn synchronize(
         state.cursor = *ids.last().unwrap();
         state.synced_count += records.len() as u64;
         pages += 1;
-        if !manual && pages >= AUTO_PAGES {
+        if !manual
+            && pages
+                >= if crate::background_policy::is_background() {
+                    1
+                } else {
+                    AUTO_PAGES
+                }
+        {
             progress.finish(ClusteringPhase::Paused);
             return Ok(SyncOutcome::More);
         }
+    }
+}
+
+pub(crate) async fn run_scheduled_slice(
+    app: &AppHandle,
+    manual: bool,
+) -> Result<background_scheduler::ScheduledSliceResult, String> {
+    use background_scheduler::ScheduledSliceResult;
+    match synchronize(app, manual, None, None).await? {
+        SyncOutcome::Ready(progress) => {
+            progress.finish(ClusteringPhase::Completed);
+            Ok(ScheduledSliceResult::complete(false))
+        }
+        SyncOutcome::Busy => Ok(ScheduledSliceResult::skipped("clustering_already_running")),
+        SyncOutcome::More => Ok(ScheduledSliceResult::complete(true)),
+        SyncOutcome::WaitingForIndex => Ok(ScheduledSliceResult::skipped("waiting_for_index")),
     }
 }
 
@@ -310,6 +408,10 @@ async fn prepare_page(
         if read_storage.db_generation() != generation {
             return Err("database changed".to_string());
         }
+        let revisions: std::collections::HashMap<_, _> = read_storage
+            .archive_scoring_source_revisions(generation, &ids)?
+            .into_iter()
+            .collect();
         let sources = minilm_sources(&read_storage, &ids).map_err(|e| e.to_string())?;
         let mut prepared = Vec::new();
         for id in ids {
@@ -326,18 +428,22 @@ async fn prepare_page(
                 if cached.is_none() && !manual {
                     read_storage.ensure_derived_index_job(&source.spec)?;
                 }
-                prepared.push((source.clone(), cached));
+                prepared.push((
+                    source.clone(),
+                    cached,
+                    revisions.get(&id).copied().flatten().unwrap_or(0),
+                ));
             }
         }
         Ok::<_, String>(prepared)
     })
     .await
     .map_err(|e| e.to_string())??;
-    if !manual && sources.iter().any(|(_, vector)| vector.is_none()) {
+    if !manual && sources.iter().any(|(_, vector, _)| vector.is_none()) {
         return Ok(None);
     }
     let mut records = Vec::with_capacity(sources.len());
-    for (source, cached) in sources {
+    for (source, cached, source_revision) in sources {
         let vector = if let Some(vector) = cached {
             vector
         } else {
@@ -346,6 +452,7 @@ async fn prepare_page(
         };
         records.push(json!({
             "id":source.spec.subject_key, "embedding":vector,
+            "source_revision":source_revision,
             "timestamp":source.summary.timestamp.unwrap_or(0),
             "process_name":source.summary.process_name.unwrap_or_default(),
             "window_title":source.summary.window_title.unwrap_or_default(),
@@ -409,6 +516,7 @@ async fn encode_source(
             return Err("database changed".to_string());
         }
         let id = source.summary.id;
+        let revisions = storage.archive_scoring_source_revisions(generation, &[id])?;
         let current = minilm_sources(&storage, &[id]).map_err(|e| e.to_string())?;
         if current.indexable.get(&id).map(|s| &s.spec) != Some(&source.spec) {
             return Err(
@@ -431,11 +539,16 @@ async fn encode_source(
         }
         storage.upsert_derived_index_job(&source.spec)?;
         let lease_token = storage.mark_derived_index_job_processing(&source.spec)?;
-        storage.commit_derived_embedding(&DerivedEmbeddingWrite {
-            job: source.spec,
-            lease_token,
-            vector: saved,
-        })?;
+        storage.commit_archive_embedding(
+            &DerivedEmbeddingWrite {
+                job: source.spec,
+                lease_token,
+                vector: saved,
+            },
+            generation,
+            &revisions,
+            None,
+        )?;
         storage.enqueue_smart_cluster_pending(id)?;
         Ok::<_, String>(())
     })

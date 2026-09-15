@@ -143,12 +143,24 @@ pub(super) async fn run_batch(
     storage: Arc<StorageState>,
     forced: bool,
 ) -> Result<Option<BatchProgress>, String> {
+    if !forced
+        && !crate::background_scheduler::prefer_staged(
+            app,
+            crate::background_scheduler::BackgroundTaskKind::SmartCluster,
+            false,
+        )
+    {
+        return Ok(None);
+    }
     let (ids, targets) = tokio::task::spawn_blocking({
         let storage = storage.clone();
         move || -> Result<_, String> {
             let targets = storage.list_smart_cluster_scoring_targets()?;
-            let ids = storage
-                .staged_smart_cluster_pending_ids(batch_size_for(forced, targets.len()) as usize)?;
+            let ids = storage.staged_smart_cluster_pending_ids(if forced {
+                batch_size_for(true, targets.len()) as usize
+            } else {
+                1
+            })?;
             Ok((ids, targets))
         }
     })
@@ -240,7 +252,9 @@ pub(super) async fn run_batch(
             }
             Err(error) => {
                 let yielded = crate::rerank::is_yield(&error);
-                let failed = !yielded && !error.starts_with("deferred:");
+                let failed = !yielded
+                    && !error.starts_with("deferred:")
+                    && !crate::background_policy::is_pause(&error);
                 let receipt = work.receipt.clone();
                 let release = tokio::task::spawn_blocking({
                     let storage = storage.clone();

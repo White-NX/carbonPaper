@@ -329,13 +329,59 @@ fn ready_selection_scans_past_unindexed_inputs_without_acquiring_keys() {
         storage.enqueue_smart_cluster_pending(id).unwrap();
     }
     indexed_input(storage, 258, Consumer::SmartCluster.bit());
+    indexed_input(storage, 259, Consumer::SmartCluster.bit());
     let before = broker.acquisitions.load(Ordering::SeqCst);
+    assert!(storage
+        .staged_smart_cluster_pending_ids(0)
+        .unwrap()
+        .is_empty());
     assert_eq!(storage.staged_smart_cluster_pending_ids(1).unwrap(), [258]);
+    assert_eq!(
+        storage.staged_smart_cluster_pending_ids(2).unwrap(),
+        [258, 259]
+    );
     assert_eq!(broker.acquisitions.load(Ordering::SeqCst), before);
     assert!(storage
         .peek_smart_cluster_pending_batch(32)
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn ready_selection_preserves_pending_and_current_vector_filters() {
+    let mut fixture = fixture();
+    let (_dir, storage, broker) = fixture.parts();
+    for id in 1..=14 {
+        indexed_input(storage, id, Consumer::SmartCluster.bit());
+    }
+    sql(
+        storage,
+        "UPDATE screenshots SET is_deleted=1 WHERE id=2;
+         UPDATE screenshots SET status='staging' WHERE id=3;
+         DELETE FROM smart_cluster_pending WHERE screenshot_id=4;
+         UPDATE smart_cluster_pending SET queued_at=datetime('now','-31 days') WHERE screenshot_id=5;
+         UPDATE derived_index_jobs SET status='pending' WHERE subject_key='6';
+         UPDATE derived_index_jobs SET source_fingerprint='changed' WHERE subject_key='7';
+         UPDATE derived_embeddings SET model_id='old-model' WHERE subject_key='8';
+         UPDATE derived_index_jobs SET model_id='old-model' WHERE subject_key='8';
+         UPDATE derived_embeddings SET model_revision='old-revision' WHERE subject_key='9';
+         UPDATE derived_index_jobs SET model_revision='old-revision' WHERE subject_key='9';
+         UPDATE derived_embeddings SET embedding_version=2 WHERE subject_key='10';
+         UPDATE derived_index_jobs SET embedding_version=2 WHERE subject_key='10';
+         DELETE FROM derived_index_jobs WHERE subject_key='11';
+         DELETE FROM derived_embeddings WHERE subject_key='12';",
+    );
+    let before = broker.acquisitions.load(Ordering::SeqCst);
+    assert_eq!(storage.staged_smart_cluster_pending_ids(1).unwrap(), [1]);
+    assert_eq!(
+        storage.staged_smart_cluster_pending_ids(2).unwrap(),
+        [1, 13]
+    );
+    assert_eq!(
+        storage.staged_smart_cluster_pending_ids(32).unwrap(),
+        [1, 13, 14]
+    );
+    assert_eq!(broker.acquisitions.load(Ordering::SeqCst), before);
 }
 
 #[test]

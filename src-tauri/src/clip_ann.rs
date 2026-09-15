@@ -41,12 +41,10 @@ use windows::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 
+mod resumable;
+pub(crate) use resumable::run_scheduled_slice;
+
 const ANN_FILE_FORMAT_VERSION: u32 = 1;
-// A page is large enough to amortize SQLCipher setup/statement overhead while
-// still keeping the rollback-journal SHARED lock short-lived between pages.
-// The old 512-row page made a 54k-row bootstrap perform more than a hundred
-// independent scans and sidecar write batches.
-const SNAPSHOT_PAGE_ROWS: u32 = 4096;
 const MAX_TAIL_ROWS: u64 = 20_000;
 const REBUILD_TAIL_ROWS: u64 = 5_000;
 const REBUILD_TAIL_PERCENT: u64 = 5;
@@ -229,6 +227,7 @@ pub fn enabled() -> bool {
 }
 
 pub struct ClipAnnState {
+    resumable_worker: tokio::sync::Mutex<Option<resumable::BuildWorker>>,
     generation: RwLock<Option<Arc<GenerationReader>>>,
     build_lock: tokio::sync::Mutex<()>,
     last_error: RwLock<Option<String>>,
@@ -240,6 +239,7 @@ impl Default for ClipAnnState {
     fn default() -> Self {
         let (arm_tx, _) = watch::channel(ArmStatus::Idle);
         Self {
+            resumable_worker: tokio::sync::Mutex::new(None),
             generation: RwLock::new(None),
             build_lock: tokio::sync::Mutex::const_new(()),
             last_error: RwLock::new(None),
@@ -569,6 +569,9 @@ impl ClipAnnState {
     }
 
     pub(crate) fn disarm(&self) {
+        if let Ok(mut worker) = self.resumable_worker.try_lock() {
+            worker.take();
+        }
         let mut generation = self
             .generation
             .write()
@@ -578,6 +581,17 @@ impl ClipAnnState {
         arm.token = arm.token.wrapping_add(1);
         arm.status = ArmStatus::Idle;
         self.arm_tx.send_replace(ArmStatus::Idle);
+    }
+
+    pub(crate) fn reclaim_builder(&self, memory_pressure: bool) {
+        if let Ok(mut slot) = self.resumable_worker.try_lock() {
+            if slot
+                .as_ref()
+                .is_some_and(|worker| memory_pressure || worker.expired())
+            {
+                slot.take();
+            }
+        }
     }
 
     fn begin_arm(&self) -> Option<u64> {
@@ -756,14 +770,6 @@ impl ClipAnnState {
         tokio::time::timeout(timeout, wait).await.unwrap_or(false)
     }
 
-    fn has_generation_for(&self, data_dir: &Path) -> bool {
-        self.generation
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-            .is_some_and(|generation| generation.data_dir == data_dir)
-    }
-
     pub fn status(&self) -> (&'static str, Option<u64>, Option<String>) {
         if !enabled() {
             return ("disabled", None, None);
@@ -902,6 +908,7 @@ pub fn spawn_startup_arm(app: AppHandle) {
             Ok(Err(error)) => {
                 tracing::warn!("[CLIP:ANN] startup arm failed: {error}");
                 state.fail_arm(arm_token, error);
+                let _ = maybe_rebuild(&app, false).await;
             }
             Err(error) => {
                 state.fail_arm(arm_token, format!("ANN startup task failed: {error}"));
@@ -941,7 +948,7 @@ fn spawn_missing_generation_bootstrap(app: AppHandle, state: Arc<ClipAnnState>) 
         }
         let result = maybe_rebuild(&app, false).await;
         match result {
-            Ok(true) => tracing::info!("[CLIP:ANN] bootstrap published the initial generation"),
+            Ok(true) => tracing::info!("[CLIP:ANN] bootstrap queued the initial generation"),
             Ok(false) => tracing::info!("[CLIP:ANN] bootstrap found no query-visible vectors"),
             Err(error) => tracing::warn!("[CLIP:ANN] bootstrap failed: {error}"),
         }
@@ -952,275 +959,22 @@ fn startup_bootstrap_ready(clip_done: bool, maintenance_active: bool) -> bool {
     clip_done && !maintenance_active
 }
 
-async fn bootstrap_with_own_maintenance(app: &AppHandle) -> Result<bool, String> {
-    // An installation can have completed the legacy migration without ever
-    // producing a query-visible CLIP vector (for example, a fresh/empty
-    // library). Check that cheaply before entering maintenance so the idle
-    // worker does not pause capture every time it retries the missing ANN.
-    let state = app.state::<Arc<ClipAnnState>>().inner().clone();
-    let storage = app.state::<Arc<StorageState>>().inner().clone();
-    let has_vectors = tokio::task::spawn_blocking({
-        let storage = storage.clone();
-        move || storage.has_query_visible_embeddings(DerivedIndexKind::ClipImage)
-    })
-    .await
-    .map_err(|error| format!("ANN bootstrap existence check failed: {error}"))??;
-    if !has_vectors {
-        return Ok(false);
-    }
-
-    let Ok(_build_guard) = state.build_lock.try_lock() else {
-        return Ok(false);
-    };
-    let data_dir = storage
-        .data_dir
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
-    if state.has_generation() && state.has_generation_for(&data_dir) {
-        return Ok(false);
-    }
-    if state.has_generation() {
-        state.disarm();
-    }
-    let lifecycle_token = state.lifecycle_token();
-    // Resolve the packaged builder and verify Job Object setup before capture
-    // is paused. The actual build creates a fresh job after the snapshot.
-    let builder_executable = preflight_builder(app)?;
-
-    let Some(maintenance) = crate::maintenance::enter("clip_ann_bootstrap") else {
-        return Ok(false);
-    };
-    let restore = match crate::migration_support::pause_capture_for_maintenance(app).await {
-        Ok(restore) => restore,
-        Err(error) => {
-            drop(maintenance);
-            return Err(format!("ANN bootstrap could not pause capture: {error}"));
-        }
-    };
-    let result = bootstrap_locked_in_maintenance(
-        app,
-        &state,
-        &storage,
-        lifecycle_token,
-        &builder_executable,
-    )
-    .await;
-    crate::migration_support::restore_monitor_after_migration(app, &restore).await;
-    drop(maintenance);
-    result
-}
-
-/// Build and arm the first ANN generation while the caller owns maintenance.
-///
-/// This is intentionally public to the CLIP Chroma migration module. It does
-/// not enter/leave maintenance and it does not pause or resume capture; the
-/// caller must keep the maintenance guard and monitor restore boundary alive
-/// for the whole operation.
+/// Migration and retry callers only enqueue; the durable task owns all builds.
 pub async fn bootstrap_in_maintenance(app: &AppHandle) -> Result<bool, String> {
-    if !enabled() {
-        return Ok(false);
-    }
-    let state = app.state::<Arc<ClipAnnState>>().inner().clone();
-    let _build_guard = state.build_lock.lock().await;
-    let storage = app.state::<Arc<StorageState>>().inner().clone();
-    let build_state = storage.get_derived_ann_build_state(DerivedIndexKind::ClipImage)?;
-    if !ann_retry_due(build_state.as_ref(), Utc::now(), false) {
-        return Ok(false);
-    }
-    let data_dir = storage
-        .data_dir
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
-    if state.has_generation() && state.has_generation_for(&data_dir) {
-        return Ok(false);
-    }
-    if state.has_generation() {
-        state.disarm();
-    }
-    let lifecycle_token = state.lifecycle_token();
-    let builder_executable = match preflight_builder(app) {
-        Ok(executable) => executable,
-        Err(error) => {
-            record_ann_build_failure(app, &storage, &state, lifecycle_token, &error)?;
-            return Err(error);
-        }
-    };
-    let result = bootstrap_locked_in_maintenance(
-        app,
-        &state,
-        &storage,
-        lifecycle_token,
-        &builder_executable,
-    )
-    .await;
-    if let Err(error) = &result {
-        record_ann_build_failure(app, &storage, &state, lifecycle_token, error)?;
-    }
-    result
-}
-
-async fn bootstrap_locked_in_maintenance(
-    _app: &AppHandle,
-    state: &Arc<ClipAnnState>,
-    storage: &Arc<StorageState>,
-    lifecycle_token: u64,
-    builder_executable: &Path,
-) -> Result<bool, String> {
-    let should_build = tokio::task::spawn_blocking({
-        let storage = storage.clone();
-        move || rebuild_needed(&storage, true)
-    })
-    .await
-    .map_err(|error| format!("ANN bootstrap decision task failed: {error}"))??;
-    if !should_build {
-        return Ok(false);
-    }
-    let build_storage = storage.clone();
-    let build_state = state.clone();
-    let builder_executable = builder_executable.to_path_buf();
-    let build = tokio::task::spawn_blocking(move || {
-        let _publish_guard = build_storage.derived_generation_publish_guard();
-        let prepared =
-            build_generation_under_publish_guard(&build_storage, true, &builder_executable)?;
-        let generation = prepared.reader().manifest.generation;
-        let rows = prepared.reader().manifest.row_count;
-        let installed =
-            build_state.publish_from_lifecycle(lifecycle_token, &build_storage, prepared)?;
-        Ok::<_, String>((generation, rows, installed))
-    })
-    .await
-    .map_err(|error| format!("ANN bootstrap task failed: {error}"))??;
-    if !build.2 {
-        tracing::info!(
-            "[CLIP:ANN] discarded bootstrap generation={} after lifecycle changed",
-            build.0
-        );
-        return Ok(false);
-    }
-    tracing::info!(
-        "[CLIP:ANN] bootstrap published generation={} rows={}",
-        build.0,
-        build.1
-    );
-    Ok(true)
+    maybe_rebuild(app, false).await
 }
 
 pub async fn maybe_rebuild(app: &AppHandle, force: bool) -> Result<bool, String> {
     if !enabled() {
         return Ok(false);
     }
-    let state = app.state::<Arc<ClipAnnState>>().inner().clone();
-    let storage = app.state::<Arc<StorageState>>().inner().clone();
-    let build_state = storage.get_derived_ann_build_state(DerivedIndexKind::ClipImage)?;
-    if !ann_retry_due(build_state.as_ref(), Utc::now(), force) {
-        tracing::debug!(
-            "[CLIP:ANN] rebuild deferred until {}",
-            build_state
-                .as_ref()
-                .map(|state| state.next_retry_at.as_str())
-                .unwrap_or("unknown")
-        );
-        return Ok(false);
-    }
-    let data_dir = storage
-        .data_dir
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
-    if state.has_generation() && !state.has_generation_for(&data_dir) {
-        state.disarm();
-    }
-    if !state.has_generation() {
-        let ready = tokio::task::spawn_blocking({
-            let storage = storage.clone();
-            move || {
-                storage
-                    .is_auto_migration_done(DerivedIndexKind::ClipImage, CLIP_VECTOR_SPACE_REVISION)
-                    .unwrap_or(false)
-            }
-        })
-        .await
-        .unwrap_or(false);
-        if !startup_bootstrap_ready(ready, crate::maintenance::is_active()) {
-            return Ok(false);
-        }
-        let lifecycle_token = state.lifecycle_token();
-        return match bootstrap_with_own_maintenance(app).await {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                record_ann_build_failure(app, &storage, &state, lifecycle_token, &error)?;
-                Err(error)
-            }
-        };
-    }
-    // The migration path calls `bootstrap_in_maintenance` explicitly. A
-    // normal tail rebuild must stand down while any other maintenance task is
-    // rewriting the authoritative store.
-    if crate::maintenance::is_active() {
-        return Ok(false);
-    }
-    let Ok(_build_guard) = state.build_lock.try_lock() else {
-        return Ok(false);
-    };
-    let lifecycle_token = state.lifecycle_token();
-    let runtime_missing = !state.has_generation();
-    let should_build = tokio::task::spawn_blocking({
-        let storage = storage.clone();
-        move || rebuild_needed(&storage, force || runtime_missing)
-    })
-    .await
-    .map_err(|error| format!("ANN rebuild decision task failed: {error}"))??;
-    if !should_build {
-        return Ok(false);
-    }
-    let builder_executable = match preflight_builder(app) {
-        Ok(executable) => executable,
-        Err(error) => {
-            record_ann_build_failure(app, &storage, &state, lifecycle_token, &error)?;
-            return Err(error);
-        }
-    };
-    let build_storage = storage.clone();
-    let build_state = state.clone();
-    let build = tokio::task::spawn_blocking(move || {
-        let _publish_guard = build_storage.derived_generation_publish_guard();
-        let prepared =
-            build_generation_under_publish_guard(&build_storage, false, &builder_executable)?;
-        let generation = prepared.reader().manifest.generation;
-        let rows = prepared.reader().manifest.row_count;
-        let installed =
-            build_state.publish_from_lifecycle(lifecycle_token, &build_storage, prepared)?;
-        Ok::<_, String>((generation, rows, installed))
-    })
-    .await;
-    match build {
-        Ok(Ok((generation, rows, installed))) => {
-            if !installed {
-                tracing::info!(
-                    "[CLIP:ANN] discarded generation={} after lifecycle changed",
-                    generation
-                );
-                return Ok(false);
-            }
-            tracing::info!(
-                "[CLIP:ANN] published generation={} rows={}",
-                generation,
-                rows
-            );
-            Ok(true)
-        }
-        Ok(Err(error)) => {
-            record_ann_build_failure(app, &storage, &state, lifecycle_token, &error)?;
-            Err(error)
-        }
-        Err(error) => {
-            let error = format!("ANN build task failed: {error}");
-            record_ann_build_failure(app, &storage, &state, lifecycle_token, &error)?;
-            Err(error)
-        }
-    }
+    app.state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
+        .enqueue(
+            app,
+            crate::background_scheduler::BackgroundTaskKind::AnnBuild,
+            force,
+        )?;
+    Ok(true)
 }
 
 fn rebuild_needed(storage: &StorageState, force: bool) -> Result<bool, String> {
@@ -1253,152 +1007,6 @@ fn rebuild_needed(storage: &StorageState, force: bool) -> Result<bool, String> {
         .unwrap_or(true))
 }
 
-fn build_generation_under_publish_guard(
-    storage: &StorageState,
-    single_snapshot_connection: bool,
-    builder_executable: &Path,
-) -> Result<PreparedGeneration, String> {
-    if storage.is_migration_in_progress() {
-        return Err("Cannot build ANN during data migration".to_string());
-    }
-    let (
-        covered_epoch,
-        expected_rows,
-        expected_key_bytes,
-        dimensions,
-        model_id,
-        model_revision,
-        embedding_version,
-    ) = storage.derived_index_snapshot_for_ann(DerivedIndexKind::ClipImage)?;
-    if dimensions as usize != CLIP_DIMENSIONS
-        || model_id != CLIP_MODEL_ID
-        || model_revision != CLIP_VECTOR_SPACE_REVISION
-        || embedding_version != CLIP_EMBEDDING_VERSION
-    {
-        return Err("ANN source model contract does not match current CLIP".to_string());
-    }
-    let generation = next_generation_id()?;
-    let data_dir = storage
-        .data_dir
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone();
-    let directory = data_dir.join("derived-indexes");
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("Failed to create ANN directory: {error}"))?;
-    let flat_name = format!("clip_image-{generation}.cpdvec");
-    let ann_name = format!("clip_image-{generation}.cpdann");
-    let flat_path = directory.join(&flat_name);
-    let ann_path = directory.join(&ann_name);
-    let flat_temp = directory.join(format!(".{flat_name}.tmp"));
-    let ann_temp = directory.join(format!(".{ann_name}.tmp"));
-    let result = (|| {
-        let started = std::time::Instant::now();
-        let expansion_search = expansion_search(expected_rows as usize);
-        let header = Header::for_snapshot(
-            generation,
-            covered_epoch,
-            expected_rows,
-            dimensions,
-            DerivedIndexKind::ClipImage.as_str(),
-            &model_id,
-            &model_revision,
-            expansion_search as u32,
-            expected_key_bytes,
-        )?;
-        let mut writer = FlatFileWriter::create(&flat_temp, header)?;
-        let mut written_rows = 0u64;
-        if single_snapshot_connection {
-            storage.for_each_query_visible_embedding_page_for_ann(
-                DerivedIndexKind::ClipImage,
-                SNAPSHOT_PAGE_ROWS,
-                |page| write_ann_snapshot_page(&mut writer, dimensions, &mut written_rows, &page),
-            )?;
-        } else {
-            let mut cursor: Option<String> = None;
-            loop {
-                let page = storage.list_query_visible_ann_snapshot_page_for_ann(
-                    DerivedIndexKind::ClipImage,
-                    cursor.as_deref(),
-                    SNAPSHOT_PAGE_ROWS,
-                )?;
-                if page.is_empty() {
-                    break;
-                }
-                cursor = page.last().map(|row| row.subject_key.clone());
-                write_ann_snapshot_page(&mut writer, dimensions, &mut written_rows, &page)?;
-            }
-        }
-        if written_rows != expected_rows {
-            return Err(format!(
-                "ANN snapshot changed while freezing: expected {expected_rows}, read {}",
-                written_rows
-            ));
-        }
-        writer.finish()?;
-        let snapshot_elapsed = started.elapsed();
-        tracing::info!(
-            "[CLIP:ANN] froze snapshot rows={} page_rows={} connection_mode={} elapsed_ms={}",
-            written_rows,
-            SNAPSHOT_PAGE_ROWS,
-            if single_snapshot_connection {
-                "maintenance_single"
-            } else {
-                "background_per_page"
-            },
-            snapshot_elapsed.as_millis()
-        );
-        let builder_started = std::time::Instant::now();
-        run_builder(builder_executable, &flat_temp, &ann_temp)?;
-        tracing::info!(
-            "[CLIP:ANN] builder completed rows={} elapsed_ms={}",
-            expected_rows,
-            builder_started.elapsed().as_millis()
-        );
-        let flat_checksum = sha256_file(&flat_temp)?;
-        let ann_checksum = sha256_file(&ann_temp)?;
-        publish_generation_files(&flat_temp, &flat_path, &ann_temp, &ann_path)?;
-        let manifest = DerivedAnnGeneration {
-            index_kind: DerivedIndexKind::ClipImage,
-            generation,
-            covered_epoch,
-            flat_file_name: flat_name,
-            flat_checksum_sha256: flat_checksum,
-            ann_file_name: ann_name,
-            ann_checksum_sha256: ann_checksum,
-            row_count: expected_rows,
-            dimensions,
-            model_id,
-            model_revision,
-            embedding_version,
-            sidecar_format_version: FORMAT_VERSION,
-            ann_format_version: ANN_FILE_FORMAT_VERSION,
-            algorithm: ANN_ALGORITHM.to_string(),
-            implementation_version: ANN_IMPLEMENTATION_VERSION.to_string(),
-            metric: ANN_METRIC.to_string(),
-            quantization: ANN_QUANTIZATION.to_string(),
-            connectivity: ANN_CONNECTIVITY,
-            expansion_add: ANN_EXPANSION_ADD,
-            expansion_search: expansion_search as u32,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-        let reader = match open_generation(&data_dir, manifest) {
-            Ok(reader) => reader,
-            Err(error) => {
-                let _ = fs::remove_file(&flat_path);
-                let _ = fs::remove_file(&ann_path);
-                return Err(error);
-            }
-        };
-        Ok(PreparedGeneration::new(reader))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&flat_temp);
-        let _ = fs::remove_file(&ann_temp);
-    }
-    result
-}
-
 fn write_ann_snapshot_page(
     writer: &mut FlatFileWriter,
     dimensions: u32,
@@ -1415,21 +1023,6 @@ fn write_ann_snapshot_page(
     writer.push_keys(&keys)?;
     writer.push_vector_bytes(&vectors)?;
     *written_rows = written_rows.saturating_add(page.len() as u64);
-    Ok(())
-}
-
-fn publish_generation_files(
-    flat_temp: &Path,
-    flat_path: &Path,
-    ann_temp: &Path,
-    ann_path: &Path,
-) -> Result<(), String> {
-    fs::rename(flat_temp, flat_path)
-        .map_err(|error| format!("Failed to publish ANN flat file: {error}"))?;
-    if let Err(error) = fs::rename(ann_temp, ann_path) {
-        let _ = fs::remove_file(flat_path);
-        return Err(format!("Failed to publish ANN graph file: {error}"));
-    }
     Ok(())
 }
 
@@ -1458,6 +1051,17 @@ fn open_generation(
     {
         return Err("ANN generation checksum mismatch".to_string());
     }
+    open_generation_validated(data_dir, manifest)
+}
+
+fn open_generation_validated(
+    data_dir: &Path,
+    manifest: DerivedAnnGeneration,
+) -> Result<GenerationReader, String> {
+    validate_manifest(&manifest)?;
+    let directory = data_dir.join("derived-indexes");
+    let flat_path = directory.join(&manifest.flat_file_name);
+    let ann_path = directory.join(&manifest.ann_file_name);
     let flat = MappedFlatIndex::open(&flat_path)?;
     if flat.header.generation != manifest.generation
         || flat.header.covered_epoch != manifest.covered_epoch
@@ -1551,47 +1155,6 @@ fn validate_manifest(manifest: &DerivedAnnGeneration) -> Result<(), String> {
     Ok(())
 }
 
-fn preflight_builder(app: &AppHandle) -> Result<PathBuf, String> {
-    let executable = resolve_ml_executable(app)?;
-    let _job = create_builder_job()?;
-    Ok(executable)
-}
-
-fn run_builder(executable: &Path, flat: &Path, output: &Path) -> Result<(), String> {
-    let job = create_builder_job()?;
-    let mut command = Command::new(executable);
-    command
-        .arg("--build-ann")
-        .arg("--flat")
-        .arg(flat)
-        .arg("--output")
-        .arg(output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
-    let child = command
-        .spawn()
-        .map_err(|error| format!("Failed to start ANN builder: {error}"))?;
-    let mut pending = PendingBuilder::new(child);
-    assign_builder_job(&job, pending.child())?;
-    let result = pending
-        .take()
-        .wait_with_output()
-        .map_err(|error| format!("Failed to wait for ANN builder: {error}"))?;
-    if !result.status.success() {
-        return Err(format!(
-            "ANN builder failed (status={}): {}",
-            result.status,
-            String::from_utf8_lossy(&result.stderr)
-                .chars()
-                .take(1000)
-                .collect::<String>()
-        ));
-    }
-    Ok(())
-}
-
 struct PendingBuilder(Option<Child>);
 
 impl PendingBuilder {
@@ -1618,6 +1181,9 @@ impl Drop for PendingBuilder {
 }
 
 struct BuilderJob(HANDLE);
+// SAFETY: a Job Object is a kernel reference. The owned wrapper can move
+// between scheduler threads; Drop remains its only CloseHandle owner.
+unsafe impl Send for BuilderJob {}
 
 impl Drop for BuilderJob {
     fn drop(&mut self) {
@@ -1951,22 +1517,6 @@ mod tests {
         corrupt.next_retry_at = "not-a-timestamp".to_string();
         assert!(!ann_retry_due(Some(&corrupt), now, false));
         assert!(ann_retry_due(Some(&corrupt), now, true));
-    }
-
-    #[test]
-    fn failed_second_rename_removes_the_first_final_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let flat_temp = temp.path().join(".flat.cpdvec.tmp");
-        let flat_path = temp.path().join("flat.cpdvec");
-        let missing_ann_temp = temp.path().join(".missing.cpdann.tmp");
-        let ann_path = temp.path().join("graph.cpdann");
-        std::fs::write(&flat_temp, b"flat").unwrap();
-
-        let error = publish_generation_files(&flat_temp, &flat_path, &missing_ann_temp, &ann_path)
-            .unwrap_err();
-        assert!(error.contains("graph file"));
-        assert!(!flat_path.exists());
-        assert!(!ann_path.exists());
     }
 
     #[test]

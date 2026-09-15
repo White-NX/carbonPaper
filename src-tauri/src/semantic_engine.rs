@@ -1,18 +1,20 @@
 //! Batch-capable ONNX semantic inference used only by the isolated ML worker.
 
 use crate::ml_protocol::{MlImageInput, MlProvider, MlSemanticModel};
+use crate::semantic_cancellation::RequestControl;
 use crate::semantic_models::{
     resolve_semantic_model, ResolvedSemanticModel, SemanticPooling, SUPPORTED_SEMANTIC_MODELS,
 };
 use image::RgbImage;
 use ort::{
     ep,
-    session::{builder::GraphOptimizationLevel, Session},
+    session::{builder::GraphOptimizationLevel, RunOptions, Session},
     value::Tensor,
 };
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use tokenizers::{
     EncodeInput, PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams,
@@ -22,6 +24,7 @@ use tokenizers::{
 pub struct SemanticInference<T> {
     pub value: T,
     pub model_load_ms: f64,
+    pub model_load_cpu_ms: f64,
     pub preprocess_ms: f64,
     pub inference_ms: f64,
 }
@@ -41,6 +44,7 @@ pub struct SemanticEngine {
     models_root: PathBuf,
     onnx_models_root: PathBuf,
     loaded: Option<LoadedModel>,
+    request_control: Option<Arc<RequestControl>>,
 }
 
 struct LoadedModel {
@@ -88,6 +92,7 @@ impl SemanticEngine {
             models_root,
             onnx_models_root,
             loaded: None,
+            request_control: None,
         }
     }
 
@@ -111,6 +116,22 @@ impl SemanticEngine {
         self.loaded = None;
     }
 
+    pub fn begin_request(&mut self, control: Arc<RequestControl>) {
+        self.request_control = Some(control);
+    }
+    fn check_request(&self) -> Result<(), String> {
+        self.request_control.as_ref().map_or(Ok(()), |c| c.check())
+    }
+    pub fn request_error(&self, error: String) -> String {
+        self.check_request().err().unwrap_or(error)
+    }
+    fn run_options(&self) -> Result<Arc<RunOptions>, String> {
+        self.request_control.as_ref().map_or_else(
+            || RunOptions::new().map(Arc::new).map_err(|e| e.to_string()),
+            |c| c.run_options(),
+        )
+    }
+
     pub fn embed_text(
         &mut self,
         model: MlSemanticModel,
@@ -119,22 +140,27 @@ impl SemanticEngine {
         if model == MlSemanticModel::BgeRerankerV2M3 {
             return Err("invalid_request: reranker does not expose text embeddings".to_string());
         }
-        let model_load_ms = self.ensure_loaded(model)?;
+        let options = self.run_options()?;
+        let (model_load_ms, model_load_cpu_ms) = self.ensure_loaded(model)?;
         let loaded = self.loaded.as_mut().expect("semantic model is loaded");
 
         let preprocess_started = Instant::now();
         let tokens = tokenize_texts(&mut loaded.tokenizer, loaded.resolved.descriptor, texts)?;
+        if let Some(control) = &self.request_control {
+            control.check()?;
+        }
         let preprocess_ms = elapsed_ms(preprocess_started);
         let inference_started = Instant::now();
         let vectors = if model == MlSemanticModel::ChineseClip {
-            run_clip_text(loaded, &tokens)?
+            run_clip_text(loaded, &tokens, &options)?
         } else {
-            run_transformer_embedding(loaded, &tokens)?
+            run_transformer_embedding(loaded, &tokens, &options)?
         };
         let inference_ms = elapsed_ms(inference_started);
         Ok(SemanticInference {
             value: vectors,
             model_load_ms,
+            model_load_cpu_ms,
             preprocess_ms,
             inference_ms,
         })
@@ -149,7 +175,8 @@ impl SemanticEngine {
         if model != MlSemanticModel::ChineseClip {
             return Err("invalid_request: only Chinese-CLIP accepts image embeddings".to_string());
         }
-        let model_load_ms = self.ensure_loaded(model)?;
+        let options = self.run_options()?;
+        let (model_load_ms, model_load_cpu_ms) = self.ensure_loaded(model)?;
         let loaded = self.loaded.as_mut().expect("semantic model is loaded");
         let preprocessor = loaded
             .clip_preprocessor
@@ -158,13 +185,17 @@ impl SemanticEngine {
 
         let preprocess_started = Instant::now();
         let pixels = preprocess_clip_images(&preprocessor, images, body)?;
+        if let Some(control) = &self.request_control {
+            control.check()?;
+        }
         let preprocess_ms = elapsed_ms(preprocess_started);
         let inference_started = Instant::now();
-        let vectors = run_clip_image(loaded, images.len(), &preprocessor, pixels)?;
+        let vectors = run_clip_image(loaded, images.len(), &preprocessor, pixels, &options)?;
         let inference_ms = elapsed_ms(inference_started);
         Ok(SemanticInference {
             value: vectors,
             model_load_ms,
+            model_load_cpu_ms,
             preprocess_ms,
             inference_ms,
         })
@@ -179,7 +210,8 @@ impl SemanticEngine {
         if model != MlSemanticModel::BgeRerankerV2M3 {
             return Err("invalid_request: selected model is not a reranker".to_string());
         }
-        let model_load_ms = self.ensure_loaded(model)?;
+        let options = self.run_options()?;
+        let (model_load_ms, model_load_cpu_ms) = self.ensure_loaded(model)?;
         let loaded = self.loaded.as_mut().expect("semantic model is loaded");
 
         let preprocess_started = Instant::now();
@@ -191,11 +223,15 @@ impl SemanticEngine {
         )?;
         let preprocess_ms = elapsed_ms(preprocess_started);
         let inference_started = Instant::now();
-        let scores = run_reranker(loaded, &tokens)?;
+        if let Some(control) = &self.request_control {
+            control.check()?;
+        }
+        let scores = run_reranker(loaded, &tokens, &options)?;
         let inference_ms = elapsed_ms(inference_started);
         Ok(SemanticInference {
             value: scores,
             model_load_ms,
+            model_load_cpu_ms,
             preprocess_ms,
             inference_ms,
         })
@@ -227,7 +263,8 @@ impl SemanticEngine {
         })
     }
 
-    fn ensure_loaded(&mut self, model: MlSemanticModel) -> Result<f64, String> {
+    fn ensure_loaded(&mut self, model: MlSemanticModel) -> Result<(f64, f64), String> {
+        self.check_request()?;
         if !provider_supports_model(self.provider, model) {
             return Err(format!(
                 "provider_unavailable: DirectML parity is not approved for {}; retry with CPU",
@@ -239,19 +276,23 @@ impl SemanticEngine {
             .as_ref()
             .is_some_and(|loaded| loaded.resolved.descriptor.model == model)
         {
-            return Ok(0.0);
+            return Ok((0.0, 0.0));
         }
 
         self.loaded = None;
         let started = Instant::now();
+        let cpu_started = crate::semantic_metrics::cpu_ms();
         let resolved = resolve_semantic_model(model, &self.models_root, &self.onnx_models_root)?;
+        self.check_request()?;
         let tokenizer = load_tokenizer(&resolved)?;
+        self.check_request()?;
         let clip_preprocessor = resolved
             .preprocessor_path
             .as_deref()
             .map(load_clip_preprocessor)
             .transpose()?;
         let session = load_session(&resolved, self.provider, self.dml_device_id)?;
+        self.check_request()?;
         validate_session_layout(&session, &resolved)?;
         self.loaded = Some(LoadedModel {
             resolved,
@@ -259,7 +300,10 @@ impl SemanticEngine {
             session,
             clip_preprocessor,
         });
-        Ok(elapsed_ms(started))
+        Ok((
+            elapsed_ms(started),
+            crate::semantic_metrics::cpu_ms() - cpu_started,
+        ))
     }
 }
 
@@ -492,6 +536,13 @@ fn load_session(
     let builder = builder
         .with_memory_pattern(false)
         .map_err(|error| format!("provider_unavailable: failed to set memory pattern: {error}"))?;
+    // Completed requests must release CPU before their job cap is restored.
+    let builder = builder
+        .with_config_entry("session.intra_op.allow_spinning", "0")
+        .and_then(|builder| builder.with_config_entry("session.inter_op.allow_spinning", "0"))
+        .map_err(|error| {
+            format!("provider_unavailable: failed to disable pool spinning: {error}")
+        })?;
     let builder = builder
         .with_config_entry("session.use_device_allocator_for_initializers", "0")
         .map_err(|error| {
@@ -566,6 +617,7 @@ fn validate_session_layout(
 fn run_transformer_embedding(
     loaded: &mut LoadedModel,
     tokens: &TokenizedBatch,
+    options: &RunOptions,
 ) -> Result<Vec<Vec<f32>>, String> {
     let input_ids = Tensor::from_array(([tokens.batch, tokens.sequence], tokens.input_ids.clone()))
         .map_err(|error| format!("inference: failed to build input_ids: {error}"))?;
@@ -581,11 +633,14 @@ fn run_transformer_embedding(
     .map_err(|error| format!("inference: failed to build token_type_ids: {error}"))?;
     let outputs = loaded
         .session
-        .run(ort::inputs![
-            "input_ids" => input_ids,
-            "attention_mask" => attention_mask,
-            "token_type_ids" => token_type_ids,
-        ])
+        .run_with_options(
+            ort::inputs![
+                "input_ids" => input_ids,
+                "attention_mask" => attention_mask,
+                "token_type_ids" => token_type_ids,
+            ],
+            options,
+        )
         .map_err(|error| format!("inference: transformer ONNX run failed: {error}"))?;
     let output = outputs
         .get("last_hidden_state")
@@ -630,6 +685,7 @@ fn run_transformer_embedding(
 fn run_clip_text(
     loaded: &mut LoadedModel,
     tokens: &TokenizedBatch,
+    options: &RunOptions,
 ) -> Result<Vec<Vec<f32>>, String> {
     let preprocessor = loaded
         .clip_preprocessor
@@ -654,11 +710,14 @@ fn run_clip_text(
     .map_err(|error| format!("inference: failed to build CLIP placeholder pixels: {error}"))?;
     let outputs = loaded
         .session
-        .run(ort::inputs![
-            "attention_mask" => attention_mask,
-            "input_ids" => input_ids,
-            "pixel_values" => pixels,
-        ])
+        .run_with_options(
+            ort::inputs![
+                "attention_mask" => attention_mask,
+                "input_ids" => input_ids,
+                "pixel_values" => pixels,
+            ],
+            options,
+        )
         .map_err(|error| format!("inference: CLIP text ONNX run failed: {error}"))?;
     extract_matrix(
         &outputs,
@@ -674,6 +733,7 @@ fn run_clip_image(
     batch: usize,
     preprocessor: &ClipPreprocessor,
     pixels: Vec<f32>,
+    options: &RunOptions,
 ) -> Result<Vec<Vec<f32>>, String> {
     let input_ids = Tensor::from_array(([batch, 1], vec![0i64; batch]))
         .map_err(|error| format!("inference: failed to build CLIP placeholder ids: {error}"))?;
@@ -692,11 +752,14 @@ fn run_clip_image(
     .map_err(|error| format!("inference: failed to build CLIP pixels: {error}"))?;
     let outputs = loaded
         .session
-        .run(ort::inputs![
-            "attention_mask" => attention_mask,
-            "input_ids" => input_ids,
-            "pixel_values" => pixels,
-        ])
+        .run_with_options(
+            ort::inputs![
+                "attention_mask" => attention_mask,
+                "input_ids" => input_ids,
+                "pixel_values" => pixels,
+            ],
+            options,
+        )
         .map_err(|error| format!("inference: CLIP image ONNX run failed: {error}"))?;
     extract_matrix(
         &outputs,
@@ -707,7 +770,11 @@ fn run_clip_image(
     )
 }
 
-fn run_reranker(loaded: &mut LoadedModel, tokens: &TokenizedBatch) -> Result<Vec<f32>, String> {
+fn run_reranker(
+    loaded: &mut LoadedModel,
+    tokens: &TokenizedBatch,
+    options: &RunOptions,
+) -> Result<Vec<f32>, String> {
     let input_ids = Tensor::from_array(([tokens.batch, tokens.sequence], tokens.input_ids.clone()))
         .map_err(|error| format!("inference: failed to build reranker input_ids: {error}"))?;
     let attention_mask = Tensor::from_array((
@@ -717,10 +784,13 @@ fn run_reranker(loaded: &mut LoadedModel, tokens: &TokenizedBatch) -> Result<Vec
     .map_err(|error| format!("inference: failed to build reranker attention_mask: {error}"))?;
     let outputs = loaded
         .session
-        .run(ort::inputs![
-            "input_ids" => input_ids,
-            "attention_mask" => attention_mask,
-        ])
+        .run_with_options(
+            ort::inputs![
+                "input_ids" => input_ids,
+                "attention_mask" => attention_mask,
+            ],
+            options,
+        )
         .map_err(|error| format!("inference: reranker ONNX run failed: {error}"))?;
     let output = outputs
         .get("logits")

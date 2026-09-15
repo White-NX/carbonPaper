@@ -435,6 +435,43 @@ pub struct FlatFileWriter {
 }
 
 impl FlatFileWriter {
+    pub fn resume(path: &Path, header: Header, rows: u64, key_bytes: u64) -> Result<Self, String> {
+        use std::io::Read;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        let mut bytes = [0u8; HEADER_BYTES as usize];
+        file.read_exact(&mut bytes).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                "ANN partial flat checkpoint mismatch".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
+        if bytes != header.encode()?
+            || file.metadata().map_err(|e| e.to_string())?.len() != header.file_len()?
+            || rows > header.row_count
+            || key_bytes > header.keys_bytes
+        {
+            return Err("ANN partial flat checkpoint mismatch".into());
+        }
+        Ok(Self {
+            file,
+            header,
+            next_key_offset: key_bytes,
+            keys_written: rows,
+            vectors_written: rows,
+            vector_bytes: Vec::new(),
+        })
+    }
+
+    pub fn sync_checkpoint(&mut self) -> Result<(), String> {
+        self.file
+            .sync_all()
+            .map_err(|e| format!("Failed to sync ANN input checkpoint: {e}"))
+    }
     pub fn create(path: &Path, header: Header) -> Result<Self, String> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -657,6 +694,27 @@ fn slice_at(bytes: &[u8], offset: u64, len: u64) -> Result<&[u8], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_flat_page_is_replayed_from_its_durable_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial.cpdvec");
+        let header = Header::for_snapshot(1, 2, 2, 2, "clip_image", "model", "rev", 96, 2).unwrap();
+        let mut writer = FlatFileWriter::create(&path, header.clone()).unwrap();
+        writer.push_key("a").unwrap();
+        writer.push_vector(&[1.0, 0.0]).unwrap();
+        writer.sync_checkpoint().unwrap();
+        writer.push_key("b").unwrap(); // crash before this page's vector / cursor
+        drop(writer);
+        let mut writer = FlatFileWriter::resume(&path, header, 1, 1).unwrap();
+        writer.push_key("b").unwrap();
+        writer.push_vector(&[0.0, 1.0]).unwrap();
+        writer.finish().unwrap();
+        let flat = MappedFlatIndex::open(&path).unwrap();
+        assert_eq!(flat.key(0).unwrap(), "a");
+        assert_eq!(flat.key(1).unwrap(), "b");
+        assert_eq!(flat.vector(1).unwrap(), &[0.0, 1.0]);
+    }
 
     #[test]
     fn round_trip_supports_unicode_paths_and_keys() {

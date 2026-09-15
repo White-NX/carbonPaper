@@ -5,11 +5,14 @@
 
 mod analysis;
 mod ann_format;
+mod ann_protocol;
 mod app_bound;
 #[cfg(feature = "app-bound-dev")]
 mod app_bound_dev;
 mod autostart;
 mod background_activity;
+mod background_policy;
+mod background_resources;
 mod background_scheduler;
 mod blind_index_repair;
 mod capture;

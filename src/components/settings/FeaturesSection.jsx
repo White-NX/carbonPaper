@@ -6,6 +6,7 @@ import FeatureModeCard from './organize/FeatureModeCard';
 import { FEATURE_MODE_OPTIONS, getFeatureMode } from './organize/featureModes';
 import ModelInventoryTable from './organize/ModelInventoryTable';
 import SmartClusterCard from './organize/SmartClusterCard';
+import BackgroundSchedulingCard from './organize/BackgroundSchedulingCard';
 import { useFeaturesController } from './useFeaturesController';
 import { ConfirmDialog } from '../ConfirmDialog';
 
@@ -41,6 +42,9 @@ export default function FeaturesSection({ monitorStatus }) {
     handleFeatureModeChange,
     handleCustomFeatureToggle,
     handleClusteringIntervalChange,
+    handleBackgroundTimingChange,
+    backgroundTimingSaving,
+    backgroundTimingError,
     handleRunClustering,
     handleDownloadReranker,
     handleDrainNow,
@@ -87,6 +91,13 @@ export default function FeaturesSection({ monitorStatus }) {
             onFeatureModeChange={handleFeatureModeChange}
             onCustomFeatureToggle={handleCustomFeatureToggle}
             onToggleCustomControls={() => setCustomControlsOpen((open) => !open)}
+          />
+
+          <BackgroundSchedulingCard
+            value={config.background_scheduling_mode || 'auto'}
+            saving={backgroundTimingSaving}
+            error={backgroundTimingError}
+            onChange={handleBackgroundTimingChange}
           />
 
           <ClusteringScheduleCard

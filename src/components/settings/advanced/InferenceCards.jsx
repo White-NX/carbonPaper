@@ -98,6 +98,23 @@ export function BackgroundSchedulerCard({ enabled, saving, status, onChange, onR
             <RefreshCw className="w-3.5 h-3.5" />
           </button>
         </div>
+        {status?.execution_profile && (
+          <details className="text-xs text-ide-muted">
+            <summary className="cursor-pointer">{t('settings.advanced.background_processing.diagnostics')}</summary>
+            <dl className="grid grid-cols-2 gap-2 mt-3">
+              <dt>{t('settings.advanced.background_processing.profile')}</dt><dd>{status.execution_profile}</dd>
+              <dt>{t('settings.advanced.background_processing.waitReason')}</dt><dd>{status.blocked_reason || '—'}</dd>
+              <dt>{t('settings.advanced.background_processing.pauses')}</dt><dd>{status.pauses?.total ?? 0}</dd>
+              <dt>{t('settings.advanced.background_processing.yieldLatency')}</dt><dd>{status.pauses?.last_yield_ms == null ? '—' : `${Math.round(status.pauses.last_yield_ms)} ms`}</dd>
+            </dl>
+            <table className="w-full mt-3 text-left">
+              <thead><tr><th>{t('settings.advanced.background_processing.task')}</th><th>{t('settings.advanced.background_processing.eligible')}</th><th>{t('settings.advanced.background_processing.backlogAge')}</th></tr></thead>
+              <tbody>{Object.entries(status.task_background_eligible || {}).map(([task, eligible]) => (
+                <tr key={task}><td className="py-1">{task}</td><td>{eligible ? t('settings.advanced.background_processing.verified') : t('settings.advanced.background_processing.pendingEvaluation')}</td><td>{Math.floor((status.backlog_age_ms?.[task] || 0) / 60000)} min</td></tr>
+              ))}</tbody>
+            </table>
+          </details>
+        )}
       </div>
     </div>
   );
