@@ -43,7 +43,7 @@ export default function MonitorServiceSection({
                         : 'text-red-500'
                 }`}
               >
-                {monitorStatus.toUpperCase()}
+                {t(`settings.monitorStates.${monitorStatus}`)}
               </span>
             </label>
             <p className="text-xs text-ide-muted">{t('settings.general.monitor.description')}</p>
@@ -113,6 +113,7 @@ export default function MonitorServiceSection({
             </div>
             <SettingsSwitch
               checked={autoStartMonitor}
+              disabled={autoStartMonitor === null}
               onChange={(next) => onAutoStartMonitorChange?.(next)}
               title={t('settings.general.monitor.autoStart.tooltip')}
             />

@@ -1,36 +1,48 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ShieldCheck } from 'lucide-react';
+import { SettingsDisclosure } from '../SettingsPrimitives';
+import { useSettingsActive, useSettingsActivity } from '../SettingsActivityContext';
 import {
   getAppBoundStatus, installAppBound, setAppBoundPolicy, uninstallAppBound, appBoundErrorMessage,
 } from '../../../lib/app_bound_api';
 
 export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
   const { t } = useTranslation();
+  const active = useSettingsActive();
   const [status, setStatus] = useState(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
+  const [statusError, setStatusError] = useState('');
   const [days, setDays] = useState(30);
   const [capacity, setCapacity] = useState(4096);
   const dirty = useRef(false);
+  useSettingsActivity('protected-processing', { dirty: dirty.current, busy });
   const mounted = useRef(false);
   const refresh = useCallback(async () => {
     try {
       const next = await getAppBoundStatus();
       if (!mounted.current) return;
       setStatus(next);
+      setStatusError('');
       if (!dirty.current && next?.limits) {
         setDays(next.limits.retention_days);
         setCapacity(next.limits.capacity_bytes / 1024 / 1024);
       }
-    } catch { /* Status is retried on the next poll. */ }
-  }, []);
+    } catch {
+      if (mounted.current) setStatusError(t('settings.feedback.readFailed'));
+    }
+  }, [t]);
   useEffect(() => {
     mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  useEffect(() => {
+    if (!active) return undefined;
     refresh();
     const timer = setInterval(refresh, 10000);
-    return () => { mounted.current = false; clearInterval(timer); };
-  }, [refresh]);
+    return () => clearInterval(timer);
+  }, [refresh, active]);
 
   const run = async (action) => {
     setBusy(true);
@@ -50,7 +62,7 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
   const canEnable = backgroundEnabled && status?.supported && (status?.installed || status?.package_available) && validLimits;
   const canRepair = status?.supported && status?.package_available;
   const needsRepair = status?.reason === 'repair_required';
-  const stateText = needsRepair ? t('appBound.waitingForRepair', '等待组件恢复') : status?.enabled
+  const stateText = !status ? t('settings.feedback.loading') : needsRepair ? t('appBound.waitingForRepair', '等待组件恢复') : status?.enabled
     ? status.available
       ? t('appBound.active', '已开启')
       : t('appBound.waitingForRepair', '等待组件恢复')
@@ -83,7 +95,7 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
         {status?.supported === false && <p className="text-xs text-ide-muted">
           {t('appBound.packageUnavailable', '此构建暂不提供该功能，请使用正式发布的安装包。')}
         </p>}
-        {status?.installed && <>
+        {status?.installed && <SettingsDisclosure title={t('settings.details.options')}>
           <div className="grid grid-cols-2 gap-3">
             <label className="space-y-1 text-xs text-ide-muted">
               <span>{t('appBound.retention', '待处理内容保留天数')}</span>
@@ -109,8 +121,9 @@ export default function ProtectedProcessingCard({ backgroundEnabled = true }) {
             <button type="button" disabled={busy} className="text-ide-muted disabled:opacity-50"
               onClick={() => run(uninstallAppBound)}>{t('appBound.uninstall', '移除后台组件')}</button>
           </div>
-        </>}
+        </SettingsDisclosure>}
         {message && <p role="alert" className="text-xs text-amber-600 dark:text-amber-400">{message}</p>}
+        {statusError && <p role="alert" className="text-xs text-ide-error">{statusError}</p>}
       </div>
     </section>
   );

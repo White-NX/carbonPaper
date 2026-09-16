@@ -1,10 +1,12 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChevronDown, Loader2, Play, X } from 'lucide-react';
-import { SettingsButton } from '../SettingsControls';
+import { SettingsButton, SettingsSelect } from '../SettingsControls';
+import { CLUSTERING_INTERVAL_OPTIONS } from '../advanced/advancedOptions';
 
 export default function ClusteringScheduleCard({
   config,
+  saving = false,
   monitorStatus,
   clusteringDropdownOpen,
   clusteringAdvancedOpen,
@@ -58,39 +60,8 @@ export default function ClusteringScheduleCard({
         <div className="flex-1 min-w-0">
           <p className="text-sm text-ide-muted">{t('settings.features.management.clustering.interval_label', '自动聚类间隔')}</p>
         </div>
-        <div className="relative">
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleDropdown();
-            }}
-            className="flex items-center gap-2 px-4 py-2 bg-ide-panel border border-ide-border rounded-lg text-sm text-ide-text hover:bg-ide-hover transition-colors min-w-[120px]"
-          >
-            <span className="flex-1 text-left">{t(`settings.advanced.clustering.intervals.${config.clustering_interval || '1w'}`)}</span>
-            <ChevronDown className={`w-4 h-4 text-ide-muted transition-transform ${clusteringDropdownOpen ? 'rotate-180' : ''}`} />
-          </button>
-          {clusteringDropdownOpen && (
-            <div
-              className="absolute right-0 top-full mt-2 w-40 bg-ide-panel border border-ide-border rounded-xl shadow-xl z-50 overflow-hidden"
-              onClick={(e) => e.stopPropagation()}
-            >
-              {['1d', '1w', '1m', '6m'].map((interval) => (
-                <button
-                  key={interval}
-                  onClick={async () => {
-                    await onIntervalChange(interval);
-                  }}
-                  className={`w-full px-4 py-2.5 text-left hover:bg-ide-hover transition-colors flex items-center justify-between ${interval === (config.clustering_interval || '1w') ? 'bg-ide-accent/10' : ''}`}
-                >
-                  <span className="text-sm text-ide-text">{t(`settings.advanced.clustering.intervals.${interval}`)}</span>
-                  {interval === (config.clustering_interval || '1w') && (
-                    <div className="w-2 h-2 rounded-full bg-ide-accent shrink-0" />
-                  )}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+        <SettingsSelect label={t('settings.features.management.clustering.interval_label')} value={config.clustering_interval || '1w'} disabled={saving}
+          options={CLUSTERING_INTERVAL_OPTIONS.map((value) => ({ value, label: t(`settings.advanced.clustering.intervals.${value}`) }))} onChange={onIntervalChange} />
       </div>
 
       {clusteringProgress && (clusteringProgress.active || (progressLabel !== clusteringError && progressLabel !== clusteringNotice)) && (
@@ -143,6 +114,7 @@ export default function ClusteringScheduleCard({
             <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto_1fr] gap-2 items-center">
               <input
                 type="date"
+                aria-label={t('settings.features.management.clustering.rangeStart')}
                 value={rangeStart}
                 disabled={clusteringRunning}
                 onChange={(e) => onRangeStartChange(e.target.value)}
@@ -151,6 +123,7 @@ export default function ClusteringScheduleCard({
               <span className="hidden sm:block text-xs text-ide-muted">-</span>
               <input
                 type="date"
+                aria-label={t('settings.features.management.clustering.rangeEnd')}
                 value={rangeEnd}
                 disabled={clusteringRunning}
                 onChange={(e) => onRangeEndChange(e.target.value)}

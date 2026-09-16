@@ -1,4 +1,5 @@
 import React from 'react';
+import { SettingsSelect } from '../SettingsControls';
 
 export default function StorageOptionSelect({
   label,
@@ -22,17 +23,13 @@ export default function StorageOptionSelect({
           {description && <div className="text-xs text-ide-muted mt-0.5">{description}</div>}
         </div>
       </div>
-      <select
+      <SettingsSelect
+        label={label}
         value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full bg-ide-panel border border-ide-border rounded-lg px-3 py-2 text-sm text-ide-text focus:outline-none focus:border-ide-accent cursor-pointer"
-      >
-        {options.map((opt) => (
-          <option key={opt.value} value={opt.value}>
-            {opt.label}
-          </option>
-        ))}
-      </select>
+        onChange={(next) => onChange(String(next))}
+        options={options}
+        className="w-full"
+      />
     </div>
   );
 }

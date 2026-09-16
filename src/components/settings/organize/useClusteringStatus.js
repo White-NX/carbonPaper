@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getClusteringStatus } from '../../../lib/task_api';
 
-export function useClusteringStatus(monitorStatus, requestPending) {
+export function useClusteringStatus(monitorStatus, requestPending, active = true) {
   const [clusteringStatus, setClusteringStatus] = useState(null);
   const mounted = useRef(false);
   const generation = useRef(0);
@@ -51,7 +51,7 @@ export function useClusteringStatus(monitorStatus, requestPending) {
   }, [monitorStatus]);
 
   useEffect(() => {
-    if (monitorStatus !== 'running') return;
+    if (!active || monitorStatus !== 'running') return;
     let cancelled = false;
     let timer;
     const poll = async () => {
@@ -68,7 +68,7 @@ export function useClusteringStatus(monitorStatus, requestPending) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [monitorStatus, requestPending, refreshClusteringStatus]);
+  }, [monitorStatus, requestPending, refreshClusteringStatus, active]);
 
   return { clusteringStatus, refreshClusteringStatus };
 }

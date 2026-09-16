@@ -1086,7 +1086,7 @@ pub async fn install_spacy_model(
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     model_name: String,
 ) -> Result<String, String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
     install_spacy_model_impl(app, model_name).await

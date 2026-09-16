@@ -1,4 +1,7 @@
-import React, { useEffect } from 'react';
+import React, { useId } from 'react';
+import { createPortal } from 'react-dom';
+import { useDialogFocus, useDialogVisibility } from '../hooks/useDialogFocus';
+import { useTranslation } from 'react-i18next';
 import PropTypes from 'prop-types';
 import { X } from 'lucide-react';
 import { cn } from '../lib/utils';
@@ -14,30 +17,24 @@ export function Dialog({
   disableClose = false,
   hideCloseButton = false,
 }) {
-  useEffect(() => {
-    const handleEscape = (e) => {
-      if (!disableClose && e.key === 'Escape') onClose();
-    };
+  const titleId = useId();
+  const { t } = useTranslation();
+  const visible = useDialogVisibility(isOpen);
+  const dialogRef = useDialogFocus(visible, onClose, disableClose);
 
-    if (isOpen) {
-      document.addEventListener('keydown', handleEscape);
-      document.body.style.overflow = 'hidden';
-    }
+  if (!visible) return null;
 
-    return () => {
-      document.removeEventListener('keydown', handleEscape);
-      document.body.style.overflow = 'unset';
-    };
-  }, [isOpen, onClose, disableClose]);
-
-  if (!isOpen) return null;
-
-  return (
+  return createPortal(
     <div 
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200"
       onClick={disableClose ? undefined : onClose}
     >
-      <div 
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
         className={cn(
           "relative w-full bg-ide-bg border border-ide-border rounded-lg shadow-2xl flex flex-col max-h-[90vh] animate-in zoom-in-95 duration-200",
           maxWidth,
@@ -46,11 +43,12 @@ export function Dialog({
         onClick={e => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-ide-border bg-ide-panel shrink-0 rounded-t-lg">
-          <h3 className="text-sm font-semibold uppercase tracking-wide text-ide-muted select-none">
+          <h3 id={titleId} className="text-sm font-semibold text-ide-muted select-none">
             {title}
           </h3>
           {!hideCloseButton && !disableClose && (
             <button 
+              aria-label={t('common.close')}
               onClick={onClose}
               className="text-ide-muted hover:text-ide-text transition-colors p-1 hover:bg-ide-hover rounded"
             >
@@ -63,7 +61,7 @@ export function Dialog({
           {children}
         </div>
       </div>
-    </div>
+    </div>, document.body
   );
 }
 

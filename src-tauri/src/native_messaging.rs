@@ -257,9 +257,11 @@ pub fn sync_installed_extension() -> Result<bool, String> {
 
 #[tauri::command]
 pub async fn get_nm_host_status() -> Result<serde_json::Value, String> {
+    let extension_path = get_extension_install_dir().join("extension");
     Ok(json!({
         "chrome": is_nm_host_registered(CHROME_REG_KEY),
         "edge": is_nm_host_registered(EDGE_REG_KEY),
+        "extension_path": extension_path.is_dir().then(|| extension_path.to_string_lossy().into_owned()),
     }))
 }
 
@@ -268,7 +270,7 @@ pub async fn register_nm_host_chrome(
     window: tauri::Window,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
 ) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
     // Use wildcard for allowed_origins to support any extension ID during development
@@ -281,7 +283,7 @@ pub async fn register_nm_host_edge(
     window: tauri::Window,
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
 ) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
     let manifest_path = write_nm_manifest(&[EXTENSION_ID])?;
@@ -294,7 +296,7 @@ pub async fn install_browser_extension(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     browser: String,
 ) -> Result<serde_json::Value, String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
     // 1. Copy extension files

@@ -69,6 +69,16 @@ fn signals(app: &AppHandle, staged: bool) -> AdmissionSignals {
     }
 }
 
+fn describe_auth_gate(app: &AppHandle, reason: &'static str) -> &'static str {
+    if reason == "waiting_for_unlock" {
+        app.state::<Arc<StorageState>>()
+            .silent_read_wait_reason()
+            .unwrap_or(reason)
+    } else {
+        reason
+    }
+}
+
 impl AdaptiveRuntime {
     pub(super) fn cancel_active(&self, reason: &'static str) {
         if let Some(active) = self
@@ -168,7 +178,10 @@ impl AdaptiveRuntime {
             .unwrap_or_else(|e| e.into_inner())
             .contains(kind.as_str())
         {
-            return Err(activity.hard_gate().unwrap_or("waiting_for_evaluation"));
+            return Err(describe_auth_gate(
+                app,
+                activity.hard_gate().unwrap_or("waiting_for_evaluation"),
+            ));
         }
         let qualified = self
             .book
@@ -184,6 +197,7 @@ impl AdaptiveRuntime {
             &self.resources.lock().unwrap_or_else(|e| e.into_inner()),
             self.now(),
         )
+        .map_err(|reason| describe_auth_gate(app, reason))
     }
 
     pub(super) fn begin(
@@ -224,40 +238,43 @@ impl AdaptiveRuntime {
             return;
         };
         let signals = signals(app, active.staged);
-        let reason = signals.hard_gate().or_else(|| {
-            if app.state::<Arc<StorageState>>().db_generation() != active.db_generation {
-                Some("database_changed")
-            } else if runtime.manual_request_generation.load(Ordering::SeqCst)
-                != active.manual_generation
-            {
-                Some("manual_request_pending")
-            } else if app
-                .state::<Arc<SemanticRuntimeState>>()
-                .external_background_waiting()
-            {
-                Some("external_background_request")
-            } else if active.lease.profile == ExecutionProfile::Idle
-                && signals.idle_secs
-                    < if active.lease.task == TASK_PYTHON_CLUSTERING {
-                        LEGACY_CLUSTER_IDLE_SECS
+        let reason = signals
+            .hard_gate()
+            .map(|reason| describe_auth_gate(app, reason))
+            .or_else(|| {
+                if app.state::<Arc<StorageState>>().db_generation() != active.db_generation {
+                    Some("database_changed")
+                } else if runtime.manual_request_generation.load(Ordering::SeqCst)
+                    != active.manual_generation
+                {
+                    Some("manual_request_pending")
+                } else if app
+                    .state::<Arc<SemanticRuntimeState>>()
+                    .external_background_waiting()
+                {
+                    Some("external_background_request")
+                } else if active.lease.profile == ExecutionProfile::Idle
+                    && signals.idle_secs
+                        < if active.lease.task == TASK_PYTHON_CLUSTERING {
+                            LEGACY_CLUSTER_IDLE_SECS
+                        } else {
+                            SHORT_IDLE_SECS
+                        }
+                {
+                    Some("input_resumed")
+                } else if active.lease.profile == ExecutionProfile::Background {
+                    if configured_mode() == SchedulingMode::IdleOnly {
+                        Some("waiting_for_idle")
                     } else {
-                        SHORT_IDLE_SECS
+                        self.resources
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .retain(self.now(), active.additional_peak, active.disk)
                     }
-            {
-                Some("input_resumed")
-            } else if active.lease.profile == ExecutionProfile::Background {
-                if configured_mode() == SchedulingMode::IdleOnly {
-                    Some("waiting_for_idle")
                 } else {
-                    self.resources
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .retain(self.now(), active.additional_peak, active.disk)
+                    None
                 }
-            } else {
-                None
-            }
-        });
+            });
         if let Some(reason) = reason {
             active.lease.revoke(reason);
         }

@@ -28,7 +28,7 @@ export default function StorageOverviewCard({
         </div>
       </div>
 
-      <div className="flex flex-col lg:flex-row items-center gap-8">
+      <div className="settings-storage-overview flex items-center gap-8">
         <div className="flex-shrink-0">
           <StorageRingChart
             totalDiskUsed={diskInfo.usedSize}
@@ -38,7 +38,7 @@ export default function StorageOverviewCard({
           />
         </div>
 
-        <div className="flex-1 space-y-4">
+        <div className="min-w-0 w-full flex-1 space-y-4">
           <div className="space-y-2">
             <div className="flex items-center gap-3">
               <div className="w-3 h-3 rounded-full bg-gradient-to-r from-purple-500 to-purple-400" />

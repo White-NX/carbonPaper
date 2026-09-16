@@ -10,6 +10,23 @@
 @tailwind components;
 @tailwind utilities;
 
+.settings-surface { container-type: inline-size; }
+.settings-storage-overview { flex-direction: row; }
+.settings-choices { grid-template-columns: repeat(var(--settings-columns, 2), minmax(0, 1fr)); }
+.settings-disclosure > summary::-webkit-details-marker { display: none; }
+.settings-disclosure[open] > summary .settings-disclosure-chevron { transform: rotate(180deg); }
+.settings-surface :is(button, input, select, textarea, summary, a):focus-visible {
+  outline: 2px solid var(--ide-accent);
+  outline-offset: 3px;
+}
+@container (max-width: 540px) {
+  .settings-choices { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-surface .settings-policy-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@container (max-width: 600px) {
+  .settings-storage-overview { flex-direction: column; }
+}
+
 :root {
   font-family: 'Source Han Sans SC', system-ui, sans-serif;
   color: var(--ide-text);

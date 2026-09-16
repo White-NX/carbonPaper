@@ -491,7 +491,11 @@ impl StorageState {
     /// live UI session therefore authorizes them even when unattended work is
     /// disabled, while automatic scheduling requires the background lease.
     pub(crate) fn is_silent_read_authorized(&self) -> bool {
-        self.is_session_valid() || self.is_background_authorized()
+        self.credential_state.protected_read_authorized()
+    }
+
+    pub(crate) fn silent_read_wait_reason(&self) -> Option<&'static str> {
+        self.credential_state.protected_read_wait_reason()
     }
 
     /// The identity of the currently open database file.

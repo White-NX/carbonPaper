@@ -31,6 +31,7 @@ export default function PiiDetectionSection({
           </p>
         </div>
         <SettingsSwitch
+          title={t('settings.ai_embedding.content_filter.pii.title')}
           checked={piiEnabled}
           onChange={onPiiToggle}
         />

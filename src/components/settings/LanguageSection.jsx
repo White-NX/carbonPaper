@@ -1,6 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Check } from 'lucide-react';
+import { changeAppLanguage } from '../../i18n';
 
 const LANGUAGES = [
   { value: 'zh-CN', label: '简体中文', nativeName: '简体中文' },
@@ -11,8 +12,7 @@ export default function LanguageSection() {
   const { t, i18n } = useTranslation();
 
   const handleSelect = (lang) => {
-    i18n.changeLanguage(lang);
-    localStorage.setItem('language', lang);
+    changeAppLanguage(lang);
   };
 
   return (

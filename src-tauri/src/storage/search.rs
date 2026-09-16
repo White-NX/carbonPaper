@@ -1211,7 +1211,7 @@ impl StorageState {
             .filter_map(|id| grouped.remove(&id))
             .collect();
 
-        let decrypted = unwrap_batch_parallel(batches, |session, rows| {
+        let decrypted = unwrap_batch_parallel(&self.credential_state, batches, |session, rows| {
             let unwrap = |ciphertext: &[u8]| session.unwrap_row_key(ciphertext);
             let mut screenshot_key = rows
                 .first()
@@ -1359,14 +1359,14 @@ impl StorageState {
         Ok(rows)
     }
 
-    /// Decrypts candidate text, one CNG session per worker thread.
+    /// Decrypts candidate text using the authenticated credential context.
     ///
     /// A row that cannot be decrypted comes back with empty text rather than
     /// failing the search: it will score nothing and be dropped, which is the
     /// same outcome as never having proposed it. A locked session is different
     /// and does fail, because every remaining row would fail the same way.
-    fn decrypt_candidates(rows: Vec<CandidateRow>) -> Result<Vec<VerifiedRow>, String> {
-        unwrap_batch_parallel(rows, |session, row| {
+    fn decrypt_candidates(&self, rows: Vec<CandidateRow>) -> Result<Vec<VerifiedRow>, String> {
+        unwrap_batch_parallel(&self.credential_state, rows, |session, row| {
             let text = Self::decrypt_payload_with_unwrap(&row.text_enc, &row.text_key_enc, &|c| {
                 session.unwrap_row_key(c)
             });
@@ -1661,7 +1661,7 @@ impl StorageState {
             .map(|candidate| candidate.ocr_id)
             .collect();
         let rows = self.load_candidate_rows(&conn, &ids, &mut telemetry.counts)?;
-        let verified = Self::decrypt_candidates(rows)?;
+        let verified = self.decrypt_candidates(rows)?;
         telemetry.counts.verified += verified.len();
 
         for row in verified {

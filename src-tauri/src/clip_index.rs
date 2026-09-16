@@ -13,7 +13,7 @@ use crate::clip_migration::{
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
 use crate::ml_protocol::{MlImageInput, MlSemanticModel};
-use crate::semantic_runtime::{IndexRunProgress, SemanticRuntimeState};
+use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{
     BackgroundReadError, DerivedEmbeddingWrite, DerivedIndexJobSpec, DerivedIndexKind, StorageState,
 };
@@ -21,10 +21,10 @@ use chrono::{Duration as ChronoDuration, Utc};
 use image::RgbImage;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// How often the worker asks whether the machine has gone idle.
 /// Subjects claimed from the ledger per drain.
@@ -444,6 +444,9 @@ async fn run_scheduled_request(
 ) -> Result<ScheduledSliceResult, String> {
     let run = app.state::<Arc<ClipIndexRunState>>().inner().clone();
     let _active = manual.then(|| run.begin());
+    if manual && run.stopped_by_user() {
+        return Ok(ScheduledSliceResult::skipped(STOPPED_BY_USER));
+    }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     if manual {
         // See the MiniLM counterpart: a click that arrived during an earlier
@@ -522,76 +525,7 @@ pub struct ClipIndexRunSummary {
     pub skipped_reason: Option<String>,
 }
 
-#[derive(Default)]
-pub struct ClipIndexRunState {
-    running: AtomicBool,
-    stop_requested: AtomicBool,
-    processed: AtomicU64,
-    indexed: AtomicU64,
-    total: AtomicU64,
-}
-
-impl ClipIndexRunState {
-    /// Ask the running pass to stop after the image it is encoding. A request in
-    /// flight cannot be interrupted, so this is prompt rather than immediate.
-    pub fn request_stop(&self) {
-        self.stop_requested.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-
-    fn stopped_by_user(&self) -> bool {
-        self.stop_requested.load(Ordering::SeqCst)
-    }
-
-    /// Counters as they stand, for a caller that polls rather than listens.
-    ///
-    /// The progress event is the primary channel and stays that way; this exists
-    /// for the search box, which can mount in the middle of a run that has been
-    /// going for hours and would otherwise show nothing until the next chunk
-    /// lands. Reads four atomics and touches neither the worker nor the
-    /// database, which is what makes it safe on a poll loop.
-    pub fn progress(&self) -> IndexRunProgress {
-        IndexRunProgress {
-            running: self.running.load(Ordering::SeqCst),
-            processed: self.processed.load(Ordering::SeqCst),
-            indexed: self.indexed.load(Ordering::SeqCst),
-            total: self.total.load(Ordering::SeqCst),
-        }
-    }
-
-    fn begin(self: &Arc<Self>) -> ActiveRun {
-        self.stop_requested.store(false, Ordering::SeqCst);
-        self.processed.store(0, Ordering::SeqCst);
-        self.indexed.store(0, Ordering::SeqCst);
-        self.total.store(0, Ordering::SeqCst);
-        self.running.store(true, Ordering::SeqCst);
-        ActiveRun(self.clone())
-    }
-
-    fn report_chunk(&self, app: &AppHandle, processed: u64, indexed: u64) {
-        let processed_total = self.processed.fetch_add(processed, Ordering::SeqCst) + processed;
-        let indexed_total = self.indexed.fetch_add(indexed, Ordering::SeqCst) + indexed;
-        let _ = app.emit(
-            CLIP_INDEX_PROGRESS_EVENT,
-            serde_json::json!({
-                "processed": processed_total,
-                "indexed": indexed_total,
-                "total": self.total.load(Ordering::SeqCst),
-            }),
-        );
-    }
-}
-
-struct ActiveRun(Arc<ClipIndexRunState>);
-
-impl Drop for ActiveRun {
-    fn drop(&mut self) {
-        self.0.running.store(false, Ordering::SeqCst);
-    }
-}
+pub type ClipIndexRunState = crate::index_progress::IndexRunState<true>;
 
 /// Whether background CLIP work may run right now.
 ///
@@ -790,7 +724,7 @@ async fn run_pass(
             })
             .await
             .unwrap_or(0);
-            run.total.store(total, Ordering::SeqCst);
+            run.set_remaining(total);
             drain_until_done(app, storage, mode).await
         }
     }
@@ -1005,9 +939,7 @@ async fn drain_queue(
             }
             Err(chunk_failure) => {
                 outcome.failed += chunk_len;
-                if mode.is_manual() {
-                    run.report_chunk(app, chunk_len, 0);
-                }
+                // Failed subjects remain queued; attempts are not completed progress.
                 // Whatever broke the worker breaks every remaining chunk the
                 // same way, and charging the retry budget for an attempt that
                 // was never made would spend it on the worker's behalf.
@@ -1131,6 +1063,19 @@ async fn encode_chunk(
         preparation.complete();
     }
 
+    // Losing consent is a resumable task failure, not an unreadable image.
+    // Preserve every claim so the scheduler can wait for an explicit unlock.
+    if decoded
+        .iter()
+        .any(|result| matches!(result, Err(BackgroundReadError::AuthRequired)))
+    {
+        return Err(EncodeChunkFailure {
+            error: "AUTH_REQUIRED".to_string(),
+            claimed,
+            deferred_reason: None,
+        });
+    }
+
     // Partition before submitting: an unreadable image must not cost the
     // readable ones in the same chunk their attempt.
     let mut encodable = Vec::with_capacity(claimed.len());
@@ -1146,7 +1091,7 @@ async fn encode_chunk(
             &job.spec,
             &job.lease_token,
             "image_unreadable",
-            &error,
+            &error.to_string(),
         );
         forget_prepared(&job.image_hash);
         tracing::warn!("[CLIP:INDEX] discarded {}: {error}", job.spec.subject_key);
@@ -1280,25 +1225,29 @@ struct DecodedImage {
 /// collection was keyed under, so the subject key needs no translation to reach
 /// the bytes. "Silent" matters: this runs unattended, and CNG must not raise a
 /// consent dialog behind an idle worker.
-fn load_images(storage: &StorageState, hashes: &[String]) -> Vec<Result<DecodedImage, String>> {
+fn load_images(
+    storage: &StorageState,
+    hashes: &[String],
+) -> Vec<Result<DecodedImage, BackgroundReadError>> {
     hashes
         .iter()
         .map(|hash| {
             if let Some(prepared) = prepared_image(hash) {
                 return Ok(prepared);
             }
-            let (bytes, _format) = storage
-                .read_image_bytes_silent(&clip_memory_uri(hash))
-                .map_err(|error| format!("failed to read the image: {error}"))?;
-            let decoded = image::load_from_memory(&bytes)
-                .map_err(|error| format!("failed to decode the image: {error}"))?;
+            let (bytes, _format) = storage.read_image_bytes_silent(&clip_memory_uri(hash))?;
+            let decoded = image::load_from_memory(&bytes).map_err(|error| {
+                BackgroundReadError::Other(format!("failed to decode the image: {error}"))
+            })?;
             // RGB8 because that is what `preprocess_clip_images` reconstructs;
             // the alpha of a transparent capture is dropped here rather than
             // being resized into a channel the model does not read.
             let rgb = decoded.to_rgb8();
             let (width, height) = (rgb.width(), rgb.height());
             if width == 0 || height == 0 {
-                return Err("the image has a zero dimension".to_string());
+                return Err(BackgroundReadError::Other(
+                    "the image has a zero dimension".to_string(),
+                ));
             }
             Ok(DecodedImage {
                 width,
@@ -1627,11 +1576,12 @@ async fn reconcile_missing(
 #[tauri::command]
 pub async fn clip_index_run_now(
     app: AppHandle,
+    window: tauri::Window,
     credential: tauri::State<'_, Arc<CredentialManagerState>>,
     run: tauri::State<'_, Arc<ClipIndexRunState>>,
 ) -> Result<ClipIndexRunSummary, String> {
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential)?;
-    let _ = run;
     let scheduler = app
         .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
         .ok_or_else(|| "Background scheduler is unavailable".to_string())?;
@@ -1642,6 +1592,7 @@ pub async fn clip_index_run_now(
     })
     .await
     .map_err(|error| format!("clip retry reset task failed: {error}"))??;
+    run.request_run();
     scheduler.enqueue(
         &app,
         crate::background_scheduler::BackgroundTaskKind::ClipIndex,
@@ -1690,7 +1641,7 @@ pub async fn clip_index_stop_now(
     app: AppHandle,
     run: tauri::State<'_, Arc<ClipIndexRunState>>,
 ) -> Result<bool, String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     let was_running = run.is_running();
     run.request_stop();
     let storage = app.state::<Arc<StorageState>>().inner().clone();
@@ -1944,6 +1895,15 @@ pub async fn set_clip_backfill_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_needing_unlock_is_not_classified_as_unreadable() {
+        let directory = tempfile::tempdir().unwrap();
+        let credential = Arc::new(CredentialManagerState::new(directory.path().to_path_buf()));
+        let storage = StorageState::new(directory.path().to_path_buf(), credential);
+        let images = load_images(&storage, &["locked-image".to_string()]);
+        assert!(matches!(&images[0], Err(BackgroundReadError::AuthRequired)));
+    }
 
     fn prepared(bytes: usize, age: Duration) -> PreparedCapture {
         PreparedCapture {

@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { fetchThumbnail } from '../lib/monitor_api';
 import { CATEGORY_COLORS } from '../lib/categories';
 import { cn } from '../lib/utils';
+import { usePreference } from '../lib/preference_store';
 
 export function CategoryBadge({ category }) {
   if (!category) return null;
@@ -69,14 +70,8 @@ export function ThumbnailCard({
     path: item.image_path || item.metadata?.image_path || item.path,
   };
 
-  let cardClickBehavior = 'preview';
-  if (sourceType === 'search') {
-    cardClickBehavior = localStorage.getItem('cardClickBehavior_search') || 'preview';
-  } else if (sourceType === 'tasks') {
-    cardClickBehavior = localStorage.getItem('cardClickBehavior_tasks') || 'standalone';
-  } else if (sourceType === 'clusters') {
-    cardClickBehavior = localStorage.getItem('cardClickBehavior_clusters') || 'standalone';
-  }
+  const clickScope = ['search', 'tasks', 'clusters'].includes(sourceType) ? sourceType : 'preview';
+  const cardClickBehavior = usePreference(`cardClickBehavior_${clickScope}`, ['tasks', 'clusters'].includes(clickScope) ? 'standalone' : 'preview');
   const isStandaloneDefault = cardClickBehavior === 'standalone' && !!onOpenFloatingPreview;
 
   const handleSelect = (event) => {

@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import Timeline from './components/Timeline';
-import SettingsDialog from './components/settings/SettingsDialog';
+import { useSettingsHost } from './hooks/useSettingsHost';
+import { useSavedCaptureFilters } from './components/settings/hooks/useSavedCaptureFilters';
 import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
 import SecurityAlertMask from './components/SecurityAlertMask';
@@ -53,7 +54,6 @@ function App() {
     };
   }, []);
 
-  const [showSettings, setShowSettings] = useState(false);
   const [showOcrModelRepair, setShowOcrModelRepair] = useState(false);
   const [activeTab, setActiveTab] = useState('preview');
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
@@ -62,7 +62,6 @@ function App() {
   const [timelineSearch, setTimelineSearch] = useState(null);
 
   const openOcrModelRepair = useCallback(() => {
-    setShowSettings(false);
     setShowOcrModelRepair(true);
     invoke('take_ocr_model_repair_request').catch(() => {});
   }, []);
@@ -128,6 +127,7 @@ function App() {
     handleStartBackend,
     handlePauseMonitor,
     handleResumeMonitor,
+    handleSettingsMonitorAction,
   } = useMonitorLifecycle({
     pythonVersion,
     depsNeedUpdate,
@@ -171,6 +171,13 @@ function App() {
     clearSelection,
     bumpTimelineRefresh,
   } = useSelectedSnapshot();
+  const { showSettings, openSettings } = useSettingsHost({
+    onMonitorAction: handleSettingsMonitorAction,
+    onRecordsChanged: bumpTimelineRefresh,
+    onClosed: refreshPythonVersion,
+    onError: (error) => reportBackendError(t('settings.title'), String(error)),
+  });
+  useSavedCaptureFilters({ monitorStatus: backendStatus === 'online' ? 'running' : backendStatus, enabled: isAuthenticated });
   const {
     updateModalVisible,
     updateInfo,
@@ -245,7 +252,7 @@ function App() {
       <TopBar
         darkMode={darkMode}
         setDarkMode={setDarkMode}
-        setShowSettings={setShowSettings}
+        setShowSettings={() => openSettings()}
         showNotifications={showNotifications}
         setShowNotifications={setShowNotifications}
         isMaximized={isMaximized}
@@ -421,26 +428,6 @@ function App() {
       />
 
       <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings && !updateModalVisible && !showExtensionSetup && !showClusteringSetup && !showSmartClusterSetup} />
-
-      <SettingsDialog
-        isOpen={showSettings && isAuthenticated}
-        onClose={() => {
-          setShowSettings(false);
-          refreshPythonVersion();
-        }}
-        autoStartMonitor={autoStartMonitor}
-        onRecordsDeleted={bumpTimelineRefresh}
-        powerSavingSuppressed={powerSavingSuppressed}
-        powerSavingMode={powerSavingMode}
-        onPowerSavingModeChange={setPowerSavingMode}
-        onAutoStartMonitorChange={setAutoStartMonitor}
-        onManualStartMonitor={handleManualStartMonitor}
-        onManualStopMonitor={handleManualStopMonitor}
-        sessionTimeout={sessionTimeout}
-        onSessionTimeoutChange={setSessionTimeout}
-        isSessionValid={isAuthenticated}
-        onLockSession={handleLockSession}
-      />
 
       <OcrModelRepairCard
         isOpen={showOcrModelRepair}

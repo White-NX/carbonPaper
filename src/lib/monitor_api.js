@@ -698,16 +698,10 @@ export const getSmartClusterWorkerStatus = async () => {
 export const getBackgroundIndexProgress = async () => {
     try {
         const response = await invoke('get_background_index_progress');
-        return {
-            semantic: response?.semantic || { running: false, processed: 0, indexed: 0, total: 0 },
-            clip: response?.clip || { running: false, processed: 0, indexed: 0, total: 0 },
-        };
+        return response?.error ? null : response;
     } catch (e) {
         console.warn('Failed to get background index progress', e);
-        return {
-            semantic: { running: false, processed: 0, indexed: 0, total: 0 },
-            clip: { running: false, processed: 0, indexed: 0, total: 0 },
-        };
+        return null;
     }
 };
 

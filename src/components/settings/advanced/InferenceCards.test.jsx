@@ -105,7 +105,7 @@ describe('manual index phases', () => {
     );
 
     expect(screen.getByText('settings.advanced.semantic_backend.run_retry_wait')).toBeInTheDocument();
-    expect(screen.queryByText('settings.advanced.semantic_backend.run_stop')).not.toBeInTheDocument();
+    expect(screen.getByText('settings.advanced.semantic_backend.run_stop')).toBeInTheDocument();
     fireEvent.click(screen.getByText('settings.advanced.semantic_backend.run_retry'));
     expect(onRun).toHaveBeenCalledTimes(1);
     expect(onStop).not.toHaveBeenCalled();
@@ -131,6 +131,32 @@ describe('manual index phases', () => {
 
     fireEvent.click(screen.getByText('settings.advanced.semantic_backend.run_stop'));
     expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows stopping feedback for a queued task', () => {
+    render(<ClipBackendCard status={{ clip_backend: {} }} indexPhase="queued" indexStopping />);
+    expect(screen.getByText('settings.advanced.clip_backend.run_stopping')).toBeInTheDocument();
+    expect(screen.getByText('settings.advanced.clip_backend.run_stop_pending')).toBeDisabled();
+    expect(screen.queryByText('settings.advanced.clip_backend.run_queued')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['waiting_for_unlock', 'run_unlock'],
+    ['waiting_for_verification', 'run_verify'],
+  ])('preserves progress during %s and offers resume and stop', (phase, action) => {
+    const resume = vi.fn();
+    const stop = vi.fn();
+    render(<ClipBackendCard status={{ clip_backend: {} }} indexPhase={phase}
+      indexProgress={{ processed: 4, total: 10 }} onRunIndexNow={resume} onStopIndexNow={stop} />);
+    expect(screen.getByRole('progressbar')).toHaveAttribute('value', '0.4');
+    expect(screen.getByText(`settings.advanced.clip_backend.run_${phase}`)).toBeInTheDocument();
+    if (phase === 'waiting_for_verification') {
+      expect(screen.queryByText('settings.advanced.clip_backend.run_unlock')).not.toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByText(`settings.advanced.clip_backend.${action}`));
+    fireEvent.click(screen.getByText('settings.advanced.clip_backend.run_stop'));
+    expect(resume).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it('does not keep showing a stale queued summary after the scheduler finishes', () => {

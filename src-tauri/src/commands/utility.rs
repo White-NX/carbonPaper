@@ -505,6 +505,13 @@ pub async fn switch_to_lightweight_mode(
     app: tauri::AppHandle,
     lightweight_state: tauri::State<'_, Arc<LightweightModeState>>,
 ) -> Result<(), String> {
+    if let Some(settings) = app.get_webview_window(crate::settings_window::LABEL) {
+        use tauri::Emitter;
+        settings
+            .emit("settings-close-requested", true)
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     tracing::info!("Switching to lightweight mode");
 
     // Cancel any pending automatic mode switch.
@@ -603,7 +610,7 @@ pub fn set_lightweight_config(
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     config: serde_json::Value,
 ) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
     if let Some(start_hidden) = config
@@ -640,7 +647,7 @@ pub fn open_path(
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     path: String,
 ) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
     let p = std::path::Path::new(&path);

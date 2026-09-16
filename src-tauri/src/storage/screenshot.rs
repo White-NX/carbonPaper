@@ -2,6 +2,7 @@
 
 use crate::credential_manager::{
     decrypt_with_master_key, encrypt_with_master_key, CngKeySession, CredentialError,
+    CredentialManagerState,
 };
 use chrono::{DateTime, Utc};
 use rand::RngCore;
@@ -109,32 +110,31 @@ impl EncryptedScreenshotSummaryRow {
     }
 }
 
-/// Upper bound for CNG unwrap worker threads. The RSA work runs inside the
-/// key-isolation service, which stops scaling beyond a few concurrent
-/// callers, and background reads must not saturate every core.
+/// Bound parallel payload decoding so background reads leave cores for the UI.
 const CNG_UNWRAP_MAX_THREADS: usize = 8;
 
-fn open_cng_session() -> Result<CngKeySession, BackgroundReadError> {
-    CngKeySession::open_silent().map_err(|error| match error {
+fn open_cng_session(
+    credential: &CredentialManagerState,
+) -> Result<CngKeySession<'_>, BackgroundReadError> {
+    CngKeySession::open_silent(credential).map_err(|error| match error {
         CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
         other => BackgroundReadError::Other(format!("Failed to open CNG session: {other}")),
     })
 }
 
-/// Runs RPC-bound row-key unwrapping in parallel. Items are split into
-/// contiguous chunks; every worker thread opens its own [`CngKeySession`], so
-/// a batch pays the provider/key-open round-trip once per thread instead of
-/// once per row and no NCrypt handle receives concurrent calls. Input order
-/// is preserved. Any `AuthRequired` fails the whole batch with `AuthRequired`
-/// so callers keep their wait-for-unlock semantics.
+/// Decode row batches in parallel, borrowing the authenticated credential
+/// context in each worker. Only the NCrypt calls are serialized; workers can
+/// decrypt and decode payloads concurrently without opening unauthenticated
+/// native handles. Preserve input order and fail the whole batch on AuthRequired.
 pub(super) fn unwrap_batch_parallel<T, R, F>(
+    credential: &CredentialManagerState,
     items: Vec<T>,
     process: F,
 ) -> Result<Vec<R>, BackgroundReadError>
 where
     T: Send,
     R: Send,
-    F: Fn(&CngKeySession, T) -> Result<R, BackgroundReadError> + Sync,
+    F: Fn(&CngKeySession<'_>, T) -> Result<R, BackgroundReadError> + Sync,
 {
     if items.is_empty() {
         return Ok(Vec::new());
@@ -146,7 +146,7 @@ where
         .min(items.len())
         .max(1);
     if threads == 1 {
-        let session = open_cng_session()?;
+        let session = open_cng_session(credential)?;
         return items
             .into_iter()
             .map(|item| process(&session, item))
@@ -169,7 +169,7 @@ where
             .into_iter()
             .map(|chunk| {
                 scope.spawn(|| {
-                    let session = open_cng_session()?;
+                    let session = open_cng_session(credential)?;
                     chunk
                         .into_iter()
                         .map(|item| process(&session, item))
@@ -1444,7 +1444,7 @@ impl StorageState {
         // Phase 2: decrypt outside the mutex.
         Ok(raw_rows
             .into_iter()
-            .map(RawRecentCaptureRow::into_capture)
+            .map(|raw| raw.into_capture(&self.credential_state))
             .collect())
     }
 
@@ -1564,8 +1564,10 @@ impl StorageState {
         let query_elapsed = diag_start.elapsed();
 
         // Phase 2: Decrypt outside mutex
-        let records: Vec<ScreenshotRecord> =
-            raw_rows.into_iter().map(|raw| raw.into_record()).collect();
+        let records: Vec<ScreenshotRecord> = raw_rows
+            .into_iter()
+            .map(|raw| raw.into_record(&self.credential_state))
+            .collect();
 
         if diag_start.elapsed().as_secs() >= 5 {
             tracing::warn!(
@@ -1860,8 +1862,10 @@ impl StorageState {
         let query_elapsed = diag_start.elapsed();
 
         // Phase 2: Decrypt only the page rows
-        let records: Vec<ScreenshotRecord> =
-            raw_rows.into_iter().map(|raw| raw.into_record()).collect();
+        let records: Vec<ScreenshotRecord> = raw_rows
+            .into_iter()
+            .map(|raw| raw.into_record(&self.credential_state))
+            .collect();
 
         if diag_start.elapsed().as_secs() >= 2 {
             tracing::warn!(
@@ -1924,12 +1928,14 @@ impl StorageState {
             rows
         };
 
-        Ok(raw_rows.into_iter().map(|raw| raw.into_record()).collect())
+        Ok(raw_rows
+            .into_iter()
+            .map(|raw| raw.into_record(&self.credential_state))
+            .collect())
     }
 
     /// Decrypts one summary row with an injected row-key unwrap so batch
-    /// callers reuse a per-thread [`CngKeySession`] instead of paying a CNG
-    /// open/free round-trip per row.
+    /// callers borrow the authenticated [`CngKeySession`] across worker threads.
     fn decrypt_screenshot_summary_with_unwrap(
         row: EncryptedScreenshotSummaryRow,
         unwrap_row_key: &dyn Fn(&[u8]) -> Result<Vec<u8>, CredentialError>,
@@ -2018,7 +2024,7 @@ impl StorageState {
         if !self.is_silent_read_authorized() {
             return Err(BackgroundReadError::AuthRequired);
         }
-        unwrap_batch_parallel(raw_rows, |session, row| {
+        unwrap_batch_parallel(&self.credential_state, raw_rows, |session, row| {
             if !self.is_silent_read_authorized() {
                 return Err(BackgroundReadError::AuthRequired);
             }
@@ -2201,7 +2207,7 @@ impl StorageState {
         // Phase 2: Decrypt outside mutex
         match raw_row {
             Some(raw) => {
-                let record = raw.into_record();
+                let record = raw.into_record(&self.credential_state);
                 tracing::debug!(
                     "Found record id={}, image_path={}",
                     record.id,
@@ -2272,7 +2278,7 @@ impl StorageState {
 
         match raw_row {
             Some(raw) => {
-                let record = raw.into_record();
+                let record = raw.into_record(&self.credential_state);
                 tracing::debug!(
                     "Found record id={}, image_path={}",
                     record.id,
@@ -2502,7 +2508,7 @@ impl StorageState {
         }
 
         // Phase 3: decrypt each screenshot's prefix in parallel.
-        let maps = unwrap_batch_parallel(groups, |session, group| {
+        let maps = unwrap_batch_parallel(&self.credential_state, groups, |session, group| {
             assemble_ocr_text_prefixes(group, min_chars, |data, key| {
                 if !self.is_silent_read_authorized() {
                     return Err(BackgroundReadError::AuthRequired);

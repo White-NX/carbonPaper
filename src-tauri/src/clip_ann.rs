@@ -1230,7 +1230,7 @@ pub async fn clip_ann_retry_now(
     window: tauri::Window,
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
 ) -> Result<bool, String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
     maybe_rebuild(&app, true).await
 }

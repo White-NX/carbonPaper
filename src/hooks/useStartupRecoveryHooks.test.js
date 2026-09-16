@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
 import {
+  getBackgroundIndexProgress,
   getSmartClusterWorkerStatus,
   getSoftDeleteQueueStatus,
   searchScreenshots,
@@ -54,6 +55,32 @@ describe('startup and search recovery hooks', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it.each([
+    ['waiting_for_unlock', 'WaitingForUnlock'],
+    ['waiting_for_verification', 'WaitingForVerification'],
+  ])('keeps search progress visible during %s', async (phase, label) => {
+    vi.useFakeTimers();
+    const idle = { phase: 'idle', running: false, processed: 0, total: 0 };
+    const run = { phase: 'running', running: true, processed: 3, total: 10, revision: 1 };
+    getBackgroundIndexProgress
+      .mockResolvedValueOnce({ semantic: idle, clip: run })
+      .mockResolvedValueOnce({ semantic: idle, clip: { ...run, phase, running: false, revision: 2 } })
+      .mockResolvedValueOnce({ semantic: idle, clip: { ...run, processed: 6, revision: 3 } })
+      .mockResolvedValueOnce({ semantic: idle, clip: { ...idle, revision: 4 } });
+    const hook = renderHook(() => useSearchBoxController({ t }));
+    await act(async () => {});
+    expect(hook.result.current.clipIndexPercent).toBe(30);
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(hook.result.current.hasClipIndexTask).toBe(true);
+    expect(hook.result.current.showProgressBar).toBe(true);
+    expect(hook.result.current.taskSummaryPlaceholder).toContain(`clipIndex${label}`);
+    expect(hook.result.current.clipIndexPercent).toBe(30);
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(hook.result.current.clipIndexPercent).toBe(60);
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(hook.result.current.hasClipIndexTask).toBe(false);
   });
 
   it('clears SearchBox loading when the query is emptied while a request is pending', async () => {

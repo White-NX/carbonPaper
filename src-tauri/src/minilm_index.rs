@@ -69,7 +69,7 @@ use crate::minilm_migration::{
 };
 use crate::ml_protocol::MlSemanticModel;
 use crate::monitor::{authenticated_monitor_command, MonitorState};
-use crate::semantic_runtime::{IndexRunProgress, SemanticRuntimeState};
+use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{
     BackgroundReadError, BackgroundScreenshotSummary, DerivedEmbeddingWrite, DerivedIndexJobSpec,
     DerivedIndexKind, StorageState,
@@ -77,10 +77,9 @@ use crate::storage::{
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// Rust keeps the same 30-day window as the Chroma hot layer it replaced, but
 /// decides it against SQLite `created_at` rather than mirroring Python's
@@ -447,6 +446,9 @@ async fn run_scheduled_request(
 ) -> Result<ScheduledSliceResult, String> {
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let _active = manual.then(|| run.begin());
+    if manual && run.stopped_by_user() {
+        return Ok(ScheduledSliceResult::skipped(STOPPED_BY_USER));
+    }
     let storage = app.state::<Arc<StorageState>>().inner().clone();
     if manual {
         // Reset at admission as well as at button-click time. A second click
@@ -560,106 +562,7 @@ pub struct SemanticIndexRunSummary {
     pub skipped_reason: Option<String>,
 }
 
-/// Manual-run state shared with the two Tauri commands that drive it.
-///
-/// The run is an async task the "index now" command awaits for its whole
-/// duration, so "stop" cannot be a return value from it and has to be a flag
-/// the pass polls between chunks — the same shape `SmartClusterWorkerState`
-/// uses for its forced drain, and for the same reason.
-///
-/// The counters exist because a run is now open-ended. While it was capped at
-/// 128 subjects a summary at the end was an adequate report; a run that may
-/// legitimately last minutes needs to say so as it goes.
-#[derive(Default)]
-pub struct SemanticIndexRunState {
-    /// A manual pass is executing right now.
-    running: AtomicBool,
-    /// Set by `semantic_index_stop_now`; checked between chunks and between
-    /// drains. Cleared when the next run starts, so a stop that arrives as a
-    /// run is finishing cannot cancel the following one.
-    stop_requested: AtomicBool,
-    /// Subjects that left the queue in this run, encoded or not. This is what
-    /// the progress ratio measures, because it is what actually shrinks the
-    /// backlog — an invalid vector is discarded rather than retried, and a
-    /// screenshot whose text vanished is excluded, neither of which is an
-    /// "indexed" outcome but both of which are progress.
-    processed: AtomicU64,
-    /// Subjects that became query-visible in this run.
-    indexed: AtomicU64,
-    /// Queue depth when this run started.
-    total: AtomicU64,
-}
-
-impl SemanticIndexRunState {
-    /// Ask the running pass to stop after the chunk it is encoding. A chunk is
-    /// four subjects and cannot be interrupted once submitted to the worker, so
-    /// this is prompt rather than immediate.
-    pub fn request_stop(&self) {
-        self.stop_requested.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-
-    fn stopped_by_user(&self) -> bool {
-        self.stop_requested.load(Ordering::SeqCst)
-    }
-
-    /// Counters as they stand, for a caller that polls rather than listens.
-    ///
-    /// The progress event is the primary channel and stays that way; this exists
-    /// for the search box, which can mount in the middle of a run that has been
-    /// going for minutes and would otherwise show nothing until the next chunk
-    /// lands. Reads four atomics and touches neither the worker nor the
-    /// database, which is what makes it safe on a poll loop.
-    pub fn progress(&self) -> IndexRunProgress {
-        IndexRunProgress {
-            running: self.running.load(Ordering::SeqCst),
-            processed: self.processed.load(Ordering::SeqCst),
-            indexed: self.indexed.load(Ordering::SeqCst),
-            total: self.total.load(Ordering::SeqCst),
-        }
-    }
-
-    /// Claim the run and reset its counters. The returned guard clears
-    /// `running` on every path out of the command, including the error one.
-    fn begin(self: &Arc<Self>) -> ActiveRun {
-        self.stop_requested.store(false, Ordering::SeqCst);
-        self.processed.store(0, Ordering::SeqCst);
-        self.indexed.store(0, Ordering::SeqCst);
-        self.total.store(0, Ordering::SeqCst);
-        self.running.store(true, Ordering::SeqCst);
-        ActiveRun(self.clone())
-    }
-
-    /// Record one finished chunk and tell the settings dialog about it.
-    ///
-    /// A dropped event costs a progress line, never correctness: the run's
-    /// summary is the authoritative report, and the dialog reconciles against
-    /// it when the command returns.
-    fn report_chunk(&self, app: &AppHandle, processed: u64, indexed: u64) {
-        let processed_total = self.processed.fetch_add(processed, Ordering::SeqCst) + processed;
-        let indexed_total = self.indexed.fetch_add(indexed, Ordering::SeqCst) + indexed;
-        let _ = app.emit(
-            SEMANTIC_INDEX_PROGRESS_EVENT,
-            serde_json::json!({
-                "processed": processed_total,
-                "indexed": indexed_total,
-                "total": self.total.load(Ordering::SeqCst),
-            }),
-        );
-    }
-}
-
-/// Holds `running` for the lifetime of one manual pass.
-struct ActiveRun(Arc<SemanticIndexRunState>);
-
-impl Drop for ActiveRun {
-    fn drop(&mut self) {
-        self.0.running.store(false, Ordering::SeqCst);
-    }
-}
+pub type SemanticIndexRunState = crate::index_progress::IndexRunState<false>;
 
 /// Whether background semantic work may run right now.
 ///
@@ -764,7 +667,7 @@ async fn run_pass(
             })
             .await
             .unwrap_or(0);
-            run.total.store(total, Ordering::SeqCst);
+            run.set_remaining(total);
             drain_until_done(app, storage, deadline, waited, mode).await
         }
     }
@@ -1189,9 +1092,7 @@ async fn drain_queue(
             }
             Err(chunk_failure) => {
                 outcome.failed += chunk_len;
-                if mode.is_manual() {
-                    run.report_chunk(app, chunk_len, 0);
-                }
+                // Failed subjects remain queued; attempts are not completed progress.
                 // Whatever broke the worker will break every remaining chunk the
                 // same way, and charging the retry budget for an attempt that was
                 // never made would spend it on the worker's behalf.
@@ -1671,7 +1572,7 @@ pub async fn semantic_index_run_now(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
     app: AppHandle,
 ) -> Result<SemanticIndexRunSummary, String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
     let scheduler = app
@@ -1686,6 +1587,7 @@ pub async fn semantic_index_run_now(
     })
     .await
     .map_err(|error| format!("semantic retry reset task failed: {error}"))??;
+    app.state::<Arc<SemanticIndexRunState>>().request_run();
     scheduler.enqueue(
         &app,
         crate::background_scheduler::BackgroundTaskKind::SemanticIndex,
@@ -1729,7 +1631,7 @@ pub async fn semantic_index_stop_now(
     window: tauri::Window,
     app: AppHandle,
 ) -> Result<bool, String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let was_running = run.is_running();
     run.request_stop();
@@ -1779,6 +1681,7 @@ mod tests {
         // as the previous run was returning — must not cancel the next run
         // before it has encoded anything.
         state.request_stop();
+        state.request_run();
         {
             let _active = state.begin();
             assert!(state.is_running());
@@ -1789,19 +1692,6 @@ mod tests {
         // The guard cleared `running`, so the stop command reports honestly
         // that there was nothing left to stop.
         assert!(!state.is_running());
-    }
-
-    #[test]
-    fn progress_counts_what_left_the_queue_not_only_what_was_indexed() {
-        // A chunk of four whose fourth vector came back invalid shrinks the
-        // backlog by four and the index by three. Reporting three would leave
-        // the progress line short of the total forever on a corpus with any
-        // discarded subject in it.
-        let state = SemanticIndexRunState::default();
-        state.processed.fetch_add(4, Ordering::SeqCst);
-        state.indexed.fetch_add(3, Ordering::SeqCst);
-        assert_eq!(state.processed.load(Ordering::SeqCst), 4);
-        assert_eq!(state.indexed.load(Ordering::SeqCst), 3);
     }
 
     #[test]

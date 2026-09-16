@@ -290,7 +290,7 @@ impl StorageState {
             .map(|(mut stub, url_enc, wt_enc, pn_enc, key_enc)| {
                 let row_key = key_enc
                     .as_ref()
-                    .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+                    .and_then(|enc| decrypt_row_key_with_cng(&self.credential_state, enc).ok());
 
                 if let (Some(data), Some(key)) = (url_enc.as_ref(), row_key.as_ref()) {
                     if let Ok(decrypted) = decrypt_with_master_key(key, data) {
@@ -484,7 +484,7 @@ impl StorageState {
             .map(|(mut stub, url_enc, wt_enc, pn_enc, key_enc)| {
                 let row_key = key_enc
                     .as_ref()
-                    .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+                    .and_then(|enc| decrypt_row_key_with_cng(&self.credential_state, enc).ok());
 
                 if let (Some(data), Some(key)) = (url_enc.as_ref(), row_key.as_ref()) {
                     if let Ok(decrypted) = decrypt_with_master_key(key, data) {

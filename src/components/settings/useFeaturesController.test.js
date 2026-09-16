@@ -6,6 +6,7 @@ import { useFeaturesController } from './useFeaturesController';
 vi.mock('./organize/useModelInventory', () => ({
   useModelInventory: () => ({}),
 }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock('./organize/useSmartClusterControls', () => ({
   useSmartClusterControls: () => ({ scModelAvailable: true }),
 }));

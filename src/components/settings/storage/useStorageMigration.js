@@ -3,6 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import { withAuth } from '../../../lib/auth_api';
+import { runMonitorAction, notifySettingsChanged } from '../../../lib/settings_api';
+import { useSettingsActivity } from '../SettingsActivityContext';
 
 export function useStorageMigration({ storage, onRefresh, t }) {
   const [isMigrating, setIsMigrating] = useState(false);
@@ -12,10 +14,12 @@ export function useStorageMigration({ storage, onRefresh, t }) {
   const [isMigrationChoiceDialogOpen, setIsMigrationChoiceDialogOpen] = useState(false);
   const [pendingTargetPath, setPendingTargetPath] = useState('');
   const mountedRef = useRef(true);
+  useSettingsActivity('storage-migration', { busy: isMigrating || isUpdatingStoragePath });
   const migrationUnlistenersRef = useRef([]);
   const currentStoragePath = storage?.root_path || 'LocalAppData/CarbonPaper';
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       migrationUnlistenersRef.current.forEach((unlisten) => {
@@ -62,7 +66,7 @@ export function useStorageMigration({ storage, onRefresh, t }) {
       }
 
       if (shouldRestartMonitor) {
-        await invoke('stop_monitor');
+        await runMonitorAction('maintenance-stop');
       }
 
       if (shouldMigrateData) {
@@ -91,6 +95,7 @@ export function useStorageMigration({ storage, onRefresh, t }) {
       }
 
       onRefresh?.();
+      await notifySettingsChanged(['storage', 'records']);
     } catch (e) {
       console.error('change storage path failed', e);
       if (mountedRef.current) {
@@ -105,7 +110,7 @@ export function useStorageMigration({ storage, onRefresh, t }) {
         setIsUpdatingStoragePath(false);
       }
       if (shouldRestartMonitor) {
-        try { await invoke('start_monitor'); } catch { }
+        try { await runMonitorAction('maintenance-start'); } catch { }
       }
     }
   };

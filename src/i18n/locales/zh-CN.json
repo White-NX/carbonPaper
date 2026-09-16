@@ -189,7 +189,7 @@
       "extension": "浏览器扩展",
       "ai_embedding": "人工智能嵌入",
       "features": "功能",
-      "capture": "记录与搜索",
+      "capture": "记录与采集",
       "organize": "整理与智能",
       "privacy": "隐私与访问",
       "maintenance": "存储与维护"
@@ -197,12 +197,12 @@
     "security": {
       "protection": {
         "title": "数据受到 Windows CNG 保护",
-        "description": "您的快照数据已使用 Windows CNG 管理的凭据加密。只有通过您的授权才能访问数据。"
+        "description": "记录以加密形式保存在这台电脑上，通过 Windows Hello 验证后即可访问。"
       },
-      "unlock_label": "解锁有效期",
+      "unlock_label": "解锁保护",
       "session": {
-        "title": "自动锁定时间",
-        "description": "设置在用户无操作多长时间后自动锁定并需要重新验证",
+        "title": "解锁有效期",
+        "description": "超过设定时间后，查看记录需要重新验证。",
         "options": {
           "5m": {
             "label": "5 分钟",
@@ -221,8 +221,8 @@
             "description": "较低安全性"
           },
           "until_close": {
-            "label": "直到关闭",
-            "description": "不推荐",
+            "label": "直到退出应用",
+            "description": "保持解锁，直到完全退出应用。",
             "warning": true
           }
         },
@@ -245,9 +245,9 @@
         "minilm": "MiniLM-L12 是用于把 OCR 文本编码成向量的轻量语言模型，供任务聚类使用。"
       },
       "cpu": {
-        "title": "Python 子进程 CPU 限制",
+        "title": "CPU 占用限制",
         "label": "限制 CPU 占用率",
-        "description": "限制 OCR 和向量化处理使用的 CPU 资源，避免影响系统性能",
+        "description": "限制后台处理的 CPU 占用，减少对其他应用的影响。",
         "percent_label": "CPU 限制百分比",
         "changed_notice": "CPU 限制更改将在下次启动监控服务时生效"
       },
@@ -261,9 +261,10 @@
         "queue_limit_desc": "超过此大小时，暂停所有截图直到队列消化",
         "max_queue_label": "最大队列大小",
         "timeout_label": "OCR 超时时间",
-        "timeout_desc": "设定 OCR 任务的超时时间。冷启动固定允许 180 秒。",
+        "timeout_desc": "单次文字识别的最长等待时间。",
         "seconds": "秒",
-        "info": "OCR 队列设置会即时生效，无需重启监控服务"
+        "info": "OCR 队列设置会即时生效，无需重启监控服务",
+        "invalidTimeout": "请输入 30 至 600 之间的整数。"
       },
       "rust_ocr": {
         "title": "OCR 引擎",
@@ -287,13 +288,14 @@
       },
       "dml": {
         "title": "DirectML 推理加速",
-        "label": "使用 DirectML 进行推理",
-        "description": "启用后将使用 GPU 加速支持 DirectML 的 OCR 和向量推理，需要 DirectX 12 兼容的显卡。",
+        "label": "使用显卡加速",
+        "description": "使用兼容 DirectX 12 的显卡加速识别和向量处理。",
         "notice": "注意：在主要 GPU 上运行 DirectML 可能会影响游戏性能。",
         "changed_notice": "DirectML 设置将在下次启动监控服务时生效",
         "gpu_select": "选择 GPU 设备",
         "gpu_loading": "正在检测 GPU...",
-        "gpu_none": "未检测到兼容的 GPU"
+        "gpu_none": "未检测到兼容的 GPU",
+        "selectDevice": "请选择可用的显卡"
       },
       "background_processing": {
         "title": "后台自动整理",
@@ -304,6 +306,7 @@
         "states": {
           "waiting_for_idle": "等待空闲",
           "waiting_for_unlock": "等待解锁",
+          "waiting_for_verification": "等待身份验证",
           "running": "执行中",
           "retry_wait": "失败重试",
           "failed": "处理失败",
@@ -328,7 +331,7 @@
         "interval_label": "自动聚类间隔",
         "interval_desc": "设置后台自动运行任务聚类的时间间隔",
         "allow_full_low_memory_label": "低内存时仍允许自动全量聚类",
-        "allow_full_low_memory_desc": "默认关闭。关闭时，自动聚类在 2 万张以上且内存不足时会使用降级分批模式；开启后仍尝试完整 PaCMAP + HDBSCAN，可能触发虚拟内存换页并显著变慢。",
+        "allow_full_low_memory_desc": "内存紧张时仍允许完整聚类，处理期间可能影响其他应用。",
         "info": "任务聚类会自动将相似的活动分组为长期任务。使用 MiniLM-L12 模型编码文本，模型在聚类完成后会自动卸载以释放内存。",
         "intervals": {
           "1d": "每天",
@@ -338,12 +341,12 @@
         }
       },
       "network": {
-        "title": "网络控制",
-        "label": "启用网络功能",
-        "description": "关闭后将禁用程序的所有外部网络请求，包括检查更新、下载模型等。"
+        "title": "联网功能",
+        "label": "允许联网",
+        "description": "用于检查更新和下载所需组件。"
       },
       "semantic_backend": {
-        "title": "截图文本语义检索",
+        "title": "文字检索索引",
         "label": "Rust MiniLM 文本索引",
         "description": "Rust 维护截图检索和任务分组使用的本地文本索引。",
         "diagnostic": "本地诊断",
@@ -357,7 +360,13 @@
         "stalled_hint": "这些截图已经用完索引重试次数，不会再被自动处理，在重建索引之前它们不会出现在自然语言检索结果里。",
         "run_now": "立即索引",
         "run_now_hint": "如果这台电脑很少空闲或者经常使用电池，可以在这里手动索引等待中的截图。索引会一直进行到队列清空为止，期间会占用处理器，可以随时停止。",
-        "run_preparing": "正在索引。第一次运行需要先加载模型。",
+        "run_preparing": "正在准备索引…",
+        "run_waiting_for_unlock": "等待解锁后继续整理。",
+        "run_unlock": "解锁并继续",
+        "run_waiting_for_verification": "验证身份后可继续整理。",
+        "run_verify": "验证并继续",
+        "run_start_failed": "未能开始整理，请重试。",
+        "run_stop_failed": "未能停止整理，请重试。",
         "run_progress": "正在索引：已处理 {{processed}} / {{total}} 张，其中 {{indexed}} 张建立了索引。",
         "run_stop": "停止",
         "run_stop_pending": "正在停止…",
@@ -371,7 +380,7 @@
         "run_failed": "索引遇到无法自动恢复的错误，已经停止。"
       },
       "clip_backend": {
-        "title": "截图画面检索（文搜图）",
+        "title": "画面检索索引",
         "label": "Rust Chinese-CLIP 画面索引",
         "description": "Rust 维护文搜图使用的本地画面索引。",
         "diagnostic": "本地诊断",
@@ -400,7 +409,13 @@
         "stalled_hint": "这些画面已经用尽编码重试次数，不会再被自动处理。在重建索引之前，它们不会出现在文搜图结果里。",
         "run_now": "立即编码",
         "run_now_hint": "编码一张画面比编码一行文字慢得多。如果这台电脑很少空闲或经常用电池，可以在这里手动处理等待中的画面；运行期间会占用处理器，可随时停止。",
-        "run_preparing": "正在编码。第一批还没完成，首次运行需要先加载模型。",
+        "run_preparing": "正在准备索引…",
+        "run_waiting_for_unlock": "等待解锁后继续整理。",
+        "run_unlock": "解锁并继续",
+        "run_waiting_for_verification": "验证身份后可继续整理。",
+        "run_verify": "验证并继续",
+        "run_start_failed": "未能开始整理，请重试。",
+        "run_stop_failed": "未能停止整理，请重试。",
         "run_progress": "正在编码：已处理 {{processed}} / {{total}} 张，其中 {{indexed}} 张已建立索引。",
         "run_stop": "停止",
         "run_stop_pending": "正在停止…",
@@ -423,14 +438,34 @@
       },
       "vacuum": {
         "title": "数据库维护",
-        "label": "手动执行数据库优化",
-        "description": "执行 VACUUM 可回收数据库空间并整理存储结构，过程可能持续数秒到数分钟。",
+        "label": "优化数据库",
+        "description": "回收已清理数据占用的空间，优化期间可能需要等待。",
         "running": "优化中...",
         "action": "立即优化",
         "already_running": "已有数据库优化任务正在执行，请稍候。",
         "success": "数据库优化已完成。",
         "error": "数据库优化失败",
         "error_with_detail": "数据库优化失败：{{error}}"
+      },
+      "groups": {
+        "performance": "性能与处理",
+        "components": "组件与修复",
+        "diagnostics": "运行诊断"
+      },
+      "ocrHealth": {
+        "title": "文字识别",
+        "checking": "正在检查识别组件…",
+        "ready": "识别组件可用。",
+        "repair": "识别组件需要修复。",
+        "unavailable": "暂时无法检查识别组件。",
+        "refresh": "重新检查识别组件",
+        "state": "运行状态",
+        "provider": "推理后端",
+        "model": "模型",
+        "success": "成功次数",
+        "failure": "失败次数",
+        "elapsed": "最近耗时",
+        "restart": "重新启动文字识别"
       }
     },
     "storageManagement": {
@@ -575,7 +610,11 @@
         "confirmTitle": "确认？",
         "confirmMessage": "这会删除所选时间范围内的快照和 OCR 记录，且无法撤销。确定继续吗？",
         "yes": "是",
-        "no": "否"
+        "no": "否",
+        "chooseRange": "选择时间范围",
+        "range": "清除记录的时间范围",
+        "action": "清除记录",
+        "confirmRange": "这会永久删除“{{range}}”范围内的记录，且无法撤销。确定继续吗？"
       }
     },
     "delete": {
@@ -583,10 +622,10 @@
       "success": "已删除 {{count}} 条记录"
     },
     "save_filters": {
-      "synced": "",
-      "saved_local_not_running": "",
+      "synced": "过滤规则已保存并生效。",
+      "saved_local_not_running": "规则已保存，将在下次开始记录时生效。",
       "saved_local_unsupported": "",
-      "saved_local_sync_failed": ""
+      "saved_local_sync_failed": "规则已保存，暂时无法应用。请重试，或重新启动记录服务。"
     },
     "autolaunch": {
       "read_error": "",
@@ -614,11 +653,16 @@
       },
       "status": {
         "registered": "已注册",
-        "not_registered": "未注册"
+        "not_registered": "未注册",
+        "checking": "正在检查…",
+        "connected": "已连接",
+        "configured": "已配置，未连接",
+        "not_configured": "未配置",
+        "unavailable": "连接状态暂不可用"
       },
       "enhance": {
         "label": "扩展增强",
-        "description": "启用后，已连接扩展的浏览器将由扩展接管截图捕获，提供更丰富的元数据（页面 URL、标题、网站图标、链接）。支持任意 Chromium 内核浏览器。",
+        "description": "为浏览器记录保存页面网址、标题和链接，方便再次打开原网页。",
         "global": "启用扩展增强"
       },
       "sessions": {
@@ -630,15 +674,25 @@
       "error": "安装失败：{{error}}",
       "help": "点击按钮后，请在浏览器扩展管理页面中加载显示路径的未打包扩展。",
       "tutorial": {
-        "title": "安装步骤",
-        "step1": "点击上方的安装按钮。「Chrome / Chromium 内核浏览器」同样适用于其他 Chromium 内核浏览器（360、百分、Brave 等）。",
-        "step2": "打开浏览器扩展页面，启用「开发者模式」。",
-        "step3": "点击「加载已解压的扩展程序」，选择安装后显示的扩展文件夹。",
-        "step4": "CarbonPaper 扩展图标将出现在浏览器工具栏中，且该浏览器会显示在「已连接的浏览器」列表里。"
-      }
+        "title": "查看安装步骤",
+        "step1": "点击对应浏览器的“设置浏览器”或“重新配置”，准备扩展文件并打开扩展管理页面。",
+        "step2": "在浏览器扩展管理页面中启用“开发者模式”。",
+        "step3": "选择“加载已解压的扩展程序”，使用上方显示的扩展文件夹。",
+        "step4": "保持 CarbonPaper 运行。连接建立后，对应浏览器会显示“已连接”。"
+      },
+      "prepared": "扩展文件已准备好，请按安装步骤在浏览器中加载。",
+      "preparing": "正在配置…",
+      "setup": "设置浏览器",
+      "configureAgain": "重新配置",
+      "readFailed": "暂时无法读取浏览器连接状态。",
+      "folder": "扩展文件夹",
+      "copyFolder": "复制目录",
+      "copied": "已复制",
+      "copyFailed": "复制失败，请重试。",
+      "connectionDetails": "连接详情"
     },
     "ai_embedding": {
-      "title": "人工智能嵌入",
+      "title": "AI 助手访问",
       "description": "管理人工智能嵌入服务",
       "mcp_service": "MCP 服务",
       "mcp_description": "启用后将启动本地 MCP 服务，允许 AI 工具连接获取快照数据（截图元数据、OCR 文本、任务聚类信息）。请注意隐私安全风险，确保只授权可信的 AI 工具连接。",
@@ -834,7 +888,7 @@
         "title": "功能管理",
         "featureMode": {
           "label": "功能等级",
-          "description": "选择截图语义功能的启用深度。等级越高，自动整理能力越强，后台资源占用也可能更高。",
+          "description": "选择自动分类和整理记录的方式。",
           "customControls": {
             "label": "单独调整"
           },
@@ -863,7 +917,7 @@
         },
         "clustering": {
           "label": "任务聚类",
-          "description": "使用 MiniLM 模型将相似活动分组为长期任务",
+          "description": "将相关活动整理为任务分组。",
           "interval_label": "自动聚类间隔",
           "interval_desc": "设置后台自动运行任务聚类的时间间隔",
           "advanced_label": "高级",
@@ -882,31 +936,33 @@
             "completed": "整理完成",
             "already_running": "已有整理任务正在运行",
             "prepared_count": "已准备 {{count}} 条记录"
-          }
+          },
+          "rangeStart": "开始日期",
+          "rangeEnd": "结束日期"
         },
         "classification": {
           "label": "内容分类",
-          "description": "使用 BGE 模型自动分类截图内容"
+          "description": "根据窗口标题和文字内容自动分类记录。"
         },
         "smartCluster": {
           "label": "智能聚类（按描述自动归档）",
           "description": "使用自然语言描述自动将相关快照归入同一分类",
           "modelMissing": "模型未下载",
-          "modelNotDownloaded": "需要下载 bge-reranker-v2-m3 模型（~570MB）",
-          "downloadModel": "下载模型",
+          "modelNotDownloaded": "首次使用需要下载智能归档组件。",
+          "downloadModel": "准备组件",
           "downloading": "正在下载 bge-reranker-v2-m3 模型…",
           "status": "状态",
           "pending": "待处理",
           "activeClusters": "已启用",
-          "drainNow": "立即处理待处理队列",
-          "rescanAll": "全部重新匹配 hot 层",
+          "drainNow": "处理待整理记录",
+          "rescanAll": "重新匹配记录",
           "retry": "重试下载",
           "openManagement": "打开智能聚类管理",
           "clusteringDisabledWarning": "任务聚类已关闭。智能聚类仍可在重扫时运行，但由于缺少截图采集阶段的自动文本向量化，候选召回需要临时编码，可能导致处理速度显著下降并增加资源占用。"
         },
         "indexHealth": {
-          "label": "索引健康",
-          "description": "截图、OCR、向量索引和后台重试队列的当前状态",
+          "label": "检索与维护",
+          "description": "查看检索数据的处理状态，并管理维护操作。",
           "refresh": "刷新",
           "indexBacklog": "索引待处理",
           "screenshots": "截图",
@@ -942,6 +998,81 @@
         "idleDescription": "接通电源且停止操作一分钟后，开始整理记录。",
         "saveError": "保存失败，请重试。"
       }
+    },
+    "window": {
+      "title": "CarbonPaper 设置",
+      "minimize": "最小化",
+      "maximize": "最大化或还原",
+      "operationInProgress": "当前操作完成后即可关闭设置，你可以先最小化窗口。",
+      "unsavedTitle": "有尚未保存的更改",
+      "unsavedDescription": "继续编辑并保存，或放弃这些更改后关闭设置。",
+      "discardAndClose": "放弃更改并关闭",
+      "keepEditing": "继续编辑"
+    },
+    "pages": {
+      "general": "调整启动方式、资源使用和窗口操作。",
+      "capture": "选择记录范围，并连接浏览器扩展。",
+      "organize": "选择整理功能和后台处理时机。",
+      "privacy": "管理解锁、后台访问和 AI 助手权限。",
+      "advanced": "调整处理性能，并按需查看组件与诊断信息。",
+      "about": "版本、更新与项目信息。"
+    },
+    "feedback": {
+      "loading": "正在读取…",
+      "readFailed": "暂时无法读取设置，请重试。",
+      "saveFailed": "保存失败：{{error}}",
+      "operationFailed": "操作失败：{{error}}",
+      "retryApply": "重试应用",
+      "savedPendingRestart": "更改已保存，重新启动记录服务后生效。",
+      "saved": "已保存。"
+    },
+    "details": {
+      "options": "更多选项",
+      "diagnostics": "查看诊断详情",
+      "download": "查看下载详情"
+    },
+    "monitorStates": {
+      "running": "记录中",
+      "paused": "已暂停",
+      "stopped": "已停止",
+      "waiting": "正在启动",
+      "loading": "正在处理",
+      "unknown": "状态暂不可用"
+    },
+    "maintenance": {
+      "manageIndexes": "管理检索索引"
+    },
+    "about": {
+      "updates": "应用更新",
+      "check": "检查更新",
+      "checking": "正在检查…",
+      "latest": "已是最新版本",
+      "available": "发现新版本 {{version}}",
+      "download": "下载并安装",
+      "license": "采用 GPL-3.0 许可证发布。",
+      "author": "由 White-NX 开发。",
+      "repository": "项目主页",
+      "repositoryDescription": "查看源代码、反馈问题或参与开发。",
+      "developers": "开发预览",
+      "preview": "预览",
+      "previews": {
+        "error": "错误窗口",
+        "security": "安全警报",
+        "ocr": "识别组件修复提醒",
+        "update": "更新提示",
+        "critical-update": "重要更新提示",
+        "extension": "扩展安装引导",
+        "clustering": "任务分组引导",
+        "smart-cluster": "智能归档引导",
+        "app-bound": "后台组件引导",
+        "app-bound-repair": "后台组件修复"
+      }
+    },
+    "serviceStates": {
+      "running": "运行中",
+      "waiting": "等待解锁",
+      "error": "异常",
+      "stopped": "已停止"
     }
   },
   "common": {
@@ -953,7 +1084,8 @@
     "processing": "处理中…",
     "back": "上一步",
     "next": "下一步",
-    "clear": "清空"
+    "clear": "清空",
+    "refresh": "刷新"
   },
   "delete": {
     "failure": "删除失败: {{error}}",
@@ -1112,10 +1244,22 @@
       "smartClusterRunningTitle": "智能聚类队列处理中",
       "smartClusterRunningDesc": "当前进度 {{progress}}%，待处理快照 {{pending}} 条。",
       "semanticIndexSummaryPlaceholder": "文本索引回填中 ({{progress}}%)",
-      "semanticIndexRunningTitle": "MiniLM 文本向量索引中",
+      "semanticIndexPreparing": "正在准备文字检索索引…",
+      "semanticIndexQueued": "文字检索索引等待整理",
+      "semanticIndexWaitingForUnlock": "文字检索索引等待解锁",
+      "semanticIndexWaitingForVerification": "文字检索索引等待身份验证",
+      "semanticIndexRetryWait": "文字检索索引等待重试",
+      "semanticIndexStopping": "正在停止文字检索索引…",
+      "semanticIndexRunningTitle": "文字检索索引",
       "semanticIndexRunningDesc": "正在为历史截图生成文本向量，当前进度 {{progress}}%。此期间新截图的索引可能会延迟。",
       "clipIndexSummaryPlaceholder": "图像索引回填中 ({{progress}}%)",
-      "clipIndexRunningTitle": "CLIP 图像向量索引中",
+      "clipIndexPreparing": "正在准备画面检索索引…",
+      "clipIndexQueued": "画面检索索引等待整理",
+      "clipIndexWaitingForUnlock": "画面检索索引等待解锁",
+      "clipIndexWaitingForVerification": "画面检索索引等待身份验证",
+      "clipIndexRetryWait": "画面检索索引等待重试",
+      "clipIndexStopping": "正在停止画面检索索引…",
+      "clipIndexRunningTitle": "画面检索索引",
       "clipIndexRunningDesc": "正在为历史截图生成图像向量，当前进度 {{progress}}%。此期间文本索引与智能分组会暂停，直到回填完成。",
       "modelDownloadSummaryPlaceholder": "模型文件下载中 ({{progress}}%)",
       "modelDownloadRunningTitle": "后台模型下载中",

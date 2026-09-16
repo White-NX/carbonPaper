@@ -91,6 +91,7 @@ export default function McpServiceCard({
             </button>
           )}
           <SettingsSwitch
+            title={t('settings.ai_embedding.enable_label')}
             checked={enabled}
             onChange={onToggle}
             disabled={mcpOperationLoading}

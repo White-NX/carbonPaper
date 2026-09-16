@@ -9,6 +9,7 @@ import {
   DEFAULT_AGENT_SETUP_VARIANT,
 } from './agent-access/agentAccessConstants';
 import { useSensitiveFilterSettings } from './agent-access/useSensitiveFilterSettings';
+import { useSettingsActive, useSettingsActivity } from './SettingsActivityContext';
 
 function isCurrentMcpSmokeReport(report, status) {
   if (
@@ -27,6 +28,7 @@ function isCurrentMcpSmokeReport(report, status) {
 }
 
 export function useAiEmbeddingController({ t }) {
+  const active = useSettingsActive();
   const [enabled, setEnabled] = useState(() => localStorage.getItem('mcpEnabled') === 'true');
   const [port, setPort] = useState(() => {
     const saved = parseInt(localStorage.getItem('mcpPort'), 10);
@@ -69,6 +71,7 @@ export function useAiEmbeddingController({ t }) {
   const CONFIRM_TEXT = t('settings.ai_embedding.privacy_warning.confirm_text');
   const sensitiveFilter = useSensitiveFilterSettings({ t, onError: setError });
   const { loadFilterConfig, loadSpacyModels } = sensitiveFilter;
+  useSettingsActivity('ai-access', { busy: actionLoading || restoreLoading || smokeTestLoading || Boolean(sensitiveFilter.downloadingModel) || sensitiveFilter.recheckLoading });
 
   const invalidateSmokeTestReport = useCallback(() => {
     smokeTestRequestRef.current += 1;
@@ -140,13 +143,14 @@ export function useAiEmbeddingController({ t }) {
   }, [invalidateSmokeTestReport, loadFilterConfig, loadSpacyModels]);
 
   useEffect(() => {
-    loadStatus();
-  }, [loadStatus]);
+    if (active) loadStatus();
+    return () => { statusRequestRef.current += 1; };
+  }, [loadStatus, active]);
 
   useTauriEventListener('mcp-status-changed', () => {
     invalidateSmokeTestReport();
     loadStatus();
-  }, [invalidateSmokeTestReport, loadStatus]);
+  }, [invalidateSmokeTestReport, loadStatus], active);
 
   const startMcpService = useCallback(async ({ auto = false, operation: existingOperation = null } = {}) => {
     const operation = existingOperation || beginMcpOperation(auto ? 'restore' : 'start');
@@ -346,11 +350,11 @@ export function useAiEmbeddingController({ t }) {
     : 'disabled';
   const shouldShowStartButton = enabled && normalizedServiceState !== 'running';
   const statusBadge = {
-    running: { label: 'RUNNING', className: 'text-green-500' },
-    pending_auth: { label: 'WAITING', className: 'text-amber-400' },
-    error: { label: 'ERROR', className: 'text-red-500' },
-    stopped: { label: 'STOPPED', className: 'text-red-500' },
-  }[normalizedServiceState] || { label: 'STOPPED', className: 'text-red-500' };
+    running: { label: t('settings.serviceStates.running'), className: 'text-ide-info-success' },
+    pending_auth: { label: t('settings.serviceStates.waiting'), className: 'text-ide-warning' },
+    error: { label: t('settings.serviceStates.error'), className: 'text-ide-error' },
+    stopped: { label: t('settings.serviceStates.stopped'), className: 'text-ide-muted' },
+  }[normalizedServiceState] || { label: t('settings.serviceStates.stopped'), className: 'text-ide-muted' };
   const statusMessage = (() => {
     if (restoreLoading) return t('settings.ai_embedding.status.starting');
     if (!enabled) return t('settings.ai_embedding.status.stopped');
@@ -367,6 +371,7 @@ export function useAiEmbeddingController({ t }) {
   })();
 
   useEffect(() => {
+    if (!active) return;
     if (!enabled || running) {
       restoreAttemptRef.current = '';
       return;
@@ -388,6 +393,7 @@ export function useAiEmbeddingController({ t }) {
       }
     });
   }, [
+    active,
     enabled,
     running,
     normalizedServiceState,
@@ -399,14 +405,14 @@ export function useAiEmbeddingController({ t }) {
   ]);
 
   useEffect(() => {
-    if (!enabled || running) return undefined;
+    if (!active || !enabled || running) return undefined;
 
     const timer = window.setInterval(() => {
       loadStatus();
     }, 5000);
 
     return () => window.clearInterval(timer);
-  }, [enabled, running, loadStatus]);
+  }, [active, enabled, running, loadStatus]);
 
   return {
     enabled,

@@ -1,6 +1,8 @@
 //! Data type definitions for the storage module.
 
-use crate::credential_manager::{decrypt_row_key_with_cng, decrypt_with_master_key};
+use crate::credential_manager::{
+    decrypt_row_key_with_cng, decrypt_with_master_key, CredentialManagerState,
+};
 use serde::{Deserialize, Serialize};
 
 use super::wire_time;
@@ -143,11 +145,11 @@ pub(super) struct RawRecentCaptureRow {
 impl RawRecentCaptureRow {
     /// Decrypt the two label fields and produce a [`RecentCapture`].
     /// Runs outside the DB mutex.
-    pub(super) fn into_capture(self) -> RecentCapture {
+    pub(super) fn into_capture(self, credential: &CredentialManagerState) -> RecentCapture {
         let mut row_key = self
             .content_key_enc
             .as_ref()
-            .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+            .and_then(|enc| decrypt_row_key_with_cng(credential, enc).ok());
 
         let window_title = match (self.window_title_enc.as_ref(), row_key.as_ref()) {
             (Some(data), Some(key)) => decrypt_with_master_key(key, data)
@@ -257,11 +259,11 @@ pub(super) struct RawScreenshotRow {
 impl RawScreenshotRow {
     /// Decrypt encrypted fields and produce a ScreenshotRecord.
     /// CNG decryption happens here, outside of the DB mutex.
-    pub(super) fn into_record(self) -> ScreenshotRecord {
+    pub(super) fn into_record(self, credential: &CredentialManagerState) -> ScreenshotRecord {
         let mut row_key = self
             .content_key_enc
             .as_ref()
-            .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+            .and_then(|enc| decrypt_row_key_with_cng(credential, enc).ok());
 
         let window_title = match (self.window_title_enc.as_ref(), row_key.as_ref()) {
             (Some(data), Some(key)) => decrypt_with_master_key(key, data)
@@ -301,7 +303,7 @@ impl RawScreenshotRow {
                 self.page_icon_ref_key.as_ref(),
             ) {
                 (Some(data), Some(key)) => {
-                    let dedup_row_key = decrypt_row_key_with_cng(key).ok()?;
+                    let dedup_row_key = decrypt_row_key_with_cng(credential, key).ok()?;
                     let decrypted = decrypt_with_master_key(&dedup_row_key, data).ok()?;
                     String::from_utf8(decrypted).ok()
                 }
@@ -322,7 +324,7 @@ impl RawScreenshotRow {
                 self.link_set_ref_key.as_ref(),
             ) {
                 (Some(data), Some(key)) => {
-                    let dedup_row_key = decrypt_row_key_with_cng(key).ok()?;
+                    let dedup_row_key = decrypt_row_key_with_cng(credential, key).ok()?;
                     let decrypted = decrypt_with_master_key(&dedup_row_key, data).ok()?;
                     let s = String::from_utf8(decrypted).ok()?;
                     serde_json::from_str::<Vec<VisibleLink>>(&s).ok()

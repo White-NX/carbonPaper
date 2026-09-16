@@ -7,10 +7,10 @@ import {
   getSoftDeleteQueueStatus,
   getSmartClusterWorkerStatus,
   normalizeSmartClusterWorkerStatus,
-  getBackgroundIndexProgress,
 } from '../lib/monitor_api';
 import { smartClusterStopDrain } from '../lib/task_api';
 import { useHmacMigrationStatus } from './useHmacMigrationStatus';
+import { isIndexTaskPending, useBackgroundIndexProgress } from './useBackgroundIndexProgress';
 
 function useDebounce(value, delay) {
   const [debouncedValue, setDebouncedValue] = useState(value);
@@ -43,21 +43,6 @@ const EMPTY_CLUSTER_QUEUE_STATUS = {
   processed: 0,
 };
 
-// A manual index run that has not been observed yet. `total` of zero means "the
-// run has not finished counting its queue", not "there is nothing to do", which
-// is why the percentage below treats it as indeterminate.
-const EMPTY_INDEX_RUN = {
-  running: false,
-  processed: 0,
-  indexed: 0,
-  total: 0,
-};
-
-const EMPTY_BACKGROUND_INDEX_PROGRESS = {
-  semantic: EMPTY_INDEX_RUN,
-  clip: EMPTY_INDEX_RUN,
-};
-
 /**
  * Percentage of one manual index run, or `null` while it is indeterminate.
  *
@@ -67,8 +52,19 @@ const EMPTY_BACKGROUND_INDEX_PROGRESS = {
  * captures were still arriving can process more than it counted.
  */
 function indexRunPercent(run) {
-  if (!run?.running || !run.total) return null;
+  if (!isIndexTaskPending(run) || !run.total) return null;
   return Math.max(0, Math.min(100, (run.processed / run.total) * 100));
+}
+
+function indexTaskLabel(run, percent, kind, t) {
+  const state = {
+    queued: 'Queued', waiting_for_unlock: 'WaitingForUnlock',
+    waiting_for_verification: 'WaitingForVerification',
+    retry_wait: 'RetryWait', stopping: 'Stopping',
+  }[run.phase];
+  return t(`search.task.${kind}Index${state || (percent === null ? 'Preparing' : 'SummaryPlaceholder')}`, {
+    progress: percent === null ? '…' : Math.round(percent),
+  });
 }
 
 export function useSearchBoxController({
@@ -95,7 +91,7 @@ export function useSearchBoxController({
   const [smartClusterQueuePeak, setSmartClusterQueuePeak] = useState(0);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [isDownloadingModels, setIsDownloadingModels] = useState(false);
-  const [backgroundIndex, setBackgroundIndex] = useState(EMPTY_BACKGROUND_INDEX_PROGRESS);
+  const { progress: backgroundIndex } = useBackgroundIndexProgress();
 
   const debouncedQuery = useDebounce(query, 500);
   const wrapperRef = useRef(null);
@@ -250,21 +246,6 @@ export function useSearchBoxController({
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    const loadBackgroundIndex = async () => {
-      const progress = await getBackgroundIndexProgress();
-      if (!cancelled) setBackgroundIndex(progress);
-    };
-
-    loadBackgroundIndex();
-    const timer = setInterval(loadBackgroundIndex, 4000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, []);
-
-  useEffect(() => {
     let unlisten = null;
     let cancelled = false;
     listen('smart-cluster-progress', ({ payload }) => {
@@ -284,34 +265,6 @@ export function useSearchBoxController({
       cancelled = true;
       if (unlisten) unlisten();
     };
-  }, []);
-
-  // Index runs already publish chunk events. Keep the existing event-driven
-  // smoothing for those queues; Smart Cluster has its own queue event above.
-  useEffect(() => {
-    const subscriptions = [
-      ['semantic-index-progress', 'semantic'],
-      ['clip-index-progress', 'clip'],
-    ].map(([event, key]) => {
-      let unlisten = null;
-      let cancelled = false;
-      listen(event, ({ payload }) => {
-        if (!payload) return;
-        setBackgroundIndex((prev) => (prev[key].running
-          ? { ...prev, [key]: { ...prev[key], ...payload } }
-          : prev));
-      }).then((fn) => {
-        if (cancelled) fn();
-        else unlisten = fn;
-      }).catch((err) => {
-        console.warn(`Failed to subscribe to ${event}:`, err);
-      });
-      return () => {
-        cancelled = true;
-        if (unlisten) unlisten();
-      };
-    });
-    return () => subscriptions.forEach((dispose) => dispose());
   }, []);
 
   const pendingDeleteTotal = Number(deleteQueueStatus?.pending_ocr || 0)
@@ -344,11 +297,13 @@ export function useSearchBoxController({
     return Math.max(0, Math.min(100, ratio));
   })();
 
-  const hasSemanticIndexTask = backgroundIndex.semantic.running;
+  const hasSemanticIndexTask = isIndexTaskPending(backgroundIndex.semantic);
   const semanticIndexPercent = indexRunPercent(backgroundIndex.semantic);
 
-  const hasClipIndexTask = backgroundIndex.clip.running;
+  const hasClipIndexTask = isIndexTaskPending(backgroundIndex.clip);
   const clipIndexPercent = indexRunPercent(backgroundIndex.clip);
+  const semanticIndexTaskLabel = indexTaskLabel(backgroundIndex.semantic, semanticIndexPercent, 'semantic', t);
+  const clipIndexTaskLabel = indexTaskLabel(backgroundIndex.clip, clipIndexPercent, 'clip', t);
 
   const showProgressBar = hasDeleteTask || hasClusterTask || isDownloadingModels
     || hasSemanticIndexTask || hasClipIndexTask;
@@ -385,12 +340,10 @@ export function useSearchBoxController({
       return t('search.task.modelDownloadSummaryPlaceholder', { progress: Math.round(downloadProgress) });
     }
     if (hasClipIndexTask) {
-      const progress = clipIndexPercent === null ? '…' : Math.round(clipIndexPercent);
-      return t('search.task.clipIndexSummaryPlaceholder', { progress });
+      return clipIndexTaskLabel;
     }
     if (hasSemanticIndexTask) {
-      const progress = semanticIndexPercent === null ? '…' : Math.round(semanticIndexPercent);
-      return t('search.task.semanticIndexSummaryPlaceholder', { progress });
+      return semanticIndexTaskLabel;
     }
     return '';
   })();
@@ -522,8 +475,10 @@ export function useSearchBoxController({
     clusterProgress,
     hasSemanticIndexTask,
     semanticIndexPercent,
+    semanticIndexTaskLabel,
     hasClipIndexTask,
     clipIndexPercent,
+    clipIndexTaskLabel,
     showProgressBar,
     progressFillPercent,
     taskSummaryPlaceholder,

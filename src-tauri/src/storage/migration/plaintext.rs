@@ -270,7 +270,7 @@ impl StorageState {
             for (id, process_enc, key_enc) in &batch {
                 let mut row_key = key_enc
                     .as_ref()
-                    .and_then(|enc| decrypt_row_key_with_cng(enc).ok());
+                    .and_then(|enc| decrypt_row_key_with_cng(&storage.credential_state, enc).ok());
                 let name = match (process_enc.as_ref(), row_key.as_ref()) {
                     (Some(data), Some(key)) => decrypt_with_master_key(key, data)
                         .ok()

@@ -52,7 +52,7 @@ impl StorageState {
         // Phase 2: CNG decrypt + file read + AES decrypt + base64 — all outside mutex
         let mut row_key = key_enc
             .as_ref()
-            .and_then(|enc| decrypt_row_key_with_cng(enc).ok())
+            .and_then(|enc| decrypt_row_key_with_cng(&self.credential_state, enc).ok())
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
         let abs_path_str = abs_path.to_string_lossy().to_string();
@@ -145,9 +145,9 @@ impl StorageState {
             return Err(BackgroundReadError::AuthRequired);
         }
         let mut row_key = if silent {
-            decrypt_row_key_with_cng_silent(encrypted_key)
+            decrypt_row_key_with_cng_silent(&self.credential_state, encrypted_key)
         } else {
-            decrypt_row_key_with_cng(encrypted_key)
+            decrypt_row_key_with_cng(&self.credential_state, encrypted_key)
         }
         .map_err(|error| match error {
             CredentialError::AuthRequired => BackgroundReadError::AuthRequired,
@@ -224,7 +224,7 @@ impl StorageState {
         // Phase 2: Decrypt row key
         let mut row_key = key_enc
             .as_ref()
-            .and_then(|enc| decrypt_row_key_with_cng(enc).ok())
+            .and_then(|enc| decrypt_row_key_with_cng(&self.credential_state, enc).ok())
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
         let thumb_path = Self::thumbnail_path_for(&abs_path);
@@ -302,7 +302,7 @@ impl StorageState {
         // Phase 3: Decrypt row key and generate thumbnail
         let mut row_key = key_enc
             .as_ref()
-            .and_then(|enc| decrypt_row_key_with_cng(enc).ok())
+            .and_then(|enc| decrypt_row_key_with_cng(&self.credential_state, enc).ok())
             .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
         let abs_path_str = abs_path.to_string_lossy().to_string();
@@ -446,7 +446,7 @@ impl StorageState {
 
                     let mut row_key = key_enc
                         .as_ref()
-                        .and_then(|enc| decrypt_row_key_with_cng(enc).ok())
+                        .and_then(|enc| decrypt_row_key_with_cng(&self.credential_state, enc).ok())
                         .ok_or_else(|| "Failed to unwrap image row key".to_string())?;
 
                     let abs_path = self.resolve_image_path(path);

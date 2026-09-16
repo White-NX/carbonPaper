@@ -18,6 +18,7 @@ export function usePowerSavingState() {
 
   useTauriEventListener('power-saving-changed', (event) => {
     const payload = event.payload || {};
+    if (typeof payload.enabled === 'boolean') setPowerSavingMode(payload.enabled);
     setPowerSavingSuppressed(payload.active === true);
   });
 

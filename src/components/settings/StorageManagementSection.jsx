@@ -18,6 +18,8 @@ export default function StorageManagementSection({
   refreshing,
   error,
   onRefresh,
+  maintenance,
+  cleanup,
 }) {
   const { t } = useTranslation();
   const {
@@ -84,7 +86,7 @@ export default function StorageManagementSection({
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between shrink-0">
         <div className="space-y-1">
-          <h2 className="text-xl font-semibold">{t('settings.storageManagement.title')}</h2>
+          <h1 className="text-xl font-semibold">{t('settings.tabs.maintenance')}</h1>
           <p className="text-xs text-ide-muted">{t('settings.storageManagement.description')}</p>
         </div>
         <button
@@ -120,6 +122,7 @@ export default function StorageManagementSection({
             deleteQueuePending={indexHealthDeleteQueuePending}
             onRefresh={loadIndexHealth}
             formatIndexCount={formatIndexCount}
+            children={maintenance}
           />
 
           <StoragePolicyGrid
@@ -143,6 +146,8 @@ export default function StorageManagementSection({
             processStatsError={processStatsError}
             onOpenProcessDetail={openProcessDetail}
           />
+
+          {cleanup}
 
           {storageLimit === 'unlimited' && retentionPeriod === 'permanent' && (
             <SettingsWarningBanner title={t('settings.storageManagement.warning.title')}>

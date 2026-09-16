@@ -228,7 +228,7 @@ pub async fn app_bound_status(
     window: tauri::Window,
     storage: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<AppBoundStatus, String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     let storage = storage.inner().clone();
     tokio::task::spawn_blocking(move || {
         if storage.background_processing_enabled() {
@@ -279,7 +279,7 @@ pub async fn app_bound_set_policy(
     retention_days: u32,
     capacity_mib: u32,
 ) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credentials)?;
     if enabled && !credentials.background_processing_enabled() {
         return Err("BACKGROUND_PROCESSING_DISABLED".into());
@@ -397,7 +397,7 @@ pub async fn app_bound_install(
     credentials: tauri::State<'_, Arc<CredentialManagerState>>,
     enable: bool,
 ) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credentials)?;
     if enable && !credentials.background_processing_enabled() {
         return Err("BACKGROUND_PROCESSING_DISABLED".into());
@@ -413,7 +413,7 @@ pub async fn app_bound_uninstall(
     credentials: tauri::State<'_, Arc<CredentialManagerState>>,
     storage: tauri::State<'_, Arc<StorageState>>,
 ) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credentials)?;
     let storage = storage.inner().clone();
     tokio::task::spawn_blocking(move || {
