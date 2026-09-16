@@ -1806,35 +1806,56 @@ pub async fn get_ml_semantic_status(
     Ok(status)
 }
 
-/// One manual index run, as a poller reads it.
-///
-/// Every field is an atomic load. That is the point: the search box already
-/// polls the delete queue and the Smart Cluster worker every four seconds, and
-/// both of those take the process-wide database mutex for their counts. A third
-/// poll doing the same would put a lock acquisition on that cadence for numbers
-/// that only decorate a placeholder, so this one reads nothing but the run's own
-/// counters.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
-pub struct IndexRunProgress {
-    /// A manual run is executing. An idle pass never sets this — only
-    /// `begin()` does, and only the two "index now" commands call it — so this
-    /// means "somebody pressed a button", not "the machine is busy".
-    pub running: bool,
-    /// Subjects that left the queue in this run, encoded or not.
-    pub processed: u64,
-    /// Subjects that became query-visible in this run.
-    pub indexed: u64,
-    /// Queue depth when the run started. Zero until the run's repair scan has
-    /// finished counting, which is why a caller has to treat zero as "unknown"
-    /// rather than as "nothing to do".
-    pub total: u64,
+/// One authoritative view for settings and search, including scheduler waits.
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexTaskProgress {
+    #[serde(flatten)]
+    pub progress: crate::index_progress::IndexRunProgress,
+    pub phase: &'static str,
+    pub retry_at_ms: Option<i64>,
 }
 
-/// Both manual index runs, for the search box.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+impl IndexTaskProgress {
+    fn resolve(
+        progress: crate::index_progress::IndexRunProgress,
+        task: Option<&crate::storage::BackgroundTaskState>,
+        read_wait_reason: Option<&'static str>,
+    ) -> Self {
+        let phase = if progress.running {
+            if progress.stopping {
+                "stopping"
+            } else {
+                "running"
+            }
+        } else if task.is_some_and(|row| row.manual_in_flight && row.status == "running") {
+            "running"
+        } else if task.is_some_and(|row| row.manual_pending) {
+            if let Some(reason) = read_wait_reason {
+                reason
+            } else if task.is_some_and(|row| row.status == "retry_wait") {
+                "retry_wait"
+            } else {
+                "queued"
+            }
+        } else if task.is_some_and(|row| row.status == "failed") {
+            "failed"
+        } else {
+            "idle"
+        };
+        Self {
+            progress,
+            phase,
+            retry_at_ms: task
+                .filter(|_| phase == "retry_wait")
+                .map(|row| row.next_attempt_at_ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct BackgroundIndexProgress {
-    pub semantic: IndexRunProgress,
-    pub clip: IndexRunProgress,
+    pub semantic: IndexTaskProgress,
+    pub clip: IndexTaskProgress,
 }
 
 /// Read both manual index runs at once.
@@ -1848,13 +1869,31 @@ pub struct BackgroundIndexProgress {
 /// a status read that went blank exactly when the run was longest would hide the
 /// thing it exists to explain. It returns counters and no user data.
 #[tauri::command]
-pub fn get_background_index_progress(
+pub async fn get_background_index_progress(
+    storage: tauri::State<'_, Arc<crate::storage::StorageState>>,
     index_run: tauri::State<'_, Arc<crate::minilm_index::SemanticIndexRunState>>,
     clip_run: tauri::State<'_, Arc<crate::clip_index::ClipIndexRunState>>,
 ) -> Result<BackgroundIndexProgress, String> {
+    let read_storage = storage.inner().clone();
+    let tasks = tokio::task::spawn_blocking(move || read_storage.background_scheduler_tasks())
+        .await
+        .map_err(|error| format!("Failed to read index task state: {error}"))??;
+    let read_wait_reason = storage.silent_read_wait_reason();
     Ok(BackgroundIndexProgress {
-        semantic: index_run.progress(),
-        clip: clip_run.progress(),
+        semantic: IndexTaskProgress::resolve(
+            index_run.progress(),
+            tasks
+                .iter()
+                .find(|row| row.task_kind == crate::background_scheduler::TASK_SEMANTIC_INDEX),
+            read_wait_reason,
+        ),
+        clip: IndexTaskProgress::resolve(
+            clip_run.progress(),
+            tasks
+                .iter()
+                .find(|row| row.task_kind == crate::background_scheduler::TASK_CLIP_INDEX),
+            read_wait_reason,
+        ),
     })
 }
 
@@ -1874,6 +1913,60 @@ pub fn restart_ml_semantic_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_status_covers_scheduler_waits_and_ignores_automatic_work() {
+        use crate::index_progress::IndexRunProgress;
+        let mut task = crate::storage::BackgroundTaskState {
+            task_kind: "clip_index".into(),
+            ready_since_ms: 0,
+            next_attempt_at_ms: 1_000,
+            failure_count: 0,
+            last_served_seq: 1,
+            last_error: None,
+            last_completed_at_ms: None,
+            status: "queued".into(),
+            manual_pending: true,
+            manual_in_flight: false,
+        };
+        let progress = IndexRunProgress {
+            processed: 4,
+            total: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            IndexTaskProgress::resolve(progress, Some(&task), None).phase,
+            "queued"
+        );
+        let waiting = IndexTaskProgress::resolve(progress, Some(&task), Some("waiting_for_unlock"));
+        assert_eq!(waiting.phase, "waiting_for_unlock");
+        assert_eq!(waiting.progress.processed, 4);
+        task.status = "retry_wait".into();
+        let verification =
+            IndexTaskProgress::resolve(progress, Some(&task), Some("waiting_for_verification"));
+        assert_eq!(verification.phase, "waiting_for_verification");
+        assert_eq!(verification.progress.processed, 4);
+        let retry = IndexTaskProgress::resolve(progress, Some(&task), None);
+        assert_eq!(retry.phase, "retry_wait");
+        assert_eq!(retry.retry_at_ms, Some(1_000));
+        task.status = "running".into();
+        task.manual_pending = false;
+        task.manual_in_flight = true;
+        assert_eq!(
+            IndexTaskProgress::resolve(progress, Some(&task), None).phase,
+            "running"
+        );
+        task.manual_in_flight = false;
+        assert_eq!(
+            IndexTaskProgress::resolve(progress, Some(&task), None).phase,
+            "idle"
+        );
+        task.status = "failed".into();
+        assert_eq!(
+            IndexTaskProgress::resolve(progress, Some(&task), None).phase,
+            "failed"
+        );
+    }
 
     #[test]
     fn a_foreground_successor_observes_the_restored_native_job_budget() {

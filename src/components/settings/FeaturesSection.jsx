@@ -4,7 +4,7 @@ import { Layers } from 'lucide-react';
 import ClusteringScheduleCard from './organize/ClusteringScheduleCard';
 import FeatureModeCard from './organize/FeatureModeCard';
 import { FEATURE_MODE_OPTIONS, getFeatureMode } from './organize/featureModes';
-import ModelInventoryTable from './organize/ModelInventoryTable';
+import { SettingsErrorBanner } from './SettingsPrimitives';
 import SmartClusterCard from './organize/SmartClusterCard';
 import BackgroundSchedulingCard from './organize/BackgroundSchedulingCard';
 import { useFeaturesController } from './useFeaturesController';
@@ -15,8 +15,8 @@ export default function FeaturesSection({ monitorStatus }) {
   const {
     config,
     loading,
-    models,
-    modelsLoading,
+    featureSaving,
+    featureError,
     clusteringDropdownOpen,
     setClusteringDropdownOpen,
     clusteringAdvancedOpen,
@@ -38,7 +38,6 @@ export default function FeaturesSection({ monitorStatus }) {
     scDownloading,
     scDownloadLog,
     scDownloadError,
-    handleOpenLocation,
     handleFeatureModeChange,
     handleCustomFeatureToggle,
     handleClusteringIntervalChange,
@@ -51,12 +50,10 @@ export default function FeaturesSection({ monitorStatus }) {
     handleRescanAll,
     clearClusteringError,
     clearClusteringNotice,
-    formatSize,
     lastClusteringRunLabel,
     featureMode,
     featureModeOptions,
     selectedFeatureMode,
-    loadModels,
   } = useFeaturesController({
     monitorStatus,
     t,
@@ -74,6 +71,7 @@ export default function FeaturesSection({ monitorStatus }) {
 
   return (
     <div className="space-y-6">
+      {featureError && <SettingsErrorBanner>{featureError}</SettingsErrorBanner>}
       <section className="space-y-3">
         <label className="text-sm font-semibold text-ide-accent px-1 flex items-center gap-2">
           <Layers className="w-4 h-4" />
@@ -82,6 +80,7 @@ export default function FeaturesSection({ monitorStatus }) {
 
         <div className="space-y-3">
           <FeatureModeCard
+            disabled={featureSaving}
             config={config}
             featureMode={featureMode}
             featureModeOptions={featureModeOptions}
@@ -101,6 +100,7 @@ export default function FeaturesSection({ monitorStatus }) {
           />
 
           <ClusteringScheduleCard
+            saving={featureSaving}
             config={config}
             monitorStatus={monitorStatus}
             clusteringDropdownOpen={clusteringDropdownOpen}
@@ -135,14 +135,6 @@ export default function FeaturesSection({ monitorStatus }) {
           />
         </div>
       </section>
-
-      <ModelInventoryTable
-        models={models}
-        modelsLoading={modelsLoading}
-        onRefresh={loadModels}
-        onOpenLocation={handleOpenLocation}
-        formatSize={formatSize}
-      />
 
       <ConfirmDialog
         isOpen={Boolean(clusteringResourceChoice)}

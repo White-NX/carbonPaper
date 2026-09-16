@@ -31,9 +31,9 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
         canCancelClusterTask,
         clusterProgress,
         hasSemanticIndexTask,
-        semanticIndexPercent,
+        semanticIndexTaskLabel,
         hasClipIndexTask,
-        clipIndexPercent,
+        clipIndexTaskLabel,
         showProgressBar,
         progressFillPercent,
         taskSummaryPlaceholder,
@@ -207,9 +207,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                                 {t('search.task.semanticIndexRunningTitle')}
                             </div>
                             <div className="text-xs text-ide-muted leading-relaxed">
-                                {t('search.task.semanticIndexRunningDesc', {
-                                    progress: semanticIndexPercent === null ? '…' : Math.round(semanticIndexPercent),
-                                })}
+                                {semanticIndexTaskLabel}
                             </div>
                         </div>
                     )}
@@ -220,9 +218,7 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
                                 {t('search.task.clipIndexRunningTitle')}
                             </div>
                             <div className="text-xs text-ide-muted leading-relaxed">
-                                {t('search.task.clipIndexRunningDesc', {
-                                    progress: clipIndexPercent === null ? '…' : Math.round(clipIndexPercent),
-                                })}
+                                {clipIndexTaskLabel}
                             </div>
                         </div>
                     )}

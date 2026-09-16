@@ -1803,6 +1803,7 @@ mod tests {
             last_completed_at_ms: None,
             status: status.to_string(),
             manual_pending,
+            manual_in_flight: false,
         }
     }
 

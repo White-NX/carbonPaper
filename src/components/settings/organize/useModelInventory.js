@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../../../lib/auth_api';
 
-export function useModelInventory() {
+export function useModelInventory(active = true) {
   const [models, setModels] = useState([]);
   const [modelsLoading, setModelsLoading] = useState(false);
 
@@ -44,8 +44,8 @@ export function useModelInventory() {
   };
 
   useEffect(() => {
-    loadModels();
-  }, []);
+    if (active) loadModels();
+  }, [active]);
 
   return {
     models,

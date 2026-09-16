@@ -13,6 +13,7 @@ export default function FeatureModeCard({
   onFeatureModeChange,
   onCustomFeatureToggle,
   onToggleCustomControls,
+  disabled = false,
 }) {
   const { t } = useTranslation();
 
@@ -24,11 +25,12 @@ export default function FeatureModeCard({
       </div>
 
       <SettingsSegmentedControl
+        label={t('settings.features.management.featureMode.label')}
+        disabled={disabled}
         value={featureMode}
         options={featureModeOptions}
         onChange={onFeatureModeChange}
-        density="card"
-        className="grid-cols-2 md:grid-cols-4"
+        columns={4}
       />
 
       {featureMode !== 'custom' && (
@@ -80,7 +82,7 @@ export default function FeatureModeCard({
                   <SettingsSwitch
                     checked={Boolean(config[item.key])}
                     onChange={() => onCustomFeatureToggle(item.key)}
-                    disabled={item.disabled}
+                    disabled={disabled || item.disabled}
                     title={item.disabled ? t('settings.features.management.smartCluster.modelMissing', '请先下载模型') : item.label}
                   />
                 </div>

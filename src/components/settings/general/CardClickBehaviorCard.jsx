@@ -27,6 +27,7 @@ export default function CardClickBehaviorCard({
         <div className="flex items-center justify-between gap-4">
           <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.searchLabel')}</label>
           <DropdownSelect
+            label={t('settings.general.cardClickBehavior.searchLabel')}
             value={cardClickBehaviorSearch}
             onChange={(val) => onSetCardClickBehavior('search', val)}
             options={options}
@@ -36,6 +37,7 @@ export default function CardClickBehaviorCard({
         <div className="flex items-center justify-between gap-4">
           <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.clustersLabel')}</label>
           <DropdownSelect
+            label={t('settings.general.cardClickBehavior.clustersLabel')}
             value={cardClickBehaviorClusters}
             onChange={(val) => onSetCardClickBehavior('clusters', val)}
             options={options}
@@ -45,6 +47,7 @@ export default function CardClickBehaviorCard({
         <div className="flex items-center justify-between gap-4">
           <label className="text-xs text-ide-text font-medium">{t('settings.general.cardClickBehavior.activityContextLabel')}</label>
           <DropdownSelect
+            label={t('settings.general.cardClickBehavior.activityContextLabel')}
             value={cardClickBehaviorActivityContext}
             onChange={(val) => onSetCardClickBehavior('activityContext', val)}
             options={options}

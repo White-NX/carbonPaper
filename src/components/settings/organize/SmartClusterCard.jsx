@@ -2,6 +2,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Download, Loader2, RefreshCw, RotateCcw, Sparkles, Zap } from 'lucide-react';
 import { SettingsButton } from '../SettingsControls';
+import { SettingsDisclosure } from '../SettingsPrimitives';
 
 export default function SmartClusterCard({
   config,
@@ -64,12 +65,15 @@ export default function SmartClusterCard({
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
             {t('settings.features.management.smartCluster.downloading', '正在下载…')}
           </div>
+          <progress aria-label={t('settings.features.management.smartCluster.downloading')} className="h-1.5 w-full accent-ide-accent" />
+          <SettingsDisclosure title={t('settings.details.download')}>
           <textarea
             readOnly
             value={scDownloadLog.slice(-12).join('\n')}
             rows={6}
             className="w-full bg-ide-panel border border-ide-border rounded p-2 text-[11px] font-mono text-ide-muted resize-none"
           />
+          </SettingsDisclosure>
         </div>
       )}
 

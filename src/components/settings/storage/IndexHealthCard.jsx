@@ -1,81 +1,35 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Database, RefreshCw } from 'lucide-react';
-import { SettingsCard } from '../SettingsPrimitives';
+import { Database, RefreshCw } from 'lucide-react';
+import { SettingsCard, SettingsDisclosure, SettingsErrorBanner } from '../SettingsPrimitives';
+import { SettingsButton } from '../SettingsControls';
+import { DiagnosticValues } from '../advanced/InferenceCards';
 
-export default function IndexHealthCard({
-  indexHealth,
-  indexHealthLoading,
-  indexHealthError,
-  indexBacklog,
-  deleteQueuePending,
-  onRefresh,
-  formatIndexCount,
-}) {
+export default function IndexHealthCard({ indexHealth, indexHealthLoading, indexHealthError, indexBacklog, deleteQueuePending, onRefresh, formatIndexCount, children }) {
   const { t } = useTranslation();
-
-  return (
-    <SettingsCard>
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2 min-w-0">
-          <div className="p-2 rounded-lg bg-ide-bg border border-ide-border">
-            <Database className="w-4 h-4" />
-          </div>
-          <div className="min-w-0">
-            <h3 className="font-semibold">{t('settings.features.management.indexHealth.label', '索引健康')}</h3>
-            <p className="text-[11px] text-ide-muted">
-              {t('settings.features.management.indexHealth.description', '截图、OCR、向量索引和后台重试队列的当前状态')}
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={onRefresh}
-            disabled={indexHealthLoading}
-            className="p-1.5 text-ide-muted hover:text-ide-text hover:bg-ide-hover rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            title={t('settings.features.management.indexHealth.refresh', '刷新')}
-          >
-            <RefreshCw className={`w-4 h-4 ${indexHealthLoading ? 'animate-spin' : ''}`} />
-          </button>
-        </div>
+  const key = 'settings.features.management.indexHealth.';
+  return <SettingsCard>
+    <div className="flex items-center justify-between gap-4">
+      <div className="flex min-w-0 items-center gap-2">
+        <div className="rounded-lg border border-ide-border bg-ide-bg p-2"><Database className="h-4 w-4" /></div>
+        <div><h2 className="text-sm font-semibold">{t(key + 'label')}</h2><p className="mt-1 text-xs text-ide-muted">{t(key + 'description')}</p></div>
       </div>
-
-      <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-3 text-xs">
-        <div>
-          <p className="text-ide-muted">{t('settings.features.management.indexHealth.screenshots', '截图')}</p>
-          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(indexHealth?.screenshots_count)}</p>
-        </div>
-        <div>
-          <p className="text-ide-muted">{t('settings.features.management.indexHealth.ocrRows', 'OCR 行')}</p>
-          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(indexHealth?.ocr_rows_count)}</p>
-        </div>
-        <div>
-          <p className="text-ide-muted">{t('settings.features.management.indexHealth.vectorRows', '向量')}</p>
-          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(indexHealth?.vector_rows_count)}</p>
-        </div>
-        <div>
-          <p className="text-ide-muted">{t('settings.features.management.indexHealth.indexBacklog', '索引待处理')}</p>
-          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(indexBacklog)}</p>
-        </div>
-        <div>
-          <p className="text-ide-muted">{t('settings.features.management.indexHealth.deleteQueue', '删除队列')}</p>
-          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(deleteQueuePending)}</p>
-        </div>
-        <div>
-          <p className="text-ide-muted">{t('settings.features.management.indexHealth.smartPending', '智能聚类待处理')}</p>
-          <p className="mt-1 font-mono text-ide-text">{formatIndexCount(indexHealth?.smart_cluster_pending_count)}</p>
-        </div>
-      </div>
-
-      {indexHealthError && (
-        <div className="mt-4 flex items-start gap-2 px-2.5 py-2 bg-red-500/10 border border-red-500/30 rounded-lg">
-          <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
-          <div className="min-w-0 text-xs text-red-300">
-            <p className="break-all">{indexHealthError}</p>
-          </div>
-        </div>
-      )}
-    </SettingsCard>
-  );
+      <SettingsButton variant="ghost" icon={<RefreshCw className={'h-4 w-4 ' + (indexHealthLoading ? 'animate-spin' : '')} />}
+        onClick={onRefresh} disabled={indexHealthLoading} aria-label={t(key + 'refresh')} />
+    </div>
+    <div className="mt-4 grid grid-cols-2 gap-4 text-xs">
+      <div><p className="text-ide-muted">{t(key + 'screenshots')}</p><p className="mt-1 text-sm font-medium tabular-nums">{formatIndexCount(indexHealth?.screenshots_count)}</p></div>
+      <div><p className="text-ide-muted">{t(key + 'indexBacklog')}</p><p className="mt-1 text-sm font-medium tabular-nums">{formatIndexCount(indexBacklog)}</p></div>
+    </div>
+    {indexHealthError && <div className="mt-3"><SettingsErrorBanner>{indexHealthError}</SettingsErrorBanner></div>}
+    <SettingsDisclosure className="mt-3" title={t('settings.details.diagnostics')}>
+      <DiagnosticValues rows={[
+        [t(key + 'ocrRows'), formatIndexCount(indexHealth?.ocr_rows_count)],
+        [t(key + 'vectorRows'), formatIndexCount(indexHealth?.vector_rows_count)],
+        [t(key + 'deleteQueue'), formatIndexCount(deleteQueuePending)],
+        [t(key + 'smartPending'), formatIndexCount(indexHealth?.smart_cluster_pending_count)],
+      ]} />
+    </SettingsDisclosure>
+    {children}
+  </SettingsCard>;
 }

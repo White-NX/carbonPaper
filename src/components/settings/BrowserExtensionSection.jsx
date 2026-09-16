@@ -1,178 +1,138 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
-import { Globe, MonitorCheck } from 'lucide-react';
+import { Copy, Globe, Loader2, RefreshCw } from 'lucide-react';
 import { withAuth } from '../../lib/auth_api';
-import { SettingsSwitch } from './SettingsControls';
+import { SettingsButton, SettingsSwitch } from './SettingsControls';
+import { SettingsDisclosure, SettingsDivider, SettingsGroup, SettingsRow, SettingsSection, SettingsStatus } from './SettingsPrimitives';
+import { useSettingsActive, useSettingsActivity } from './SettingsActivityContext';
 
 export default function BrowserExtensionSection() {
   const { t } = useTranslation();
-  const [status, setStatus] = useState({ chrome: false, edge: false });
-  const [enhanceEnabled, setEnhanceEnabled] = useState(false);
-  const [sessions, setSessions] = useState([]);
-  const [installing, setInstalling] = useState(null); // 'chrome' | 'edge' | null
-  const [message, setMessage] = useState('');
-  const [messageType, setMessageType] = useState(''); // 'success' | 'error'
+  const active = useSettingsActive();
+  const [status, setStatus] = useState(null);
+  const [enhanceEnabled, setEnhanceEnabled] = useState(null);
+  const [sessions, setSessions] = useState(null);
+  const [installing, setInstalling] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState(null);
+  const [guideOpen, setGuideOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [readError, setReadError] = useState(false);
+  const mounted = useRef(false);
+  const operation = useRef(false);
+  const request = useRef(0);
+  const setupBrowser = useRef(null);
+  useSettingsActivity('browser-extension', { busy: Boolean(installing) || saving });
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
-  const checkStatus = async () => {
+  const load = useCallback(async () => {
+    const id = ++request.current;
     try {
-      const result = await invoke('get_nm_host_status');
-      setStatus(result);
-    } catch (e) {
-      console.error('Failed to check NM host status:', e);
+      const [host, config, connected] = await Promise.all([
+        invoke('get_nm_host_status'), invoke('get_extension_enhancement_config'), invoke('get_nmh_sessions'),
+      ]);
+      if (!mounted.current || id !== request.current) return;
+      setStatus((current) => ({ ...host, extension_path: host.extension_path || current?.extension_path }));
+      setReadError(false);
+      setEnhanceEnabled(Boolean(config?.enabled));
+      setSessions(Array.isArray(connected) ? connected : []);
+      setMessage((current) => current?.key === 'settings.extension.readFailed' ? null : current);
+      if (setupBrowser.current && (connected || []).some((session) => {
+        const edge = (session.browser_exe_name || session.browser_exe_path || '').toLowerCase().includes('msedge');
+        return setupBrowser.current === 'edge' ? edge : !edge;
+      })) {
+        setupBrowser.current = null;
+        setGuideOpen(false);
+        setMessage(null);
+      }
+    } catch (error) {
+      if (mounted.current && id === request.current) { setReadError(true); setMessage({ tone: 'error', key: 'settings.extension.readFailed' }); }
     }
-  };
-
-  const loadEnhanceConfig = async () => {
-    try {
-      const result = await invoke('get_extension_enhancement_config');
-      setEnhanceEnabled(Boolean(result?.enabled));
-    } catch (e) {
-      console.error('Failed to load extension enhancement config:', e);
-    }
-  };
-
-  const loadSessions = async () => {
-    try {
-      const result = await invoke('get_nmh_sessions');
-      setSessions(Array.isArray(result) ? result : []);
-    } catch (e) {
-      console.error('Failed to load NMH sessions:', e);
-    }
-  };
-
+  }, [t]);
   useEffect(() => {
-    checkStatus();
-    loadEnhanceConfig();
-    loadSessions();
-    const timer = setInterval(loadSessions, 5000);
-    return () => clearInterval(timer);
-  }, []);
+    if (!active) return undefined;
+    let cancelled = false;
+    let timer;
+    const poll = async () => { await load(); if (!cancelled) timer = setTimeout(poll, 5000); };
+    poll();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [active, load]);
 
-  const handleInstall = async (browser) => {
+  const install = async (browser) => {
+    if (operation.current) return;
+    operation.current = true;
     setInstalling(browser);
-    setMessage('');
+    setMessage(null);
     try {
-      await withAuth(() => invoke('install_browser_extension', { browser }), { autoPrompt: true });
-      setMessage(t('settings.extension.success'));
-      setMessageType('success');
-      await checkStatus();
-    } catch (e) {
-      setMessage(t('settings.extension.error', { error: e?.message || String(e) }));
-      setMessageType('error');
-    } finally {
-      setInstalling(null);
-    }
+      const result = await withAuth(() => invoke('install_browser_extension', { browser }), { autoPrompt: true });
+      if (!mounted.current) return;
+      setStatus((current) => ({ ...current, [browser]: true, extension_path: result?.extension_path || current?.extension_path }));
+      setGuideOpen(true);
+      setupBrowser.current = browser;
+      setMessage({ tone: 'success', key: 'settings.extension.prepared' });
+      await load();
+    } catch (error) {
+      if (mounted.current) setMessage({ tone: 'error', key: 'settings.extension.error', values: { error: error?.message || String(error) } });
+    } finally { operation.current = false; if (mounted.current) setInstalling(null); }
   };
-
-  const handleEnhanceToggle = async (enabled) => {
+  const toggle = async (enabled) => {
+    if (operation.current) return;
+    operation.current = true;
+    setSaving(true);
+    setMessage(null);
     try {
       await withAuth(() => invoke('set_extension_enhancement', { enabled }), { autoPrompt: true });
-      setEnhanceEnabled(enabled);
-    } catch (e) {
-      console.error('Failed to set extension enhancement:', e);
-    }
+      if (mounted.current) setEnhanceEnabled(enabled);
+    } catch (error) {
+      if (mounted.current) setMessage({ tone: 'error', key: 'settings.feedback.saveFailed', values: { error: String(error) } });
+    } finally { operation.current = false; if (mounted.current) setSaving(false); }
   };
-
-  const renderBrowser = (browser) => (
-    <div className="px-4 py-3 rounded-lg bg-ide-panel border border-ide-border">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Globe className="w-5 h-5 text-ide-text-secondary" />
-          <div>
-            <div className="text-sm font-medium">{t(`settings.extension.${browser}.name`)}</div>
-            <div className={`text-xs ${status[browser] ? 'text-ide-info-success' : 'text-ide-text-secondary'}`}>
-              {status[browser] ? t('settings.extension.status.registered') : t('settings.extension.status.not_registered')}
-            </div>
-          </div>
-        </div>
-        <button
-          onClick={() => handleInstall(browser)}
-          disabled={installing !== null}
-          className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${status[browser]
-              ? 'bg-green-500/20 text-ide-info-success border border-green-500/30'
-              : 'bg-ide-accent text-white hover:bg-ide-accent/80'
-            } disabled:opacity-50`}
-        >
-          {installing === browser
-            ? t(`settings.extension.${browser}.registering`)
-            : status[browser]
-              ? t(`settings.extension.${browser}.registered`)
-              : t(`settings.extension.${browser}.label`)}
-        </button>
-      </div>
-    </div>
-  );
+  const connected = (browser) => sessions?.some((session) => {
+    const name = (session.browser_exe_name || session.browser_exe_path || '').toLowerCase();
+    return browser === 'edge' ? name.includes('msedge') : !name.includes('msedge');
+  });
 
   return (
-    <div className="space-y-4">
-      <div className="space-y-1">
-        <h2 className="text-xl font-semibold">{t('settings.extension.title')} <span className="px-1 py-0.5 bg-amber-500/20 text-amber-400 text-[10px] rounded">alpha</span></h2>
-        <p className="text-xs text-ide-muted">{t('settings.extension.description')}</p>
-      </div>
-
-      <div className="space-y-3">
-        {renderBrowser('chrome')}
-        {renderBrowser('edge')}
-      </div>
-
-      {/* Global enhancement toggle */}
-      <div className="px-4 py-3 rounded-lg bg-ide-panel border border-ide-border space-y-2">
-        <div className="flex items-center justify-between">
-          <span className="text-sm font-medium">{t('settings.extension.enhance.global')}</span>
-          <SettingsSwitch
-            checked={enhanceEnabled}
-            onChange={handleEnhanceToggle}
-            title={t('settings.extension.enhance.global')}
-          />
+    <SettingsSection id="browser-extension" title={t('settings.extension.title')} icon={Globe}>
+      <SettingsGroup>
+        <SettingsRow label={t('settings.extension.enhance.global')} description={t('settings.extension.enhance.description')}
+          control={<SettingsSwitch checked={enhanceEnabled === true} disabled={enhanceEnabled === null || saving || Boolean(installing)} onChange={toggle} />} />
+        <SettingsDivider />
+        <div className="space-y-4">
+          {['chrome', 'edge'].map((browser) => (
+            <SettingsRow key={browser} label={t(`settings.extension.${browser}.name`)}
+              description={t(readError ? 'settings.extension.status.unavailable' : !status || sessions === null ? 'settings.extension.status.checking' : connected(browser) ? 'settings.extension.status.connected' : status[browser] ? 'settings.extension.status.configured' : 'settings.extension.status.not_configured')}
+              control={<SettingsButton onClick={() => install(browser)} disabled={saving || Boolean(installing)}
+                icon={installing === browser ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : undefined}>
+                {t(installing === browser ? 'settings.extension.preparing' : status?.[browser] ? 'settings.extension.configureAgain' : 'settings.extension.setup')}
+              </SettingsButton>} />
+          ))}
         </div>
-        {enhanceEnabled && (
-          <p className="text-xs text-ide-text-secondary">
-            {t('settings.extension.enhance.description')}
-          </p>
-        )}
-      </div>
-
-      {/* Live connected-browser sessions */}
-      <div className="px-4 py-3 rounded-lg bg-ide-panel border border-ide-border space-y-2">
-        <div className="flex items-center gap-2">
-          <MonitorCheck className="w-4 h-4 text-ide-text-secondary" />
-          <span className="text-sm font-medium">{t('settings.extension.sessions.title')}</span>
-        </div>
-        {sessions.length === 0 ? (
-          <p className="text-xs text-ide-text-secondary">{t('settings.extension.sessions.empty')}</p>
-        ) : (
-          <ul className="space-y-1">
-            {sessions.map((s) => (
-              <li key={`${s.nmh_pid}-${s.cmd_pipe_name}`} className="flex items-center gap-2 text-xs">
-                <span className="w-1.5 h-1.5 rounded-full bg-ide-info-success shrink-0" />
-                <span className="text-ide-text">{s.browser_exe_name || s.browser_exe_path}</span>
-                <span className="text-ide-text-secondary">
-                  {t('settings.extension.sessions.pid', { pid: s.browser_pid })}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-
-      {message && (
-        <div className={`text-xs px-3 py-2 rounded ${messageType === 'success' ? 'bg-green-500/10 text-ide-info-success' : 'bg-red-500/10 text-ide-error'
-          }`}>
-          {message}
-        </div>
-      )}
-
-      {/* Tutorial */}
-      <div className="bg-ide-bg rounded-lg border border-ide-border p-3">
-        <h4 className="text-xs font-semibold text-ide-text mb-2">{t('settings.extension.tutorial.title')}</h4>
-        <ol className="text-xs text-ide-text-secondary space-y-1.5 list-decimal list-inside">
-          <li>{t('settings.extension.tutorial.step1')}</li>
-          <li>{t('settings.extension.tutorial.step2')}</li>
-          <li>{t('settings.extension.tutorial.step3')}</li>
-          <li>{t('settings.extension.tutorial.step4')}</li>
-        </ol>
-      </div>
-    </div>
+        {message && <div className="mt-4 flex items-center gap-3"><SettingsStatus tone={message.tone}>{t(message.key, message.values)}</SettingsStatus>
+          {message.tone === 'error' && <SettingsButton variant="ghost" icon={RefreshCw} onClick={load}>{t('common.retry')}</SettingsButton>}</div>}
+        <SettingsDivider />
+        <SettingsDisclosure title={t('settings.extension.tutorial.title')} open={guideOpen} onOpenChange={setGuideOpen}>
+          {status?.extension_path && <div className="space-y-2">
+            <p className="text-xs font-medium">{t('settings.extension.folder')}</p>
+            <div className="flex items-center gap-2 rounded-lg bg-ide-panel p-3">
+              <code className="min-w-0 flex-1 break-all text-xs text-ide-muted">{status.extension_path}</code>
+              <SettingsButton icon={Copy} onClick={async () => {
+                try { await navigator.clipboard.writeText(status.extension_path); setCopied(true); }
+                catch (error) { setMessage({ tone: 'error', key: 'settings.extension.copyFailed' }); }
+              }}>{t(copied ? 'settings.extension.copied' : 'settings.extension.copyFolder')}</SettingsButton>
+            </div>
+          </div>}
+          <ol className="list-inside list-decimal space-y-2 text-xs leading-relaxed text-ide-muted">
+            {[1, 2, 3, 4].map((step) => <li key={step}>{t(`settings.extension.tutorial.step${step}`)}</li>)}
+          </ol>
+        </SettingsDisclosure>
+        <SettingsDisclosure title={t('settings.extension.connectionDetails')}>
+          {sessions?.length ? <ul className="space-y-2 text-xs text-ide-muted">{sessions.map((session) =>
+            <li key={session.nmh_pid + '-' + session.cmd_pipe_name} className="break-all">{session.browser_exe_name || session.browser_exe_path} · {t('settings.extension.sessions.pid', { pid: session.browser_pid })}</li>)}</ul>
+            : <p className="text-xs text-ide-muted">{t('settings.extension.sessions.empty')}</p>}
+        </SettingsDisclosure>
+      </SettingsGroup>
+    </SettingsSection>
   );
 }

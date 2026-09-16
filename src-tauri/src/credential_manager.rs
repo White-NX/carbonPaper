@@ -16,8 +16,10 @@ use aes_gcm::{
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use thiserror::Error;
+use zeroize::Zeroize;
 
 /// Errors produced by credential and key-management operations.
 #[derive(Debug, Error)]
@@ -57,6 +59,43 @@ const CNG_KEY_NAME: &str = "CarbonPaperMasterKeyV3";
 // The Software KSP supports RSA encryption and protected UI policy.
 const CNG_PROVIDER_NAME: &str = "Microsoft Software Key Storage Provider";
 
+/// Keep the exact private-key handle used for verification. Opening another
+/// handle is not a proof that it can decrypt silently, even in the same process.
+/// A still-usable handle requires fresh consent from the verification child;
+/// a missing/expired handle is authenticated in the parent and retained here.
+fn verify_with_retained_key<K>(
+    retained: &mut Option<K>,
+    mut probe_retained: impl FnMut(&K) -> Result<(), CredentialError>,
+    verify_parent: impl FnOnce() -> Result<(K, Vec<u8>), CredentialError>,
+    verify_child: impl FnOnce() -> Result<Vec<u8>, CredentialError>,
+) -> Result<Vec<u8>, CredentialError> {
+    if let Some(key) = retained.as_ref() {
+        match probe_retained(key) {
+            Ok(()) => {
+                let mut master_key = verify_child()?;
+                // Consent in the child must not be mistaken for usable access
+                // in the parent if its provider context expired during the UI.
+                if let Err(error) = probe_retained(key) {
+                    master_key.zeroize();
+                    return Err(error);
+                }
+                return Ok(master_key);
+            }
+            Err(CredentialError::AuthRequired) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let (key, mut master_key) = verify_parent()?;
+    // Do not report an unlocked session until the retained handle can actually
+    // serve the same silent reads that indexing and search will perform.
+    if let Err(error) = probe_retained(&key) {
+        master_key.zeroize();
+        return Err(error);
+    }
+    *retained = Some(key);
+    Ok(master_key)
+}
+
 /// Shared credential-manager state.
 pub struct CredentialManagerState {
     /// Cached SQLCipher database key, available only to an authenticated UI session.
@@ -65,6 +104,10 @@ pub struct CredentialManagerState {
     cached_public_key: Mutex<Option<Vec<u8>>>,
     /// Cached master key used by background data encryption.
     cached_master_key: Mutex<Option<Vec<u8>>>,
+    /// Private-key context authenticated by the explicit unlock. All readers
+    /// borrow this handle; the mutex serializes NCrypt operations on it.
+    #[cfg(windows)]
+    cached_private_key: Mutex<Option<CngKeyHandle>>,
     /// Data directory containing persisted key material.
     data_dir: Mutex<PathBuf>,
     /// Time of the last successful authentication, used for session expiry.
@@ -78,6 +121,9 @@ pub struct CredentialManagerState {
     /// Process-scoped lease granted after a successful Windows Hello unlock.
     /// This is intentionally never persisted across application restarts.
     background_lease_active: Mutex<bool>,
+    /// A retained CNG context can still be revoked by Windows. Only a native
+    /// silent-decrypt denial sets this flag; application policy is separate.
+    silent_read_auth_required: AtomicBool,
 }
 
 /// In-memory state changed by backup credential import.
@@ -92,6 +138,7 @@ pub(crate) struct CredentialImportSnapshot {
     cached_master_key: Option<Vec<u8>>,
     last_auth_time: Option<std::time::Instant>,
     background_lease_active: bool,
+    silent_read_auth_required: bool,
 }
 
 impl CredentialManagerState {
@@ -140,12 +187,15 @@ impl CredentialManagerState {
             cached_db_key: Mutex::new(None),
             cached_public_key: Mutex::new(None),
             cached_master_key: Mutex::new(None),
+            #[cfg(windows)]
+            cached_private_key: Mutex::new(None),
             data_dir: Mutex::new(data_dir),
             last_auth_time: Mutex::new(None),
             app_in_foreground: Mutex::new(true),
             session_timeout_secs: Mutex::new(initial_timeout),
             background_processing_enabled: Mutex::new(background_processing_enabled),
             background_lease_active: Mutex::new(false),
+            silent_read_auth_required: AtomicBool::new(false),
         }
     }
 
@@ -161,12 +211,29 @@ impl CredentialManagerState {
     /// reads. The lease is granted only by a successful unlock and is never
     /// restored from disk.
     pub fn background_authorized(&self) -> bool {
-        self.background_processing_enabled()
+        !self.silent_read_auth_required()
+            && self.background_processing_enabled()
             && *self
                 .background_lease_active
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
             && get_cached_master_key(self).is_some()
+    }
+
+    /// Explicit jobs may read during a valid UI session even when unattended
+    /// processing is disabled. Every private-key operation rechecks this gate.
+    pub(crate) fn protected_read_authorized(&self) -> bool {
+        self.protected_read_wait_reason().is_none()
+    }
+
+    pub(crate) fn protected_read_wait_reason(&self) -> Option<&'static str> {
+        if self.silent_read_auth_required() {
+            Some("waiting_for_verification")
+        } else if self.is_session_valid() || self.background_authorized() {
+            None
+        } else {
+            Some("waiting_for_unlock")
+        }
     }
 
     /// Grant the process-scoped background lease after Windows Hello succeeds.
@@ -287,6 +354,23 @@ impl CredentialManagerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *last_auth = Some(std::time::Instant::now());
+        self.silent_read_auth_required
+            .store(false, Ordering::SeqCst);
+    }
+
+    pub fn silent_read_auth_required(&self) -> bool {
+        self.silent_read_auth_required.load(Ordering::SeqCst)
+    }
+
+    /// Ignore failures from work admitted before a newer successful unlock.
+    fn require_silent_read_authentication(&self, attempted_at: std::time::Instant) {
+        let last_auth = self
+            .last_auth_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if last_auth.is_none_or(|authenticated_at| authenticated_at <= attempted_at) {
+            self.silent_read_auth_required.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Invalidates UI access while retaining the master key for background encryption.
@@ -312,6 +396,17 @@ impl CredentialManagerState {
 
     /// Clears every cached key during shutdown or credential reset.
     pub fn clear_all_cached_keys(&self) {
+        // Serialize a full reset with verification's key/session publication.
+        #[cfg(windows)]
+        let mut retained = self
+            .cached_private_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        #[cfg(windows)]
+        {
+            *retained = None;
+        }
+        self.invalidate_session();
         self.revoke_background_lease();
         {
             let mut cached_db = self.cached_db_key.lock().unwrap_or_else(|e| e.into_inner());
@@ -396,6 +491,7 @@ impl CredentialManagerState {
                 .background_lease_active
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()),
+            silent_read_auth_required: self.silent_read_auth_required(),
         }
     }
 
@@ -420,6 +516,8 @@ impl CredentialManagerState {
             .background_lease_active
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = snapshot.background_lease_active;
+        self.silent_read_auth_required
+            .store(snapshot.silent_read_auth_required, Ordering::SeqCst);
     }
 
     pub(crate) fn prepare_import_master_key_file(
@@ -771,42 +869,61 @@ mod windows_impl {
 
     /// Forces user verification and unlocks the master key.
     ///
-    /// Cold start decrypts in the main process so one prompt establishes the CNG PIN
-    /// cache used by later row-key reads. Re-unlocking an already cached master key uses
-    /// a short-lived child process with no PIN cache, forcing fresh user verification
-    /// without disrupting the main process cache used for subsequent reads.
+    /// Cold start retains the private-key handle authenticated in the main process.
+    /// Re-unlocking with a usable handle uses a short-lived child to require fresh
+    /// user verification while keeping the parent's read context alive.
     pub fn force_verify_and_unlock_master_key(
         state: &CredentialManagerState,
         owner_hwnd: Option<isize>,
-    ) -> Result<Vec<u8>, CredentialError> {
+    ) -> Result<(), CredentialError> {
         let key_file = state.master_key_file_path();
         if !key_file.exists() {
             return Err(CredentialError::KeyNotFound);
         }
 
-        let already_cached = get_cached_master_key(state).is_some();
-
-        let master_key = if already_cached {
-            // A child process bypasses the main process's existing CNG PIN cache.
-            verify_via_subprocess(&key_file, owner_hwnd)?
-        } else {
-            // Cold start keeps the new CNG PIN cache in the main process.
-            let file_data = std::fs::read(&key_file).map_err(|e| {
-                CredentialError::SystemError(format!("Failed to read master key file: {}", e))
-            })?;
-            let ciphertext = decode_master_key_file(&file_data)?;
-            decrypt_master_key_with_cng_for_window(&ciphertext, owner_hwnd)?
-        };
-
+        let file_data = std::fs::read(&key_file).map_err(|e| {
+            CredentialError::SystemError(format!("Failed to read master key file: {}", e))
+        })?;
+        let ciphertext = decode_master_key_file(&file_data)?;
+        let mut retained = state
+            .cached_private_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let master_key = verify_with_retained_key(
+            &mut retained,
+            |key| {
+                let mut probe = key.unwrap_row_key(&ciphertext)?;
+                let length = probe.len();
+                probe.zeroize();
+                if length != MASTER_KEY_LEN {
+                    return Err(CredentialError::CryptoError(format!(
+                        "Unexpected master key length: {length}"
+                    )));
+                }
+                Ok(())
+            },
+            || {
+                let key = CngKeyHandle::open(CngKeyAccess::Existing)?;
+                let master_key = key.decrypt_for_window(&ciphertext, owner_hwnd)?;
+                Ok((key, master_key))
+            },
+            || verify_via_subprocess(&key_file, owner_hwnd),
+        )?;
         {
             let mut cached = state
                 .cached_master_key
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            *cached = Some(master_key.clone());
+            *cached = Some(master_key);
         }
 
-        Ok(master_key)
+        // Publish authorization while reset is still excluded by the handle
+        // mutex, so reset cannot be followed by a late successful unlock flag.
+        state.update_auth_time();
+        state.grant_background_lease();
+        drop(retained);
+
+        Ok(())
     }
 
     /// Runs CNG decryption in a child process to bypass the main process PIN cache.
@@ -885,7 +1002,16 @@ mod windows_impl {
         })?;
 
         let ciphertext = decode_master_key_file(&file_data)?;
-        let master_key = decrypt_master_key_with_cng(&ciphertext)?;
+        let mut retained = state
+            .cached_private_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = CngKeyHandle::open(CngKeyAccess::Existing)?;
+        let master_key = key.decrypt_for_window(&ciphertext, None)?;
+        let mut probe = key.unwrap_row_key(&ciphertext)?;
+        probe.zeroize();
+        *retained = Some(key);
+        drop(retained);
 
         {
             let mut cached = state
@@ -1091,19 +1217,10 @@ pub fn get_or_create_master_key_sync(
 enum CngKeyAccess {
     CreateIfMissing,
     Existing,
-    ExistingSilent,
 }
 
 #[cfg(windows)]
 impl CngKeyAccess {
-    fn flags(self) -> windows::Win32::Security::Cryptography::NCRYPT_FLAGS {
-        use windows::Win32::Security::Cryptography::{NCRYPT_FLAGS, NCRYPT_SILENT_FLAG};
-        match self {
-            Self::ExistingSilent => NCRYPT_SILENT_FLAG,
-            _ => NCRYPT_FLAGS(0),
-        }
-    }
-
     /// Only first-use setup may create a key, and only after confirmed absence.
     /// Authentication, cancellation and provider failures must never replace it.
     fn allow_creation_after(self, error: windows::core::Error) -> Result<(), CredentialError> {
@@ -1168,7 +1285,7 @@ fn open_cng_key(
             &mut key,
             key_pcwstr,
             CERT_KEY_SPEC(0),
-            access.flags(),
+            NCRYPT_FLAGS(0),
         )
     };
 
@@ -1332,79 +1449,96 @@ fn encrypt_master_key_with_cng(master_key: &[u8]) -> Result<Vec<u8>, CredentialE
 }
 
 #[cfg(windows)]
-pub fn decrypt_master_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    decrypt_master_key_with_cng_for_window(ciphertext, None)
-}
-
-#[cfg(windows)]
 pub fn decrypt_master_key_with_cng_for_window(
     ciphertext: &[u8],
     owner_hwnd: Option<isize>,
 ) -> Result<Vec<u8>, CredentialError> {
-    use windows::Win32::Security::Cryptography::NCRYPT_PAD_PKCS1_FLAG;
-
-    decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG, owner_hwnd)
+    // Standalone verification child only. The main process keeps its own
+    // authenticated handle in CredentialManagerState instead of using this helper.
+    CngKeyHandle::open(CngKeyAccess::Existing)?.decrypt_for_window(ciphertext, owner_hwnd)
 }
 
 #[cfg(windows)]
-fn decrypt_master_key_with_cng_flags(
-    ciphertext: &[u8],
-    flags: windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
-    owner_hwnd: Option<isize>,
-) -> Result<Vec<u8>, CredentialError> {
-    use windows::Win32::Security::Cryptography::{
-        NCryptFreeObject, NCRYPT_HANDLE, NCRYPT_SILENT_FLAG,
-    };
+struct CngKeyHandle {
+    key: windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE,
+}
 
-    let access = if flags.contains(NCRYPT_SILENT_FLAG) {
-        CngKeyAccess::ExistingSilent
-    } else {
-        CngKeyAccess::Existing
-    };
-    let key = open_cng_key(access)?;
-    if let Some(hwnd) = owner_hwnd {
-        use windows::Win32::Security::Cryptography::{
-            NCryptSetProperty, NCRYPT_WINDOW_HANDLE_PROPERTY,
-        };
-        let hwnd_bytes = (hwnd as usize).to_ne_bytes();
-        // SAFETY: key is live and `hwnd_bytes` has the native pointer width expected by
-        // `NCRYPT_WINDOW_HANDLE_PROPERTY`; the slice is used synchronously.
-        unsafe {
-            NCryptSetProperty(
-                key,
-                NCRYPT_WINDOW_HANDLE_PROPERTY,
-                &hwnd_bytes,
-                windows::Win32::Security::Cryptography::NCRYPT_FLAGS(0),
-            )
-        }
-        .map_err(|e| {
-            // SAFETY: key ownership remains local when setting the property fails.
-            let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-            CredentialError::SystemError(format!("Failed to set CNG owner window: {}", e))
-        })?;
+#[cfg(windows)]
+impl CngKeyHandle {
+    fn open(access: CngKeyAccess) -> Result<Self, CredentialError> {
+        Ok(Self {
+            key: open_cng_key(access)?,
+        })
     }
 
-    let result = ncrypt_decrypt_with_key(key, ciphertext, flags);
-    // SAFETY: this is the final use of the owned key handle.
-    let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(key.0)) };
-    result
+    fn decrypt_for_window(
+        &self,
+        ciphertext: &[u8],
+        owner_hwnd: Option<isize>,
+    ) -> Result<Vec<u8>, CredentialError> {
+        use windows::Win32::Security::Cryptography::NCRYPT_PAD_PKCS1_FLAG;
+
+        if let Some(hwnd) = owner_hwnd {
+            use windows::Win32::Security::Cryptography::{
+                NCryptSetProperty, NCRYPT_FLAGS, NCRYPT_WINDOW_HANDLE_PROPERTY,
+            };
+            let hwnd_bytes = (hwnd as usize).to_ne_bytes();
+            // SAFETY: the owned key is live; the value has the native HWND width
+            // and remains valid throughout the synchronous property update.
+            unsafe {
+                NCryptSetProperty(
+                    self.key,
+                    NCRYPT_WINDOW_HANDLE_PROPERTY,
+                    &hwnd_bytes,
+                    NCRYPT_FLAGS(0),
+                )
+            }
+            .map_err(|e| {
+                CredentialError::SystemError(format!("Failed to set CNG owner window: {e}"))
+            })?;
+        }
+        ncrypt_decrypt_with_key(self.key, ciphertext, NCRYPT_PAD_PKCS1_FLAG)
+    }
+
+    fn unwrap_row_key(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+        use windows::Win32::Security::Cryptography::{NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG};
+        ncrypt_decrypt_with_key(
+            self.key,
+            ciphertext,
+            NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG,
+        )
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CngKeyHandle {
+    fn drop(&mut self) {
+        use windows::Win32::Security::Cryptography::{NCryptFreeObject, NCRYPT_HANDLE};
+        // SAFETY: this object exclusively owns the handle; no reader can keep
+        // a raw handle after the credential state's mutex guard is released.
+        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(self.key.0)) };
+    }
 }
 
 /// Runs the size-query + decrypt `NCryptDecrypt` pair against a borrowed key
 /// handle. The caller keeps ownership of the handle and frees it, which lets
-/// [`CngKeySession`] reuse one handle across a whole batch.
+/// the credential state reuse the authenticated handle for all readers.
 #[cfg(windows)]
 fn ncrypt_decrypt_with_key(
     key: windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE,
     ciphertext: &[u8],
     flags: windows::Win32::Security::Cryptography::NCRYPT_FLAGS,
 ) -> Result<Vec<u8>, CredentialError> {
-    use windows::Win32::Foundation::NTE_SILENT_CONTEXT;
+    use windows::Win32::Foundation::{ERROR_CANCELLED, NTE_SILENT_CONTEXT, NTE_USER_CANCELLED};
     use windows::Win32::Security::Cryptography::NCryptDecrypt;
 
     let map_error = |stage: &str, e: windows::core::Error| {
         if e.code() == NTE_SILENT_CONTEXT {
             CredentialError::AuthRequired
+        } else if e.code() == NTE_USER_CANCELLED
+            || e.code() == windows::core::HRESULT::from_win32(ERROR_CANCELLED.0)
+        {
+            CredentialError::UserCancelled
         } else {
             CredentialError::SystemError(format!("{stage}: {e}"))
         }
@@ -1436,85 +1570,75 @@ fn ncrypt_decrypt_with_key(
     Ok(output)
 }
 
-/// Unwraps a row key with the protected CNG private key, allowing OS UI.
-pub fn decrypt_row_key_with_cng(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    decrypt_master_key_with_cng(ciphertext)
+/// Unwrap a row key using the explicit unlock's retained context. Data reads
+/// never open a separate interactive authentication flow.
+pub fn decrypt_row_key_with_cng(
+    state: &CredentialManagerState,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CredentialError> {
+    decrypt_row_key_with_cng_silent(state, ciphertext)
 }
 
 /// Silently unwraps a row key with CNG and never displays authentication UI.
 ///
 /// Returns [`CredentialError::AuthRequired`] when user interaction would be needed so
 /// background callers can wait for an explicit unlock.
-#[cfg(windows)]
-pub fn decrypt_row_key_with_cng_silent(ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    use windows::Win32::Security::Cryptography::{NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG};
-
-    decrypt_master_key_with_cng_flags(ciphertext, NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG, None)
+pub fn decrypt_row_key_with_cng_silent(
+    state: &CredentialManagerState,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CredentialError> {
+    if !state.protected_read_authorized() {
+        return Err(CredentialError::AuthRequired);
+    }
+    #[cfg(windows)]
+    {
+        let retained = state
+            .cached_private_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A reader may have waited for another unwrap or an explicit
+        // verification; revocation must take effect before its own call.
+        if !state.protected_read_authorized() {
+            return Err(CredentialError::AuthRequired);
+        }
+        let key = retained.as_ref().ok_or(CredentialError::AuthRequired)?;
+        let attempted_at = std::time::Instant::now();
+        let result = key.unwrap_row_key(ciphertext);
+        if matches!(result, Err(CredentialError::AuthRequired)) {
+            tracing::warn!("Retained CNG key requires user verification for silent reads");
+            // Keep the handle mutex until the failure is recorded. A newer
+            // verification cannot be overwritten by a late reader failure.
+            state.require_silent_read_authentication(attempted_at);
+        }
+        result
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ciphertext;
+        Err(CredentialError::SystemError(
+            "CNG is only available on Windows".to_string(),
+        ))
+    }
 }
 
-/// Reusable CNG unwrap session that keeps the private-key handle open for a
-/// whole batch.
-///
-/// Every one-shot [`decrypt_row_key_with_cng_silent`] call pays a
-/// provider-open + key-open + free RPC round-trip to the key-isolation
-/// service before the actual RSA decrypt. Batch readers (the MiniLM
-/// migration fingerprints tens of thousands of OCR boxes) amortize that
-/// fixed cost by opening the handle once. Handles are not tied to a thread,
-/// but each worker thread must open its own session so no handle receives
-/// concurrent `NCryptDecrypt` calls.
-#[cfg(windows)]
-pub struct CngKeySession {
-    key: windows::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE,
+/// A batch reader of the credential state's authenticated private-key handle.
+/// It owns no native handle, so clearing credentials also revokes readers
+/// already handed to worker threads. Policy is checked for every row.
+pub struct CngKeySession<'a> {
+    state: &'a CredentialManagerState,
 }
 
-#[cfg(windows)]
-impl CngKeySession {
-    /// Opens the persisted key for silent batch unwrapping. Background use
-    /// only: a locked session surfaces as `AuthRequired` on decrypt instead
-    /// of popping system UI.
-    pub fn open_silent() -> Result<Self, CredentialError> {
-        Ok(Self {
-            key: open_cng_key(CngKeyAccess::ExistingSilent)?,
-        })
+impl<'a> CngKeySession<'a> {
+    pub fn open_silent(state: &'a CredentialManagerState) -> Result<Self, CredentialError> {
+        if !state.protected_read_authorized() {
+            return Err(CredentialError::AuthRequired);
+        }
+        Ok(Self { state })
     }
 
-    /// Silently unwraps one row key with the cached handle.
+    /// Silently unwrap one row key without opening another native handle.
     pub fn unwrap_row_key(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-        use windows::Win32::Security::Cryptography::{NCRYPT_PAD_PKCS1_FLAG, NCRYPT_SILENT_FLAG};
-
-        ncrypt_decrypt_with_key(
-            self.key,
-            ciphertext,
-            NCRYPT_PAD_PKCS1_FLAG | NCRYPT_SILENT_FLAG,
-        )
-    }
-}
-
-#[cfg(windows)]
-impl Drop for CngKeySession {
-    fn drop(&mut self) {
-        use windows::Win32::Security::Cryptography::{NCryptFreeObject, NCRYPT_HANDLE};
-
-        // SAFETY: the session exclusively owns the handle; this is its final use.
-        let _ = unsafe { NCryptFreeObject(NCRYPT_HANDLE(self.key.0)) };
-    }
-}
-
-#[cfg(not(windows))]
-pub struct CngKeySession;
-
-#[cfg(not(windows))]
-impl CngKeySession {
-    pub fn open_silent() -> Result<Self, CredentialError> {
-        Err(CredentialError::SystemError(
-            "CNG is only available on Windows".to_string(),
-        ))
-    }
-
-    pub fn unwrap_row_key(&self, _ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-        Err(CredentialError::SystemError(
-            "CNG is only available on Windows".to_string(),
-        ))
+        decrypt_row_key_with_cng_silent(self.state, ciphertext)
     }
 }
 
@@ -1588,23 +1712,146 @@ pub fn save_public_key_to_file(
     Ok(())
 }
 
-#[cfg(not(windows))]
-pub fn decrypt_row_key_with_cng(_ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    Err(CredentialError::SystemError(
-        "CNG is only available on Windows".to_string(),
-    ))
-}
-
-#[cfg(not(windows))]
-pub fn decrypt_row_key_with_cng_silent(_ciphertext: &[u8]) -> Result<Vec<u8>, CredentialError> {
-    Err(CredentialError::SystemError(
-        "CNG is only available on Windows".to_string(),
-    ))
-}
+#[cfg(all(test, windows))]
+mod cng_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_retained_key_is_replaced_only_after_explicit_verification() {
+        let mut retained = Some(1);
+        let key = verify_with_retained_key(
+            &mut retained,
+            |handle| {
+                if *handle == 1 {
+                    Err(CredentialError::AuthRequired)
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok((2, vec![7; MASTER_KEY_LEN])),
+            || panic!("a child cannot renew the parent's CNG PIN cache"),
+        )
+        .unwrap();
+        assert_eq!(key, vec![7; MASTER_KEY_LEN]);
+        assert_eq!(retained, Some(2));
+    }
+
+    #[test]
+    fn a_usable_retained_key_still_requires_fresh_child_verification() {
+        let mut retained = Some(1);
+        let result = verify_with_retained_key(
+            &mut retained,
+            |_| Ok(()),
+            || panic!("the parent would reuse cached consent"),
+            || Err(CredentialError::UserCancelled),
+        );
+        assert!(matches!(result, Err(CredentialError::UserCancelled)));
+        assert_eq!(retained, Some(1));
+    }
+
+    #[test]
+    fn retained_key_probe_failures_do_not_fall_back_to_interactive_key_access() {
+        let mut retained = Some(1);
+        let result = verify_with_retained_key(
+            &mut retained,
+            |_| Err(CredentialError::KeyNotFound),
+            || panic!("missing keys must not trigger verification"),
+            || panic!("missing keys must not trigger verification"),
+        );
+        assert!(matches!(result, Err(CredentialError::KeyNotFound)));
+    }
+
+    #[test]
+    fn first_unlock_keeps_the_verified_handle_instead_of_only_the_master_key() {
+        let mut retained = None;
+        let result = verify_with_retained_key(
+            &mut retained,
+            |handle| {
+                assert_eq!(*handle, 7);
+                Ok(())
+            },
+            || Ok((7, vec![9; MASTER_KEY_LEN])),
+            || panic!("initial verification must authenticate the parent handle"),
+        )
+        .unwrap();
+        assert_eq!(retained, Some(7));
+        assert_eq!(result, vec![9; MASTER_KEY_LEN]);
+    }
+
+    #[test]
+    fn unlock_does_not_succeed_if_the_verified_handle_cannot_read_silently() {
+        let mut retained = None;
+        let result = verify_with_retained_key(
+            &mut retained,
+            |_| Err(CredentialError::AuthRequired),
+            || Ok((7, vec![9; MASTER_KEY_LEN])),
+            || panic!("initial verification must happen in the parent"),
+        );
+        assert!(matches!(result, Err(CredentialError::AuthRequired)));
+        assert_eq!(retained, None);
+    }
+
+    #[test]
+    fn child_success_cannot_hide_parent_access_expiring_during_verification() {
+        let mut retained = Some(1);
+        let mut probes = 0;
+        let result = verify_with_retained_key(
+            &mut retained,
+            |_| {
+                probes += 1;
+                if probes == 1 {
+                    Ok(())
+                } else {
+                    Err(CredentialError::AuthRequired)
+                }
+            },
+            || panic!("the existing handle was initially usable"),
+            || Ok(vec![9; MASTER_KEY_LEN]),
+        );
+        assert!(matches!(result, Err(CredentialError::AuthRequired)));
+    }
+
+    #[test]
+    fn cancelled_first_unlock_does_not_install_a_private_key_context() {
+        let mut retained: Option<usize> = None;
+        let result = verify_with_retained_key(
+            &mut retained,
+            |_| panic!("there is no authenticated key to probe"),
+            || Err(CredentialError::UserCancelled),
+            || panic!("there is no retained context"),
+        );
+        assert!(matches!(result, Err(CredentialError::UserCancelled)));
+        assert_eq!(retained, None);
+    }
+
+    #[test]
+    fn silent_read_failures_wait_for_a_new_unlock_without_erasing_encryption_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = CredentialManagerState::new(temp.path().to_path_buf());
+        state.set_session_timeout(-1);
+        state.cache_master_key_for_tests(vec![9; MASTER_KEY_LEN]);
+        state.update_auth_time();
+        let attempt = std::time::Instant::now();
+        state.require_silent_read_authentication(attempt);
+        assert!(state.is_session_valid());
+        assert!(state.silent_read_auth_required());
+        assert_eq!(
+            state.protected_read_wait_reason(),
+            Some("waiting_for_verification")
+        );
+        assert!(!state.background_authorized());
+        assert!(get_cached_master_key(&state).is_some());
+        state.update_auth_time();
+        assert!(!state.silent_read_auth_required());
+        state.require_silent_read_authentication(attempt);
+        assert!(
+            !state.silent_read_auth_required(),
+            "an old attempt must not invalidate a newer unlock"
+        );
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1612,11 +1859,7 @@ mod tests {
         use windows::Win32::Foundation::{
             ERROR_CANCELLED, NTE_BAD_DATA, NTE_PERM, NTE_SILENT_CONTEXT, NTE_USER_CANCELLED,
         };
-        for access in [
-            CngKeyAccess::CreateIfMissing,
-            CngKeyAccess::Existing,
-            CngKeyAccess::ExistingSilent,
-        ] {
+        for access in [CngKeyAccess::CreateIfMissing, CngKeyAccess::Existing] {
             assert!(matches!(
                 access.allow_creation_after(NTE_SILENT_CONTEXT.into()),
                 Err(CredentialError::AuthRequired)
@@ -1647,12 +1890,10 @@ mod tests {
             assert!(CngKeyAccess::CreateIfMissing
                 .allow_creation_after(code.into())
                 .is_ok());
-            for access in [CngKeyAccess::Existing, CngKeyAccess::ExistingSilent] {
-                assert!(matches!(
-                    access.allow_creation_after(code.into()),
-                    Err(CredentialError::KeyNotFound)
-                ));
-            }
+            assert!(matches!(
+                CngKeyAccess::Existing.allow_creation_after(code.into()),
+                Err(CredentialError::KeyNotFound)
+            ));
         }
     }
 

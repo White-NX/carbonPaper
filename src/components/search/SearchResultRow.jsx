@@ -5,6 +5,7 @@ import { fetchThumbnail } from '../../lib/monitor_api';
 import { CATEGORY_COLORS } from '../../lib/categories';
 import { buildSnippet } from '../../lib/search_snippet';
 import { captureDateOf } from '../../lib/search_grouping';
+import { usePreference } from '../../lib/preference_store';
 
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -131,7 +132,7 @@ export function SearchResultRow({
     path: item.image_path || item.metadata?.image_path || item.path,
   });
 
-  const cardClickBehavior = localStorage.getItem('cardClickBehavior_search') || 'preview';
+  const cardClickBehavior = usePreference('cardClickBehavior_search', 'preview');
   const isStandaloneDefault = cardClickBehavior === 'standalone' && !!onOpenFloatingPreview;
 
   const handleSelect = (item) => {

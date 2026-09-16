@@ -706,6 +706,9 @@ fn queue_depths(storage: Option<tauri::State<'_, Arc<StorageState>>>) -> serde_j
 
 pub(crate) fn gate_reason(app: &AppHandle, manual: bool) -> Option<&'static str> {
     let credential = app.state::<Arc<CredentialManagerState>>();
+    if credential.silent_read_auth_required() {
+        return Some("waiting_for_verification");
+    }
     if manual {
         if !credential.is_session_valid() && !credential.background_authorized() {
             return Some("waiting_for_unlock");
@@ -745,7 +748,11 @@ pub(crate) fn gate_reason_for_kind(
                 .adaptive
                 .admission(app, kind, staged)
                 .err();
-            if reason != Some("waiting_for_unlock") || kind != BackgroundTaskKind::SmartCluster {
+            if !matches!(
+                reason,
+                Some("waiting_for_unlock" | "waiting_for_verification")
+            ) || kind != BackgroundTaskKind::SmartCluster
+            {
                 return reason;
             }
         }
@@ -1461,16 +1468,22 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 if normalized.contains("auth_required")
                     || normalized.contains("authentication required")
                 {
+                    // CredentialManagerState records native CNG denials at the
+                    // failed unwrap. A task's generic AUTH_REQUIRED must not
+                    // revoke read access for an otherwise authenticated app.
+                    let credential = app.state::<Arc<CredentialManagerState>>();
+                    let reason = credential
+                        .protected_read_wait_reason()
+                        .unwrap_or("waiting_for_unlock");
                     *runtime
                         .blocked_reason
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner()) =
-                        Some("waiting_for_unlock".to_string());
-                    background_activity::blocked(kind.as_str(), "waiting_for_unlock");
+                        .unwrap_or_else(|e| e.into_inner()) = Some(reason.to_string());
+                    background_activity::blocked(kind.as_str(), reason);
                     let _ = storage.defer_background_task(
                         kind.as_str(),
                         now_ms().saturating_add(TICK_INTERVAL.as_millis() as i64),
-                        "waiting_for_unlock",
+                        reason,
                     );
                     continue;
                 }
@@ -1662,6 +1675,7 @@ mod tests {
             last_completed_at_ms: None,
             status: "queued".to_string(),
             manual_pending: manual,
+            manual_in_flight: false,
         }
     }
 

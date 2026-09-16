@@ -21,6 +21,9 @@ export function useMonitorLifecycle({
     return saved === null ? true : saved === 'true';
   });
   const [autoStartSuppressed, setAutoStartSuppressed] = useState(false);
+  const autoStartSuppressedRef = useRef(false);
+  const maintenanceSuppressedRef = useRef(null);
+  const runtimeActionRef = useRef(false);
   const [backendStatus, setBackendStatus] = useState('unknown');
   const [monitorPaused, setMonitorPaused] = useState(false);
   const [backendError, setBackendError] = useState('');
@@ -63,14 +66,17 @@ export function useMonitorLifecycle({
   }, [autoStartMonitor]);
 
   const handleManualStartMonitor = useCallback(() => {
+    autoStartSuppressedRef.current = false;
     setAutoStartSuppressed(false);
   }, []);
 
   const handleManualStopMonitor = useCallback(() => {
+    autoStartSuppressedRef.current = true;
     setAutoStartSuppressed(true);
   }, []);
 
   const handleStartBackend = useCallback(async () => {
+    autoStartSuppressedRef.current = false;
     setAutoStartSuppressed(false);
     setBackendError('');
     setBackendStatus('waiting');
@@ -158,6 +164,46 @@ export function useMonitorLifecycle({
     }
   }, [formatErrorDetails, reportBackendError, resetBackendErrorDedupe, t]);
 
+  // One owner for manual and maintenance commands, including requests from the
+  // settings window. Suppress auto-start synchronously before stopping capture.
+  const handleSettingsMonitorAction = useCallback(async (action) => {
+    if (runtimeActionRef.current) throw new Error('MONITOR_ACTION_BUSY');
+    runtimeActionRef.current = true;
+    const previous = autoStartSuppressedRef.current;
+    try {
+      if (action === 'pause' || action === 'resume') {
+        await invoke(action === 'pause' ? 'pause_monitor' : 'resume_monitor');
+      } else {
+        if (!['start', 'stop', 'restart', 'maintenance-stop', 'maintenance-start'].includes(action)) throw new Error('INVALID_MONITOR_ACTION');
+        if (action === 'maintenance-stop' && maintenanceSuppressedRef.current === null) maintenanceSuppressedRef.current = previous;
+        autoStartSuppressedRef.current = true;
+        setAutoStartSuppressed(true);
+        if (['stop', 'restart', 'maintenance-stop'].includes(action)) await invoke('stop_monitor');
+        if (['start', 'restart', 'maintenance-start'].includes(action)) {
+          if (powerSavingSuppressed) throw new Error(t('settings.general.monitor.power_saving_blocked'));
+          setBackendStatus('waiting');
+          backendStatusRef.current = 'waiting';
+          await invoke('start_monitor');
+          await checkBackendStatus();
+          const suppressed = action === 'maintenance-start' ? Boolean(maintenanceSuppressedRef.current) : false;
+          maintenanceSuppressedRef.current = null;
+          autoStartSuppressedRef.current = suppressed;
+          setAutoStartSuppressed(suppressed);
+        }
+      }
+      await checkBackendStatus();
+    } finally { runtimeActionRef.current = false; }
+  }, [checkBackendStatus, powerSavingSuppressed, t]);
+
+  useTauriEventListener('settings-preferences-changed', ({ payload }) => {
+    if (payload?.includes('autostart')) {
+      invoke('get_monitor_autostart').then((enabled) => {
+        setAutoStartMonitorState(Boolean(enabled));
+        if (enabled) handleManualStartMonitor();
+      }).catch(console.warn);
+    }
+  });
+
   useEffect(() => {
     checkBackendStatus();
     const interval = setInterval(checkBackendStatus, 3000);
@@ -195,7 +241,7 @@ export function useMonitorLifecycle({
 
   useEffect(() => {
     if (!autoStartMonitor) return;
-    if (autoStartSuppressed) return;
+    if (autoStartSuppressed || autoStartSuppressedRef.current || runtimeActionRef.current) return;
     if (powerSavingSuppressed) return;
     if (!pythonVersion) return;
     if (!depsCheckDone) return;
@@ -228,5 +274,6 @@ export function useMonitorLifecycle({
     handleStartBackend,
     handlePauseMonitor,
     handleResumeMonitor,
+    handleSettingsMonitorAction,
   };
 }

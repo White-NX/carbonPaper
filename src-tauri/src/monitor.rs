@@ -1908,7 +1908,7 @@ pub fn set_monitor_autostart(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     enabled: bool,
 ) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
     crate::registry_config::set_bool("autoStartMonitor", enabled)
 }

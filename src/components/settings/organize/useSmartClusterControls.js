@@ -2,14 +2,18 @@ import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../../../lib/auth_api';
 import { useTauriEventListener } from '../../../hooks/useTauriEventListener';
+import { useSettingsActive, useSettingsActivity } from '../SettingsActivityContext';
+import { notifySettingsChanged } from '../../../lib/settings_api';
 
 export function useSmartClusterControls() {
+  const active = useSettingsActive();
   const [scModelAvailable, setScModelAvailable] = useState(false);
   const [scStatus, setScStatus] = useState(null);
   const [scDownloading, setScDownloading] = useState(false);
   const [scDownloadLog, setScDownloadLog] = useState([]);
   const [scDownloadError, setScDownloadError] = useState(null);
   const scDownloadStartedRef = useRef(false);
+  useSettingsActivity('smart-component', { busy: scDownloading });
 
   const refreshSmartClusterModel = async () => {
     try {
@@ -31,13 +35,14 @@ export function useSmartClusterControls() {
   };
 
   useEffect(() => {
+    if (!active) return undefined;
     refreshSmartClusterModel();
     refreshSmartClusterStatus();
     const interval = setInterval(() => {
       refreshSmartClusterStatus();
     }, 10000);
     return () => clearInterval(interval);
-  }, []);
+  }, [active]);
 
   useTauriEventListener('install-log', (event) => {
     const line = event?.payload?.line || JSON.stringify(event?.payload || {});
@@ -59,11 +64,13 @@ export function useSmartClusterControls() {
       );
       await invoke('mark_smart_cluster_setup_done', { dismissedPermanently: false });
       await refreshSmartClusterModel();
+      await notifySettingsChanged(['models']);
     } catch (err) {
       setScDownloadError(err?.message || String(err));
       scDownloadStartedRef.current = false;
     } finally {
       setScDownloading(false);
+      scDownloadStartedRef.current = false;
     }
   };
 

@@ -9,11 +9,11 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-import CaptureFiltersSection from './CaptureFiltersSection';
+import QuickDeleteSection from './QuickDeleteSection';
 
 function renderSection(onQuickDelete = vi.fn()) {
   return render(
-    <CaptureFiltersSection
+    <QuickDeleteSection
       filterSettings={{ processes: [], titles: [], ignoreProtected: false }}
       processInput=""
       titleInput=""
@@ -28,14 +28,14 @@ function renderSection(onQuickDelete = vi.fn()) {
       filtersDirty={false}
       savingFilters={false}
       saveFiltersMessage=""
-      onQuickDelete={onQuickDelete}
+      onDelete={onQuickDelete}
       isDeleting={false}
       deleteMessage=""
     />
   );
 }
 
-describe('CaptureFiltersSection quick delete confirmation', () => {
+describe('QuickDeleteSection confirmation', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -45,7 +45,8 @@ describe('CaptureFiltersSection quick delete confirmation', () => {
     const user = userEvent.setup();
     renderSection(onQuickDelete);
 
-    await user.click(screen.getAllByRole('button', { name: /settings\.captureFilters\.quickDelete\.button/ })[0]);
+    await user.selectOptions(screen.getByRole('combobox'), '5min');
+    await user.click(screen.getByRole('button', { name: 'settings.captureFilters.quickDelete.action' }));
     expect(screen.getByRole('dialog')).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'settings.captureFilters.quickDelete.no' }));
@@ -62,7 +63,8 @@ describe('CaptureFiltersSection quick delete confirmation', () => {
     const user = userEvent.setup();
     renderSection(onQuickDelete);
 
-    await user.click(screen.getAllByRole('button', { name: /settings\.captureFilters\.quickDelete\.button/ })[0]);
+    await user.selectOptions(screen.getByRole('combobox'), '5min');
+    await user.click(screen.getByRole('button', { name: 'settings.captureFilters.quickDelete.action' }));
     await user.click(screen.getByRole('button', { name: 'settings.captureFilters.quickDelete.yes' }));
 
     expect(screen.getByRole('button', { name: 'common.processing' })).toBeDisabled();

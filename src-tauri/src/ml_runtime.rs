@@ -978,7 +978,7 @@ pub fn restart_ml_ocr_worker(
     credential_state: tauri::State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
     state: tauri::State<'_, Arc<MlRuntimeState>>,
 ) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
     state.stop();
     Ok(())
@@ -1001,7 +1001,7 @@ pub async fn download_rust_ocr_model(
     use rapidocr_core::config::PipelineConfig;
     use rapidocr_core::model::model_set_by_name;
 
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     invalidate_model_status_cache();
     if let Ok(status) = inspect_model_status(&app) {
         if status.installed {

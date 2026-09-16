@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { getIndexHealth } from '../../../lib/monitor_api';
+import { useSettingsActive } from '../SettingsActivityContext';
 
 export function useIndexHealthStatus() {
+  const active = useSettingsActive();
   const [indexHealth, setIndexHealth] = useState(null);
   const [indexHealthLoading, setIndexHealthLoading] = useState(false);
   const [indexHealthError, setIndexHealthError] = useState(null);
@@ -28,11 +30,11 @@ export function useIndexHealthStatus() {
   }, []);
 
   useEffect(() => {
-    loadIndexHealth();
-  }, [loadIndexHealth]);
+    if (active) loadIndexHealth();
+  }, [loadIndexHealth, active]);
 
-  const indexBacklog = (indexHealth?.semantic_index_backlog?.claimable ?? 0)
-    + (indexHealth?.clip_index_backlog?.claimable ?? 0);
+  const indexBacklog = indexHealth ? (indexHealth.semantic_index_backlog?.claimable ?? 0)
+    + (indexHealth.clip_index_backlog?.claimable ?? 0) : null;
   const indexHealthDeleteQueuePending = indexHealth
     ? (indexHealth.delete_queue?.pending_screenshots ?? 0) + (indexHealth.delete_queue?.pending_ocr ?? 0)
     : null;

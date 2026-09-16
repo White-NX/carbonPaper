@@ -28,6 +28,7 @@ export default function ResourcePolicyCard({
       </div>
 
       <SettingsSegmentedControl
+        label={t('settings.general.resourcePolicy.label')}
         value={resourcePolicy}
         options={resourcePolicyOptions}
         onChange={onResourcePolicyChange}

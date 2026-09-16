@@ -10,6 +10,14 @@ export function useAppTheme() {
   });
 
   useEffect(() => {
+    const syncTheme = (event) => {
+      if (event.key === 'theme') setDarkMode(event.newValue === 'dark');
+    };
+    window.addEventListener('storage', syncTheme);
+    return () => window.removeEventListener('storage', syncTheme);
+  }, []);
+
+  useEffect(() => {
     if (darkMode) {
       document.documentElement.classList.add('dark');
       localStorage.setItem('theme', 'dark');

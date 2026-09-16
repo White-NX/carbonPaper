@@ -528,7 +528,7 @@ pub async fn download_model(
     window: tauri::Window,
     model_id: String,
 ) -> Result<String, String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     let spec = model_download_spec(&model_id)
         .ok_or_else(|| format!("Unsupported model id: {}", model_id))?;
     let download_lock = model_download_lock(&model_id);

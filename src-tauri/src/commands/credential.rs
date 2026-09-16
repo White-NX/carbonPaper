@@ -85,8 +85,7 @@ pub async fn credential_verify_user(
         credential_manager::force_verify_and_unlock_master_key(&state, Some(owner_hwnd.0 as isize))
             .map_err(|e| format!("Verification failed: {}", e))?;
 
-        state.update_auth_time();
-        state.grant_background_lease();
+        crate::settings_window::broadcast_auth_state(&app);
         if let Some(scheduler) =
             app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
         {
@@ -120,8 +119,10 @@ pub async fn credential_verify_user(
 /// Frontend: `hooks/useAuthSession.js`.
 #[tauri::command]
 pub async fn credential_check_session(
+    app: tauri::AppHandle,
     state: tauri::State<'_, Arc<CredentialManagerState>>,
 ) -> Result<bool, String> {
+    crate::settings_window::broadcast_auth_state(&app);
     Ok(state.is_session_valid())
 }
 
@@ -130,9 +131,11 @@ pub async fn credential_check_session(
 /// Authentication: not required. Returns JSON `null` on success.
 #[tauri::command]
 pub async fn credential_lock_session(
+    app: tauri::AppHandle,
     state: tauri::State<'_, Arc<CredentialManagerState>>,
 ) -> Result<(), String> {
     state.invalidate_session();
+    crate::settings_window::broadcast_auth_state(&app);
     Ok(())
 }
 
@@ -142,10 +145,13 @@ pub async fn credential_lock_session(
 /// returns JSON `null` on success.
 #[tauri::command]
 pub async fn credential_set_foreground(
-    state: tauri::State<'_, Arc<CredentialManagerState>>,
+    app: tauri::AppHandle,
+    window: tauri::Window,
     in_foreground: bool,
 ) -> Result<(), String> {
-    state.set_foreground_state(in_foreground);
+    crate::settings_window::check_settings_ui(&window)?;
+    let _ = in_foreground;
+    crate::settings_window::refresh_ui_foreground(&app);
     Ok(())
 }
 
@@ -160,11 +166,8 @@ pub async fn credential_set_session_timeout(
 ) -> Result<(), String> {
     crate::commands::check_auth_required(&state)?;
 
+    crate::registry_config::set_string("session_timeout_secs", &timeout.to_string())?;
     state.set_session_timeout(timeout);
-    if let Err(e) = crate::registry_config::set_string("session_timeout_secs", &timeout.to_string())
-    {
-        tracing::error!("Failed to persist session_timeout_secs: {}", e);
-    }
     Ok(())
 }
 

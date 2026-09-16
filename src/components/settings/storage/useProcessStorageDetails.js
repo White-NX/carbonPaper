@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useSettingsActive, useSettingsActivity } from '../SettingsActivityContext';
+import { notifySettingsChanged } from '../../../lib/settings_api';
 import {
   fetchThumbnailBatch,
   getProcessMonthlyThumbnails,
@@ -9,6 +11,7 @@ import {
 } from '../../../lib/monitor_api';
 
 export function useProcessStorageDetails({ onRefresh, t }) {
+  const active = useSettingsActive();
   const [panelView, setPanelView] = useState('overview');
   const [processStats, setProcessStats] = useState([]);
   const [processStatsLoading, setProcessStatsLoading] = useState(false);
@@ -21,6 +24,7 @@ export function useProcessStorageDetails({ onRefresh, t }) {
   const [processThumbMap, setProcessThumbMap] = useState({});
   const [selectedScreenshotIds, setSelectedScreenshotIds] = useState(() => new Set());
   const [deletingTarget, setDeletingTarget] = useState('');
+  useSettingsActivity('process-cleanup', { busy: Boolean(deletingTarget) });
   const [pendingDeleteIntent, setPendingDeleteIntent] = useState(null);
   const [isBackupDialogOpen, setIsBackupDialogOpen] = useState(false);
   const [backupMode, setBackupMode] = useState('export');
@@ -150,6 +154,7 @@ export function useProcessStorageDetails({ onRefresh, t }) {
   const handleConfirmSoftDelete = useCallback(async () => {
     if (!pendingDeleteIntent) return;
     await executeSoftDelete(pendingDeleteIntent);
+    await notifySettingsChanged(['records', 'storage']);
     setPendingDeleteIntent(null);
   }, [executeSoftDelete, pendingDeleteIntent]);
 
@@ -159,18 +164,20 @@ export function useProcessStorageDetails({ onRefresh, t }) {
   }, [deletingTarget]);
 
   useEffect(() => {
+    if (!active) return undefined;
     loadDeleteQueueStatus();
     const timer = setInterval(loadDeleteQueueStatus, 5000);
     return () => clearInterval(timer);
-  }, [loadDeleteQueueStatus]);
+  }, [loadDeleteQueueStatus, active]);
 
   useEffect(() => {
-    if (panelView === 'overview') {
+    if (active && panelView === 'overview') {
       loadProcessStats();
     }
-  }, [panelView, loadProcessStats]);
+  }, [panelView, loadProcessStats, active]);
 
   useEffect(() => {
+    if (!active) return;
     const items = processMonthData?.items || [];
     if (!items.length) {
       setProcessThumbMap({});
@@ -181,7 +188,7 @@ export function useProcessStorageDetails({ onRefresh, t }) {
     fetchThumbnailBatch(ids)
       .then((batch) => setProcessThumbMap(batch || {}))
       .catch(() => setProcessThumbMap({}));
-  }, [processMonthData]);
+  }, [processMonthData, active]);
 
   const groupedMonthItems = useMemo(() => {
     const grouped = {};

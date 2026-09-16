@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../lib/auth_api';
+import { useTauriEventListener } from './useTauriEventListener';
 
 export function useAuthSession() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -29,10 +30,20 @@ export function useAuthSession() {
     setIsAuthenticated(false);
   }, []);
 
+  useTauriEventListener('auth-session-changed', ({ payload }) => {
+    setIsAuthenticated(payload === true);
+  });
+  useTauriEventListener('settings-preferences-changed', ({ payload }) => {
+    if (payload?.includes('session')) {
+      invoke('credential_get_session_timeout').then((value) => setSessionTimeout(Number(value))).catch(console.warn);
+    }
+  });
+
   useEffect(() => {
     checkAuthStatus();
-    const interval = setInterval(checkAuthStatus, 10000);
-    return () => clearInterval(interval);
+    const interval = setInterval(checkAuthStatus, 1000);
+    window.addEventListener('focus', checkAuthStatus);
+    return () => { clearInterval(interval); window.removeEventListener('focus', checkAuthStatus); };
   }, [checkAuthStatus]);
 
   useEffect(() => {

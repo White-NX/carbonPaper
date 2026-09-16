@@ -1,6 +1,5 @@
 import { useAutoLaunchStatus } from './hooks/useAutoLaunchStatus';
 import { useCaptureFilterSettings } from './hooks/useCaptureFilterSettings';
-import { useGeneralPreferenceFlags } from './hooks/useGeneralPreferenceFlags';
 import { useMonitorControls } from './hooks/useMonitorControls';
 import { useStorageAnalysisOverview } from './hooks/useStorageAnalysisOverview';
 import { useUpdateCheck } from './hooks/useUpdateCheck';
@@ -13,7 +12,6 @@ export function useSettingsDialogController({
   onRecordsDeleted,
   t,
 }) {
-  const generalPreferences = useGeneralPreferenceFlags();
   const monitorControls = useMonitorControls({
     isOpen,
     onManualStartMonitor,
@@ -29,7 +27,6 @@ export function useSettingsDialogController({
   const updateCheck = useUpdateCheck();
 
   return {
-    ...generalPreferences,
     ...monitorControls,
     ...captureFilters,
     ...autoLaunchStatus,

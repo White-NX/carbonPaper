@@ -7,6 +7,7 @@ import { useAdvancedSectionController } from './useAdvancedSectionController';
 
 vi.mock('../../lib/auth_api', () => ({
   withAuth: vi.fn((fn) => fn()),
+  requestAuth: vi.fn(async () => true),
 }));
 
 vi.mock('@tauri-apps/api/event', () => ({
@@ -38,6 +39,10 @@ describe('useAdvancedSectionController', () => {
       if (command === 'storage_is_startup_vacuum_in_progress') return false;
       if (command === 'get_rust_ocr_model_status') return {};
       if (command === 'get_ml_ocr_status') return {};
+      if (command === 'get_background_index_progress') return {
+        semantic: { phase: 'idle', running: false, total: 0, processed: 0 },
+        clip: { phase: clipRunActive ? 'running' : 'idle', running: clipRunActive, total: 10, processed: 3 },
+      };
       if (command === 'get_ml_semantic_status') {
         return {
           backend: { index_run_active: false },
@@ -81,6 +86,7 @@ describe('useAdvancedSectionController', () => {
     }));
 
     await waitFor(() => expect(reopened.result.current.clipIndexRunning).toBe(true));
+    expect(reopened.result.current.clipIndexProgress.processed).toBe(3);
 
     await act(async () => {
       await reopened.result.current.handleStopClipIndex();
@@ -185,6 +191,7 @@ describe('useAdvancedSectionController', () => {
 
   it('keeps a queued CLIP drain stoppable while the scheduler owns it', async () => {
     clipRunActive = false;
+    let clipQueued = false;
     invoke.mockImplementation(async (command) => {
       if (command === 'get_advanced_config') return {};
       if (command === 'storage_is_startup_vacuum_in_progress') return false;
@@ -204,7 +211,10 @@ describe('useAdvancedSectionController', () => {
           tasks: [{ task_kind: 'clip_index', manual_pending: true }],
         };
       }
-      if (command === 'clip_index_run_now') return { queued: true };
+      if (command === 'get_background_index_progress') return {
+        clip: { phase: clipQueued ? 'queued' : 'idle', running: false, total: 0, processed: 0 },
+      };
+      if (command === 'clip_index_run_now') { clipQueued = true; return { queued: true }; }
       return undefined;
     });
     const hook = renderHook(() => useAdvancedSectionController({
@@ -236,18 +246,11 @@ describe('useAdvancedSectionController', () => {
         };
       }
       if (command === 'credential_get_background_processing_enabled') return true;
-      if (command === 'background_scheduler_status') {
+      if (command === 'get_background_index_progress') {
         schedulerReads += 1;
-        if (schedulerReads > 1) return { running_task: null, running_manual: false };
+        if (schedulerReads > 1) return {};
         return {
-          running_task: null,
-          running_manual: false,
-          tasks: [{
-            task_kind: 'semantic_index',
-            manual_pending: true,
-            status: 'retry_wait',
-            next_attempt_at_ms: 1_800_000_000_000,
-          }],
+          semantic: { phase: 'retry_wait', running: false, retry_at_ms: 1_800_000_000_000 },
         };
       }
       return undefined;
@@ -262,8 +265,24 @@ describe('useAdvancedSectionController', () => {
     expect(hook.result.current.semanticIndexRunning).toBe(false);
     expect(hook.result.current.semanticIndexRetryAt).toBe(1_800_000_000_000);
     await act(async () => {
-      await hook.result.current.refreshBackgroundSchedulerStatus();
+      await hook.result.current.refreshSemanticStatus();
     });
     expect(hook.result.current.semanticIndexPhase).toBe('retry_wait');
+  });
+
+  it('does not let diagnostics or scheduler polls overwrite the authoritative waiting phase', async () => {
+    const original = invoke.getMockImplementation();
+    invoke.mockImplementation((command, ...args) => {
+      if (command === 'get_background_index_progress') return Promise.resolve({
+        clip: { phase: 'waiting_for_unlock', running: false, processed: 4, total: 10 },
+      });
+      return original(command, ...args);
+    });
+    const hook = renderHook(() => useAdvancedSectionController({ monitorStatus: 'stopped', t }));
+    await waitFor(() => expect(hook.result.current.clipIndexPhase).toBe('waiting_for_unlock'));
+    await act(async () => { await hook.result.current.refreshSemanticStatus(); });
+    expect(hook.result.current.clipIndexPhase).toBe('waiting_for_unlock');
+    expect(hook.result.current.clipIndexRunning).toBe(false);
+    expect(hook.result.current.clipIndexProgress.processed).toBe(4);
   });
 });

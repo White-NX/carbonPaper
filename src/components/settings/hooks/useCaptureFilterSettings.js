@@ -1,8 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { deleteRecordsByTimeRange, updateMonitorFilters } from '../../../lib/monitor_api';
 import { defaultFilterSettings, normalizeList } from '../filterUtils';
+import { useSettingsActivity } from '../SettingsActivityContext';
+import { notifySettingsChanged } from '../../../lib/settings_api';
+import { setPreference } from '../../../lib/preference_store';
 
-function readInitialFilterSettings() {
+export function readSavedCaptureFilters() {
   try {
     const saved = JSON.parse(localStorage.getItem('monitorFilters') || 'null');
     if (saved && typeof saved === 'object') {
@@ -25,7 +28,7 @@ export function useCaptureFilterSettings({
   onRecordsDeleted,
   t,
 }) {
-  const [filterSettings, setFilterSettings] = useState(readInitialFilterSettings);
+  const [filterSettings, setFilterSettings] = useState(readSavedCaptureFilters);
   const [processInput, setProcessInput] = useState('');
   const [titleInput, setTitleInput] = useState('');
   const [filtersDirty, setFiltersDirty] = useState(false);
@@ -33,7 +36,11 @@ export function useCaptureFilterSettings({
   const [saveFiltersMessage, setSaveFiltersMessage] = useState('');
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteMessage, setDeleteMessage] = useState('');
+  const [deleteMessageType, setDeleteMessageType] = useState('neutral');
+  const [pendingApply, setPendingApply] = useState(false);
   const filterSettingsRef = useRef(filterSettings);
+  const hasDraft = filtersDirty || Boolean(processInput.trim() || titleInput.trim());
+  useSettingsActivity('capture-filters', { dirty: hasDraft, busy: savingFilters });
 
   const addProcessTags = () => {
     const items = normalizeList(processInput);
@@ -108,13 +115,16 @@ export function useCaptureFilterSettings({
     try {
       const result = await deleteRecordsByTimeRange(minutes);
       if (result.error) {
+        setDeleteMessageType('error');
         setDeleteMessage(t('settings.delete.failure', { error: result.error }));
       } else {
+        setDeleteMessageType('success');
         const count = result.deleted_count || 0;
         setDeleteMessage(t('settings.delete.success', { count }));
         onRecordsDeleted?.();
       }
     } catch (e) {
+      setDeleteMessageType('error');
       setDeleteMessage(t('settings.delete.failure', { error: e?.message || e }));
     } finally {
       setIsDeleting(false);
@@ -122,37 +132,34 @@ export function useCaptureFilterSettings({
   };
 
   const handleSaveFilters = async () => {
+    if (savingFilters) return;
     setSavingFilters(true);
     setSaveFiltersMessage('');
 
-    const nextFilters = { ...filterSettings };
-
-    setFilterSettings(nextFilters);
-    setFiltersDirty(false);
-
-    const result = await syncFiltersToMonitor(nextFilters);
-    setSavingFilters(false);
-    if (result.ok) {
-      setSaveFiltersMessage(t('settings.save_filters.synced'));
-    } else if (result.reason === 'not_running') {
-      setSaveFiltersMessage(t('settings.save_filters.saved_local_not_running'));
-    } else if (result.reason === 'unsupported') {
-      setSaveFiltersMessage(t('settings.save_filters.saved_local_unsupported'));
-    } else {
-      setSaveFiltersMessage(t('settings.save_filters.saved_local_sync_failed', { error: result.error?.message || result.error || 'Unknown error' }));
+    const nextFilters = {
+      ...filterSettings,
+      processes: Array.from(new Set([...filterSettings.processes, ...normalizeList(processInput)])),
+      titles: Array.from(new Set([...filterSettings.titles, ...normalizeList(titleInput)])),
+    };
+    try {
+      setPreference('monitorFilters', JSON.stringify(nextFilters));
+      filterSettingsRef.current = nextFilters;
+      setFilterSettings(nextFilters);
+      setProcessInput('');
+      setTitleInput('');
+      setFiltersDirty(false);
+      const result = await syncFiltersToMonitor(nextFilters);
+      setPendingApply(!result.ok && result.reason !== 'not_running');
+      if (result.ok) setSaveFiltersMessage(t('settings.save_filters.synced'));
+      else if (result.reason === 'not_running') setSaveFiltersMessage(t('settings.save_filters.saved_local_not_running'));
+      else setSaveFiltersMessage(t('settings.save_filters.saved_local_sync_failed', { error: result.error?.message || result.error || '' }));
+      await notifySettingsChanged(['filters']);
+    } catch (error) {
+      setSaveFiltersMessage(t('settings.feedback.saveFailed', { error: String(error) }));
+    } finally {
+      setSavingFilters(false);
     }
   };
-
-  useEffect(() => {
-    filterSettingsRef.current = filterSettings;
-    localStorage.setItem('monitorFilters', JSON.stringify(filterSettings));
-  }, [filterSettings]);
-
-  useEffect(() => {
-    if (monitorStatus === 'running') {
-      syncFiltersToMonitor();
-    }
-  }, [monitorStatus, syncFiltersToMonitor]);
 
   return {
     filterSettings,
@@ -160,11 +167,13 @@ export function useCaptureFilterSettings({
     setProcessInput,
     titleInput,
     setTitleInput,
-    filtersDirty,
+    filtersDirty: hasDraft,
+    pendingApply,
     savingFilters,
     saveFiltersMessage,
     isDeleting,
     deleteMessage,
+    deleteMessageType,
     addProcessTags,
     addTitleTags,
     removeProcessTag,

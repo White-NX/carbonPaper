@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { runMonitorAction } from '../../../lib/settings_api';
 
 export function useMonitorControls({
   isOpen,
@@ -7,6 +8,7 @@ export function useMonitorControls({
   onManualStopMonitor,
 }) {
   const [monitorStatus, setMonitorStatus] = useState('stopped');
+  const [monitorError, setMonitorError] = useState('');
   const monitorStatusRef = useRef('stopped');
 
   const checkMonitorStatus = useCallback(async () => {
@@ -42,11 +44,16 @@ export function useMonitorControls({
     monitorStatusRef.current = 'waiting';
     onManualStartMonitor?.();
     try {
-      await invoke('start_monitor');
+      setMonitorError('');
+      await runMonitorAction('start');
+      await checkMonitorStatus();
+      return true;
     } catch (e) {
       console.error('Failed to start monitor', e);
+      setMonitorError(String(e));
       setMonitorStatus('stopped');
       monitorStatusRef.current = 'stopped';
+      return false;
     }
   };
 
@@ -54,9 +61,11 @@ export function useMonitorControls({
     setMonitorStatus('loading');
     monitorStatusRef.current = 'loading';
     try {
-      await invoke('stop_monitor');
+      setMonitorError('');
+      await runMonitorAction('stop');
     } catch (e) {
       console.error('Failed to stop monitor', e);
+      setMonitorError(String(e));
     } finally {
       onManualStopMonitor?.();
       setMonitorStatus('stopped');
@@ -68,33 +77,38 @@ export function useMonitorControls({
     setMonitorStatus('loading');
     monitorStatusRef.current = 'loading';
     try {
-      await invoke('stop_monitor');
-      setMonitorStatus('waiting');
-      monitorStatusRef.current = 'waiting';
-      await invoke('start_monitor');
+      setMonitorError('');
+      await runMonitorAction('restart');
       await checkMonitorStatus();
+      return true;
     } catch (e) {
       console.error('Failed to restart monitor', e);
+      setMonitorError(String(e));
       setMonitorStatus('stopped');
       monitorStatusRef.current = 'stopped';
       await checkMonitorStatus();
+      return false;
     }
   };
 
   const handlePauseMonitor = async () => {
     try {
-      await invoke('pause_monitor');
+      setMonitorError('');
+      await runMonitorAction('pause');
       await checkMonitorStatus();
     } catch (e) {
+      setMonitorError(String(e));
       console.error(e);
     }
   };
 
   const handleResumeMonitor = async () => {
     try {
-      await invoke('resume_monitor');
+      setMonitorError('');
+      await runMonitorAction('resume');
       await checkMonitorStatus();
     } catch (e) {
+      setMonitorError(String(e));
       console.error(e);
     }
   };
@@ -114,6 +128,7 @@ export function useMonitorControls({
 
   return {
     monitorStatus,
+    monitorError,
     handleStartMonitor,
     handleStopMonitor,
     handleRestartMonitor,

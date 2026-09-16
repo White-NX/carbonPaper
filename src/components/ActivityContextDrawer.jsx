@@ -9,6 +9,7 @@ import { fetchThumbnailBatch } from '../lib/monitor_api';
 import { getHostname } from '../lib/activity_context';
 import { parseCreatedAt } from '../lib/search_grouping';
 import { ConfirmDialog } from './ConfirmDialog';
+import { usePreference } from '../lib/preference_store';
 
 const PAGE_SIZE = 24;
 
@@ -38,7 +39,7 @@ function ActivitySnapshotCard({ item, thumbnailSrc, onSelect, onOpenFloatingPrev
     formatTimestamp(item.timestamp, item.created_at),
     host || item.process_name,
   ].filter(Boolean).join(' - ');
-  const cardClickBehavior = localStorage.getItem('cardClickBehavior_activityContext') || 'preview';
+  const cardClickBehavior = usePreference('cardClickBehavior_activityContext', 'preview');
   const isStandaloneDefault = cardClickBehavior === 'standalone' && !!onOpenFloatingPreview;
   const normalizedItem = {
     ...item,

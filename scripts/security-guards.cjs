@@ -3,6 +3,14 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const COMMAND_TIERS = {
+  'settings_window::take_settings_monitor_action': 'runtime_public',
+  'settings_window::settings_debug_preview': 'session_required',
+  'settings_window::open_settings_window': 'lifecycle_public',
+  'settings_window::close_settings_window': 'lifecycle_public',
+  'settings_window::settings_set_busy': 'public',
+  'settings_window::settings_monitor_action': 'runtime_public',
+  'settings_window::complete_settings_monitor_action': 'runtime_public',
+  'settings_window::settings_preferences_changed': 'public',
   'app_bound::app_bound_status': 'public',
   'app_bound::app_bound_acknowledge_offer': 'public',
   'app_bound::app_bound_set_policy': 'session_required',
@@ -286,24 +294,14 @@ function checkCommandGuardImplementations() {
   }
 
   const mainWindowCommands = [
-    'set_autostart',
-    'python::install_spacy_model',
-    'model_management::download_model',
-    'updater::updater_install',
-    'native_messaging::register_nm_host_chrome',
-    'native_messaging::register_nm_host_edge',
-    'native_messaging::install_browser_extension',
-    'commands::utility::set_lightweight_config',
-    'commands::utility::open_path',
-    'power::set_power_saving_enabled',
-    'ml_runtime::restart_ml_ocr_worker',
-    'ml_runtime::download_rust_ocr_model',
+    'settings_window::take_settings_monitor_action',
+    'settings_window::open_settings_window',
+    'settings_window::complete_settings_monitor_action',
     'ml_runtime::debug_trigger_ocr_model_repair_notification',
     'monitor::start_monitor',
     'monitor::stop_monitor',
     'monitor::pause_monitor',
     'monitor::resume_monitor',
-    'monitor::set_monitor_autostart',
     'commands::utility::close_process',
     'commands::utility::restart_app',
     'commands::utility::exit_app',
@@ -316,6 +314,36 @@ function checkCommandGuardImplementations() {
   if (missingWindowGuard.length) {
     throw new Error(`High-impact commands missing main-window guard:\n${missingWindowGuard.join('\n')}`);
   }
+  const settingsCommands = [
+  "minilm_index::semantic_index_run_now",
+  "minilm_index::semantic_index_stop_now",
+  "clip_index::clip_index_run_now",
+  "clip_index::clip_index_stop_now",
+  "clip_ann::clip_ann_retry_now",
+  "set_autostart",
+  "python::install_spacy_model",
+  "model_management::download_model",
+  "updater::updater_install",
+  "native_messaging::register_nm_host_chrome",
+  "native_messaging::register_nm_host_edge",
+  "native_messaging::install_browser_extension",
+  "commands::utility::set_lightweight_config",
+  "commands::utility::open_path",
+  "power::set_power_saving_enabled",
+  "ml_runtime::restart_ml_ocr_worker",
+  "ml_runtime::download_rust_ocr_model",
+  "monitor::set_monitor_autostart",
+  "app_bound::app_bound_status",
+  "app_bound::app_bound_set_policy",
+  "app_bound::app_bound_install",
+  "app_bound::app_bound_uninstall"
+];
+  for (const command of settingsCommands) {
+    if (!commandFunctionBody(command).includes('check_settings_ui')) {
+      throw new Error(command + ' must restrict access to main/settings windows');
+    }
+  }
+
 }
 
 function checkRuntimeControlInvariants() {

@@ -6,6 +6,8 @@ import { open, save } from '@tauri-apps/plugin-dialog';
 import { Dialog } from './Dialog';
 import { Lock, FileUp, FileDown, ShieldAlert, CheckCircle2, RefreshCw } from 'lucide-react';
 import { withAuth } from '../lib/auth_api';
+import { useSettingsActivity } from './settings/SettingsActivityContext';
+import { notifySettingsChanged } from '../lib/settings_api';
 
 export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export' }) {
   const { t } = useTranslation();
@@ -14,6 +16,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
   const [status, setStatus] = useState('idle'); // idle, processing, success, error
   const [error, setError] = useState('');
   const [progress, setProgress] = useState(null);
+  useSettingsActivity('backup', { busy: status === 'processing' });
 
   useEffect(() => {
     let unlistenPromise;
@@ -70,6 +73,7 @@ export default function BackupMigrationDialog({ isOpen, onClose, mode = 'export'
       }
 
       setStatus('success');
+      if (mode === 'import') await notifySettingsChanged(['storage', 'records']);
     } catch (err) {
       console.error('Backup migration failed:', err);
       setStatus('error');

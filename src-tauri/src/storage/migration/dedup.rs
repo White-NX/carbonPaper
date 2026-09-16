@@ -65,7 +65,10 @@ impl StorageState {
 
             for (id, icon_enc, content_key_enc) in &rows {
                 // Decrypt inline data using the screenshot's row key
-                let row_key = match decrypt_row_key_with_cng(content_key_enc) {
+                let row_key = match decrypt_row_key_with_cng(
+                    &self.credential_state,
+                    content_key_enc,
+                ) {
                     Ok(k) => k,
                     Err(e) => {
                         tracing::warn!("migrate_inline_to_dedup: failed to decrypt row key for screenshot id={}: {}", id, e);
@@ -149,7 +152,10 @@ impl StorageState {
             }
 
             for (id, links_enc, content_key_enc) in &rows {
-                let row_key = match decrypt_row_key_with_cng(content_key_enc) {
+                let row_key = match decrypt_row_key_with_cng(
+                    &self.credential_state,
+                    content_key_enc,
+                ) {
                     Ok(k) => k,
                     Err(e) => {
                         tracing::warn!("migrate_inline_to_dedup: failed to decrypt row key for screenshot id={}: {}", id, e);

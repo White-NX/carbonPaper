@@ -1,4 +1,6 @@
 import React, { useId } from 'react';
+import { createPortal } from 'react-dom';
+import { useDialogFocus, useDialogVisibility } from '../hooks/useDialogFocus';
 import PropTypes from 'prop-types';
 import { cn } from '../lib/utils';
 
@@ -13,13 +15,16 @@ export function ConfirmDialog({
   confirmVariant = 'default',
   loading = false,
   loadingLabel = 'Processing…',
+  allowWhenLocked = false,
 }) {
   const titleId = useId();
   const messageId = useId();
+  const visible = useDialogVisibility(isOpen, allowWhenLocked);
+  const dialogRef = useDialogFocus(visible, onCancel, loading);
 
-  if (!isOpen) return null;
+  if (!visible) return null;
 
-  return (
+  return createPortal(
     <div
       className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm px-4 py-6"
       onClick={(event) => {
@@ -28,6 +33,8 @@ export function ConfirmDialog({
       }}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -67,7 +74,7 @@ export function ConfirmDialog({
           </button>
         </div>
       </div>
-    </div>
+    </div>, document.body
   );
 }
 
@@ -82,6 +89,7 @@ ConfirmDialog.propTypes = {
   confirmVariant: PropTypes.oneOf(['default', 'danger']),
   loading: PropTypes.bool,
   loadingLabel: PropTypes.string,
+  allowWhenLocked: PropTypes.bool,
 };
 
 export default ConfirmDialog;

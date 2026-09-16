@@ -1,8 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getLightweightConfig, setLightweightConfig, switchToLightweightMode } from '../../lib/lightweight_api';
 import { withAuth } from '../../lib/auth_api';
 import { useTauriEventListener } from '../../hooks/useTauriEventListener';
+import { setPreference } from '../../lib/preference_store';
+import { notifySettingsChanged } from '../../lib/settings_api';
+import { useSettingsActive, useSettingsActivity } from './SettingsActivityContext';
 
 const RESOURCE_POLICY_STORAGE_KEY = 'settings.resourcePolicy';
 
@@ -51,6 +54,11 @@ function getResourcePolicy(powerSaving, gameMode) {
 }
 
 export function useGeneralOptionsController({ externalPowerSavingMode, onTogglePowerSaving, t }) {
+  const active = useSettingsActive();
+  const [optionError, setOptionError] = useState('');
+  const [windowConfigSaving, setWindowConfigSaving] = useState(false);
+  const windowQueue = useRef(Promise.resolve());
+  const windowWrites = useRef(0);
   const [powerSavingMode, setPowerSavingMode] = useState(externalPowerSavingMode !== false);
   const [gameModeEnabled, setGameModeEnabled] = useState(false);
   const [gameModeActive, setGameModeActive] = useState(false);
@@ -59,6 +67,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
   const [useDml, setUseDml] = useState(false);
   const [gameModeLoading, setGameModeLoading] = useState(true);
   const [resourcePolicyLoading, setResourcePolicyLoading] = useState(false);
+  useSettingsActivity('general-options', { busy: resourcePolicyLoading || windowConfigSaving });
   const [manualResourcePolicy, setManualResourcePolicy] = useState(() => {
     if (typeof window === 'undefined') return null;
     return localStorage.getItem(RESOURCE_POLICY_STORAGE_KEY) === 'custom' ? 'custom' : null;
@@ -73,8 +82,8 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
   const [cardClickBehaviorActivityContext, setCardClickBehaviorActivityContext] = useState(() => localStorage.getItem('cardClickBehavior_activityContext') || 'preview');
 
   useEffect(() => {
-    getLightweightConfig().then(setLightweightConfigState).catch(console.error);
-  }, []);
+    if (active) getLightweightConfig().then(setLightweightConfigState).catch((error) => setOptionError(t('settings.feedback.readFailed')));
+  }, [active, t]);
 
   useEffect(() => {
     setPowerSavingMode(externalPowerSavingMode !== false);
@@ -93,13 +102,15 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
       await withAuth(() => invoke('set_power_saving_enabled', { enabled: next }), { autoPrompt: true });
     } catch (err) {
       console.error('Failed to set power saving mode:', err);
+      setOptionError(t('settings.feedback.saveFailed', { error: String(err) }));
       setPowerSavingMode(previous);
       onTogglePowerSaving?.(previous);
-      throw err;
+      return false;
     }
   };
 
   useEffect(() => {
+    if (!active) return;
     (async () => {
       try {
         const config = await invoke('get_advanced_config');
@@ -116,7 +127,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
         setGameModeLoading(false);
       }
     })();
-  }, []);
+  }, [active]);
 
   useTauriEventListener('game-mode-status', (event) => {
     setGameModeActive(event.payload?.active || false);
@@ -133,8 +144,9 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
       await withAuth(() => invoke('toggle_game_mode', { enabled: next }), { autoPrompt: true });
     } catch (err) {
       console.error('Failed to set game mode:', err);
+      setOptionError(t('settings.feedback.saveFailed', { error: String(err) }));
       setGameModeEnabled(previous);
-      throw err;
+      return false;
     }
   };
 
@@ -151,6 +163,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
     const previousGameMode = gameModeEnabled;
     const previousManualResourcePolicy = manualResourcePolicy;
     setResourcePolicyLoading(true);
+    setOptionError('');
     setManualResourcePolicy(null);
     localStorage.removeItem(RESOURCE_POLICY_STORAGE_KEY);
     setPowerSavingMode(option.powerSaving);
@@ -165,6 +178,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
       }
     } catch (err) {
       console.error('Failed to change resource policy:', err);
+      setOptionError(t('settings.feedback.saveFailed', { error: String(err) }));
       if (previousGameMode !== option.gameMode) {
         try {
           await withAuth(() => invoke('toggle_game_mode', { enabled: previousGameMode }), { autoPrompt: true });
@@ -190,17 +204,26 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
       onTogglePowerSaving?.(previousPowerSaving);
     } finally {
       setResourcePolicyLoading(false);
+      notifySettingsChanged(['advanced', 'power']);
     }
   };
 
   const handleLightweightConfigChange = async (key, value) => {
-    const newConfig = { ...lightweightConfig, [key]: value };
-    setLightweightConfigState(newConfig);
-    try {
-      await setLightweightConfig(newConfig);
-    } catch (error) {
-      console.error('Failed to save lightweight config:', error);
-    }
+    setLightweightConfigState((current) => ({ ...current, [key]: value }));
+    windowWrites.current += 1;
+    setWindowConfigSaving(true);
+    setOptionError('');
+    windowQueue.current = windowQueue.current.then(async () => {
+      try { await setLightweightConfig({ [key]: value }); }
+      catch (error) {
+        setOptionError(t('settings.feedback.saveFailed', { error: String(error) }));
+        try { setLightweightConfigState(await getLightweightConfig()); } catch { }
+      } finally {
+        windowWrites.current -= 1;
+        setWindowConfigSaving(windowWrites.current > 0);
+      }
+    });
+    return windowQueue.current;
   };
 
   const handleSwitchToLightweight = async () => {
@@ -212,7 +235,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
   };
 
   const setCardClickBehavior = (scope, value) => {
-    localStorage.setItem(`cardClickBehavior_${scope}`, value);
+    setPreference(`cardClickBehavior_${scope}`, value);
     if (scope === 'search') setCardClickBehaviorSearch(value);
     if (scope === 'clusters') setCardClickBehaviorClusters(value);
     if (scope === 'activityContext') setCardClickBehaviorActivityContext(value);
@@ -230,6 +253,7 @@ export function useGeneralOptionsController({ externalPowerSavingMode, onToggleP
   const selectedResourcePolicy = resourcePolicyOptions.find((option) => option.value === resourcePolicy) || resourcePolicyOptions[2];
 
   return {
+    optionError,
     powerSavingMode,
     gameModeEnabled,
     gameModeActive,

@@ -29,6 +29,7 @@ i18n
     },
     react: {
       useSuspense: true,
+      bindI18nStore: 'added',
     },
   });
 
@@ -43,6 +44,14 @@ const ensureLoaded = async (lng) => {
   }
 };
 
+let languageRequest = 0;
+export const changeAppLanguage = async (language) => {
+  const lng = language?.startsWith('en') ? 'en' : 'zh-CN';
+  const request = ++languageRequest;
+  await ensureLoaded(lng);
+  if (request === languageRequest) await i18n.changeLanguage(lng);
+};
+
 const syncBackendLanguage = (lng) => {
   invoke('set_app_language', { language: lng || 'zh-CN' }).catch(() => {
     // Backend may not be available in web-only mode; ignore failures.
@@ -53,16 +62,13 @@ if (typeof window !== 'undefined') {
   window.addEventListener('storage', (event) => {
     if (event.key !== 'language' || !event.newValue) return;
     if (event.newValue === i18n.language) return;
-    i18n.changeLanguage(event.newValue).catch(() => {});
+    changeAppLanguage(event.newValue).catch(() => {});
   });
 }
 
 // load initial language (useLang detector may set i18n.language)
 const initialLang = localStorage.getItem('language') || i18n.language || 'zh-CN';
-ensureLoaded(initialLang).then(() => {
-  i18n.changeLanguage(initialLang).catch(() => {});
-  syncBackendLanguage(initialLang);
-});
+changeAppLanguage(initialLang).catch(() => {});
 
 // when language changes, try to lazy-load resources for it
 i18n.on('languageChanged', (lng) => {

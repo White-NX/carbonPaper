@@ -3,8 +3,10 @@ import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../../lib/auth_api';
 import { runClustering, saveClusteringResults } from '../../lib/task_api';
 import { useClusteringStatus } from './organize/useClusteringStatus';
-import { useModelInventory } from './organize/useModelInventory';
 import { useSmartClusterControls } from './organize/useSmartClusterControls';
+import { saveAdvancedConfig } from '../../lib/settings_api';
+import { useSettingsActive, useSettingsActivity } from './SettingsActivityContext';
+import { useTauriEventListener } from '../../hooks/useTauriEventListener';
 
 export function useFeaturesController({
   monitorStatus,
@@ -12,7 +14,11 @@ export function useFeaturesController({
   featureModeDefinitions,
   getFeatureMode,
 }) {
+  const active = useSettingsActive();
   const [config, setConfig] = useState(null);
+  const [featureSaving, setFeatureSaving] = useState(false);
+  const [featureError, setFeatureError] = useState('');
+  const savingConfig = useRef(false);
   const [loading, setLoading] = useState(true);
   const [backgroundTimingSaving, setBackgroundTimingSaving] = useState(false);
   const [backgroundTimingError, setBackgroundTimingError] = useState(false);
@@ -22,7 +28,7 @@ export function useFeaturesController({
   const [clusteringPhase, setClusteringPhase] = useState(null);
   const [clusteringError, setClusteringError] = useState(null);
   const [clusteringNotice, setClusteringNotice] = useState(null);
-  const { clusteringStatus, refreshClusteringStatus } = useClusteringStatus(monitorStatus, clusteringRunning);
+  const { clusteringStatus, refreshClusteringStatus } = useClusteringStatus(monitorStatus, clusteringRunning, active);
   const [rangeStart, setRangeStart] = useState('');
   const [rangeEnd, setRangeEnd] = useState('');
   const [clusteringResourceChoice, setClusteringResourceChoice] = useState(null);
@@ -32,8 +38,8 @@ export function useFeaturesController({
   const clusteringRetryOptions = useRef(null);
   const queuedClusteringAt = useRef(null);
   const [customControlsOpen, setCustomControlsOpen] = useState(false);
-  const modelInventory = useModelInventory();
   const smartCluster = useSmartClusterControls();
+  useSettingsActivity('feature-operation', { busy: featureSaving || clusteringRunning || Boolean(clusteringResourceChoice) });
   const { scModelAvailable } = smartCluster;
 
   const loadConfig = async () => {
@@ -43,6 +49,7 @@ export function useFeaturesController({
       if (result.classification_enabled === undefined) result.classification_enabled = true;
       setConfig(result);
     } catch (err) {
+      setFeatureError(t('settings.feedback.readFailed'));
       console.error('Failed to load advanced config:', err);
     } finally {
       setLoading(false);
@@ -50,8 +57,11 @@ export function useFeaturesController({
   };
 
   useEffect(() => {
-    loadConfig();
-  }, []);
+    if (active) loadConfig();
+  }, [active]);
+  useTauriEventListener('settings-preferences-changed', ({ payload }) => {
+    if (active && payload?.includes('advanced') && !savingConfig.current) loadConfig();
+  });
 
   useEffect(() => {
     const handler = () => {
@@ -86,16 +96,27 @@ export function useFeaturesController({
   }, []);
 
   const saveConfig = async (newConfig) => {
-    setConfig(newConfig);
+    if (savingConfig.current) return false;
+    const patch = Object.fromEntries(Object.entries(newConfig).filter(([key, value]) => !Object.is(config?.[key], value)));
+    savingConfig.current = true;
+    setFeatureSaving(true);
+    setFeatureError('');
     try {
-      await withAuth(() => invoke('set_advanced_config', { config: newConfig }), { autoPrompt: true });
-      await withAuth(() => invoke('monitor_update_feature_config', {
-        clusteringEnabled: newConfig.clustering_enabled,
-        classificationEnabled: newConfig.classification_enabled,
-      }), { autoPrompt: true });
+      await saveAdvancedConfig(patch);
+      setConfig((current) => ({ ...current, ...patch }));
+      if ('clustering_enabled' in patch || 'classification_enabled' in patch) {
+        try {
+          await withAuth(() => invoke('monitor_update_feature_config', {
+            clusteringEnabled: newConfig.clustering_enabled,
+            classificationEnabled: newConfig.classification_enabled,
+          }), { autoPrompt: true });
+        } catch { setFeatureError(t('settings.feedback.savedPendingRestart')); }
+      }
+      return true;
     } catch (err) {
-      console.error('Failed to save advanced config:', err);
-    }
+      setFeatureError(t('settings.feedback.saveFailed', { error: String(err) }));
+      return false;
+    } finally { savingConfig.current = false; setFeatureSaving(false); }
   };
 
   const handleFeatureModeChange = async (mode) => {
@@ -143,7 +164,7 @@ export function useFeaturesController({
     if (!config) return;
     setClusteringDropdownOpen(false);
     const newConfig = { ...config, clustering_interval: interval };
-    await saveConfig(newConfig);
+    if (!await saveConfig(newConfig)) return;
     try {
       await withAuth(() => invoke('monitor_set_clustering_interval', { interval }), { autoPrompt: true });
     } catch {
@@ -331,7 +352,8 @@ export function useFeaturesController({
   return {
     config,
     loading,
-    ...modelInventory,
+    featureSaving,
+    featureError,
     clusteringDropdownOpen,
     setClusteringDropdownOpen,
     clusteringAdvancedOpen,

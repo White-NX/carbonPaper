@@ -20,6 +20,8 @@ pub struct BackgroundTaskState {
     pub last_completed_at_ms: Option<i64>,
     pub status: String,
     pub manual_pending: bool,
+    #[serde(default)]
+    pub manual_in_flight: bool,
 }
 
 impl BackgroundTaskState {
@@ -39,6 +41,7 @@ fn row_to_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackgroundTaskState
         last_completed_at_ms: row.get(6)?,
         status: row.get(7)?,
         manual_pending: row.get::<_, i64>(8)? != 0,
+        manual_in_flight: row.get::<_, i64>(9)? != 0,
     })
 }
 
@@ -127,7 +130,7 @@ impl StorageState {
             .prepare(
                 "SELECT task_kind, ready_since_ms, next_attempt_at_ms, failure_count,
                         last_served_seq, last_error, last_completed_at_ms, status,
-                        manual_pending
+                        manual_pending, manual_in_flight
                  FROM background_scheduler_tasks",
             )
             .map_err(|e| format!("Failed to prepare scheduler state query: {e}"))?;
@@ -516,7 +519,7 @@ impl StorageState {
         conn.query_row(
             "SELECT task_kind, ready_since_ms, next_attempt_at_ms, failure_count,
                     last_served_seq, last_error, last_completed_at_ms, status,
-                    manual_pending
+                    manual_pending, manual_in_flight
              FROM background_scheduler_tasks WHERE task_kind = ?1",
             params![task_kind],
             row_to_state,

@@ -29,6 +29,7 @@ pub mod error;
 mod error_window;
 mod i18n;
 mod idle;
+mod index_progress;
 mod logging;
 mod maintenance;
 pub mod mcp_contract;
@@ -66,6 +67,7 @@ mod semantic_query;
 #[allow(dead_code)]
 mod semantic_runtime;
 mod sensitive_filter;
+mod settings_window;
 mod smart_cluster_scoring;
 mod storage;
 mod task_vector_sync;
@@ -731,6 +733,9 @@ pub fn create_main_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::err
 
 // 启动自动切换到轻量模式的定时器
 fn start_auto_lightweight_timer(app: tauri::AppHandle) {
+    if app.get_webview_window(settings_window::LABEL).is_some() {
+        return;
+    }
     // 检查是否启用自动切换
     let auto_enabled = registry_config::get_bool("auto_lightweight_enabled").unwrap_or(false);
     if !auto_enabled {
@@ -755,6 +760,12 @@ fn start_auto_lightweight_timer(app: tauri::AppHandle) {
 
         tracing::info!("Auto-lightweight timer expired, checking window state");
 
+        if app_clone
+            .get_webview_window(settings_window::LABEL)
+            .is_some()
+        {
+            return;
+        }
         // 检查窗口是否仍然隐藏
         if let Some(window) = app_clone.get_webview_window("main") {
             if !window.is_visible().unwrap_or(true) {
@@ -785,9 +796,7 @@ fn start_auto_lightweight_timer(app: tauri::AppHandle) {
 pub(crate) fn hide_main_window_to_tray(window: &tauri::Window) -> Result<(), String> {
     window.hide().map_err(|e| e.to_string())?;
     let app = window.app_handle();
-    if let Some(credential_state) = app.try_state::<Arc<CredentialManagerState>>() {
-        credential_state.set_foreground_state(false);
-    }
+    settings_window::refresh_ui_foreground(app);
     let _ = app.emit("app-hidden", ());
     start_auto_lightweight_timer(app.clone());
     Ok(())
@@ -855,6 +864,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(MonitorState::new())
+        .manage(settings_window::SettingsWindowState::default())
         .manage(Arc::new(ml_runtime::MlRuntimeState::new()))
         .manage(Arc::new(office_runtime::OfficeRuntimeState::new()))
         .manage(Arc::new(semantic_runtime::SemanticRuntimeState::new()))
@@ -881,6 +891,7 @@ pub fn run() {
         .manage(Arc::new(minilm_index::SemanticIndexRunState::default()))
         .manage(Arc::new(rerank::RerankQueryState::default()))
         .on_window_event(|window, event| {
+            settings_window::on_window_event(window, event);
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     if error_window::HAS_CRITICAL_ERROR.load(Ordering::Relaxed) {
@@ -1322,6 +1333,14 @@ pub fn run() {
             commands::mcp::mcp_set_sensitive_filter_config,
             // 高级配置命令
             commands::utility::get_advanced_config,
+            settings_window::open_settings_window,
+            settings_window::close_settings_window,
+            settings_window::settings_set_busy,
+            settings_window::settings_monitor_action,
+            settings_window::take_settings_monitor_action,
+            settings_window::complete_settings_monitor_action,
+            settings_window::settings_preferences_changed,
+            settings_window::settings_debug_preview,
             commands::utility::set_advanced_config,
             monitor::enumerate_gpus,
             commands::utility::toggle_game_mode,

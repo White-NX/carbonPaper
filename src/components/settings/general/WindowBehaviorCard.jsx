@@ -19,7 +19,7 @@ export default function WindowBehaviorCard({
         </p>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-2">
+      <div className="settings-policy-grid grid gap-4 md:grid-cols-2">
         <div className="space-y-2">
           <label className="block text-xs font-medium text-ide-text">{t('settings.general.windowBehavior.startup.label')}</label>
           <SettingsSegmentedControl

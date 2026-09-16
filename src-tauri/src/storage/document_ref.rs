@@ -87,7 +87,7 @@ impl StorageState {
             return Ok(None);
         };
 
-        let session = CngKeySession::open_silent()
+        let session = CngKeySession::open_silent(&self.credential_state)
             .map_err(|error| format!("Failed to open Office document key session: {error}"))?;
         let plaintext =
             Self::decrypt_payload_with_unwrap(&ref_enc, &content_key_encrypted, &|ciphertext| {

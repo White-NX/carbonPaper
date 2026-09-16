@@ -1,19 +1,18 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { SettingsSwitch } from './SettingsControls';
+import { SettingsGroup, SettingsSection, SettingsErrorBanner } from './SettingsPrimitives';
 import CardClickBehaviorCard from './general/CardClickBehaviorCard';
 import ResourcePolicyCard from './general/ResourcePolicyCard';
 import WindowBehaviorCard from './general/WindowBehaviorCard';
 import { useGeneralOptionsController } from './useGeneralOptionsController';
 
 export default function GeneralOptionsSection({
-  sendTelemetryDiagnostics,
-  onToggleTelemetry,
   powerSavingMode: externalPowerSavingMode,
   onTogglePowerSaving,
 }) {
   const { t } = useTranslation();
   const {
+    optionError,
     powerSavingMode,
     gameModeEnabled,
     gameModeActive,
@@ -38,25 +37,9 @@ export default function GeneralOptionsSection({
   } = useGeneralOptionsController({ externalPowerSavingMode, onTogglePowerSaving, t });
 
   return (
-    <div className="space-y-3">
-      <label className="text-sm font-semibold text-ide-accent px-1 block">{t('settings.general.title')}</label>
-      <div className="p-4 bg-ide-bg border border-ide-border rounded-xl text-sm text-ide-muted space-y-3">
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <label className="block font-semibold text-ide-text mb-1">{t('settings.general.telemetry.label')}</label>
-            <p className="text-xs text-ide-muted">
-              {t('settings.general.telemetry.description')}
-            </p>
-          </div>
-          <SettingsSwitch
-            checked={sendTelemetryDiagnostics}
-            onChange={onToggleTelemetry}
-            title={t('settings.general.telemetry.label')}
-          />
-        </div>
-
-        <div className="w-full h-px bg-ide-border/50" />
-
+    <SettingsSection title={t('settings.general.title')}>
+      {optionError && <SettingsErrorBanner>{optionError}</SettingsErrorBanner>}
+      <SettingsGroup className="space-y-4">
         <ResourcePolicyCard
           resourcePolicy={resourcePolicy}
           resourcePolicyOptions={resourcePolicyOptions}
@@ -90,7 +73,7 @@ export default function GeneralOptionsSection({
           cardClickBehaviorActivityContext={cardClickBehaviorActivityContext}
           onSetCardClickBehavior={setCardClickBehavior}
         />
-      </div>
-    </div>
+      </SettingsGroup>
+    </SettingsSection>
   );
 }

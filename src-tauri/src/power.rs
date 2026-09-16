@@ -189,23 +189,23 @@ pub fn set_power_saving_enabled(
     app: AppHandle,
     enabled: bool,
 ) -> Result<(), String> {
-    crate::commands::check_main_window(&window)?;
+    crate::settings_window::check_settings_ui(&window)?;
     crate::commands::check_auth_required(&credential_state)?;
 
     registry_config::set_bool("power_saving_mode_enabled", enabled)?;
     power_state.enabled.store(enabled, Ordering::SeqCst);
 
-    // If disabling while active, reset active state and emit event
+    // Publish both enabling and disabling so every UI window sees the setting.
     if !enabled {
         power_state.active.store(false, Ordering::SeqCst);
-        let _ = app.emit(
-            "power-saving-changed",
-            serde_json::json!({
-                "enabled": false,
-                "active": false,
-            }),
-        );
     }
+    let _ = app.emit(
+        "power-saving-changed",
+        serde_json::json!({
+            "enabled": enabled,
+            "active": power_state.active.load(Ordering::SeqCst),
+        }),
+    );
 
     tracing::info!("Power saving mode enabled: {}", enabled);
     Ok(())

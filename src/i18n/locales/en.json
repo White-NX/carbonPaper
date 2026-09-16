@@ -189,7 +189,7 @@
       "extension": "Browser Extension",
       "ai_embedding": "AI Embedding",
       "features": "Features",
-      "capture": "Record & Search",
+      "capture": "Capture",
       "organize": "Organize",
       "privacy": "Privacy & Access",
       "maintenance": "Maintenance"
@@ -197,12 +197,12 @@
     "security": {
       "protection": {
         "title": "Protected by Windows CNG",
-        "description": "Your snapshot data is encrypted using credentials managed by Windows CNG. Only authorized access can decrypt it."
+        "description": "Records are encrypted on this computer. Verify with Windows Hello to access them."
       },
-      "unlock_label": "Unlock Duration",
+      "unlock_label": "Unlock protection",
       "session": {
-        "title": "Auto-lock timeout",
-        "description": "Set how long of inactivity before automatic lock requiring re-authentication.",
+        "title": "Unlock duration",
+        "description": "Verify again to view records after this time has elapsed.",
         "options": {
           "5m": {
             "label": "5 minutes",
@@ -221,8 +221,8 @@
             "description": "Lower security"
           },
           "until_close": {
-            "label": "Until closed",
-            "description": "Not recommended",
+            "label": "Until app exits",
+            "description": "Stay unlocked until the app fully exits.",
             "warning": true
           }
         },
@@ -245,9 +245,9 @@
         "minilm": "MiniLM-L12 is the compact language model used to encode OCR text before task clustering."
       },
       "cpu": {
-        "title": "Python subprocess CPU limits",
+        "title": "CPU usage limit",
         "label": "Limit CPU usage",
-        "description": "Limit CPU resources used for OCR and embeddings to avoid impacting system performance",
+        "description": "Limit background CPU usage to reduce its effect on other apps.",
         "percent_label": "CPU limit percent",
         "changed_notice": "CPU limit changes take effect when the monitor service restarts"
       },
@@ -261,9 +261,10 @@
         "queue_limit_desc": "Pause captures until queue is drained when above this size",
         "max_queue_label": "Max queue size",
         "timeout_label": "OCR timeout",
-        "timeout_desc": "Set the timeout for OCR tasks. Cold starts always allow 180 seconds.",
+        "timeout_desc": "The maximum time allowed for a single recognition task.",
         "seconds": "seconds",
-        "info": "OCR queue settings take effect immediately without restarting the monitor service"
+        "info": "OCR queue settings take effect immediately without restarting the monitor service",
+        "invalidTimeout": "Enter a whole number between 30 and 600."
       },
       "rust_ocr": {
         "title": "OCR engine",
@@ -287,13 +288,14 @@
       },
       "dml": {
         "title": "DirectML inference acceleration",
-        "label": "Use DirectML for inference",
-        "description": "When enabled, uses the GPU for DirectML-capable OCR and vector inference; requires a DirectX 12 compatible GPU",
+        "label": "Use graphics acceleration",
+        "description": "Use a DirectX 12 compatible graphics device to accelerate recognition and vector processing.",
         "changed_notice": "DirectML changes take effect when the monitor service restarts",
         "notice": "Note: Running DirectML on the primary GPU may impact gaming performance.",
         "gpu_select": "Select GPU device",
         "gpu_loading": "Detecting GPUs...",
-        "gpu_none": "No compatible GPU detected"
+        "gpu_none": "No compatible GPU detected",
+        "selectDevice": "Select an available device"
       },
       "background_processing": {
         "title": "Background organization",
@@ -304,6 +306,7 @@
         "states": {
           "waiting_for_idle": "Waiting for idle",
           "waiting_for_unlock": "Waiting for unlock",
+          "waiting_for_verification": "Waiting for verification",
           "running": "Running",
           "retry_wait": "Retrying later",
           "failed": "Processing failed",
@@ -328,7 +331,7 @@
         "interval_label": "Auto-clustering interval",
         "interval_desc": "Set the time interval for automatic background task clustering",
         "allow_full_low_memory_label": "Allow full auto-clustering under low memory",
-        "allow_full_low_memory_desc": "Off by default. When off, automatic clustering uses batched degraded mode for 20k+ snapshots under low memory; when on, it still attempts full PaCMAP + HDBSCAN and may page heavily.",
+        "allow_full_low_memory_desc": "Allow full clustering when memory is limited. Processing may affect other apps.",
         "info": "Task clustering automatically groups similar activities into long-term tasks. Uses MiniLM-L12 model for text encoding; the model is automatically unloaded after clustering to free memory.",
         "intervals": {
           "1d": "Daily",
@@ -338,12 +341,12 @@
         }
       },
       "network": {
-        "title": "Network Control",
-        "label": "Enable Network Features",
-        "description": "When disabled, all external network requests will be blocked, including update checks and model downloads."
+        "title": "Network access",
+        "label": "Allow network access",
+        "description": "Used to check for updates and download required components."
       },
       "semantic_backend": {
-        "title": "Screenshot text retrieval",
+        "title": "Text search index",
         "label": "Rust MiniLM text index",
         "description": "Rust maintains the local text index used for screenshot search and task grouping.",
         "diagnostic": "Local diagnostic",
@@ -357,7 +360,13 @@
         "stalled_hint": "These screenshots exhausted their indexing retries and will not be picked up again on their own. They stay out of natural-language search until indexing is rebuilt.",
         "run_now": "Index now",
         "run_now_hint": "If this computer is rarely idle or often on battery, index the waiting screenshots by hand here. A run continues until the queue is empty and uses the processor while it does, so you can stop it at any point.",
-        "run_preparing": "Indexing. The first batch has not finished yet; the first run has to load the model.",
+        "run_preparing": "Preparing the index…",
+        "run_waiting_for_unlock": "Waiting for unlock to continue.",
+        "run_unlock": "Unlock and continue",
+        "run_waiting_for_verification": "Verify your identity to continue.",
+        "run_verify": "Verify and continue",
+        "run_start_failed": "Could not start indexing. Please try again.",
+        "run_stop_failed": "Could not stop indexing. Please try again.",
         "run_progress": "Indexing: {{processed}} of {{total}} processed, {{indexed}} of them indexed.",
         "run_stop": "Stop",
         "run_stop_pending": "Stopping…",
@@ -371,7 +380,7 @@
         "run_failed": "Indexing stopped after an error that could not be recovered automatically."
       },
       "clip_backend": {
-        "title": "Screenshot image search",
+        "title": "Image search index",
         "label": "Rust Chinese-CLIP image index",
         "description": "Rust maintains the local image index used for text-to-image search.",
         "diagnostic": "Local diagnostic",
@@ -400,7 +409,13 @@
         "stalled_hint": "These images exhausted their encoding retries and will not be picked up again on their own. They stay out of image search until indexing is rebuilt.",
         "run_now": "Index now",
         "run_now_hint": "Encoding one image is far slower than encoding a line of text. If this computer is rarely idle or often on battery, index the waiting images by hand here. A run uses the processor while it goes, so you can stop it at any point.",
-        "run_preparing": "Encoding. The first image has not finished yet; the first run has to load the model.",
+        "run_preparing": "Preparing the index…",
+        "run_waiting_for_unlock": "Waiting for unlock to continue.",
+        "run_unlock": "Unlock and continue",
+        "run_waiting_for_verification": "Verify your identity to continue.",
+        "run_verify": "Verify and continue",
+        "run_start_failed": "Could not start indexing. Please try again.",
+        "run_stop_failed": "Could not stop indexing. Please try again.",
         "run_progress": "Encoding: {{processed}} of {{total}} processed, {{indexed}} of them indexed.",
         "run_stop": "Stop",
         "run_stop_pending": "Stopping…",
@@ -423,14 +438,34 @@
       },
       "vacuum": {
         "title": "Database maintenance",
-        "label": "Run database optimization manually",
-        "description": "VACUUM can reclaim database space and reorganize storage. It may take a few seconds to several minutes.",
+        "label": "Optimize database",
+        "description": "Reclaim space from cleared data. Optimization may take a little time.",
         "running": "Optimizing...",
         "action": "Optimize now",
         "already_running": "A database optimization task is already running. Please wait.",
         "success": "Database optimization completed.",
         "error": "Database optimization failed",
         "error_with_detail": "Database optimization failed: {{error}}"
+      },
+      "groups": {
+        "performance": "Processing and performance",
+        "components": "Components and repair",
+        "diagnostics": "Runtime diagnostics"
+      },
+      "ocrHealth": {
+        "title": "Text recognition",
+        "checking": "Checking the recognition component…",
+        "ready": "The recognition component is available.",
+        "repair": "The recognition component needs repair.",
+        "unavailable": "The recognition component could not be checked.",
+        "refresh": "Check the recognition component",
+        "state": "Runtime state",
+        "provider": "Inference provider",
+        "model": "Model",
+        "success": "Successful requests",
+        "failure": "Failed requests",
+        "elapsed": "Last duration",
+        "restart": "Restart text recognition"
       }
     },
     "storageManagement": {
@@ -561,7 +596,7 @@
         "label": "Do not capture protected windows",
         "description": "When disabled, attempts to capture windows that have screen-protected attributes."
       },
-      "save": "Save filters",
+      "save": "Save filter rules",
       "quickDelete": {
         "title": "Quick Delete Records",
         "description": "Quickly delete all screenshots and OCR records within the specified range. This action cannot be undone.",
@@ -575,7 +610,11 @@
         "confirmTitle": "Confirm?",
         "confirmMessage": "This deletes snapshots and OCR records in the selected range and cannot be undone. Continue?",
         "yes": "YES",
-        "no": "NO"
+        "no": "NO",
+        "chooseRange": "Choose a time range",
+        "range": "Time range to clear",
+        "action": "Clear records",
+        "confirmRange": "Permanently delete records from “{{range}}”? This cannot be undone."
       }
     },
     "delete": {
@@ -583,10 +622,10 @@
       "success": "Deleted {{count}} records"
     },
     "save_filters": {
-      "synced": "",
-      "saved_local_not_running": "",
+      "synced": "Filter rules saved and applied.",
+      "saved_local_not_running": "Rules saved. They will apply when recording next starts.",
       "saved_local_unsupported": "",
-      "saved_local_sync_failed": ""
+      "saved_local_sync_failed": "Rules saved but could not be applied yet. Retry or restart recording."
     },
     "autolaunch": {
       "read_error": "",
@@ -614,11 +653,16 @@
       },
       "status": {
         "registered": "Registered",
-        "not_registered": "Not registered"
+        "not_registered": "Not registered",
+        "checking": "Checking…",
+        "connected": "Connected",
+        "configured": "Configured, not connected",
+        "not_configured": "Not configured",
+        "unavailable": "Connection status unavailable"
       },
       "enhance": {
         "label": "Extension Enhancement",
-        "description": "Install the CarbonPaper browser extension to capture viewport screenshots with page metadata (URL, title, visible links). Works with any Chromium-based browser.",
+        "description": "Save page addresses, titles, and links with browser records so you can return to the original page.",
         "global": "Enable extension enhancement"
       },
       "sessions": {
@@ -630,15 +674,25 @@
       "error": "Installation failed: {{error}}",
       "help": "After clicking the button, load the unpacked extension from the path shown in your browser's extension settings page.",
       "tutorial": {
-        "title": "How to install",
-        "step1": "Click the install button above. \"Chrome / Chromium browsers\" also covers other Chromium-based browsers (360, Cent, Brave, ...).",
-        "step2": "Open the browser extensions page and enable \"Developer mode\".",
-        "step3": "Click \"Load unpacked\" and select the extension folder shown after installation.",
-        "step4": "The CarbonPaper extension icon will appear in your browser toolbar, and the browser shows up under \"Connected browsers\"."
-      }
+        "title": "View installation steps",
+        "step1": "Choose “Set up browser” or “Set up again” to prepare the files and open the browser extension manager.",
+        "step2": "Enable “Developer mode” in the browser extension manager.",
+        "step3": "Choose “Load unpacked” and select the extension folder shown above.",
+        "step4": "Keep CarbonPaper running. The browser will show “Connected” once the connection is established."
+      },
+      "prepared": "Extension files are ready. Follow the steps to load them in your browser.",
+      "preparing": "Setting up…",
+      "setup": "Set up browser",
+      "configureAgain": "Set up again",
+      "readFailed": "Browser connection status could not be loaded.",
+      "folder": "Extension folder",
+      "copyFolder": "Copy folder",
+      "copied": "Copied",
+      "copyFailed": "Could not copy. Please retry.",
+      "connectionDetails": "Connection details"
     },
     "ai_embedding": {
-      "title": "AI Embedding",
+      "title": "AI assistant access",
       "description": "Expose a local MCP (Model Context Protocol) HTTP server so that AI assistants can query your snapshot data, OCR text, and task clusters.",
       "mcp_service": "MCP Service",
       "mcp_description": "When enabled, starts a local MCP service that lets AI tools query snapshot data, including screenshot metadata, OCR text, and task cluster information. Be mindful of privacy and only authorize AI tools you trust.",
@@ -834,7 +888,7 @@
         "title": "Feature Management",
         "featureMode": {
           "label": "Feature Level",
-          "description": "Choose how much semantic functionality CarbonPaper should enable. Higher levels provide more automation and may use more background resources.",
+          "description": "Choose how records are classified and organized.",
           "customControls": {
             "label": "Adjust individually"
           },
@@ -863,7 +917,7 @@
         },
         "clustering": {
           "label": "Task Clustering",
-          "description": "Group similar activities into long-term tasks using MiniLM model",
+          "description": "Group related activity into tasks.",
           "interval_label": "Auto Clustering Interval",
           "interval_desc": "Set the interval for background auto clustering",
           "advanced_label": "Advanced",
@@ -882,31 +936,33 @@
             "completed": "Organization complete",
             "already_running": "An organization task is already running",
             "prepared_count": "Records prepared: {{count}}"
-          }
+          },
+          "rangeStart": "Start date",
+          "rangeEnd": "End date"
         },
         "classification": {
           "label": "Content Classification",
-          "description": "Automatically classify screenshot content using BGE model"
+          "description": "Classify records using window titles and text."
         },
         "smartCluster": {
           "label": "Smart Clusters (auto-archive by description)",
           "description": "Auto-group related screenshots by natural-language description",
           "modelMissing": "Model not downloaded",
-          "modelNotDownloaded": "Requires bge-reranker-v2-m3 model (~570MB)",
-          "downloadModel": "Download Model",
+          "modelNotDownloaded": "Download the smart filing component before first use.",
+          "downloadModel": "Prepare component",
           "downloading": "Downloading bge-reranker-v2-m3 model…",
           "status": "Status",
           "pending": "Pending",
           "activeClusters": "Active",
-          "drainNow": "Process pending queue now",
-          "rescanAll": "Re-match all hot layer",
+          "drainNow": "Process pending records",
+          "rescanAll": "Match records again",
           "retry": "Retry Download",
           "openManagement": "Open Smart Cluster Management",
           "clusteringDisabledWarning": "Task Clustering is disabled. Smart Clusters can still run during rescans, but without automatic text vectorization at screenshot capture time, candidate retrieval must encode text on demand, which may significantly reduce processing performance and increase resource usage."
         },
         "indexHealth": {
-          "label": "Index Health",
-          "description": "Current status of screenshots, OCR, vector indexes, and background retry queues",
+          "label": "Search and maintenance",
+          "description": "Check search processing status and manage maintenance tasks.",
           "refresh": "Refresh",
           "indexBacklog": "Index backlog",
           "screenshots": "Screenshots",
@@ -942,6 +998,81 @@
         "idleDescription": "Organize records after one minute without input while connected to power.",
         "saveError": "Could not save. Please try again."
       }
+    },
+    "window": {
+      "title": "CarbonPaper Settings",
+      "minimize": "Minimize",
+      "maximize": "Maximize or restore",
+      "operationInProgress": "You can close settings when the current operation finishes, or minimize the window now.",
+      "unsavedTitle": "Unsaved changes",
+      "unsavedDescription": "Continue editing to save your changes, or discard them and close settings.",
+      "discardAndClose": "Discard and close",
+      "keepEditing": "Keep editing"
+    },
+    "pages": {
+      "general": "Choose how the app starts, uses resources, and handles windows.",
+      "capture": "Choose what to record and connect browser extensions.",
+      "organize": "Choose organization features and when to run them.",
+      "privacy": "Manage unlocking, background access, and AI assistant permissions.",
+      "advanced": "Adjust processing performance and inspect components when needed.",
+      "about": "Version, updates, and project information."
+    },
+    "feedback": {
+      "loading": "Loading…",
+      "readFailed": "Settings could not be loaded. Please retry.",
+      "saveFailed": "Could not save: {{error}}",
+      "operationFailed": "Operation failed: {{error}}",
+      "retryApply": "Retry applying",
+      "savedPendingRestart": "Changes saved. Restart recording to apply them.",
+      "saved": "Saved."
+    },
+    "details": {
+      "options": "More options",
+      "diagnostics": "View diagnostics",
+      "download": "View download details"
+    },
+    "monitorStates": {
+      "running": "Recording",
+      "paused": "Paused",
+      "stopped": "Stopped",
+      "waiting": "Starting",
+      "loading": "Working",
+      "unknown": "Status unavailable"
+    },
+    "maintenance": {
+      "manageIndexes": "Manage search indexes"
+    },
+    "about": {
+      "updates": "App updates",
+      "check": "Check for updates",
+      "checking": "Checking…",
+      "latest": "Up to date",
+      "available": "Version {{version}} is available",
+      "download": "Download and install",
+      "license": "Released under the GPL-3.0 license.",
+      "author": "Developed by White-NX.",
+      "repository": "Project home",
+      "repositoryDescription": "Browse the source, report an issue, or contribute.",
+      "developers": "Developer previews",
+      "preview": "Preview",
+      "previews": {
+        "error": "Error window",
+        "security": "Security alert",
+        "ocr": "Recognition repair notice",
+        "update": "Update prompt",
+        "critical-update": "Critical update prompt",
+        "extension": "Extension setup",
+        "clustering": "Task grouping setup",
+        "smart-cluster": "Smart filing setup",
+        "app-bound": "Background component setup",
+        "app-bound-repair": "Background component repair"
+      }
+    },
+    "serviceStates": {
+      "running": "Running",
+      "waiting": "Waiting for unlock",
+      "error": "Error",
+      "stopped": "Stopped"
     }
   },
   "common": {
@@ -953,7 +1084,8 @@
     "processing": "Processing…",
     "back": "Back",
     "next": "Next",
-    "clear": "Clear"
+    "clear": "Clear",
+    "refresh": "Refresh"
   },
   "topbar": {
     "settings": "Settings",
@@ -1112,10 +1244,22 @@
       "smartClusterRunningTitle": "Smart Clustering Queue processing",
       "smartClusterRunningDesc": "Current progress {{progress}}%, pending screenshots {{pending}}.",
       "semanticIndexSummaryPlaceholder": "Text indexing ({{progress}}%)",
-      "semanticIndexRunningTitle": "Building MiniLM text vectors",
+      "semanticIndexPreparing": "Preparing text search index…",
+      "semanticIndexQueued": "Text search index queued",
+      "semanticIndexWaitingForUnlock": "Text search index waiting for unlock",
+      "semanticIndexWaitingForVerification": "Text search index waiting for verification",
+      "semanticIndexRetryWait": "Text search index waiting to retry",
+      "semanticIndexStopping": "Stopping text search indexing…",
+      "semanticIndexRunningTitle": "Text search index",
       "semanticIndexRunningDesc": "Encoding text vectors for past screenshots, progress {{progress}}%. Indexing of new screenshots may lag while this runs.",
       "clipIndexSummaryPlaceholder": "Image indexing ({{progress}}%)",
-      "clipIndexRunningTitle": "Building CLIP image vectors",
+      "clipIndexPreparing": "Preparing image search index…",
+      "clipIndexQueued": "Image search index queued",
+      "clipIndexWaitingForUnlock": "Image search index waiting for unlock",
+      "clipIndexWaitingForVerification": "Image search index waiting for verification",
+      "clipIndexRetryWait": "Image search index waiting to retry",
+      "clipIndexStopping": "Stopping image search indexing…",
+      "clipIndexRunningTitle": "Image search index",
       "clipIndexRunningDesc": "Encoding image vectors for past screenshots, progress {{progress}}%. Text indexing and Smart Cluster scoring are paused until this finishes.",
       "modelDownloadSummaryPlaceholder": "Downloading models ({{progress}}%)",
       "modelDownloadRunningTitle": "Downloading Model Files",

@@ -1,256 +1,35 @@
 import React from 'react';
-import { Github, User, CheckCircle2, Download, AlertCircle, RefreshCw, Bug, ShieldAlert, BellRing } from 'lucide-react';
-import { openUrl } from '@tauri-apps/plugin-opener';
-import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
+import { Github, RefreshCw } from 'lucide-react';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { APP_VERSION } from '../../lib/version';
-import { withAuth } from '../../lib/auth_api';
+import appIcon from '../../../src-tauri/icons/128x128.png';
+import { SettingsButton } from './SettingsControls';
+import { SettingsDivider, SettingsErrorBanner, SettingsGroup, SettingsRow, SettingsStatus } from './SettingsPrimitives';
 
-export default function AboutSection({
-  checking,
-  upToDate,
-  onCheckUpdate,
-  updateInfo,
-  updateError,
-  downloading,
-  downloadProgress,
-  onDownloadUpdate,
-}) {
+export default function AboutSection({ checking, upToDate, onCheckUpdate, updateInfo, updateError, downloading, downloadProgress, onDownloadUpdate }) {
   const { t } = useTranslation();
   const phase = downloadProgress?.phase || 'downloading';
-  const hasValidTotal = downloading && downloadProgress.contentLength > 0;
-  const progressPercent = hasValidTotal
-      ? Math.round((downloadProgress.downloaded / downloadProgress.contentLength) * 100)
-      : 0;
-  const isApplying = phase === 'applying';
-  const isExtracting = phase === 'extracting';
-  const statusLabel = isApplying
-    ? t('updateModal.applying')
-    : isExtracting
-      ? t('updateModal.extracting')
-      : t('updateModal.downloading');
-
-  const renderUpdateButton = () => {
-    if (downloading) {
-      return (
-        <div className="w-full space-y-1.5">
-          <div className="w-full h-2 bg-ide-bg rounded-full overflow-hidden">
-            <div
-              className="h-full bg-ide-accent rounded-full transition-all duration-300"
-              style={{ width: `${isApplying || isExtracting ? 100 : progressPercent}%` }}
-            />
-          </div>
-          <div className="text-[10px] text-ide-muted text-center">
-            {isApplying || isExtracting
-              ? statusLabel
-              : hasValidTotal ? `${progressPercent}%` : `${(downloadProgress.downloaded / 1024 / 1024).toFixed(1)} MB`}
-          </div>
-        </div>
-      );
-    }
-
-    if (updateInfo) {
-      return (
-        <div className="w-full space-y-1.5">
-          <div className="text-xs text-ide-accent font-medium text-center">
-            v{updateInfo.version} available
-          </div>
-          <button
-            onClick={onDownloadUpdate}
-            className="w-full py-1.5 rounded text-xs font-medium transition-all flex items-center justify-center gap-2 bg-ide-accent text-white hover:opacity-90"
-          >
-            <Download className="w-3 h-3" /> Download & Install
-          </button>
-        </div>
-      );
-    }
-
-    if (updateError) {
-      return (
-        <div className="w-full space-y-1.5">
-          <div className="flex items-center gap-1 text-[10px] text-ide-error justify-center">
-            <AlertCircle className="w-3 h-3" />
-            <span className="truncate max-w-[180px]">{updateError}</span>
-          </div>
-          <button
-            onClick={onCheckUpdate}
-            className="w-full py-1.5 rounded text-xs font-medium transition-all flex items-center justify-center gap-2 bg-ide-text text-ide-bg hover:opacity-90"
-          >
-            <RefreshCw className="w-3 h-3" /> Retry
-          </button>
-        </div>
-      );
-    }
-
-    if (upToDate) {
-      return (
-        <button
-          disabled
-          className="w-full py-1.5 rounded text-xs font-medium transition-all flex items-center justify-center gap-2 bg-green-500/10 text-green-500 border border-green-500/20 cursor-default"
-        >
-          <CheckCircle2 className="w-3 h-3" /> Latest
-        </button>
-      );
-    }
-
-    return (
-      <button
-        onClick={onCheckUpdate}
-        disabled={checking}
-        className="w-full py-1.5 rounded text-xs font-medium transition-all flex items-center justify-center gap-2 bg-ide-text text-ide-bg hover:opacity-90"
-      >
-        {checking ? 'Checking...' : 'Check Now'}
-      </button>
-    );
-  };
-
-  return (
-    <div className="w-full h-full overflow-y-auto pr-2 text-ide-text select-none custom-scrollbar">
-      <div className="flex flex-col gap-6 max-w-2xl mx-auto pb-8 pt-2">
-        {/* Header - More Compact */}
-        <div className="flex items-center gap-5">
-          <div className="relative w-16 h-16 shrink-0 flex items-center justify-center bg-gradient-to-br from-ide-panel to-ide-bg rounded-2xl shadow border border-ide-border group cursor-default">
-            <div className="absolute inset-0 bg-ide-accent/5 rounded-2xl transform rotate-3 group-hover:rotate-6 transition-transform duration-500" />
-            <svg
-              className="w-8 h-8 text-ide-accent relative z-10"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-              <polyline points="14 2 14 8 20 8" />
-              <line x1="16" y1="13" x2="8" y2="13" />
-              <line x1="16" y1="17" x2="8" y2="17" />
-              <polyline points="10 9 9 9 8 9" />
-            </svg>
-          </div>
-
-          <div className="flex flex-col items-start gap-1">
-            <h1 className="text-2xl font-bold text-ide-text tracking-tight">CarbonPaper - 复写纸</h1>
-            <div className="flex items-center gap-3">
-              <span className="px-2 py-0.5 rounded bg-ide-panel border border-ide-border text-[10px] font-mono text-ide-muted">
-                {APP_VERSION}
-              </span>
-            </div>
-          </div>
-        </div>
-
-        {/* Content Layout - Single Column */}
-        <div className="flex flex-col gap-6">
-          <section className="space-y-4">
-            {/* Description */}
-            <div className="p-4 bg-ide-panel/30 border border-ide-border rounded-xl text-sm leading-relaxed text-ide-muted space-y-4">
-              <p>
-                This program is under GPL-3.0 Licence.
-              </p>
-              <p>
-                Built by White-NX with ❤️.
-              </p>
-            </div>
-
-            <div className="bg-ide-panel/50 border border-ide-border rounded-xl p-4 backdrop-blur-sm flex flex-col justify-between">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="font-semibold text-ide-text text-sm">Updates</h3>
-                <div className="text-[10px] text-ide-muted font-mono">{APP_VERSION}</div>
-              </div>
-              {renderUpdateButton()}
-            </div>
-
-            <div onClick={() => openUrl('https://github.com/White-NX/carbonPaper')} className="block">
-              <div className="relative group overflow-hidden bg-gradient-to-br from-indigo-500/10 to-ide-panel border border-indigo-500/20 rounded-xl p-4 cursor-pointer transition-all hover:shadow-lg hover:border-indigo-500/40">
-                <div className="relative z-10 flex items-center justify-between">
-                  <div>
-                    <h2 className="text-sm font-bold text-ide-text group-hover:text-indigo-400 transition-colors">GitHub Repository</h2>
-                    <p className="text-xs text-ide-muted">Star, fork, and contribute.</p>
-                  </div>
-                  <Github className="w-5 h-5 text-ide-muted group-hover:text-indigo-400 transition-colors" />
-                </div>
-              </div>
-            </div>
-          </section>
-
-          {/* Debug: Test Error Window (dev only) */}
-          {import.meta.env.DEV && (
-            <section className="space-y-2">
-              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl flex flex-col gap-2">
-                <button
-                  onClick={() => withAuth(() => invoke('trigger_test_error'), { autoPrompt: true }).catch(console.error)}
-                  className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
-                >
-                  <Bug className="w-3.5 h-3.5" />
-                  {t('errorWindow.triggerTest')}
-                </button>
-                <button
-                  onClick={() => withAuth(() => invoke('debug_trigger_security_alert'), { autoPrompt: true }).catch(console.error)}
-                  className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
-                >
-                  <ShieldAlert className="w-3.5 h-3.5" />
-                  {t('aboutSection.debug.trigger_security_alert', 'Preview Security Alert Mask')}
-                </button>
-                <button
-                  onClick={() => withAuth(() => invoke('debug_trigger_ocr_model_repair_notification'), { autoPrompt: true }).catch(console.error)}
-                  className="flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
-                >
-                  <BellRing className="w-3.5 h-3.5" />
-                  {t('aboutSection.debug.trigger_ocr_model_repair_notification', 'Test OCR Model Repair Notification')}
-                </button>
-                <button
-                  onClick={() => window.dispatchEvent(new CustomEvent('debug-update-modal', { detail: { critical: false } }))}
-                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
-                >
-                  <Bug className="w-3.5 h-3.5" />
-                  Preview Update Modal (Normal)
-                </button>
-                <button
-                  onClick={() => window.dispatchEvent(new CustomEvent('debug-update-modal', { detail: { critical: true } }))}
-                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
-                >
-                  <Bug className="w-3.5 h-3.5" />
-                  Preview Update Modal (Critical)
-                </button>
-                <button
-                  onClick={() => window.dispatchEvent(new CustomEvent('debug-show-extension-wizard'))}
-                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
-                >
-                  <Bug className="w-3.5 h-3.5" />
-                  Preview Extension Setup Wizard
-                </button>
-                <button
-                  onClick={() => window.dispatchEvent(new CustomEvent('debug-show-clustering-wizard'))}
-                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
-                >
-                  <Bug className="w-3.5 h-3.5" />
-                  Preview Clustering Setup Wizard
-                </button>
-                <button
-                  onClick={() => window.dispatchEvent(new CustomEvent('debug-show-smart-cluster-wizard'))}
-                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
-                >
-                  <Bug className="w-3.5 h-3.5" />
-                  Preview Smart Cluster Setup Wizard
-                </button>
-                <button
-                  onClick={() => window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer'))}
-                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
-                >
-                  <Bug className="w-3.5 h-3.5" />
-                  {t('aboutSection.debug.preview_app_bound_offer', 'Preview App Bound Upgrade Prompt')}
-                </button>
-                <button
-                  onClick={() => window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer', { detail: { repair: true } }))}
-                  className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-medium transition-colors w-full justify-center"
-                >
-                  <Bug className="w-3.5 h-3.5" />
-                  {t('aboutSection.debug.preview_app_bound_repair', 'Preview App Bound Repair Prompt')}
-                </button>
-              </div>
-            </section>
-          )}
-        </div>
-      </div>
+  const progress = downloadProgress?.contentLength > 0 ? Math.min(1, downloadProgress.downloaded / downloadProgress.contentLength) : undefined;
+  return <div className="space-y-6">
+    <div className="flex items-center gap-4 py-2">
+      <img src={appIcon} alt="" className="h-14 w-14 shrink-0" />
+      <div><h2 className="text-2xl font-semibold tracking-tight">CarbonPaper</h2><p className="mt-1 text-sm text-ide-muted">{APP_VERSION}</p></div>
     </div>
-  );
+    <SettingsGroup className="space-y-3">
+      <SettingsRow label={t('settings.about.updates')} description={updateInfo ? t('settings.about.available', { version: updateInfo.version }) : upToDate ? t('settings.about.latest') : APP_VERSION}
+        control={<SettingsButton icon={RefreshCw} onClick={onCheckUpdate} disabled={checking || downloading}>{t(checking ? 'settings.about.checking' : 'settings.about.check')}</SettingsButton>} />
+      {updateError && <SettingsErrorBanner>{updateError}</SettingsErrorBanner>}
+      {downloading ? <div className="space-y-2">
+        <SettingsStatus>{t(phase === 'applying' ? 'updateModal.applying' : phase === 'extracting' ? 'updateModal.extracting' : 'updateModal.downloading')}</SettingsStatus>
+        <progress className="h-1.5 w-full accent-ide-accent" max={1} value={phase === 'downloading' ? progress : undefined} aria-label={t('settings.about.download')} />
+      </div> : updateInfo && <SettingsButton variant="primary" onClick={onDownloadUpdate}>{t('settings.about.download')}</SettingsButton>}
+    </SettingsGroup>
+    <SettingsGroup>
+      <div className="space-y-2 text-xs leading-relaxed text-ide-muted"><p>{t('settings.about.license')}</p><p>{t('settings.about.author')}</p></div>
+      <SettingsDivider />
+      <SettingsRow label={t('settings.about.repository')} description={t('settings.about.repositoryDescription')}
+        control={<SettingsButton icon={Github} onClick={() => openUrl('https://github.com/White-NX/carbonPaper')}>GitHub</SettingsButton>} />
+    </SettingsGroup>
+  </div>;
 }

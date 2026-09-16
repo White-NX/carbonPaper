@@ -2,11 +2,14 @@ import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { formatInvokeError } from '../filterUtils';
 import { withAuth } from '../../../lib/auth_api';
+import { useSettingsActivity } from '../SettingsActivityContext';
 
 export function useAutoLaunchStatus({ isOpen, t }) {
   const [autoLaunchEnabled, setAutoLaunchEnabled] = useState(null);
   const [autoLaunchLoading, setAutoLaunchLoading] = useState(false);
   const [autoLaunchMessage, setAutoLaunchMessage] = useState('');
+  const [saving, setSaving] = useState(false);
+  useSettingsActivity('auto-launch', { busy: saving });
 
   const refreshAutoLaunchStatus = async () => {
     setAutoLaunchLoading(true);
@@ -23,6 +26,8 @@ export function useAutoLaunchStatus({ isOpen, t }) {
   };
 
   const handleToggleAutoLaunch = async () => {
+    if (saving) return;
+    setSaving(true);
     setAutoLaunchLoading(true);
     setAutoLaunchMessage('');
     try {
@@ -36,6 +41,7 @@ export function useAutoLaunchStatus({ isOpen, t }) {
     } catch (e) {
       setAutoLaunchMessage(t('settings.autolaunch.action_failed', { error: formatInvokeError(e) }));
     } finally {
+      setSaving(false);
       setAutoLaunchLoading(false);
     }
   };
