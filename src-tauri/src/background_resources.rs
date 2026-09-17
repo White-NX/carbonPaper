@@ -4,7 +4,7 @@ use crate::background_policy::{ExecutionEnvironment, ResourceSample};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{FILETIME, HANDLE};
 use windows::Win32::System::JobObjects::{
-    JobObjectCpuRateControlInformation, SetInformationJobObject,
+    JobObjectCpuRateControlInformation, QueryInformationJobObject, SetInformationJobObject,
     JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
     JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
 };
@@ -128,6 +128,26 @@ impl Drop for DiskCounter {
 
 /// Job limits count a percentage of the whole machine, not one logical CPU.
 pub fn set_cpu_rate(job: HANDLE, percent: Option<u32>) -> Result<(), String> {
+    let mut current = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
+    // Windows rejects ControlFlags=0 with ERROR_INVALID_PARAMETER when CPU
+    // rate control has never been enabled for this Job Object. Query first so
+    // restoring an already-unlimited worker is an idempotent operation.
+    unsafe {
+        QueryInformationJobObject(
+            job,
+            JobObjectCpuRateControlInformation,
+            &mut current as *mut _ as *mut _,
+            std::mem::size_of_val(&current) as u32,
+            None,
+        )
+    }
+    .map_err(|e| format!("worker_budget: failed to read current CPU budget: {e}"))?;
+
+    let enabled = current.ControlFlags.0 & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE.0 != 0;
+    if percent.is_none() && !enabled {
+        return Ok(());
+    }
+
     let mut info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION::default();
     if let Some(percent) = percent {
         if !(1..=100).contains(&percent) {
@@ -136,6 +156,13 @@ pub fn set_cpu_rate(job: HANDLE, percent: Option<u32>) -> Result<(), String> {
         info.ControlFlags =
             JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
         info.Anonymous.CpuRate = percent * 100;
+
+        if current.ControlFlags == info.ControlFlags
+            // SAFETY: HARD_CAP selects the CpuRate member of the Win32 union.
+            && unsafe { current.Anonymous.CpuRate == info.Anonymous.CpuRate }
+        {
+            return Ok(());
+        }
     }
     // SAFETY: info is the documented structure for this information class and
     // job remains owned by the child supervisor throughout this call.

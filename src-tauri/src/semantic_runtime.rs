@@ -1969,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn a_foreground_successor_observes_the_restored_native_job_budget() {
+    fn native_job_budget_is_idempotent_and_restored_for_foreground_successors() {
         use windows::Win32::System::JobObjects::{
             JobObjectCpuRateControlInformation, QueryInformationJobObject,
             JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
@@ -2015,6 +2015,14 @@ mod tests {
             }
             info
         };
+        // A fresh Job Object has never enabled CPU rate control. Windows
+        // rejects a literal ControlFlags=0 update in that state, so the helper
+        // must recognize that it is already unlimited.
+        let unlimited = RequestCpuBudget::apply(process.clone(), None).unwrap();
+        assert_eq!(read_budget().ControlFlags.0, 0);
+        drop(unlimited);
+        assert_eq!(read_budget().ControlFlags.0, 0);
+
         let limited = RequestCpuBudget::apply(process.clone(), Some(5)).unwrap();
         assert_ne!(read_budget().ControlFlags.0, 0);
         // SAFETY: HARD_CAP uses the CpuRate member of this Win32 union.
