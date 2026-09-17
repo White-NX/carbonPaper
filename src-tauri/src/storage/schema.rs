@@ -10,6 +10,8 @@ use std::sync::atomic::Ordering;
 use super::policy::disk_totals_for_path;
 use super::{connection, database_snapshot, mode, StorageState};
 
+const WORKER_BUDGET_RECOVERY_KEY: &str = "worker_budget_invalid_argument_recovery_v1";
+
 impl StorageState {
     const MCP_PRIVACY_ACKNOWLEDGED_KEY: &'static str = "mcp_privacy_acknowledged";
 
@@ -806,6 +808,13 @@ impl StorageState {
         }
 
         self.ensure_schema(conn)?;
+        let recovered = Self::recover_invalid_worker_budget_failures(conn)?;
+        if recovered > 0 {
+            tracing::info!(
+                "[DB] recovered {} task row(s) affected by the invalid worker CPU budget transition",
+                recovered
+            );
+        }
         self.init_processing_stage_schema(conn)?;
         self.recover_interrupted_derived_index_jobs_at_startup(conn)?;
 
@@ -1543,6 +1552,86 @@ impl StorageState {
         Ok(())
     }
 
+    /// Release only durable retries charged by the pre-v1 CPU budget bug.
+    ///
+    /// That build sent `ControlFlags=0` to a fresh Job Object. Windows returns
+    /// ERROR_INVALID_PARAMETER in that state, so classification and index work
+    /// could exhaust otherwise valid retry budgets before inference began.
+    /// Keep this migration one-shot so a genuinely unsupported future system
+    /// cannot be forced into an endless startup retry loop.
+    fn recover_invalid_worker_budget_failures(conn: &Connection) -> Result<usize, String> {
+        let applied = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key=?1)",
+                [WORKER_BUDGET_RECOVERY_KEY],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("Failed to inspect worker budget recovery state: {error}"))?;
+        if applied {
+            return Ok(0);
+        }
+
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|error| format!("Failed to start worker budget recovery: {error}"))?;
+        let mut recovered = 0usize;
+        recovered += tx
+            .execute(
+                "UPDATE screenshot_ocr_status
+                 SET postprocess_status='pending', postprocess_error=NULL,
+                     postprocess_attempts=0, postprocess_next_retry_at=NULL,
+                     postprocess_lease=NULL, updated_at=CURRENT_TIMESTAMP
+                 WHERE postprocess_status IN
+                       ('pending','queued','processing','waiting_for_auth','failed')
+                   AND instr(lower(COALESCE(postprocess_error,'')), 'worker_budget:') > 0",
+                [],
+            )
+            .map_err(|error| format!("Failed to recover classification retries: {error}"))?;
+        recovered += tx
+            .execute(
+                "UPDATE classification_feedback
+                 SET attempts=0, next_retry_at=0, last_error=NULL
+                 WHERE instr(lower(COALESCE(last_error,'')), 'worker_budget:') > 0",
+                [],
+            )
+            .map_err(|error| format!("Failed to recover classification feedback: {error}"))?;
+        recovered += tx
+            .execute(
+                "UPDATE derived_index_jobs
+                 SET status='pending', error_code=NULL, error=NULL, attempts=0,
+                     next_retry_at=NULL, lease_token=NULL, updated_at=CURRENT_TIMESTAMP
+                 WHERE status IN ('pending','failed')
+                   AND instr(lower(COALESCE(error,'')), 'worker_budget:') > 0",
+                [],
+            )
+            .map_err(|error| format!("Failed to recover derived index jobs: {error}"))?;
+        recovered += tx
+            .execute(
+                "UPDATE background_scheduler_tasks
+                 SET status='queued', next_attempt_at_ms=0, failure_count=0,
+                     last_error=NULL, manual_in_flight=0
+                 WHERE status IN ('queued','retry_wait','failed','degraded')
+                   AND instr(lower(COALESCE(last_error,'')), 'worker_budget:') > 0",
+                [],
+            )
+            .map_err(|error| format!("Failed to recover scheduled index work: {error}"))?;
+        recovered += tx
+            .execute(
+                "DELETE FROM derived_ann_build_state
+                 WHERE instr(lower(last_error), 'worker_budget:') > 0",
+                [],
+            )
+            .map_err(|error| format!("Failed to recover ANN build state: {error}"))?;
+        tx.execute(
+            "INSERT INTO app_metadata(key,value) VALUES(?1,'complete')",
+            [WORKER_BUDGET_RECOVERY_KEY],
+        )
+        .map_err(|error| format!("Failed to record worker budget recovery: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("Failed to commit worker budget recovery: {error}"))?;
+        Ok(recovered)
+    }
+
     fn add_column_if_missing(
         conn: &Connection,
         table: &str,
@@ -2131,5 +2220,128 @@ mod tests {
             .unwrap();
         assert_eq!(semantic_changes, 0);
         assert_eq!(clip_changes, 1);
+    }
+
+    #[test]
+    fn worker_budget_recovery_is_exact_and_one_time() {
+        let (_temp, storage) = test_storage();
+        let conn = Connection::open_in_memory().unwrap();
+        storage.init_tables(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM app_metadata WHERE key=?1",
+            [WORKER_BUDGET_RECOVERY_KEY],
+        )
+        .unwrap();
+        conn.execute_batch(
+            r#"
+            INSERT INTO screenshots(id,image_path,image_hash) VALUES
+                (1,'1','hash-1'),(2,'2','hash-2');
+            INSERT INTO screenshot_ocr_status
+                (screenshot_id,postprocess_status,postprocess_error,postprocess_attempts)
+            VALUES
+                (1,'failed','embed failed: worker_budget: invalid argument',5),
+                (2,'failed','model_missing: bge',5);
+            INSERT INTO classification_feedback
+                (screenshot_id,category,source_revision,attempts,next_retry_at,last_error)
+            VALUES
+                (1,'Development',0,5,9999,'worker_budget: invalid argument'),
+                (2,'Development',0,5,9999,'model_missing: bge');
+            INSERT INTO derived_index_jobs
+                (index_kind,subject_key,status,error_code,error,attempts,next_retry_at,
+                 model_id,model_revision,embedding_version,source_fingerprint)
+            VALUES
+                ('clip_image','hash-1','failed','embed_failed','worker_budget: invalid argument',5,
+                 '2099-01-01 00:00:00','clip','r1',1,'source-1'),
+                ('clip_image','hash-2','failed','embed_failed','model_missing: clip',5,
+                 '2099-01-01 00:00:00','clip','r1',1,'source-2');
+            INSERT INTO background_scheduler_tasks
+                (task_kind,ready_since_ms,status,failure_count,next_attempt_at_ms,last_error)
+            VALUES
+                ('clip_index',1,'retry_wait',3,9999,'embed failed: worker_budget: invalid argument'),
+                ('semantic_index',1,'retry_wait',3,9999,'model_missing: minilm');
+            INSERT INTO derived_ann_build_state
+                (index_kind,consecutive_failures,last_failure_at,next_retry_at,last_error_code,last_error,circuit_open)
+            VALUES
+                ('clip_image',3,'2026-01-01T00:00:00Z','2099-01-01T00:00:00Z',
+                 'worker_failed','worker_budget: invalid argument',1);
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            StorageState::recover_invalid_worker_budget_failures(&conn).unwrap(),
+            5
+        );
+        let classification: (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT postprocess_status,postprocess_attempts,postprocess_error
+                 FROM screenshot_ocr_status WHERE screenshot_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(classification, ("pending".into(), 0, None));
+        let feedback: (i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT attempts,next_retry_at,last_error FROM classification_feedback
+                 WHERE screenshot_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(feedback, (0, 0, None));
+        let derived: (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status,attempts,error FROM derived_index_jobs WHERE subject_key='hash-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(derived, ("pending".into(), 0, None));
+        let scheduled: (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status,failure_count,last_error FROM background_scheduler_tasks
+                 WHERE task_kind='clip_index'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(scheduled, ("queued".into(), 0, None));
+        let ann_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM derived_ann_build_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(ann_rows, 0);
+
+        let unrelated: (String, i64, String) = conn
+            .query_row(
+                "SELECT postprocess_status,postprocess_attempts,postprocess_error
+                 FROM screenshot_ocr_status WHERE screenshot_id=2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(unrelated, ("failed".into(), 5, "model_missing: bge".into()));
+
+        conn.execute(
+            "UPDATE screenshot_ocr_status
+             SET postprocess_error='worker_budget: later failure'
+             WHERE screenshot_id=2",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            StorageState::recover_invalid_worker_budget_failures(&conn).unwrap(),
+            0
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT postprocess_attempts FROM screenshot_ocr_status WHERE screenshot_id=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 5);
     }
 }

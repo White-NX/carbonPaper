@@ -218,12 +218,19 @@ pub(crate) fn enqueue_capture(app: &AppHandle, id: i64, input: Input) -> Result<
             let deferred = scheduling_deferred(&error);
             let _ = storage.defer_native_classification(&lease, &error, deferred);
             crate::classification_runtime::record_pipeline_error(&error);
-            tracing::debug!(
-                "[CLASSIFICATION] capture deferred={} screenshot_id={} error={}",
-                deferred,
-                id,
-                error
-            );
+            if deferred {
+                tracing::debug!(
+                    "[CLASSIFICATION] capture deferred=true screenshot_id={} error={}",
+                    id,
+                    error
+                );
+            } else {
+                tracing::warn!(
+                    "[CLASSIFICATION] capture failed screenshot_id={} error={}",
+                    id,
+                    error
+                );
+            }
         }
     });
     Ok(true)
@@ -301,12 +308,15 @@ pub(crate) fn enqueue_staged(app: &AppHandle, work: StagedWork) -> Result<bool, 
         }
         .await;
         if let Err(error) = result {
-            let _ = storage
-                .processing_stage
-                .release(&work.receipt, !scheduling_deferred(&error));
+            let deferred = scheduling_deferred(&error);
+            let _ = storage.processing_stage.release(&work.receipt, !deferred);
             crate::background_activity::classification_deferred();
             crate::classification_runtime::record_pipeline_error(&error);
-            tracing::debug!("[CLASSIFICATION] staged processing deferred: {}", error);
+            if deferred {
+                tracing::debug!("[CLASSIFICATION] staged processing deferred: {}", error);
+            } else {
+                tracing::warn!("[CLASSIFICATION] staged processing failed: {}", error);
+            }
         }
     });
     Ok(true)
@@ -344,13 +354,15 @@ pub(crate) fn start_feedback(app: &AppHandle) {
             if let Err(error) =
                 learn_feedback(&app, storage.clone(), &state, generation, &feedback).await
             {
-                let _ = storage.defer_classification_feedback(
-                    generation,
-                    &feedback,
-                    &error,
-                    scheduling_deferred(&error),
-                );
+                let deferred = scheduling_deferred(&error);
+                let _ =
+                    storage.defer_classification_feedback(generation, &feedback, &error, deferred);
                 crate::classification_runtime::record_pipeline_error(&error);
+                if deferred {
+                    tracing::debug!("[CLASSIFICATION] feedback learning deferred: {}", error);
+                } else {
+                    tracing::warn!("[CLASSIFICATION] feedback learning failed: {}", error);
+                }
                 break;
             }
         }
