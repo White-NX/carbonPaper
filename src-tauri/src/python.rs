@@ -968,7 +968,7 @@ fn normalize_chroma_runtime(python: &str) -> io::Result<()> {
         let output = command.output()?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
-                "Failed to repair clustering dependencies: {}",
+                "Failed to repair legacy vector migration dependencies: {}",
                 String::from_utf8_lossy(&output.stderr),
             )));
         }

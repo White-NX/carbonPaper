@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../../lib/auth_api';
-import { getClipBackfillOffer, setClipBackfillDecision } from '../../lib/task_api';
+import { getClipBackfillOffer, setClipBackfillDecision } from '../../lib/semantic_api';
 import { useAdvancedPreferences } from './advanced/useAdvancedPreferences';
 import { useSettingsActivity } from './SettingsActivityContext';
 import { notifySettingsChanged } from '../../lib/settings_api';

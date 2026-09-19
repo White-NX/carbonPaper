@@ -3648,30 +3648,6 @@ mod tests {
     }
 
     #[test]
-    fn a_committed_vector_marks_rescan_even_before_the_scheduler_wakes() {
-        let (_temp, storage) = test_storage();
-        let pass = storage
-            .begin_task_vector_sync(0, "recent", "test", 0.0, 2_000_000_000.0)
-            .unwrap();
-        storage
-            .acknowledge_task_vector_sync(0, &pass, pass.upper_id, 0, true)
-            .unwrap();
-        assert!(!storage.task_vector_sync_pending().unwrap());
-        commit_vector(
-            &storage,
-            job(DerivedIndexKind::SemanticText, "902"),
-            vec![1.0, 0.0],
-        )
-        .unwrap();
-        assert!(storage.task_vector_sync_pending().unwrap());
-        let resumed = storage
-            .begin_task_vector_sync(0, "recent", "test", 0.0, 2_000_000_000.0)
-            .unwrap();
-        assert_eq!(resumed.cursor, 0);
-        assert_eq!(resumed.upper_id, 902);
-    }
-
-    #[test]
     fn ann_generation_zero_is_a_real_fence_and_stale_builds_cannot_write() {
         let (_temp, storage) = test_storage();
         let mut state = ann_checkpoint(&storage, 78);

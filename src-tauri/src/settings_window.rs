@@ -331,7 +331,6 @@ pub fn settings_debug_preview(
                 | "update"
                 | "critical-update"
                 | "extension"
-                | "clustering"
                 | "smart-cluster"
                 | "app-bound"
                 | "app-bound-repair"

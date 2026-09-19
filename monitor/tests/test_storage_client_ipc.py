@@ -147,7 +147,7 @@ def test_send_request_reconnects_once_when_write_sees_closing_pipe(monkeypatch):
     monkeypatch.setattr(sc.win32file, "ReadFile", fake_read_file)
     monkeypatch.setattr(sc.win32file, "CloseHandle", lambda _h: state.__setitem__("close_calls", state["close_calls"] + 1))
 
-    result = sc.StorageClient("test-pipe")._send_request({"command": "get_idle_state"})
+    result = sc.StorageClient("test-pipe")._send_request({"command": "get_auth_status"})
 
     assert result == response_obj
     assert state["create_calls"] == 2
@@ -188,7 +188,7 @@ def test_send_request_reconnects_once_after_empty_response(monkeypatch):
     monkeypatch.setattr(sc.win32file, "ReadFile", fake_read_file)
     monkeypatch.setattr(sc.win32file, "CloseHandle", lambda _h: state.__setitem__("close_calls", state["close_calls"] + 1))
 
-    result = sc.StorageClient("test-pipe")._send_request({"command": "get_idle_state"})
+    result = sc.StorageClient("test-pipe")._send_request({"command": "get_auth_status"})
 
     assert result == response_obj
     assert state["create_calls"] == 2
@@ -249,44 +249,3 @@ def test_is_session_valid_reads_response_flag(monkeypatch):
         lambda _req: {"status": "success", "data": {"session_valid": False}},
     )
     assert client.is_session_valid() is False
-
-
-def test_get_idle_state_treats_success_null_data_as_not_idle(monkeypatch):
-    client = sc.StorageClient("test-pipe")
-    monkeypatch.setattr(
-        client,
-        "_send_request",
-        lambda _req: {"status": "success", "data": None},
-    )
-
-    assert client.get_idle_state() == {
-        "is_idle": False,
-        "idle_secs": 0,
-        "fullscreen_exclusive": True,
-    }
-
-
-def test_list_screenshots_for_clustering_uses_expected_payload(monkeypatch):
-    client = sc.StorageClient("test-pipe")
-    captured = {}
-
-    def fake_send(req):
-        captured.update(req)
-        return {"status": "success", "data": {"screenshots": [], "total": 0}}
-
-    monkeypatch.setattr(client, "_send_request", fake_send)
-    result = client.list_screenshots_for_clustering(
-        start_ts=10.5,
-        end_ts=20.5,
-        offset=3,
-        limit=9,
-    )
-
-    assert captured == {
-        "command": "list_screenshots_for_clustering",
-        "start_ts": 10.5,
-        "end_ts": 20.5,
-        "offset": 3,
-        "limit": 9,
-    }
-    assert result["status"] == "success"

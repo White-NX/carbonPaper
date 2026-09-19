@@ -1247,82 +1247,19 @@ impl StorageState {
             "#,
         )?;
 
-        // Acknowledged progress for rebuilding the Python clustering consumer.
-        // Contains identifiers only; plaintext inputs never enter this ledger.
+        // Retire derived clustering work while preserving existing task labels
+        // and assignments. New databases no longer create those legacy tables.
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS task_vector_sync (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                scope TEXT NOT NULL, target TEXT NOT NULL,
-                start_time REAL NOT NULL, end_time REAL NOT NULL,
-                upper_id INTEGER NOT NULL, cursor INTEGER NOT NULL DEFAULT 0,
-                synced_count INTEGER NOT NULL DEFAULT 0,
-                complete INTEGER NOT NULL DEFAULT 0
-            );",
+            "DROP TRIGGER IF EXISTS task_vector_sync_embedding_insert;
+             DROP TRIGGER IF EXISTS task_vector_sync_embedding_update;
+             DROP TRIGGER IF EXISTS task_vector_sync_embedding_delete;
+             DROP TABLE IF EXISTS task_vector_sync;
+             DELETE FROM background_scheduler_tasks
+                WHERE task_kind IN ('python_clustering', 'task_vector_sync');",
         )
-        .map_err(|e| format!("Failed to create task vector synchronization state: {e}"))?;
-
-        Self::add_column_if_missing(
-            conn,
-            "task_vector_sync",
-            "needs_rescan",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        // Producer commits and the rescan marker share the transaction. A
-        // process exit before the in-memory scheduler wake cannot lose debt.
-        conn.execute_batch(
-            "CREATE TRIGGER IF NOT EXISTS task_vector_sync_embedding_insert
-                AFTER INSERT ON derived_embeddings WHEN NEW.index_kind='semantic_text'
-                BEGIN UPDATE task_vector_sync SET needs_rescan=1 WHERE id=1 AND needs_rescan=0; END;
-             CREATE TRIGGER IF NOT EXISTS task_vector_sync_embedding_update
-                AFTER UPDATE ON derived_embeddings WHEN NEW.index_kind='semantic_text'
-                BEGIN UPDATE task_vector_sync SET needs_rescan=1 WHERE id=1 AND needs_rescan=0; END;
-             CREATE TRIGGER IF NOT EXISTS task_vector_sync_embedding_delete
-                AFTER DELETE ON derived_embeddings WHEN OLD.index_kind='semantic_text'
-                BEGIN UPDATE task_vector_sync SET needs_rescan=1 WHERE id=1 AND needs_rescan=0; END;",
-        ).map_err(|e| format!("Failed to create vector synchronization markers: {e}"))?;
+        .map_err(|e| format!("Failed to retire legacy clustering work: {e}"))?;
         self.init_classification_schema(conn)?;
         Self::add_column_if_missing(conn, "screenshot_ocr_status", "postprocess_lease", "TEXT")?;
-
-        // Task clustering tables
-        Self::create_table_if_missing(
-            conn,
-            "tasks",
-            r#"
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                label TEXT,
-                auto_label TEXT,
-                dominant_process TEXT,
-                dominant_category TEXT,
-                start_time REAL,
-                end_time REAL,
-                snapshot_count INTEGER DEFAULT 0,
-                layer TEXT DEFAULT 'hot',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-        )?;
-        Self::create_table_if_missing(
-            conn,
-            "task_assignments",
-            r#"
-            CREATE TABLE IF NOT EXISTS task_assignments (
-                screenshot_id INTEGER NOT NULL,
-                task_id INTEGER NOT NULL,
-                confidence REAL,
-                PRIMARY KEY (screenshot_id, task_id),
-                FOREIGN KEY (screenshot_id) REFERENCES screenshots(id) ON DELETE CASCADE,
-                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
-            )
-            "#,
-        )?;
-
-        // Index for reverse lookup: task_id → screenshot_ids
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_task_assignments_task_id ON task_assignments(task_id)",
-        )
-        .map_err(|e| format!("Failed to create task_assignments index: {}", e))?;
 
         // Smart cluster tables (NL-anchored user-defined clusters)
         Self::create_table_if_missing(
@@ -1815,6 +1752,71 @@ mod tests {
         let credential = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         let storage = StorageState::new(temp.path().to_path_buf(), credential);
         (temp, storage)
+    }
+
+    #[test]
+    fn retiring_clustering_preserves_legacy_records_and_active_queues() {
+        let (_temp, storage) = test_storage();
+        let conn = Connection::open_in_memory().unwrap();
+        storage.init_tables(&conn).unwrap();
+        for table in ["tasks", "task_assignments", "task_vector_sync"] {
+            assert!(!StorageState::table_exists(&conn, table).unwrap());
+        }
+
+        conn.execute_batch(
+            "CREATE TABLE tasks (id INTEGER PRIMARY KEY, label TEXT);
+             CREATE TABLE task_assignments (screenshot_id INTEGER, task_id INTEGER);
+             INSERT INTO tasks VALUES (7, 'Saved project name');
+             INSERT INTO task_assignments VALUES (42, 7);
+             CREATE TABLE task_vector_sync (id INTEGER PRIMARY KEY, needs_rescan INTEGER);
+             INSERT INTO task_vector_sync VALUES (1, 0);
+             CREATE TRIGGER task_vector_sync_embedding_insert AFTER INSERT ON derived_embeddings
+                BEGIN UPDATE task_vector_sync SET needs_rescan=1; END;
+             CREATE TRIGGER task_vector_sync_embedding_update AFTER UPDATE ON derived_embeddings
+                BEGIN UPDATE task_vector_sync SET needs_rescan=1; END;
+             CREATE TRIGGER task_vector_sync_embedding_delete AFTER DELETE ON derived_embeddings
+                BEGIN UPDATE task_vector_sync SET needs_rescan=1; END;
+             INSERT INTO background_scheduler_tasks (task_kind, ready_since_ms, status) VALUES
+                ('python_clustering', 10, 'running'),
+                ('task_vector_sync', 10, 'queued'),
+                ('smart_cluster', 20, 'queued');",
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            storage.init_tables(&conn).unwrap();
+            assert!(!StorageState::table_exists(&conn, "task_vector_sync").unwrap());
+            for trigger in [
+                "task_vector_sync_embedding_insert",
+                "task_vector_sync_embedding_update",
+                "task_vector_sync_embedding_delete",
+            ] {
+                assert!(!object_exists(&conn, "trigger", trigger));
+            }
+            assert_eq!(
+                conn.query_row("SELECT label FROM tasks WHERE id=7", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "Saved project name"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT screenshot_id FROM task_assignments WHERE task_id=7",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                42
+            );
+            let queued: Vec<String> = conn
+                .prepare("SELECT task_kind FROM background_scheduler_tasks")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(queued, vec!["smart_cluster"]);
+        }
     }
 
     fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {

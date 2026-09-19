@@ -2,17 +2,13 @@
 //! messaging.
 //!
 //! The authenticated reverse pipe exposes the narrow storage and inference
-//! operations needed by classification and task clustering. Browser-extension
+//! operations needed by the remaining Python services. Browser-extension
 //! screenshot ingestion uses the separate NMH pipe in this module.
 //!
 use crate::capture::CaptureState;
 use crate::monitor::MonitorState;
 use crate::reverse_ipc_protocol::{read_ipc_frame, write_ipc_frame, StorageResponse};
-#[cfg(test)]
-use crate::storage::ScreenshotRecord;
-use crate::storage::{
-    BackgroundReadError, BackgroundScreenshotSummary, SaveScreenshotRequest, StorageState,
-};
+use crate::storage::{SaveScreenshotRequest, StorageState};
 use rand::RngCore;
 use serde::Serialize;
 use std::os::windows::io::AsRawHandle;
@@ -22,44 +18,6 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer};
 use tokio::sync::{mpsc, Semaphore};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
-
-#[cfg(test)]
-fn screenshot_record_with_ocr_json(
-    rec: ScreenshotRecord,
-    ocr_map: &std::collections::HashMap<i64, String>,
-) -> serde_json::Value {
-    let ocr_text = ocr_map.get(&rec.id).cloned().unwrap_or_default();
-    serde_json::json!({
-        "id": rec.id,
-        "process_name": rec.process_name.unwrap_or_default(),
-        "window_title": rec.window_title.unwrap_or_default(),
-        "ocr_text": ocr_text,
-        "timestamp": rec.timestamp.unwrap_or(0) as f64,
-        "category": rec.category.unwrap_or_default(),
-    })
-}
-
-fn background_screenshot_with_ocr_json(
-    rec: BackgroundScreenshotSummary,
-    ocr_map: &std::collections::HashMap<i64, String>,
-) -> serde_json::Value {
-    let ocr_text = ocr_map.get(&rec.id).cloned().unwrap_or_default();
-    serde_json::json!({
-        "id": rec.id,
-        "process_name": rec.process_name.unwrap_or_default(),
-        "window_title": rec.window_title.unwrap_or_default(),
-        "ocr_text": ocr_text,
-        "timestamp": rec.timestamp.unwrap_or(0) as f64,
-        "category": rec.category.unwrap_or_default(),
-    })
-}
-
-fn background_read_error_response(error: BackgroundReadError) -> StorageResponse {
-    match error {
-        BackgroundReadError::AuthRequired => StorageResponse::error("AUTH_REQUIRED"),
-        BackgroundReadError::Other(message) => StorageResponse::error(&message),
-    }
-}
 
 use windows::Win32::Security::GetTokenInformation;
 use windows::Win32::Security::{
@@ -474,7 +432,7 @@ async fn handle_client(
             .unwrap_or(false);
         requests_handled = requests_handled.saturating_add(1);
 
-        let response = process_request(&req, &storage, &app_handle).await;
+        let response = process_request(&req, &storage).await;
 
         // 发送响应
         let response_bytes = serde_json::to_vec(&response).unwrap_or_default();
@@ -493,11 +451,7 @@ async fn handle_client(
 }
 
 /// 处理存储请求
-async fn process_request(
-    req: &serde_json::Value,
-    storage: &StorageState,
-    app_handle: &tauri::AppHandle,
-) -> StorageResponse {
+async fn process_request(req: &serde_json::Value, storage: &StorageState) -> StorageResponse {
     let command = req.get("command").and_then(|c| c.as_str()).unwrap_or("");
     let diag_start = std::time::Instant::now();
 
@@ -540,17 +494,6 @@ async fn process_request(
             }
         }
 
-        "decrypt_from_chromadb_silent" => {
-            let encrypted = req.get("encrypted").and_then(|p| p.as_str()).unwrap_or("");
-
-            match storage.decrypt_from_chromadb_silent(encrypted) {
-                Ok(decrypted) => StorageResponse::success(serde_json::json!({
-                    "decrypted": decrypted
-                })),
-                Err(error) => background_read_error_response(error),
-            }
-        }
-
         "decrypt_many_from_chromadb" => {
             let list_value = req.get("encrypted_list");
             let mut decrypted_list: Vec<String> = Vec::new();
@@ -575,109 +518,10 @@ async fn process_request(
             }))
         }
 
-        "decrypt_many_from_chromadb_silent" => {
-            let Some(values) = req.get("encrypted_list").and_then(|v| v.as_array()) else {
-                return StorageResponse::error("encrypted_list must be an array");
-            };
-            let encrypted_list: Vec<String> = values
-                .iter()
-                .map(|value| value.as_str().unwrap_or("").to_string())
-                .collect();
-            match storage.decrypt_many_from_chromadb_silent(&encrypted_list) {
-                Ok(decrypted_list) => StorageResponse::success(serde_json::json!({
-                    "decrypted_list": decrypted_list,
-                    "error_count": 0
-                })),
-                Err(error) => background_read_error_response(error),
-            }
-        }
-
         "get_auth_status" => StorageResponse::success(serde_json::json!({
             "session_valid": storage.is_session_valid(),
             "background_authorized": storage.is_background_authorized()
         })),
-
-        "list_screenshots_for_clustering" => {
-            if !storage.is_silent_read_authorized() {
-                return StorageResponse::error("AUTH_REQUIRED");
-            }
-
-            let start_ts = req.get("start_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let end_ts = req.get("end_ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let offset = req.get("offset").and_then(|v| v.as_i64()).unwrap_or(0);
-            let limit = req
-                .get("limit")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(500)
-                .min(1000);
-
-            // If no time range given, use full range
-            let (s, e) = if end_ts <= start_ts {
-                (0.0_f64, 4102444800.0_f64) // epoch 0 to 2100-01-01
-            } else {
-                (start_ts, end_ts)
-            };
-
-            // Fast COUNT query (no decryption)
-            let total = match storage.count_screenshots_by_time_range(s, e) {
-                Ok(n) => n,
-                Err(err) => return StorageResponse::error(&err),
-            };
-
-            // Paged unattended query: decrypt only clustering metadata and
-            // force CNG silent mode so a state race can never display UI.
-            match storage.get_screenshot_summaries_by_time_range_paged_silent(s, e, offset, limit) {
-                Ok(records) => {
-                    let ids: Vec<i64> = records.iter().map(|rec| rec.id).collect();
-                    let ocr_batch_started = std::time::Instant::now();
-                    let ocr_map = match storage.get_ocr_results_by_screenshot_ids_silent(&ids) {
-                        Ok(map) => map,
-                        Err(error) => return background_read_error_response(error),
-                    };
-                    tracing::debug!(
-                        "[DIAG:CLUSTERING] batch OCR fetch ids={} elapsed={}ms",
-                        ids.len(),
-                        ocr_batch_started.elapsed().as_millis()
-                    );
-                    let page: Vec<serde_json::Value> = records
-                        .into_iter()
-                        .map(|rec| background_screenshot_with_ocr_json(rec, &ocr_map))
-                        .collect();
-                    StorageResponse::success(serde_json::json!({
-                        "screenshots": page,
-                        "total": total,
-                    }))
-                }
-                Err(error) => background_read_error_response(error),
-            }
-        }
-
-        // M2.5 step 5 retired three MiniLM mirror commands that lived here:
-        // `upsert_minilm_derived_embeddings`, `report_minilm_import_debt`, and
-        // `delete_minilm_derived_embeddings`. All three existed because Python
-        // owned MiniLM inference and Rust held a copy that could fall behind.
-        // Rust is now the only encoder, mirrors *to* Chroma through
-        // `upsert_task_vectors`, and expires its own rows against SQLite
-        // timestamps, so there is nothing left for Python to write or report
-        // here. Removing them rather than leaving them inert matters: a handler
-        // that still accepts vectors is a second writer for a store that is
-        // supposed to have exactly one.
-        "get_idle_state" => {
-            use std::sync::atomic::Ordering;
-            use tauri::Manager;
-            match app_handle.try_state::<std::sync::Arc<crate::idle::IdleState>>() {
-                Some(s) => StorageResponse::success(serde_json::json!({
-                    "is_idle": s.is_idle.load(Ordering::SeqCst),
-                    "idle_secs": s.idle_secs.load(Ordering::SeqCst),
-                    "fullscreen_exclusive": s.fullscreen_exclusive.load(Ordering::SeqCst),
-                    // Additive. The retained Python task-clustering scheduler
-                    // gates on `is_idle` alone, which already accounts for
-                    // battery; this lets diagnostics identify the gate signal.
-                    "ac_connected": s.ac_connected.load(Ordering::SeqCst),
-                })),
-                None => StorageResponse::error("IdleState not initialised"),
-            }
-        }
 
         _ => StorageResponse::error(&format!("Unknown command: {}", command)),
     };
@@ -1608,7 +1452,6 @@ async fn process_extension_ocr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_storage_response_success() {
@@ -1645,14 +1488,6 @@ mod tests {
         assert!(json.contains("\"error\":\"bad request\""));
         // data field should be skipped
         assert!(!json.contains("\"data\""));
-    }
-
-    #[test]
-    fn background_auth_error_uses_stable_auth_required_code() {
-        let response = background_read_error_response(BackgroundReadError::AuthRequired);
-        assert_eq!(response.status, "error");
-        assert_eq!(response.error.as_deref(), Some("AUTH_REQUIRED"));
-        assert!(response.data.is_none());
     }
 
     fn make_session(browser_pid: u32, nmh_pid: u32, last_seen_ms: i64) -> NmhSession {
@@ -1880,67 +1715,5 @@ mod tests {
         assert!(first.get("process_name").is_some());
         assert!(first.get("window_title").is_some());
         assert!(first.get("ocr_text").is_some());
-    }
-
-    #[test]
-    fn test_screenshot_record_with_ocr_json_uses_batch_map() {
-        let mut ocr_map = HashMap::new();
-        ocr_map.insert(42, "alpha beta".to_string());
-
-        let rec = ScreenshotRecord {
-            id: 42,
-            image_path: "screenshots/42.jpg.enc".to_string(),
-            image_hash: "h42".to_string(),
-            width: Some(100),
-            height: Some(80),
-            window_title: Some("Editor".to_string()),
-            process_name: Some("code.exe".to_string()),
-            created_at: "2026-06-16 12:00:00".to_string(),
-            metadata: None,
-            timestamp: Some(1_797_331_200_000),
-            source: None,
-            page_url: None,
-            page_icon: None,
-            visible_links: None,
-            category: Some("Development".to_string()),
-            category_confidence: Some(0.9),
-        };
-
-        let value = screenshot_record_with_ocr_json(rec, &ocr_map);
-
-        assert_eq!(value["id"], 42);
-        assert_eq!(value["ocr_text"], "alpha beta");
-        assert_eq!(value["process_name"], "code.exe");
-        assert_eq!(value["window_title"], "Editor");
-        assert_eq!(value["category"], "Development");
-    }
-
-    #[test]
-    fn test_screenshot_record_with_ocr_json_missing_ocr_is_empty() {
-        let rec = ScreenshotRecord {
-            id: 7,
-            image_path: "screenshots/7.jpg.enc".to_string(),
-            image_hash: "h7".to_string(),
-            width: None,
-            height: None,
-            window_title: None,
-            process_name: None,
-            created_at: "2026-06-16 12:00:00".to_string(),
-            metadata: None,
-            timestamp: None,
-            source: None,
-            page_url: None,
-            page_icon: None,
-            visible_links: None,
-            category: None,
-            category_confidence: None,
-        };
-
-        let value = screenshot_record_with_ocr_json(rec, &HashMap::new());
-
-        assert_eq!(value["ocr_text"], "");
-        assert_eq!(value["process_name"], "");
-        assert_eq!(value["window_title"], "");
-        assert_eq!(value["timestamp"], 0.0);
     }
 }

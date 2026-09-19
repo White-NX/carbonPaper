@@ -55,11 +55,10 @@ export function useAdvancedPreferences({ monitorStatus, t, active = true, device
       setConfig((current) => ({ ...current, ...patch }));
       if ('cpu_limit_enabled' in patch || 'cpu_limit_percent' in patch) setCpuChanged(true);
       if ('use_dml' in patch || 'dml_device_id' in patch) setDmlChanged(true);
-      if (monitorStatus === 'running' && ('ocr_timeout_secs' in patch || 'clustering_allow_full_low_memory' in patch)) {
+      if (monitorStatus === 'running' && 'ocr_timeout_secs' in patch) {
         try {
           await withAuth(() => invoke('monitor_update_advanced_config', {
             ocrTimeoutSecs: patch.ocr_timeout_secs ?? config.ocr_timeout_secs ?? 120,
-            clusteringAllowFullLowMemory: patch.clustering_allow_full_low_memory ?? Boolean(config.clustering_allow_full_low_memory),
           }), { autoPrompt: true });
         } catch (error) { setConfigError(t('settings.feedback.savedPendingRestart')); setCpuChanged(true); }
       }

@@ -8,7 +8,7 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-vi.mock('../lib/task_api', () => ({
+vi.mock('../lib/semantic_api', () => ({
   getBlindIndexRepairStatus: vi.fn(),
   getMaintenanceStatus: vi.fn(),
   getMinilmRebuildStatus: vi.fn(),
@@ -25,7 +25,7 @@ import {
   getClipRebuildStatus,
   getMaintenanceStatus,
   getMinilmRebuildStatus,
-} from '../lib/task_api';
+} from '../lib/semantic_api';
 import { requestAuth } from '../lib/auth_api';
 
 const runningStatus = (overrides = {}) => ({

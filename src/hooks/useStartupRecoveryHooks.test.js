@@ -37,7 +37,7 @@ vi.mock('../lib/monitor_api', () => ({
   searchScreenshots: vi.fn(async () => []),
 }));
 
-vi.mock('../lib/task_api', () => ({
+vi.mock('../lib/semantic_api', () => ({
   smartClusterStopDrain: vi.fn(async () => ({})),
 }));
 

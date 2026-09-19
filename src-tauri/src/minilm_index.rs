@@ -1,64 +1,10 @@
-//! M2.5 step 5 — Rust-owned MiniLM capture indexing, retention, and the Chroma
-//! mirror.
+//! Rust-owned MiniLM capture indexing and 30-day retention.
 //!
-//! Before this step the only writers of `semantic_text` rows were the M2.4
-//! migration and Python's reverse-IPC dual-write, and the only reaper was
-//! Python's hot-layer expiry mirroring its deletions back. `semantic_index =
-//! rust` therefore meant "Rust reads an index Python writes". This module makes
-//! Rust the writer:
-//!
-//! - the capture path enqueues a ledger job as soon as the OCR row commits, or
-//!   records a terminal "nothing to encode" row when the screenshot has no text
-//!   at all — the ledger is what remembers that decision, because the candidate
-//!   scan that repairs missed enqueues cannot read it out of ciphertext;
-//! - an idle-gated worker encodes the queue in small chunks and commits vector
-//!   plus ledger in the one transaction M2.3 already provides;
-//! - the same worker ages rows out on its own 30-day rule, which is the part
-//!   nothing else was doing: screenshot *deletion* has always been handled
-//!   transactionally by the schema triggers
-//!   (`cleanup_derived_index_on_screenshot_soft_delete`), but expiry on age was
-//!   only ever mirrored over from Python, and that mirror is gone;
-//! - each newly encoded vector is mirrored *to* Python, the M2.4 dual-write
-//!   reversed, so the Chroma `task_vectors` hot layer Milestone 4 clustering
-//!   still reads keeps being fed without Python running MiniLM itself.
-//!
-//! Two consequences are deliberate and are written down rather than smoothed
-//! over.
-//!
-//! **Indexing is strictly idle-gated, so search freshness regresses.** MiniLM is
-//! a 118 MB model; the roadmap's idle rule covers exactly this kind of
-//! background capture indexing. Python encoded inline on the post-process path,
-//! so a screenshot was searchable within seconds. Here it is searchable after
-//! the next idle window. That is a real regression in freshness and the
-//! backlog is reported as a number rather than hidden.
-//!
-//! **A backlog is no longer a reason to refuse to serve.** The step-4 read path
-//! stood down whenever the Rust store was known to be behind. Now that Rust is
-//! the encoder, the remaining Chroma mirror receives its rows from this index,
-//! so both stores are behind by exactly the same screenshots. Refusing the Rust
-//! query would recover nothing. See `semantic_query.rs`.
-//!
-//! **The immediate Chroma mirror is an optimization.** A failed delivery queues
-//! the clustering consumer for repair. `task_vector_sync` reconciles the whole
-//! requested range before clustering, reuses current Rust vectors, and persists
-//! acknowledged progress. Python never encodes missing vectors itself.
-//!
-//! **This pass is one of two background users of a single-slot worker.** Smart
-//! Cluster scoring (`smart_cluster_scoring.rs`) polls on the same 60-second
-//! cadence, gates on the same idle signal, and wants a different model from an
-//! engine that keeps one resident. Both therefore claim
-//! `semantic_runtime::BACKGROUND_PASS_GUARD` before touching the worker, and
-//! both stop feeding it when a foreground query announces itself.
-//!
-//! **An idle pass stands down; a manual run stands aside.** Both stop
-//! submitting the moment a foreground query takes a lease, because interleaving
-//! against a single-model engine buys an eviction per chunk rather than shared
-//! progress ([`crate::semantic_runtime::BACKGROUND_PASS_GUARD`] states that
-//! cost). What differs is what happens next. An idle pass ends: nobody asked
-//! for it and its next tick is a minute away. A manual run waits and resumes,
-//! because somebody pressed a button, and a run that an unrelated search
-//! silently cancelled would make that button unreliable. See
-//! [`stand_aside_for_foreground`].
+//! Capture records durable indexing jobs; admitted background slices encode
+//! them through the shared semantic worker. Vectors and ledger state commit
+//! together in Rust, where semantic search and Smart Clusters consume them.
+//! Manual indexing can drain the same queue while yielding to foreground
+//! searches. Legacy Chroma data is read only by the migration service.
 
 use crate::background_scheduler::{
     deferred_release_note, AutomaticSliceContext, AutomaticSliceStopReason, ScheduledSliceResult,
@@ -68,11 +14,9 @@ use crate::minilm_migration::{
     build_minilm_task_text, minilm_job_spec, validate_minilm_vector, MINILM_OCR_SNIPPET_CHARS,
 };
 use crate::ml_protocol::MlSemanticModel;
-use crate::monitor::{authenticated_monitor_command, MonitorState};
 use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{
-    BackgroundReadError, BackgroundScreenshotSummary, DerivedEmbeddingWrite, DerivedIndexJobSpec,
-    DerivedIndexKind, StorageState,
+    BackgroundReadError, DerivedEmbeddingWrite, DerivedIndexJobSpec, DerivedIndexKind, StorageState,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
@@ -120,11 +64,6 @@ const EMBED_TIMEOUT: Duration = Duration::from_secs(120);
 /// Ledger repairs and expiry deletions per pass. Bounded so one pass cannot
 /// hold the process-wide database mutex through a whole backlog.
 const MAINTENANCE_BATCH: u32 = 256;
-
-/// Records per `upsert_task_vectors` request. Python rejects a batch above 128
-/// outright; staying well under it keeps one mirror message small, since each
-/// record carries 384 floats plus the document text as JSON.
-const MIRROR_BATCH: usize = 32;
 
 /// Wall-clock ceiling for one manual run, including a cold model load.
 ///
@@ -203,16 +142,11 @@ const EMPTY_SOURCE_CODE: &str = "empty_source";
 const EMPTY_SOURCE_REASON: &str =
     "process name, window title, and OCR text are all empty, so there is nothing to encode";
 
-/// One screenshot's MiniLM model input, the ledger identity derived from it,
-/// and the metadata the Chroma mirror has to carry.
+/// One screenshot's MiniLM model input and the ledger identity derived from it.
 #[derive(Clone)]
 pub(crate) struct MinilmSource {
     pub text: String,
     pub spec: DerivedIndexJobSpec,
-    /// Kept from the same read that produced `text`. The mirror needs
-    /// process/title/timestamp/category, and re-reading them later would pay a
-    /// second round of CNG decryption for values already in hand.
-    pub summary: BackgroundScreenshotSummary,
 }
 
 /// The corpus decision for one page of screenshots.
@@ -262,14 +196,7 @@ pub(crate) fn minilm_sources(
             excluded.insert(summary.id, spec);
             continue;
         }
-        indexable.insert(
-            summary.id,
-            MinilmSource {
-                text,
-                spec,
-                summary,
-            },
-        );
+        indexable.insert(summary.id, MinilmSource { text, spec });
     }
     Ok(MinilmSources {
         indexable,
@@ -306,39 +233,6 @@ pub(crate) fn enqueue_captured_input(
         storage.ensure_derived_index_job(&spec)?;
     }
     Ok(())
-}
-
-pub(crate) async fn mirror_staged_result(
-    app: &AppHandle,
-    id: i64,
-    input: &crate::processing_stage::ProcessingInput,
-    text: String,
-    vector: Vec<f32>,
-) {
-    let indexed = staged_subject(id, input, text, vector);
-    // The staged embedding transaction already published Smart Cluster debt.
-    mirror_to_chroma(app, &[indexed]).await;
-}
-
-fn staged_subject(
-    id: i64,
-    input: &crate::processing_stage::ProcessingInput,
-    text: String,
-    vector: Vec<f32>,
-) -> IndexedSubject {
-    IndexedSubject {
-        id,
-        source_revision: input.source_revision,
-        text,
-        vector,
-        summary: BackgroundScreenshotSummary {
-            id,
-            window_title: Some(input.window_title.clone()),
-            process_name: Some(input.process_name.clone()),
-            timestamp: Some(input.timestamp_ms.div_euclid(1000)),
-            category: None,
-        },
-    }
 }
 
 /// Execute one automatic MiniLM maintenance/encode slice, or a complete manual
@@ -489,16 +383,6 @@ async fn run_scheduled_request(
                 crate::background_scheduler::BackgroundTaskKind::SmartCluster,
                 false,
             );
-            // Python HDBSCAN consumes the mirrored hot layer only after the
-            // semantic queue reaches a boundary. Queue it when this slice
-            // drained the backlog so it does not rerun once per MiniLM batch.
-            if backlog == 0 {
-                let _ = scheduler.enqueue(
-                    app,
-                    crate::background_scheduler::BackgroundTaskKind::PythonClustering,
-                    false,
-                );
-            }
         }
     }
     Ok(ScheduledSliceResult::complete(backlog > 0).with_processed(outcome.indexed))
@@ -920,15 +804,14 @@ async fn reconcile_missing(storage: Arc<StorageState>) -> Result<(), String> {
     Ok(())
 }
 
-/// One claimed job: its ledger identity, its model input, the metadata the
-/// mirror will need, and the lease that authorizes the commit.
+/// One claimed job: its model input, ledger identity, and commit authorization.
 #[derive(Clone)]
 struct ClaimedJob {
     generation: u64,
     source_revision: Option<i64>,
     spec: DerivedIndexJobSpec,
     text: String,
-    summary: BackgroundScreenshotSummary,
+    id: i64,
     lease_token: String,
 }
 
@@ -939,17 +822,7 @@ struct EncodeChunkFailure {
 }
 
 struct EncodeChunkSuccess {
-    indexed: Vec<IndexedSubject>,
-}
-
-/// One screenshot that became query-visible in this pass, in the shape the
-/// Chroma mirror sends.
-struct IndexedSubject {
-    id: i64,
-    source_revision: i64,
-    vector: Vec<f32>,
-    text: String,
-    summary: BackgroundScreenshotSummary,
+    indexed: u64,
 }
 
 async fn drain_queue(
@@ -974,7 +847,6 @@ async fn drain_queue(
     }
     let run = app.state::<Arc<SemanticIndexRunState>>().inner().clone();
     let mut pending: VecDeque<ClaimedJob> = claimed.into();
-    let mut indexed: Vec<IndexedSubject> = Vec::new();
     let mut outcome = PassOutcome::default();
     let mut failure: Option<String> = None;
     while !pending.is_empty() {
@@ -1065,15 +937,13 @@ async fn drain_queue(
         };
         match encoded_result {
             Ok(success) => {
-                let mut encoded = success.indexed;
-                outcome.indexed += encoded.len() as u64;
+                outcome.indexed += success.indexed;
                 // The whole chunk left the queue; not all of it necessarily
                 // became a vector, since an invalid one is discarded rather
                 // than retried. Both are progress, only one is an index.
                 if mode.is_manual() {
-                    run.report_chunk(app, chunk_len, encoded.len() as u64);
+                    run.report_chunk(app, chunk_len, success.indexed);
                 }
-                indexed.append(&mut encoded);
                 if mode.yields_after_chunk() && !pending.is_empty() {
                     // One automatic request unit is one worker request and
                     // commit. Return the rest of this broader database claim
@@ -1113,9 +983,8 @@ async fn drain_queue(
         }
     }
 
-    if !indexed.is_empty() {
-        tracing::info!("[SEMANTIC:INDEX] indexed {} screenshot(s)", indexed.len());
-        mirror_to_chroma(app, &indexed).await;
+    if outcome.indexed > 0 {
+        tracing::info!("[SEMANTIC:INDEX] indexed {} screenshot(s)", outcome.indexed);
     }
     match failure {
         // The failure propagates rather than being folded into the summary:
@@ -1310,7 +1179,7 @@ async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, Stri
                     source_revision: revisions.get(&id).copied().flatten(),
                     spec: job.spec,
                     text: source.text.clone(),
-                    summary: source.summary.clone(),
+                    id,
                     lease_token,
                 }),
                 // Lost the race to another claimant, or the row moved on.
@@ -1326,15 +1195,15 @@ async fn claim_batch(storage: Arc<StorageState>) -> Result<Vec<ClaimedJob>, Stri
     .map_err(|error| format!("claim task failed: {error}"))?
 }
 
-/// Commit the encoded batch, returning the subjects that became query-visible.
+/// Commit the encoded batch, returning the number of query-visible subjects.
 async fn commit_batch(
     storage: Arc<StorageState>,
     claimed: Vec<ClaimedJob>,
     vectors: Vec<Vec<f32>>,
-) -> Result<Vec<IndexedSubject>, String> {
+) -> Result<u64, String> {
     let execution = crate::background_policy::current_execution();
     tokio::task::spawn_blocking(move || {
-        let mut indexed = Vec::with_capacity(claimed.len());
+        let mut indexed = 0;
         for (job, vector) in claimed.into_iter().zip(vectors) {
             if let Err(error) = validate_minilm_vector(&vector) {
                 // A zero or non-finite vector would poison every cosine score
@@ -1355,32 +1224,23 @@ async fn commit_batch(
             let write = DerivedEmbeddingWrite {
                 job: job.spec.clone(),
                 lease_token: job.lease_token.clone(),
-                vector: vector.clone(),
+                vector,
             };
             match storage.commit_archive_embedding(
                 &write,
                 job.generation,
-                &[(job.summary.id, job.source_revision)],
+                &[(job.id, job.source_revision)],
                 execution.as_deref(),
             ) {
                 Ok(()) => {
-                    let id = job.summary.id;
-                    // Smart Cluster scoring used to be queued by Python's
-                    // `add_snapshot`, right after it wrote the vector. Same
-                    // position, new writer: the prefilter needs the vector
-                    // to exist before the entry is worth anything.
+                    let id = job.id;
+                    // Scoring needs the committed vector for candidate retrieval.
                     if let Err(error) = storage.enqueue_smart_cluster_pending(id) {
                         tracing::debug!(
                             "[SEMANTIC:INDEX] smart cluster enqueue failed for {id}: {error}"
                         );
                     }
-                    indexed.push(IndexedSubject {
-                        id,
-                        source_revision: job.source_revision.unwrap_or(0),
-                        vector,
-                        text: job.text,
-                        summary: job.summary,
-                    });
+                    indexed += 1;
                 }
                 Err(error) => {
                     // A completed inference is disposable until its short
@@ -1464,87 +1324,6 @@ async fn settle_failed_claims(storage: Arc<StorageState>, claimed: Vec<ClaimedJo
         )
         .await;
     }
-}
-
-/// Mirror newly indexed vectors into Python's Chroma hot layer.
-///
-/// The M2.4 dual-write with its direction reversed. Milestone 4 task clustering
-/// still reads `task_vectors`, and Python no longer runs MiniLM, so without this
-/// the clustering corpus would stop growing. It reuses `upsert_task_vectors` —
-/// the existing command for writing a Rust-produced vector into the hot layer
-/// rather than adding a second ingest contract for the same write.
-///
-/// The full row is sent, not just the vector. `add_snapshot` used to write the
-/// metadata and the document alongside it, and both are load-bearing: clustering
-/// selects hot vectors by `timestamp`, so a row that arrived without one would
-/// be silently outside every window, and the reranker scores the stored document
-/// text. Python encrypts the process name, window title, and document on its
-/// side exactly as it did when it built them itself.
-///
-/// Delivery failures schedule durable reconciliation before the next clustering
-/// run. Rust keeps the authoritative copy throughout recovery.
-async fn mirror_to_chroma(app: &AppHandle, indexed: &[IndexedSubject]) {
-    if indexed.is_empty() {
-        return;
-    }
-    if crate::background_policy::current_execution().is_some() {
-        // The vector is durable; its consumer has its own qualification/cursor.
-        crate::task_vector_sync::schedule_repair(app);
-        return;
-    }
-    let credential = app.state::<Arc<CredentialManagerState>>();
-    let monitor = app.state::<MonitorState>();
-    for chunk in indexed.chunks(MIRROR_BATCH) {
-        let records: Vec<serde_json::Value> = chunk.iter().map(mirror_record).collect();
-        let request = serde_json::json!({
-            "command": "upsert_task_vectors",
-            "records": records,
-        });
-        match authenticated_monitor_command(&credential, &monitor, request).await {
-            // Python reports a refused command in the response body rather than
-            // as a transport error, so an `error` field is the failure that
-            // actually shows up in practice: clustering disabled, the vault
-            // locked, or the monitor still starting.
-            Ok(response) => {
-                if let Some(error) = response.get("error").and_then(|value| value.as_str()) {
-                    crate::task_vector_sync::schedule_repair(app);
-                    tracing::debug!(
-                        "[SEMANTIC:INDEX] chroma mirror rejected {} vector(s): {error}",
-                        chunk.len()
-                    );
-                }
-            }
-            Err(error) => {
-                crate::task_vector_sync::schedule_repair(app);
-                tracing::debug!(
-                    "[SEMANTIC:INDEX] chroma mirror deferred for {} vector(s): {error}",
-                    chunk.len()
-                );
-                // A transport failure applies to the pipe, not to this batch,
-                // so the remaining chunks would fail the same way.
-                return;
-            }
-        }
-    }
-}
-
-/// One `upsert_task_vectors` record, field-for-field what `add_snapshot` used
-/// to write into the hot layer for the same screenshot.
-fn mirror_record(subject: &IndexedSubject) -> serde_json::Value {
-    serde_json::json!({
-        "id": subject.id.to_string(),
-        "source_revision": subject.source_revision,
-        "embedding": subject.vector,
-        // Seconds since the epoch, which is what `screenshots.created_at`
-        // yields here and what Chroma's `timestamp` metadata has always held.
-        "timestamp": subject.summary.timestamp.unwrap_or(0),
-        "process_name": subject.summary.process_name.clone().unwrap_or_default(),
-        "window_title": subject.summary.window_title.clone().unwrap_or_default(),
-        "category": subject.summary.category.clone().unwrap_or_default(),
-        // The encoder input doubles as the stored document, as it did when
-        // Python built both from one `build_task_text` call.
-        "document": subject.text,
-    })
 }
 
 /// Run an indexing pass right now, outside the idle gate.
@@ -1725,108 +1504,6 @@ mod tests {
         // morning over a transient fault.
         assert!(MAX_ATTEMPTS >= 3);
         assert!(RETRY_BACKOFF_MINUTES >= 15);
-    }
-
-    fn indexed(id: i64) -> IndexedSubject {
-        IndexedSubject {
-            id,
-            source_revision: 1,
-            vector: vec![0.5; crate::minilm_migration::MINILM_DIMENSIONS],
-            text: "proc.exe | Title | OCR".to_string(),
-            summary: BackgroundScreenshotSummary {
-                id,
-                window_title: Some("Title".to_string()),
-                process_name: Some("proc.exe".to_string()),
-                timestamp: Some(1_700_000_000),
-                category: Some("work".to_string()),
-            },
-        }
-    }
-
-    #[test]
-    fn a_staged_mirror_uses_epoch_seconds_for_the_clustering_window() {
-        let input = crate::processing_stage::ProcessingInput {
-            image_hash: "hash".into(),
-            window_title: "Title".into(),
-            process_name: "proc.exe".into(),
-            timestamp_ms: 1_700_000_000_123,
-            ocr_text: "OCR".into(),
-            source_revision: 1,
-            clip: None,
-        };
-        let record = mirror_record(&staged_subject(
-            42,
-            &input,
-            "proc.exe | Title | OCR".into(),
-            vec![0.5; crate::minilm_migration::MINILM_DIMENSIONS],
-        ));
-        assert_eq!(record["timestamp"], 1_700_000_000);
-        assert_eq!(record["id"], "42");
-        assert_eq!(record["document"], "proc.exe | Title | OCR");
-    }
-
-    #[test]
-    fn a_mirror_record_carries_every_field_add_snapshot_used_to_write() {
-        // `upsert_task_vectors` reads exactly these keys. A vector arriving
-        // without `timestamp` would land outside every clustering window, and
-        // one without `document` would leave the reranker nothing to score —
-        // both silent, both only visible as degraded clustering months later.
-        let record = mirror_record(&indexed(42));
-        let mut keys: Vec<&str> = record
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            vec![
-                "category",
-                "document",
-                "embedding",
-                "id",
-                "process_name",
-                "source_revision",
-                "timestamp",
-                "window_title",
-            ]
-        );
-        // Python parses the id with `str.isdigit()`, so it has to be a string.
-        assert_eq!(record["id"], "42");
-        assert_eq!(record["timestamp"], 1_700_000_000);
-        assert_eq!(record["process_name"], "proc.exe");
-        assert_eq!(record["window_title"], "Title");
-        assert_eq!(record["category"], "work");
-        assert_eq!(record["document"], "proc.exe | Title | OCR");
-        assert_eq!(
-            record["embedding"].as_array().unwrap().len(),
-            crate::minilm_migration::MINILM_DIMENSIONS
-        );
-    }
-
-    #[test]
-    fn absent_metadata_mirrors_as_empty_strings_rather_than_null() {
-        // Python calls `str(...)` on each of these, so a JSON null would reach
-        // Chroma as the literal text "None".
-        let mut subject = indexed(7);
-        subject.summary.process_name = None;
-        subject.summary.window_title = None;
-        subject.summary.category = None;
-        subject.summary.timestamp = None;
-        let record = mirror_record(&subject);
-        assert_eq!(record["process_name"], "");
-        assert_eq!(record["window_title"], "");
-        assert_eq!(record["category"], "");
-        assert_eq!(record["timestamp"], 0);
-    }
-
-    #[test]
-    fn one_mirror_request_stays_inside_the_python_batch_limit() {
-        // `upsert_task_vectors` raises above 128 records, and a raised batch
-        // would lose the whole chunk rather than degrade.
-        assert!(MIRROR_BATCH <= 128);
-        assert!(DRAIN_BATCH <= MIRROR_BATCH);
     }
 
     #[test]

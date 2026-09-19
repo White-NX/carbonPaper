@@ -32,7 +32,7 @@
       "name": "get_snapshots_by_time_range"
     },
     {
-      "description": "Get full details of a specific snapshot including metadata, OCR text, and the task cluster it belongs to (if any). By default OCR bounding box coordinates are omitted to save tokens; set include_coords=true to include them.",
+      "description": "Get full details of a specific snapshot including metadata and OCR text. By default OCR bounding box coordinates are omitted to save tokens; set include_coords=true to include them.",
       "inputSchema": {
         "properties": {
           "id": {
@@ -139,76 +139,6 @@
         "type": "object"
       },
       "name": "search_nl"
-    },
-    {
-      "description": "Get task clustering results. Tasks are groups of related screenshots identified by activity patterns.",
-      "inputSchema": {
-        "properties": {
-          "end_time": {
-            "description": "Filter end time (ms)",
-            "type": "number"
-          },
-          "hide_inactive": {
-            "description": "Hide inactive tasks",
-            "type": "boolean"
-          },
-          "layer": {
-            "description": "Clustering layer (e.g. 'hot', 'cold')",
-            "type": "string"
-          },
-          "start_time": {
-            "description": "Filter start time (ms)",
-            "type": "number"
-          }
-        },
-        "type": "object"
-      },
-      "name": "get_task_clusters"
-    },
-    {
-      "description": "Get screenshots belonging to a specific task cluster, with pagination.",
-      "inputSchema": {
-        "properties": {
-          "page": {
-            "description": "Page number (0-based, default 0)",
-            "type": "integer"
-          },
-          "page_size": {
-            "description": "Page size (default 50)",
-            "type": "integer"
-          },
-          "task_id": {
-            "description": "Task cluster ID",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "task_id"
-        ],
-        "type": "object"
-      },
-      "name": "get_task_screenshots"
-    },
-    {
-      "description": "Rename a task cluster.",
-      "inputSchema": {
-        "properties": {
-          "label": {
-            "description": "New label for the task",
-            "type": "string"
-          },
-          "task_id": {
-            "description": "Task cluster ID",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "task_id",
-          "label"
-        ],
-        "type": "object"
-      },
-      "name": "rename_task"
     },
     {
       "description": "List smart clusters with assignment counts and any stored AI-generated summary.",

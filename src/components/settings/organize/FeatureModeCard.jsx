@@ -30,7 +30,7 @@ export default function FeatureModeCard({
         value={featureMode}
         options={featureModeOptions}
         onChange={onFeatureModeChange}
-        columns={4}
+        columns={featureModeOptions.length}
       />
 
       {featureMode !== 'custom' && (
@@ -58,11 +58,6 @@ export default function FeatureModeCard({
                 key: 'classification_enabled',
                 label: t('settings.features.management.classification.label', '内容分类'),
                 description: t('settings.features.management.classification.description', '使用 BGE 模型自动分类截图内容'),
-              },
-              {
-                key: 'clustering_enabled',
-                label: t('settings.features.management.clustering.label', '任务聚类'),
-                description: t('settings.features.management.clustering.description', '使用 MiniLM 模型将相似活动分组为长期任务'),
               },
               {
                 key: 'smart_cluster_enabled',

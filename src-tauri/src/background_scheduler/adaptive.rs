@@ -192,7 +192,6 @@ impl AdaptiveRuntime {
         choose_profile(
             activity,
             configured_mode(),
-            kind == BackgroundTaskKind::PythonClustering,
             qualified,
             &self.resources.lock().unwrap_or_else(|e| e.into_inner()),
             self.now(),
@@ -254,12 +253,7 @@ impl AdaptiveRuntime {
                 {
                     Some("external_background_request")
                 } else if active.lease.profile == ExecutionProfile::Idle
-                    && signals.idle_secs
-                        < if active.lease.task == TASK_PYTHON_CLUSTERING {
-                            LEGACY_CLUSTER_IDLE_SECS
-                        } else {
-                            SHORT_IDLE_SECS
-                        }
+                    && signals.idle_secs < SHORT_IDLE_SECS
                 {
                     Some("input_resumed")
                 } else if active.lease.profile == ExecutionProfile::Background {
@@ -473,6 +467,9 @@ impl BackgroundSchedulerState {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map_or_else(Vec::new, PerformanceBook::qualifications)
+            .into_iter()
+            .filter(|qualification| BackgroundTaskKind::parse(&qualification.key.task).is_some())
+            .collect()
     }
 
     pub(crate) fn qualification_summary(&self) -> BTreeMap<String, bool> {
@@ -486,8 +483,6 @@ impl BackgroundSchedulerState {
             TASK_SEMANTIC_INDEX,
             TASK_CLIP_INDEX,
             TASK_SMART_CLUSTER,
-            TASK_PYTHON_CLUSTERING,
-            TASK_VECTOR_SYNC,
             TASK_ANN_BUILD,
         ]
         .into_iter()

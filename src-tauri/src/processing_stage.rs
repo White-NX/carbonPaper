@@ -1329,8 +1329,7 @@ pub(crate) fn captured_input(
     image: &image::RgbImage,
 ) -> Result<(ProcessingInput, u8), String> {
     let smart_enabled = crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
-    let semantic_enabled =
-        crate::registry_config::get_bool("clustering_enabled").unwrap_or(true) || smart_enabled;
+    let semantic_enabled = smart_enabled;
     let classification = crate::registry_config::get_bool("classification_enabled").unwrap_or(true);
     let has_ocr = !ocr_text.trim().is_empty();
     let semantic_text = crate::minilm_migration::build_minilm_task_text(process, title, &ocr_text);
@@ -1553,27 +1552,17 @@ async fn encode_staged(
             &crate::storage::DerivedEmbeddingWrite {
                 job: spec.clone(),
                 lease_token: lease_token.clone(),
-                vector: vector.clone(),
+                vector,
             },
             &work.receipt,
         )?;
-        Ok::<_, String>(vector)
+        Ok::<_, String>(())
     }
     .await;
     match result {
-        Ok(vector) => {
+        Ok(()) => {
             if work.receipt.consumer == Consumer::Clip {
                 let _ = crate::clip_ann::maybe_rebuild(app, false).await;
-            }
-            if work.receipt.consumer == Consumer::MiniLm {
-                crate::minilm_index::mirror_staged_result(
-                    app,
-                    work.receipt.screenshot_id,
-                    input,
-                    text.unwrap_or_default(),
-                    vector,
-                )
-                .await;
             }
             Ok(())
         }

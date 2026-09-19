@@ -127,8 +127,6 @@ function getLocalizedSourceLabel(tab, t) {
       return t('snapshotPreview.sources.mainPreview');
     case 'advanced-search':
       return t('snapshotPreview.sources.advancedSearch');
-    case 'task':
-      return t('snapshotPreview.sources.tasks');
     case 'smart-cluster':
       return t('snapshotPreview.sources.smartClusters');
     default:

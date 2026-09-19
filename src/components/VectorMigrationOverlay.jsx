@@ -14,7 +14,7 @@ import {
   getClipRebuildStatus,
   getMaintenanceStatus,
   getMinilmRebuildStatus,
-} from '../lib/task_api';
+} from '../lib/semantic_api';
 import { requestAuth } from '../lib/auth_api';
 import { cn } from '../lib/utils';
 

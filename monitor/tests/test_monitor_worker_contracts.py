@@ -1,6 +1,6 @@
-import ast
-import inspect
 from pathlib import Path
+
+import pytest
 
 import monitor as mm
 
@@ -10,10 +10,7 @@ def _snapshot_monitor_globals():
         "_auth_token": mm._auth_token,
         "_last_seq_no": mm._last_seq_no,
         "_clip_exporter": mm._clip_exporter,
-        "_clustering_scheduler": mm._clustering_scheduler,
-        "_clustering_manager": mm._clustering_manager,
-        "_clustering_scheduler_active": mm._clustering_scheduler_active,
-        "_last_clustering_session_valid": mm._last_clustering_session_valid,
+        "_minilm_exporter": mm._minilm_exporter,
         "_storage_pipe": mm._storage_pipe,
     }
 
@@ -54,19 +51,25 @@ class _FakeExporter:
         return True
 
 
-def test_legacy_clip_export_dispatch_is_monitor_owned(monkeypatch):
+@pytest.mark.parametrize("prefix, attribute", [("clip", "_clip_exporter"), ("task", "_minilm_exporter")])
+def test_legacy_vector_export_dispatch_requires_auth(monkeypatch, prefix, attribute):
     snapshot = _snapshot_monitor_globals()
     exporter = _FakeExporter()
     try:
         mm._auth_token = None
         mm._last_seq_no = -1
-        mm._clip_exporter = exporter
-        monkeypatch.setattr(mm, "_sync_clustering_scheduler_auth_gate", lambda force=False: True)
+        setattr(mm, attribute, exporter)
+        monkeypatch.setattr(mm, "_is_storage_session_valid", lambda: False)
+        for command in (f"start_{prefix}_vectors_export", f"get_{prefix}_vectors_export_status", f"export_{prefix}_vectors_page", f"finish_{prefix}_vectors_export"):
+            denied = mm._handle_command_impl({"command": command, "export_id": "export-run-123456"})
+            assert "AUTH_REQUIRED" in denied["error"]
+        assert exporter.calls == []
+        monkeypatch.setattr(mm, "_is_storage_session_valid", lambda: True)
 
-        start = mm._handle_command_impl({"command": "start_clip_vectors_export", "export_id": "clip-run-123456"})
-        status = mm._handle_command_impl({"command": "get_clip_vectors_export_status", "export_id": "clip-run-123456"})
-        page = mm._handle_command_impl({"command": "export_clip_vectors_page", "export_id": "clip-run-123456", "cursor": 0, "limit": 2})
-        finish = mm._handle_command_impl({"command": "finish_clip_vectors_export", "export_id": "clip-run-123456"})
+        start = mm._handle_command_impl({"command": f"start_{prefix}_vectors_export", "export_id": "export-run-123456"})
+        status = mm._handle_command_impl({"command": f"get_{prefix}_vectors_export_status", "export_id": "export-run-123456"})
+        page = mm._handle_command_impl({"command": f"export_{prefix}_vectors_page", "export_id": "export-run-123456", "cursor": 0, "limit": 2})
+        finish = mm._handle_command_impl({"command": f"finish_{prefix}_vectors_export", "export_id": "export-run-123456"})
     finally:
         _restore_monitor_globals(snapshot)
 

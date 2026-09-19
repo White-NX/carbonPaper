@@ -1,29 +1,11 @@
 import monitor as mm
 
 
-class DummyScheduler:
-    def __init__(self):
-        self.last_args = None
-
-    def run_now(self, start_time=None, end_time=None, clustering_mode="auto", manual=False):
-        self.last_args = {
-            "start_time": start_time,
-            "end_time": end_time,
-            "clustering_mode": clustering_mode,
-            "manual": manual,
-        }
-        return {"n_clusters": 2, "n_noise": 1}
-
-
 def _snapshot_globals():
     return {
         "_auth_token": mm._auth_token,
         "_last_seq_no": mm._last_seq_no,
         "_seen_seq_nos": set(mm._seen_seq_nos),
-        "_clustering_scheduler": mm._clustering_scheduler,
-        "_clustering_manager": mm._clustering_manager,
-        "_clustering_scheduler_active": mm._clustering_scheduler_active,
-        "_last_clustering_session_valid": mm._last_clustering_session_valid,
         "_storage_pipe": mm._storage_pipe,
     }
 
@@ -46,45 +28,6 @@ def test_classification_dispatch_is_retired():
             assert "unknown command" in result["error"].lower()
     finally:
         _restore_globals(snapshot)
-
-
-def test_run_clustering_requires_unlocked_session(monkeypatch):
-    snapshot = _snapshot_globals()
-    scheduler = DummyScheduler()
-    try:
-        mm._clustering_scheduler = scheduler
-        monkeypatch.setattr(mm, "_sync_clustering_scheduler_auth_gate", lambda force=False: False)
-        result = mm._handle_command_impl({"command": "run_clustering"})
-    finally:
-        _restore_globals(snapshot)
-
-    assert "AUTH_REQUIRED" in result["error"]
-    assert scheduler.last_args is None
-
-
-def test_run_clustering_parses_numeric_range(monkeypatch):
-    snapshot = _snapshot_globals()
-    scheduler = DummyScheduler()
-    try:
-        mm._clustering_scheduler = scheduler
-        monkeypatch.setattr(mm, "_sync_clustering_scheduler_auth_gate", lambda force=False: True)
-        result = mm._handle_command_impl({
-            "command": "run_clustering",
-            "start_time": "1000",
-            "end_time": 2000,
-            "clustering_mode": "full",
-            "manual": True,
-        })
-    finally:
-        _restore_globals(snapshot)
-
-    assert result["status"] == "success"
-    assert scheduler.last_args == {
-        "start_time": 1000.0,
-        "end_time": 2000.0,
-        "clustering_mode": "full",
-        "manual": True,
-    }
 
 
 def test_auth_token_and_sequence_number_guard():

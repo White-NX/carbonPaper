@@ -2036,7 +2036,7 @@ impl StorageState {
         })
     }
 
-    /// Fetch only the metadata required by unattended clustering.
+    /// Fetch only the metadata required by background semantic processing.
     /// CNG is always called with `NCRYPT_SILENT_FLAG`; a locked session fails
     /// the whole batch with `AuthRequired` instead of displaying system UI.
     pub(crate) fn get_screenshot_summaries_by_ids_silent(
@@ -2086,71 +2086,6 @@ impl StorageState {
                 .map_err(|error| {
                     BackgroundReadError::Other(format!(
                         "Failed to read background screenshot row: {}",
-                        error
-                    ))
-                })?;
-            rows
-        };
-
-        if !self.is_silent_read_authorized() {
-            return Err(BackgroundReadError::AuthRequired);
-        }
-        self.decrypt_summaries_parallel(raw_rows)
-    }
-
-    pub(crate) fn get_screenshot_summaries_by_time_range_paged_silent(
-        &self,
-        start_ts: f64,
-        end_ts: f64,
-        offset: i64,
-        limit: i64,
-    ) -> Result<Vec<BackgroundScreenshotSummary>, BackgroundReadError> {
-        if !self.is_silent_read_authorized() {
-            return Err(BackgroundReadError::AuthRequired);
-        }
-
-        let raw_rows = {
-            let conn = self
-                .open_read_connection_named("get_screenshot_summaries_by_time_range_paged_silent")
-                .map_err(BackgroundReadError::Other)?;
-            let start_dt = DateTime::<Utc>::from_timestamp(start_ts as i64, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_default();
-            let end_dt = DateTime::<Utc>::from_timestamp(end_ts as i64, 0)
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_default();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, window_title, process_name, window_title_enc,
-                            process_name_enc, content_key_encrypted,
-                            strftime('%s', created_at) AS timestamp, category
-                     FROM screenshots
-                     WHERE is_deleted = 0
-                       AND created_at BETWEEN ?1 AND ?2
-                     ORDER BY created_at ASC
-                     LIMIT ?3 OFFSET ?4",
-                )
-                .map_err(|error| {
-                    BackgroundReadError::Other(format!(
-                        "Failed to prepare background screenshot page query: {}",
-                        error
-                    ))
-                })?;
-            let rows = stmt
-                .query_map(
-                    params![start_dt, end_dt, limit.clamp(1, 1000), offset.max(0)],
-                    EncryptedScreenshotSummaryRow::from_row,
-                )
-                .map_err(|error| {
-                    BackgroundReadError::Other(format!(
-                        "Failed to execute background screenshot page query: {}",
-                        error
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    BackgroundReadError::Other(format!(
-                        "Failed to read background screenshot page row: {}",
                         error
                     ))
                 })?;
@@ -4170,7 +4105,7 @@ mod ocr_lifecycle_tests {
     }
 
     #[test]
-    fn silent_clustering_reads_fail_fast_while_session_is_locked() {
+    fn silent_metadata_reads_fail_fast_while_session_is_locked() {
         let temp = tempfile::tempdir().expect("temp storage directory");
         let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
@@ -4185,15 +4120,6 @@ mod ocr_lifecycle_tests {
         ));
         assert!(matches!(
             storage.get_screenshot_summaries_by_ids_silent(&[1]),
-            Err(BackgroundReadError::AuthRequired)
-        ));
-        assert!(matches!(
-            storage.get_screenshot_summaries_by_time_range_paged_silent(
-                0.0,
-                4_102_444_800.0,
-                0,
-                32,
-            ),
             Err(BackgroundReadError::AuthRequired)
         ));
     }

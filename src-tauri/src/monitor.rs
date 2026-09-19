@@ -664,173 +664,21 @@ pub async fn monitor_update_filters(
 #[tauri::command]
 pub async fn monitor_update_advanced_config(
     credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
     capture_state: State<'_, Arc<CaptureState>>,
     ocr_timeout_secs: u32,
-    clustering_allow_full_low_memory: bool,
 ) -> Result<Value, String> {
     crate::commands::check_auth_required(&credential_state)?;
     let payload = serde_json::json!({
         "command": "update_advanced_config",
         "ocr_timeout_secs": ocr_timeout_secs,
-        "clustering_allow_full_low_memory": clustering_allow_full_low_memory,
     });
-    dispatch_typed_monitor_command(&state, Some(&capture_state), None, payload).await
-}
-
-#[tauri::command]
-pub async fn monitor_update_feature_config(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
-    clustering_enabled: bool,
-    classification_enabled: bool,
-) -> Result<Value, String> {
-    crate::commands::check_auth_required(&credential_state)?;
-    crate::registry_config::set_bool("classification_enabled", classification_enabled)?;
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({
-            "command": "update_feature_config",
-            "clustering_enabled": clustering_enabled,
-        }),
-    )
-    .await
-}
-
-#[tauri::command]
-pub async fn monitor_run_clustering(
-    app: tauri::AppHandle,
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
-    start_time: Option<f64>,
-    end_time: Option<f64>,
-    clustering_mode: Option<String>,
-    manual: Option<bool>,
-) -> Result<Value, String> {
-    if manual.unwrap_or(false) && start_time.is_none() && end_time.is_none() {
-        crate::commands::check_auth_required(&credential_state)?;
-        let scheduler = app
-            .try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
-            .ok_or_else(|| "Background scheduler is unavailable".to_string())?;
-        scheduler.enqueue(
-            &app,
-            crate::background_scheduler::BackgroundTaskKind::PythonClustering,
-            true,
-        )?;
-        return Ok(serde_json::json!({
-            "status": "queued",
-            "queued": true,
-            "task": "python_clustering",
-        }));
-    }
-    crate::commands::check_auth_required(&credential_state)?;
-    let progress = match crate::task_vector_sync::synchronize(&app, true, start_time, end_time)
-        .await?
-    {
-        crate::task_vector_sync::SyncOutcome::Ready(progress) => progress,
-        crate::task_vector_sync::SyncOutcome::Busy | crate::task_vector_sync::SyncOutcome::More => {
-            return Err("CLUSTERING_ALREADY_RUNNING".into())
-        }
-        crate::task_vector_sync::SyncOutcome::WaitingForIndex => {
-            return Err("CLUSTERING_WAITING_FOR_INDEX".into())
-        }
-    };
-    let response = authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({
-            "command": "run_clustering",
-            "start_time": start_time,
-            "end_time": end_time,
-            "clustering_mode": clustering_mode.unwrap_or_else(|| "auto".to_string()),
-            "manual": manual.unwrap_or(false),
-        }),
-    )
-    .await?;
-    if response.get("error").is_none() {
-        use crate::task_vector_sync::ClusteringPhase;
-        progress.finish(match response.get("status").and_then(Value::as_str) {
-            Some("needs_user_choice") => ClusteringPhase::AwaitingChoice,
-            // The frontend still needs to save the returned clusters.
-            Some("success" | "empty") => ClusteringPhase::ResultsReady,
-            _ => ClusteringPhase::Paused,
-        });
-    }
-    Ok(response)
-}
-
-#[tauri::command]
-pub async fn monitor_get_clustering_status(
-    app: tauri::AppHandle,
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    scheduler: State<'_, Arc<crate::background_scheduler::BackgroundSchedulerState>>,
-) -> Result<Value, String> {
-    crate::commands::check_auth_required(&credential_state)?;
-    let status = scheduler.status(&app);
-    let storage = app.state::<Arc<StorageState>>();
-    let progress = crate::task_vector_sync::progress_status(&storage);
-    let task = status
-        .tasks
-        .iter()
-        .find(|task| task.task_kind == crate::background_scheduler::TASK_PYTHON_CLUSTERING);
-    let interval = crate::registry_config::get_string("clustering_interval")
-        .unwrap_or_else(|| "1w".to_string());
-    let interval_secs = match interval.as_str() {
-        "1d" => 86_400,
-        "1m" => 2_592_000,
-        "6m" => 15_552_000,
-        _ => 604_800,
-    };
-    Ok(serde_json::json!({
-        "status": "success",
-        "config": {
-            "interval": interval,
-            "interval_secs": interval_secs,
-            "last_run": task.and_then(|task| task.last_completed_at_ms).map(|ms| ms as f64 / 1000.0),
-            "running": progress.as_ref().is_some_and(|progress| progress.active)
-                || status.running_task.as_deref() == Some(crate::background_scheduler::TASK_PYTHON_CLUSTERING),
-        },
-        "last_result": task.map(|task| serde_json::json!({
-            "status": task.status,
-            "last_error": task.last_error,
-        })),
-        "scheduler": status,
-        "vector_sync": storage.task_vector_sync_status()?,
-        "clustering_progress": progress,
-    }))
-}
-
-#[tauri::command]
-pub async fn monitor_set_clustering_interval(
-    app: tauri::AppHandle,
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    interval: String,
-) -> Result<Value, String> {
-    crate::commands::check_auth_required(&credential_state)?;
-    if !matches!(interval.as_str(), "1d" | "1w" | "1m" | "6m") {
-        return Err(format!("Unknown clustering interval: {interval}"));
-    }
-    crate::registry_config::set_string("clustering_interval", &interval)?;
-    if let Some(scheduler) =
-        app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
-    {
-        scheduler.wake();
-    }
-    Ok(serde_json::json!({ "status": "success", "interval": interval }))
-}
-
-#[tauri::command]
-pub async fn monitor_get_task_clusters(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
-) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({ "command": "get_tasks" }),
-    )
-    .await
+    apply_monitor_side_effects(
+        "update_advanced_config",
+        &payload,
+        Some(&capture_state),
+        None,
+    );
+    Ok(serde_json::json!({ "status": "success" }))
 }
 
 #[tauri::command]
@@ -1049,8 +897,8 @@ pub async fn forward_command_to_python(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let needs_full_cpu = command == "search_nl";
-    let limited = automatic && command != "run_scheduled_clustering";
-    // Status, pause, and stop must remain responsive during long clustering.
+    let limited = automatic;
+    // Keep control traffic responsive during background computation.
     // Serialize computations that own the process budget, not control traffic.
     let _budget_gate = if limited {
         Some(
@@ -1059,12 +907,7 @@ pub async fn forward_command_to_python(
                 .try_lock()
                 .map_err(|_| "background_paused: monitor request pending")?,
         )
-    } else if needs_full_cpu
-        || matches!(
-            command,
-            "run_scheduled_clustering" | "upsert_task_vectors" | "get_task_vector_sync_target"
-        )
-    {
+    } else if needs_full_cpu {
         Some(state.command_budget_gate.lock().await)
     } else {
         None
@@ -1193,8 +1036,6 @@ fn append_known_native_dll_dirs(dirs: &mut Vec<PathBuf>, site_packages: &Path) {
     push(&["onnxruntime", "capi"]);
     push(&["numpy.libs"]);
     push(&["scipy.libs"]);
-    push(&["sklearn", ".libs"]);
-    push(&["scikit_learn.libs"]);
     push(&["Pillow.libs"]);
     push(&["cv2"]);
     push(&["tokenizers"]);
@@ -1258,7 +1099,6 @@ pub async fn start_monitor_impl(
             }
         }
     }
-    let resolved_onnx_paths = crate::model_management::resolve_required_onnx_paths().ok();
 
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -1567,26 +1407,6 @@ pub async fn start_monitor_impl(
             cmd_proc.env("CARBONPAPER_DATA_DIR", dd);
         }
 
-        cmd_proc
-            .env(
-                "CARBONPAPER_CLUSTERING_ENABLED",
-                crate::registry_config::get_bool("clustering_enabled")
-                    .unwrap_or(true)
-                    .to_string(),
-            )
-            .env(
-                "CARBONPAPER_CLUSTERING_ALLOW_FULL_LOW_MEMORY",
-                crate::registry_config::get_bool("clustering_allow_full_low_memory")
-                    .unwrap_or(false)
-                    .to_string(),
-            );
-        if let Some(paths) = &resolved_onnx_paths {
-            cmd_proc.env(
-                "MINILM_MODEL_PATH",
-                paths.minilm_path.to_string_lossy().to_string(),
-            );
-        }
-
         // Pass DirectML configuration. The persisted preference is not enough:
         // game mode can temporarily or permanently suppress GPU inference.
         let configured_dml = crate::registry_config::get_bool("use_dml").unwrap_or(false);
@@ -1883,18 +1703,7 @@ pub async fn start_monitor(
 ) -> Result<String, String> {
     crate::commands::check_main_window(&window)?;
     crate::maintenance::guard()?;
-    let result = start_monitor_impl(state, app.clone()).await;
-    if result.is_ok() {
-        if let Some(scheduler) =
-            app.try_state::<Arc<crate::background_scheduler::BackgroundSchedulerState>>()
-        {
-            // This command is the explicit recovery action exposed to the
-            // user. It is the only event that clears the in-process monitor
-            // restart degradation latch.
-            scheduler.clear_monitor_restart_degraded(&app);
-        }
-    }
-    result
+    start_monitor_impl(state, app).await
 }
 
 #[tauri::command]

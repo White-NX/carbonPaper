@@ -20,15 +20,12 @@ import {
 } from './monitor_api';
 import {
   createSmartCluster,
-  getRelatedScreenshots,
   getSmartClusterAssignments,
-  mergeTasks,
   nlClusterQuery,
-  saveClusteringResults,
   toggleSmartClusterEnabled,
   renameSmartCluster,
   updateSmartClusterThreshold,
-} from './task_api';
+} from './semantic_api';
 
 describe('API contract payloads', () => {
   beforeEach(() => {
@@ -111,17 +108,14 @@ describe('API contract payloads', () => {
     expectWithAuth(6, { autoPrompt: true });
   });
 
-  it('sends task and natural-language clustering payloads', async () => {
+  it('sends natural-language retrieval payloads', async () => {
     invoke
       .mockResolvedValueOnce({
         results: [{ id: 1 }],
         reranked: true,
         rerank_variant: 'uint8',
         backend: 'rust',
-      })
-      .mockResolvedValueOnce({ task_id: 7, screenshots: [] })
-      .mockResolvedValueOnce(99)
-      .mockResolvedValueOnce([101, 102]);
+      });
 
     // `backend` survives the wrapper so calibration provenance remains explicit.
     // Current production responses are Rust-served.
@@ -135,10 +129,6 @@ describe('API contract payloads', () => {
       // because nothing failed.
       cancelled: false,
     });
-    await getRelatedScreenshots(42, 6);
-    await mergeTasks([1, 2]);
-    await saveClusteringResults([{ label: 'Work', screenshot_ids: [42] }]);
-
     // No `rerankVariant` key: M2.5 step 6 pinned the variant in Rust, and the
     // old `q4f16` default named a file that is never installed.
     expect(invoke).toHaveBeenNthCalledWith(1, 'monitor_nl_cluster_query', {
@@ -146,24 +136,9 @@ describe('API contract payloads', () => {
       nResults: 12,
       enableRerank: true,
     });
-    expect(invoke).toHaveBeenNthCalledWith(2, 'storage_get_related_screenshots', {
-      screenshotId: 42,
-      limit: 6,
-    });
-    expect(invoke).toHaveBeenNthCalledWith(3, 'storage_merge_tasks', {
-      taskIds: [1, 2],
-    });
-    expect(invoke).toHaveBeenNthCalledWith(4, 'storage_save_clustering_results', {
-      tasks: [{ label: 'Work', screenshot_ids: [42] }],
-    });
-
-    expect(withAuth).toHaveBeenCalledTimes(4);
+    expect(withAuth).toHaveBeenCalledTimes(1);
     expectWithAuth(1);
-    expectWithAuth(2);
-    expectWithAuth(3, { autoPrompt: true });
-    expectWithAuth(4, { autoPrompt: true });
   });
-
   it('sends smart cluster CRUD payloads', async () => {
     invoke.mockResolvedValue({});
 

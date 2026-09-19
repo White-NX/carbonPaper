@@ -86,6 +86,10 @@ def test_monitor_bundle_excludes_retired_python_inference_modules():
         "reranker.py",
         "smart_cluster_worker.py",
         "vector_store.py",
+        "task_clustering.py",
+        "clustering_resources.py",
+        "clustering_commands.py",
+        "legacy_clip_export.py",
     }
     root = _project_root()
     generated_dir = root / "src-tauri" / "pre-bundle" / "monitor"

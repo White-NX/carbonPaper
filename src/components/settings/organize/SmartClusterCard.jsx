@@ -35,15 +35,6 @@ export default function SmartClusterCard({
         </div>
       </div>
 
-      {config.smart_cluster_enabled && !config.clustering_enabled && (
-        <div className="mt-4 flex items-start gap-2.5 p-2.5 bg-ide-warning-bg border border-ide-warning-border rounded-lg">
-          <AlertTriangle className="w-4 h-4 text-ide-warning shrink-0 mt-0.5" />
-          <p className="text-xs leading-relaxed text-ide-warning-muted">
-            {t('settings.features.management.smartCluster.clusteringDisabledWarning', '任务聚类已关闭。智能聚类仍可在重扫时运行，但由于缺少截图采集阶段的自动文本向量化，候选召回需要临时编码，可能导致处理速度显著下降并增加资源占用。')}
-          </p>
-        </div>
-      )}
-
       {!scModelAvailable && !scDownloading && !scDownloadError && (
         <div className="mt-4 pt-4 border-t border-ide-border/50 flex items-center justify-between gap-3">
           <p className="text-xs text-ide-muted">

@@ -70,8 +70,8 @@ export function ThumbnailCard({
     path: item.image_path || item.metadata?.image_path || item.path,
   };
 
-  const clickScope = ['search', 'tasks', 'clusters'].includes(sourceType) ? sourceType : 'preview';
-  const cardClickBehavior = usePreference(`cardClickBehavior_${clickScope}`, ['tasks', 'clusters'].includes(clickScope) ? 'standalone' : 'preview');
+  const clickScope = ['search', 'clusters'].includes(sourceType) ? sourceType : 'preview';
+  const cardClickBehavior = usePreference(`cardClickBehavior_${clickScope}`, clickScope === 'clusters' ? 'standalone' : 'preview');
   const isStandaloneDefault = cardClickBehavior === 'standalone' && !!onOpenFloatingPreview;
 
   const handleSelect = (event) => {

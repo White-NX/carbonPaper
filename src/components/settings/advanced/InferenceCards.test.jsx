@@ -63,7 +63,6 @@ describe('ClipBackendCard ANN health', () => {
 describe('BackgroundSchedulerCard status', () => {
   it.each([
     ['disabled', 'settings.advanced.background_processing.states.disabled'],
-    ['clustering_already_running', 'settings.advanced.background_processing.states.organizing'],
     ['waiting_for_index', 'settings.advanced.background_processing.states.preparing'],
   ])('shows a user-facing label for %s', (blockedReason, expectedKey) => {
     render(

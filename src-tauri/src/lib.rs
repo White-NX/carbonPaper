@@ -70,7 +70,6 @@ mod sensitive_filter;
 mod settings_window;
 mod smart_cluster_scoring;
 mod storage;
-mod task_vector_sync;
 mod updater;
 
 use analysis::AnalysisState;
@@ -616,16 +615,7 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     let cs = app_handle.state::<Arc<CaptureState>>();
                     let _ = monitor::stop_monitor_impl(state, cs, app_handle.clone()).await;
                     let start_state = app_handle.state::<MonitorState>();
-                    if monitor::start_monitor_impl(start_state, app_handle.clone())
-                        .await
-                        .is_ok()
-                    {
-                        if let Some(scheduler) = app_handle
-                            .try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
-                        {
-                            scheduler.clear_monitor_restart_degraded(&app_handle);
-                        }
-                    }
+                    let _ = monitor::start_monitor_impl(start_state, app_handle.clone()).await;
                 });
             }
             MENU_ID_LIGHTWEIGHT => {
@@ -1242,11 +1232,6 @@ pub fn run() {
             monitor::monitor_search_nl,
             monitor::monitor_update_filters,
             monitor::monitor_update_advanced_config,
-            monitor::monitor_update_feature_config,
-            monitor::monitor_run_clustering,
-            monitor::monitor_get_clustering_status,
-            monitor::monitor_set_clustering_interval,
-            monitor::monitor_get_task_clusters,
             monitor::monitor_nl_cluster_query,
             monitor::monitor_nl_cluster_reranker_status,
             monitor::monitor_smart_cluster_worker_status,
@@ -1327,15 +1312,6 @@ pub fn run() {
             commands::database_mode::storage_get_database_mode_metadata,
             commands::database_mode::storage_check_database_mode_eligibility,
             commands::database_mode::storage_transition_wal_to_delete,
-            // 任务聚类命令
-            commands::storage::storage_get_tasks,
-            commands::storage::storage_get_related_screenshots,
-            commands::storage::storage_get_task_screenshots,
-            commands::storage::storage_update_task_label,
-            commands::storage::storage_delete_task,
-            commands::storage::storage_remove_task_screenshot,
-            commands::storage::storage_merge_tasks,
-            commands::storage::storage_save_clustering_results,
             analysis::get_analysis_overview,
             // MCP 服务命令
             commands::mcp::mcp_set_enabled,
@@ -1409,8 +1385,6 @@ pub fn run() {
             native_messaging::sync_extension_if_needed,
             commands::utility::check_extension_setup_needed,
             commands::utility::mark_extension_setup_done,
-            commands::utility::check_clustering_setup_needed,
-            commands::utility::mark_clustering_setup_done,
             commands::utility::check_smart_cluster_setup_needed,
             commands::utility::mark_smart_cluster_setup_done,
             commands::utility::get_extension_enhancement_config,

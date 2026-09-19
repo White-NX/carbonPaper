@@ -93,7 +93,7 @@ pub fn get_maintenance_status() -> MaintenanceStatus {
 
 /// Reverse-IPC commands that remain usable during maintenance: session/crypto
 /// helpers the migration itself depends on, read-only status, and NMH session
-/// bookkeeping. Everything that writes screenshots, OCR, or clustering state is
+/// bookkeeping. Everything that writes screenshots, OCR, or smart cluster state is
 /// rejected. The MiniLM mirror commands used to be allowed here because Python
 /// wrote vectors Rust had to accept even mid-migration; M2.5 step 5 removed
 /// them along with the Python-side writer.
@@ -102,12 +102,9 @@ pub fn reverse_ipc_command_allowed(command: &str) -> bool {
         command,
         "get_public_key"
             | "get_auth_status"
-            | "get_idle_state"
             | "encrypt_for_chromadb"
             | "decrypt_from_chromadb"
             | "decrypt_many_from_chromadb"
-            | "decrypt_from_chromadb_silent"
-            | "decrypt_many_from_chromadb_silent"
             | "register_nmh"
             | "unregister_nmh"
     )

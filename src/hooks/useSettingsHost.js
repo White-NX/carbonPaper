@@ -39,7 +39,7 @@ export function useSettingsHost({ onMonitorAction, onRecordsChanged, onClosed, o
       else if (payload === 'update' || payload === 'critical-update') window.dispatchEvent(new CustomEvent('debug-update-modal', { detail: { critical: payload === 'critical-update' } }));
       else if (payload === 'app-bound' || payload === 'app-bound-repair') window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer', { detail: { repair: payload === 'app-bound-repair' } }));
       else {
-        const events = { extension: 'debug-show-extension-wizard', clustering: 'debug-show-clustering-wizard', 'smart-cluster': 'debug-show-smart-cluster-wizard' };
+        const events = { extension: 'debug-show-extension-wizard', 'smart-cluster': 'debug-show-smart-cluster-wizard' };
         if (events[payload]) window.dispatchEvent(new CustomEvent(events[payload]));
       }
     } catch (error) { onError?.(error); }

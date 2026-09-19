@@ -107,17 +107,6 @@ impl StorageState {
             [],
         )
         .map_err(|e| format!("Failed to recover scheduler tasks: {e}"))?;
-        // `degraded` is intentionally process-scoped: it means this process
-        // exhausted its automatic monitor-restart budget. A fresh process is
-        // the documented recovery boundary, so make the durable row runnable
-        // again on startup while retaining the last error for diagnostics.
-        conn.execute(
-            "UPDATE background_scheduler_tasks
-             SET status = 'queued', next_attempt_at_ms = 0
-             WHERE status = 'degraded'",
-            [],
-        )
-        .map_err(|e| format!("Failed to recover degraded scheduler tasks: {e}"))?;
         Ok(())
     }
 
@@ -184,7 +173,7 @@ impl StorageState {
                 !manual_pending
                     || matches!(
                         status.as_str(),
-                        "retry_wait" | "degraded" | "parked" | "completed" | "failed"
+                        "retry_wait" | "parked" | "completed" | "failed"
                     )
             }
             // A terminal failure is a circuit breaker, not another backlog
@@ -212,7 +201,7 @@ impl StorageState {
                 END,
                  status = CASE
                     WHEN excluded.manual_pending = 1
-                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded', 'failed')
+                         AND background_scheduler_tasks.status IN ('retry_wait', 'failed')
                         THEN 'queued'
                     WHEN background_scheduler_tasks.status = 'parked'
                         THEN 'queued'
@@ -222,7 +211,7 @@ impl StorageState {
                 END,
                  ready_since_ms = CASE
                     WHEN excluded.manual_pending = 1
-                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded', 'failed')
+                         AND background_scheduler_tasks.status IN ('retry_wait', 'failed')
                         THEN excluded.ready_since_ms
                     WHEN background_scheduler_tasks.status = 'parked'
                         THEN excluded.ready_since_ms
@@ -232,7 +221,7 @@ impl StorageState {
                 END,
                  next_attempt_at_ms = CASE
                     WHEN excluded.manual_pending = 1
-                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded', 'failed')
+                         AND background_scheduler_tasks.status IN ('retry_wait', 'failed')
                         THEN 0
                     WHEN background_scheduler_tasks.status = 'parked'
                         THEN 0
@@ -242,7 +231,7 @@ impl StorageState {
                 END,
                 failure_count = CASE
                     WHEN excluded.manual_pending = 1
-                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded', 'failed')
+                         AND background_scheduler_tasks.status IN ('retry_wait', 'failed')
                         THEN 0
                     WHEN background_scheduler_tasks.status IN ('completed', 'parked')
                         THEN 0
@@ -250,7 +239,7 @@ impl StorageState {
                 END,
                 last_error = CASE
                     WHEN excluded.manual_pending = 1
-                         AND background_scheduler_tasks.status IN ('retry_wait', 'degraded', 'failed')
+                         AND background_scheduler_tasks.status IN ('retry_wait', 'failed')
                         THEN NULL
                     WHEN background_scheduler_tasks.status IN ('completed', 'parked')
                         THEN NULL
@@ -261,49 +250,6 @@ impl StorageState {
             )
             .map_err(|e| format!("Failed to enqueue background task: {e}"))?;
         Ok(changed > 0)
-    }
-
-    /// Put a task back into the runnable queue after an explicit user action.
-    /// This is used to release a Python task from the in-process degraded
-    /// monitor state after the user manually starts the monitor.
-    pub fn resume_background_task(&self, task_kind: &str, now_ms: i64) -> Result<(), String> {
-        let guard = self.get_connection_named("resume_background_task")?;
-        let conn = guard
-            .as_ref()
-            .ok_or_else(|| "Database not initialized".to_string())?;
-        conn.execute(
-            "UPDATE background_scheduler_tasks
-             SET status = 'queued', ready_since_ms = ?2, next_attempt_at_ms = 0,
-                 failure_count = 0, last_error = NULL
-             WHERE task_kind = ?1 AND status = 'degraded'",
-            params![task_kind, now_ms],
-        )
-        .map_err(|e| format!("Failed to resume background task: {e}"))?;
-        Ok(())
-    }
-
-    /// Persist a non-retryable degraded state. Unlike `retry_wait`, this state
-    /// is not made eligible by a timer; an explicit manual recovery action or
-    /// a fresh process must release it.
-    pub fn mark_background_task_degraded(
-        &self,
-        task_kind: &str,
-        error: &str,
-    ) -> Result<(), String> {
-        let guard = self.get_connection_named("mark_background_task_degraded")?;
-        let conn = guard
-            .as_ref()
-            .ok_or_else(|| "Database not initialized".to_string())?;
-        conn.execute(
-            "UPDATE background_scheduler_tasks
-             SET status = 'degraded', next_attempt_at_ms = 0, last_error = ?2,
-                 manual_pending = CASE WHEN manual_in_flight = 1 THEN 1 ELSE manual_pending END,
-                 manual_in_flight = 0
-             WHERE task_kind = ?1",
-            params![task_kind, error],
-        )
-        .map_err(|e| format!("Failed to mark background task degraded: {e}"))?;
-        Ok(())
     }
 
     pub fn mark_background_task_started(
@@ -369,18 +315,6 @@ impl StorageState {
         let conn = guard
             .as_ref()
             .ok_or_else(|| "Database not initialized".to_string())?;
-        // Producers mark vector debt before enqueueing. A notification arriving
-        // while this task is running is otherwise a no-op, so check the durable
-        // marker under the same DB lock as scheduler completion.
-        let has_more = has_more
-            || (task_kind == crate::background_scheduler::TASK_VECTOR_SYNC
-                && conn
-                    .query_row(
-                        "SELECT COALESCE((SELECT needs_rescan FROM task_vector_sync WHERE id=1),0)",
-                        [],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .map_err(|e| e.to_string())?);
         if has_more {
             conn.execute(
                 "UPDATE background_scheduler_tasks
@@ -820,37 +754,37 @@ mod tests {
     fn failure_and_defer_restore_a_manual_request_to_pending() {
         let (_temp, storage) = test_storage();
         storage
-            .enqueue_background_task("python_clustering", true, 10)
+            .enqueue_background_task("smart_cluster", true, 10)
             .unwrap();
         storage
-            .mark_background_task_started("python_clustering", 1, true, 10)
+            .mark_background_task_started("smart_cluster", 1, true, 10)
             .unwrap();
 
         storage
-            .mark_background_task_failed("python_clustering", 1, 500, "temporary")
+            .mark_background_task_failed("smart_cluster", 1, 500, "temporary")
             .unwrap();
         let failed = storage
-            .background_scheduler_task("python_clustering")
+            .background_scheduler_task("smart_cluster")
             .unwrap()
             .unwrap();
         assert!(failed.manual_pending);
         assert_eq!(failed.status, "retry_wait");
-        assert_eq!(raw_manual_flags(&storage, "python_clustering"), (1, 0));
+        assert_eq!(raw_manual_flags(&storage, "smart_cluster"), (1, 0));
 
         storage
-            .mark_background_task_started("python_clustering", 2, true, 500)
+            .mark_background_task_started("smart_cluster", 2, true, 500)
             .unwrap();
         storage
-            .defer_background_task("python_clustering", 900, "waiting_for_unlock")
+            .defer_background_task("smart_cluster", 900, "waiting_for_unlock")
             .unwrap();
         let deferred = storage
-            .background_scheduler_task("python_clustering")
+            .background_scheduler_task("smart_cluster")
             .unwrap()
             .unwrap();
         assert!(deferred.manual_pending);
         assert_eq!(deferred.status, "queued");
         assert_eq!(deferred.next_attempt_at_ms, 900);
-        assert_eq!(raw_manual_flags(&storage, "python_clustering"), (1, 0));
+        assert_eq!(raw_manual_flags(&storage, "smart_cluster"), (1, 0));
     }
 
     #[test]
@@ -931,17 +865,17 @@ mod tests {
     fn manual_enqueue_releases_retry_wait_immediately() {
         let (_temp, storage) = test_storage();
         storage
-            .enqueue_background_task("python_clustering", false, 10)
+            .enqueue_background_task("smart_cluster", false, 10)
             .unwrap();
         storage
-            .mark_background_task_failed("python_clustering", 2, 9_999, "temporary")
+            .mark_background_task_failed("smart_cluster", 2, 9_999, "temporary")
             .unwrap();
         storage
-            .enqueue_background_task("python_clustering", true, 20)
+            .enqueue_background_task("smart_cluster", true, 20)
             .unwrap();
 
         let task = storage
-            .background_scheduler_task("python_clustering")
+            .background_scheduler_task("smart_cluster")
             .unwrap()
             .unwrap();
         assert_eq!(task.status, "queued");
@@ -952,69 +886,42 @@ mod tests {
     }
 
     #[test]
-    fn degraded_task_can_only_resume_explicitly() {
-        let (_temp, storage) = test_storage();
-        storage
-            .enqueue_background_task("python_clustering", false, 10)
-            .unwrap();
-        storage
-            .mark_background_task_degraded("python_clustering", "manual start required")
-            .unwrap();
-        let degraded = storage
-            .background_scheduler_task("python_clustering")
-            .unwrap()
-            .unwrap();
-        assert_eq!(degraded.status, "degraded");
-        assert!(!degraded.is_eligible(100_000));
-
-        storage
-            .resume_background_task("python_clustering", 50)
-            .unwrap();
-        let resumed = storage
-            .background_scheduler_task("python_clustering")
-            .unwrap()
-            .unwrap();
-        assert_eq!(resumed.status, "queued");
-        assert_eq!(resumed.ready_since_ms, 50);
-    }
-
-    #[test]
     fn parked_task_preserves_completion_and_manual_request_until_reenabled() {
         let (_temp, storage) = test_storage();
         storage
-            .enqueue_background_task("python_clustering", false, 10)
+            .enqueue_background_task("smart_cluster", false, 10)
             .unwrap();
         storage
-            .mark_background_task_started("python_clustering", 1, false, 10)
+            .mark_background_task_started("smart_cluster", 1, false, 10)
             .unwrap();
         storage
-            .mark_background_task_succeeded("python_clustering", false, 20)
+            .mark_background_task_succeeded("smart_cluster", false, 20)
             .unwrap();
         storage
-            .enqueue_background_task("python_clustering", true, 30)
+            .enqueue_background_task("smart_cluster", true, 30)
             .unwrap();
         storage
-            .mark_background_task_started("python_clustering", 2, true, 30)
+            .mark_background_task_started("smart_cluster", 2, true, 30)
             .unwrap();
 
         storage
-            .park_background_task("python_clustering", "feature_disabled")
+            .park_background_task("smart_cluster", "feature_disabled")
             .unwrap();
         let parked = storage
-            .background_scheduler_task("python_clustering")
+            .background_scheduler_task("smart_cluster")
             .unwrap()
             .unwrap();
         assert_eq!(parked.status, "parked");
         assert_eq!(parked.last_completed_at_ms, Some(20));
         assert_eq!(parked.last_error.as_deref(), Some("feature_disabled"));
         assert!(parked.manual_pending);
-        assert_eq!(raw_manual_flags(&storage, "python_clustering"), (1, 0));
+        assert_eq!(raw_manual_flags(&storage, "smart_cluster"), (1, 0));
 
         storage
-            .enqueue_background_task("python_clustering", false, 40)
+            .enqueue_background_task("smart_cluster", false, 40)
             .unwrap();
         let resumed = storage
-            .background_scheduler_task("python_clustering")
+            .background_scheduler_task("smart_cluster")
             .unwrap()
             .unwrap();
         assert_eq!(resumed.status, "queued");
@@ -1024,6 +931,6 @@ mod tests {
         assert_eq!(resumed.last_error, None);
         assert!(resumed.manual_pending);
         assert!(resumed.is_eligible(40));
-        assert_eq!(raw_manual_flags(&storage, "python_clustering"), (1, 0));
+        assert_eq!(raw_manual_flags(&storage, "smart_cluster"), (1, 0));
     }
 }

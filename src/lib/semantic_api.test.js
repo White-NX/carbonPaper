@@ -11,24 +11,19 @@ vi.mock('./auth_api', () => ({
 
 import { withAuth } from './auth_api';
 import {
-  getTasks,
-  getTaskScreenshots,
   getSmartClusterOcrCorpus,
   getSmartClusterSummary,
   upsertSmartClusterSummary,
   deleteSmartClusterSummary,
-  removeTaskScreenshot,
-  runClustering,
-  setClusteringInterval,
   getMinilmRebuildStatus,
   listMinilmRebuildErrors,
   getClipRebuildStatus,
   getBlindIndexRepairStatus,
   listClipRebuildErrors,
   getMaintenanceStatus,
-} from './task_api';
+} from './semantic_api';
 
-describe('task_api', () => {
+describe('semantic_api', () => {
   beforeEach(() => {
     invoke.mockReset();
     withAuth.mockClear();
@@ -43,79 +38,6 @@ describe('task_api', () => {
       expect(call?.[1]).toEqual(options);
     }
   };
-
-  it('calls getTasks with default payload', async () => {
-    invoke.mockResolvedValue([]);
-
-    await getTasks();
-
-    expect(invoke).toHaveBeenCalledWith('storage_get_tasks', {
-      layer: null,
-      startTime: null,
-      endTime: null,
-      hideInactive: true,
-      hideEntertainment: true,
-      hideSocial: true,
-    });
-    expectWithAuth(1);
-  });
-
-  it('calls getTaskScreenshots with defaults', async () => {
-    invoke.mockResolvedValue([]);
-
-    await getTaskScreenshots(123);
-
-    expect(invoke).toHaveBeenCalledWith('storage_get_task_screenshots', {
-      taskId: 123,
-      page: 0,
-      pageSize: 50,
-    });
-    expectWithAuth(1);
-  });
-
-  it('calls removeTaskScreenshot with expected payload', async () => {
-    invoke.mockResolvedValue(11);
-
-    await removeTaskScreenshot(123, 456);
-
-    expect(invoke).toHaveBeenCalledWith('storage_remove_task_screenshot', {
-      taskId: 123,
-      screenshotId: 456,
-    });
-    expectWithAuth(1, { autoPrompt: true });
-  });
-
-  it('throws when runClustering returns error', async () => {
-    invoke.mockResolvedValue({ error: 'AUTH_REQUIRED' });
-
-    await expect(runClustering()).rejects.toThrow('AUTH_REQUIRED');
-    expectWithAuth(1, { autoPrompt: false });
-  });
-
-  it.each(['', ' \n ', null])('throws a fallback for a blank clustering error: %j', async (error) => {
-    invoke.mockResolvedValue({ error });
-
-    await expect(runClustering({ manual: true })).rejects.toThrow('CLUSTERING_FAILED');
-    expectWithAuth(1, { autoPrompt: true });
-  });
-
-  it('sends clustering commands with provided params', async () => {
-    invoke.mockResolvedValue({ status: 'success' });
-
-    await runClustering({ startTime: 10, endTime: 20 });
-    await setClusteringInterval('1w');
-
-    expect(invoke).toHaveBeenNthCalledWith(1, 'monitor_run_clustering', {
-      startTime: 10,
-      endTime: 20,
-      clusteringMode: 'auto',
-      manual: false,
-    });
-
-    expect(invoke).toHaveBeenNthCalledWith(2, 'monitor_set_clustering_interval', { interval: '1w' });
-    expectWithAuth(1, { autoPrompt: false });
-    expectWithAuth(2, { autoPrompt: true });
-  });
 
   it('exposes read-only MiniLM migration status commands', async () => {
     invoke.mockResolvedValue({ running: true });
