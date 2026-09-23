@@ -15,13 +15,13 @@ vi.mock('./Dialog', () => ({
   Dialog: ({ isOpen, children }) => (isOpen ? <div>{children}</div> : null),
 }));
 
-vi.mock('../lib/task_api', () => ({
+vi.mock('../lib/semantic_api', () => ({
   getClipBackfillOffer: vi.fn(),
   setClipBackfillDecision: vi.fn(),
 }));
 
 import ClipBackfillDialog from './ClipBackfillDialog';
-import { getClipBackfillOffer, setClipBackfillDecision } from '../lib/task_api';
+import { getClipBackfillOffer, setClipBackfillDecision } from '../lib/semantic_api';
 
 const offer = (overrides = {}) => ({
   migration_settled: true,

@@ -84,7 +84,6 @@ fn compute_storage_stats(data_dir: PathBuf) -> Result<StorageStats, String> {
         .unwrap_or_else(|| data_dir.join("models"));
 
     let screenshots_dir = data_dir.join("screenshots");
-    let chroma_dir = data_dir.join("chroma_db");
     let ocr_db = data_dir.join("screenshots.db");
 
     let models_bytes = if models_dir.exists() {
@@ -97,18 +96,10 @@ fn compute_storage_stats(data_dir: PathBuf) -> Result<StorageStats, String> {
     } else {
         0
     };
-    let database_bytes = {
-        let chroma_size = if chroma_dir.exists() {
-            directory_size(&chroma_dir)
-        } else {
-            0
-        };
-        let ocr_size = if ocr_db.exists() {
-            file_size(&ocr_db)
-        } else {
-            0
-        };
-        chroma_size + ocr_size
+    let database_bytes = if ocr_db.exists() {
+        file_size(&ocr_db)
+    } else {
+        0
     };
     let data_dir_bytes = if data_dir.exists() {
         directory_size(&data_dir)

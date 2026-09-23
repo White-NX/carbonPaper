@@ -2,9 +2,7 @@
 //!
 //! CRUD over the SQLite tables defined in `storage/smart_cluster.rs`,
 //! plus thin orchestration helpers (drain-now flag, status fetch).
-//! The actual scoring logic lives in the Python worker; these commands
-//! just write to the persistence layer and signal the worker via a
-//! reverse-IPC ping or the next idle poll.
+//! Scoring runs in Rust through the unified background scheduler.
 
 use std::sync::Arc;
 
@@ -18,9 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use super::check_auth_required;
 
-/// Days of hot-layer screenshots to consider when backfilling on cluster
-/// creation. Matches `monitor/task_clustering.py::HOT_LAYER_DAYS` and the
-/// pending-queue TTL in `storage::smart_cluster`.
+/// Days of screenshots to consider when backfilling on cluster creation.
+/// Matches the pending-queue TTL in `storage::smart_cluster`.
 const HOT_LAYER_DAYS: i64 = 30;
 
 fn normalize_anchor_text(anchor: &str) -> Result<String, String> {
@@ -58,7 +55,7 @@ pub struct CreateSmartClusterResponse {
 /// Lists every user-defined smart cluster.
 ///
 /// Authentication: required. Returns `SmartClusterRecord[]`.
-/// Frontend: `lib/task_api.js`.
+/// Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_list(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -70,7 +67,7 @@ pub fn smart_cluster_list(
 
 /// Returns one smart cluster by `id`, or JSON `null` when it does not exist.
 ///
-/// Authentication: required. Frontend: `lib/task_api.js`.
+/// Authentication: required. Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_get(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -84,7 +81,7 @@ pub fn smart_cluster_get(
 /// Returns calibration examples stored for cluster `id`.
 ///
 /// Authentication: required. Returns `SmartClusterExample[]`.
-/// Frontend: `lib/task_api.js`.
+/// Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_get_examples(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -98,7 +95,7 @@ pub fn smart_cluster_get_examples(
 /// Creates a smart cluster and queues recent screenshots for scoring.
 ///
 /// Authentication: required. `req` contains anchor text, threshold, optional color, and
-/// examples. Returns `{ "id": number, "enqueued": number }`. Frontend: `lib/task_api.js`.
+/// examples. Returns `{ "id": number, "enqueued": number }`. Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub async fn smart_cluster_create(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -190,7 +187,7 @@ fn configured_scorer() -> crate::storage::smart_cluster::SmartClusterScorer {
 
 /// Deletes cluster `id` and its dependent data.
 ///
-/// Authentication: required. Returns JSON `null`. Frontend: `lib/task_api.js`.
+/// Authentication: required. Returns JSON `null`. Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_delete(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -203,7 +200,7 @@ pub fn smart_cluster_delete(
 
 /// Renames cluster `id`.
 ///
-/// Authentication: required. Returns JSON `null`. Frontend: `lib/task_api.js`.
+/// Authentication: required. Returns JSON `null`. Frontend: `lib/semantic_api.js`.
 ///
 /// The name is a label. The anchor text a cluster matches against is fixed at
 /// creation, when its threshold is calibrated against examples the user picked
@@ -225,7 +222,7 @@ pub fn smart_cluster_rename(
 
 /// Changes the match threshold for cluster `id`.
 ///
-/// Authentication: required. Returns JSON `null`. Frontend: `lib/task_api.js`.
+/// Authentication: required. Returns JSON `null`. Frontend: `lib/semantic_api.js`.
 ///
 /// A hand-adjusted threshold is stamped with the current scorer for the same
 /// reason a calibrated one is: the number is only meaningful next to the logits
@@ -245,7 +242,7 @@ pub fn smart_cluster_update_threshold(
 
 /// Enables or disables scoring for cluster `id`.
 ///
-/// Authentication: required. Returns JSON `null`. Frontend: `lib/task_api.js`.
+/// Authentication: required. Returns JSON `null`. Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_toggle_enabled(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -260,7 +257,7 @@ pub fn smart_cluster_toggle_enabled(
 /// Returns a page of screenshot assignments for `cluster_id`.
 ///
 /// Authentication: required. Pagination defaults to page 0 and size 50; returns
-/// `SmartClusterAssignmentStub[]`. Frontend: `lib/task_api.js`.
+/// `SmartClusterAssignmentStub[]`. Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_assignments(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -276,7 +273,7 @@ pub fn smart_cluster_assignments(
 /// Returns a page of OCR corpus items for summarizing `cluster_id`.
 ///
 /// Authentication: required. Pagination defaults to page 0 and size 50; returns
-/// `SmartClusterOcrCorpusItem[]`. Frontend: `lib/task_api.js`.
+/// `SmartClusterOcrCorpusItem[]`. Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_ocr_corpus(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -291,7 +288,7 @@ pub fn smart_cluster_ocr_corpus(
 
 /// Returns the saved summary for `cluster_id`, or JSON `null`.
 ///
-/// Authentication: required. Frontend: `lib/task_api.js`.
+/// Authentication: required. Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_get_summary(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -305,7 +302,7 @@ pub fn smart_cluster_get_summary(
 /// Creates or replaces a smart-cluster summary.
 ///
 /// Authentication: required. Returns the persisted `SmartClusterSummaryRecord`.
-/// Frontend: `lib/task_api.js`.
+/// Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_upsert_summary(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -319,7 +316,7 @@ pub fn smart_cluster_upsert_summary(
 /// Deletes the saved summary for `cluster_id`.
 ///
 /// Authentication: required. Returns whether a row was deleted.
-/// Frontend: `lib/task_api.js`.
+/// Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_delete_summary(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -337,7 +334,7 @@ pub fn smart_cluster_delete_summary(
 /// `smart_cluster_clear_assignments` first if desired.
 ///
 /// Authentication: required. Returns the number of queued screenshots.
-/// Frontend: `lib/task_api.js`.
+/// Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub async fn smart_cluster_rescan(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -370,7 +367,7 @@ pub async fn smart_cluster_rescan_all(
 
 /// Clears all screenshot assignments for `cluster_id` without deleting the cluster.
 ///
-/// Authentication: required. Returns JSON `null`. Frontend: `lib/task_api.js`.
+/// Authentication: required. Returns JSON `null`. Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_clear_assignments(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
@@ -391,7 +388,7 @@ pub struct SmartClusterStatus {
 /// Returns pending-work and enabled/total cluster counts.
 ///
 /// Authentication: required. Returns `{ "pending_count", "enabled_cluster_count",
-/// "total_cluster_count" }`. Frontend: `lib/task_api.js`.
+/// "total_cluster_count" }`. Frontend: `lib/semantic_api.js`.
 #[tauri::command]
 pub fn smart_cluster_status(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,

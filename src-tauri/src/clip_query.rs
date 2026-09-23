@@ -2,7 +2,7 @@
 //!
 //! Provides text encoding and vector similarity queries against the Rust CLIP image index.
 
-use crate::clip_migration::{
+use crate::clip_contract::{
     clip_document_id, clip_memory_uri, CLIP_DIMENSIONS, CLIP_VECTOR_SPACE_REVISION,
 };
 use crate::ml_protocol::MlSemanticModel;
@@ -75,26 +75,17 @@ struct BackendObservations {
 
 static OBSERVATIONS: RwLock<Option<BackendObservations>> = RwLock::new(None);
 
-/// Caches the one-way transition of the step-7 migration sentinel, for the same
-/// reason `semantic_query.rs` caches MiniLM's: it is written once per vector
-/// space and never cleared, so once observed the answer cannot change for the
-/// life of the process.
+/// Caches the one-way transition of the index sentinel, for the same reason
+/// `semantic_query.rs` caches MiniLM's: it is written once per vector space and
+/// never cleared, so once observed the answer cannot change for the life of
+/// the process.
 static MIGRATION_SETTLED: AtomicBool = AtomicBool::new(false);
 
-/// Whether the sentinel-triggered step-7 copy has finished for this vector
-/// space.
+/// Whether the index sentinel has settled for this vector space.
 ///
-/// The copy commits page by page and a migrated row becomes query-visible as
-/// soon as its job row reaches `completed`, so an interrupted run leaves a
-/// *prefix* of the collection: not empty, therefore not caught by the
-/// empty-index refusal, but missing whatever the cursor never reached. Ranking
-/// that returns a plausible page with screenshots silently absent from it,
-/// which is the failure this refusal exists to prevent.
-///
-/// `clip_index.rs::repair_scope` asks the same question for the write path, and
-/// for the mirror-image reason: until the copy settles, an image with no vector
-/// is one the copy has not reached, so re-encoding it would spend hours
-/// reproducing vectors Chroma already holds.
+/// Settled at startup by `legacy_vector_discard.rs`; until then the store's
+/// contents are unvouched-for and a query is refused rather than ranked.
+/// `clip_index.rs::repair_scope` asks the same question for the write path.
 pub(crate) fn migration_settled(storage: &StorageState) -> bool {
     if MIGRATION_SETTLED.load(Ordering::Relaxed) {
         return true;

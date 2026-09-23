@@ -14,6 +14,9 @@ symbol names are the durable references; line numbers are intentionally omitted.
 - This page includes the native classification changes committed alongside this
   revision of the page, following the baseline. Historical validation below belongs to its
   recorded source snapshot and does not validate later changes.
+- The current working tree also retires the automatic task module and its UI.
+- The 2026-09-20 revision retires the legacy Chroma vector exporters and both
+  sentinel-triggered vector copies in favour of an explicit, recorded discard.
 
 ## v0.8.4 Comparison
 
@@ -38,17 +41,17 @@ consumer migrations require their own validation.
 ## Current Target: Remaining Python Consumers
 
 Rust automatic work now uses A (60 seconds without input) and locally qualified,
-CPU-budgeted B during ordinary use. MiniLM, CLIP, Smart Cluster, task-vector
-projection and the resumable ANN task use independent admission and cancellation
+CPU-budgeted B during ordinary use. MiniLM, CLIP, Smart Cluster and the resumable ANN task use independent admission and cancellation
 boundaries. ANN input pages and complete checkpoints survive restarts without a
 long capture-pause window. Details and repeatable checks are in
 [Adaptive background scheduling](adaptive-background-scheduling.md).
 
-Python still owns full task clustering and its remaining Chroma consumer. Its
-automatic full-clustering entrance remains **1800 seconds** of idle time; it has
-not become a preemptible B task. Rust projects one acknowledged vector unit at a
-time before that consumer runs. ML worker protocol 4 supplies request-level
-cancellation and uses the same shared semantic worker for foreground requests.
+The PaCMAP/HDBSCAN task module has been retired, including its UI, scheduled
+runs, Chroma vector writes and synchronization. The read-only legacy vector
+exports and the two startup Chroma copies are retired as well; Python retains
+Presidio/spaCy only, and no longer imports or installs Chroma. ML worker
+protocol 4 supplies request-level cancellation and uses the shared semantic
+worker for foreground requests.
 
 The cleanup keeps these four goals:
 
@@ -73,8 +76,8 @@ The following paths are implemented and scheduled by the Tauri/Rust backend:
   `src-tauri/src/bin/ml.rs`, using the pinned `rapidocr-core` model runtime.
 - MiniLM text encoding, derived semantic storage, natural-language text
   retrieval, and idle/manual indexing in `semantic_query.rs`,
-  `semantic_runtime.rs`, and `minilm_index.rs`. Historical clustering ranges and
-  Chroma consumer reconciliation are owned by `task_vector_sync.rs`.
+  `semantic_runtime.rs`, and `minilm_index.rs`. Automatic text indexing follows
+  the Smart Cluster feature setting; explicit indexing remains available.
 - Chinese-CLIP image encoding, image retrieval, persistent ANN maintenance, and
   exact-search recovery in `clip_index.rs`, `clip_query.rs`, and `clip_ann.rs`.
 - Category scoring, scoped anchors, correction learning and postprocessing in
@@ -94,16 +97,10 @@ Python fallback counter.
 Python remains a deliberately smaller service for live consumers that have not
 yet moved:
 
-- HDBSCAN/PaCMAP task clustering in `monitor/task_clustering.py`, including the
-  `task_vectors` hot layer and `task_centroids` cold layer. Rust produces new
-  MiniLM vectors and sends them to the Python Chroma hot layer through the
-  `upsert_task_vectors` command; Python consumes those vectors for clustering.
 - Presidio and spaCy PII analysis in the Presidio worker modules.
-- Monitor lifecycle, authenticated named-pipe dispatch, and storage-session gating in `monitor/monitor/__init__.py` and related IPC
-  modules. Automatic scheduling, authorization admission and retries are owned
-  by `background_scheduler.rs`; the Python scheduler is a compatibility facade.
-- The read-only legacy CLIP exporter in `monitor/legacy_clip_export.py`, only
-  for an interrupted migration of the old Chroma `screenshots` collection.
+- Monitor lifecycle and authenticated named-pipe dispatch in
+  `monitor/monitor/__init__.py` and related IPC modules. Automatic scheduling,
+  authorization admission and retries are owned by `background_scheduler.rs`.
 
 Python must not regain OCR, Chinese-CLIP inference, semantic retrieval,
 reranking, classification or BGE inference, or Smart Cluster queue-write/drain ownership as a
@@ -115,52 +112,51 @@ SQLite remains the source of truth for screenshots, OCR, metadata, and Smart
 Cluster state. Vectors and ANN structures are derived data. They can be copied,
 rebuilt, or discarded, but they must remain versioned and diagnosable.
 
-### CLIP image migration
+### Legacy vector collections: explicit discard
 
-`src-tauri/src/clip_migration.rs` drives a resumable page cursor against four
-Python commands:
+Releases up to `v0.8.5` seeded the two derived indexes by copying the old
+Chroma collections (`task_vectors` for MiniLM, `screenshots` for Chinese-CLIP)
+through four Python export commands per collection, under global maintenance
+mode, and kept the query and repair paths closed until a once-per-revision
+sentinel in `app_metadata` said the copy had settled. Both copies, the
+`LegacyVectorExporter`, `collection_export.py`, the `chromadb`/`numpy`
+requirements, and the installer's Chroma ONNX repair are removed.
 
-- `start_clip_vectors_export`
-- `get_clip_vectors_export_status`
-- `export_clip_vectors_page`
-- `finish_clip_vectors_export`
+`src-tauri/src/legacy_vector_discard.rs` replaces them. At startup, for each
+index whose sentinel is missing, it:
 
-Those commands are implemented by `LegacyClipVectorExporter`. The exporter may
-read the existing Chroma `screenshots` collection, create no collection for a
-missing source, and has no encode, query, upsert, or delete operation. Rust
-maps exported IDs to live SQLite image hashes, validates dimensions and
-finiteness, commits pages transactionally, and records unmappable rows.
+1. writes a `derived_migration_runs` row with mode `discard_legacy_chroma_v1`
+   and status `discarded`, plus a `legacy_collection_discarded` diagnostic that
+   records whether a `chroma_db` directory was present;
+2. clears any earlier CLIP backfill answer, because the question is now posed
+   over a different corpus;
+3. settles the sentinel, so `semantic_query.rs`, `clip_query.rs`,
+   `clip_index.rs::repair_scope` and the ANN bootstrap open exactly as they did
+   after a completed copy;
+4. once both sentinels are settled, removes the `chroma_db` directory.
 
-The old collection is retained only until the persisted CLIP migration is
-settled. New captures and normal image search use Rust storage/index paths.
+Nothing is copied and nothing needs Python, an unlocked vault, or maintenance
+mode. The recovery cost is bounded: MiniLM re-encodes its 30-day window from
+OCR text during idle time; CLIP re-encodes the last 7 days on its own and
+offers the full-history backfill through the existing
+`get_clip_backfill_offer` dialog, which reports a discard under "skipped", not
+"failed". Installations that completed the real copy on `v0.8.4`/`v0.8.5` keep
+their sentinels, run history and backfill answer untouched.
 
-### MiniLM task-vector migration
+Release note for users upgrading from `v0.8.3` or earlier: to keep the old
+image vectors instead of re-encoding, upgrade to `v0.8.5` first and let its
+migration finish, then upgrade again. Otherwise the discard is the documented
+path and the backfill dialog is how the vectors come back.
 
-`src-tauri/src/minilm_migration.rs` can import the existing Chroma
-`task_vectors` collection through its snapshot commands. The migration is
-read-only on the Python side and uses a persisted cursor. The Rust capture/index
-worker writes current vectors through `upsert_task_vectors`; Python task
-clustering continues to read the hot layer and writes cold centroids.
-
-Before every clustering run, `task_vector_sync.rs` reconciles the requested
-range against the live SQLite screenshots. Current vectors are reused only
-when their model/source contract matches. Missing vectors in a manual range,
-including ranges older than 30 days, are encoded by the Rust MiniLM worker.
-Automatic runs queue missing semantic work and defer clustering until it exists.
-
-`storage/task_vector_sync.rs` stores a bounded snapshot's range, high watermark,
-Chroma collection identity and acknowledged cursor in `task_vector_sync`.
-A failed write or lost response leaves the page replayable. Recreating the
-collection resets the cursor; each completed reconciliation starts a fresh scan
-on the next run, including partial gaps. A failed immediate capture mirror wakes
-the durable clustering task. Archive authorization, database generation,
-maintenance and model arbitration still apply. `monitor_get_clustering_status`
-includes the persisted `vector_sync` state.
-
-The Python consumer has no MiniLM encoder or historical backfill. Both Chroma
-collections disable embedding functions. Python's CPU ONNX dependency remains
-for Chroma; the environment installer repairs the overlapping DirectML wheel
-left by earlier versions. Native model runtime assets are independent.
+The `derived_migration_runs`, `derived_migration_subjects` and
+`derived_migration_run_errors` tables stay: they hold the history of copies
+that did run, and the discard writes into the first and third. The page-import
+methods that filled them are gone from `storage/derived_migration.rs`.
+`clip_contract.rs` and `minilm_contract.rs` keep the vector-space constants,
+job specifications and validators the live indexes share; `maintenance_support.rs`
+keeps the capture pause/restore the blind-index repair uses. Backups no longer
+archive `chroma_db`; older archives that contain it still restore, after which
+the same discard removes it.
 
 ### Classification anchors and feedback
 
@@ -299,19 +295,25 @@ rejection. Classification parity uses synthetic embeddings. A full signed
 release build and end-to-end classification against existing user archives were
 not run for these changes.
 
+### Task module retirement validation: 2026-09-19
+
+Frontend tests passed (50 files, 324 tests), Rust library tests passed (694 passed,
+1 ignored), and Python tests passed (91 service tests plus 9 bundle checks).
+The Python service suite used a 60-second per-test timeout for Presidio's cold
+dependency imports; the committed test timeout is unchanged. The frontend
+production build, Rust formatting, i18n checks and security guards passed.
+An ephemeral Chroma client with synthetic vectors verified both missing-source
+exports and existing MiniLM/CLIP exports without creating missing collections.
+A full signed release build and an interactive desktop smoke test were not run.
+
 ## Later Milestones
 
 The following work is intentionally not part of the v0.8.5 Beta cleanup:
 
-- Move task clustering's HDBSCAN/PaCMAP orchestration and its Chroma hot/cold
-  consumer only after a replacement consumer and data migration are accepted.
 - Keep Presidio/spaCy until the MCP PII contract has a replacement with the same
   language/model behavior and an explicit resource policy.
-- After those consumers are gone, remove the Python monitor process, its named
-  pipe lifecycle, and the remaining Chroma operational dependencies.
-- Remove the legacy CLIP exporter and old `screenshots` collection only after
-  every persisted CLIP migration is settled or has an explicit, recoverable
-  discard decision.
+- After those consumers are gone, remove the Python monitor process and its
+  named pipe lifecycle. No Chroma operational dependency remains.
 
 No future milestone may reintroduce a hidden fallback merely to make a missing
 model appear available. Recovery must be an explicit repair, rebuild, retry, or
@@ -325,11 +327,12 @@ The current implementation is backed by these source areas:
 | --- | --- |
 | Rust composition and command registration | `src-tauri/src/lib.rs`, `src-tauri/src/commands/` |
 | Semantic indexing and query | `src-tauri/src/semantic_query.rs`, `src-tauri/src/minilm_index.rs`, `src-tauri/src/semantic_runtime.rs` |
-| CLIP indexing, ANN, and migration | `src-tauri/src/clip_index.rs`, `src-tauri/src/clip_ann.rs`, `src-tauri/src/clip_migration.rs`, `src-tauri/src/clip_query.rs` |
+| CLIP indexing, ANN, and contract | `src-tauri/src/clip_index.rs`, `src-tauri/src/clip_ann.rs`, `src-tauri/src/clip_contract.rs`, `src-tauri/src/clip_query.rs` |
+| Legacy vector discard | `src-tauri/src/legacy_vector_discard.rs`, `src-tauri/src/storage/derived_migration.rs`, `src-tauri/src/minilm_contract.rs` |
 | Rerank and Smart Cluster scoring | `src-tauri/src/rerank.rs`, `src-tauri/src/smart_cluster_scoring.rs`, `src-tauri/src/commands/smart_cluster.rs` |
 | Native classification | `src-tauri/src/classification/`, `src-tauri/src/storage/classification.rs`, `src-tauri/src/classification_runtime.rs` |
-| Python retained service | `monitor/monitor/__init__.py`, `monitor/task_clustering.py`, `monitor/monitor/presidio_service.py` |
-| Legacy export and task-vector IPC | `monitor/legacy_clip_export.py`, `monitor/monitor/clustering_commands.py`, `monitor/storage_client.py`, `monitor/tests/test_legacy_clip_export.py` |
+| Python retained service | `monitor/monitor/__init__.py`, `monitor/monitor/presidio_service.py` |
+| Python IPC | `monitor/storage_client.py`, `monitor/tests/test_monitor_worker_contracts.py` |
 | Frontend status and controls | `src/components/settings/advanced/InferenceCards.jsx`, `src/components/settings/useAdvancedSectionController.js`, `src/lib/monitor_api.js` |
 | Security and contract tests | `scripts/security-guards.cjs`, `monitor/tests/`, `src/lib/api_contracts.test.js`, Rust module tests |
 
@@ -340,3 +343,5 @@ The current implementation is backed by these source areas:
 | 2026-08-20 | `24a09f3` plus the dirty branch working tree | Rebased the roadmap on the passed v0.8.4 gates, documented the v0.8.5 Beta ownership boundary, recorded the successful Rust, Python, frontend, security, and release-build checks, and limited the migration claim to the automated contracts that were actually run. |
 | 2026-09-14 | `693d45a` plus the native classification change committed with this page | Recorded Rust task-vector reconciliation, native classification and feedback ownership, retained Python consumers, and the validation for both batches. |
 | 2026-09-15 | `feat/adaptive-background-scheduling` | Added A/B scheduling, task-specific local qualification, request cancellation, resumable ANN checkpoints and source-versioned vector projection. Retained the 1800-second Python full-clustering gate. See [adaptive scheduling](adaptive-background-scheduling.md) for measurements and acceptance limits. |
+| 2026-09-19 | Task module retirement | Removed PaCMAP/HDBSCAN, its UI and MCP commands, vector synchronization and dedicated tests; preserved legacy records and read-only vector migration. |
+| 2026-09-20 | Legacy vector discard | Removed the Chroma exporters, both startup copies, the migration overlay states, the `chromadb`/`numpy` requirements and the installer's Chroma ONNX repair; added the startup discard that settles the index sentinels and records the decision. Rust library tests (687 passed, 1 ignored), Python tests (92), frontend tests (50 files, 321 tests), i18n check, security guards and lint passed. A release build and an upgrade smoke against a real `v0.8.3` data directory were not run. |

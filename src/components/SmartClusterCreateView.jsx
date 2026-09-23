@@ -4,7 +4,7 @@ import {
   Search, Loader2, Sparkles, AlertCircle, X, Square,
   Check, ArrowLeft, ArrowRight, Info,
 } from 'lucide-react';
-import { nlClusterQuery, nlRerankStopNow, getRerankerStatus } from '../lib/task_api';
+import { nlClusterQuery, nlRerankStopNow, getRerankerStatus } from '../lib/semantic_api';
 import { fetchThumbnailBatch } from '../lib/monitor_api';
 import { ThumbnailCard } from './ThumbnailCard';
 import { PageHeader } from './PageHeader';

@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(RERANK_OCR_SNIPPET_CHARS, 600);
         assert_ne!(
             RERANK_OCR_SNIPPET_CHARS,
-            crate::minilm_migration::MINILM_OCR_SNIPPET_CHARS
+            crate::minilm_contract::MINILM_OCR_SNIPPET_CHARS
         );
 
         let ocr: String = std::iter::repeat_n('字', 900).collect();
@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn the_reranker_status_keeps_the_fields_the_calibration_screen_reads() {
-        // `task_api.js::getRerankerStatus` normalizes exactly these keys, and
+        // `semantic_api.js::getRerankerStatus` normalizes exactly these keys, and
         // `SmartClusterCreateView.jsx` tells the user the feature is not ready
         // when `available === false`. A missing key would silently become
         // "unavailable".

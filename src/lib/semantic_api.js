@@ -1,185 +1,19 @@
 /**
- * Task clustering API — Tauri command wrappers for long-term task management.
+ * Semantic search, index maintenance, and Smart Cluster Tauri command wrappers.
  */
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
-
-// ── DB-backed task queries (Rust) ──────────────────────────────────────
-
-/**
- * Get tasks from the database.
- * @param {Object} [options]
- * @param {string} [options.layer] - 'hot' | 'cold' | undefined (all)
- * @param {number} [options.startTime] - start timestamp (seconds)
- * @param {number} [options.endTime] - end timestamp (seconds)
- * @param {boolean} [options.hideInactive] - hide tasks inactive >30 days (default true)
- * @param {boolean} [options.hideEntertainment] - hide entertainment-dominated tasks (default true)
- * @param {boolean} [options.hideSocial] - hide social-dominated tasks (default true)
- * @returns {Promise<Array>} TaskRecord[]
- */
-export async function getTasks({ layer, startTime, endTime, hideInactive = true, hideEntertainment = true, hideSocial = true } = {}) {
-  return withAuth(() => invoke('storage_get_tasks', {
-    layer: layer || null,
-    startTime: startTime ?? null,
-    endTime: endTime ?? null,
-    hideInactive,
-    hideEntertainment,
-    hideSocial,
-  }));
-}
-
-/**
- * Get screenshots assigned to a specific task.
- * @param {number} taskId
- * @param {number} [page=0]
- * @param {number} [pageSize=50]
- * @returns {Promise<Array>} TaskScreenshotStub[]
- */
-export async function getTaskScreenshots(taskId, page = 0, pageSize = 50) {
-  return withAuth(() => invoke('storage_get_task_screenshots', {
-    taskId,
-    page,
-    pageSize,
-  }));
-}
-
-/**
- * Rename a task.
- * @param {number} taskId
- * @param {string} label
- */
-export async function updateTaskLabel(taskId, label) {
-  return withAuth(() => invoke('storage_update_task_label', { taskId, label }), { autoPrompt: true });
-}
-
-/**
- * Delete a task (screenshots are preserved).
- * @param {number} taskId
- */
-export async function deleteTask(taskId) {
-  return withAuth(() => invoke('storage_delete_task', { taskId }), { autoPrompt: true });
-}
-
-/**
- * Remove a screenshot from a task assignment. The screenshot itself is preserved.
- * @param {number} taskId
- * @param {number} screenshotId
- * @returns {Promise<number>} Remaining assigned screenshots for the task.
- */
-export async function removeTaskScreenshot(taskId, screenshotId) {
-  return withAuth(() => invoke('storage_remove_task_screenshot', {
-    taskId,
-    screenshotId,
-  }), { autoPrompt: true });
-}
-
-/**
- * Merge multiple tasks into one.
- * @param {number[]} taskIds - First ID becomes the target.
- * @returns {Promise<number>} The surviving task ID.
- */
-export async function mergeTasks(taskIds) {
-  return withAuth(() => invoke('storage_merge_tasks', { taskIds }), { autoPrompt: true });
-}
-
-/**
- * Save clustering results to the database.
- * @param {Array} tasks - SaveTaskRequest[]
- * @returns {Promise<number[]>} New task IDs.
- */
-export async function saveClusteringResults(tasks) {
-  return withAuth(() => invoke('storage_save_clustering_results', { tasks }), { autoPrompt: true });
-}
-
-/**
- * Get screenshots related to the given screenshot (same task cluster).
- * @param {number} screenshotId
- * @param {number} [limit=8]
- * @returns {Promise<{task_id: number, task_label: string|null, screenshots: Array}>}
- */
-export async function getRelatedScreenshots(screenshotId, limit = 8) {
-  return withAuth(() => invoke('storage_get_related_screenshots', {
-    screenshotId,
-    limit,
-  }));
-}
-
-// ── Python-backed clustering commands (via monitor IPC) ────────────────
-
-/**
- * Trigger a clustering run.
- * @param {Object} [options]
- * @param {number} [options.startTime] - optional range start (seconds)
- * @param {number} [options.endTime] - optional range end (seconds)
- * @param {'auto'|'full'|'batched'} [options.clusteringMode] - resource strategy
- * @param {boolean} [options.manual] - true when invoked from a user action
- * @returns {Promise<Object>} Clustering result summary.
- */
-export async function runClustering({ startTime, endTime, clusteringMode, manual = false } = {}) {
-  const result = await withAuth(() => invoke('monitor_run_clustering', {
-    startTime: startTime ?? null,
-    endTime: endTime ?? null,
-    clusteringMode: clusteringMode || 'auto',
-    manual,
-  }), { autoPrompt: manual });
-  // Python exceptions such as MemoryError can have an empty message.
-  if (result && Object.prototype.hasOwnProperty.call(result, 'error')) {
-    const message = typeof result.error === 'string' ? result.error : '';
-    throw new Error(message.trim() ? message : 'CLUSTERING_FAILED');
-  }
-  return result;
-}
-
-/**
- * Read clustering activity, per-record preparation progress and its durable checkpoint.
- * @returns {Promise<Object>} { config, last_result, scheduler, vector_sync, clustering_progress }
- */
-export async function getClusteringStatus() {
-  return withAuth(() => invoke('monitor_get_clustering_status'));
-}
-
-/**
- * Read progress for the active or most recently persisted MiniLM migration
- * run. The migration itself is sentinel-triggered at startup and cannot be
- * started or cancelled from the frontend; an interrupted run resumes on the
- * next launch/unlock.
- */
-export async function getMinilmRebuildStatus() {
-  return invoke('get_minilm_rebuild_status');
-}
-
-/** List in-memory + persisted diagnostics and failed/discarded ledger jobs. */
-export async function listMinilmRebuildErrors(offset = 0, limit = 100) {
-  return withAuth(() => invoke('list_minilm_rebuild_errors', { offset, limit }));
-}
-
-/**
- * The same, for the Chinese-CLIP image-vector migration (M2.5 step 7).
- *
- * A separate command rather than one parameterised by index kind, because the
- * two runs have separate state and separate sentinels and only their
- * orchestration is shared. The response shape is field-compatible with the
- * MiniLM one, which is what lets a single overlay render either.
- */
-export async function getClipRebuildStatus() {
-  return invoke('get_clip_rebuild_status');
-}
 
 /** Read progress for the mandatory stale text-search index repair. */
 export async function getBlindIndexRepairStatus() {
   return invoke('get_blind_index_repair_status');
 }
 
-/** List diagnostics for the CLIP migration run. */
-export async function listClipRebuildErrors(offset = 0, limit = 100) {
-  return withAuth(() => invoke('list_clip_rebuild_errors', { offset, limit }));
-}
-
 /**
  * What a CLIP backfill would cover and cost.
  *
- * Read-only and unauthenticated, so the dialog can poll it while waiting for
- * the step-7 copy to settle. The counts it returns are deliberately separate:
+ * Read-only and unauthenticated, so the dialog can poll it before the index
+ * sentinel settles at startup. The counts it returns are deliberately separate:
  * `skipped_deleted` is the ordinary consequence of having deleted screenshots
  * and needs no action, while `never_indexed` is what a backfill would encode
  * and what `estimated_seconds` is an estimate for. The full-history census is
@@ -203,22 +37,6 @@ export async function setClipBackfillDecision(decision) {
 /** Whether the app is in global maintenance mode (blocking overlay shown). */
 export async function getMaintenanceStatus() {
   return invoke('get_maintenance_status');
-}
-
-/**
- * Set the automatic clustering interval.
- * @param {'1d'|'1w'|'1m'|'6m'} interval
- */
-export async function setClusteringInterval(interval) {
-  return withAuth(() => invoke('monitor_set_clustering_interval', { interval }), { autoPrompt: true });
-}
-
-/**
- * Get task clusters from the Python clustering manager (live data, not DB).
- * @returns {Promise<Object>} { hot_clusters, cold_clusters }
- */
-export async function getTaskClusters() {
-  return withAuth(() => invoke('monitor_get_task_clusters'));
 }
 
 /**

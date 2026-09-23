@@ -19,8 +19,8 @@ mod capture;
 mod classification;
 mod classification_runtime;
 mod clip_ann;
+mod clip_contract;
 mod clip_index;
-mod clip_migration;
 mod clip_preprocess;
 mod clip_query;
 pub mod commands;
@@ -30,15 +30,16 @@ mod error_window;
 mod i18n;
 mod idle;
 mod index_progress;
+mod legacy_vector_discard;
 mod logging;
 mod maintenance;
+mod maintenance_support;
 pub mod mcp_contract;
 mod mcp_server;
 mod mcp_smoke;
 mod mcp_token;
-mod migration_support;
+mod minilm_contract;
 mod minilm_index;
-mod minilm_migration;
 #[allow(dead_code)]
 mod ml_contracts;
 #[allow(dead_code)]
@@ -70,7 +71,6 @@ mod sensitive_filter;
 mod settings_window;
 mod smart_cluster_scoring;
 mod storage;
-mod task_vector_sync;
 mod updater;
 
 use analysis::AnalysisState;
@@ -616,16 +616,7 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     let cs = app_handle.state::<Arc<CaptureState>>();
                     let _ = monitor::stop_monitor_impl(state, cs, app_handle.clone()).await;
                     let start_state = app_handle.state::<MonitorState>();
-                    if monitor::start_monitor_impl(start_state, app_handle.clone())
-                        .await
-                        .is_ok()
-                    {
-                        if let Some(scheduler) = app_handle
-                            .try_state::<Arc<background_scheduler::BackgroundSchedulerState>>()
-                        {
-                            scheduler.clear_monitor_restart_degraded(&app_handle);
-                        }
-                    }
+                    let _ = monitor::start_monitor_impl(start_state, app_handle.clone()).await;
                 });
             }
             MENU_ID_LIGHTWEIGHT => {
@@ -888,8 +879,6 @@ pub fn run() {
         .manage(Arc::new(classification::ClassificationState::default()))
         .manage(Arc::new(background_scheduler::BackgroundSchedulerState::default()))
         .manage(Arc::new(blind_index_repair::BlindIndexRepairState::new()))
-        .manage(Arc::new(minilm_migration::MinilmMigrationState::new()))
-        .manage(Arc::new(clip_migration::ClipMigrationState::new()))
         .manage(Arc::new(clip_index::ClipIndexRunState::default()))
         .manage(Arc::new(clip_ann::ClipAnnState::default()))
         .manage(Arc::new(CaptureState::default()))
@@ -1069,12 +1058,12 @@ pub fn run() {
                             app.handle().clone(),
                         );
 
-                        // Sentinel-gated one-time Chroma copies; each waits for
-                        // unlock internally before starting. The CLIP one also
-                        // waits out the MiniLM one's maintenance guard, so the
-                        // two never pause and restore capture at the same time.
-                        minilm_migration::spawn_minilm_auto_migration(app.handle().clone());
-                        clip_migration::spawn_clip_auto_migration(app.handle().clone());
+                        // Settle the derived-index sentinels by explicit
+                        // discard of the retired Chroma collections. Needs
+                        // neither an unlocked vault nor maintenance mode.
+                        legacy_vector_discard::spawn_legacy_vector_discard(
+                            app.handle().clone(),
+                        );
                         clip_ann::spawn_startup_arm(app.handle().clone());
 
                         let app_handle_cleanup = app.handle().clone();
@@ -1242,11 +1231,6 @@ pub fn run() {
             monitor::monitor_search_nl,
             monitor::monitor_update_filters,
             monitor::monitor_update_advanced_config,
-            monitor::monitor_update_feature_config,
-            monitor::monitor_run_clustering,
-            monitor::monitor_get_clustering_status,
-            monitor::monitor_set_clustering_interval,
-            monitor::monitor_get_task_clusters,
             monitor::monitor_nl_cluster_query,
             monitor::monitor_nl_cluster_reranker_status,
             monitor::monitor_smart_cluster_worker_status,
@@ -1274,10 +1258,6 @@ pub fn run() {
             clip_ann::clip_ann_take_failure_notification,
             clip_ann::clip_ann_ack_failure_notification,
             rerank::nl_rerank_stop_now,
-            minilm_migration::get_minilm_rebuild_status,
-            minilm_migration::list_minilm_rebuild_errors,
-            clip_migration::get_clip_rebuild_status,
-            clip_migration::list_clip_rebuild_errors,
             blind_index_repair::get_blind_index_repair_status,
             maintenance::get_maintenance_status,
             monitor::monitor_remove_local_anchors_by_process,
@@ -1327,15 +1307,6 @@ pub fn run() {
             commands::database_mode::storage_get_database_mode_metadata,
             commands::database_mode::storage_check_database_mode_eligibility,
             commands::database_mode::storage_transition_wal_to_delete,
-            // 任务聚类命令
-            commands::storage::storage_get_tasks,
-            commands::storage::storage_get_related_screenshots,
-            commands::storage::storage_get_task_screenshots,
-            commands::storage::storage_update_task_label,
-            commands::storage::storage_delete_task,
-            commands::storage::storage_remove_task_screenshot,
-            commands::storage::storage_merge_tasks,
-            commands::storage::storage_save_clustering_results,
             analysis::get_analysis_overview,
             // MCP 服务命令
             commands::mcp::mcp_set_enabled,
@@ -1409,8 +1380,6 @@ pub fn run() {
             native_messaging::sync_extension_if_needed,
             commands::utility::check_extension_setup_needed,
             commands::utility::mark_extension_setup_done,
-            commands::utility::check_clustering_setup_needed,
-            commands::utility::mark_clustering_setup_done,
             commands::utility::check_smart_cluster_setup_needed,
             commands::utility::mark_smart_cluster_setup_done,
             commands::utility::get_extension_enhancement_config,

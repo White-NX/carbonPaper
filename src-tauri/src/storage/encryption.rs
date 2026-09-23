@@ -118,33 +118,6 @@ impl StorageState {
             .map_err(|error| error.to_string())
     }
 
-    /// Decrypt Chroma text for unattended work without ever allowing CNG UI.
-    pub(crate) fn decrypt_from_chromadb_silent(
-        &self,
-        encrypted: &str,
-    ) -> Result<String, BackgroundReadError> {
-        if !self.is_silent_read_authorized() {
-            return Err(BackgroundReadError::AuthRequired);
-        }
-        self.decrypt_from_chromadb_with_mode(encrypted, true)
-    }
-
-    /// Batch variant used by Python HDBSCAN metadata hydration. A single
-    /// authorization/CNG failure aborts the batch so callers retain the task
-    /// instead of silently clustering ciphertext.
-    pub(crate) fn decrypt_many_from_chromadb_silent(
-        &self,
-        encrypted_list: &[String],
-    ) -> Result<Vec<String>, BackgroundReadError> {
-        if !encrypted_list.is_empty() && !self.is_silent_read_authorized() {
-            return Err(BackgroundReadError::AuthRequired);
-        }
-        encrypted_list
-            .iter()
-            .map(|encrypted| self.decrypt_from_chromadb_with_mode(encrypted, true))
-            .collect()
-    }
-
     fn decrypt_from_chromadb_with_mode(
         &self,
         encrypted: &str,

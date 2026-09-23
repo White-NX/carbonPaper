@@ -359,9 +359,6 @@ define_mcp_tool_dispatch!(
     "get_snapshot_details" => tool_get_snapshot_details,
     "search_ocr_text" => tool_search_ocr,
     "search_nl" => tool_search_nl,
-    "get_task_clusters" => tool_get_task_clusters,
-    "get_task_screenshots" => tool_get_task_screenshots,
-    "rename_task" => tool_rename_task,
     "get_smart_clusters" => tool_get_smart_clusters,
     "get_smart_cluster_ocr_corpus" => tool_get_smart_cluster_ocr_corpus,
     "get_smart_cluster_summary" => tool_get_smart_cluster_summary,
@@ -1067,7 +1064,7 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
                             }
                             _ => {
                                 // "reject" mode
-                                return Ok((r, ocr_results, None, true));
+                                return Ok((r, ocr_results, true));
                             }
                         }
                     }
@@ -1077,7 +1074,7 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
                         match filter_mode.as_str() {
                             "reject" => {
                                 if links.iter().any(|l| filter.contains_sensitive(&l.text)) {
-                                    return Ok((r, ocr_results, None, true));
+                                    return Ok((r, ocr_results, true));
                                 }
                             }
                             "remove_paragraph" => {
@@ -1113,7 +1110,7 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
                                 .iter()
                                 .any(|o| filter.contains_sensitive(&o.text));
                             if any_sensitive {
-                                return Ok((r, ocr_results, None, true));
+                                return Ok((r, ocr_results, true));
                             }
                         }
                         "remove_paragraph" => {
@@ -1121,8 +1118,7 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
                                 .into_iter()
                                 .filter(|o| !filter.contains_sensitive(&o.text))
                                 .collect();
-                            let related = storage.get_related_screenshots(r.id, 0)?;
-                            return Ok((r, ocr_results, Some(related), false));
+                            return Ok((r, ocr_results, false));
                         }
                         "mask" => {
                             let ocr_results: Vec<_> = ocr_results
@@ -1132,15 +1128,13 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
                                     o
                                 })
                                 .collect();
-                            let related = storage.get_related_screenshots(r.id, 0)?;
-                            return Ok((r, ocr_results, Some(related), false));
+                            return Ok((r, ocr_results, false));
                         }
                         _ => {}
                     }
                 }
 
-                let related = storage.get_related_screenshots(r.id, 0)?;
-                Ok((r, ocr_results, Some(related), false))
+                Ok((r, ocr_results, false))
             }
             None => Err("not_found".to_string()),
         }
@@ -1149,13 +1143,12 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
     .map_err(|e| format!("Task join error: {:?}", e))?;
 
     // Handle not found or DB errors
-    let (mut r, mut ocr_results, related_opt, dict_rejected) = match result {
+    let (mut r, mut ocr_results, dict_rejected) = match result {
         Ok(tuple) => tuple,
         Err(ref e) if e == "not_found" => {
             return Ok(serde_json::json!({
                 "record": null,
-                "ocr_results": [],
-                "task": null
+                "ocr_results": []
             }));
         }
         Err(e) => return Err(e),
@@ -1167,7 +1160,6 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
             "error": "Rejected by user's privacy settings"
         }));
     }
-    let related = related_opt.unwrap();
 
     // Presidio second-pass (tier 2)
     let has_content = !ocr_results.is_empty()
@@ -1320,18 +1312,9 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
             .collect::<Vec<_>>()
             .into()
     };
-    let task = if related.task_id >= 0 {
-        serde_json::json!({
-            "task_id": related.task_id,
-            "task_label": related.task_label
-        })
-    } else {
-        Value::Null
-    };
     Ok(serde_json::json!({
         "record": r,
-        "ocr_results": ocr_value,
-        "task": task
+        "ocr_results": ocr_value
     }))
 }
 
@@ -1633,256 +1616,6 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
         .collect();
 
     Ok(Value::Array(cleaned))
-}
-
-async fn tool_get_task_clusters(state: &McpServerInner, args: Value) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
-
-    let layer = args.get("layer").and_then(|v| v.as_str()).map(String::from);
-    let start_time = args.get("start_time").and_then(|v| v.as_f64());
-    let end_time = args.get("end_time").and_then(|v| v.as_f64());
-    let hide_inactive = args.get("hide_inactive").and_then(|v| v.as_bool());
-
-    let storage = state.app_handle.state::<Arc<StorageState>>();
-    let storage_clone = storage.inner().clone();
-    let layer_clone = layer.clone();
-    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
-    let filter = filter.inner().clone();
-    let (presidio_enabled, presidio_lang, presidio_entities) = filter.get_presidio_config();
-    let app_handle = state.app_handle.clone();
-
-    let mut tasks = tokio::task::spawn_blocking(move || {
-        let filter_mode = filter.get_mode();
-        let tasks = storage_clone.get_tasks(
-            layer_clone.as_deref(),
-            start_time,
-            end_time,
-            hide_inactive,
-            None,
-            None,
-        )?;
-        let tasks: Vec<_> = tasks
-            .into_iter()
-            .filter(|t| match filter_mode.as_str() {
-                "remove_paragraph" | "mask" => true,
-                _ => {
-                    let label = t.label.as_deref();
-                    let auto_label = t.auto_label.as_deref();
-                    let mut texts: Vec<&str> = Vec::new();
-                    if let Some(l) = auto_label {
-                        texts.push(l);
-                    }
-                    !filter.is_record_sensitive(label, &texts)
-                }
-            })
-            .map(|mut t| {
-                if filter.is_enabled() {
-                    let is_mask = filter_mode == "mask";
-                    if let Some(ref label) = t.label {
-                        if filter.contains_sensitive(label) {
-                            t.label = Some(if is_mask {
-                                filter.mask_sensitive(label)
-                            } else {
-                                CENSORED_LABEL.to_string()
-                            });
-                        }
-                    }
-                    if let Some(ref auto_label) = t.auto_label {
-                        if filter.contains_sensitive(auto_label) {
-                            t.auto_label = Some(if is_mask {
-                                filter.mask_sensitive(auto_label)
-                            } else {
-                                CENSORED_LABEL.to_string()
-                            });
-                        }
-                    }
-                }
-                t
-            })
-            .collect();
-        Ok::<_, String>(tasks)
-    })
-    .await
-    .map_err(|e| format!("Task join error: {:?}", e))??;
-
-    // Presidio second-pass on task labels
-    // Analyze label and auto_label independently so PII offsets are correct for each field.
-    if presidio_enabled && !tasks.is_empty() {
-        let mut all_texts: Vec<String> = Vec::new();
-        // Per-task indices into all_texts: (label_index, auto_label_index)
-        let mut pii_indices: Vec<(Option<usize>, Option<usize>)> = Vec::new();
-        for t in tasks.iter() {
-            let label_idx = t.label.as_ref().map(|l| {
-                let idx = all_texts.len();
-                all_texts.push(l.clone());
-                idx
-            });
-            let auto_label_idx = t.auto_label.as_ref().map(|al| {
-                let idx = all_texts.len();
-                all_texts.push(al.clone());
-                idx
-            });
-            pii_indices.push((label_idx, auto_label_idx));
-        }
-        let pii_results =
-            presidio_analyze_texts(&app_handle, &all_texts, &presidio_lang, &presidio_entities)
-                .await;
-        let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
-        let mode = filter_reload.get_mode();
-        match mode.as_str() {
-            "reject" => {
-                let mut keep = Vec::new();
-                for (i, t) in tasks.into_iter().enumerate() {
-                    let (li, ali) = pii_indices[i];
-                    let any_pii = li.map_or(false, |idx| has_pii(&pii_results[idx]))
-                        || ali.map_or(false, |idx| has_pii(&pii_results[idx]));
-                    if !any_pii {
-                        keep.push(t);
-                    }
-                }
-                tasks = keep;
-            }
-            "remove_paragraph" => {
-                for (i, t) in tasks.iter_mut().enumerate() {
-                    let (li, ali) = pii_indices[i];
-                    let any_pii = li.map_or(false, |idx| has_pii(&pii_results[idx]))
-                        || ali.map_or(false, |idx| has_pii(&pii_results[idx]));
-                    if any_pii {
-                        t.label = Some(CENSORED_LABEL.to_string());
-                        t.auto_label = Some(CENSORED_LABEL.to_string());
-                    }
-                }
-            }
-            "mask" => {
-                for (i, t) in tasks.iter_mut().enumerate() {
-                    let (li, ali) = pii_indices[i];
-                    if let (Some(ref label), Some(idx)) = (&t.label, li) {
-                        if has_pii(&pii_results[idx]) {
-                            t.label = Some(mask_pii_in_text(label, &pii_results[idx]));
-                        }
-                    }
-                    if let (Some(ref auto_label), Some(idx)) = (&t.auto_label, ali) {
-                        if has_pii(&pii_results[idx]) {
-                            t.auto_label = Some(mask_pii_in_text(auto_label, &pii_results[idx]));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(serde_json::to_value(&tasks).unwrap_or(Value::Null))
-}
-
-async fn tool_get_task_screenshots(state: &McpServerInner, args: Value) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
-
-    let task_id = args
-        .get("task_id")
-        .and_then(|v| v.as_i64())
-        .ok_or("Missing required parameter: task_id")?;
-    let page = args.get("page").and_then(|v| v.as_i64()).unwrap_or(0);
-    let page_size = args.get("page_size").and_then(|v| v.as_i64()).unwrap_or(50);
-
-    let storage = state.app_handle.state::<Arc<StorageState>>();
-    let storage = storage.inner().clone();
-    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
-    let filter = filter.inner().clone();
-    let (presidio_enabled, presidio_lang, presidio_entities) = filter.get_presidio_config();
-    let app_handle = state.app_handle.clone();
-
-    let mut screenshots = tokio::task::spawn_blocking(move || {
-        let filter_mode = filter.get_mode();
-        let screenshots = storage.get_task_screenshots(task_id, page, page_size)?;
-        let screenshots: Vec<_> = screenshots
-            .into_iter()
-            .filter(|s| match filter_mode.as_str() {
-                "remove_paragraph" | "mask" => true,
-                _ => !filter.is_record_sensitive(s.window_title.as_deref(), &[]),
-            })
-            .map(|mut s| {
-                if filter.is_enabled() {
-                    if let Some(ref title) = s.window_title {
-                        if filter.contains_sensitive(title) {
-                            s.window_title = Some(match filter_mode.as_str() {
-                                "mask" => filter.mask_sensitive(title),
-                                _ => CENSORED_LABEL.to_string(),
-                            });
-                        }
-                    }
-                }
-                s
-            })
-            .collect();
-        Ok::<_, String>(screenshots)
-    })
-    .await
-    .map_err(|e| format!("Task join error: {:?}", e))??;
-
-    // Presidio second-pass on window titles
-    if presidio_enabled && !screenshots.is_empty() {
-        let titles: Vec<String> = screenshots
-            .iter()
-            .map(|s| s.window_title.clone().unwrap_or_default())
-            .collect();
-        let pii_results =
-            presidio_analyze_texts(&app_handle, &titles, &presidio_lang, &presidio_entities).await;
-        let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
-        let mode = filter_reload.get_mode();
-        match mode.as_str() {
-            "reject" => {
-                let mut keep = Vec::new();
-                for (i, s) in screenshots.into_iter().enumerate() {
-                    if !has_pii(&pii_results[i]) {
-                        keep.push(s);
-                    }
-                }
-                screenshots = keep;
-            }
-            "remove_paragraph" => {
-                for (i, s) in screenshots.iter_mut().enumerate() {
-                    if has_pii(&pii_results[i]) {
-                        s.window_title = Some(CENSORED_LABEL.to_string());
-                    }
-                }
-            }
-            "mask" => {
-                for (i, s) in screenshots.iter_mut().enumerate() {
-                    if has_pii(&pii_results[i]) {
-                        s.window_title = Some(mask_pii_in_text(
-                            &s.window_title.clone().unwrap_or_default(),
-                            &pii_results[i],
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(serde_json::to_value(&screenshots).unwrap_or(Value::Null))
-}
-
-async fn tool_rename_task(state: &McpServerInner, args: Value) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
-
-    let task_id = args
-        .get("task_id")
-        .and_then(|v| v.as_i64())
-        .ok_or("Missing required parameter: task_id")?;
-    let label = args
-        .get("label")
-        .and_then(|v| v.as_str())
-        .ok_or("Missing required parameter: label")?
-        .to_string();
-
-    let storage = state.app_handle.state::<Arc<StorageState>>();
-    let storage = storage.inner().clone();
-    tokio::task::spawn_blocking(move || storage.update_task_label(task_id, &label))
-        .await
-        .map_err(|e| format!("Task join error: {:?}", e))?
-        .map(|_| serde_json::json!({"status": "ok"}))
 }
 
 async fn tool_get_smart_clusters(state: &McpServerInner, _args: Value) -> Result<Value, String> {

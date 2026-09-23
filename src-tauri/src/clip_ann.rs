@@ -9,7 +9,7 @@ use crate::ann_format::{
     MappedFlatIndex, ANN_ALGORITHM, ANN_CONNECTIVITY, ANN_EXPANSION_ADD,
     ANN_IMPLEMENTATION_VERSION, ANN_METRIC, ANN_QUANTIZATION, FORMAT_VERSION,
 };
-use crate::clip_migration::{
+use crate::clip_contract::{
     CLIP_DIMENSIONS, CLIP_EMBEDDING_VERSION, CLIP_MODEL_ID, CLIP_VECTOR_SPACE_REVISION,
 };
 use crate::registry_config;
@@ -917,18 +917,13 @@ pub fn spawn_startup_arm(app: AppHandle) {
     });
 }
 
-/// Arrange a one-time bootstrap for an already-migrated installation. The
-/// Chroma migration path calls [`bootstrap_in_maintenance`] directly while it
-/// already owns the maintenance/capture pause; this coordinator is only for
-/// the case where the legacy SQLite rows were present before ANN support was
-/// introduced.
+/// Arrange a one-time bootstrap for an installation whose index is settled but
+/// has no persisted generation yet.
 fn spawn_missing_generation_bootstrap(app: AppHandle, state: Arc<ClipAnnState>) {
     tauri::async_runtime::spawn(async move {
-        // Do not compete with the CLIP Chroma copy. If it is needed, that copy
-        // builds the ANN in its existing maintenance window. The migration
-        // auto-triggers retry maintenance contention, so another startup
-        // migration that races this ANN-only task waits rather than being
-        // postponed to the next launch.
+        // Wait for the index sentinel (settled at startup by the legacy
+        // discard task) and for any other maintenance task to finish, rather
+        // than being postponed to the next launch.
         loop {
             if state.has_generation() {
                 return;
@@ -957,11 +952,6 @@ fn spawn_missing_generation_bootstrap(app: AppHandle, state: Arc<ClipAnnState>) 
 
 fn startup_bootstrap_ready(clip_done: bool, maintenance_active: bool) -> bool {
     clip_done && !maintenance_active
-}
-
-/// Migration and retry callers only enqueue; the durable task owns all builds.
-pub async fn bootstrap_in_maintenance(app: &AppHandle) -> Result<bool, String> {
-    maybe_rebuild(app, false).await
 }
 
 pub async fn maybe_rebuild(app: &AppHandle, force: bool) -> Result<bool, String> {

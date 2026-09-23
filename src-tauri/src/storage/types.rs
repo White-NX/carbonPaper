@@ -40,7 +40,7 @@ pub struct ScreenshotRecord {
     pub category_confidence: Option<f64>,
 }
 
-/// Minimal decrypted screenshot metadata used by unattended clustering work.
+/// Minimal decrypted screenshot metadata used by background semantic processing.
 ///
 /// Keeping this separate from `ScreenshotRecord` prevents background workers
 /// from decrypting unrelated fields such as page icons, links, or metadata.

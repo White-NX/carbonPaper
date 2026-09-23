@@ -4,7 +4,6 @@ Provides ``start()`` / ``stop()`` and the IPC command dispatcher that
 bridges Rust - Python communication.
 """
 
-from . import config
 from .config import (
     paused_event,
     stop_event,
@@ -12,33 +11,15 @@ from .config import (
     update_exclusion_settings,
     get_exclusion_settings,
     _get_process_icon_base64,
-    update_clustering_resource_config,
-    update_feature_config,
 )
-from .clustering_commands import handle_clustering_command
-from legacy_clip_export import LegacyClipVectorExporter
-from .ipc_pipe import start_pipe_server
 import os
 import uuid
-import base64
-import json
 import logging
-import time
 import threading
 
 logger = logging.getLogger(__name__)
 
-# Short cache for explicit/manual compatibility commands. Rust owns all
-# periodic background admission; this is not an authentication monitor.
-AUTH_STATUS_CACHE_INTERVAL_SECS = 2.0
-
 _server = None
-_clip_exporter = None        # Read-only legacy Chroma exporter
-_clustering_manager = None   # HotColdManager instance
-_clustering_scheduler = None # compatibility facade; no background timer
-_clustering_scheduler_active = False
-_last_clustering_auth_check = 0.0
-_last_clustering_session_valid = False
 _auth_token = None           # Auth token for IPC validation
 _last_seq_no = -1            # Last processed sequence number
 _seen_seq_nos = set()        # Accepted sequence numbers inside the replay window
@@ -48,55 +29,6 @@ _storage_pipe = None         # Storage service pipe name
 
 # Cache for dynamically extracted icons by process name
 _dynamic_icon_cache = {}
-
-
-def _is_storage_session_valid(force: bool = False) -> bool:
-    """Return whether Rust credential session is unlocked (cached for a short period)."""
-    global _last_clustering_auth_check, _last_clustering_session_valid
-
-    if _storage_pipe is None:
-        # No storage IPC configured: treat as available to avoid disabling clustering.
-        return True
-
-    now = time.perf_counter()
-    if (not force) and (now - _last_clustering_auth_check < AUTH_STATUS_CACHE_INTERVAL_SECS):
-        return _last_clustering_session_valid
-
-    _last_clustering_auth_check = now
-    try:
-        from storage_client import get_storage_client
-        sc = get_storage_client()
-        if not sc:
-            _last_clustering_session_valid = False
-            return False
-        _last_clustering_session_valid = bool(sc.is_session_valid())
-        return _last_clustering_session_valid
-    except Exception as exc:
-        logger.debug('Failed to query storage auth status: %s', exc)
-        _last_clustering_session_valid = False
-        return False
-
-
-def _sync_clustering_scheduler_auth_gate(force: bool = False) -> bool:
-    """Compatibility auth probe for explicit/manual IPC commands.
-
-    Rust owns the periodic scheduler now; this helper only reports the live UI
-    session for legacy commands that still require an interactive unlock.
-    """
-    # The Python object is only a compatibility facade. Reporting it as an
-    # active scheduler would make status consumers believe the retired timer
-    # and authentication monitor are still running.
-    global _clustering_scheduler_active
-    _clustering_scheduler_active = False
-    return _is_storage_session_valid(force=force)
-
-
-def _cached_clustering_session_valid() -> bool:
-    if not _clustering_scheduler:
-        return False
-    if _storage_pipe is None:
-        return True
-    return _last_clustering_session_valid
 
 
 def get_data_dir():
@@ -203,8 +135,6 @@ def _handle_command_impl(req: dict):
             'paused': paused_event.is_set(),
             'stopped': stop_event.is_set(),
             'interval': INTERVAL,
-            'clustering_auth_unlocked': _cached_clustering_session_valid(),
-            'clustering_scheduler_active': _clustering_scheduler_active,
         }
         return status
 
@@ -220,22 +150,6 @@ def _handle_command_impl(req: dict):
             return {'status': 'success', 'filters': get_exclusion_settings()}
         except Exception as e:
             return {'error': str(e)}
-
-    if cmd == 'update_advanced_config':
-        allow_full_low_memory = bool(req.get(
-            'clustering_allow_full_low_memory',
-            getattr(config, 'CLUSTERING_ALLOW_FULL_LOW_MEMORY', False),
-        ))
-        update_clustering_resource_config(allow_full_low_memory)
-        return {
-            'status': 'success',
-            'clustering_allow_full_low_memory': allow_full_low_memory,
-        }
-
-    if cmd == 'update_feature_config':
-        clustering_enabled = bool(req.get('clustering_enabled', True))
-        update_feature_config(clustering_enabled)
-        return {'status': 'success', 'clustering_enabled': clustering_enabled}
 
     # ----- Presidio PII detection commands -----
     if cmd == 'presidio_analyze':
@@ -317,49 +231,6 @@ def _handle_command_impl(req: dict):
             logger.error('presidio_check_idle failed: %s', e)
             return {'error': str(e)}
 
-    # ----- Legacy CLIP Chroma snapshot export (read-only) -----
-    if cmd in (
-        'start_clip_vectors_export',
-        'get_clip_vectors_export_status',
-        'export_clip_vectors_page',
-        'finish_clip_vectors_export',
-    ):
-        if not _clip_exporter:
-            return {'error': 'Legacy CLIP collection is unavailable'}
-        if not _sync_clustering_scheduler_auth_gate(force=True):
-            return {'error': 'AUTH_REQUIRED: the CLIP export requires an unlocked session'}
-        export_id = req.get('export_id', '')
-        try:
-            if cmd == 'start_clip_vectors_export':
-                return {'status': 'success', **_clip_exporter.start(export_id)}
-            if cmd == 'get_clip_vectors_export_status':
-                return {'status': 'success', **_clip_exporter.status(export_id)}
-            if cmd == 'export_clip_vectors_page':
-                return {
-                    'status': 'success',
-                    **_clip_exporter.page(
-                        export_id,
-                        cursor=req.get('cursor', 0),
-                        limit=req.get('limit', 128),
-                    ),
-                }
-            return {
-                'status': 'success',
-                'released': _clip_exporter.finish(export_id),
-            }
-        except Exception as exc:
-            logger.exception('%s failed', cmd)
-            return {'error': str(exc)}
-
-    clustering_response = handle_clustering_command(
-        req,
-        scheduler=_clustering_scheduler,
-        manager=_clustering_manager,
-        auth_gate=_sync_clustering_scheduler_auth_gate,
-    )
-    if clustering_response is not None:
-        return clustering_response
-
     return {'error': 'unknown command'}
 
 
@@ -368,7 +239,7 @@ def _handle_command_impl(req: dict):
 # ---------------------------------------------------------------------------
 
 def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: str = None):
-    """Start the IPC server and initialise the remaining clustering/export services.
+    """Start the IPC server.
 
     Args:
         _debug: Debug mode flag.
@@ -376,16 +247,13 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         auth_token: Authentication token for IPC validation.
         storage_pipe: Storage service pipe name (Rust reverse IPC).
     """
-    global _server, _clip_exporter, _storage_pipe, _clustering_manager, _clustering_scheduler, _clustering_scheduler_active, _auth_token, _last_seq_no, _last_clustering_auth_check, _last_clustering_session_valid
+    global _server, _storage_pipe, _auth_token, _last_seq_no
 
     _auth_token = auth_token
     with _seq_lock:
         _last_seq_no = -1
         _seen_seq_nos.clear()
     _storage_pipe = storage_pipe
-    _clustering_scheduler_active = False
-    _last_clustering_auth_check = 0.0
-    _last_clustering_session_valid = False
 
     if not pipe_name:
         pipe_name = os.environ.get('CARBON_MONITOR_PIPE')
@@ -406,51 +274,9 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         from .ipc_pipe import start_pipe_server
         _server = start_pipe_server(handler=_handle_command, pipe_name=pipe_name)
 
-    # --- Single Shared ChromaDB Client ---
-    try:
-        import chromadb
-        from chromadb.config import Settings as ChromaSettings
-        chroma_path = os.path.join(get_data_dir(), 'chroma_db')
-        shared_chroma_client = chromadb.PersistentClient(
-            path=chroma_path,
-            settings=ChromaSettings(anonymized_telemetry=False),
-        )
-    except Exception as e:
-        logger.error("Failed to initialize shared ChromaDB client: %s", e)
-        shared_chroma_client = None
-
-    try:
-        _clip_exporter = LegacyClipVectorExporter(shared_chroma_client)
-    except Exception as exc:
-        logger.warning('Legacy CLIP export unavailable (non-fatal): %s', exc)
-        _clip_exporter = None
-
-    # Initialise task clustering service (MiniLM + HDBSCAN). Rust owns all
-    # periodic scheduling; Python only executes an explicit IPC request.
-    try:
-        from task_clustering import HotColdManager, ClusteringScheduler
-
-        if shared_chroma_client is not None:
-            sc = None
-            if storage_pipe:
-                from storage_client import get_storage_client
-                sc = get_storage_client()
-
-            _clustering_manager = HotColdManager(shared_chroma_client, storage_client=sc)
-            _clustering_scheduler = ClusteringScheduler(_clustering_manager, storage_client=sc)
-            logger.info('Task clustering service initialised (Rust scheduler)')
-        else:
-            logger.warning('Task clustering service skipped: shared ChromaDB client is None')
-            _clustering_manager = None
-            _clustering_scheduler = None
-    except Exception as e:
-        logger.warning('Task clustering service failed to initialise (non-fatal): %s', e)
-        _clustering_manager = None
-        _clustering_scheduler = None
-
     # Screenshot capture, OCR, semantic/CLIP inference, and Smart Cluster
     # scoring and category classification are handled by Rust. Python provides
-    # task clustering, Presidio, and legacy read-only migration export.
+    # Presidio only.
 
     return _server
 

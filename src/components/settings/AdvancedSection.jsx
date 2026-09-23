@@ -60,9 +60,6 @@ export default function AdvancedSection({ controller: r }) {
         </SettingsRow>
         <SettingsDivider />
         <OcrTimeoutRow value={config.ocr_timeout_secs} disabled={r.configSaving} onChange={r.handleOcrTimeoutChange} />
-        <SettingsDivider />
-        <SettingsRow label={t('settings.advanced.clustering.allow_full_low_memory_label')} description={t('settings.advanced.clustering.allow_full_low_memory_desc')}
-          control={<SettingsSwitch checked={config.clustering_allow_full_low_memory} disabled={r.configSaving} onChange={() => r.handleToggle('clustering_allow_full_low_memory')} />} />
       </SettingsGroup>
     </SettingsSection>
     <SettingsSection title={t('settings.advanced.groups.components')} icon={Wrench}>

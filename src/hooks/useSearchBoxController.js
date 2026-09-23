@@ -8,7 +8,7 @@ import {
   getSmartClusterWorkerStatus,
   normalizeSmartClusterWorkerStatus,
 } from '../lib/monitor_api';
-import { smartClusterStopDrain } from '../lib/task_api';
+import { smartClusterStopDrain } from '../lib/semantic_api';
 import { useHmacMigrationStatus } from './useHmacMigrationStatus';
 import { isIndexTaskPending, useBackgroundIndexProgress } from './useBackgroundIndexProgress';
 

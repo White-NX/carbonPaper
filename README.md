@@ -36,12 +36,6 @@ CarbonPaper 将忠实地记录用户所见，并利用系统的 CNG 服务加密
 #### 快捷检索
 
 CarbonPaper 支持 OCR 关键词搜索所见文本，同时也支持使用自然语言的图片特征搜索快照。同时 CarbonPaper 也会对快照进行分类，以便快速查询。
-![task-clustering](./docs/imgs/carbonpaper-task-clustering.png)
-
-#### 任务聚类（目前仅限中文环境）
-
-CarbonPaper 会自动尝试识别用户正在或先前执行的任务，并将快照进行关联。
-
 #### 无需 NPU
 
 不需要 Copilot+ 验证，相关服务通过 DirectML 使用 CPU 或 GPU 进行推理。
@@ -78,5 +72,4 @@ The model files and dependencies will take up approximately 4GB. With high-frequ
 ## Main open source libs used
 
 - 文本OCR：[RapidOCR](https://github.com/RapidAI/RapidOCR)
-- 向量数据库：[ChromaDB](https://github.com/chroma-core/chroma)
 - UI：[Tauri](https://github.com/tauri-apps/tauri)

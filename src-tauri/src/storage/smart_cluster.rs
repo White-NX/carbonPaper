@@ -1068,7 +1068,7 @@ impl StorageState {
         if ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let spec = crate::minilm_migration::minilm_job_spec(0, "");
+        let spec = crate::minilm_contract::minilm_job_spec(0, "");
         let sql = Self::indexed_smart_cluster_pending_id_sql();
         let guard = self.get_connection_named("indexed_smart_cluster_pending_ids")?;
         let conn = guard.as_ref().ok_or("Database not initialized")?;
@@ -1329,7 +1329,7 @@ mod tests {
         let (_temp, storage) = test_storage();
         let guard = storage.db.lock().unwrap();
         let conn = guard.as_ref().unwrap();
-        let spec = crate::minilm_migration::minilm_job_spec(0, "");
+        let spec = crate::minilm_contract::minilm_job_spec(0, "");
         conn.execute_batch(
             "WITH RECURSIVE ids(id) AS (
                  SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<10000

@@ -8,7 +8,6 @@ import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
 import SecurityAlertMask from './components/SecurityAlertMask';
 import ExtensionSetupWizard from './components/ExtensionSetupWizard';
-import ClusteringSetupWizard from './components/ClusteringSetupWizard';
 import SmartClusterSetupWizard from './components/SmartClusterSetupWizard';
 import AppBoundUpgradePrompt from './components/AppBoundUpgradePrompt';
 import ActivityBar from './components/ActivityBar';
@@ -21,7 +20,6 @@ import ClipBackfillDialog from './components/ClipBackfillDialog';
 import StartupVacuumDialog from './components/StartupVacuumDialog';
 import VectorMigrationOverlay from './components/VectorMigrationOverlay';
 import OcrModelRepairCard from './components/OcrModelRepairCard';
-import { ConfirmDialog } from './components/ConfirmDialog';
 import { deleteScreenshot, deleteRecordsByTimeRange } from './lib/monitor_api';
 import { UpdateModal } from './components/UpdateModal';
 import { useAppTheme } from './hooks/useAppTheme';
@@ -142,18 +140,13 @@ function App() {
   });
   const {
     showExtensionSetup,
-    showClusteringSetup,
     showSmartClusterSetup,
-    clusteringResourceChoice,
     handleExtensionSetupComplete,
-    handleClusteringSetupComplete,
     handleSmartClusterSetupComplete,
-    resolveClusteringResourceChoice,
   } = useStartupWizards({
     backendStatus,
     isAuthenticated,
     setActiveTab,
-    pushNotification,
   });
   const {
     selectedEvent,
@@ -320,23 +313,8 @@ function App() {
           onComplete={handleExtensionSetupComplete}
         />
 
-        <ClusteringSetupWizard
-          isVisible={backendStatus === 'online' && isAuthenticated && !showExtensionSetup && showClusteringSetup}
-          onComplete={handleClusteringSetupComplete}
-        />
-
-        <ConfirmDialog
-          isOpen={Boolean(clusteringResourceChoice) && isAuthenticated}
-          title={t('tasks.clusteringDegradeTitle', 'Choose clustering resource mode')}
-          message={clusteringResourceChoice?.prompt || ''}
-          confirmLabel={t('tasks.clusteringDegradeConfirm', 'Use batched mode')}
-          cancelLabel={t('tasks.clusteringDegradeCancel', 'Use full mode')}
-          onConfirm={() => resolveClusteringResourceChoice(true)}
-          onCancel={() => resolveClusteringResourceChoice(false)}
-        />
-
         <SmartClusterSetupWizard
-          isVisible={backendStatus === 'online' && isAuthenticated && !showExtensionSetup && !showClusteringSetup && showSmartClusterSetup}
+          isVisible={backendStatus === 'online' && isAuthenticated && !showExtensionSetup && showSmartClusterSetup}
           onComplete={handleSmartClusterSetupComplete}
         />
 
@@ -427,7 +405,7 @@ function App() {
         onClose={() => setUpdateModalVisible(false)}
       />
 
-      <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings && !updateModalVisible && !showExtensionSetup && !showClusteringSetup && !showSmartClusterSetup} />
+      <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings && !updateModalVisible && !showExtensionSetup && !showSmartClusterSetup} />
 
       <OcrModelRepairCard
         isOpen={showOcrModelRepair}

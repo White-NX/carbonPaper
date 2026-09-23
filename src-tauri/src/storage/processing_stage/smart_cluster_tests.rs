@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     background_scheduler::BackgroundTaskKind,
-    minilm_migration::{build_minilm_task_text, minilm_job_spec, MINILM_DIMENSIONS},
+    minilm_contract::{build_minilm_task_text, minilm_job_spec, MINILM_DIMENSIONS},
     rerank::{build_rerank_document, ScorerIdentity},
     smart_cluster_scoring::staged::score_and_commit,
     storage::{
@@ -118,7 +118,7 @@ async fn smart_cluster_completes_after_other_consumers_on_a_locked_restart() {
         .commit_staged_embedding(
             &write(
                 storage,
-                crate::clip_migration::clip_job_spec(&input.image_hash),
+                crate::clip_contract::clip_job_spec(&input.image_hash),
             ),
             &clip.receipt,
         )

@@ -10,7 +10,7 @@ import {
   toggleSmartClusterEnabled, getSmartClusterAssignments,
   smartClusterDrainNow, getSmartClusterStatus, createSmartCluster,
   smartClusterStopDrain,
-} from '../lib/task_api';
+} from '../lib/semantic_api';
 import { fetchThumbnailBatch, getSmartClusterWorkerStatus } from '../lib/monitor_api';
 import { ThumbnailCard } from './ThumbnailCard';
 import ClusterRow, { formatRelativeStamp } from './cluster/ClusterRow';

@@ -14,8 +14,8 @@ export function DiagnosticValues({ rows }) {
 export function BackgroundSchedulerCard({ enabled, saving, status, onChange, onRefresh }) {
   const { t } = useTranslation();
   const state = status?.running_task ? 'running' : status?.blocked_reason || (status?.next_retry_at_ms ? 'retry_wait' : 'waiting_for_idle');
-  const mapped = { clustering_already_running: 'organizing', waiting_for_index: 'preparing', waiting_for_ac_power: 'waiting_for_idle', waiting_for_fullscreen: 'waiting_for_idle', foreground_request: 'waiting_for_idle', maintenance: 'waiting_for_idle', semantic_worker_busy: 'waiting_for_idle' }[state] || state;
-  const known = ['running', 'waiting_for_idle', 'waiting_for_unlock', 'waiting_for_verification', 'retry_wait', 'failed', 'monitor_unavailable', 'disabled', 'organizing', 'preparing'];
+  const mapped = { waiting_for_index: 'preparing', waiting_for_ac_power: 'waiting_for_idle', waiting_for_fullscreen: 'waiting_for_idle', foreground_request: 'waiting_for_idle', maintenance: 'waiting_for_idle', semantic_worker_busy: 'waiting_for_idle' }[state] || state;
+  const known = ['running', 'waiting_for_idle', 'waiting_for_unlock', 'waiting_for_verification', 'retry_wait', 'failed', 'disabled', 'preparing'];
   const label = t(`settings.advanced.background_processing.states.${(known.includes(mapped) ? mapped : 'waiting_for_idle')}`);
   return (
     <SettingsSection id="background-access" title={t('settings.advanced.background_processing.title')}>

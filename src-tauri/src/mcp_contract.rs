@@ -12,9 +12,6 @@ pub const TOOL_NAMES: &[&str] = &[
     "get_snapshot_details",
     "search_ocr_text",
     "search_nl",
-    "get_task_clusters",
-    "get_task_screenshots",
-    "rename_task",
     "get_smart_clusters",
     "get_smart_cluster_ocr_corpus",
     "get_smart_cluster_summary",
@@ -39,7 +36,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "get_snapshot_details",
-            "description": "Get full details of a specific snapshot including metadata, OCR text, and the task cluster it belongs to (if any). By default OCR bounding box coordinates are omitted to save tokens; set include_coords=true to include them.",
+            "description": "Get full details of a specific snapshot including metadata and OCR text. By default OCR bounding box coordinates are omitted to save tokens; set include_coords=true to include them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -81,44 +78,6 @@ pub fn tool_definitions() -> Value {
                     "end_time": { "type": "number", "description": "Filter end time (ms)" }
                 },
                 "required": ["query"]
-            }
-        },
-        {
-            "name": "get_task_clusters",
-            "description": "Get task clustering results. Tasks are groups of related screenshots identified by activity patterns.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "layer": { "type": "string", "description": "Clustering layer (e.g. 'hot', 'cold')" },
-                    "start_time": { "type": "number", "description": "Filter start time (ms)" },
-                    "end_time": { "type": "number", "description": "Filter end time (ms)" },
-                    "hide_inactive": { "type": "boolean", "description": "Hide inactive tasks" }
-                }
-            }
-        },
-        {
-            "name": "get_task_screenshots",
-            "description": "Get screenshots belonging to a specific task cluster, with pagination.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "integer", "description": "Task cluster ID" },
-                    "page": { "type": "integer", "description": "Page number (0-based, default 0)" },
-                    "page_size": { "type": "integer", "description": "Page size (default 50)" }
-                },
-                "required": ["task_id"]
-            }
-        },
-        {
-            "name": "rename_task",
-            "description": "Rename a task cluster.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "integer", "description": "Task cluster ID" },
-                    "label": { "type": "string", "description": "New label for the task" }
-                },
-                "required": ["task_id", "label"]
             }
         },
         {

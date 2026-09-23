@@ -4,8 +4,8 @@
 //! runtime configuration validate the calling window and/or authenticated session.
 
 use crate::{
-    capture::CaptureState, monitor, monitor::MonitorState, registry_config, storage::StorageState,
-    LightweightModeState, IS_QUITTING,
+    capture::CaptureState, monitor, monitor::MonitorState, registry_config, LightweightModeState,
+    IS_QUITTING,
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -153,14 +153,9 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
     let use_dml = registry_config::get_bool("use_dml").unwrap_or(false);
     let dml_device_id = registry_config::get_u32("dml_device_id").unwrap_or(0);
     let game_mode_enabled = registry_config::get_bool("game_mode_enabled").unwrap_or(true);
-    let clustering_interval =
-        registry_config::get_string("clustering_interval").unwrap_or_else(|| "1w".to_string());
-    let clustering_enabled = registry_config::get_bool("clustering_enabled").unwrap_or(true);
     let classification_enabled =
         registry_config::get_bool("classification_enabled").unwrap_or(true);
     let smart_cluster_enabled = registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
-    let clustering_allow_full_low_memory =
-        registry_config::get_bool("clustering_allow_full_low_memory").unwrap_or(false);
     let network_enabled = registry_config::get_bool("network_enabled").unwrap_or(true);
     let background_scheduling_mode = registry_config::get_string("background_scheduling_mode")
         .filter(|v| matches!(v.as_str(), "auto" | "idle_only"))
@@ -173,11 +168,8 @@ pub fn get_advanced_config() -> Result<serde_json::Value, String> {
         "use_dml": use_dml,
         "dml_device_id": dml_device_id,
         "game_mode_enabled": game_mode_enabled,
-        "clustering_interval": clustering_interval,
-        "clustering_enabled": clustering_enabled,
         "classification_enabled": classification_enabled,
         "smart_cluster_enabled": smart_cluster_enabled,
-        "clustering_allow_full_low_memory": clustering_allow_full_low_memory,
         "network_enabled": network_enabled,
         "background_scheduling_mode": background_scheduling_mode,
     });
@@ -222,12 +214,6 @@ pub fn set_advanced_config(
     if let Some(v) = config.get("game_mode_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("game_mode_enabled", v)?;
     }
-    if let Some(v) = config.get("clustering_interval").and_then(|v| v.as_str()) {
-        registry_config::set_string("clustering_interval", v)?;
-    }
-    if let Some(v) = config.get("clustering_enabled").and_then(|v| v.as_bool()) {
-        registry_config::set_bool("clustering_enabled", v)?;
-    }
     if let Some(v) = config
         .get("classification_enabled")
         .and_then(|v| v.as_bool())
@@ -239,12 +225,6 @@ pub fn set_advanced_config(
         .and_then(|v| v.as_bool())
     {
         registry_config::set_bool("smart_cluster_enabled", v)?;
-    }
-    if let Some(v) = config
-        .get("clustering_allow_full_low_memory")
-        .and_then(|v| v.as_bool())
-    {
-        registry_config::set_bool("clustering_allow_full_low_memory", v)?;
     }
     if let Some(v) = config.get("network_enabled").and_then(|v| v.as_bool()) {
         registry_config::set_bool("network_enabled", v)?;
@@ -303,28 +283,6 @@ pub fn check_extension_setup_needed() -> Result<bool, String> {
 #[tauri::command]
 pub fn mark_extension_setup_done() -> Result<(), String> {
     registry_config::set_bool("extension_setup_done", true)
-}
-
-/// Reports whether clustering setup is needed for an existing screenshot database.
-///
-/// Authentication: not required. Returns a JSON boolean.
-#[tauri::command]
-pub async fn check_clustering_setup_needed(
-    state: tauri::State<'_, Arc<StorageState>>,
-) -> Result<bool, String> {
-    if registry_config::get_bool("clustering_setup_done").unwrap_or(false) {
-        return Ok(false);
-    }
-    let count = state.count_screenshots_by_time_range(0.0, 9_999_999_999.0)?;
-    Ok(count > 0)
-}
-
-/// Marks clustering setup as completed.
-///
-/// Authentication: not required. Returns JSON `null`.
-#[tauri::command]
-pub fn mark_clustering_setup_done() -> Result<(), String> {
-    registry_config::set_bool("clustering_setup_done", true)
 }
 
 /// Smart cluster setup wizard — returns true if the wizard should be shown.

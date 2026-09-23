@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const SHORT_IDLE_SECS: u64 = 60;
-pub const LEGACY_CLUSTER_IDLE_SECS: u64 = 1800;
 pub const CPU_RATE_PERCENT: u32 = 5;
 pub const SAMPLE_LIMIT: usize = 64;
 pub const MIN_SAMPLES: usize = 20;
@@ -496,7 +495,6 @@ impl AdmissionSignals {
 pub fn choose_profile(
     signals: AdmissionSignals,
     mode: SchedulingMode,
-    legacy: bool,
     qualified: bool,
     resources: &ResourcePolicy,
     now: u64,
@@ -504,16 +502,10 @@ pub fn choose_profile(
     if let Some(reason) = signals.hard_gate() {
         return Err(reason);
     }
-    if signals.idle_secs
-        >= if legacy {
-            LEGACY_CLUSTER_IDLE_SECS
-        } else {
-            SHORT_IDLE_SECS
-        }
-    {
+    if signals.idle_secs >= SHORT_IDLE_SECS {
         return Ok(ExecutionProfile::Idle);
     }
-    if legacy || mode == SchedulingMode::IdleOnly {
+    if mode == SchedulingMode::IdleOnly {
         return Err("waiting_for_idle");
     }
     if !qualified {
@@ -827,30 +819,19 @@ mod tests {
     fn typing_allows_qualified_b_but_unknown_work_waits_for_a() {
         let r = stable();
         assert_eq!(
-            choose_profile(signals(0), SchedulingMode::Auto, false, true, &r, 10_000),
+            choose_profile(signals(0), SchedulingMode::Auto, true, &r, 10_000),
             Ok(ExecutionProfile::Background)
         );
         assert_eq!(
-            choose_profile(signals(0), SchedulingMode::Auto, false, false, &r, 10_000),
+            choose_profile(signals(0), SchedulingMode::Auto, false, &r, 10_000),
             Err("waiting_for_evaluation")
         );
         assert_eq!(
-            choose_profile(signals(60), SchedulingMode::Auto, false, false, &r, 10_000),
+            choose_profile(signals(60), SchedulingMode::Auto, false, &r, 10_000),
             Ok(ExecutionProfile::Idle)
         );
         assert_eq!(
-            choose_profile(signals(60), SchedulingMode::Auto, true, true, &r, 10_000),
-            Err("waiting_for_idle")
-        );
-        assert_eq!(
-            choose_profile(
-                signals(0),
-                SchedulingMode::IdleOnly,
-                false,
-                true,
-                &r,
-                10_000
-            ),
+            choose_profile(signals(0), SchedulingMode::IdleOnly, true, &r, 10_000),
             Err("waiting_for_idle")
         );
         for s in [
@@ -875,7 +856,7 @@ mod tests {
                 ..signals(600)
             },
         ] {
-            assert!(choose_profile(s, SchedulingMode::Auto, false, true, &r, 10_000).is_err());
+            assert!(choose_profile(s, SchedulingMode::Auto, true, &r, 10_000).is_err());
         }
     }
     #[test]

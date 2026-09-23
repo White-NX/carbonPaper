@@ -7,12 +7,10 @@
 use crate::background_activity::{self, WorkSource};
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
-use crate::monitor::MonitorState;
 use crate::semantic_runtime::SemanticRuntimeState;
 use crate::storage::{BackgroundTaskState, DerivedIndexKind, StorageState};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,8 +26,6 @@ use adaptive::AdaptiveRuntime;
 pub const TASK_SEMANTIC_INDEX: &str = "semantic_index";
 pub const TASK_CLIP_INDEX: &str = "clip_index";
 pub const TASK_SMART_CLUSTER: &str = "smart_cluster";
-pub const TASK_PYTHON_CLUSTERING: &str = "python_clustering";
-pub const TASK_VECTOR_SYNC: &str = "task_vector_sync";
 pub const TASK_ANN_BUILD: &str = "ann_build";
 
 /// Automatic work may wait behind a user-requested pass for this long before
@@ -46,8 +42,6 @@ pub enum BackgroundTaskKind {
     SemanticIndex,
     ClipIndex,
     SmartCluster,
-    PythonClustering,
-    TaskVectorSync,
     AnnBuild,
 }
 
@@ -57,8 +51,6 @@ impl BackgroundTaskKind {
             Self::SemanticIndex => TASK_SEMANTIC_INDEX,
             Self::ClipIndex => TASK_CLIP_INDEX,
             Self::SmartCluster => TASK_SMART_CLUSTER,
-            Self::PythonClustering => TASK_PYTHON_CLUSTERING,
-            Self::TaskVectorSync => TASK_VECTOR_SYNC,
             Self::AnnBuild => TASK_ANN_BUILD,
         }
     }
@@ -68,8 +60,6 @@ impl BackgroundTaskKind {
             TASK_SEMANTIC_INDEX => Some(Self::SemanticIndex),
             TASK_CLIP_INDEX => Some(Self::ClipIndex),
             TASK_SMART_CLUSTER => Some(Self::SmartCluster),
-            TASK_PYTHON_CLUSTERING => Some(Self::PythonClustering),
-            TASK_VECTOR_SYNC => Some(Self::TaskVectorSync),
             TASK_ANN_BUILD => Some(Self::AnnBuild),
             _ => None,
         }
@@ -79,9 +69,7 @@ impl BackgroundTaskKind {
         match self {
             Self::ClipIndex => Some(CLIP_AUTO_QUANTUM),
             Self::SemanticIndex => Some(MINILM_AUTO_QUANTUM),
-            Self::SmartCluster | Self::PythonClustering | Self::TaskVectorSync | Self::AnnBuild => {
-                None
-            }
+            Self::SmartCluster | Self::AnnBuild => None,
         }
     }
 }
@@ -89,15 +77,11 @@ impl BackgroundTaskKind {
 fn task_feature_enabled_with_config(
     kind: BackgroundTaskKind,
     manual: bool,
-    clustering_enabled: bool,
     smart_cluster_enabled: bool,
 ) -> bool {
     match kind {
-        // Python also enforces this flag on explicit clustering requests.
-        BackgroundTaskKind::PythonClustering => clustering_enabled,
-        BackgroundTaskKind::TaskVectorSync => clustering_enabled,
         _ if manual => true,
-        BackgroundTaskKind::SemanticIndex => clustering_enabled || smart_cluster_enabled,
+        BackgroundTaskKind::SemanticIndex => smart_cluster_enabled,
         BackgroundTaskKind::SmartCluster => smart_cluster_enabled,
         BackgroundTaskKind::ClipIndex | BackgroundTaskKind::AnnBuild => true,
     }
@@ -107,7 +91,6 @@ pub(crate) fn task_feature_enabled(kind: BackgroundTaskKind, manual: bool) -> bo
     task_feature_enabled_with_config(
         kind,
         manual,
-        crate::registry_config::get_bool("clustering_enabled").unwrap_or(true),
         crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false),
     )
 }
@@ -345,8 +328,6 @@ pub struct BackgroundSchedulerStatus {
     pub next_retry_at_ms: Option<i64>,
     /// Earliest retry timestamp among manually requested tasks.
     pub manual_retry_at_ms: Option<i64>,
-    pub worker_restart_count: u64,
-    pub monitor_restart_degraded: bool,
     pub execution_profile: ExecutionProfile,
     pub scheduling_mode: SchedulingMode,
     pub qualifications: Vec<Qualification>,
@@ -365,12 +346,6 @@ struct SchedulerRuntime {
     blocked_reason: Mutex<Option<String>>,
     service_seq: AtomicU64,
     manual_request_generation: Arc<AtomicU64>,
-    worker_restart_count: AtomicU64,
-    worker_restart_attempts: Mutex<VecDeque<i64>>,
-    /// Automatic monitor recovery remains degraded until a manual start or a
-    /// new process. A rolling window by itself would silently resume a worker
-    /// that has already failed repeatedly in this process.
-    monitor_restart_degraded: AtomicBool,
 }
 
 impl Default for SchedulerRuntime {
@@ -385,9 +360,6 @@ impl Default for SchedulerRuntime {
             blocked_reason: Mutex::new(None),
             service_seq: AtomicU64::new(0),
             manual_request_generation: Arc::new(AtomicU64::new(0)),
-            worker_restart_count: AtomicU64::new(0),
-            worker_restart_attempts: Mutex::new(VecDeque::new()),
-            monitor_restart_degraded: AtomicBool::new(false),
         }
     }
 }
@@ -425,7 +397,6 @@ impl BackgroundSchedulerState {
         // shutdown) while leaving a finished handle in the slot.
         task.take();
         self.runtime.stop.store(false, Ordering::SeqCst);
-        migrate_legacy_clustering_config(&app);
         if let Some(storage) = app.try_state::<Arc<StorageState>>() {
             if let Err(error) = storage.recover_background_scheduler_tasks() {
                 tracing::warn!("[SCHEDULER] startup recovery failed: {error}");
@@ -444,12 +415,7 @@ impl BackgroundSchedulerState {
             // a scheduler row because those workers predate the unified ledger.
             // Seed only missing rows; an existing completed row must retain its
             // durable completion timestamp and interval semantics.
-            for kind in [
-                TASK_SEMANTIC_INDEX,
-                TASK_CLIP_INDEX,
-                TASK_ANN_BUILD,
-                TASK_VECTOR_SYNC,
-            ] {
+            for kind in [TASK_SEMANTIC_INDEX, TASK_CLIP_INDEX, TASK_ANN_BUILD] {
                 if storage
                     .background_scheduler_task(kind)
                     .ok()
@@ -484,24 +450,6 @@ impl BackgroundSchedulerState {
 
     pub fn wake(&self) {
         self.runtime.wake.notify_one();
-    }
-
-    /// Release the in-process monitor degradation after an explicit manual
-    /// start. The durable Python task is released at the same boundary so it
-    /// cannot remain parked on the old degraded state.
-    pub fn clear_monitor_restart_degraded(&self, app: &AppHandle) {
-        self.runtime
-            .monitor_restart_degraded
-            .store(false, Ordering::SeqCst);
-        self.runtime
-            .worker_restart_attempts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        if let Some(storage) = app.try_state::<Arc<StorageState>>() {
-            let _ = storage.resume_background_task(TASK_PYTHON_CLUSTERING, now_ms());
-        }
-        self.wake();
     }
 
     pub fn enqueue(
@@ -589,11 +537,6 @@ impl BackgroundSchedulerState {
             blocked_reason,
             next_retry_at_ms,
             manual_retry_at_ms,
-            worker_restart_count: self.runtime.worker_restart_count.load(Ordering::Relaxed),
-            monitor_restart_degraded: self
-                .runtime
-                .monitor_restart_degraded
-                .load(Ordering::Relaxed),
             execution_profile: self
                 .runtime
                 .adaptive
@@ -623,65 +566,6 @@ fn retry_delay(failure_count: u32) -> Duration {
     let exponent = failure_count.saturating_sub(1).min(16);
     let seconds = 60u64.saturating_mul(1u64 << exponent);
     Duration::from_secs(seconds).min(MAX_RETRY_DELAY)
-}
-
-fn clustering_interval_secs(key: &str) -> u64 {
-    match key {
-        "1d" => 86_400,
-        "1m" => 2_592_000,
-        "6m" => 15_552_000,
-        _ => 604_800,
-    }
-}
-
-fn migrate_legacy_clustering_config(app: &AppHandle) {
-    let Some(storage) = app.try_state::<Arc<StorageState>>() else {
-        return;
-    };
-    if storage
-        .background_scheduler_task(TASK_PYTHON_CLUSTERING)
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return;
-    }
-
-    let data_dir = storage
-        .data_dir
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let path = data_dir.join("clustering_config.json");
-    let mut last_run_ms = 0i64;
-    if let Ok(contents) = std::fs::read_to_string(&path) {
-        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&contents) {
-            if let Some(interval) = config.get("interval").and_then(|value| value.as_str()) {
-                if matches!(interval, "1d" | "1w" | "1m" | "6m") {
-                    let _ = crate::registry_config::set_string("clustering_interval", interval);
-                }
-            }
-            last_run_ms = config
-                .get("last_run")
-                .and_then(|value| value.as_f64())
-                .map(|seconds| (seconds.max(0.0) * 1_000.0) as i64)
-                .unwrap_or(0);
-        }
-    }
-    let now = now_ms();
-    if storage
-        .enqueue_background_task(TASK_PYTHON_CLUSTERING, false, now)
-        .is_ok()
-        && last_run_ms > 0
-    {
-        let _ = storage.mark_background_task_succeeded(TASK_PYTHON_CLUSTERING, false, last_run_ms);
-    }
-    if path.exists() {
-        let migrated = data_dir.join("clustering_config.json.migrated");
-        if let Err(error) = std::fs::rename(&path, &migrated) {
-            tracing::debug!("[SCHEDULER] legacy clustering config rename failed: {error}");
-        }
-    }
 }
 
 fn queue_depths(storage: Option<tauri::State<'_, Arc<StorageState>>>) -> serde_json::Value {
@@ -873,12 +757,10 @@ async fn refresh_backlog(app: &AppHandle) {
     // newly discovered work directly: using the public enqueue path here would
     // notify the same loop while it is running, leave a Notify permit behind,
     // and turn an admission-gated queue into a self-waking hot loop.
-    // The semantic text index only exists to feed task clustering and smart
-    // cluster scoring. When both consumers are off there is no reason to admit
-    // encoding work; the ledger rows stay pending and are picked up again the
-    // moment either switch is turned back on.
-    let semantic_consumers = crate::registry_config::get_bool("clustering_enabled").unwrap_or(true)
-        || crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
+    // Automatic text indexing supplies Smart Cluster candidate retrieval.
+    // Pending ledger rows resume when the feature is enabled again.
+    let semantic_consumers =
+        crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false);
     if semantic > 0 && semantic_consumers {
         let _ = storage.enqueue_background_task_if_changed(TASK_SEMANTIC_INDEX, false, now_ms());
     }
@@ -889,32 +771,6 @@ async fn refresh_backlog(app: &AppHandle) {
     // pending rows exist. The registry is the application-side source of truth.
     if smart > 0 && crate::registry_config::get_bool("smart_cluster_enabled").unwrap_or(false) {
         let _ = storage.enqueue_background_task_if_changed(TASK_SMART_CLUSTER, false, now_ms());
-    }
-
-    if crate::registry_config::get_bool("clustering_enabled").unwrap_or(true) {
-        if storage.task_vector_sync_pending().unwrap_or(false) {
-            let _ = storage.enqueue_background_task_if_changed(TASK_VECTOR_SYNC, false, now_ms());
-        }
-        let interval_key = crate::registry_config::get_string("clustering_interval")
-            .unwrap_or_else(|| "1w".to_string());
-        let interval_ms = clustering_interval_secs(&interval_key).saturating_mul(1_000) as i64;
-        let due = storage
-            .background_scheduler_task(TASK_PYTHON_CLUSTERING)
-            .ok()
-            .flatten()
-            .map(|task| {
-                task.status == "parked"
-                    || (!matches!(task.status.as_str(), "running" | "degraded")
-                        && task
-                            .last_completed_at_ms
-                            .map(|last| now_ms().saturating_sub(last) >= interval_ms)
-                            .unwrap_or(true))
-            })
-            .unwrap_or(true);
-        if due {
-            let _ =
-                storage.enqueue_background_task_if_changed(TASK_PYTHON_CLUSTERING, false, now_ms());
-        }
     }
 }
 
@@ -944,125 +800,18 @@ async fn execute_slice(
     app: &AppHandle,
     kind: BackgroundTaskKind,
     manual: bool,
-    runtime: &SchedulerRuntime,
     automatic_context: Option<&AutomaticSliceContext>,
 ) -> Result<ScheduledSliceResult, String> {
     // A queued row can outlive a settings change. Check every dispatch path,
-    // including automatic model quanta, before loading a model or restarting
-    // the monitor. Explicit Rust maintenance remains available when disabled.
+    // including automatic model quanta, before loading a model. Explicit
+    // maintenance remains available when disabled.
     if !task_feature_enabled(kind, manual) {
         return Ok(ScheduledSliceResult::skipped("disabled"));
-    }
-    if kind == BackgroundTaskKind::TaskVectorSync {
-        return crate::task_vector_sync::run_scheduled_slice(app, manual).await;
     }
     if kind == BackgroundTaskKind::AnnBuild {
         return crate::clip_ann::run_scheduled_slice(app, manual).await;
     }
-    // Python's HDBSCAN run is intentionally non-preemptible, but it does not
-    // own the Rust semantic model slot for the duration of that computation.
-    // Holding BACKGROUND_PASS_GUARD here would make a foreground search wait
-    // for the whole clustering run. The Rust adapters below still claim the
-    // guard for every request that actually drives the shared semantic worker.
-    if kind == BackgroundTaskKind::PythonClustering {
-        let monitor_running = {
-            let monitor = app.state::<MonitorState>();
-            let running = monitor
-                .process
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some();
-            running
-        };
-        if !monitor_running {
-            if runtime.monitor_restart_degraded.load(Ordering::SeqCst) {
-                return Err("monitor_unavailable: restart limit reached".to_string());
-            }
-            if !crate::registry_config::get_bool("autoStartMonitor").unwrap_or(true) {
-                return Err("monitor_unavailable".to_string());
-            }
-            let now = now_ms();
-            {
-                let mut attempts = runtime
-                    .worker_restart_attempts
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                while attempts
-                    .front()
-                    .is_some_and(|attempt| now.saturating_sub(*attempt) >= 3_600_000)
-                {
-                    attempts.pop_front();
-                }
-                if attempts.len() >= 3 {
-                    runtime
-                        .monitor_restart_degraded
-                        .store(true, Ordering::SeqCst);
-                    return Err("monitor_unavailable: restart limit reached".to_string());
-                }
-                attempts.push_back(now);
-            }
-            runtime.worker_restart_count.fetch_add(1, Ordering::SeqCst);
-            crate::monitor::start_monitor_impl(app.state::<MonitorState>(), app.clone()).await?;
-        }
-        let progress = match crate::task_vector_sync::synchronize(app, manual, None, None).await? {
-            crate::task_vector_sync::SyncOutcome::Busy => {
-                return Ok(ScheduledSliceResult::skipped("clustering_already_running"))
-            }
-            crate::task_vector_sync::SyncOutcome::More => {
-                return Ok(ScheduledSliceResult::complete(true))
-            }
-            crate::task_vector_sync::SyncOutcome::WaitingForIndex => {
-                return Ok(ScheduledSliceResult::skipped("waiting_for_index"))
-            }
-            crate::task_vector_sync::SyncOutcome::Ready(progress) => progress,
-        };
-        let monitor = app.state::<MonitorState>();
-        let response = crate::monitor::forward_command_to_python(
-            &monitor,
-            serde_json::json!({
-                "command": "run_scheduled_clustering",
-                "timeout_secs": 1800,
-                "manual": manual,
-            }),
-        )
-        .await?;
-        if response.get("status").and_then(|v| v.as_str()) == Some("success") {
-            let result_status = response
-                .get("result")
-                .and_then(|value| value.get("status"))
-                .and_then(|value| value.as_str());
-            if result_status == Some("already_running") {
-                progress.finish(crate::task_vector_sync::ClusteringPhase::Paused);
-                Ok(ScheduledSliceResult::skipped("clustering_already_running"))
-            } else if result_status == Some("disabled") {
-                progress.finish(crate::task_vector_sync::ClusteringPhase::Paused);
-                Ok(ScheduledSliceResult::skipped("disabled"))
-            } else if result_status == Some("waiting_for_index") {
-                // Python deliberately leaves the work untouched until the
-                // Rust semantic index has produced vectors. Treat this as a
-                // deferred slice, not a completed interval run; otherwise a
-                // fresh `last_completed_at` would hide the backlog for the
-                // whole configured clustering interval.
-                progress.finish(crate::task_vector_sync::ClusteringPhase::WaitingForIndex);
-                Ok(ScheduledSliceResult::skipped("waiting_for_index"))
-            } else {
-                let processed = response
-                    .get("result")
-                    .and_then(|value| value.get("n_total"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0);
-                background_activity::index_progress(processed);
-                progress.finish(crate::task_vector_sync::ClusteringPhase::Completed);
-                Ok(ScheduledSliceResult::complete(false).with_processed(processed))
-            }
-        } else {
-            Err(response
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("python clustering failed")
-                .to_string())
-        }
-    } else if !manual
+    if !manual
         && matches!(
             kind,
             BackgroundTaskKind::SemanticIndex | BackgroundTaskKind::ClipIndex
@@ -1076,10 +825,7 @@ async fn execute_slice(
             BackgroundTaskKind::ClipIndex => {
                 crate::clip_index::run_scheduled_slice(app, false, Some(context)).await
             }
-            BackgroundTaskKind::SmartCluster
-            | BackgroundTaskKind::PythonClustering
-            | BackgroundTaskKind::TaskVectorSync
-            | BackgroundTaskKind::AnnBuild => {
+            BackgroundTaskKind::SmartCluster | BackgroundTaskKind::AnnBuild => {
                 unreachable!()
             }
         }
@@ -1097,9 +843,7 @@ async fn execute_slice(
             BackgroundTaskKind::SmartCluster => {
                 crate::smart_cluster_scoring::run_scheduled_slice(app, manual).await
             }
-            BackgroundTaskKind::PythonClustering
-            | BackgroundTaskKind::TaskVectorSync
-            | BackgroundTaskKind::AnnBuild => unreachable!(),
+            BackgroundTaskKind::AnnBuild => unreachable!(),
         }
     }
 }
@@ -1216,7 +960,6 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 let inactive = tasks.iter().filter_map(|task| {
                     let reason = match task.status.as_str() {
                         "retry_wait" => "retry_wait",
-                        "degraded" => "monitor_unavailable",
                         "failed" => "failed",
                         "parked" => "disabled",
                         _ => return None,
@@ -1329,7 +1072,7 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 }
             }
         };
-        let execution = execute_slice(&app, kind, manual, &runtime, automatic_context.as_ref());
+        let execution = execute_slice(&app, kind, manual, automatic_context.as_ref());
         let result = if let Some(lease) = &lease {
             let result = background_policy::EXECUTION
                 .scope(lease.clone(), execution)
@@ -1338,10 +1081,7 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                 let _ = lease.rest(started.elapsed()).await;
             }
             runtime.adaptive.finish(lease);
-            if let Some(reason) = lease
-                .reason()
-                .filter(|_| kind != BackgroundTaskKind::PythonClustering)
-            {
+            if let Some(reason) = lease.reason() {
                 // A revoked slice may have committed earlier records; leave
                 // their progress intact without advancing business completion.
                 Ok(ScheduledSliceResult::skipped(reason))
@@ -1451,20 +1191,6 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                     started.elapsed().as_millis(),
                 );
                 let normalized = error.to_ascii_lowercase();
-                if normalized.contains("clustering_already_running") {
-                    *runtime
-                        .blocked_reason
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) =
-                        Some("clustering_already_running".to_string());
-                    background_activity::blocked(kind.as_str(), "clustering_already_running");
-                    let _ = storage.defer_background_task(
-                        kind.as_str(),
-                        now_ms().saturating_add(TICK_INTERVAL.as_millis() as i64),
-                        "clustering_already_running",
-                    );
-                    continue;
-                }
                 if normalized.contains("auth_required")
                     || normalized.contains("authentication required")
                 {
@@ -1484,23 +1210,6 @@ async fn scheduler_loop(app: AppHandle, runtime: Arc<SchedulerRuntime>) {
                         kind.as_str(),
                         now_ms().saturating_add(TICK_INTERVAL.as_millis() as i64),
                         reason,
-                    );
-                    continue;
-                }
-                if normalized.contains("monitor_unavailable")
-                    || normalized.contains("monitor not started")
-                {
-                    *runtime
-                        .blocked_reason
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) =
-                        Some("monitor_unavailable".to_string());
-                    background_activity::blocked(kind.as_str(), "monitor_unavailable");
-                }
-                if normalized.contains("restart limit reached") {
-                    let _ = storage.mark_background_task_degraded(
-                        kind.as_str(),
-                        "monitor restart limit reached; manual start required",
                     );
                     continue;
                 }
@@ -1748,63 +1457,36 @@ mod tests {
     }
 
     #[test]
-    fn automatic_semantic_index_requires_an_enabled_consumer() {
-        for (clustering, smart_cluster, expected) in [
-            (false, false, false),
-            (true, false, true),
-            (false, true, true),
-            (true, true, true),
+    fn automatic_semantic_work_requires_smart_clusters() {
+        for kind in [
+            BackgroundTaskKind::SemanticIndex,
+            BackgroundTaskKind::SmartCluster,
         ] {
-            assert_eq!(
-                task_feature_enabled_with_config(
-                    BackgroundTaskKind::SemanticIndex,
-                    false,
-                    clustering,
-                    smart_cluster,
-                ),
-                expected,
-            );
+            assert!(!task_feature_enabled_with_config(kind, false, false));
+            assert!(task_feature_enabled_with_config(kind, false, true));
         }
+        assert!(task_feature_enabled_with_config(
+            BackgroundTaskKind::ClipIndex,
+            false,
+            false
+        ));
+        assert!(task_feature_enabled_with_config(
+            BackgroundTaskKind::AnnBuild,
+            false,
+            false
+        ));
     }
 
     #[test]
-    fn manual_rust_maintenance_remains_available_when_features_are_disabled() {
+    fn manual_maintenance_remains_available_when_features_are_disabled() {
         for kind in [
             BackgroundTaskKind::SemanticIndex,
             BackgroundTaskKind::ClipIndex,
             BackgroundTaskKind::SmartCluster,
+            BackgroundTaskKind::AnnBuild,
         ] {
-            assert!(task_feature_enabled_with_config(kind, true, false, false));
+            assert!(task_feature_enabled_with_config(kind, true, false));
         }
-        // The Python service rejects disabled clustering even for manual runs.
-        assert!(!task_feature_enabled_with_config(
-            BackgroundTaskKind::PythonClustering,
-            true,
-            false,
-            false,
-        ));
-    }
-
-    #[test]
-    fn automatic_tasks_observe_their_own_feature_flags() {
-        assert!(task_feature_enabled_with_config(
-            BackgroundTaskKind::ClipIndex,
-            false,
-            false,
-            false,
-        ));
-        assert!(!task_feature_enabled_with_config(
-            BackgroundTaskKind::SmartCluster,
-            false,
-            true,
-            false,
-        ));
-        assert!(!task_feature_enabled_with_config(
-            BackgroundTaskKind::PythonClustering,
-            false,
-            false,
-            true,
-        ));
     }
 
     #[test]
@@ -1818,10 +1500,6 @@ mod tests {
             Some(Duration::from_secs(30))
         );
         assert_eq!(BackgroundTaskKind::SmartCluster.automatic_quantum(), None);
-        assert_eq!(
-            BackgroundTaskKind::PythonClustering.automatic_quantum(),
-            None
-        );
     }
 
     #[test]

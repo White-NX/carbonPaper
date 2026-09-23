@@ -374,8 +374,6 @@ export default function MainArea({
           <DetailCard
             selectedEvent={selectedEvent}
             selectedDetails={selectedDetails}
-            onSelectRelated={onAdvancedSelect}
-            onOpenFloatingPreview={openSnapshotPreview}
           />
 
           {/* OCR Content Panel */}

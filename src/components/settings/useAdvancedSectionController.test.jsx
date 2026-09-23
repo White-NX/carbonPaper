@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 
-import { getClipBackfillOffer } from '../../lib/task_api';
+import { getClipBackfillOffer } from '../../lib/semantic_api';
 import { useAdvancedSectionController } from './useAdvancedSectionController';
 
 vi.mock('../../lib/auth_api', () => ({
@@ -14,7 +14,7 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn(async () => vi.fn()),
 }));
 
-vi.mock('../../lib/task_api', () => ({
+vi.mock('../../lib/semantic_api', () => ({
   getClipBackfillOffer: vi.fn(),
   setClipBackfillDecision: vi.fn(),
 }));

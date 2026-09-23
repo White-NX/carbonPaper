@@ -1,6 +1,6 @@
 //! Repair for stale OCR ids left in the blind bitmap index.
 
-use crate::migration_support;
+use crate::maintenance_support;
 use crate::storage::{BlindIndexRepairProgress, StorageState};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,7 +164,7 @@ async fn run_repair(
 ) {
     tracing::info!("[BLIND_INDEX_REPAIR] starting stale-posting repair");
 
-    let restore = migration_support::pause_capture_for_maintenance(&app).await;
+    let restore = maintenance_support::pause_capture_for_maintenance(&app).await;
     let result = match restore.as_ref() {
         Ok(_) => {
             let storage = app.state::<Arc<StorageState>>().inner().clone();
@@ -192,7 +192,7 @@ async fn run_repair(
     };
 
     if let Ok(restore) = restore.as_ref() {
-        migration_support::restore_monitor_after_migration(&app, restore).await;
+        maintenance_support::restore_monitor_after_maintenance(&app, restore).await;
     }
 
     match result {

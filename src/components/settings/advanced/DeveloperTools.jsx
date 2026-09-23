@@ -5,7 +5,7 @@ import { withAuth } from '../../../lib/auth_api';
 import { SettingsButton } from '../SettingsControls';
 import { SettingsDisclosure, SettingsGroup, SettingsStatus } from '../SettingsPrimitives';
 
-const PREVIEWS = ['error', 'security', 'ocr', 'update', 'critical-update', 'extension', 'clustering', 'smart-cluster', 'app-bound', 'app-bound-repair'];
+const PREVIEWS = ['error', 'security', 'ocr', 'update', 'critical-update', 'extension', 'smart-cluster', 'app-bound', 'app-bound-repair'];
 
 export default function DeveloperTools() {
   const { t } = useTranslation();

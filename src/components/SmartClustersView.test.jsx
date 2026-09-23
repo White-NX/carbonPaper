@@ -11,7 +11,7 @@ vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn(async () => () => {}),
 }));
 
-vi.mock('../lib/task_api', () => ({
+vi.mock('../lib/semantic_api', () => ({
   createSmartCluster: vi.fn(),
   deleteSmartCluster: vi.fn(),
   getSmartClusterAssignments: vi.fn(async () => []),
@@ -45,7 +45,7 @@ import {
   getSmartClusterStatus,
   listSmartClusters,
   smartClusterDrainNow,
-} from '../lib/task_api';
+} from '../lib/semantic_api';
 import { getSmartClusterWorkerStatus } from '../lib/monitor_api';
 
 const cluster = {

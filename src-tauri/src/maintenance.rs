@@ -1,13 +1,13 @@
 //! Global application maintenance mode.
 //!
-//! While a maintenance task (currently the explicit MiniLM migration) is
-//! running, background mutation paths must stand still so the migration's
-//! Chroma snapshot and the Rust-derived cache cannot drift apart. The flag is
+//! While a maintenance task (the blind-index repair, or an ANN bootstrap) is
+//! running, background mutation paths must stand still so the task's view of
+//! the store and the Rust-derived cache cannot drift apart. The flag is
 //! process-global because it gates surfaces that do not carry a Tauri
 //! `AppHandle` (reverse IPC, MCP dispatch, background loops).
 //!
-//! Allowed while active: status queries, Windows Hello authentication, error
-//! listing, and app exit. The migration itself has no user cancellation path.
+//! Allowed while active: status queries, Windows Hello authentication, and app
+//! exit. Maintenance tasks have no user cancellation path.
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,22 +92,16 @@ pub fn get_maintenance_status() -> MaintenanceStatus {
 }
 
 /// Reverse-IPC commands that remain usable during maintenance: session/crypto
-/// helpers the migration itself depends on, read-only status, and NMH session
-/// bookkeeping. Everything that writes screenshots, OCR, or clustering state is
-/// rejected. The MiniLM mirror commands used to be allowed here because Python
-/// wrote vectors Rust had to accept even mid-migration; M2.5 step 5 removed
-/// them along with the Python-side writer.
+/// helpers, read-only status, and NMH session bookkeeping. Everything that
+/// writes screenshots, OCR, or smart cluster state is rejected.
 pub fn reverse_ipc_command_allowed(command: &str) -> bool {
     matches!(
         command,
         "get_public_key"
             | "get_auth_status"
-            | "get_idle_state"
             | "encrypt_for_chromadb"
             | "decrypt_from_chromadb"
             | "decrypt_many_from_chromadb"
-            | "decrypt_from_chromadb_silent"
-            | "decrypt_many_from_chromadb_silent"
             | "register_nmh"
             | "unregister_nmh"
     )

@@ -1,8 +1,7 @@
 # Adaptive background scheduling
 
-The scheduler owns six durable task kinds: MiniLM indexing, CLIP indexing,
-Smart Cluster scoring, task-vector synchronization, ANN maintenance, and the
-remaining Python full-clustering entry point. Capture, immediate classification,
+The scheduler owns four durable task kinds: MiniLM indexing, CLIP indexing,
+Smart Cluster scoring, and ANN maintenance. Capture, immediate classification,
 and foreground requests retain their own priority and authorization paths.
 
 ## Admission
@@ -15,7 +14,6 @@ switch has priority over either setting.
 | Rule | Implementation |
 | --- | --- |
 | A | AC power, valid authorization, no protected game/fullscreen session or maintenance, at least 60 seconds without input |
-| Python full clustering | Retains the 1800-second idle entrance and configured monitor CPU policy |
 | B admission | Total CPU below 30% for 10 seconds; no core at 85% in two consecutive samples |
 | B retreat | Total CPU at least 50%, or a core at least 95% in two consecutive samples |
 | B memory | `available_bytes >= ceil(expected_additional_peak_bytes * 1.15) + ceil(0.8 * 2^30)` |

@@ -137,8 +137,7 @@
         "preview": "跳转到主预览页面",
         "standalone": "从独立窗口打开",
         "searchLabel": "高级搜索卡片",
-        "clustersLabel": "智能聚类卡片",
-        "activityContextLabel": "同一活动卡片"
+        "clustersLabel": "智能聚类卡片"
       },
       "monitor": {
         "title": "Python 子服务",
@@ -240,9 +239,7 @@
       "warning": "这些设置可能会影响监控服务的性能和稳定性，甚至影响操作系统整体性能。请谨慎调整。",
       "quick_restart": "快速重启",
       "terms": {
-        "directml": "DirectML 是微软的 GPU 推理接口。它可以在兼容显卡上加速 OCR，但可能与游戏或图形密集应用争用 GPU。",
-        "pacmap_hdbscan": "PaCMAP 会把高维文本向量压缩成更容易聚类的形状；HDBSCAN 再按密度自动分组，不需要预先指定分组数量。",
-        "minilm": "MiniLM-L12 是用于把 OCR 文本编码成向量的轻量语言模型，供任务聚类使用。"
+        "directml": "DirectML 是微软的 GPU 推理接口。它可以在兼容显卡上加速 OCR，但可能与游戏或图形密集应用争用 GPU。"
       },
       "cpu": {
         "title": "CPU 占用限制",
@@ -310,9 +307,7 @@
           "running": "执行中",
           "retry_wait": "失败重试",
           "failed": "处理失败",
-          "monitor_unavailable": "监控不可用",
-          "disabled": "任务分组已关闭",
-          "organizing": "正在整理",
+          "disabled": "功能已关闭",
           "preparing": "正在准备记录"
         },
         "diagnostics": "调度诊断",
@@ -326,20 +321,6 @@
         "verified": "已验证",
         "pendingEvaluation": "等待评估"
       },
-      "clustering": {
-        "title": "任务聚类",
-        "interval_label": "自动聚类间隔",
-        "interval_desc": "设置后台自动运行任务聚类的时间间隔",
-        "allow_full_low_memory_label": "低内存时仍允许自动全量聚类",
-        "allow_full_low_memory_desc": "内存紧张时仍允许完整聚类，处理期间可能影响其他应用。",
-        "info": "任务聚类会自动将相似的活动分组为长期任务。使用 MiniLM-L12 模型编码文本，模型在聚类完成后会自动卸载以释放内存。",
-        "intervals": {
-          "1d": "每天",
-          "1w": "每周",
-          "1m": "每月",
-          "6m": "每半年"
-        }
-      },
       "network": {
         "title": "联网功能",
         "label": "允许联网",
@@ -348,7 +329,7 @@
       "semantic_backend": {
         "title": "文字检索索引",
         "label": "Rust MiniLM 文本索引",
-        "description": "Rust 维护截图检索和任务分组使用的本地文本索引。",
+        "description": "维护文本语义检索和智能归档使用的本地文本索引。",
         "diagnostic": "本地诊断",
         "refresh": "刷新诊断",
         "indexed": "本地已索引向量",
@@ -695,13 +676,13 @@
       "title": "AI 助手访问",
       "description": "管理人工智能嵌入服务",
       "mcp_service": "MCP 服务",
-      "mcp_description": "启用后将启动本地 MCP 服务，允许 AI 工具连接获取快照数据（截图元数据、OCR 文本、任务聚类信息）。请注意隐私安全风险，确保只授权可信的 AI 工具连接。",
+      "mcp_description": "启用后将启动本地 MCP 服务，允许 AI 工具连接获取快照数据（截图元数据、OCR 文本、智能归档信息）。请注意隐私安全风险，确保只授权可信的 AI 工具连接。",
       "enable_label": "MCP 服务",
       "start_button": "启动",
       "starting": "启动中",
       "privacy_warning": {
         "title": "隐私安全警告",
-        "message": "启用此功能后，您的快照数据（包括截图元数据、OCR 文本、任务聚类信息）将通过本地 HTTP 服务对外暴露。虽然服务仅绑定 localhost 且需要令牌认证，但本机上运行的任何程序都有可能访问这些数据。\n\n请确认您理解此风险并自愿启用。",
+        "message": "启用此功能后，您的快照数据（包括截图元数据、OCR 文本、智能归档信息）将通过本地 HTTP 服务对外暴露。虽然服务仅绑定 localhost 且需要令牌认证，但本机上运行的任何程序都有可能访问这些数据。\n\n请确认您理解此风险并自愿启用。",
         "confirm_prompt": "请输入以下文本以确认：",
         "confirm_text": "我已阅读警告并且我接受可能的暴露风险",
         "confirm_button": "确认启用",
@@ -745,7 +726,7 @@
           "codex": {
             "label": "Codex",
             "description": "安装原生 Skill，并配置 Codex 的 Streamable HTTP MCP 连接。",
-            "prompt": "请在 Codex 中配置 CarbonPaper 本地记忆访问。\n\n1. 从 {{repo}} 获取 {{skillName}} 目录，安装为 Codex Skill；它对应工具契约 v{{toolSchemaVersion}}。\n2. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n3. 配置请求头 Authorization: Bearer <CarbonPaper token>。不要让我把令牌写入提示词或日志；请让我在 CarbonPaper 中单独点击“复制令牌”，再将它存入 Codex 的本地安全配置。\n4. 使用该 Skill 处理截图历史、OCR、任务聚类和智能聚类摘要请求。search_nl 是 Chinese-CLIP 文本到图像的视觉检索，不是 Python-only 功能。\n5. tools/list 是稳定契约；临时可用性以 CarbonPaper 诊断和调用结果为准。如果返回 AUTH_REQUIRED，请提示我先在应用中完成 Windows Hello 解锁。\n6. 只读取完成我明确请求所需的本机数据。完成后告诉我配置文件位置和连接验证结果。"
+            "prompt": "请在 Codex 中配置 CarbonPaper 本地记忆访问。\n\n1. 从 {{repo}} 获取 {{skillName}} 目录，安装为 Codex Skill；它对应工具契约 v{{toolSchemaVersion}}。\n2. 添加名为 carbonpaper 的 Streamable HTTP MCP 服务器，URL 为 {{endpoint}}。\n3. 配置请求头 Authorization: Bearer <CarbonPaper token>。不要让我把令牌写入提示词或日志；请让我在 CarbonPaper 中单独点击“复制令牌”，再将它存入 Codex 的本地安全配置。\n4. 使用该 Skill 处理截图历史、OCR 和智能归档摘要请求。search_nl 是 Chinese-CLIP 文本到图像的视觉检索，不是 Python-only 功能。\n5. tools/list 是稳定契约；临时可用性以 CarbonPaper 诊断和调用结果为准。如果返回 AUTH_REQUIRED，请提示我先在应用中完成 Windows Hello 解锁。\n6. 只读取完成我明确请求所需的本机数据。完成后告诉我配置文件位置和连接验证结果。"
           },
           "claude": {
             "label": "Claude",
@@ -895,50 +876,21 @@
           "options": {
             "minimal": {
               "label": "最小功能",
-              "description": "保留基础截图与 OCR 搜索，不启用语义分类和聚类。"
+              "description": "记录快照，并通过 OCR 文字搜索查找内容。"
             },
             "basic": {
               "label": "基础功能",
               "description": "启用内容分类，帮助筛选、统计和后续整理。"
             },
-            "organized": {
-              "label": "整理功能",
-              "description": "启用内容分类和任务聚类，自动整理长期活动。"
-            },
             "smart": {
               "label": "智能功能",
-              "description": "启用全部语义功能，支持按描述自动归档快照。"
+              "description": "自动分类快照，并按描述持续归档相关内容。"
             },
             "custom": {
               "label": "自定义",
               "description": "当前功能组合来自单独设置或旧版本配置。"
             }
           }
-        },
-        "clustering": {
-          "label": "任务聚类",
-          "description": "将相关活动整理为任务分组。",
-          "interval_label": "自动聚类间隔",
-          "interval_desc": "设置后台自动运行任务聚类的时间间隔",
-          "advanced_label": "高级",
-          "run_now": "立即运行聚类",
-          "queued": "已加入后台整理队列",
-          "completed": "聚类完成：已保存 {{count}} 个活动",
-          "progress": {
-            "preparing": "正在准备历史记录",
-            "waiting": "暂时等待，稍后继续",
-            "clustering": "正在整理任务",
-            "saving": "正在保存整理结果",
-            "waiting_for_records": "正在等待记录准备完成",
-            "awaiting_choice": "准备就绪，请选择处理方式",
-            "retry_wait": "整理暂时中断，稍后自动重试",
-            "interrupted": "本次整理已中断，可重新运行以继续处理",
-            "completed": "整理完成",
-            "already_running": "已有整理任务正在运行",
-            "prepared_count": "已准备 {{count}} 条记录"
-          },
-          "rangeStart": "开始日期",
-          "rangeEnd": "结束日期"
         },
         "classification": {
           "label": "内容分类",
@@ -957,8 +909,7 @@
           "drainNow": "处理待整理记录",
           "rescanAll": "重新匹配记录",
           "retry": "重试下载",
-          "openManagement": "打开智能聚类管理",
-          "clusteringDisabledWarning": "任务聚类已关闭。智能聚类仍可在重扫时运行，但由于缺少截图采集阶段的自动文本向量化，候选召回需要临时编码，可能导致处理速度显著下降并增加资源占用。"
+          "openManagement": "打开智能聚类管理"
         },
         "indexHealth": {
           "label": "检索与维护",
@@ -984,10 +935,10 @@
         "purposes": {
           "image_embedding": "图像特征提取",
           "content_classification": "内容分类",
-          "task_clustering": "任务聚类",
           "smart_cluster_rerank": "智能聚类重排",
           "ocr": "文字识别 (OCR)",
-          "legacy_ocr_cache": "旧版 OCR 缓存"
+          "legacy_ocr_cache": "旧版 OCR 缓存",
+          "text_embedding": "文本语义检索"
         }
       },
       "backgroundTiming": {
@@ -1062,7 +1013,6 @@
         "update": "更新提示",
         "critical-update": "重要更新提示",
         "extension": "扩展安装引导",
-        "clustering": "任务分组引导",
         "smart-cluster": "智能归档引导",
         "app-bound": "后台组件引导",
         "app-bound-repair": "后台组件修复"
@@ -1207,7 +1157,6 @@
     "sources": {
       "mainPreview": "主预览",
       "advancedSearch": "高级搜索",
-      "tasks": "长期任务",
       "smartClusters": "智能聚类"
     }
   },
@@ -1283,41 +1232,11 @@
       "title": "页面上的链接",
       "currentPage": "当前页面"
     },
-    "related": {
-      "title": "同一活动",
-      "untitled": "同一活动",
-      "count": "{{count}} 张",
-      "now": "当前",
-      "before": "{{value}}前",
-      "after": "{{value}}后",
-      "previous": "之前",
-      "next": "之后",
-      "nearby": "附近",
-      "snapshot": "快照"
-    },
     "empty": "从时间线中选择一个事件以查看详情。"
-  },
-  "activityContext": {
-    "title": "同一活动",
-    "open": "查看全部",
-    "untitled": "未命名活动",
-    "snapshot": "快照",
-    "count": "{{count}} 张快照",
-    "refresh": "刷新",
-    "rename": "重命名活动",
-    "deleteActivity": "取消活动关联",
-    "deleteActivityConfirm": "这会删除该活动及其全部关联关系，但不会删除任何快照。确定继续吗？",
-    "removeSnapshot": "从活动中移除",
-    "removeSnapshotConfirm": "只会移除这张快照与当前活动的关联，不会删除快照。确定继续吗？",
-    "previousPage": "上一页",
-    "nextPage": "下一页",
-    "page": "{{current}} / {{total}}",
-    "empty": "这个活动中暂无快照"
   },
   "activityBar": {
     "preview": "预览",
     "advancedSearch": "高级搜索",
-    "tasks": "长期任务",
     "smartCluster": "智能聚类",
     "expand": "展开侧栏",
     "collapse": "收起侧栏"
@@ -1336,15 +1255,6 @@
     "success_message": "扩展安装成功。请在浏览器中启用开发者模式，然后从以下路径加载已解压的扩展。",
     "connected": "已连接的浏览器：",
     "error_message": "安装失败"
-  },
-  "clusteringSetup": {
-    "title": "整理活动记录",
-    "subtitle": "将已有的截图快照自动归类为任务",
-    "description": "新版本支持将你积累的截图快照按活动内容自动聚类为「任务」，帮助你按主题回顾和整理历史工作记录。",
-    "delay_hint": "确认后将在 1 分钟后于后台自动执行聚类（等待嵌入模型加载完成），期间你可以正常使用应用。",
-    "info_note": "你也可以跳过此步骤，之后随时在 设置 > 功能 > 任务聚类 中手动执行聚类。",
-    "apply": "开始整理",
-    "skip": "跳过"
   },
   "clusterCard": {
     "actionResume": "继续",
@@ -1575,7 +1485,7 @@
         "using_python_default": "(未指定，将使用默认路径)",
         "download_models": "开始下载模型文件...",
         "download_bge": "开始下载分类模型 (BGE-small-zh-v1.5)...",
-        "download_minilm": "开始下载聚类模型 (MiniLM-L12-v2)...",
+        "download_minilm": "正在准备文本检索组件…",
         "deps_complete": "所有依赖安装完成。",
         "install_logs": "安装日志",
         "install_failed": "安装失败",
@@ -1605,49 +1515,10 @@
       "retry": "重试",
       "downloading_clip": "正在下载 Chinese-CLIP 模型...",
       "downloading_bge": "正在下载分类模型 (BGE-small-zh-v1.5)...",
-      "downloading_minilm": "正在下载聚类模型 (MiniLM-L12-v2)...",
+      "downloading_minilm": "正在准备文本检索组件…",
       "complete": "模型下载完成。",
       "run_in_background": "后台运行"
     }
-  },
-  "tasks": {
-    "title": "长期任务",
-    "unnamed": "未命名任务",
-    "rename": "重命名",
-    "delete": "删除",
-    "merge": "合并",
-    "mergeMode": "合并模式",
-    "cancel": "取消",
-    "refresh": "刷新",
-    "runClustering": "运行聚类",
-    "lastRun": "上次运行",
-    "never": "从未运行",
-    "empty": "暂无任务",
-    "emptyHint": "运行聚类以自动发现长期任务",
-    "selectHint": "选择一个任务查看详情",
-    "snapshots": "张快照",
-    "noScreenshots": "暂无关联快照",
-    "noData": "没有足够的数据用于聚类，请积累更多快照后再试",
-    "modelMissing": "聚类模型 (MiniLM-L12) 未下载，请在 设置 > 关于 中下载模型",
-    "clusteringFailed": "任务整理失败，请重试。",
-    "clusteringRangeScope": "所选范围",
-    "clusteringAllScope": "全部可聚类快照",
-    "clusteringLargeRangeReason": "可聚类快照数量较多",
-    "clusteringLowMemoryReason": "当前可用内存不足，完整聚类可能明显变慢或失败",
-    "clusteringDegradeTitle": "选择聚类资源模式",
-    "clusteringDegradeConfirm": "使用降级分批模式",
-    "clusteringDegradeCancel": "使用全量模式",
-    "clusteringDegradePrompt": "{{scope}}约 {{count}} 张快照。{{reason}}。建议使用降级分批模式；这会先对样本聚类，再分批归属剩余快照。预计峰值内存约 {{estimatedGb}} GB。\n\n选择“确定”使用降级分批；选择“取消”继续全量聚类。",
-    "clusteringDegradedNotice": "本次使用降级分批模式：样本 {{sampleSize}} 张，分批归属 {{assignedCount}} 张。",
-    "showInactive": "显示不活跃任务",
-    "hideInactive": "隐藏不活跃任务",
-    "inactiveTasks": "不活跃",
-    "showEntertainment": "显示娱乐任务",
-    "hideEntertainment": "隐藏娱乐任务",
-    "entertainmentTasks": "娱乐",
-    "showSocial": "显示社交任务",
-    "hideSocial": "隐藏社交任务",
-    "socialTasks": "社交"
   },
   "aboutSection": {
     "debug": {
@@ -1659,7 +1530,7 @@
   },
   "clipBackfill": {
     "title": "画面索引补算",
-    "lead": "画面索引迁移已完成，但有 {{count}} 张截图没有可迁移的画面向量。它们不会出现在主搜索框的自然语言搜索结果里，除非重新计算。",
+    "lead": "有 {{count}} 张截图还没有画面索引。在完成索引之前，它们不会出现在主搜索框的自然语言搜索结果里。",
     "missing": "需要补算的截图",
     "stalled": "此前索引失败的截图",
     "estimateLabel": "预计耗时",
@@ -1667,8 +1538,8 @@
     "estimateMinutes": "约 {{minutes}} 分钟",
     "estimateHours": "约 {{hours}} 小时",
     "estimateHoursMinutes": "约 {{hours}} 小时 {{minutes}} 分钟",
-    "skippedDeleted": "另有 {{count}} 条向量因对应截图已被删除而跳过，这是正常的，无需处理。",
-    "failedImports": "有 {{count}} 条向量无法读取，详情见迁移诊断。",
+    "skippedDeleted": "另有 {{count}} 条早先的记录已跳过，例如对应截图已被删除。这是正常的，无需处理。",
+    "failedImports": "有 {{count}} 条早先的记录无法读取。",
     "whenItRuns": "补算只在电脑空闲且接入电源时进行，不会打扰你正在做的事。可以随时在“设置 → 高级”里手动加速或停止，也可以之后再改变主意。",
     "approve": "允许自动补算",
     "decline": "不允许自动补算",
@@ -1680,13 +1551,9 @@
   },
   "vectorMigration": {
     "kinds": {
-      "minilm": {
-        "title": "文本索引迁移中",
-        "subtitle": "正在把截图文本的向量迁移到本地 Rust 索引。迁移期间应用处于维护模式。"
-      },
       "clip": {
-        "title": "画面索引迁移中",
-        "subtitle": "正在把截图画面的向量迁移到本地 Rust 索引。迁移期间应用处于维护模式。"
+        "title": "正在准备图片搜索",
+        "subtitle": "正在构建图片搜索加速索引。构建期间应用处于维护模式。"
       },
       "blindIndex": {
         "title": "正在修复文本搜索索引",
@@ -1698,21 +1565,12 @@
       }
     },
     "eta": "预计剩余时间：{{eta}}",
-    "safeWrite": "正在写入磁盘，请勿强制关闭应用。",
-    "waitingForAuth": "会话已过期。请完成 Windows Hello 认证，迁移随后会自动继续。",
+    "waitingForAuth": "会话已过期。请完成 Windows Hello 认证，任务随后会自动继续。",
     "reauth": "重新认证",
-    "errorCount": "有 {{count}} 条记录无法迁移，详情已写入迁移诊断。",
+    "errorCount": "有 {{count}} 条记录无法修复。",
     "blockedHint": "维护期间其它操作暂不可用；若应用退出，将在下次启动后自动继续。",
     "phases": {
       "starting": "正在准备…",
-      "preflight": "正在检查磁盘空间…",
-      "snapshotting_chroma": "正在创建向量快照…",
-      "copying_chroma": "正在复制现有向量…",
-      "reconciling": "正在清理超出范围的本地向量…",
-      "publishing_write": "正在写入索引文件…",
-      "publishing_sync": "正在发布索引…",
-      "publishing_verify": "正在校验索引文件…",
-      "publishing_commit": "正在提交索引…",
       "building_ann": "正在构建图片搜索加速索引…",
       "scanning_valid_ocr": "正在检查有效搜索记录…",
       "repairing_blind_index": "正在修复文本搜索索引…",

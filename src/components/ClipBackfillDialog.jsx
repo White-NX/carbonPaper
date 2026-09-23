@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Images, Loader2 } from 'lucide-react';
 import { Dialog } from './Dialog';
-import { getClipBackfillOffer, setClipBackfillDecision } from '../lib/task_api';
+import { getClipBackfillOffer, setClipBackfillDecision } from '../lib/semantic_api';
 
 /// Until an answer exists there is something to watch for: the offer only
 /// becomes askable once the step-7 copy settles, which can be many minutes

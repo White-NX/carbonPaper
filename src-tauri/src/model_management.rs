@@ -210,44 +210,6 @@ fn minilm_onnx_missing(base: &Path) -> Vec<String> {
     )
 }
 
-#[derive(Debug, Clone)]
-pub struct ResolvedRequiredModelPaths {
-    pub minilm_path: PathBuf,
-}
-
-fn resolve_onnx_path(
-    primary: PathBuf,
-    legacy: PathBuf,
-    missing: fn(&Path) -> Vec<String>,
-) -> Option<PathBuf> {
-    if missing(&primary).is_empty() {
-        Some(primary)
-    } else if missing(&legacy).is_empty() {
-        Some(legacy)
-    } else {
-        None
-    }
-}
-
-/// Resolve the reviewed ONNX locations used by the Rust workers and the
-/// remaining Python task-clustering consumer. The legacy `models` location is
-/// accepted only as an ONNX compatibility location; PyTorch is not selected.
-pub fn resolve_required_onnx_paths() -> Result<ResolvedRequiredModelPaths, String> {
-    let appdata_dir = file_in_local_appdata()
-        .ok_or_else(|| "Could not determine local appdata directory.".to_string())?;
-    let models_dir = appdata_dir.join("models");
-    let onnx_models_dir = appdata_dir.join("models-onnx");
-
-    let minilm_path = resolve_onnx_path(
-        onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
-        models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
-        minilm_onnx_missing,
-    )
-    .ok_or_else(|| "MiniLM ONNX model files are incomplete".to_string())?;
-
-    Ok(ResolvedRequiredModelPaths { minilm_path })
-}
-
 fn insert_status_with_legacy_location(
     result: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -718,7 +680,7 @@ const REQUIRED_MODEL_DEFS: &[RequiredModelDef] = &[
     RequiredModelDef {
         id: "minilm-l12",
         display_name: "MiniLM-L12 multilingual",
-        purpose: "task_clustering",
+        purpose: "text_embedding",
         subdir: Some("paraphrase-multilingual-MiniLM-L12-v2"),
         onnx_missing: minilm_onnx_missing,
     },
@@ -970,40 +932,6 @@ mod tests {
         assert_eq!(
             chinese_clip_onnx_missing(tmp.path()),
             vec!["tokenizer.json".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_onnx_runtime_paths_skip_incomplete_primary_model_dir() {
-        let tmp = tempfile::tempdir().expect("create temp dir");
-        let models_dir = tmp.path().join("models");
-        let onnx_models_dir = tmp.path().join("models-onnx");
-
-        write_complete_clip_onnx(&onnx_models_dir);
-
-        let primary_bge = onnx_models_dir.join("bge-small-zh-v1.5");
-        let legacy_bge = models_dir.join("bge-small-zh-v1.5");
-        touch(&primary_bge, "onnx/model_quantized.onnx");
-        write_complete_text_onnx(&legacy_bge);
-
-        let primary_minilm = onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2");
-        write_complete_text_onnx(&primary_minilm);
-
-        assert_eq!(
-            resolve_onnx_path(
-                onnx_models_dir.join("bge-small-zh-v1.5"),
-                legacy_bge.clone(),
-                bge_onnx_missing,
-            ),
-            Some(legacy_bge)
-        );
-        assert_eq!(
-            resolve_onnx_path(
-                onnx_models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
-                models_dir.join("paraphrase-multilingual-MiniLM-L12-v2"),
-                minilm_onnx_missing,
-            ),
-            Some(primary_minilm)
         );
     }
 

@@ -1,36 +1,20 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Layers } from 'lucide-react';
-import ClusteringScheduleCard from './organize/ClusteringScheduleCard';
 import FeatureModeCard from './organize/FeatureModeCard';
 import { FEATURE_MODE_OPTIONS, getFeatureMode } from './organize/featureModes';
 import { SettingsErrorBanner } from './SettingsPrimitives';
 import SmartClusterCard from './organize/SmartClusterCard';
 import BackgroundSchedulingCard from './organize/BackgroundSchedulingCard';
 import { useFeaturesController } from './useFeaturesController';
-import { ConfirmDialog } from '../ConfirmDialog';
 
-export default function FeaturesSection({ monitorStatus }) {
+export default function FeaturesSection() {
   const { t } = useTranslation();
   const {
     config,
     loading,
     featureSaving,
     featureError,
-    clusteringDropdownOpen,
-    setClusteringDropdownOpen,
-    clusteringAdvancedOpen,
-    setClusteringAdvancedOpen,
-    clusteringRunning,
-    clusteringProgress,
-    clusteringError,
-    clusteringNotice,
-    rangeStart,
-    setRangeStart,
-    rangeEnd,
-    setRangeEnd,
-    clusteringResourceChoice,
-    resolveClusteringResourceChoice,
     customControlsOpen,
     setCustomControlsOpen,
     scModelAvailable,
@@ -40,22 +24,16 @@ export default function FeaturesSection({ monitorStatus }) {
     scDownloadError,
     handleFeatureModeChange,
     handleCustomFeatureToggle,
-    handleClusteringIntervalChange,
     handleBackgroundTimingChange,
     backgroundTimingSaving,
     backgroundTimingError,
-    handleRunClustering,
     handleDownloadReranker,
     handleDrainNow,
     handleRescanAll,
-    clearClusteringError,
-    clearClusteringNotice,
-    lastClusteringRunLabel,
     featureMode,
     featureModeOptions,
     selectedFeatureMode,
   } = useFeaturesController({
-    monitorStatus,
     t,
     featureModeDefinitions: FEATURE_MODE_OPTIONS,
     getFeatureMode,
@@ -99,29 +77,6 @@ export default function FeaturesSection({ monitorStatus }) {
             onChange={handleBackgroundTimingChange}
           />
 
-          <ClusteringScheduleCard
-            saving={featureSaving}
-            config={config}
-            monitorStatus={monitorStatus}
-            clusteringDropdownOpen={clusteringDropdownOpen}
-            clusteringAdvancedOpen={clusteringAdvancedOpen}
-            clusteringRunning={clusteringRunning}
-            clusteringProgress={clusteringProgress}
-            clusteringError={clusteringError}
-            clusteringNotice={clusteringNotice}
-            rangeStart={rangeStart}
-            rangeEnd={rangeEnd}
-            lastClusteringRunLabel={lastClusteringRunLabel}
-            onToggleDropdown={() => setClusteringDropdownOpen(!clusteringDropdownOpen)}
-            onToggleAdvanced={() => setClusteringAdvancedOpen((value) => !value)}
-            onIntervalChange={handleClusteringIntervalChange}
-            onRangeStartChange={setRangeStart}
-            onRangeEndChange={setRangeEnd}
-            onRunClustering={handleRunClustering}
-            onClearClusteringError={clearClusteringError}
-            onClearClusteringNotice={clearClusteringNotice}
-          />
-
           <SmartClusterCard
             config={config}
             scModelAvailable={scModelAvailable}
@@ -135,16 +90,6 @@ export default function FeaturesSection({ monitorStatus }) {
           />
         </div>
       </section>
-
-      <ConfirmDialog
-        isOpen={Boolean(clusteringResourceChoice)}
-        title={t('tasks.clusteringDegradeTitle', '选择聚类资源模式')}
-        message={clusteringResourceChoice?.prompt || ''}
-        confirmLabel={t('tasks.clusteringDegradeConfirm', '使用降级分批模式')}
-        cancelLabel={t('tasks.clusteringDegradeCancel', '使用全量模式')}
-        onConfirm={() => resolveClusteringResourceChoice(true)}
-        onCancel={() => resolveClusteringResourceChoice(false)}
-      />
     </div>
   );
 }

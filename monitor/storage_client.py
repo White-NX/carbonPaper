@@ -72,10 +72,6 @@ READ_RETRY_COMMANDS = {
     'encrypt_for_chromadb',
     'decrypt_from_chromadb',
     'decrypt_many_from_chromadb',
-    'decrypt_from_chromadb_silent',
-    'decrypt_many_from_chromadb_silent',
-    'list_screenshots_for_clustering',
-    'get_idle_state',
     'get_auth_status',
 }
 
@@ -616,37 +612,6 @@ class StorageClient:
         logger.error("[storage_client] Decryption failed: %s", response.get('error'))
         return None
 
-    def decrypt_from_chromadb_silent(self, encrypted: str) -> Optional[str]:
-        """Decrypt one field through the non-interactive background path."""
-        if not encrypted:
-            return encrypted
-        response = self._send_request({
-            'command': 'decrypt_from_chromadb_silent',
-            'encrypted': encrypted,
-        })
-        if response.get('status') == 'success':
-            return response.get('data', {}).get('decrypted')
-        if response.get('error') in ('AUTH_REQUIRED', 'AUTH_REQUIRED: background lease unavailable'):
-            raise PermissionError('AUTH_REQUIRED')
-        logger.error("[storage_client] Silent decryption failed: %s", response.get('error'))
-        return None
-
-    def decrypt_many_from_chromadb_silent(self, encrypted_list: List[str]) -> List[Optional[str]]:
-        """Batch decrypt fields without permitting an authentication prompt."""
-        if not encrypted_list:
-            return []
-        response = self._send_request({
-            'command': 'decrypt_many_from_chromadb_silent',
-            'encrypted_list': encrypted_list,
-        })
-        if response.get('status') == 'success':
-            values = response.get('data', {}).get('decrypted_list')
-            if isinstance(values, list) and len(values) == len(encrypted_list):
-                return values
-        if response.get('error') in ('AUTH_REQUIRED', 'AUTH_REQUIRED: background lease unavailable'):
-            raise PermissionError('AUTH_REQUIRED')
-        logger.error("[storage_client] Silent batch decryption failed: %s", response.get('error'))
-        return [None] * len(encrypted_list)
 
     def decrypt_many_from_chromadb(self, encrypted_list: List[str]) -> List[Optional[str]]:
         """
@@ -705,37 +670,7 @@ class StorageClient:
         logger.error("[storage_client] Batch decryption failed: %s", response.get('error'))
         return results
     
-    def list_screenshots_for_clustering(
-        self,
-        start_ts: float = 0.0,
-        end_ts: float = 0.0,
-        offset: int = 0,
-        limit: int = 500,
-    ) -> Dict[str, Any]:
-        """Fetch screenshots with OCR text from SQLite for clustering backfill.
 
-        Returns {'screenshots': [...], 'total': int}.
-        """
-        return self._send_request({
-            'command': 'list_screenshots_for_clustering',
-            'start_ts': start_ts,
-            'end_ts': end_ts,
-            'offset': offset,
-            'limit': limit,
-        })
-
-    def get_idle_state(self) -> Dict[str, Any]:
-        """Read the current system idle state from Rust.
-
-        Returns {'is_idle': bool, 'idle_secs': int, 'fullscreen_exclusive': bool}.
-        Default to "not idle" on any error to fail safe.
-        """
-        response = self._send_request({'command': 'get_idle_state'})
-        if response.get('status') == 'success':
-            data = response.get('data')
-            if isinstance(data, dict):
-                return data
-        return {'is_idle': False, 'idle_secs': 0, 'fullscreen_exclusive': True}
 
     def is_session_valid(self) -> bool:
         """Check whether the Rust credential session is currently unlocked."""
@@ -745,12 +680,6 @@ class StorageClient:
             return bool(data.get('session_valid', False))
         return False
 
-    def is_background_authorized(self) -> bool:
-        """Whether Rust granted this process the unattended processing lease."""
-        response = self._send_request({'command': 'get_auth_status'})
-        if response.get('status') == 'success':
-            return bool(response.get('data', {}).get('background_authorized', False))
-        return False
 
 # Global storage client instance
 _storage_client: Optional[StorageClient] = None
