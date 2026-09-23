@@ -1,15 +1,12 @@
 //! M2.5 step 8 — Rust-owned Chinese-CLIP capture indexing.
 //!
 //! Enqueues captured screenshot images for CLIP vector indexing, manages
-//! background/foreground index workers, performs periodic repair scans, and
-//! Legacy Chroma migration export remains a separate read-only monitor path.
+//! background/foreground index workers, and performs periodic repair scans.
 
 use crate::background_scheduler::{
     deferred_release_note, AutomaticSliceContext, AutomaticSliceStopReason, ScheduledSliceResult,
 };
-use crate::clip_migration::{
-    clip_job_spec, clip_memory_uri, diagnostic_code, validate_clip_vector,
-};
+use crate::clip_contract::{clip_job_spec, clip_memory_uri, diagnostic_code, validate_clip_vector};
 use crate::credential_manager::CredentialManagerState;
 use crate::idle::IdleState;
 use crate::ml_protocol::{MlImageInput, MlSemanticModel};
@@ -1023,7 +1020,7 @@ async fn encode_chunk(
                 .clone()
                 .unit(
                     "image_prepare",
-                    crate::clip_migration::CLIP_VECTOR_SPACE_REVISION,
+                    crate::clip_contract::CLIP_VECTOR_SPACE_REVISION,
                     pixels.iter().sum(),
                     "one-image:decode-rgb",
                 )
@@ -1661,33 +1658,35 @@ pub async fn clip_index_stop_now(
 
 /// What a CLIP backfill would cover, and why it is being offered.
 ///
-/// Deliberately not one "failed" number. A migration that skipped rows because
-/// their screenshots were deleted did nothing wrong, and reporting that as a
-/// failure would alarm every user who has ever emptied their history; a
-/// migration that could not decode a stored vector did fail, and hiding it
-/// inside the same total would be the opposite mistake. The two populations
-/// that actually need encoding are the third and fourth fields, and they are
-/// the only ones the estimate covers.
+/// Deliberately not one "failed" number. A run that skipped rows because their
+/// screenshots were deleted, or that discarded the retired collection outright,
+/// did nothing wrong, and reporting that as a failure would alarm every user
+/// who upgrades; a run that could not decode a stored vector did fail, and
+/// hiding it inside the same total would be the opposite mistake. The two
+/// populations that actually need encoding are the third and fourth fields,
+/// and they are the only ones the estimate covers.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClipBackfillOffer {
-    /// Whether the step-7 copy has settled. Until it has, nothing is offered:
-    /// the right answer to an unfinished copy is to let it finish, which costs
-    /// a float copy rather than hours of inference.
+    /// Whether the index sentinel has settled. It settles at startup now (by
+    /// explicit discard of the retired collection), so this is `false` only in
+    /// the seconds before that task runs or when the database cannot be read.
     pub migration_settled: bool,
     /// `approved`, `declined`, or absent when the user has not been asked.
     pub decision: Option<String>,
     /// There is work to offer and no decision recorded yet.
     pub should_ask: bool,
-    /// Images with no vector and no ledger row: the migration had nothing to
-    /// copy for them, usually because Python never indexed them.
+    /// Images with no vector and no ledger row: nothing has encoded them yet,
+    /// which after a discard is every image older than the repair window.
     pub never_indexed: u64,
     /// Queued images whose encode retry budget is spent. Nothing clears these
     /// on its own.
     pub stalled: u64,
-    /// Migration rows skipped because no live screenshot matches them. Ordinary
-    /// consequence of deleting a screenshot; nothing to re-encode.
+    /// Diagnostics from the most recent run that describe expected outcomes: a
+    /// copied row whose screenshot was since deleted, or a discarded
+    /// collection. Nothing to re-encode beyond what `never_indexed` counts.
     pub skipped_deleted: u64,
-    /// Migration rows that could not be imported for any other reason.
+    /// Diagnostics from that run that describe rows which could not be read.
+    /// Only a v0.8.4/v0.8.5 installation that ran the copy can have any.
     pub failed_imports: u64,
     /// Estimated wall-clock encode time for `never_indexed`, from the measured
     /// cost model. Not a promise: it assumes the machine that measured it and
@@ -1757,6 +1756,10 @@ const EXPECTED_SKIP_CODES: &[&str] = &[
     diagnostic_code::ORPHAN_DOCUMENT_ID,
     diagnostic_code::SCREENSHOT_DISAPPEARED,
     diagnostic_code::SNAPSHOT_ROW_MISSING,
+    // A discarded collection is the deliberate outcome of upgrading past the
+    // Chroma copy, not a row that could not be read; the backfill offer is
+    // how those vectors come back.
+    crate::legacy_vector_discard::DISCARD_CODE,
 ];
 /// Recorded against the run rather than against a row, so it belongs to neither
 /// population.
@@ -2003,7 +2006,7 @@ mod tests {
 
     #[test]
     fn clip_vectors_are_the_declared_width() {
-        use crate::clip_migration::CLIP_DIMENSIONS;
+        use crate::clip_contract::CLIP_DIMENSIONS;
         // Guards against the index quietly accepting a MiniLM row if a caller
         // ever passed the wrong model.
         assert_eq!(CLIP_DIMENSIONS, 512);
@@ -2083,14 +2086,16 @@ mod tests {
 
     #[test]
     fn a_skipped_row_is_not_reported_as_a_failed_one() {
-        // Deleting a screenshot orphans its Chroma id, so any collection with
-        // deletion history produces these in quantity. Counting them as
-        // failures would tell every such user that their migration broke.
+        // Deleting a screenshot orphaned its Chroma id, so any collection with
+        // deletion history produced these in quantity; and every upgrade past
+        // the copy records a discard. Counting either as a failure would tell
+        // every such user that something broke.
         for code in EXPECTED_SKIP_CODES {
             assert_ne!(*code, diagnostic_code::LEGACY_VECTOR_DECODE_FAILED);
             assert_ne!(*code, diagnostic_code::INVALID_VECTOR);
         }
         assert!(EXPECTED_SKIP_CODES.contains(&diagnostic_code::ORPHAN_DOCUMENT_ID));
+        assert!(EXPECTED_SKIP_CODES.contains(&crate::legacy_vector_discard::DISCARD_CODE));
         // The run-level code belongs to neither column.
         assert!(!EXPECTED_SKIP_CODES.contains(&RUN_LEVEL_CODE));
     }

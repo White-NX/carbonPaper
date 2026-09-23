@@ -1332,7 +1332,7 @@ pub(crate) fn captured_input(
     let semantic_enabled = smart_enabled;
     let classification = crate::registry_config::get_bool("classification_enabled").unwrap_or(true);
     let has_ocr = !ocr_text.trim().is_empty();
-    let semantic_text = crate::minilm_migration::build_minilm_task_text(process, title, &ocr_text);
+    let semantic_text = crate::minilm_contract::build_minilm_task_text(process, title, &ocr_text);
     let clip = if has_ocr {
         let resized =
             crate::clip_preprocess::pillow_bicubic_resize_rgb(image, CLIP_SIZE, CLIP_SIZE);
@@ -1458,20 +1458,17 @@ async fn encode_staged(
     let input = &work.input;
     let (spec, text) = match work.receipt.consumer {
         Consumer::MiniLm => {
-            let text = crate::minilm_migration::build_minilm_task_text(
+            let text = crate::minilm_contract::build_minilm_task_text(
                 &input.process_name,
                 &input.window_title,
                 &input.ocr_text,
             );
             (
-                crate::minilm_migration::minilm_job_spec(work.receipt.screenshot_id, &text),
+                crate::minilm_contract::minilm_job_spec(work.receipt.screenshot_id, &text),
                 Some(text),
             )
         }
-        Consumer::Clip => (
-            crate::clip_migration::clip_job_spec(&input.image_hash),
-            None,
-        ),
+        Consumer::Clip => (crate::clip_contract::clip_job_spec(&input.image_hash), None),
         Consumer::Classification | Consumer::SmartCluster => {
             return Err("invalid model consumer".into())
         }
@@ -1542,8 +1539,8 @@ async fn encode_staged(
             .next()
             .ok_or("model returned no vector")?;
         match work.receipt.consumer {
-            Consumer::MiniLm => crate::minilm_migration::validate_minilm_vector(&vector)?,
-            Consumer::Clip => crate::clip_migration::validate_clip_vector(&vector)?,
+            Consumer::MiniLm => crate::minilm_contract::validate_minilm_vector(&vector)?,
+            Consumer::Clip => crate::clip_contract::validate_clip_vector(&vector)?,
             _ => unreachable!(),
         }
         storage.processing_stage.check_receipt(&work.receipt)?;

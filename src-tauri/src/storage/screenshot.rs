@@ -1634,12 +1634,10 @@ impl StorageState {
 
     /// Estimated expected row count for the derived CLIP image index.
     ///
-    /// Semantics (Milestone 1): a vector row is expected for every DISTINCT
-    /// `image_hash` among non-deleted screenshots that have at least one
-    /// active OCR row. Distinct-hash because the vector collection is keyed by
-    /// image hash, so duplicate captures share one row. OCR-row existence is a
-    /// stable migration-baseline proxy; Milestone 2 replaces it with a
-    /// first-party per-row ledger.
+    /// A vector row is expected for every DISTINCT `image_hash` among
+    /// non-deleted screenshots that have at least one active OCR row.
+    /// Distinct-hash because the image index is keyed by image hash, so
+    /// duplicate captures share one row.
     pub fn count_expected_clip_image_rows(&self) -> Result<i64, String> {
         let guard = self.get_connection_named("count_expected_clip_image_rows")?;
         let conn = guard
@@ -1656,37 +1654,6 @@ impl StorageState {
             |row| row.get::<_, i64>(0),
         )
         .map_err(|e| format!("Failed to count expected CLIP image rows: {}", e))
-    }
-
-    /// Every distinct `image_hash` that a CLIP vector may legitimately belong to.
-    ///
-    /// The same population `count_expected_clip_image_rows` counts, returned
-    /// rather than counted. The M2.5 step-7 migration needs it because the
-    /// Chroma `screenshots` collection is keyed by `md5("memory://" +
-    /// image_hash)` and MD5 cannot be inverted: the only way back to a subject
-    /// key is to hash the hashes SQLite already holds and match. An exported id
-    /// that no row here reproduces is an orphan — a screenshot deleted after it
-    /// was indexed — and the importer quarantines it rather than guessing.
-    pub fn list_clip_eligible_image_hashes(&self) -> Result<Vec<String>, String> {
-        let guard = self.get_connection_named("list_clip_eligible_image_hashes")?;
-        let conn = guard
-            .as_ref()
-            .ok_or_else(|| "Database connection is None".to_string())?;
-        let mut statement = conn
-            .prepare(
-                "SELECT DISTINCT s.image_hash FROM screenshots s
-                 WHERE s.is_deleted = 0
-                   AND EXISTS (
-                       SELECT 1 FROM ocr_results o
-                        WHERE o.screenshot_id = s.id AND o.is_deleted = 0
-                   )",
-            )
-            .map_err(|e| format!("Failed to prepare the CLIP image hash scan: {}", e))?;
-        let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| format!("Failed to scan CLIP image hashes: {}", e))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to read a CLIP image hash: {}", e))
     }
 
     /// Active screenshot ids for each of `image_hashes`.
@@ -2351,18 +2318,6 @@ impl StorageState {
             .map_err(|error| error.to_string())
     }
 
-    /// Batch OCR read for unattended workers. Authentication failures abort
-    /// immediately and CNG is never allowed to display interactive UI.
-    pub(crate) fn get_ocr_results_by_screenshot_ids_silent(
-        &self,
-        screenshot_ids: &[i64],
-    ) -> Result<std::collections::HashMap<i64, String>, BackgroundReadError> {
-        if !screenshot_ids.is_empty() && !self.is_silent_read_authorized() {
-            return Err(BackgroundReadError::AuthRequired);
-        }
-        self.get_ocr_results_by_screenshot_ids_with_mode(screenshot_ids, true)
-    }
-
     /// Batch OCR text for MiniLM source fingerprints. Per screenshot only the
     /// first `min_chars` joined characters are guaranteed — the MiniLM source
     /// contract truncates OCR input to a fixed prefix — which lets the
@@ -2372,8 +2327,7 @@ impl StorageState {
     /// The prefix replays the boxes in insertion order so it reproduces the
     /// text that was actually embedded; see [`ocr_text_prefix_query`].
     /// Every requested id is present in the result (empty string when the
-    /// screenshot has no decryptable text), matching
-    /// [`Self::get_ocr_results_by_screenshot_ids_silent`].
+    /// screenshot has no decryptable text).
     pub(crate) fn get_ocr_text_prefixes_by_screenshot_ids_silent(
         &self,
         screenshot_ids: &[i64],
@@ -4110,10 +4064,6 @@ mod ocr_lifecycle_tests {
         let credential_state = Arc::new(CredentialManagerState::new(temp.path().to_path_buf()));
         let storage = StorageState::new(temp.path().to_path_buf(), credential_state);
 
-        assert!(matches!(
-            storage.get_ocr_results_by_screenshot_ids_silent(&[1]),
-            Err(BackgroundReadError::AuthRequired)
-        ));
         assert!(matches!(
             storage.get_ocr_text_prefixes_by_screenshot_ids_silent(&[1], 200),
             Err(BackgroundReadError::AuthRequired)

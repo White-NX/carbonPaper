@@ -19,8 +19,8 @@ mod capture;
 mod classification;
 mod classification_runtime;
 mod clip_ann;
+mod clip_contract;
 mod clip_index;
-mod clip_migration;
 mod clip_preprocess;
 mod clip_query;
 pub mod commands;
@@ -30,15 +30,16 @@ mod error_window;
 mod i18n;
 mod idle;
 mod index_progress;
+mod legacy_vector_discard;
 mod logging;
 mod maintenance;
+mod maintenance_support;
 pub mod mcp_contract;
 mod mcp_server;
 mod mcp_smoke;
 mod mcp_token;
-mod migration_support;
+mod minilm_contract;
 mod minilm_index;
-mod minilm_migration;
 #[allow(dead_code)]
 mod ml_contracts;
 #[allow(dead_code)]
@@ -878,8 +879,6 @@ pub fn run() {
         .manage(Arc::new(classification::ClassificationState::default()))
         .manage(Arc::new(background_scheduler::BackgroundSchedulerState::default()))
         .manage(Arc::new(blind_index_repair::BlindIndexRepairState::new()))
-        .manage(Arc::new(minilm_migration::MinilmMigrationState::new()))
-        .manage(Arc::new(clip_migration::ClipMigrationState::new()))
         .manage(Arc::new(clip_index::ClipIndexRunState::default()))
         .manage(Arc::new(clip_ann::ClipAnnState::default()))
         .manage(Arc::new(CaptureState::default()))
@@ -1059,12 +1058,12 @@ pub fn run() {
                             app.handle().clone(),
                         );
 
-                        // Sentinel-gated one-time Chroma copies; each waits for
-                        // unlock internally before starting. The CLIP one also
-                        // waits out the MiniLM one's maintenance guard, so the
-                        // two never pause and restore capture at the same time.
-                        minilm_migration::spawn_minilm_auto_migration(app.handle().clone());
-                        clip_migration::spawn_clip_auto_migration(app.handle().clone());
+                        // Settle the derived-index sentinels by explicit
+                        // discard of the retired Chroma collections. Needs
+                        // neither an unlocked vault nor maintenance mode.
+                        legacy_vector_discard::spawn_legacy_vector_discard(
+                            app.handle().clone(),
+                        );
                         clip_ann::spawn_startup_arm(app.handle().clone());
 
                         let app_handle_cleanup = app.handle().clone();
@@ -1259,10 +1258,6 @@ pub fn run() {
             clip_ann::clip_ann_take_failure_notification,
             clip_ann::clip_ann_ack_failure_notification,
             rerank::nl_rerank_stop_now,
-            minilm_migration::get_minilm_rebuild_status,
-            minilm_migration::list_minilm_rebuild_errors,
-            clip_migration::get_clip_rebuild_status,
-            clip_migration::list_clip_rebuild_errors,
             blind_index_repair::get_blind_index_repair_status,
             maintenance::get_maintenance_status,
             monitor::monitor_remove_local_anchors_by_process,

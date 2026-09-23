@@ -4,13 +4,13 @@
 //! them through the shared semantic worker. Vectors and ledger state commit
 //! together in Rust, where semantic search and Smart Clusters consume them.
 //! Manual indexing can drain the same queue while yielding to foreground
-//! searches. Legacy Chroma data is read only by the migration service.
+//! searches.
 
 use crate::background_scheduler::{
     deferred_release_note, AutomaticSliceContext, AutomaticSliceStopReason, ScheduledSliceResult,
 };
 use crate::credential_manager::CredentialManagerState;
-use crate::minilm_migration::{
+use crate::minilm_contract::{
     build_minilm_task_text, minilm_job_spec, validate_minilm_vector, MINILM_OCR_SNIPPET_CHARS,
 };
 use crate::ml_protocol::MlSemanticModel;

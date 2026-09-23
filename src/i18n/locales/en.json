@@ -1530,7 +1530,7 @@
   },
   "clipBackfill": {
     "title": "Image index backfill",
-    "lead": "The image index migration has finished, but {{count}} screenshots had no image vector to migrate. They will not appear in the search box's natural-language results unless they are encoded again.",
+    "lead": "{{count}} screenshots have no image index yet. They will not appear in the search box's natural-language results until they are indexed.",
     "missing": "Screenshots to encode",
     "stalled": "Screenshots that failed earlier",
     "estimateLabel": "Estimated time",
@@ -1538,8 +1538,8 @@
     "estimateMinutes": "about {{minutes}} min",
     "estimateHours": "about {{hours}} h",
     "estimateHoursMinutes": "about {{hours}} h {{minutes}} min",
-    "skippedDeleted": "A further {{count}} vectors were skipped because their screenshots have been deleted. That is expected and needs no action.",
-    "failedImports": "{{count}} vectors could not be read. See the migration diagnostics for details.",
+    "skippedDeleted": "A further {{count}} earlier records were skipped, for example because their screenshots have been deleted. That is expected and needs no action.",
+    "failedImports": "{{count}} earlier records could not be read.",
     "whenItRuns": "The backfill only runs while the computer is idle and on mains power, so it will not interrupt what you are doing. You can speed it up or stop it under Settings → Advanced at any time, and you can change your mind later.",
     "approve": "Allow automatic backfill",
     "decline": "Disallow automatic backfill",
@@ -1551,13 +1551,9 @@
   },
   "vectorMigration": {
     "kinds": {
-      "minilm": {
-        "title": "Migrating the text index",
-        "subtitle": "Screenshot-text vectors are being moved into the local Rust index. The app is in maintenance mode while this runs."
-      },
       "clip": {
-        "title": "Migrating the image index",
-        "subtitle": "Screenshot-image vectors are being moved into the local Rust index. The app is in maintenance mode while this runs."
+        "title": "Preparing image search",
+        "subtitle": "The accelerated image-search index is being built. The app is in maintenance mode while this runs."
       },
       "blindIndex": {
         "title": "Repairing text search",
@@ -1569,21 +1565,12 @@
       }
     },
     "eta": "Estimated time remaining: {{eta}} ",
-    "safeWrite": "Writing to disk. Please do not force-quit the app.",
-    "waitingForAuth": "Your session has expired. Complete Windows Hello authentication and the migration will continue automatically.",
+    "waitingForAuth": "Your session has expired. Complete Windows Hello authentication and the task will continue automatically.",
     "reauth": "Authenticate",
-    "errorCount": "{{count}} records could not be migrated. Details were written to the migration diagnostics.",
+    "errorCount": "{{count}} records could not be repaired.",
     "blockedHint": "Other operations are unavailable during maintenance. If the app exits, the task resumes on the next launch.",
     "phases": {
       "starting": "Preparing…",
-      "preflight": "Checking disk space…",
-      "snapshotting_chroma": "Creating the vector snapshot…",
-      "copying_chroma": "Copying existing vectors…",
-      "reconciling": "Removing out-of-scope local vectors…",
-      "publishing_write": "Writing the index file…",
-      "publishing_sync": "Publishing the index…",
-      "publishing_verify": "Verifying the index file…",
-      "publishing_commit": "Committing the index…",
       "building_ann": "Building the accelerated image-search index…",
       "scanning_valid_ocr": "Checking active search records…",
       "repairing_blind_index": "Repairing text search…",

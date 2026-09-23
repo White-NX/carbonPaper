@@ -78,14 +78,8 @@ def main():
             print("No screenshots directory found to remove.")
             pass
 
-        try:
-            shutil.rmtree("chroma_db", ignore_errors=True)
-            print("Chroma DB directory removed.")
-        except FileNotFoundError as e:
-            print("No Chroma DB directory found to remove.")
-            pass
-        finally:
-            os.mkdir("chroma_db")
+        # Retired vector store from releases up to v0.8.5; harmless if absent.
+        shutil.rmtree("chroma_db", ignore_errors=True)
 
         sys.exit(0)
 

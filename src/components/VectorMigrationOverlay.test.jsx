@@ -11,8 +11,6 @@ vi.mock('react-i18next', () => ({
 vi.mock('../lib/semantic_api', () => ({
   getBlindIndexRepairStatus: vi.fn(),
   getMaintenanceStatus: vi.fn(),
-  getMinilmRebuildStatus: vi.fn(),
-  getClipRebuildStatus: vi.fn(),
 }));
 
 vi.mock('../lib/auth_api', () => ({
@@ -20,24 +18,15 @@ vi.mock('../lib/auth_api', () => ({
 }));
 
 import VectorMigrationOverlay from './VectorMigrationOverlay';
-import {
-  getBlindIndexRepairStatus,
-  getClipRebuildStatus,
-  getMaintenanceStatus,
-  getMinilmRebuildStatus,
-} from '../lib/semantic_api';
+import { getBlindIndexRepairStatus, getMaintenanceStatus } from '../lib/semantic_api';
 import { requestAuth } from '../lib/auth_api';
 
-const runningStatus = (overrides = {}) => ({
+const repairStatus = (overrides = {}) => ({
   running: true,
-  run_id: 'run-a',
-  phase: 'copying_chroma',
-  mode: 'copy_chroma_hot_layer',
-  chroma_processed: 2,
-  chroma_total: 10,
+  phase: 'repairing_blind_index',
+  processed: 20,
+  total: 100,
   failed: 0,
-  unmappable: 0,
-  discarded: 0,
   last_error: null,
   ...overrides,
 });
@@ -52,44 +41,13 @@ async function pollTick(ms = 0) {
 describe('VectorMigrationOverlay', () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    getMaintenanceStatus.mockResolvedValue({ active: true, reason: 'minilm_migration' });
-    getMinilmRebuildStatus.mockResolvedValue(runningStatus());
-    getClipRebuildStatus.mockResolvedValue(runningStatus());
-    getBlindIndexRepairStatus.mockResolvedValue({
-      running: true,
-      phase: 'repairing_blind_index',
-      processed: 20,
-      total: 100,
-      failed: 0,
-      last_error: null,
-    });
+    getMaintenanceStatus.mockResolvedValue({ active: true, reason: 'blind_index_repair' });
+    getBlindIndexRepairStatus.mockResolvedValue(repairStatus());
   });
 
   afterEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
-  });
-
-  it('shows a non-dismissable overlay for an active MiniLM run', async () => {
-    render(<VectorMigrationOverlay />);
-    await pollTick();
-
-    expect(screen.getByText('vectorMigration.kinds.minilm.title')).toBeInTheDocument();
-    expect(screen.getByText(/2\s*\/\s*10\s*\(20%\)/)).toBeInTheDocument();
-    expect(screen.queryByRole('button')).toBeNull();
-  });
-
-  // The regression this component was generalized for: the CLIP migration held
-  // the maintenance guard and rejected the monitor commands with nothing on
-  // screen, because the overlay only ever polled MiniLM.
-  it('shows the image-index box while the CLIP migration holds maintenance', async () => {
-    getMaintenanceStatus.mockResolvedValue({ active: true, reason: 'clip_migration' });
-    render(<VectorMigrationOverlay />);
-    await pollTick();
-
-    expect(screen.getByText('vectorMigration.kinds.clip.title')).toBeInTheDocument();
-    expect(getClipRebuildStatus).toHaveBeenCalled();
-    expect(getMinilmRebuildStatus).not.toHaveBeenCalled();
   });
 
   it('shows the image-index box for an ANN-only bootstrap without a migration run', async () => {
@@ -99,20 +57,16 @@ describe('VectorMigrationOverlay', () => {
 
     expect(screen.getByText('vectorMigration.kinds.clip.title')).toBeInTheDocument();
     expect(screen.getByText('vectorMigration.phases.building_ann')).toBeInTheDocument();
-    expect(getClipRebuildStatus).not.toHaveBeenCalled();
-    expect(getMinilmRebuildStatus).not.toHaveBeenCalled();
+    expect(getBlindIndexRepairStatus).not.toHaveBeenCalled();
   });
 
-  it('shows blocking progress for the blind text-index repair', async () => {
-    getMaintenanceStatus.mockResolvedValue({ active: true, reason: 'blind_index_repair' });
+  it('shows non-dismissable blocking progress for the blind text-index repair', async () => {
     render(<VectorMigrationOverlay />);
     await pollTick();
 
     expect(screen.getByText('vectorMigration.kinds.blindIndex.title')).toBeInTheDocument();
     expect(screen.getByText(/20\s*\/\s*100\s*\(20%\)/)).toBeInTheDocument();
     expect(getBlindIndexRepairStatus).toHaveBeenCalled();
-    expect(getMinilmRebuildStatus).not.toHaveBeenCalled();
-    expect(getClipRebuildStatus).not.toHaveBeenCalled();
     expect(screen.queryByRole('button')).toBeNull();
   });
 
@@ -121,11 +75,9 @@ describe('VectorMigrationOverlay', () => {
     render(<VectorMigrationOverlay />);
     await pollTick();
 
-    expect(screen.queryByText('vectorMigration.kinds.minilm.title')).toBeNull();
+    expect(screen.queryByText('vectorMigration.kinds.blindIndex.title')).toBeNull();
     expect(screen.queryByText('vectorMigration.kinds.unknown.title')).toBeNull();
     // No detail read is worth making when the cheap outer flag already says no.
-    expect(getMinilmRebuildStatus).not.toHaveBeenCalled();
-    expect(getClipRebuildStatus).not.toHaveBeenCalled();
     expect(getBlindIndexRepairStatus).not.toHaveBeenCalled();
   });
 
@@ -138,16 +90,16 @@ describe('VectorMigrationOverlay', () => {
   });
 
   it('keeps the box when the detailed status read fails', async () => {
-    getMinilmRebuildStatus.mockRejectedValue(new Error('database locked'));
+    getBlindIndexRepairStatus.mockRejectedValue(new Error('database locked'));
     render(<VectorMigrationOverlay />);
     await pollTick();
 
-    expect(screen.getByText('vectorMigration.kinds.minilm.title')).toBeInTheDocument();
+    expect(screen.getByText('vectorMigration.kinds.blindIndex.title')).toBeInTheDocument();
     expect(screen.getByText('vectorMigration.phases.starting')).toBeInTheDocument();
   });
 
-  it('offers re-authentication while the run waits for Windows Hello', async () => {
-    getMinilmRebuildStatus.mockResolvedValue(runningStatus({ phase: 'waiting_for_auth' }));
+  it('offers re-authentication while a run waits for Windows Hello', async () => {
+    getBlindIndexRepairStatus.mockResolvedValue(repairStatus({ phase: 'waiting_for_auth' }));
     render(<VectorMigrationOverlay />);
     await pollTick();
 

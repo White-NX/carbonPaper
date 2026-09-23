@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
-  Database,
   Image as ImageIcon,
   KeyRound,
   Loader2,
@@ -9,37 +8,24 @@ import {
   ShieldAlert,
   Wrench,
 } from 'lucide-react';
-import {
-  getBlindIndexRepairStatus,
-  getClipRebuildStatus,
-  getMaintenanceStatus,
-  getMinilmRebuildStatus,
-} from '../lib/semantic_api';
+import { getBlindIndexRepairStatus, getMaintenanceStatus } from '../lib/semantic_api';
 import { requestAuth } from '../lib/auth_api';
 import { cn } from '../lib/utils';
 
 const ACTIVE_POLL_MS = 1000;
 const IDLE_POLL_MS = 3000;
-// Phases whose progress pair drives the bar and the ETA estimate. Shared by
-// both migrations: they run the same orchestration out of `migration_support`
-// and therefore report the same phase names.
+// Phases whose progress pair drives the bar and the ETA estimate.
 const PROGRESS_SOURCES = {
-  copying_chroma: ['chroma_processed', 'chroma_total'],
-  publishing_write: ['publish_current', 'publish_total'],
-  publishing_sync: ['publish_current', 'publish_total'],
-  publishing_verify: ['publish_current', 'publish_total'],
   repairing_blind_index: ['processed', 'total'],
 };
 
 /**
  * Which detailed status to read, keyed by the reason string the backend passes
  * to `maintenance::enter`. Keeping the two in step is what stops this overlay
- * from going blank the next time a migration is added: an unrecognised reason
- * still renders a box, just without progress.
+ * from going blank the next time a maintenance task is added: an unrecognised
+ * reason still renders a box, just without progress.
  */
 const MIGRATION_KINDS = {
-  minilm_migration: { id: 'minilm', icon: Database, read: getMinilmRebuildStatus },
-  clip_migration: { id: 'clip', icon: ImageIcon, read: getClipRebuildStatus },
   clip_ann_bootstrap: { id: 'clip', icon: ImageIcon, read: null, phase: 'building_ann' },
   blind_index_repair: {
     id: 'blindIndex',
@@ -58,18 +44,15 @@ function formatEta(seconds) {
 }
 
 /**
- * Full-window, non-dismissable maintenance overlay for sentinel-triggered
- * index maintenance. Runs cannot be cancelled: closing the app merely
- * interrupts it, and it resumes on the next launch/unlock.
+ * Full-window, non-dismissable maintenance overlay for startup index
+ * maintenance. Runs cannot be cancelled: closing the app merely interrupts
+ * them, and they resume on the next launch/unlock.
  *
- * Visibility is decided by *maintenance mode*, not by any one migration's
- * `running` flag. The guard is taken before a run marks itself running and
- * dropped after it clears that flag, so maintenance strictly contains both
- * runs — and gating on the outer condition means the app can no longer sit in
- * maintenance mode with nothing on screen to explain it. That is what the CLIP
- * migration shipped as until now: it held the guard, rejected the monitor
- * commands, paused capture, and had no overlay, because this component only
- * ever polled MiniLM.
+ * Visibility is decided by *maintenance mode*, not by any one task's `running`
+ * flag. The guard is taken before a run marks itself running and dropped after
+ * it clears that flag, so maintenance strictly contains every run — and gating
+ * on the outer condition means the app can never sit in maintenance mode with
+ * nothing on screen to explain it.
  */
 export default function VectorMigrationOverlay() {
   const { t } = useTranslation();
@@ -153,9 +136,7 @@ export default function VectorMigrationOverlay() {
   }
 
   const waitingForAuth = phase === 'waiting_for_auth';
-  const isPublishSync = phase === 'publishing_sync';
-  const errorCount =
-    (status.failed ?? 0) + (status.unmappable ?? 0) + (status.discarded ?? 0);
+  const errorCount = status.failed ?? 0;
   const phaseText = t(`vectorMigration.phases.${phase}`, {
     defaultValue: t('vectorMigration.phases.working'),
   });
@@ -223,14 +204,6 @@ export default function VectorMigrationOverlay() {
               </p>
             )}
           </div>
-
-          {isPublishSync && (
-            <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg">
-              <p className="text-xs text-amber-400 leading-relaxed">
-                {t('vectorMigration.safeWrite')}
-              </p>
-            </div>
-          )}
 
           {waitingForAuth && (
             <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg">

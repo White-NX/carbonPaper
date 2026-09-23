@@ -1530,7 +1530,7 @@
   },
   "clipBackfill": {
     "title": "画面索引补算",
-    "lead": "画面索引迁移已完成，但有 {{count}} 张截图没有可迁移的画面向量。它们不会出现在主搜索框的自然语言搜索结果里，除非重新计算。",
+    "lead": "有 {{count}} 张截图还没有画面索引。在完成索引之前，它们不会出现在主搜索框的自然语言搜索结果里。",
     "missing": "需要补算的截图",
     "stalled": "此前索引失败的截图",
     "estimateLabel": "预计耗时",
@@ -1538,8 +1538,8 @@
     "estimateMinutes": "约 {{minutes}} 分钟",
     "estimateHours": "约 {{hours}} 小时",
     "estimateHoursMinutes": "约 {{hours}} 小时 {{minutes}} 分钟",
-    "skippedDeleted": "另有 {{count}} 条向量因对应截图已被删除而跳过，这是正常的，无需处理。",
-    "failedImports": "有 {{count}} 条向量无法读取，详情见迁移诊断。",
+    "skippedDeleted": "另有 {{count}} 条早先的记录已跳过，例如对应截图已被删除。这是正常的，无需处理。",
+    "failedImports": "有 {{count}} 条早先的记录无法读取。",
     "whenItRuns": "补算只在电脑空闲且接入电源时进行，不会打扰你正在做的事。可以随时在“设置 → 高级”里手动加速或停止，也可以之后再改变主意。",
     "approve": "允许自动补算",
     "decline": "不允许自动补算",
@@ -1551,13 +1551,9 @@
   },
   "vectorMigration": {
     "kinds": {
-      "minilm": {
-        "title": "文本索引迁移中",
-        "subtitle": "正在把截图文本的向量迁移到本地 Rust 索引。迁移期间应用处于维护模式。"
-      },
       "clip": {
-        "title": "画面索引迁移中",
-        "subtitle": "正在把截图画面的向量迁移到本地 Rust 索引。迁移期间应用处于维护模式。"
+        "title": "正在准备图片搜索",
+        "subtitle": "正在构建图片搜索加速索引。构建期间应用处于维护模式。"
       },
       "blindIndex": {
         "title": "正在修复文本搜索索引",
@@ -1569,21 +1565,12 @@
       }
     },
     "eta": "预计剩余时间：{{eta}}",
-    "safeWrite": "正在写入磁盘，请勿强制关闭应用。",
-    "waitingForAuth": "会话已过期。请完成 Windows Hello 认证，迁移随后会自动继续。",
+    "waitingForAuth": "会话已过期。请完成 Windows Hello 认证，任务随后会自动继续。",
     "reauth": "重新认证",
-    "errorCount": "有 {{count}} 条记录无法迁移，详情已写入迁移诊断。",
+    "errorCount": "有 {{count}} 条记录无法修复。",
     "blockedHint": "维护期间其它操作暂不可用；若应用退出，将在下次启动后自动继续。",
     "phases": {
       "starting": "正在准备…",
-      "preflight": "正在检查磁盘空间…",
-      "snapshotting_chroma": "正在创建向量快照…",
-      "copying_chroma": "正在复制现有向量…",
-      "reconciling": "正在清理超出范围的本地向量…",
-      "publishing_write": "正在写入索引文件…",
-      "publishing_sync": "正在发布索引…",
-      "publishing_verify": "正在校验索引文件…",
-      "publishing_commit": "正在提交索引…",
       "building_ann": "正在构建图片搜索加速索引…",
       "scanning_valid_ocr": "正在检查有效搜索记录…",
       "repairing_blind_index": "正在修复文本搜索索引…",

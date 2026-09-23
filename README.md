@@ -72,5 +72,4 @@ The model files and dependencies will take up approximately 4GB. With high-frequ
 ## Main open source libs used
 
 - 文本OCR：[RapidOCR](https://github.com/RapidAI/RapidOCR)
-- 向量数据库：[ChromaDB](https://github.com/chroma-core/chroma)
 - UI：[Tauri](https://github.com/tauri-apps/tauri)

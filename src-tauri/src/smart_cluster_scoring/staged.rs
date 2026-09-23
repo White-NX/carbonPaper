@@ -92,17 +92,17 @@ where
     }
     let id = work.receipt.screenshot_id;
     let input = &work.input;
-    let text = crate::minilm_migration::build_minilm_task_text(
+    let text = crate::minilm_contract::build_minilm_task_text(
         &input.process_name,
         &input.window_title,
         &input.ocr_text,
     );
-    let expected = crate::minilm_migration::minilm_job_spec(id, &text);
+    let expected = crate::minilm_contract::minilm_job_spec(id, &text);
     let record = storage
         .get_query_visible_embedding(DerivedIndexKind::SemanticText, &id.to_string())?
         .filter(|record| record.job == expected)
         .ok_or("deferred: waiting_for_index")?;
-    crate::minilm_migration::validate_minilm_vector(&record.vector)?;
+    crate::minilm_contract::validate_minilm_vector(&record.vector)?;
     let document = build_rerank_document(&input.process_name, &input.window_title, &input.ocr_text);
     let documents = HashMap::from([(id, document)]);
     let vectors = HashMap::from([(id, record.vector)]);

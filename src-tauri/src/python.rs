@@ -784,8 +784,6 @@ fn perform_install_python_venv(
         }
     }
 
-    normalize_chroma_runtime(&python_exec_cmd)?;
-
     if let Ok(arc_file) = log_file.lock() {
         if let Ok(mut f) = arc_file.as_ref().lock() {
             let _ = writeln!(
@@ -942,40 +940,6 @@ pub fn check_deps_freshness(app: AppHandle) -> Result<serde_json::Value, String>
     }
 }
 
-// Chroma still depends on the CPU ONNX package, even though both collections
-// explicitly disable embedding functions. Old releases replaced its files with
-// the DirectML wheel. Remove that overlapping distribution and repair the CPU
-// package before recording a successful dependency sync. Native inference uses
-// the independently bundled Rust runtime, not either of these Python wheels.
-fn normalize_chroma_runtime(python: &str) -> io::Result<()> {
-    for args in [
-        vec!["-m", "pip", "uninstall", "onnxruntime-directml", "-y"],
-        vec![
-            "-m",
-            "pip",
-            "install",
-            "onnxruntime==1.24.2",
-            "--force-reinstall",
-            "--no-deps",
-            "-i",
-            "https://mirrors.aliyun.com/pypi/simple/",
-        ],
-    ] {
-        let mut command = Command::new(python);
-        command.args(args);
-        #[cfg(windows)]
-        command.creation_flags(0x08000000);
-        let output = command.output()?;
-        if !output.status.success() {
-            return Err(io::Error::other(format!(
-                "Failed to repair legacy vector migration dependencies: {}",
-                String::from_utf8_lossy(&output.stderr),
-            )));
-        }
-    }
-    Ok(())
-}
-
 // ==================== Dependency sync command ====================
 
 #[tauri::command]
@@ -1054,8 +1018,6 @@ pub async fn sync_python_deps(app: AppHandle) -> Result<String, String> {
             .unwrap_or_else(|| "unknown".into());
         return Err(format!("pip install failed (exit code {})", exit_code));
     }
-
-    normalize_chroma_runtime(&python_exec_cmd).map_err(|e| e.to_string())?;
 
     // Write updated hash on success
     match compute_requirements_hash(&requirements_path) {

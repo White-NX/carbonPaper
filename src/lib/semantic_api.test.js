@@ -15,11 +15,7 @@ import {
   getSmartClusterSummary,
   upsertSmartClusterSummary,
   deleteSmartClusterSummary,
-  getMinilmRebuildStatus,
-  listMinilmRebuildErrors,
-  getClipRebuildStatus,
   getBlindIndexRepairStatus,
-  listClipRebuildErrors,
   getMaintenanceStatus,
 } from './semantic_api';
 
@@ -39,38 +35,16 @@ describe('semantic_api', () => {
     }
   };
 
-  it('exposes read-only MiniLM migration status commands', async () => {
+  it('exposes read-only maintenance status commands', async () => {
     invoke.mockResolvedValue({ running: true });
 
-    await getMinilmRebuildStatus();
     await getBlindIndexRepairStatus();
-    await listMinilmRebuildErrors(5, 25);
     await getMaintenanceStatus();
 
-    expect(invoke).toHaveBeenNthCalledWith(1, 'get_minilm_rebuild_status');
-    expect(invoke).toHaveBeenNthCalledWith(2, 'get_blind_index_repair_status');
-    expect(invoke).toHaveBeenNthCalledWith(3, 'list_minilm_rebuild_errors', {
-      offset: 5,
-      limit: 25,
-    });
-    expect(invoke).toHaveBeenNthCalledWith(4, 'get_maintenance_status');
-    expectWithAuth(1);
-  });
-
-  it('exposes the same pair for the CLIP migration', async () => {
-    invoke.mockResolvedValue({ running: true });
-
-    await getClipRebuildStatus();
-    await listClipRebuildErrors(0, 100);
-
-    // Status is unauthenticated so the overlay can poll it before unlock —
-    // `waiting_for_auth` is one of the phases it has to be able to render.
-    expect(invoke).toHaveBeenNthCalledWith(1, 'get_clip_rebuild_status');
-    expect(invoke).toHaveBeenNthCalledWith(2, 'list_clip_rebuild_errors', {
-      offset: 0,
-      limit: 100,
-    });
-    expectWithAuth(1);
+    // Both are unauthenticated so the overlay can poll them before unlock.
+    expect(invoke).toHaveBeenNthCalledWith(1, 'get_blind_index_repair_status');
+    expect(invoke).toHaveBeenNthCalledWith(2, 'get_maintenance_status');
+    expect(withAuth).not.toHaveBeenCalled();
   });
 
   it('calls smart cluster summary commands with expected payloads', async () => {

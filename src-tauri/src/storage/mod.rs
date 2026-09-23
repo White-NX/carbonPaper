@@ -516,6 +516,18 @@ impl StorageState {
     }
 }
 
+/// Test-only: a `StorageState` over an in-memory database with the full schema
+/// installed, for crate modules that exercise storage without a vault.
+#[cfg(test)]
+pub(crate) fn test_storage_with_schema(data_dir: PathBuf) -> StorageState {
+    let credential = Arc::new(CredentialManagerState::new(data_dir.clone()));
+    let storage = StorageState::new(data_dir, credential);
+    let connection = Connection::open_in_memory().expect("in-memory database");
+    storage.init_tables(&connection).expect("initialize schema");
+    *storage.db.lock().unwrap_or_else(|error| error.into_inner()) = Some(connection);
+    storage
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

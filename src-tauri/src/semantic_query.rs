@@ -17,9 +17,9 @@
 //! store is a *prefix* of a corpus somebody else holds in full, and each keeps
 //! its refusal:
 //!
-//! - The M2.4 migration has not finished. It commits page by page and its rows
-//!   become query-visible immediately, so an interrupted run leaves a partial
-//!   index. The once-per-revision sentinel gates this.
+//! - The index sentinel has not settled. It settles at startup now, by the
+//!   legacy-vector discard task, so this is only the first seconds of a launch
+//!   or a database that cannot be read.
 //! - The store is empty outright, which is the unmigrated machine.
 //!
 //! A capture-indexing backlog is reported rather than used to select another
@@ -90,7 +90,7 @@ struct BackendObservations {
 
 static OBSERVATIONS: RwLock<Option<BackendObservations>> = RwLock::new(None);
 
-/// Caches the one-way transition of the M2.4 migration sentinel.
+/// Caches the one-way transition of the index sentinel.
 ///
 /// The sentinel is written once per vector-space revision and never cleared, so
 /// once it is observed the answer cannot change for the life of the process and
@@ -98,15 +98,12 @@ static OBSERVATIONS: RwLock<Option<BackendObservations>> = RwLock::new(None);
 /// so a partial migration is reported instead of queried as a complete corpus.
 static MIGRATION_SETTLED: AtomicBool = AtomicBool::new(false);
 
-/// Whether the sentinel-triggered M2.4 copy has finished for this vector space.
+/// Whether the index sentinel has settled for this vector space.
 ///
-/// The migration commits page by page against a persisted cursor, and a
-/// migrated row becomes query-visible as soon as its job row reaches
-/// `completed` — there is no generation gate in front of the read path. So a
-/// run that failed or was interrupted leaves a *partial* index: not empty, and
-/// therefore not caught by the empty-index fallback, but missing whatever the
-/// cursor never reached. Ranking that is the same silent-omission failure the
-/// dual-write debt check exists to prevent, so it gets the same treatment.
+/// Kept as a gate even though nothing copies into the index anymore: the
+/// sentinel is what `legacy_vector_discard.rs` writes once the retired
+/// collection has been explicitly discarded, and a store that has not reached
+/// that point is one whose contents nobody has vouched for yet.
 fn migration_settled(storage: &StorageState) -> bool {
     if MIGRATION_SETTLED.load(Ordering::Relaxed) {
         return true;
@@ -114,7 +111,7 @@ fn migration_settled(storage: &StorageState) -> bool {
     let settled = storage
         .is_auto_migration_done(
             DerivedIndexKind::SemanticText,
-            crate::minilm_migration::MINILM_VECTOR_SPACE_REVISION,
+            crate::minilm_contract::MINILM_VECTOR_SPACE_REVISION,
         )
         // A database that cannot be read cannot vouch for its own completeness.
         .unwrap_or(false);

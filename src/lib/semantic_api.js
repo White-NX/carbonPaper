@@ -1,51 +1,19 @@
 /**
- * Semantic search, vector migration, and Smart Cluster Tauri command wrappers.
+ * Semantic search, index maintenance, and Smart Cluster Tauri command wrappers.
  */
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from './auth_api';
-
-/**
- * Read progress for the active or most recently persisted MiniLM migration
- * run. The migration itself is sentinel-triggered at startup and cannot be
- * started or cancelled from the frontend; an interrupted run resumes on the
- * next launch/unlock.
- */
-export async function getMinilmRebuildStatus() {
-  return invoke('get_minilm_rebuild_status');
-}
-
-/** List in-memory + persisted diagnostics and failed/discarded ledger jobs. */
-export async function listMinilmRebuildErrors(offset = 0, limit = 100) {
-  return withAuth(() => invoke('list_minilm_rebuild_errors', { offset, limit }));
-}
-
-/**
- * The same, for the Chinese-CLIP image-vector migration (M2.5 step 7).
- *
- * A separate command rather than one parameterised by index kind, because the
- * two runs have separate state and separate sentinels and only their
- * orchestration is shared. The response shape is field-compatible with the
- * MiniLM one, which is what lets a single overlay render either.
- */
-export async function getClipRebuildStatus() {
-  return invoke('get_clip_rebuild_status');
-}
 
 /** Read progress for the mandatory stale text-search index repair. */
 export async function getBlindIndexRepairStatus() {
   return invoke('get_blind_index_repair_status');
 }
 
-/** List diagnostics for the CLIP migration run. */
-export async function listClipRebuildErrors(offset = 0, limit = 100) {
-  return withAuth(() => invoke('list_clip_rebuild_errors', { offset, limit }));
-}
-
 /**
  * What a CLIP backfill would cover and cost.
  *
- * Read-only and unauthenticated, so the dialog can poll it while waiting for
- * the step-7 copy to settle. The counts it returns are deliberately separate:
+ * Read-only and unauthenticated, so the dialog can poll it before the index
+ * sentinel settles at startup. The counts it returns are deliberately separate:
  * `skipped_deleted` is the ordinary consequence of having deleted screenshots
  * and needs no action, while `never_indexed` is what a backfill would encode
  * and what `estimated_seconds` is an estimate for. The full-history census is

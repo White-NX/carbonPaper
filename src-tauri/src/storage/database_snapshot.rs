@@ -412,6 +412,15 @@ pub(crate) fn create_database_snapshot(
     })
 }
 
+/// Directories a backup carries besides the database group. `chroma_db` is
+/// no longer among them: the retired vector store is discarded on upgrade and
+/// its contents are rebuilt from what is here, so archiving it would only
+/// inflate the backup with data the restored app deletes on first launch.
+/// Archives written by older releases that do contain it are still accepted
+/// by `validate_backup_entry_name` and restored by the transaction, after
+/// which the same discard removes it.
+const BACKUP_PAYLOAD_ROOTS: [&str; 1] = ["screenshots"];
+
 /// Copy the user-facing payload directories into a staging tree.  Database
 /// files are intentionally excluded because they must come from
 /// `copy_database_group`; thumbnail and derived-index caches are rebuildable.
@@ -420,7 +429,7 @@ pub(crate) fn copy_payload_tree(
     target_directory: &Path,
 ) -> Result<Vec<PathBuf>, String> {
     let mut copied = Vec::new();
-    for root_name in ["chroma_db", "screenshots"] {
+    for root_name in BACKUP_PAYLOAD_ROOTS {
         let source_root = source_directory.join(root_name);
         if !source_root.exists() {
             continue;
@@ -2023,7 +2032,7 @@ mod tests {
         std::fs::create_dir_all(data.join("screenshots")).unwrap();
         std::fs::create_dir_all(data.join("chroma_db")).unwrap();
         std::fs::write(data.join("screenshots/record.enc"), b"encrypted screenshot").unwrap();
-        std::fs::write(data.join("chroma_db/record.bin"), b"derived payload").unwrap();
+        std::fs::write(data.join("chroma_db/record.bin"), b"retired vector store").unwrap();
         write_restore_credential(&data, b"old wrapped credential");
 
         // Build the same four-part encrypted archive produced by the export
@@ -2032,6 +2041,9 @@ mod tests {
         // extraction boundary rather than only testing synthetic entries.
         let snapshot = create_database_snapshot(&data, "delete", snapshot_parent.path()).unwrap();
         copy_payload_tree(&data, snapshot.path()).unwrap();
+        // The retired vector store is not part of a backup anymore.
+        assert!(!snapshot.path().join("chroma_db").exists());
+        assert!(snapshot.path().join("screenshots/record.enc").exists());
         let mut derived_key = [0u8; 32];
         Argon2::default()
             .hash_password_into(password, salt.as_bytes(), &mut derived_key)

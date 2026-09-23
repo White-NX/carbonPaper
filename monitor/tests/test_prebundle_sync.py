@@ -90,6 +90,8 @@ def test_monitor_bundle_excludes_retired_python_inference_modules():
         "clustering_resources.py",
         "clustering_commands.py",
         "legacy_clip_export.py",
+        "legacy_vector_export.py",
+        "collection_export.py",
     }
     root = _project_root()
     generated_dir = root / "src-tauri" / "pre-bundle" / "monitor"

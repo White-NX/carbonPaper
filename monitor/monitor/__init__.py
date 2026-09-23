@@ -12,7 +12,6 @@ from .config import (
     get_exclusion_settings,
     _get_process_icon_base64,
 )
-from legacy_vector_export import LegacyVectorExporter
 import os
 import uuid
 import logging
@@ -21,8 +20,6 @@ import threading
 logger = logging.getLogger(__name__)
 
 _server = None
-_clip_exporter = None        # Read-only legacy Chroma exporter
-_minilm_exporter = None      # Read-only legacy MiniLM exporter
 _auth_token = None           # Auth token for IPC validation
 _last_seq_no = -1            # Last processed sequence number
 _seen_seq_nos = set()        # Accepted sequence numbers inside the replay window
@@ -32,20 +29,6 @@ _storage_pipe = None         # Storage service pipe name
 
 # Cache for dynamically extracted icons by process name
 _dynamic_icon_cache = {}
-
-
-def _is_storage_session_valid() -> bool:
-    """Probe the Rust credential session for each legacy export request."""
-    if _storage_pipe is None:
-        return True
-
-    try:
-        from storage_client import get_storage_client
-        sc = get_storage_client()
-        return bool(sc and sc.is_session_valid())
-    except Exception as exc:
-        logger.debug('Failed to query storage auth status: %s', exc)
-        return False
 
 
 def get_data_dir():
@@ -248,45 +231,6 @@ def _handle_command_impl(req: dict):
             logger.error('presidio_check_idle failed: %s', e)
             return {'error': str(e)}
 
-    # ----- Legacy Chroma snapshot exports (read-only) -----
-    if cmd in (
-        'start_clip_vectors_export',
-        'get_clip_vectors_export_status',
-        'export_clip_vectors_page',
-        'finish_clip_vectors_export',
-        'start_task_vectors_export',
-        'get_task_vectors_export_status',
-        'export_task_vectors_page',
-        'finish_task_vectors_export',
-    ):
-        exporter = _clip_exporter if 'clip_vectors' in cmd else _minilm_exporter
-        if not exporter:
-            return {'error': 'Legacy vector collection is unavailable'}
-        if not _is_storage_session_valid():
-            return {'error': 'AUTH_REQUIRED: vector export requires an unlocked session'}
-        export_id = req.get('export_id', '')
-        try:
-            if cmd.startswith('start_'):
-                return {'status': 'success', **exporter.start(export_id)}
-            if cmd.startswith('get_'):
-                return {'status': 'success', **exporter.status(export_id)}
-            if cmd.startswith('export_'):
-                return {
-                    'status': 'success',
-                    **exporter.page(
-                        export_id,
-                        cursor=req.get('cursor', 0),
-                        limit=req.get('limit', 128),
-                    ),
-                }
-            return {
-                'status': 'success',
-                'released': exporter.finish(export_id),
-            }
-        except Exception as exc:
-            logger.exception('%s failed', cmd)
-            return {'error': str(exc)}
-
     return {'error': 'unknown command'}
 
 
@@ -295,7 +239,7 @@ def _handle_command_impl(req: dict):
 # ---------------------------------------------------------------------------
 
 def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: str = None):
-    """Start the IPC server and initialise the legacy vector export services.
+    """Start the IPC server.
 
     Args:
         _debug: Debug mode flag.
@@ -303,7 +247,7 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         auth_token: Authentication token for IPC validation.
         storage_pipe: Storage service pipe name (Rust reverse IPC).
     """
-    global _server, _clip_exporter, _minilm_exporter, _storage_pipe, _auth_token, _last_seq_no
+    global _server, _storage_pipe, _auth_token, _last_seq_no
 
     _auth_token = auth_token
     with _seq_lock:
@@ -330,30 +274,9 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         from .ipc_pipe import start_pipe_server
         _server = start_pipe_server(handler=_handle_command, pipe_name=pipe_name)
 
-    # --- Single Shared ChromaDB Client ---
-    try:
-        import chromadb
-        from chromadb.config import Settings as ChromaSettings
-        chroma_path = os.path.join(get_data_dir(), 'chroma_db')
-        shared_chroma_client = chromadb.PersistentClient(
-            path=chroma_path,
-            settings=ChromaSettings(anonymized_telemetry=False),
-        )
-    except Exception as e:
-        logger.error("Failed to initialize shared ChromaDB client: %s", e)
-        shared_chroma_client = None
-
-    try:
-        _clip_exporter = LegacyVectorExporter(shared_chroma_client, kind='clip')
-        _minilm_exporter = LegacyVectorExporter(shared_chroma_client, kind='minilm')
-    except Exception as exc:
-        logger.warning('Legacy vector export unavailable (non-fatal): %s', exc)
-        _clip_exporter = None
-        _minilm_exporter = None
-
     # Screenshot capture, OCR, semantic/CLIP inference, and Smart Cluster
     # scoring and category classification are handled by Rust. Python provides
-    # Presidio and legacy read-only migration export.
+    # Presidio only.
 
     return _server
 

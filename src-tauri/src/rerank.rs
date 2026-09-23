@@ -691,7 +691,7 @@ mod tests {
         assert_eq!(RERANK_OCR_SNIPPET_CHARS, 600);
         assert_ne!(
             RERANK_OCR_SNIPPET_CHARS,
-            crate::minilm_migration::MINILM_OCR_SNIPPET_CHARS
+            crate::minilm_contract::MINILM_OCR_SNIPPET_CHARS
         );
 
         let ocr: String = std::iter::repeat_n('字', 900).collect();
