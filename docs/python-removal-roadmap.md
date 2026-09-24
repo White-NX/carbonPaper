@@ -181,7 +181,11 @@ a requirement: an ID number that one inserted, deleted or replaced character
 would make valid is still caught, because a reader can recover it from a
 handful of candidates. Card numbers are also recognised by their four-digit
 grouping, and labels such as "身份证号" in the neighbouring OCR block on the same
-line or directly above relax the rules. Names are not detected.
+line or directly above relax the rules. Names are not detected, and neither are
+the entities that only Presidio's English built-in recognizers produced, such as
+US social security numbers and IBAN account codes. A 15-digit first-generation
+resident ID number is recognised next to a label; on its own, a string must have
+the 18-digit shape before the province, birth date and repair checks apply.
 `pii/fixtures/ocr_error_patterns.json` records 365 observed OCR edits without
 the numbers they came from; the tests replay them on generated numbers.
 
@@ -195,6 +199,12 @@ match no rule, and never removes content. Stored version 0 configurations are
 upgraded on load: `presidio_*` fields are read under their new names, the old
 default `reject` becomes `remove_paragraph`, an empty entity list becomes the
 default set, and credentials are added to an explicit list.
+
+The sensitive-word level and the personal information rules are switched
+independently. `enabled`, the content-filter level, governs the dictionary and
+its categories alone; `pii_enabled` governs the rules above. Setting the level
+to 关闭 therefore stops keyword filtering only, and personal information is
+still removed or masked according to `mode` and the selected kinds.
 
 Existing Python environments keep the Presidio and spaCy packages and models
 until the environment is rebuilt; nothing imports them any more.

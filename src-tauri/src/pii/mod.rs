@@ -1,8 +1,10 @@
 //! Rule-based detection of personal information in OCR text.
 //!
 //! This replaces the Presidio/spaCy service that used to run in the Python
-//! monitor. Everything that service found for CarbonPaper came from patterns
-//! and checksums, so the rules now run here, in process, and cannot time out.
+//! monitor. The same categories are now found by pattern and checksum rules
+//! that run here, in process, and cannot time out. Names, and the entity types
+//! that only the English built-in recognizers produced, are not detected; the
+//! capability change is recorded in `docs/python-removal-roadmap.md`.
 //!
 //! Screen OCR changes numbers in characteristic ways. On PP-OCRv5 most errors
 //! are dropped digits (CTC decoding merges repeated characters), swaps between

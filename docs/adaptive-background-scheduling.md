@@ -210,8 +210,9 @@ These Office/WebView checks require a running, authorized application session.
 The controlled worker/native-control measurements above do not claim to replace
 that acceptance.
 
-Python's default 15-second test timeout was exceeded by the initial spaCy model
-load. The full suite was rerun with `--timeout=60`. CPython's optional WMI query
+The spaCy integration fixture that exceeded Python's default 15-second test
+timeout during a cold model load was removed with Presidio on 2026-09-24; the
+full suite had been rerun with `--timeout=60`. CPython's optional WMI query
 also blocked during pytest/readline startup on this machine; the final test
 process replaced `platform._wmi_query` with an `OSError` so Python used its
 standard Windows fallback. No system service or application source was changed
