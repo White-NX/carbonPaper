@@ -52,6 +52,7 @@ mod native_messaging;
 mod office_protocol;
 mod office_runtime;
 mod office_window;
+mod pii;
 mod power;
 mod processing_stage;
 mod python;
@@ -1161,7 +1162,7 @@ pub fn run() {
                                 sensitive_filter::SensitiveFilterConfig,
                             >(filter_config.clone())
                             {
-                                filter_state.update_config(config);
+                                filter_state.update_config(config.upgraded());
                             }
                         }
                     }
@@ -1196,8 +1197,6 @@ pub fn run() {
                         }
                     });
                 }
-
-                python::auto_install_spacy_models(app.handle().clone());
 
                 ml_runtime::schedule_ocr_model_health_notification(app.handle().clone());
 
@@ -1236,7 +1235,6 @@ pub fn run() {
             monitor::monitor_smart_cluster_worker_status,
             monitor::monitor_smart_cluster_drain_now,
             monitor::monitor_smart_cluster_stop_drain,
-            monitor::monitor_presidio_set_language,
             monitor::monitor_classify_debug,
             ml_runtime::get_ml_ocr_status,
             ml_runtime::restart_ml_ocr_worker,
@@ -1363,9 +1361,6 @@ pub fn run() {
             python::install_python_venv,
             python::check_deps_freshness,
             python::sync_python_deps,
-            python::install_spacy_model,
-            python::check_spacy_models,
-            python::force_recheck_spacy_models,
             model_management::download_model,
             model_management::check_model_files,
             model_management::get_model_inventory,

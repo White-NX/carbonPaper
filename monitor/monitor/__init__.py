@@ -151,86 +151,6 @@ def _handle_command_impl(req: dict):
         except Exception as e:
             return {'error': str(e)}
 
-    # ----- Presidio PII detection commands -----
-    if cmd == 'presidio_analyze':
-        texts = req.get('texts', [])
-        language = req.get('language', 'zh-CN')
-        entity_types = req.get('entity_types')
-        if not isinstance(texts, list) or len(texts) == 0:
-            return {'error': 'texts must be a non-empty list'}
-        try:
-            from .presidio_worker import get_presidio_worker
-            results = get_presidio_worker().analyze(
-                texts,
-                language,
-                entity_types,
-                timeout=float(req.get('timeout_secs', 14.0)),
-            )
-            return {
-                'status': 'success',
-                'results': results,
-            }
-        except TimeoutError as e:
-            logger.warning('presidio_analyze timeout: %s', e)
-            return {'error': str(e)}
-        except Exception as e:
-            logger.error('presidio_analyze failed: %s', e)
-            return {'error': str(e)}
-
-    if cmd == 'presidio_set_language':
-        language = req.get('language', 'zh-CN')
-        try:
-            from .presidio_worker import get_presidio_worker
-            result = get_presidio_worker().request(
-                {'command': 'set_language', 'language': language},
-                timeout=5.0,
-            )
-            if result.get('status') != 'success':
-                return {'error': result.get('error', 'presidio_set_language failed')}
-            return {
-                'status': 'success',
-                'ok': True,
-                'language': language,
-            }
-        except Exception as e:
-            logger.error('presidio_set_language failed: %s', e)
-            return {'error': str(e)}
-
-    if cmd == 'presidio_status':
-        try:
-            from .presidio_worker import get_presidio_worker
-            result = get_presidio_worker().status()
-            if result.get('status') != 'success':
-                return {'status': 'success', 'loaded': False, 'language': None, 'model': 'none'}
-            return {
-                'status': 'success',
-                'loaded': bool(result.get('initialized')),
-                'language': result.get('language'),
-                'model': result.get('model') or 'none',
-                'watchdog': get_presidio_worker().status_snapshot(),
-            }
-        except Exception as e:
-            return {'status': 'success', 'loaded': False, 'language': None, 'model': 'none'}
-
-    if cmd == 'presidio_unload':
-        try:
-            from .presidio_worker import get_presidio_worker
-            result = get_presidio_worker().unload()
-            if result.get('status') != 'success':
-                return {'error': result.get('error', 'presidio_unload failed')}
-            return {'status': 'success', 'unloaded': True}
-        except Exception as e:
-            logger.error('presidio_unload failed: %s', e)
-            return {'error': str(e)}
-
-    if cmd == 'presidio_check_idle':
-        try:
-            from .presidio_worker import get_presidio_worker
-            return get_presidio_worker().check_idle()
-        except Exception as e:
-            logger.error('presidio_check_idle failed: %s', e)
-            return {'error': str(e)}
-
     return {'error': 'unknown command'}
 
 
@@ -274,21 +194,16 @@ def start(_debug, pipe_name: str = None, auth_token: str = None, storage_pipe: s
         from .ipc_pipe import start_pipe_server
         _server = start_pipe_server(handler=_handle_command, pipe_name=pipe_name)
 
-    # Screenshot capture, OCR, semantic/CLIP inference, and Smart Cluster
-    # scoring and category classification are handled by Rust. Python provides
-    # Presidio only.
+    # Screenshot capture, OCR, semantic/CLIP inference, Smart Cluster scoring,
+    # category classification and personal information detection are handled
+    # by Rust. Python serves only the monitor lifecycle and IPC commands above.
 
     return _server
 
 
 def stop():
-    """Shut down the Presidio worker and IPC server."""
+    """Shut down the IPC server."""
     stop_event.set()
-    try:
-        from .presidio_worker import get_presidio_worker
-        get_presidio_worker().stop()
-    except Exception:
-        pass
     if _server:
         try:
             _server.shutdown()

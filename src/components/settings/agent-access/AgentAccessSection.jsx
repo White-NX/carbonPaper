@@ -36,9 +36,7 @@ export default function AgentAccessSection() {
     setShowAdvanced,
     piiEnabled,
     piiEntities,
-    spacyModels,
-    downloadingModel,
-    recheckLoading,
+    piiMaskLongNumbers,
     showPiiAdvanced,
     setShowPiiAdvanced,
     CONFIRM_TEXT,
@@ -52,8 +50,7 @@ export default function AgentAccessSection() {
     handleFilterModeChange,
     handlePiiToggle,
     handlePiiEntityToggle,
-    handleDownloadModel,
-    handleForceRecheck,
+    handlePiiMaskLongNumbersToggle,
     handleCopyCurrentToken,
     handleAgentVariantChange,
     handleCopyAgentSetupPrompt,
@@ -97,9 +94,7 @@ export default function AgentAccessSection() {
         showAdvanced={showAdvanced}
         piiEnabled={piiEnabled}
         piiEntities={piiEntities}
-        spacyModels={spacyModels}
-        downloadingModel={downloadingModel}
-        recheckLoading={recheckLoading}
+        piiMaskLongNumbers={piiMaskLongNumbers}
         showPiiAdvanced={showPiiAdvanced}
         filterLevel={filterLevel}
         shouldShowStartButton={shouldShowStartButton}
@@ -114,8 +109,7 @@ export default function AgentAccessSection() {
         onToggleAdvanced={() => setShowAdvanced(!showAdvanced)}
         onPiiToggle={handlePiiToggle}
         onPiiEntityToggle={handlePiiEntityToggle}
-        onDownloadModel={handleDownloadModel}
-        onForceRecheck={handleForceRecheck}
+        onPiiMaskLongNumbersToggle={handlePiiMaskLongNumbersToggle}
         onTogglePiiAdvanced={() => setShowPiiAdvanced(!showPiiAdvanced)}
         onCopyCurrentToken={handleCopyCurrentToken}
         onAgentVariantChange={handleAgentVariantChange}

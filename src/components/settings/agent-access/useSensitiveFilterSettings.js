@@ -1,69 +1,81 @@
 import { useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../../../lib/auth_api';
-import { useTauriEventListener } from '../../../hooks/useTauriEventListener';
+import {
+  DEFAULT_CONTENT_FILTER_MODE,
+  DEFAULT_PII_ENTITIES,
+  PII_ENTITY_TYPES,
+} from './agentAccessConstants';
 
-export function useSensitiveFilterSettings({ t, onError }) {
+const ALL_CATEGORIES = {
+  cat_01: true, cat_02: true, cat_03: true, cat_04: true, cat_05: true,
+};
+
+function toPayload(settings) {
+  return {
+    enabled: settings.filterEnabled,
+    categories: settings.filterCategories,
+    mode: settings.filterMode,
+    pii_enabled: settings.piiEnabled,
+    pii_entities: PII_ENTITY_TYPES.filter((type) => settings.piiEntities[type]),
+    pii_mask_long_numbers: settings.piiMaskLongNumbers,
+  };
+}
+
+export function useSensitiveFilterSettings() {
   const [filterEnabled, setFilterEnabled] = useState(true);
-  const [filterCategories, setFilterCategories] = useState({
-    cat_01: true, cat_02: true, cat_03: true, cat_04: true, cat_05: true,
-  });
-  const [filterMode, setFilterMode] = useState('reject');
+  const [filterCategories, setFilterCategories] = useState(ALL_CATEGORIES);
+  const [filterMode, setFilterMode] = useState(DEFAULT_CONTENT_FILTER_MODE);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [piiEnabled, setPiiEnabled] = useState(true);
-  const [piiEntities, setPiiEntities] = useState({
-    PHONE_NUMBER: true, CN_ID_CARD: true,
-    EMAIL_ADDRESS: true, CN_BANK_CARD: true, ADDRESS: true,
-  });
-  const [spacyModels, setSpacyModels] = useState({
-    zh_core_web_sm: { installed: false },
-    en_core_web_sm: { installed: false },
-  });
-  const [downloadingModel, setDownloadingModel] = useState(null);
-  const [recheckLoading, setRecheckLoading] = useState(false);
+  const [piiEntities, setPiiEntities] = useState(DEFAULT_PII_ENTITIES);
+  const [piiMaskLongNumbers, setPiiMaskLongNumbers] = useState(false);
   const [showPiiAdvanced, setShowPiiAdvanced] = useState(false);
+
+  const current = {
+    filterEnabled, filterCategories, filterMode, piiEnabled, piiEntities, piiMaskLongNumbers,
+  };
+
+  const apply = (settings) => {
+    setFilterEnabled(settings.filterEnabled);
+    setFilterCategories(settings.filterCategories);
+    setFilterMode(settings.filterMode);
+    setPiiEnabled(settings.piiEnabled);
+    setPiiEntities(settings.piiEntities);
+    setPiiMaskLongNumbers(settings.piiMaskLongNumbers);
+  };
+
+  // Shows the change at once and restores the previous settings if saving fails.
+  const save = async (changes) => {
+    const previous = current;
+    const next = { ...current, ...changes };
+    apply(next);
+    try {
+      await withAuth(() => invoke('mcp_set_sensitive_filter_config', {
+        config: toPayload(next),
+      }), { autoPrompt: true });
+    } catch (e) {
+      apply(previous);
+      console.error('Failed to save filter config:', e);
+    }
+  };
 
   const loadFilterConfig = useCallback(async () => {
     try {
-      const filterConfig = await withAuth(() => invoke('mcp_get_sensitive_filter_config'));
-      setFilterEnabled(filterConfig.enabled);
-      setFilterCategories(filterConfig.categories);
-      if (filterConfig.mode) setFilterMode(filterConfig.mode);
-      if (filterConfig.presidio_enabled !== undefined) setPiiEnabled(filterConfig.presidio_enabled);
-      if (filterConfig.presidio_entities && filterConfig.presidio_entities.length > 0) {
-        const entityMap = {};
-        for (const entity of filterConfig.presidio_entities) entityMap[entity] = true;
-        setPiiEntities((prev) => {
-          const merged = { ...prev };
-          for (const key of Object.keys(merged)) merged[key] = !!entityMap[key];
-          return merged;
-        });
+      const config = await withAuth(() => invoke('mcp_get_sensitive_filter_config'));
+      setFilterEnabled(config.enabled);
+      setFilterCategories(config.categories);
+      if (config.mode) setFilterMode(config.mode);
+      if (config.pii_enabled !== undefined) setPiiEnabled(config.pii_enabled);
+      if (Array.isArray(config.pii_entities)) {
+        const selected = new Set(config.pii_entities);
+        setPiiEntities(Object.fromEntries(PII_ENTITY_TYPES.map((type) => [type, selected.has(type)])));
       }
+      setPiiMaskLongNumbers(Boolean(config.pii_mask_long_numbers));
     } catch (e) {
       console.error('Failed to load filter config:', e);
     }
   }, []);
-
-  const loadSpacyModels = useCallback(async () => {
-    try {
-      const models = await invoke('check_spacy_models');
-      setSpacyModels(models);
-    } catch (e) {
-      console.error('Failed to check spaCy models:', e);
-    }
-  }, []);
-
-  useTauriEventListener('spacy-model-status', (event) => {
-    const { model, status } = event.payload;
-    if (status === 'installing') {
-      setDownloadingModel(model);
-    } else if (status === 'installed') {
-      setSpacyModels((prev) => ({ ...prev, [model]: { installed: true } }));
-      setDownloadingModel((prev) => prev === model ? null : prev);
-    } else if (status === 'failed') {
-      setDownloadingModel((prev) => prev === model ? null : prev);
-    }
-  });
 
   const filterLevel = (() => {
     if (!filterEnabled) return 'off';
@@ -73,131 +85,33 @@ export function useSensitiveFilterSettings({ t, onError }) {
     return 'custom';
   })();
 
-  const handleLevelChange = async (level) => {
-    let newEnabled = filterEnabled;
-    let newCategories = { ...filterCategories };
+  const handleLevelChange = (level) => {
     if (level === 'standard') {
-      newEnabled = true;
-      newCategories = { cat_01: true, cat_02: true, cat_03: true, cat_04: true, cat_05: true };
-    } else if (level === 'minimal') {
-      newEnabled = true;
-      newCategories = { cat_01: false, cat_02: true, cat_03: false, cat_04: false, cat_05: true };
-    } else if (level === 'off') {
-      newEnabled = false;
+      return save({ filterEnabled: true, filterCategories: ALL_CATEGORIES });
     }
-    setFilterEnabled(newEnabled);
-    setFilterCategories(newCategories);
-    try {
-      await withAuth(() => invoke('mcp_set_sensitive_filter_config', {
-        config: {
-          enabled: newEnabled,
-          categories: newCategories,
-          mode: filterMode,
-          presidio_enabled: piiEnabled,
-          presidio_entities: Object.keys(piiEntities).filter((key) => piiEntities[key]),
-        },
-      }), { autoPrompt: true });
-    } catch (e) {
-      setFilterEnabled(filterEnabled);
-      setFilterCategories(filterCategories);
-      console.error('Failed to save filter config:', e);
+    if (level === 'minimal') {
+      return save({
+        filterEnabled: true,
+        filterCategories: { cat_01: false, cat_02: true, cat_03: false, cat_04: false, cat_05: true },
+      });
     }
+    if (level === 'off') return save({ filterEnabled: false });
+    return undefined;
   };
 
-  const handleCategoryToggle = async (category) => {
-    const newCategories = { ...filterCategories, [category]: !filterCategories[category] };
-    setFilterCategories(newCategories);
-    try {
-      await withAuth(() => invoke('mcp_set_sensitive_filter_config', {
-        config: {
-          enabled: filterEnabled,
-          categories: newCategories,
-          mode: filterMode,
-          presidio_enabled: piiEnabled,
-          presidio_entities: Object.keys(piiEntities).filter((key) => piiEntities[key]),
-        },
-      }), { autoPrompt: true });
-    } catch (e) {
-      setFilterCategories(filterCategories);
-      console.error('Failed to save filter config:', e);
-    }
-  };
+  const handleCategoryToggle = (category) => save({
+    filterCategories: { ...filterCategories, [category]: !filterCategories[category] },
+  });
 
-  const handleFilterModeChange = async (newMode) => {
-    const prevMode = filterMode;
-    setFilterMode(newMode);
-    try {
-      await withAuth(() => invoke('mcp_set_sensitive_filter_config', {
-        config: {
-          enabled: filterEnabled,
-          categories: filterCategories,
-          mode: newMode,
-          presidio_enabled: piiEnabled,
-          presidio_entities: Object.keys(piiEntities).filter((key) => piiEntities[key]),
-        },
-      }), { autoPrompt: true });
-    } catch (e) {
-      setFilterMode(prevMode);
-      console.error('Failed to save filter config:', e);
-    }
-  };
+  const handleFilterModeChange = (mode) => save({ filterMode: mode });
 
-  const savePiiConfig = async (newEnabled, newEntities) => {
-    try {
-      const entityList = Object.keys(newEntities).filter((key) => newEntities[key]);
-      await withAuth(() => invoke('mcp_set_sensitive_filter_config', {
-        config: {
-          enabled: filterEnabled,
-          categories: filterCategories,
-          mode: filterMode,
-          presidio_enabled: newEnabled,
-          presidio_entities: entityList,
-        },
-      }), { autoPrompt: true });
-    } catch (e) {
-      console.error('Failed to save PII config:', e);
-    }
-  };
+  const handlePiiToggle = () => save({ piiEnabled: !piiEnabled });
 
-  const handlePiiToggle = async () => {
-    const newVal = !piiEnabled;
-    setPiiEnabled(newVal);
-    await savePiiConfig(newVal, piiEntities);
-  };
+  const handlePiiEntityToggle = (type) => save({
+    piiEntities: { ...piiEntities, [type]: !piiEntities[type] },
+  });
 
-  const handlePiiEntityToggle = async (entityType) => {
-    const newEntities = { ...piiEntities, [entityType]: !piiEntities[entityType] };
-    setPiiEntities(newEntities);
-    await savePiiConfig(piiEnabled, newEntities);
-  };
-
-  const handleDownloadModel = async (modelName) => {
-    setDownloadingModel(modelName);
-    try {
-      await withAuth(
-        () => invoke('install_spacy_model', { modelName }),
-        { autoPrompt: true },
-      );
-      const models = await invoke('check_spacy_models');
-      setSpacyModels(models);
-    } catch (e) {
-      onError?.(String(e));
-    } finally {
-      setDownloadingModel(null);
-    }
-  };
-
-  const handleForceRecheck = async () => {
-    setRecheckLoading(true);
-    try {
-      const models = await invoke('force_recheck_spacy_models');
-      setSpacyModels(models);
-    } catch (e) {
-      onError?.(String(e));
-    } finally {
-      setRecheckLoading(false);
-    }
-  };
+  const handlePiiMaskLongNumbersToggle = () => save({ piiMaskLongNumbers: !piiMaskLongNumbers });
 
   return {
     filterEnabled,
@@ -207,20 +121,16 @@ export function useSensitiveFilterSettings({ t, onError }) {
     setShowAdvanced,
     piiEnabled,
     piiEntities,
-    spacyModels,
-    downloadingModel,
-    recheckLoading,
+    piiMaskLongNumbers,
     showPiiAdvanced,
     setShowPiiAdvanced,
     filterLevel,
     loadFilterConfig,
-    loadSpacyModels,
     handleLevelChange,
     handleCategoryToggle,
     handleFilterModeChange,
     handlePiiToggle,
     handlePiiEntityToggle,
-    handleDownloadModel,
-    handleForceRecheck,
+    handlePiiMaskLongNumbersToggle,
   };
 }

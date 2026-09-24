@@ -69,9 +69,9 @@ export function useAiEmbeddingController({ t }) {
   const mcpOperationRef = useRef(null);
 
   const CONFIRM_TEXT = t('settings.ai_embedding.privacy_warning.confirm_text');
-  const sensitiveFilter = useSensitiveFilterSettings({ t, onError: setError });
-  const { loadFilterConfig, loadSpacyModels } = sensitiveFilter;
-  useSettingsActivity('ai-access', { busy: actionLoading || restoreLoading || smokeTestLoading || Boolean(sensitiveFilter.downloadingModel) || sensitiveFilter.recheckLoading });
+  const sensitiveFilter = useSensitiveFilterSettings();
+  const { loadFilterConfig } = sensitiveFilter;
+  useSettingsActivity('ai-access', { busy: actionLoading || restoreLoading || smokeTestLoading });
 
   const invalidateSmokeTestReport = useCallback(() => {
     smokeTestRequestRef.current += 1;
@@ -128,7 +128,6 @@ export function useAiEmbeddingController({ t }) {
       if (status.port) localStorage.setItem('mcpPort', String(status.port));
 
       await loadFilterConfig();
-      await loadSpacyModels();
     } catch (e) {
       if (requestId !== statusRequestRef.current) return;
       console.error('Failed to load MCP status:', e);
@@ -140,7 +139,7 @@ export function useAiEmbeddingController({ t }) {
     } finally {
       if (requestId === statusRequestRef.current) setLoading(false);
     }
-  }, [invalidateSmokeTestReport, loadFilterConfig, loadSpacyModels]);
+  }, [invalidateSmokeTestReport, loadFilterConfig]);
 
   useEffect(() => {
     if (active) loadStatus();

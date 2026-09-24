@@ -17,6 +17,8 @@ symbol names are the durable references; line numbers are intentionally omitted.
 - The current working tree also retires the automatic task module and its UI.
 - The 2026-09-20 revision retires the legacy Chroma vector exporters and both
   sentinel-triggered vector copies in favour of an explicit, recorded discard.
+- The 2026-09-24 revision moves personal information detection for MCP
+  responses to Rust rules and removes Presidio and spaCy.
 
 ## v0.8.4 Comparison
 
@@ -48,10 +50,11 @@ long capture-pause window. Details and repeatable checks are in
 
 The PaCMAP/HDBSCAN task module has been retired, including its UI, scheduled
 runs, Chroma vector writes and synchronization. The read-only legacy vector
-exports and the two startup Chroma copies are retired as well; Python retains
-Presidio/spaCy only, and no longer imports or installs Chroma. ML worker
-protocol 4 supplies request-level cancellation and uses the shared semantic
-worker for foreground requests.
+exports and the two startup Chroma copies are retired as well; Python no longer
+imports or installs Chroma. Personal information detection now runs as Rust
+rules in `pii/`, so Python hosts no product feature. ML worker protocol 4
+supplies request-level cancellation and uses the shared semantic worker for
+foreground requests.
 
 The cleanup keeps these four goals:
 
@@ -87,24 +90,25 @@ The following paths are implemented and scheduled by the Tauri/Rust backend:
   in `smart_cluster_scoring.rs`. The queue is drained by the Rust worker only.
 - Screenshot, OCR, vector, Smart Cluster, MCP, lifecycle, and index-health
   persistence in the storage and command modules.
+- Personal information detection for MCP responses in `pii/`, combined with
+  the sensitive-word dictionary in `sensitive_filter.rs` and applied per field
+  in `mcp_server.rs`.
 
 The backend status commands expose model, index, queue, timing, and last-error
 data from these Rust paths. They do not expose a Python backend selector or a
 Python fallback counter.
 
-### Python-owned product paths that remain
+### Python-owned paths that remain
 
-Python remains a deliberately smaller service for live consumers that have not
-yet moved:
-
-- Presidio and spaCy PII analysis in the Presidio worker modules.
-- Monitor lifecycle and authenticated named-pipe dispatch in
-  `monitor/monitor/__init__.py` and related IPC modules. Automatic scheduling,
-  authorization admission and retries are owned by `background_scheduler.rs`.
+No product feature runs in Python. What remains is the monitor lifecycle and
+authenticated named-pipe dispatch in `monitor/monitor/__init__.py` and the
+related IPC modules. Automatic scheduling, authorization admission and retries
+are owned by `background_scheduler.rs`.
 
 Python must not regain OCR, Chinese-CLIP inference, semantic retrieval,
-reranking, classification or BGE inference, or Smart Cluster queue-write/drain ownership as a
-side effect of a restart, missing model, or ordinary Rust error.
+reranking, classification or BGE inference, personal information detection, or
+Smart Cluster queue-write/drain ownership as a side effect of a restart,
+missing model, or ordinary Rust error.
 
 ## Data and Migration Contracts
 
@@ -157,6 +161,43 @@ job specifications and validators the live indexes share; `maintenance_support.r
 keeps the capture pause/restore the blind-index repair uses. Backups no longer
 archive `chroma_db`; older archives that contain it still restore, after which
 the same discard removes it.
+
+### Personal information detection
+
+The Presidio worker, its Chinese recognizers, the spaCy model download and
+check commands, the startup model installation, the language-sync command and
+the MCP idle-unload timer are removed, together with `worker_supervisor.py`,
+which only served that worker. Before removal the service ran an English
+pipeline for Chinese users, because the language never reached Python, and it
+returned unfiltered text on any timeout or error.
+
+`src-tauri/src/pii/` finds phone numbers, resident ID numbers, bank cards,
+e-mail addresses, street addresses, credentials and, when selected, IP
+addresses. It runs in process and cannot time out. The rules are shaped by how
+PP-OCRv5 misreads numbers after the capture downscale: most errors are dropped
+digits, swaps between similar digits and misread separators, while letters in
+place of digits are rare. A checksum therefore counts as evidence rather than
+a requirement: an ID number that one inserted, deleted or replaced character
+would make valid is still caught, because a reader can recover it from a
+handful of candidates. Card numbers are also recognised by their four-digit
+grouping, and labels such as "身份证号" in the neighbouring OCR block on the same
+line or directly above relax the rules. Names are not detected.
+`pii/fixtures/ocr_error_patterns.json` records 365 observed OCR edits without
+the numbers they came from; the tests replay them on generated numbers.
+
+`SensitiveFilterConfig` version 2 makes `remove_paragraph` the default: an OCR
+segment or link with a sensitive word or personal information is dropped and
+an affected title or URL is replaced. A search snippet joins several segments,
+so it is replaced as a whole and the hit is kept; the snapshot details return
+the clean segments. `reject` and `mask` keep their meaning. The optional
+long-number setting hides digit strings of eleven or more characters that
+match no rule, and never removes content. Stored version 0 configurations are
+upgraded on load: `presidio_*` fields are read under their new names, the old
+default `reject` becomes `remove_paragraph`, an empty entity list becomes the
+default set, and credentials are added to an explicit list.
+
+Existing Python environments keep the Presidio and spaCy packages and models
+until the environment is rebuilt; nothing imports them any more.
 
 ### Classification anchors and feedback
 
@@ -310,10 +351,9 @@ A full signed release build and an interactive desktop smoke test were not run.
 
 The following work is intentionally not part of the v0.8.5 Beta cleanup:
 
-- Keep Presidio/spaCy until the MCP PII contract has a replacement with the same
-  language/model behavior and an explicit resource policy.
-- After those consumers are gone, remove the Python monitor process and its
-  named pipe lifecycle. No Chroma operational dependency remains.
+- Remove the Python monitor process and its named pipe lifecycle. Its last
+  product consumer, Presidio, was replaced on 2026-09-24, and no Chroma
+  operational dependency remains.
 
 No future milestone may reintroduce a hidden fallback merely to make a missing
 model appear available. Recovery must be an explicit repair, rebuild, retry, or
@@ -331,7 +371,8 @@ The current implementation is backed by these source areas:
 | Legacy vector discard | `src-tauri/src/legacy_vector_discard.rs`, `src-tauri/src/storage/derived_migration.rs`, `src-tauri/src/minilm_contract.rs` |
 | Rerank and Smart Cluster scoring | `src-tauri/src/rerank.rs`, `src-tauri/src/smart_cluster_scoring.rs`, `src-tauri/src/commands/smart_cluster.rs` |
 | Native classification | `src-tauri/src/classification/`, `src-tauri/src/storage/classification.rs`, `src-tauri/src/classification_runtime.rs` |
-| Python retained service | `monitor/monitor/__init__.py`, `monitor/monitor/presidio_service.py` |
+| Personal information detection | `src-tauri/src/pii/`, `src-tauri/src/sensitive_filter.rs`, `src-tauri/src/mcp_server.rs` |
+| Python retained service | `monitor/monitor/__init__.py` |
 | Python IPC | `monitor/storage_client.py`, `monitor/tests/test_monitor_worker_contracts.py` |
 | Frontend status and controls | `src/components/settings/advanced/InferenceCards.jsx`, `src/components/settings/useAdvancedSectionController.js`, `src/lib/monitor_api.js` |
 | Security and contract tests | `scripts/security-guards.cjs`, `monitor/tests/`, `src/lib/api_contracts.test.js`, Rust module tests |
@@ -345,3 +386,4 @@ The current implementation is backed by these source areas:
 | 2026-09-15 | `feat/adaptive-background-scheduling` | Added A/B scheduling, task-specific local qualification, request cancellation, resumable ANN checkpoints and source-versioned vector projection. Retained the 1800-second Python full-clustering gate. See [adaptive scheduling](adaptive-background-scheduling.md) for measurements and acceptance limits. |
 | 2026-09-19 | Task module retirement | Removed PaCMAP/HDBSCAN, its UI and MCP commands, vector synchronization and dedicated tests; preserved legacy records and read-only vector migration. |
 | 2026-09-20 | Legacy vector discard | Removed the Chroma exporters, both startup copies, the migration overlay states, the `chromadb`/`numpy` requirements and the installer's Chroma ONNX repair; added the startup discard that settles the index sentinels and records the decision. Rust library tests (687 passed, 1 ignored), Python tests (92), frontend tests (50 files, 321 tests), i18n check, security guards and lint passed. A release build and an upgrade smoke against a real `v0.8.3` data directory were not run. |
+| 2026-09-24 | Rust personal information detection | Replaced Presidio/spaCy with the rules in `pii/`, made removing the affected OCR segment the default filter mode with a version 2 configuration upgrade, loaded corpus OCR as blocks so single segments can be dropped, and removed the Presidio worker, spaCy model management, the language-sync command, the MCP idle-unload timer and their settings UI. Rust library tests (717 passed, 1 ignored), Python tests (44), frontend tests (50 files, 321 tests), i18n check, security guards, lint and the frontend production build passed. A release build and an interactive MCP session against a real archive were not run. |

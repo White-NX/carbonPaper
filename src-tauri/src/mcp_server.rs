@@ -23,10 +23,10 @@ use tower_http::cors::CorsLayer;
 use crate::credential_manager::CredentialManagerState;
 use crate::mcp_contract;
 use crate::mcp_token;
-use crate::monitor::{self, MonitorState};
-use crate::sensitive_filter::SensitiveFilterState;
+use crate::pii;
+use crate::sensitive_filter::{FilterMode, SensitiveFilterState};
 use crate::storage::smart_cluster::{SmartClusterSummaryRecord, SmartClusterSummaryUpsert};
-use crate::storage::StorageState;
+use crate::storage::{OcrResult, StorageState};
 use percent_encoding::percent_decode_str;
 use tauri::{Emitter, Manager};
 
@@ -46,7 +46,6 @@ pub struct McpRuntimeState {
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     active_port: Mutex<Option<u16>>,
     token_hash: Mutex<Option<[u8; 32]>>,
-    idle_check_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     last_error: Mutex<Option<String>>,
     generation: AtomicU64,
 }
@@ -65,7 +64,6 @@ impl McpRuntimeState {
             shutdown_tx: Mutex::new(None),
             active_port: Mutex::new(None),
             token_hash: Mutex::new(None),
-            idle_check_handle: Mutex::new(None),
             last_error: Mutex::new(None),
             generation: AtomicU64::new(0),
         }
@@ -420,150 +418,113 @@ async fn handle_tools_call(
     }
 }
 
-// ==================== Presidio PII helper ====================
+// ==================== Privacy filtering ====================
 
-/// Entity detected by Presidio (Python side).
-#[derive(Debug, Deserialize)]
-struct PiiEntity {
-    entity_type: String,
-    start: usize,
-    end: usize,
-    score: f64,
+/// A record withheld because the filter mode is [`FilterMode::Reject`].
+#[derive(Debug)]
+struct Rejected;
+
+/// One-line identity fields such as window titles: replaced, never removed.
+fn filter_identity(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    text: &str,
+) -> Result<String, Rejected> {
+    let findings = filter.inspect(text, pii::Context::default());
+    if !findings.is_flagged() {
+        return Ok(filter.kept_text(text, &findings));
+    }
+    match mode {
+        FilterMode::Reject => Err(Rejected),
+        FilterMode::RemoveParagraph => Ok(CENSORED_LABEL.to_string()),
+        FilterMode::Mask => Ok(filter.masked_text(text, &findings)),
+    }
 }
 
-/// Call Python's `presidio_analyze` IPC command with a 15-second timeout.
-/// The longer timeout accommodates transformer models (trf) which may need
-/// 10–30s for first-time loading.
-/// Returns per-text entity lists.  Falls back to empty lists on timeout/error.
-async fn presidio_analyze_texts(
-    app_handle: &tauri::AppHandle,
-    texts: &[String],
-    language: &str,
-    entity_types: &[String],
-) -> Vec<Vec<PiiEntity>> {
-    let empty: Vec<Vec<PiiEntity>> = texts.iter().map(|_| Vec::new()).collect();
-
-    let monitor_state = match app_handle.try_state::<MonitorState>() {
-        Some(s) => s,
-        None => return empty,
-    };
-
-    let mut payload = serde_json::json!({
-        "command": "presidio_analyze",
-        "texts": texts,
-        "language": language,
-    });
-    if !entity_types.is_empty() {
-        payload
-            .as_object_mut()
-            .expect("just constructed as object")
-            .insert(
-                "entity_types".to_string(),
-                serde_json::to_value(entity_types).unwrap(),
-            );
+/// An OCR segment or link text. `Ok(None)` drops it, which is what the
+/// default mode does with every segment that has a sensitive word or
+/// personal information.
+fn filter_segment(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    text: &str,
+    context: pii::Context,
+) -> Result<Option<String>, Rejected> {
+    let findings = filter.inspect(text, context);
+    if !findings.is_flagged() {
+        return Ok(Some(filter.kept_text(text, &findings)));
     }
-
-    let result = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        monitor::forward_command_to_python(&monitor_state, payload),
-    )
-    .await
-    {
-        Ok(Ok(val)) => val,
-        Ok(Err(e)) => {
-            tracing::debug!("Presidio IPC error (non-fatal): {}", e);
-            return empty;
-        }
-        Err(_) => {
-            tracing::debug!("Presidio IPC timeout (15s), falling back to dict-only");
-            return empty;
-        }
-    };
-
-    // Parse response: { results: [ { entities: [...] }, ... ] }
-    let results_arr = match result.get("results").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return empty,
-    };
-
-    results_arr
-        .iter()
-        .map(|item| {
-            item.get("entities")
-                .and_then(|v| v.as_array())
-                .map(|entities| {
-                    entities
-                        .iter()
-                        .filter_map(|e| serde_json::from_value::<PiiEntity>(e.clone()).ok())
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .collect()
+    match mode {
+        FilterMode::Reject => Err(Rejected),
+        FilterMode::RemoveParagraph => Ok(None),
+        FilterMode::Mask => Ok(Some(filter.masked_text(text, &findings))),
+    }
 }
 
-/// Mask PII entity spans in text with `[TYPE]` labels.
-///
-/// **Important:** Presidio (Python) returns *character* (codepoint) indices,
-/// but Rust `&str` is UTF-8 — slicing by byte offset.  We must map
-/// char indices → byte offsets to avoid panicking on multi-byte text.
-fn mask_pii_in_text(text: &str, entities: &[PiiEntity]) -> String {
-    if entities.is_empty() {
-        return text.to_string();
-    }
-
-    // Build char-index → byte-offset lookup.  Entry `i` is the byte offset
-    // where the `i`-th codepoint starts; the final entry equals `text.len()`.
-    let char_to_byte: Vec<usize> = text
-        .char_indices()
-        .map(|(byte_off, _)| byte_off)
-        .chain(std::iter::once(text.len()))
-        .collect();
-    let char_count = char_to_byte.len() - 1;
-
-    // Filter & sort by char-index start position
-    let mut spans: Vec<(usize, usize, &str)> = entities
-        .iter()
-        .filter(|e| e.score >= 0.3 && e.start < e.end && e.end <= char_count)
-        .map(|e| (e.start, e.end, e.entity_type.as_str()))
-        .collect();
-    spans.sort_by_key(|s| (s.0, std::cmp::Reverse(s.1)));
-
-    // Merge overlapping spans (still in char indices)
-    let mut merged: Vec<(usize, usize, &str)> = Vec::new();
-    for span in &spans {
-        if let Some(last) = merged.last_mut() {
-            if span.0 < last.1 {
-                if span.1 > last.1 {
-                    last.1 = span.1;
-                }
-                continue;
-            }
-        }
-        merged.push(*span);
-    }
-
-    // Reconstruct string, converting char indices to byte offsets for slicing
-    let mut result = String::with_capacity(text.len());
-    let mut pos = 0usize; // current char index
-    for (start, end, entity_type) in &merged {
-        if *start > pos {
-            result.push_str(&text[char_to_byte[pos]..char_to_byte[*start]]);
-        }
-        result.push('[');
-        result.push_str(entity_type);
-        result.push(']');
-        pos = *end;
-    }
-    if pos < char_count {
-        result.push_str(&text[char_to_byte[pos]..]);
-    }
-    result
+/// Text joined from several OCR segments, such as a search snippet. The
+/// segments can no longer be told apart, so the default mode replaces the
+/// whole text and keeps the hit; the snapshot details still return the
+/// clean segments.
+fn filter_joined_text(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    text: &str,
+) -> Result<String, Rejected> {
+    Ok(filter_segment(filter, mode, text, pii::Context::default())?
+        .unwrap_or_else(|| CENSORED_LABEL.to_string()))
 }
 
-/// Check if any PII entity has score >= threshold.
-fn has_pii(entities: &[PiiEntity]) -> bool {
-    entities.iter().any(|e| e.score >= 0.3)
+/// URLs are checked after percent-decoding and replaced whole when flagged.
+fn filter_url(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    url: &str,
+) -> Result<String, Rejected> {
+    let findings = filter.inspect(&decode_url_for_filter(url), pii::Context::default());
+    match (findings.is_flagged(), mode) {
+        (false, _) => Ok(url.to_string()),
+        (true, FilterMode::Reject) => Err(Rejected),
+        (true, _) => Ok(CENSORED_LABEL.to_string()),
+    }
+}
+
+/// The OCR blocks of one screenshot. Each block is checked with the labels of
+/// its neighbours, because forms put "身份证号" and the number in separate
+/// blocks.
+fn filter_ocr_blocks(
+    filter: &SensitiveFilterState,
+    mode: FilterMode,
+    blocks: Vec<OcrResult>,
+) -> Result<Vec<OcrResult>, Rejected> {
+    let contexts = {
+        let layout: Vec<(&str, Option<pii::Bounds>)> = blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.text.as_str(),
+                    pii::Bounds::from_points(&block.box_coords),
+                )
+            })
+            .collect();
+        pii::block_contexts(&layout)
+    };
+    let mut kept = Vec::with_capacity(blocks.len());
+    for (mut block, context) in blocks.into_iter().zip(contexts) {
+        if let Some(text) = filter_segment(filter, mode, &block.text, context)? {
+            block.text = text;
+            kept.push(block);
+        }
+    }
+    Ok(kept)
+}
+
+fn text_flagged(filter: &SensitiveFilterState, text: &str) -> bool {
+    filter.inspect(text, pii::Context::default()).is_flagged()
+}
+
+fn masked(filter: &SensitiveFilterState, text: &str) -> String {
+    let findings = filter.inspect(text, pii::Context::default());
+    filter.masked_text(text, &findings)
 }
 
 // ==================== Tool implementations ====================
@@ -575,11 +536,11 @@ fn decode_url_for_filter(url: &str) -> String {
     percent_decode_str(url).decode_utf8_lossy().into_owned()
 }
 
-fn value_contains_sensitive(filter: &SensitiveFilterState, value: &Value) -> bool {
+fn value_flagged(filter: &SensitiveFilterState, value: &Value) -> bool {
     match value {
-        Value::String(s) => filter.contains_sensitive(s),
-        Value::Array(items) => items.iter().any(|v| value_contains_sensitive(filter, v)),
-        Value::Object(map) => map.values().any(|v| value_contains_sensitive(filter, v)),
+        Value::String(s) => text_flagged(filter, s),
+        Value::Array(items) => items.iter().any(|v| value_flagged(filter, v)),
+        Value::Object(map) => map.values().any(|v| value_flagged(filter, v)),
         _ => false,
     }
 }
@@ -587,8 +548,8 @@ fn value_contains_sensitive(filter: &SensitiveFilterState, value: &Value) -> boo
 fn mask_json_strings(filter: &SensitiveFilterState, value: &mut Value) {
     match value {
         Value::String(s) => {
-            if filter.contains_sensitive(s) {
-                *s = filter.mask_sensitive(s);
+            if text_flagged(filter, s) {
+                *s = masked(filter, s);
             }
         }
         Value::Array(items) => {
@@ -609,99 +570,61 @@ fn cleanse_smart_cluster_summary(
     mut summary: SmartClusterSummaryRecord,
     filter: &SensitiveFilterState,
 ) -> Option<SmartClusterSummaryRecord> {
-    if !filter.is_enabled() {
+    let flagged = |text: &Option<String>| text.as_deref().is_some_and(|s| text_flagged(filter, s));
+    let title = flagged(&summary.title);
+    let body = flagged(&summary.summary);
+    let ocr = flagged(&summary.ocr_summary);
+    let key_points = summary
+        .key_points
+        .as_ref()
+        .is_some_and(|v| value_flagged(filter, v));
+    let evidence = summary
+        .evidence
+        .as_ref()
+        .is_some_and(|v| value_flagged(filter, v));
+
+    if !(title || body || ocr || key_points || evidence) {
         return Some(summary);
     }
 
-    let contains_sensitive = summary
-        .title
-        .as_deref()
-        .is_some_and(|s| filter.contains_sensitive(s))
-        || summary
-            .summary
-            .as_deref()
-            .is_some_and(|s| filter.contains_sensitive(s))
-        || summary
-            .ocr_summary
-            .as_deref()
-            .is_some_and(|s| filter.contains_sensitive(s))
-        || summary
-            .key_points
-            .as_ref()
-            .is_some_and(|v| value_contains_sensitive(filter, v))
-        || summary
-            .evidence
-            .as_ref()
-            .is_some_and(|v| value_contains_sensitive(filter, v));
-
-    if !contains_sensitive {
-        return Some(summary);
-    }
-
-    match filter.get_mode().as_str() {
-        "mask" => {
-            if let Some(ref mut title) = summary.title {
-                if filter.contains_sensitive(title) {
-                    *title = filter.mask_sensitive(title);
+    match filter.mode() {
+        FilterMode::Mask => {
+            for (hit, field) in [
+                (title, &mut summary.title),
+                (body, &mut summary.summary),
+                (ocr, &mut summary.ocr_summary),
+            ] {
+                if let (true, Some(text)) = (hit, field.as_mut()) {
+                    *text = masked(filter, text);
                 }
             }
-            if let Some(ref mut text) = summary.summary {
-                if filter.contains_sensitive(text) {
-                    *text = filter.mask_sensitive(text);
-                }
-            }
-            if let Some(ref mut text) = summary.ocr_summary {
-                if filter.contains_sensitive(text) {
-                    *text = filter.mask_sensitive(text);
-                }
-            }
-            if let Some(ref mut value) = summary.key_points {
+            if let Some(value) = summary.key_points.as_mut() {
                 mask_json_strings(filter, value);
             }
-            if let Some(ref mut value) = summary.evidence {
+            if let Some(value) = summary.evidence.as_mut() {
                 mask_json_strings(filter, value);
             }
             Some(summary)
         }
-        "remove_paragraph" => {
-            if summary
-                .title
-                .as_deref()
-                .is_some_and(|s| filter.contains_sensitive(s))
-            {
-                summary.title = Some(CENSORED_LABEL.to_string());
+        FilterMode::RemoveParagraph => {
+            for (hit, field) in [
+                (title, &mut summary.title),
+                (body, &mut summary.summary),
+                (ocr, &mut summary.ocr_summary),
+            ] {
+                if hit {
+                    *field = Some(CENSORED_LABEL.to_string());
+                }
             }
-            if summary
-                .summary
-                .as_deref()
-                .is_some_and(|s| filter.contains_sensitive(s))
-            {
-                summary.summary = Some(CENSORED_LABEL.to_string());
-            }
-            if summary
-                .ocr_summary
-                .as_deref()
-                .is_some_and(|s| filter.contains_sensitive(s))
-            {
-                summary.ocr_summary = Some(CENSORED_LABEL.to_string());
-            }
-            if summary
-                .key_points
-                .as_ref()
-                .is_some_and(|v| value_contains_sensitive(filter, v))
-            {
+            if key_points {
                 summary.key_points = None;
             }
-            if summary
-                .evidence
-                .as_ref()
-                .is_some_and(|v| value_contains_sensitive(filter, v))
-            {
+            if evidence {
                 summary.evidence = None;
             }
             Some(summary)
         }
-        _ => None,
+        FilterMode::Reject => None,
     }
 }
 
@@ -709,70 +632,48 @@ fn cleanse_smart_cluster_record(
     mut cluster: crate::storage::smart_cluster::SmartClusterRecord,
     filter: &SensitiveFilterState,
 ) -> Option<crate::storage::smart_cluster::SmartClusterRecord> {
-    if !filter.is_enabled() {
+    let flagged = |text: Option<&str>| text.is_some_and(|s| text_flagged(filter, s));
+    let anchor = text_flagged(filter, &cluster.anchor_text);
+    let display_name = flagged(cluster.display_name.as_deref());
+    let process_name = flagged(cluster.last_process_name.as_deref());
+    let window_title = flagged(cluster.last_window_title.as_deref());
+
+    if !(anchor || display_name || process_name || window_title) {
         return Some(cluster);
     }
 
-    let anchor_sensitive = filter.contains_sensitive(&cluster.anchor_text);
-    let display_name_sensitive = cluster
-        .display_name
-        .as_deref()
-        .is_some_and(|text| filter.contains_sensitive(text));
-    let process_name_sensitive = cluster
-        .last_process_name
-        .as_deref()
-        .is_some_and(|text| filter.contains_sensitive(text));
-    let window_title_sensitive = cluster
-        .last_window_title
-        .as_deref()
-        .is_some_and(|text| filter.contains_sensitive(text));
-
-    if !(anchor_sensitive
-        || display_name_sensitive
-        || process_name_sensitive
-        || window_title_sensitive)
-    {
-        return Some(cluster);
-    }
-
-    match filter.get_mode().as_str() {
-        "mask" => {
-            if anchor_sensitive {
-                cluster.anchor_text = filter.mask_sensitive(&cluster.anchor_text);
+    match filter.mode() {
+        FilterMode::Mask => {
+            if anchor {
+                cluster.anchor_text = masked(filter, &cluster.anchor_text);
             }
-            if display_name_sensitive {
-                if let Some(ref mut text) = cluster.display_name {
-                    *text = filter.mask_sensitive(text);
-                }
-            }
-            if process_name_sensitive {
-                if let Some(ref mut text) = cluster.last_process_name {
-                    *text = filter.mask_sensitive(text);
-                }
-            }
-            if window_title_sensitive {
-                if let Some(ref mut text) = cluster.last_window_title {
-                    *text = filter.mask_sensitive(text);
+            for (hit, field) in [
+                (display_name, &mut cluster.display_name),
+                (process_name, &mut cluster.last_process_name),
+                (window_title, &mut cluster.last_window_title),
+            ] {
+                if let (true, Some(text)) = (hit, field.as_mut()) {
+                    *text = masked(filter, text);
                 }
             }
             Some(cluster)
         }
-        "remove_paragraph" => {
-            if anchor_sensitive {
+        FilterMode::RemoveParagraph => {
+            if anchor {
                 cluster.anchor_text = CENSORED_LABEL.to_string();
             }
-            if display_name_sensitive {
-                cluster.display_name = Some(CENSORED_LABEL.to_string());
-            }
-            if process_name_sensitive {
-                cluster.last_process_name = Some(CENSORED_LABEL.to_string());
-            }
-            if window_title_sensitive {
-                cluster.last_window_title = Some(CENSORED_LABEL.to_string());
+            for (hit, field) in [
+                (display_name, &mut cluster.display_name),
+                (process_name, &mut cluster.last_process_name),
+                (window_title, &mut cluster.last_window_title),
+            ] {
+                if hit {
+                    *field = Some(CENSORED_LABEL.to_string());
+                }
             }
             Some(cluster)
         }
-        _ => None,
+        FilterMode::Reject => None,
     }
 }
 
@@ -860,6 +761,143 @@ mod smart_cluster_filter_tests {
         assert_eq!(result.last_process_name.as_deref(), Some(CENSORED_LABEL));
         assert_eq!(result.last_window_title.as_deref(), Some(CENSORED_LABEL));
     }
+
+    #[test]
+    fn personal_information_counts_like_a_sensitive_word() {
+        let filter = filter_with_mode("remove_paragraph");
+        let mut record = cluster();
+        record.last_window_title = Some("13812345678 - 微信".to_string());
+
+        let result = cleanse_smart_cluster_record(record, &filter).expect("cluster retained");
+
+        assert_eq!(result.last_window_title.as_deref(), Some(CENSORED_LABEL));
+        assert_eq!(result.anchor_text, "research notes");
+    }
+}
+
+#[cfg(test)]
+mod privacy_filter_tests {
+    use super::*;
+
+    fn filter(mode: FilterMode) -> SensitiveFilterState {
+        let filter = SensitiveFilterState::with_test_words(&["private"]);
+        let mut config = filter.get_config();
+        config.mode = mode.as_str().to_string();
+        filter.update_config(config);
+        filter
+    }
+
+    fn block(id: i64, text: &str, left: f64, top: f64) -> OcrResult {
+        let (right, bottom) = (left + 200.0, top + 20.0);
+        OcrResult {
+            id,
+            screenshot_id: 1,
+            text: text.to_string(),
+            confidence: 0.99,
+            box_coords: vec![
+                vec![left, top],
+                vec![right, top],
+                vec![right, bottom],
+                vec![left, bottom],
+            ],
+            created_at: String::new(),
+        }
+    }
+
+    fn texts(blocks: &[OcrResult]) -> Vec<&str> {
+        blocks.iter().map(|block| block.text.as_str()).collect()
+    }
+
+    #[test]
+    fn default_mode_removes_only_the_affected_segments() {
+        let filter = SensitiveFilterState::with_test_words(&["private"]);
+        assert_eq!(filter.mode(), FilterMode::RemoveParagraph);
+        let blocks = vec![
+            block(1, "会议纪要", 10.0, 10.0),
+            block(2, "联系人手机 13812345678", 10.0, 40.0),
+            block(3, "private roadmap", 10.0, 70.0),
+            block(4, "下周三发布", 10.0, 100.0),
+        ];
+
+        let kept = filter_ocr_blocks(&filter, filter.mode(), blocks).unwrap();
+
+        assert_eq!(texts(&kept), ["会议纪要", "下周三发布"]);
+    }
+
+    #[test]
+    fn a_label_in_a_neighbouring_block_counts() {
+        // Sixteen digits after OCR dropped two: an ID number only next to its label.
+        let filter = filter(FilterMode::RemoveParagraph);
+        let value = block(2, "1355782003011497", 300.0, 10.0);
+
+        let alone =
+            filter_ocr_blocks(&filter, FilterMode::RemoveParagraph, vec![value.clone()]).unwrap();
+        assert_eq!(texts(&alone), ["1355782003011497"]);
+
+        let label = block(1, "身份证号", 10.0, 10.0);
+        let kept =
+            filter_ocr_blocks(&filter, FilterMode::RemoveParagraph, vec![label, value]).unwrap();
+        assert_eq!(texts(&kept), ["身份证号"]);
+    }
+
+    #[test]
+    fn reject_withholds_the_record_and_mask_labels_the_match() {
+        let blocks = || vec![block(1, "手机 13812345678", 10.0, 10.0)];
+        assert!(
+            filter_ocr_blocks(&filter(FilterMode::Reject), FilterMode::Reject, blocks()).is_err()
+        );
+
+        let kept =
+            filter_ocr_blocks(&filter(FilterMode::Mask), FilterMode::Mask, blocks()).unwrap();
+        assert_eq!(texts(&kept), ["手机 [PHONE_NUMBER]"]);
+    }
+
+    #[test]
+    fn titles_urls_and_joined_snippets() {
+        let mode = FilterMode::RemoveParagraph;
+        let filter = filter(mode);
+
+        assert_eq!(
+            filter_identity(&filter, mode, "微信 - 张三").unwrap(),
+            "微信 - 张三"
+        );
+        assert_eq!(
+            filter_identity(&filter, mode, "13812345678 - 通话").unwrap(),
+            CENSORED_LABEL
+        );
+        assert_eq!(
+            filter_url(&filter, mode, "https://example.com/u?tel=138%201234%205678").unwrap(),
+            CENSORED_LABEL
+        );
+        assert_eq!(
+            filter_url(&filter, mode, "https://example.com/docs").unwrap(),
+            "https://example.com/docs"
+        );
+        // A snippet joins several segments, so the whole text is replaced.
+        assert_eq!(
+            filter_joined_text(&filter, mode, "项目进展 联系 13812345678 下周发布").unwrap(),
+            CENSORED_LABEL
+        );
+        assert_eq!(
+            filter_joined_text(&filter, mode, "项目进展 下周发布").unwrap(),
+            "项目进展 下周发布"
+        );
+    }
+
+    #[test]
+    fn long_numbers_are_masked_in_kept_segments_when_enabled() {
+        let filter = filter(FilterMode::RemoveParagraph);
+        let order = || vec![block(1, "订单编号：203496817759901245", 10.0, 10.0)];
+
+        let kept = filter_ocr_blocks(&filter, FilterMode::RemoveParagraph, order()).unwrap();
+        assert_eq!(texts(&kept), ["订单编号：203496817759901245"]);
+
+        let mut config = filter.get_config();
+        config.pii_mask_long_numbers = true;
+        filter.update_config(config);
+        let kept = filter_ocr_blocks(&filter, FilterMode::RemoveParagraph, order()).unwrap();
+        assert_eq!(texts(&kept), ["订单编号：[LONG_NUMBER]"]);
+    }
 }
 
 async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value, String> {
@@ -891,86 +929,32 @@ async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value
     let storage = storage.inner().clone();
     let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
-    let (presidio_enabled, presidio_lang, presidio_entities) = filter.get_presidio_config();
-    let app_handle = state.app_handle.clone();
 
-    let mut records: Vec<_> = tokio::task::spawn_blocking(move || {
-        let filter_mode = filter.get_mode();
+    let records: Vec<_> = tokio::task::spawn_blocking(move || {
+        let mode = filter.mode();
         let records = storage.get_screenshots_by_time_range_limited(
             start_ts,
             end_ts,
             max_records.or(Some(500)),
         )?;
+        // Metadata only: a flagged title or URL is replaced, or the record is
+        // withheld in reject mode.
         let records: Vec<_> = records
             .into_iter()
-            .filter(|r| {
-                match filter_mode.as_str() {
-                    // In remove_paragraph/mask mode, don't reject based on window_title alone
-                    "remove_paragraph" | "mask" => true,
-                    _ => !filter.is_record_sensitive(r.window_title.as_deref(), &[]),
+            .filter_map(|mut r| {
+                if let Some(title) = r.window_title.take() {
+                    r.window_title = Some(filter_identity(&filter, mode, &title).ok()?);
                 }
-            })
-            .map(|mut r| {
-                // Identity fields: [censored] for remove_paragraph, mask for mask
-                if filter.is_enabled() {
-                    if let Some(ref title) = r.window_title {
-                        if filter.contains_sensitive(title) {
-                            r.window_title = Some(match filter_mode.as_str() {
-                                "mask" => filter.mask_sensitive(title),
-                                _ => CENSORED_LABEL.to_string(),
-                            });
-                        }
-                    }
+                if let Some(url) = r.page_url.take() {
+                    r.page_url = Some(filter_url(&filter, mode, &url).ok()?);
                 }
-                r
+                Some(r)
             })
             .collect();
         Ok::<_, String>(records)
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))??;
-
-    // Presidio second-pass: filter records whose window titles contain PII
-    if presidio_enabled && !records.is_empty() {
-        let titles: Vec<String> = records
-            .iter()
-            .map(|r| r.window_title.clone().unwrap_or_default())
-            .collect();
-        let pii_results =
-            presidio_analyze_texts(&app_handle, &titles, &presidio_lang, &presidio_entities).await;
-        let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
-        let mode = filter_reload.get_mode();
-        match mode.as_str() {
-            "reject" => {
-                let mut keep = Vec::with_capacity(records.len());
-                for (i, r) in records.into_iter().enumerate() {
-                    if !has_pii(&pii_results[i]) {
-                        keep.push(r);
-                    }
-                }
-                records = keep;
-            }
-            // remove_paragraph and mask both handle the title (no paragraphs in metadata-only view)
-            "remove_paragraph" => {
-                for (i, r) in records.iter_mut().enumerate() {
-                    if has_pii(&pii_results[i]) {
-                        r.window_title = Some(CENSORED_LABEL.to_string());
-                    }
-                }
-            }
-            "mask" => {
-                for (i, r) in records.iter_mut().enumerate() {
-                    if has_pii(&pii_results[i]) {
-                        r.window_title = Some(mask_pii_in_text(
-                            &r.window_title.clone().unwrap_or_default(),
-                            &pii_results[i],
-                        ));
-                    }
-                }
-            }
-            _ => {} // remove_paragraph doesn't apply to metadata-only results
-        }
-    }
 
     // Build compact response (strip metadata, image_hash, image_path which are not useful to AI clients)
     let output: Vec<Value> = records
@@ -1015,287 +999,59 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
     let storage = storage.inner().clone();
     let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
-    let (presidio_enabled, presidio_lang, presidio_entities) = filter.get_presidio_config();
-    let app_handle = state.app_handle.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let record = storage.get_screenshot_by_id(id)?;
-        match record {
-            Some(mut r) => {
-                r.metadata = None;
-                r.page_icon = None;
-                let ocr_results = storage.get_screenshot_ocr_results(r.id)?;
-                let filter_mode = filter.get_mode();
+        let Some(mut r) = storage.get_screenshot_by_id(id)? else {
+            return Ok(None);
+        };
+        r.metadata = None;
+        r.page_icon = None;
+        let ocr_results = storage.get_screenshot_ocr_results(r.id)?;
+        let mode = filter.mode();
 
-                // Dictionary-based filtering (tier 1)
-                if filter.is_enabled() {
-                    // --- Identity fields: window_title, page_url ---
-                    // reject → reject entire record
-                    // remove_paragraph → replace with [censored]
-                    // mask → character-level mask (█)
-                    let title_sensitive = r
-                        .window_title
-                        .as_ref()
-                        .is_some_and(|t| filter.contains_sensitive(t));
-                    let url_sensitive = r
-                        .page_url
-                        .as_ref()
-                        .is_some_and(|u| filter.contains_sensitive(&decode_url_for_filter(u)));
-
-                    if title_sensitive || url_sensitive {
-                        match filter_mode.as_str() {
-                            "mask" => {
-                                if title_sensitive {
-                                    r.window_title = Some(filter.mask_sensitive(
-                                        r.window_title.as_deref().unwrap_or_default(),
-                                    ));
-                                }
-                                if url_sensitive {
-                                    r.page_url = Some(CENSORED_LABEL.to_string());
-                                }
-                            }
-                            "remove_paragraph" => {
-                                if title_sensitive {
-                                    r.window_title = Some(CENSORED_LABEL.to_string());
-                                }
-                                if url_sensitive {
-                                    r.page_url = Some(CENSORED_LABEL.to_string());
-                                }
-                            }
-                            _ => {
-                                // "reject" mode
-                                return Ok((r, ocr_results, true));
-                            }
-                        }
-                    }
-
-                    // --- visible_links (filter by link text only) ---
-                    if let Some(ref links) = r.visible_links {
-                        match filter_mode.as_str() {
-                            "reject" => {
-                                if links.iter().any(|l| filter.contains_sensitive(&l.text)) {
-                                    return Ok((r, ocr_results, true));
-                                }
-                            }
-                            "remove_paragraph" => {
-                                let filtered: Vec<_> = links
-                                    .iter()
-                                    .filter(|l| !filter.contains_sensitive(&l.text))
-                                    .cloned()
-                                    .collect();
-                                r.visible_links = if filtered.is_empty() {
-                                    None
-                                } else {
-                                    Some(filtered)
-                                };
-                            }
-                            "mask" => {
-                                let masked: Vec<_> = links
-                                    .iter()
-                                    .map(|l| crate::storage::VisibleLink {
-                                        text: filter.mask_sensitive(&l.text),
-                                        url: l.url.clone(),
-                                    })
-                                    .collect();
-                                r.visible_links = Some(masked);
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // --- OCR texts (paragraph-level content) ---
-                    match filter_mode.as_str() {
-                        "reject" => {
-                            let any_sensitive = ocr_results
-                                .iter()
-                                .any(|o| filter.contains_sensitive(&o.text));
-                            if any_sensitive {
-                                return Ok((r, ocr_results, true));
-                            }
-                        }
-                        "remove_paragraph" => {
-                            let ocr_results: Vec<_> = ocr_results
-                                .into_iter()
-                                .filter(|o| !filter.contains_sensitive(&o.text))
-                                .collect();
-                            return Ok((r, ocr_results, false));
-                        }
-                        "mask" => {
-                            let ocr_results: Vec<_> = ocr_results
-                                .into_iter()
-                                .map(|mut o| {
-                                    o.text = filter.mask_sensitive(&o.text);
-                                    o
-                                })
-                                .collect();
-                            return Ok((r, ocr_results, false));
-                        }
-                        _ => {}
+        let cleanse = || -> Result<Vec<OcrResult>, Rejected> {
+            if let Some(title) = r.window_title.take() {
+                r.window_title = Some(filter_identity(&filter, mode, &title)?);
+            }
+            if let Some(url) = r.page_url.take() {
+                r.page_url = Some(filter_url(&filter, mode, &url)?);
+            }
+            // Links are filtered by their text; the URL is the target page.
+            if let Some(links) = r.visible_links.take() {
+                let mut kept = Vec::with_capacity(links.len());
+                for link in links {
+                    let text = filter_segment(&filter, mode, &link.text, pii::Context::default())?;
+                    if let Some(text) = text {
+                        kept.push(crate::storage::VisibleLink {
+                            text,
+                            url: link.url,
+                        });
                     }
                 }
-
-                Ok((r, ocr_results, false))
+                r.visible_links = (!kept.is_empty()).then_some(kept);
             }
-            None => Err("not_found".to_string()),
-        }
+            filter_ocr_blocks(&filter, mode, ocr_results)
+        };
+        let cleansed = cleanse();
+        Ok::<_, String>(Some(cleansed.map(|ocr| (r, ocr))))
     })
     .await
-    .map_err(|e| format!("Task join error: {:?}", e))?;
+    .map_err(|e| format!("Task join error: {:?}", e))??;
 
-    // Handle not found or DB errors
-    let (mut r, mut ocr_results, dict_rejected) = match result {
-        Ok(tuple) => tuple,
-        Err(ref e) if e == "not_found" => {
+    let (r, ocr_results) = match result {
+        None => {
             return Ok(serde_json::json!({
                 "record": null,
                 "ocr_results": []
             }));
         }
-        Err(e) => return Err(e),
+        Some(Err(Rejected)) => {
+            return Ok(serde_json::json!({
+                "error": "Rejected by user's privacy settings"
+            }));
+        }
+        Some(Ok(cleansed)) => cleansed,
     };
-
-    // Check if dictionary filter already rejected
-    if dict_rejected {
-        return Ok(serde_json::json!({
-            "error": "Rejected by user's privacy settings"
-        }));
-    }
-
-    // Presidio second-pass (tier 2)
-    let has_content = !ocr_results.is_empty()
-        || r.visible_links.as_ref().is_some_and(|l| !l.is_empty())
-        || r.window_title.is_some()
-        || r.page_url.is_some();
-    if presidio_enabled && has_content {
-        let mut all_texts: Vec<String> = Vec::new();
-        // Slot 0: window_title (if present)
-        if let Some(ref title) = r.window_title {
-            all_texts.push(title.clone());
-        }
-        let title_offset = if r.window_title.is_some() { 1 } else { 0 };
-        // Slot title_offset..title_offset+N: OCR texts
-        for o in &ocr_results {
-            all_texts.push(o.text.clone());
-        }
-        let link_start_idx = all_texts.len();
-        // Slot link_start_idx..: visible_link texts
-        if let Some(ref links) = r.visible_links {
-            for l in links {
-                all_texts.push(l.text.clone());
-            }
-        }
-        let url_idx = all_texts.len();
-        // Slot url_idx: decoded page_url (if present)
-        if let Some(ref url) = r.page_url {
-            all_texts.push(decode_url_for_filter(url));
-        }
-
-        let pii_results =
-            presidio_analyze_texts(&app_handle, &all_texts, &presidio_lang, &presidio_entities)
-                .await;
-
-        let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
-        let mode = filter_reload.get_mode();
-
-        // --- Identity fields: title + page_url ---
-        let title_has_pii = title_offset == 1 && has_pii(&pii_results[0]);
-        let url_has_pii = r.page_url.is_some() && has_pii(&pii_results[url_idx]);
-
-        if title_has_pii || url_has_pii {
-            match mode.as_str() {
-                "mask" => {
-                    if title_has_pii {
-                        r.window_title = Some(mask_pii_in_text(
-                            &r.window_title.clone().unwrap_or_default(),
-                            &pii_results[0],
-                        ));
-                    }
-                    if url_has_pii {
-                        r.page_url = Some(CENSORED_LABEL.to_string());
-                    }
-                }
-                "remove_paragraph" => {
-                    if title_has_pii {
-                        r.window_title = Some(CENSORED_LABEL.to_string());
-                    }
-                    if url_has_pii {
-                        r.page_url = Some(CENSORED_LABEL.to_string());
-                    }
-                }
-                _ => {
-                    // "reject" mode
-                    return Ok(serde_json::json!({
-                        "error": "Rejected by user's privacy settings"
-                    }));
-                }
-            }
-        }
-
-        // --- OCR texts (paragraph-level) ---
-        match mode.as_str() {
-            "reject" => {
-                for i in 0..ocr_results.len() {
-                    if has_pii(&pii_results[i + title_offset]) {
-                        return Ok(serde_json::json!({
-                            "error": "Rejected by user's privacy settings"
-                        }));
-                    }
-                }
-            }
-            "remove_paragraph" => {
-                let mut keep = Vec::new();
-                for (i, o) in ocr_results.into_iter().enumerate() {
-                    if !has_pii(&pii_results[i + title_offset]) {
-                        keep.push(o);
-                    }
-                }
-                ocr_results = keep;
-            }
-            "mask" => {
-                for (i, o) in ocr_results.iter_mut().enumerate() {
-                    if has_pii(&pii_results[i + title_offset]) {
-                        o.text = mask_pii_in_text(&o.text, &pii_results[i + title_offset]);
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // Apply to visible_links (text only, not URLs)
-        if let Some(ref mut links) = r.visible_links {
-            match mode.as_str() {
-                "reject" => {
-                    for i in 0..links.len() {
-                        if has_pii(&pii_results[link_start_idx + i]) {
-                            return Ok(serde_json::json!({
-                                "error": "Rejected by user's privacy settings"
-                            }));
-                        }
-                    }
-                }
-                "remove_paragraph" => {
-                    let mut keep = Vec::new();
-                    for (i, l) in links.iter().enumerate() {
-                        if !has_pii(&pii_results[link_start_idx + i]) {
-                            keep.push(l.clone());
-                        }
-                    }
-                    *links = keep;
-                }
-                "mask" => {
-                    for (i, l) in links.iter_mut().enumerate() {
-                        if has_pii(&pii_results[link_start_idx + i]) {
-                            l.text = mask_pii_in_text(&l.text, &pii_results[link_start_idx + i]);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            if links.is_empty() {
-                r.visible_links = None;
-            }
-        }
-    }
 
     // Build response
     let ocr_value: Value = if include_coords {
@@ -1342,10 +1098,9 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
     let storage = storage.inner().clone();
     let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
-    let (presidio_enabled, presidio_lang, presidio_entities) = filter.get_presidio_config();
-    let app_handle = state.app_handle.clone();
 
-    let mut results = tokio::task::spawn_blocking(move || {
+    let results = tokio::task::spawn_blocking(move || {
+        let mode = filter.mode();
         let results = storage.search_text(
             &query,
             limit,
@@ -1356,42 +1111,22 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
             end_time,
             categories,
         )?;
+        // Each hit is one OCR segment. Its neighbours are not loaded, so only
+        // labels inside the segment count as context.
         let results: Vec<_> = results
             .into_iter()
-            .filter(|r| !filter.is_record_sensitive(r.window_title.as_deref(), &[r.text.as_str()]))
+            .filter_map(|mut r| {
+                if let Some(title) = r.window_title.take() {
+                    r.window_title = Some(filter_identity(&filter, mode, &title).ok()?);
+                }
+                r.text = filter_segment(&filter, mode, &r.text, pii::Context::default()).ok()??;
+                Some(r)
+            })
             .collect();
         Ok::<_, String>(results)
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))??;
-
-    // Presidio second-pass on search results
-    if presidio_enabled && !results.is_empty() {
-        let texts: Vec<String> = results.iter().map(|r| r.text.clone()).collect();
-        let pii_results =
-            presidio_analyze_texts(&app_handle, &texts, &presidio_lang, &presidio_entities).await;
-        let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
-        let mode = filter_reload.get_mode();
-        match mode.as_str() {
-            "reject" | "remove_paragraph" => {
-                let mut keep = Vec::new();
-                for (i, r) in results.into_iter().enumerate() {
-                    if !has_pii(&pii_results[i]) {
-                        keep.push(r);
-                    }
-                }
-                results = keep;
-            }
-            "mask" => {
-                for (i, r) in results.iter_mut().enumerate() {
-                    if has_pii(&pii_results[i]) {
-                        r.text = mask_pii_in_text(&r.text, &pii_results[i]);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 
     // Strip box_coords to save tokens — not useful in MCP search results
     let stripped: Vec<Value> = results
@@ -1447,8 +1182,7 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
     let start_time = args.get("start_time").and_then(Value::as_f64);
     let end_time = args.get("end_time").and_then(Value::as_f64);
 
-    // Use the same Rust CLIP path as the application search surface. The PII
-    // filtering below remains unchanged.
+    // Use the same Rust CLIP path as the application search surface.
     let rust = crate::clip_query::try_rust_clip_query(
         &state.app_handle,
         crate::clip_query::ClipQueryRequest {
@@ -1462,95 +1196,49 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
     )
     .await;
 
-    let result = match rust {
-        crate::clip_query::ClipQueryOutcome::Served(results) => Value::Array(results),
+    let items = match rust {
+        crate::clip_query::ClipQueryOutcome::Served(results) => results,
         crate::clip_query::ClipQueryOutcome::Unavailable(reason) => {
             return Err(format!("CLIP search unavailable: {reason}"));
         }
     };
 
-    // Dictionary filter (tier 1)
     let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
-    let (presidio_enabled, presidio_lang, presidio_entities) = filter.get_presidio_config();
-
-    let dict_filter = |item: &Value| -> bool {
-        if !filter.is_enabled() {
-            return true;
-        }
-        let title = item
-            .get("metadata")
-            .and_then(|m| m.get("window_title"))
-            .and_then(|v| v.as_str())
-            .or_else(|| item.get("window_title").and_then(|v| v.as_str()));
-        let ocr = item.get("ocr_text").and_then(|v| v.as_str());
-        let mut texts: Vec<&str> = Vec::new();
-        if let Some(t) = ocr {
-            texts.push(t);
-        }
-        !filter.is_record_sensitive(title, &texts)
-    };
-
-    // Extract items array from the response
-    let mut items: Vec<Value> = if let Some(arr) = result.as_array() {
-        arr.iter()
-            .filter(|item| dict_filter(item))
-            .cloned()
-            .collect()
-    } else if let Some(obj) = result.as_object() {
-        if let Some(arr) = obj.get("results").and_then(|v| v.as_array()) {
-            arr.iter()
-                .filter(|item| dict_filter(item))
-                .cloned()
-                .collect()
-        } else {
-            return Ok(result.clone());
-        }
-    } else {
-        return Ok(result);
-    };
-
-    // Presidio second-pass (tier 2)
-    if presidio_enabled && !items.is_empty() {
-        let texts: Vec<String> = items
-            .iter()
-            .map(|item| {
-                item.get("ocr_text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .collect();
-        let pii_results = presidio_analyze_texts(
-            &state.app_handle,
-            &texts,
-            &presidio_lang,
-            &presidio_entities,
-        )
-        .await;
-        let mode = filter.get_mode();
-
-        items = items
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, mut item)| {
-                if !has_pii(&pii_results[i]) {
-                    return Some(item);
-                }
-                match mode.as_str() {
-                    "reject" | "remove_paragraph" => None,
-                    "mask" => {
-                        if let Some(ocr) = item.get("ocr_text").and_then(|v| v.as_str()) {
-                            let masked = mask_pii_in_text(ocr, &pii_results[i]);
-                            item.as_object_mut()
-                                .map(|o| o.insert("ocr_text".to_string(), Value::String(masked)));
-                        }
-                        Some(item)
+    let mode = filter.mode();
+    let items: Vec<Value> = items
+        .into_iter()
+        .filter_map(|mut item| {
+            let title = item
+                .get("metadata")
+                .and_then(|m| m.get("window_title"))
+                .and_then(Value::as_str)
+                .or_else(|| item.get("window_title").and_then(Value::as_str))
+                .map(str::to_string);
+            if let Some(title) = title {
+                let title = Value::String(filter_identity(&filter, mode, &title).ok()?);
+                if let Some(meta) = item.get_mut("metadata").and_then(Value::as_object_mut) {
+                    if meta.contains_key("window_title") {
+                        meta.insert("window_title".into(), title.clone());
                     }
-                    _ => Some(item),
                 }
-            })
-            .collect();
-    }
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("window_title".into(), title);
+                }
+            }
+            // The snippet joins several OCR segments; see filter_joined_text.
+            let snippet = item
+                .get("ocr_text")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(snippet) = snippet {
+                let snippet = filter_joined_text(&filter, mode, &snippet).ok()?;
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("ocr_text".into(), Value::String(snippet));
+                }
+            }
+            Some(item)
+        })
+        .collect();
 
     // Resolve screenshot_ids from image_hash and clean up output
     let hashes: Vec<String> = items
@@ -1676,39 +1364,27 @@ async fn tool_get_smart_cluster_ocr_corpus(
     let storage = storage.inner().clone();
     let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
-    let (presidio_enabled, presidio_lang, presidio_entities) = filter.get_presidio_config();
-    let app_handle = state.app_handle.clone();
 
-    let mut items = tokio::task::spawn_blocking(move || {
-        let filter_mode = filter.get_mode();
-        let items = storage.list_smart_cluster_ocr_corpus(cluster_id, page, page_size)?;
-        let items: Vec<_> = items
+    let items = tokio::task::spawn_blocking(move || {
+        let mode = filter.mode();
+        let pages = storage.list_smart_cluster_ocr_corpus_blocks(cluster_id, page, page_size)?;
+        let items: Vec<_> = pages
             .into_iter()
-            .filter_map(|mut item| {
+            .filter_map(|(mut item, blocks)| {
+                if let Some(title) = item.window_title.take() {
+                    item.window_title = Some(filter_identity(&filter, mode, &title).ok()?);
+                }
+                // Rebuilt from the remaining segments, joined with spaces as
+                // the unfiltered corpus is.
+                let kept = filter_ocr_blocks(&filter, mode, blocks).ok()?;
+                item.ocr_text = kept
+                    .iter()
+                    .map(|block| block.text.as_str())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 if !include_empty_ocr && item.ocr_text.trim().is_empty() {
                     return None;
-                }
-                if filter.is_enabled() {
-                    let is_sensitive = filter.is_record_sensitive(
-                        item.window_title.as_deref(),
-                        &[item.ocr_text.as_str()],
-                    );
-                    if is_sensitive {
-                        match filter_mode.as_str() {
-                            "mask" => {
-                                if let Some(ref mut title) = item.window_title {
-                                    if filter.contains_sensitive(title) {
-                                        *title = filter.mask_sensitive(title);
-                                    }
-                                }
-                                if filter.contains_sensitive(&item.ocr_text) {
-                                    item.ocr_text = filter.mask_sensitive(&item.ocr_text);
-                                }
-                            }
-                            "remove_paragraph" | "reject" => return None,
-                            _ => {}
-                        }
-                    }
                 }
                 Some(item)
             })
@@ -1717,33 +1393,6 @@ async fn tool_get_smart_cluster_ocr_corpus(
     })
     .await
     .map_err(|e| format!("Task join error: {:?}", e))??;
-
-    if presidio_enabled && !items.is_empty() {
-        let texts: Vec<String> = items.iter().map(|item| item.ocr_text.clone()).collect();
-        let pii_results =
-            presidio_analyze_texts(&app_handle, &texts, &presidio_lang, &presidio_entities).await;
-        let filter_reload = app_handle.state::<Arc<SensitiveFilterState>>();
-        let mode = filter_reload.get_mode();
-        match mode.as_str() {
-            "reject" | "remove_paragraph" => {
-                let mut keep = Vec::new();
-                for (i, item) in items.into_iter().enumerate() {
-                    if !has_pii(&pii_results[i]) {
-                        keep.push(item);
-                    }
-                }
-                items = keep;
-            }
-            "mask" => {
-                for (i, item) in items.iter_mut().enumerate() {
-                    if has_pii(&pii_results[i]) {
-                        item.ocr_text = mask_pii_in_text(&item.ocr_text, &pii_results[i]);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 
     Ok(serde_json::json!({
         "cluster_id": cluster_id,
@@ -1850,55 +1499,6 @@ async fn tool_delete_smart_cluster_summary(
     }))
 }
 
-// ==================== Presidio model lifecycle helpers ====================
-
-/// Send `presidio_unload` to Python (fire-and-forget, best-effort).
-#[allow(dead_code)]
-async fn presidio_unload_model(app_handle: &tauri::AppHandle) {
-    let monitor_state = match app_handle.try_state::<MonitorState>() {
-        Some(s) => s,
-        None => return,
-    };
-    let payload = serde_json::json!({ "command": "presidio_unload" });
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        monitor::forward_command_to_python(&monitor_state, payload),
-    )
-    .await
-    {
-        Ok(Ok(_)) => tracing::info!("Presidio model unloaded via IPC"),
-        Ok(Err(e)) => tracing::debug!("Presidio unload IPC error (non-fatal): {}", e),
-        Err(_) => tracing::debug!("Presidio unload IPC timeout"),
-    }
-}
-
-/// Send `presidio_check_idle` to Python (fire-and-forget, best-effort).
-async fn presidio_check_idle(app_handle: &tauri::AppHandle) {
-    let monitor_state = match app_handle.try_state::<MonitorState>() {
-        Some(s) => s,
-        None => return,
-    };
-    let payload = serde_json::json!({ "command": "presidio_check_idle" });
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        monitor::forward_command_to_python(&monitor_state, payload),
-    )
-    .await
-    {
-        Ok(Ok(val)) => {
-            let unloaded = val
-                .get("unloaded")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if unloaded {
-                tracing::info!("Presidio model idle-unloaded");
-            }
-        }
-        Ok(Err(e)) => tracing::debug!("Presidio idle check IPC error (non-fatal): {}", e),
-        Err(_) => tracing::debug!("Presidio idle check IPC timeout"),
-    }
-}
-
 // ==================== Server lifecycle ====================
 
 /// Start the MCP HTTP server.
@@ -1984,24 +1584,6 @@ pub async fn start_server(
     mcp_runtime.set_active_port(port);
     mcp_runtime.bump_generation();
 
-    // Start periodic idle check for Presidio model (every 60s)
-    {
-        let app_for_idle = app_handle.clone();
-        let idle_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.tick().await; // skip immediate first tick
-            loop {
-                interval.tick().await;
-                presidio_check_idle(&app_for_idle).await;
-            }
-        });
-        let mut guard = mcp_runtime
-            .idle_check_handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *guard = Some(idle_handle);
-    }
-
     Ok(())
 }
 
@@ -2012,20 +1594,6 @@ pub async fn stop_server(mcp_runtime: &McpRuntimeState) {
     // a listener that is in the process of stopping for an active endpoint.
     mcp_runtime.clear_active_port();
     mcp_runtime.bump_generation();
-
-    // Abort the idle check timer
-    let idle_handle = {
-        let mut guard = mcp_runtime
-            .idle_check_handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.take()
-    };
-    if let Some(h) = idle_handle {
-        h.abort();
-        let _ = h.await;
-        tracing::info!("Presidio idle check timer stopped");
-    }
 
     // Send shutdown signal — select! in the server task will drop the
     // serve future (and TcpListener).

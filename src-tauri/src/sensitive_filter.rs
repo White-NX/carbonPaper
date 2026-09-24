@@ -2,8 +2,11 @@
 //!
 //! Loads AES-256-GCM-encrypted dictionary files from bundled resources at startup,
 //! builds Aho-Corasick automata per category, and provides O(n) text scanning
-//! to filter out records containing flagged words.
+//! to filter out records containing flagged words. Personal information is
+//! found by the rules in [`crate::pii`]; [`SensitiveFilterState::inspect`]
+//! runs both checks on one text field.
 
+use crate::pii::{self, PiiKind, PiiSettings, PiiSpan};
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use aho_corasick::AhoCorasick;
 use serde::{Deserialize, Serialize};
@@ -31,33 +34,80 @@ const DICT_FILES: &[(&str, &str)] = &[
     ("cat_05", "dict_05.dict.enc"),
 ];
 
-/// Configuration for sensitive data detection and masking (categories, mode, Presidio settings).
+/// Layout version of [`SensitiveFilterConfig`]. Version 2 replaced Presidio
+/// with [`crate::pii`] and made removing the affected OCR segment the default.
+pub const CONFIG_VERSION: u32 = 2;
+
+/// What happens to content with a sensitive word or personal information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterMode {
+    /// Withhold the whole snapshot.
+    Reject,
+    /// Drop the affected OCR segments and links; replace an affected title or
+    /// URL with a placeholder.
+    RemoveParagraph,
+    /// Hide the matches in place.
+    Mask,
+}
+
+impl FilterMode {
+    /// Parses a stored mode; anything unknown falls back to the default.
+    pub fn parse(mode: &str) -> Self {
+        match mode {
+            "reject" => FilterMode::Reject,
+            "mask" => FilterMode::Mask,
+            _ => FilterMode::RemoveParagraph,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FilterMode::Reject => "reject",
+            FilterMode::RemoveParagraph => "remove_paragraph",
+            FilterMode::Mask => "mask",
+        }
+    }
+}
+
+/// Configuration for sensitive words and personal information in MCP responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SensitiveFilterConfig {
     pub enabled: bool,
     pub categories: HashMap<String, bool>,
-    /// Filter mode: "reject" (reject entire snapshot), "remove_paragraph" (strip
-    /// OCR entries containing sensitive words), "mask" (replace sensitive words
-    /// with █ characters).  Defaults to "reject" for backward compatibility.
+    /// A [`FilterMode`] name: "reject", "remove_paragraph" (the default) or
+    /// "mask". Applies to sensitive words and personal information alike.
     #[serde(default = "default_mode")]
     pub mode: String,
-    /// Whether Presidio PII detection is enabled (independent toggle).
-    #[serde(default = "default_true")]
-    pub presidio_enabled: bool,
-    /// Presidio language code, auto-synced from frontend i18n.
+    /// Whether personal information detection is on.
+    #[serde(default = "default_true", alias = "presidio_enabled")]
+    pub pii_enabled: bool,
+    /// Kinds to detect, by [`PiiKind::name`]. Empty means none.
+    #[serde(default = "default_pii_entities", alias = "presidio_entities")]
+    pub pii_entities: Vec<String>,
+    /// Also mask long digit strings that match no specific rule.
     #[serde(default)]
-    pub presidio_language: String,
-    /// Which PII entity types to detect (empty = all).
+    pub pii_mask_long_numbers: bool,
+    /// Layout version; 0 for configurations saved before versioning.
     #[serde(default)]
-    pub presidio_entities: Vec<String>,
+    pub version: u32,
 }
 
 fn default_mode() -> String {
-    "reject".to_string()
+    FilterMode::RemoveParagraph.as_str().to_string()
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Every selectable kind except IP addresses, which are common and rarely
+/// personal on a developer's screen.
+fn default_pii_entities() -> Vec<String> {
+    PiiKind::SELECTABLE
+        .iter()
+        .filter(|kind| **kind != PiiKind::IpAddress)
+        .map(|kind| kind.name().to_string())
+        .collect()
 }
 
 impl Default for SensitiveFilterConfig {
@@ -69,11 +119,82 @@ impl Default for SensitiveFilterConfig {
         Self {
             enabled: true,
             categories,
-            mode: "reject".to_string(),
-            presidio_enabled: true,
-            presidio_language: String::new(),
-            presidio_entities: Vec::new(),
+            mode: default_mode(),
+            pii_enabled: true,
+            pii_entities: default_pii_entities(),
+            pii_mask_long_numbers: false,
+            version: CONFIG_VERSION,
         }
+    }
+}
+
+impl SensitiveFilterConfig {
+    /// Brings a configuration read from the stored policy up to date.
+    ///
+    /// Before version 2 every save wrote the then-default "reject", so a stored
+    /// "reject" says nothing about the user's choice and becomes the new
+    /// default. An empty Presidio entity list meant "all kinds"; credentials
+    /// did not exist then and are added to an explicit list.
+    pub fn upgraded(mut self) -> Self {
+        if self.version < 2 {
+            if self.mode == FilterMode::Reject.as_str() {
+                self.mode = default_mode();
+            }
+            if self.pii_entities.is_empty() {
+                self.pii_entities = default_pii_entities();
+            } else {
+                self.pii_entities
+                    .push(PiiKind::Credential.name().to_string());
+            }
+        }
+        self.normalized()
+    }
+
+    /// Canonical entity names in settings order and a known mode. Applied to
+    /// every configuration the settings page saves, which is current by
+    /// definition.
+    pub fn normalized(mut self) -> Self {
+        let wanted: Vec<PiiKind> = self
+            .pii_entities
+            .iter()
+            .filter_map(|name| PiiKind::from_name(name))
+            .collect();
+        self.pii_entities = PiiKind::SELECTABLE
+            .iter()
+            .filter(|kind| wanted.contains(kind))
+            .map(|kind| kind.name().to_string())
+            .collect();
+        self.mode = FilterMode::parse(&self.mode).as_str().to_string();
+        self.version = CONFIG_VERSION;
+        self
+    }
+
+    fn pii_settings(&self) -> PiiSettings {
+        if !self.pii_enabled {
+            return PiiSettings::off();
+        }
+        PiiSettings::new(
+            self.pii_entities
+                .iter()
+                .filter_map(|name| PiiKind::from_name(name)),
+            self.pii_mask_long_numbers,
+        )
+    }
+}
+
+/// What the dictionary and the personal information rules found in one text.
+#[derive(Debug, Default)]
+pub struct Findings {
+    /// A dictionary word from an enabled category.
+    pub sensitive_word: bool,
+    /// Personal information, in text order.
+    pub pii: Vec<PiiSpan>,
+}
+
+impl Findings {
+    /// Whether the filter mode applies. Long numbers alone are only masked.
+    pub fn is_flagged(&self) -> bool {
+        self.sensitive_word || self.pii.iter().any(PiiSpan::is_confident)
     }
 }
 
@@ -84,14 +205,19 @@ pub struct SensitiveFilterState {
     word_lists: RwLock<HashMap<String, Vec<String>>>,
     /// Active composite automaton (rebuilt when categories toggle)
     active_automaton: RwLock<Option<AhoCorasick>>,
+    /// Derived from the configuration so each check avoids parsing names.
+    pii: RwLock<PiiSettings>,
 }
 
 impl Default for SensitiveFilterState {
     fn default() -> Self {
+        let config = SensitiveFilterConfig::default();
+        let pii = config.pii_settings();
         Self {
-            config: RwLock::new(SensitiveFilterConfig::default()),
+            config: RwLock::new(config),
             word_lists: RwLock::new(HashMap::new()),
             active_automaton: RwLock::new(None),
+            pii: RwLock::new(pii),
         }
     }
 }
@@ -199,8 +325,36 @@ impl SensitiveFilterState {
     }
 
     /// Get the current filter mode.
-    pub fn get_mode(&self) -> String {
-        self.config.read().unwrap().mode.clone()
+    pub fn mode(&self) -> FilterMode {
+        FilterMode::parse(&self.config.read().unwrap().mode)
+    }
+
+    /// Checks one text field against the dictionary and the personal
+    /// information rules. `context` carries labels from neighbouring OCR
+    /// blocks; see [`pii::block_contexts`].
+    pub fn inspect(&self, text: &str, context: pii::Context) -> Findings {
+        let settings = *self.pii.read().unwrap();
+        Findings {
+            sensitive_word: self.contains_sensitive(text),
+            pii: pii::detect(text, settings, context),
+        }
+    }
+
+    /// The field as returned when it is kept: only long numbers are hidden.
+    pub fn kept_text(&self, text: &str, findings: &Findings) -> String {
+        let long_numbers: Vec<PiiSpan> = findings
+            .pii
+            .iter()
+            .filter(|span| !span.is_confident())
+            .copied()
+            .collect();
+        pii::mask(text, &long_numbers)
+    }
+
+    /// The field as returned in mask mode: personal information replaced by
+    /// its label, sensitive words by █.
+    pub fn masked_text(&self, text: &str, findings: &Findings) -> String {
+        self.mask_sensitive(&pii::mask(text, &findings.pii))
     }
 
     /// Replace all sensitive word occurrences in `text` with █ characters
@@ -250,6 +404,7 @@ impl SensitiveFilterState {
     /// Update the configuration and rebuild the composite automaton.
     pub fn update_config(&self, config: SensitiveFilterConfig) {
         self.rebuild_automaton(&config);
+        *self.pii.write().unwrap() = config.pii_settings();
         let mut guard = self.config.write().unwrap();
         *guard = config;
     }
@@ -257,22 +412,6 @@ impl SensitiveFilterState {
     /// Get the current configuration.
     pub fn get_config(&self) -> SensitiveFilterConfig {
         self.config.read().unwrap().clone()
-    }
-
-    /// Check if Presidio PII detection is enabled.
-    pub fn is_presidio_enabled(&self) -> bool {
-        let cfg = self.config.read().unwrap();
-        cfg.presidio_enabled
-    }
-
-    /// Get Presidio config tuple: (enabled, language, entity_types).
-    pub fn get_presidio_config(&self) -> (bool, String, Vec<String>) {
-        let cfg = self.config.read().unwrap();
-        (
-            cfg.presidio_enabled,
-            cfg.presidio_language.clone(),
-            cfg.presidio_entities.clone(),
-        )
     }
 
     /// Rebuild the composite Aho-Corasick automaton from enabled categories.
@@ -466,8 +605,138 @@ mod tests {
     fn test_default_config() {
         let config = SensitiveFilterConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.mode, "reject");
-        assert!(config.presidio_enabled);
+        assert_eq!(config.mode, "remove_paragraph");
+        assert!(config.pii_enabled);
+        assert!(!config.pii_mask_long_numbers);
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(
+            config.pii_entities,
+            [
+                "PHONE_NUMBER",
+                "CN_ID_CARD",
+                "CN_BANK_CARD",
+                "EMAIL_ADDRESS",
+                "ADDRESS",
+                "CREDENTIAL"
+            ]
+        );
         assert_eq!(config.categories.len(), CATEGORY_IDS.len());
+    }
+
+    fn stored(value: serde_json::Value) -> SensitiveFilterConfig {
+        serde_json::from_value::<SensitiveFilterConfig>(value)
+            .unwrap()
+            .upgraded()
+    }
+
+    #[test]
+    fn upgrades_presidio_era_configs() {
+        // Saved by the old settings page after the user changed a category:
+        // "reject" was the default, not a choice.
+        let config = stored(serde_json::json!({
+            "enabled": true,
+            "categories": { "cat_01": false },
+            "mode": "reject",
+            "presidio_enabled": true,
+            "presidio_language": "",
+            "presidio_entities": ["PHONE_NUMBER", "CN_ID_CARD", "PERSON", "CREDIT_CARD"],
+        }));
+        assert_eq!(config.mode, "remove_paragraph");
+        assert!(config.pii_enabled);
+        assert_eq!(
+            config.pii_entities,
+            ["PHONE_NUMBER", "CN_ID_CARD", "CN_BANK_CARD", "CREDENTIAL"]
+        );
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(config.categories.get("cat_01"), Some(&false));
+
+        // An empty Presidio list meant every kind; a chosen mode is kept.
+        let config = stored(serde_json::json!({
+            "enabled": false,
+            "categories": {},
+            "mode": "mask",
+            "presidio_enabled": false,
+            "presidio_entities": [],
+        }));
+        assert_eq!(config.mode, "mask");
+        assert!(!config.pii_enabled);
+        assert_eq!(
+            config.pii_entities,
+            SensitiveFilterConfig::default().pii_entities
+        );
+    }
+
+    #[test]
+    fn current_configs_keep_an_explicit_reject() {
+        let config = stored(serde_json::json!({
+            "enabled": true,
+            "categories": {},
+            "mode": "reject",
+            "pii_enabled": true,
+            "pii_entities": [],
+            "version": CONFIG_VERSION,
+        }));
+        assert_eq!(config.mode, "reject");
+        assert!(config.pii_entities.is_empty());
+        assert_eq!(config.pii_settings(), PiiSettings::new([], false));
+    }
+
+    #[test]
+    fn normalizes_what_the_settings_page_sends() {
+        let config = SensitiveFilterConfig {
+            mode: "unknown".to_string(),
+            pii_entities: vec![
+                "IP_ADDRESS".to_string(),
+                "PHONE_NUMBER".to_string(),
+                "PHONE_NUMBER".to_string(),
+                "PERSON".to_string(),
+            ],
+            version: 0,
+            ..SensitiveFilterConfig::default()
+        }
+        .normalized();
+        assert_eq!(config.mode, "remove_paragraph");
+        assert_eq!(config.pii_entities, ["PHONE_NUMBER", "IP_ADDRESS"]);
+        assert_eq!(config.version, CONFIG_VERSION);
+    }
+
+    #[test]
+    fn inspect_combines_words_and_personal_information() {
+        let state = make_state_with_words(vec!["secret"]);
+        let text = "secret plan, call 13812345678";
+        let findings = state.inspect(text, pii::Context::default());
+        assert!(findings.sensitive_word);
+        assert_eq!(findings.pii.len(), 1);
+        assert!(findings.is_flagged());
+        assert_eq!(
+            state.masked_text(text, &findings),
+            "██████ plan, call [PHONE_NUMBER]"
+        );
+        assert_eq!(state.kept_text(text, &findings), text);
+
+        let mut config = state.get_config();
+        config.pii_enabled = false;
+        state.update_config(config);
+        assert!(state.inspect(text, pii::Context::default()).pii.is_empty());
+    }
+
+    #[test]
+    fn long_numbers_are_masked_without_flagging() {
+        let state = make_state_with_words(vec![]);
+        let mut config = state.get_config();
+        config.pii_mask_long_numbers = true;
+        state.update_config(config);
+        let text = "订单编号：203496817759901245";
+        let findings = state.inspect(text, pii::Context::default());
+        assert!(!findings.is_flagged());
+        assert_eq!(state.kept_text(text, &findings), "订单编号：[LONG_NUMBER]");
+    }
+
+    #[test]
+    fn filter_mode_parses_unknown_as_default() {
+        assert_eq!(FilterMode::parse("reject"), FilterMode::Reject);
+        assert_eq!(FilterMode::parse("mask"), FilterMode::Mask);
+        assert_eq!(FilterMode::parse(""), FilterMode::RemoveParagraph);
+        assert_eq!(FilterMode::RemoveParagraph.as_str(), "remove_paragraph");
     }
 }
