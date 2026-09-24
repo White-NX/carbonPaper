@@ -593,15 +593,6 @@ async fn dispatch_typed_monitor_command(
     forward_command_to_python(&state, payload).await
 }
 
-pub(crate) async fn authenticated_monitor_command(
-    credential_state: &crate::credential_manager::CredentialManagerState,
-    state: &MonitorState,
-    payload: Value,
-) -> Result<Value, String> {
-    crate::commands::check_auth_required(credential_state)?;
-    dispatch_typed_monitor_command(state, None, None, payload).await
-}
-
 #[tauri::command]
 pub async fn monitor_search_nl(
     app: tauri::AppHandle,
@@ -823,20 +814,6 @@ pub async fn monitor_smart_cluster_stop_drain(
         scheduler.wake();
     }
     Ok(serde_json::json!({ "status": "success" }))
-}
-
-#[tauri::command]
-pub async fn monitor_presidio_set_language(
-    credential_state: State<'_, Arc<crate::credential_manager::CredentialManagerState>>,
-    state: State<'_, MonitorState>,
-    language: String,
-) -> Result<Value, String> {
-    authenticated_monitor_command(
-        &credential_state,
-        &state,
-        serde_json::json!({ "command": "presidio_set_language", "language": language }),
-    )
-    .await
 }
 
 #[tauri::command]

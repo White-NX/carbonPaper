@@ -2220,25 +2220,74 @@ impl StorageState {
         // cursor and read connection before starting it.
         Ok(encrypted_rows
             .into_iter()
-            .map(|row| {
-                let text = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
-                    (Some(data), Some(key)) => self
-                        .decrypt_payload_with_row_key(data, key)
-                        .ok()
-                        .and_then(|v| String::from_utf8(v).ok()),
-                    _ => None,
-                };
-
-                super::OcrResult {
-                    id: row.id,
-                    screenshot_id: row.screenshot_id,
-                    text: text.unwrap_or_default(),
-                    confidence: row.confidence,
-                    box_coords: row.box_coords,
-                    created_at: wire_time::from_sqlite_utc(&row.created_at),
-                }
-            })
+            .map(|row| self.decrypt_ocr_row(row))
             .collect())
+    }
+
+    fn decrypt_ocr_row(&self, row: EncryptedOcrResultRow) -> super::OcrResult {
+        let text = match (row.text_enc.as_deref(), row.text_key_encrypted.as_deref()) {
+            (Some(data), Some(key)) => self
+                .decrypt_payload_with_row_key(data, key)
+                .ok()
+                .and_then(|v| String::from_utf8(v).ok()),
+            _ => None,
+        };
+
+        super::OcrResult {
+            id: row.id,
+            screenshot_id: row.screenshot_id,
+            text: text.unwrap_or_default(),
+            confidence: row.confidence,
+            box_coords: row.box_coords,
+            created_at: wire_time::from_sqlite_utc(&row.created_at),
+        }
+    }
+
+    /// OCR blocks of several screenshots with their boxes, in the reading order
+    /// of [`Self::get_screenshot_ocr_results`]. Used where a filter must drop
+    /// single segments rather than a whole joined text.
+    pub fn get_ocr_blocks_by_screenshot_ids(
+        &self,
+        screenshot_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<super::OcrResult>>, String> {
+        let mut blocks: std::collections::HashMap<i64, Vec<super::OcrResult>> =
+            std::collections::HashMap::new();
+        if screenshot_ids.is_empty() {
+            return Ok(blocks);
+        }
+        let encrypted_rows = {
+            let conn = self.open_read_connection_named("get_ocr_blocks_by_screenshot_ids")?;
+            let mut rows = Vec::new();
+            // Chunked to stay under SQLite's bound-parameter limit.
+            for chunk in screenshot_ids.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT id, screenshot_id, text_enc, text_key_encrypted, confidence,
+                        box_x1, box_y1, box_x2, box_y2,
+                        box_x3, box_y3, box_x4, box_y4, created_at
+                     FROM ocr_results
+                     WHERE is_deleted = 0 AND screenshot_id IN ({placeholders})
+                     ORDER BY screenshot_id, box_y1, box_x1"
+                );
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| format!("Failed to prepare batch OCR block query: {}", e))?;
+                let mapped = stmt
+                    .query_map(params.as_slice(), EncryptedOcrResultRow::from_row)
+                    .map_err(|e| format!("Failed to execute batch OCR block query: {}", e))?;
+                rows.extend(mapped.filter_map(|row| row.ok()));
+            }
+            rows
+        };
+
+        // As above, decrypt only after the read connection is closed.
+        for row in encrypted_rows {
+            let block = self.decrypt_ocr_row(row);
+            blocks.entry(block.screenshot_id).or_default().push(block);
+        }
+        Ok(blocks)
     }
 
     /// Get OCR results for unattended recovery without allowing CNG to display UI.

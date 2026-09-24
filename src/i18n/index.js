@@ -2,7 +2,6 @@ import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 import { invoke } from '@tauri-apps/api/core';
-import { withAuth } from '../lib/auth_api';
 
 // Dynamic import loader: lazy-load locale JSON via ESM import()
 const loadLocale = async (lng) => {
@@ -79,12 +78,6 @@ i18n.on('languageChanged', (lng) => {
     // ignore
   }
   syncBackendLanguage(lng);
-  // Notify Presidio PII service of language change (best-effort, non-blocking)
-  withAuth(() => invoke('monitor_presidio_set_language', {
-    language: lng
-  })).catch(() => {
-    // Monitor may not be running in web-only mode; ignore failures.
-  });
 });
 
 export default i18n;

@@ -35,9 +35,7 @@ export default function McpServiceCard({
   showAdvanced,
   piiEnabled,
   piiEntities,
-  spacyModels,
-  downloadingModel,
-  recheckLoading,
+  piiMaskLongNumbers,
   showPiiAdvanced,
   filterLevel,
   shouldShowStartButton,
@@ -52,8 +50,7 @@ export default function McpServiceCard({
   onToggleAdvanced,
   onPiiToggle,
   onPiiEntityToggle,
-  onDownloadModel,
-  onForceRecheck,
+  onPiiMaskLongNumbersToggle,
   onTogglePiiAdvanced,
   onCopyCurrentToken,
   onAgentVariantChange,
@@ -167,7 +164,7 @@ export default function McpServiceCard({
         </>
       )}
 
-      {enabled && filterEnabled && (
+      {enabled && (filterEnabled || piiEnabled) && (
         <>
           <RowDivider />
           <FilterModeSection
@@ -183,15 +180,12 @@ export default function McpServiceCard({
           <PiiDetectionSection
             piiEnabled={piiEnabled}
             piiEntities={piiEntities}
-            spacyModels={spacyModels}
-            downloadingModel={downloadingModel}
-            recheckLoading={recheckLoading}
+            piiMaskLongNumbers={piiMaskLongNumbers}
             showPiiAdvanced={showPiiAdvanced}
             onPiiToggle={onPiiToggle}
             onTogglePiiAdvanced={onTogglePiiAdvanced}
             onPiiEntityToggle={onPiiEntityToggle}
-            onDownloadModel={onDownloadModel}
-            onForceRecheck={onForceRecheck}
+            onPiiMaskLongNumbersToggle={onPiiMaskLongNumbersToggle}
           />
         </>
       )}

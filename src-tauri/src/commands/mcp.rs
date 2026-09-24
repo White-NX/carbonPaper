@@ -700,6 +700,7 @@ pub async fn mcp_set_sensitive_filter_config(
 ) -> Result<(), String> {
     super::check_auth_required(&credential_state)?;
 
+    let config = config.normalized();
     filter_state.update_config(config.clone());
 
     let mut policy = storage_state.load_policy()?;

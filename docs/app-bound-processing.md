@@ -19,7 +19,7 @@ claim validation of a subsequently published release.
 | `carbonpaper-key-service.exe` | LocalSystem service, caller verification, task keys and grant lifecycle | [service.rs](../src-tauri/app-bound/src/windows/service.rs), [ledger.rs](../src-tauri/app-bound/src/ledger.rs) |
 | `carbonpaper-protected-setup.exe` | UAC installation, repair, registration and service removal | [install.rs](../src-tauri/app-bound/src/windows/install.rs) |
 | Native classification | Anchor scoring, learning and scoped result completion | [classification/mod.rs](../src-tauri/src/classification/mod.rs), [storage/classification.rs](../src-tauri/src/storage/classification.rs) |
-| `carbonpaper-python.exe` | Separate, unprivileged host for Presidio and legacy vector export | [python.rs](../src-tauri/src/bin/python.rs), [monitor entry point](../monitor/monitor/__init__.py) |
+| `carbonpaper-python.exe` | Separate, unprivileged host for the Python monitor service, which no longer runs a product feature | [python.rs](../src-tauri/src/bin/python.rs), [monitor entry point](../monitor/monitor/__init__.py) |
 | Native model worker | MiniLM, CLIP and BGE inference with the existing scheduler | [semantic_runtime.rs](../src-tauri/src/semantic_runtime.rs), [classification_runtime.rs](../src-tauri/src/classification_runtime.rs) |
 | Archive storage | Source revisions, deletion outbox and transactional completion receipts | [storage/processing_stage.rs](../src-tauri/src/storage/processing_stage.rs), [derived_index.rs](../src-tauri/src/storage/derived_index.rs) |
 
@@ -442,9 +442,8 @@ npm run test:security
 & "$env:LOCALAPPDATA\carbonpaper\.venv\Scripts\python.exe" -m pytest monitor/tests -q --timeout=15
 ```
 
-The existing spaCy integration fixture can exceed the fifteen-second test limit
-during a cold model load. The full Python suite was also checked with
-`--timeout=60`; this changes the test invocation, not the production timeout.
+The spaCy integration fixture that used to exceed the fifteen-second test limit
+during a cold model load was removed with Presidio on 2026-09-24.
 
 Debug builds do not contact the production broker. The normal debug command
 uses the development service and build-time trust identity; unit tests inject an

@@ -5,7 +5,6 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAiEmbeddingController } from './useAiEmbeddingController';
 
 const loadFilterConfig = vi.fn(async () => {});
-const loadSpacyModels = vi.fn(async () => {});
 const { eventListeners } = vi.hoisted(() => ({ eventListeners: new Map() }));
 
 vi.mock('../../lib/auth_api', () => ({
@@ -22,18 +21,15 @@ vi.mock('@tauri-apps/api/event', () => ({
 vi.mock('./agent-access/useSensitiveFilterSettings', () => ({
   useSensitiveFilterSettings: () => ({
     loadFilterConfig,
-    loadSpacyModels,
     filterEnabled: true,
     filterCategories: [],
-    filterMode: 'reject',
+    filterMode: 'remove_paragraph',
     filterLevel: 'standard',
     showAdvanced: false,
     setShowAdvanced: vi.fn(),
     piiEnabled: true,
-    piiEntities: [],
-    spacyModels: [],
-    downloadingModel: null,
-    recheckLoading: false,
+    piiEntities: {},
+    piiMaskLongNumbers: false,
     showPiiAdvanced: false,
     setShowPiiAdvanced: vi.fn(),
   }),

@@ -803,15 +803,15 @@
           "label": "过滤方式",
           "reject": {
             "title": "拒绝整个快照",
-            "description": "检测到敏感内容时，拒绝返回整个快照请求。"
+            "description": "发现敏感内容或个人信息时，不返回这个快照的任何内容。"
           },
           "remove_paragraph": {
             "title": "去除敏感段落",
-            "description": "移除包含敏感词的 OCR 文本段落，快照的其余内容仍然返回。"
+            "description": "只移除含有敏感内容或个人信息的文字段落，快照的其余内容照常返回。"
           },
           "mask": {
             "title": "隐去敏感词（不建议）",
-            "description": "使用 █ 字符替换敏感词，快照和周围文本仍然返回。"
+            "description": "在原位置遮挡敏感词和个人信息，周围的文字照常返回。"
           }
         },
         "categories": {
@@ -823,23 +823,21 @@
         },
         "pii": {
           "title": "个人信息检测",
-          "description": "使用 NLP 模型从 MCP 响应中检测并过滤个人身份信息（姓名、手机号、身份证号等）。",
+          "description": "找出返回给 AI 的内容中的手机号、身份证号、银行卡号、密码等个人信息，并按所选的过滤方式处理。",
           "toggle_label": "启用个人信息检测",
-          "model_status": "模型状态",
-          "model_installed": "已安装",
-          "model_not_installed": "未安装",
-          "model_download": "下载",
-          "model_downloading": "下载中...",
-          "model_active": "当前使用",
-          "model_note": "当前使用的模型会跟随语言设置自动切换",
-          "recheck": "重新检测",
           "entity_types_label": "检测的信息类型",
           "entity_types": {
             "PHONE_NUMBER": "手机号码",
             "CN_ID_CARD": "身份证号码",
-            "EMAIL_ADDRESS": "电子邮箱",
             "CN_BANK_CARD": "银行卡号",
-            "ADDRESS": "地址"
+            "EMAIL_ADDRESS": "电子邮箱",
+            "ADDRESS": "地址",
+            "CREDENTIAL": "密码与密钥",
+            "IP_ADDRESS": "IP 地址"
+          },
+          "long_numbers": {
+            "title": "遮挡较长的数字",
+            "description": "把无法判断类型的 11 位以上长数字替换为标记，例如订单号和快递单号。"
           }
         }
       }

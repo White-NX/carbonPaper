@@ -889,6 +889,38 @@ impl StorageState {
             .collect())
     }
 
+    /// The same page as [`Self::list_smart_cluster_ocr_corpus`], with each
+    /// screenshot's OCR blocks instead of their joined text so the MCP privacy
+    /// filter can drop single segments. `ocr_text` is left empty for the
+    /// caller to rebuild.
+    pub fn list_smart_cluster_ocr_corpus_blocks(
+        &self,
+        cluster_id: i64,
+        page: i64,
+        page_size: i64,
+    ) -> Result<Vec<(SmartClusterOcrCorpusItem, Vec<super::OcrResult>)>, String> {
+        let assignments = self.list_smart_cluster_assignments(cluster_id, page, page_size)?;
+        let screenshot_ids: Vec<i64> = assignments.iter().map(|s| s.screenshot_id).collect();
+        let blocks = self.get_ocr_blocks_by_screenshot_ids(&screenshot_ids)?;
+        Ok(assignments
+            .into_iter()
+            .map(|s| {
+                let item_blocks = blocks.get(&s.screenshot_id).cloned().unwrap_or_default();
+                let item = SmartClusterOcrCorpusItem {
+                    screenshot_id: s.screenshot_id,
+                    rerank_score: s.rerank_score,
+                    process_name: s.process_name,
+                    window_title: s.window_title,
+                    created_at: s.created_at,
+                    category: s.category,
+                    assigned_at: s.assigned_at,
+                    ocr_text: String::new(),
+                };
+                (item, item_blocks)
+            })
+            .collect())
+    }
+
     pub fn get_smart_cluster_summary(
         &self,
         cluster_id: i64,

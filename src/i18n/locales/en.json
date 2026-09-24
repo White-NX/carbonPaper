@@ -803,15 +803,15 @@
           "label": "Filter Behavior",
           "reject": {
             "title": "Reject Entire Snapshot",
-            "description": "Block the entire snapshot from being returned when sensitive content is detected."
+            "description": "Withhold the whole snapshot when it contains sensitive content or personal information."
           },
           "remove_paragraph": {
-            "title": "Remove Sensitive Paragraphs",
-            "description": "Remove OCR text entries that contain sensitive words; the rest of the snapshot is still returned."
+            "title": "Remove Affected Paragraphs",
+            "description": "Remove only the text paragraphs that contain sensitive content or personal information; the rest of the snapshot is still returned."
           },
           "mask": {
             "title": "Mask Sensitive Words",
-            "description": "Replace sensitive words with █ characters; the snapshot and surrounding text are still returned."
+            "description": "Cover sensitive words and personal information where they appear; the surrounding text is still returned."
           }
         },
         "categories": {
@@ -822,24 +822,22 @@
           "cat_05": "Content That May Trigger Safety Review"
         },
         "pii": {
-          "title": "PII Detection",
-          "description": "Detect and filter personal identifiable information (names, phone numbers, ID cards, etc.) from MCP responses using NLP models.",
-          "toggle_label": "Enable PII Detection",
-          "model_status": "Model Status",
-          "model_installed": "Installed",
-          "model_not_installed": "Not installed",
-          "model_download": "Download",
-          "model_downloading": "Downloading...",
-          "model_active": "Active",
-          "model_note": "Active model follows your language setting",
-          "recheck": "Re-check",
+          "title": "Personal Information Detection",
+          "description": "Find phone numbers, ID numbers, bank card numbers, passwords and other personal information in content returned to AI tools, and handle it with the selected filter behavior.",
+          "toggle_label": "Enable Personal Information Detection",
           "entity_types_label": "Entity Types to Detect",
           "entity_types": {
             "PHONE_NUMBER": "Phone Numbers",
             "CN_ID_CARD": "ID Card Numbers",
-            "EMAIL_ADDRESS": "Email Addresses",
             "CN_BANK_CARD": "Bank Card Numbers",
-            "ADDRESS": "Addresses"
+            "EMAIL_ADDRESS": "Email Addresses",
+            "ADDRESS": "Addresses",
+            "CREDENTIAL": "Passwords and Keys",
+            "IP_ADDRESS": "IP Addresses"
+          },
+          "long_numbers": {
+            "title": "Hide Long Numbers",
+            "description": "Replace numbers of 11 or more digits that match no specific type, such as order and tracking numbers."
           }
         }
       }
