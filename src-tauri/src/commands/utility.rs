@@ -253,18 +253,7 @@ pub async fn toggle_game_mode(
     if enabled {
         monitor::start_game_mode_monitor(app);
     } else {
-        let state = app.state::<MonitorState>();
-        let was_suppressed = state.game_mode_dml_suppressed.load(Ordering::SeqCst);
         monitor::stop_game_mode_monitor(&app);
-        if was_suppressed {
-            let _ = monitor::stop_monitor_impl(
-                app.state::<MonitorState>(),
-                app.state::<Arc<CaptureState>>(),
-                app.clone(),
-            )
-            .await;
-            let _ = monitor::start_monitor_impl(app.state::<MonitorState>(), app.clone()).await;
-        }
     }
     Ok(())
 }

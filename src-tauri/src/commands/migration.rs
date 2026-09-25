@@ -265,11 +265,7 @@ pub async fn storage_migrate_data_dir(
         return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
     };
 
-    let was_running = monitor_state
-        .process
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .is_some();
+    let was_running = monitor_state.is_running();
     monitor_state
         .migration_lock
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -381,13 +377,7 @@ pub async fn storage_export_backup(
 
     tracing::info!("Migration: Starting data export to {}", export_path);
 
-    let was_running = {
-        let guard = monitor_state
-            .process
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.is_some()
-    };
+    let was_running = monitor_state.is_running();
 
     monitor_state
         .migration_lock
@@ -581,13 +571,7 @@ pub async fn storage_import_backup(
 
     tracing::info!("Migration: Starting data import from {}", backup_zip_path);
 
-    let was_running = {
-        let guard = monitor_state
-            .process
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.is_some()
-    };
+    let was_running = monitor_state.is_running();
 
     monitor_state
         .migration_lock

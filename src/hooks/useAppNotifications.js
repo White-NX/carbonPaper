@@ -8,7 +8,6 @@ export function useAppNotifications() {
   const [showNotifications, setShowNotifications] = useState(false);
   const [notifications, setNotifications] = useState([]);
   const [hiddenToastIds, setHiddenToastIds] = useState(() => new Set());
-  const [securityAlert, setSecurityAlert] = useState(null);
   const lastBackendErrorRef = useRef('');
 
   const pushNotification = useCallback((notification) => {
@@ -35,15 +34,6 @@ export function useAppNotifications() {
     timestamp: payload.timestamp || Date.now(),
     toastDuration: payload.toastDuration,
   }), [t]);
-
-  useTauriEventListener('security-alert', (event) => {
-    const payload = event.payload || {};
-    setSecurityAlert({
-      code: payload.code,
-      message: payload.message,
-      detail: payload.detail,
-    });
-  });
 
   useTauriEventListener('app-toast', (event) => {
     const payload = event.payload || {};
@@ -174,8 +164,6 @@ export function useAppNotifications() {
     dismissNotification,
     handleToastClose,
     clearNotifications,
-    securityAlert,
-    setSecurityAlert,
     formatErrorDetails,
     reportBackendError,
     resetBackendErrorDedupe,

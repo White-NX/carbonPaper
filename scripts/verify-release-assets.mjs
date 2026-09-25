@@ -7,11 +7,6 @@ const root = process.cwd();
 
 const assets = [
   {
-    name: 'Python 3.12.10 installer',
-    file: 'python-3.12.10-amd64.exe',
-    sha256: '67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb',
-  },
-  {
     name: 'aria2 1.37.0 Windows x64',
     file: 'aria2c.exe',
     sha256: 'be2099c214f63a3cb4954b09a0becd6e2e34660b886d4c898d260febfe9d70c2',
@@ -117,11 +112,8 @@ for (const pkg of semanticManifest.packages) {
   }
 }
 const buildRs = readText(path.join('src-tauri', 'build.rs'));
-assertIncludes(buildRs, 'Path::new("../python-3.12.10-amd64.exe")', 'build.rs Python source path');
-assertIncludes(buildRs, 'Path::new("pre-bundle/python-3.12.10-amd64.exe")', 'build.rs Python destination path');
 assertIncludes(buildRs, 'Path::new("../aria2c.exe")', 'build.rs aria2 source path');
 assertIncludes(buildRs, 'Path::new("pre-bundle/aria2c.exe")', 'build.rs aria2 destination path');
-assertIncludes(buildRs, 'cargo:rerun-if-changed=../python-3.12.10-amd64.exe', 'build.rs Python rerun input');
 assertIncludes(buildRs, 'cargo:rerun-if-changed=../aria2c.exe', 'build.rs aria2 rerun input');
 
 const tauriConf = JSON.parse(readText(path.join('src-tauri', 'tauri.conf.json')));

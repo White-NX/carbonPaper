@@ -91,20 +91,11 @@ pub fn get_maintenance_status() -> MaintenanceStatus {
     }
 }
 
-/// Reverse-IPC commands that remain usable during maintenance: session/crypto
-/// helpers, read-only status, and NMH session bookkeeping. Everything that
-/// writes screenshots, OCR, or smart cluster state is rejected.
+/// NMH pipe commands that remain usable during maintenance: session
+/// bookkeeping only. Everything that writes screenshots, OCR, or smart
+/// cluster state is rejected.
 pub fn reverse_ipc_command_allowed(command: &str) -> bool {
-    matches!(
-        command,
-        "get_public_key"
-            | "get_auth_status"
-            | "encrypt_for_chromadb"
-            | "decrypt_from_chromadb"
-            | "decrypt_many_from_chromadb"
-            | "register_nmh"
-            | "unregister_nmh"
-    )
+    matches!(command, "register_nmh" | "unregister_nmh")
 }
 
 #[cfg(test)]
@@ -124,7 +115,8 @@ mod tests {
 
     #[test]
     fn reverse_ipc_allowlist_rejects_mutations() {
-        assert!(reverse_ipc_command_allowed("get_auth_status"));
+        assert!(reverse_ipc_command_allowed("register_nmh"));
+        assert!(!reverse_ipc_command_allowed("get_auth_status"));
         assert!(!reverse_ipc_command_allowed("save_screenshot"));
         assert!(!reverse_ipc_command_allowed("save_extension_screenshot"));
         assert!(!reverse_ipc_command_allowed("commit_screenshot"));

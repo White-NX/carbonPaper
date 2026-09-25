@@ -606,10 +606,6 @@ export const updateScreenshotCategory = async (screenshotId, category) => {
     }), { autoPrompt: true });
 };
 
-export const getCategories = async () => {
-    return await withAuth(() => invoke('storage_get_categories'));
-};
-
 export const getCategoriesFromDb = async () => {
     try {
         return await withAuth(() => invoke('storage_get_categories_from_db'));

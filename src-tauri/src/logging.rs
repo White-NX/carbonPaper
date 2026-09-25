@@ -1,8 +1,7 @@
 //! Logging Module - Daily and Size-Based Rotating Log Files with Gzip Compression and Retention
 //!
 //! Provides a logging system that writes to daily log files with automatic rotation based on file size.
-//! Rust itself uses the tracing macro to output logs, and the stderr of Python child processes is
-//! captured by Rust and written to the same log file as the `monitor.stderr` target.
+//! Rust uses the tracing macros to output logs; worker processes report through the same file.
 
 use flate2::write::GzEncoder;
 use flate2::Compression;

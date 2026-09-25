@@ -67,20 +67,15 @@ pub struct MonitorRestore {
     was_paused: bool,
 }
 
-/// Pause capture for a maintenance task. Nothing here needs Python started;
-/// starting a stopped monitor just to pause it would add avoidable work and
-/// briefly change a user's explicit stopped state.
+/// Pause capture for a maintenance task. Starting a stopped monitor just to
+/// pause it would briefly change a user's explicit stopped state.
 pub async fn pause_capture_for_maintenance(app: &AppHandle) -> Result<MonitorRestore, String> {
     let monitor = app.state::<MonitorState>();
     let capture = app.state::<Arc<crate::capture::CaptureState>>();
-    let was_running = monitor
-        .process
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_some();
+    let was_running = monitor.is_running();
     let was_paused = capture.paused.load(Ordering::SeqCst);
     if was_running && !was_paused {
-        let _ = crate::monitor::pause_monitor_impl(monitor, capture, app.clone()).await;
+        let _ = crate::monitor::pause_monitor_impl(capture, app.clone()).await;
     }
     Ok(MonitorRestore {
         was_running,
@@ -91,7 +86,6 @@ pub async fn pause_capture_for_maintenance(app: &AppHandle) -> Result<MonitorRes
 pub async fn restore_monitor_after_maintenance(app: &AppHandle, restore: &MonitorRestore) {
     if !restore.was_paused && restore.was_running {
         let _ = crate::monitor::resume_monitor_impl(
-            app.state::<MonitorState>(),
             app.state::<Arc<crate::capture::CaptureState>>(),
             app.clone(),
         )

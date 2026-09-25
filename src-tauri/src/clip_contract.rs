@@ -81,9 +81,13 @@ pub mod diagnostic_code {
     pub const ORPHAN_DOCUMENT_ID: &str = "orphan_document_id";
     /// The screenshot went away between building the id map and committing.
     pub const SCREENSHOT_DISAPPEARED: &str = "screenshot_disappeared";
-    /// Python could not read the stored vector back out of Chroma.
+    /// Python could not read the stored vector back out of Chroma. Only
+    /// historical copy runs wrote this; it is kept so the code is not reused.
+    #[allow(dead_code)]
     pub const LEGACY_VECTOR_DECODE_FAILED: &str = "legacy_vector_decode_failed";
-    /// The vector arrived, and was not usable for cosine scoring.
+    /// The vector arrived, and was not usable for cosine scoring. Only
+    /// historical copy runs wrote this; it is kept so the code is not reused.
+    #[allow(dead_code)]
     pub const INVALID_VECTOR: &str = "invalid_vector";
     /// The run itself stopped, recorded against no subject.
     pub const RUN_FAILED: &str = "run_failed";

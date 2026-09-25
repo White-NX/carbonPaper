@@ -46,7 +46,7 @@
       },
       "powerSaving": {
         "label": "Power Saving Mode",
-        "description": "Automatically pause Python sub-service when on battery power, and resume when plugged in."
+        "description": "Automatically pause monitor service when on battery power, and resume when plugged in."
       },
       "gameMode": {
         "label": "Game Mode",
@@ -153,8 +153,8 @@
         "restart": "Restart",
         "power_saving_blocked": "Power saving mode is active. Connect AC power to start the service.",
         "autoStart": {
-          "label": "Auto-start Subservice",
-          "description": "When enabled the app will attempt to launch the Python subservice on startup.",
+          "label": "Auto-start Service",
+          "description": "When enabled the app will attempt to launch the monitor service on startup.",
           "tooltip": "Automatically start screenshot/OCR background on app launch"
         },
         "autoLaunch": {
@@ -167,13 +167,10 @@
           "disable": "Disable Auto Launch"
         },
         "errors": {
-          "startFailedTitle": "Python subservice failed to start",
-          "unavailableTitle": "Python subservice unavailable",
-          "exitedTitle": "Python subservice exited unexpectedly",
+          "startFailedTitle": "Monitor service failed to start",
+          "unavailableTitle": "Monitor service unavailable",
           "startFailedFallback": "Failed to start backend",
-          "offlineFallback": "Backend offline",
-          "manualRestartRecovery": "; recovery policy: manual restart, stale IPC state cleaned",
-          "exitedMessage": "Subservice exited (code: {{code}}{{error}}){{recovery}}"
+          "offlineFallback": "Backend offline"
         }
       }
     },
@@ -1006,7 +1003,6 @@
       "preview": "Preview",
       "previews": {
         "error": "Error window",
-        "security": "Security alert",
         "ocr": "Recognition repair notice",
         "update": "Update prompt",
         "critical-update": "Critical update prompt",
@@ -1428,83 +1424,6 @@
     ]
   },
   "mask": {
-    "debug": {
-      "label": "DEBUG",
-      "none": "(none)",
-      "online": "Online (hide mask)",
-      "offline": "Backend: Offline",
-      "waiting": "Backend: Waiting",
-      "venv1": "Venv: Step 1",
-      "venv2": "Venv: Step 2",
-      "venv3": "Venv: Step 3",
-      "nopython": "First-run (no python)"
-    },
-    "backend_shutdown": {
-      "title": "Backend python services shutdown",
-      "description": "Please enable the backend services to continue using the application."
-    },
-    "start": {
-      "starting": "Starting...",
-      "start_service": "Start OCR Service",
-      "waiting": "Waiting for IPC to come up..."
-    },
-    "venv": {
-      "step1": {
-        "title": "Install Python v{{version}}",
-        "subtitle": "Step 1 / 3 — choose or install system Python"
-      },
-      "pythonPath": {
-        "label": "Python executable path",
-        "placeholder": "e.g.: C:\\Python310\\python.exe or paste custom path"
-      },
-      "choose": "Choose",
-      "auto_install": {
-        "log_start": "Starting automated Python install...",
-        "success": "Installation succeeded.",
-        "finished": "Auto-install process finished.",
-        "installing": "Installing...",
-        "button": "Auto-install Python"
-      },
-      "discovered_label": "Discovered Python versions (you may select one)",
-      "unsupported": "Not supported",
-      "not_found": "No Python discovered",
-      "note": "Not sure what Python is? We can auto-install it. After install the app will exit and must be restarted.",
-      "installing": "Installing...",
-      "auto_install_button": "Auto-install Python",
-      "install_logs": "Install logs",
-      "install_failed": "Installation failed: {{error}}",
-      "next": "Next",
-      "step2": {
-        "title": "Install required dependencies",
-        "subtitle": "Step 2 / 3 — create venv and install requirements and model files",
-        "disk_note": "This will download ~1.7GB of model files; actual time depends on network and device performance.",
-        "log_start": "Starting venv creation and dependency installation...",
-        "using_python": "Using Python path: {{path}}",
-        "using_python_default": "(not specified, will use default)",
-        "download_models": "Downloading model files...",
-        "download_bge": "Downloading classification model (BGE-small-zh-v1.5)...",
-        "download_minilm": "Preparing text search component…",
-        "deps_complete": "All dependencies installed.",
-        "install_logs": "Install logs",
-        "install_failed": "Installation failed",
-        "deps_failed": "Failed: {{error}}",
-        "retry": "Retry",
-        "running": "Installation in progress",
-        "complete": "Complete"
-      }
-    },
-    "first_run": {
-      "title": "First-time setup required",
-      "description": "The application needs to install essential environment",
-      "install_button": "Install Environment"
-    },
-    "deps_update": {
-      "title": "Updating Dependencies",
-      "subtitle": "Dependency changes detected, syncing automatically...",
-      "syncing": "Syncing dependencies...",
-      "failed": "Dependency update failed: {{error}}",
-      "retry": "Retry"
-    },
     "model_download": {
       "title": "Downloading Model Files",
       "subtitle": "Model files missing, downloading automatically...",
@@ -1520,7 +1439,6 @@
   },
   "aboutSection": {
     "debug": {
-      "trigger_security_alert": "Preview Security Alert Mask",
       "trigger_ocr_model_repair_notification": "Test OCR Model Repair Notification",
       "preview_app_bound_offer": "Preview App Bound Upgrade Prompt",
       "preview_app_bound_repair": "Preview App Bound Repair Prompt"
@@ -1577,16 +1495,6 @@
       "failed": "Repair incomplete",
       "working": "Working…"
     }
-  },
-  "securityAlert": {
-    "title": "Monitor integrity compromised",
-    "debug_title": "Security alert — debug trigger",
-    "default_message": "A required monitor component failed its integrity check. Startup has been blocked to protect your data.",
-    "code_label": "Code",
-    "detail_label": "Detail",
-    "recovery_hint": "If you did not install or update CarbonPaper yourself, please reinstall from a trusted source. A log entry has been written to security.log under your CarbonPaper AppData directory.",
-    "dismiss": "Dismiss",
-    "exit": "Exit application"
   },
   "errorWindow": {
     "title": "Critical Error",

@@ -5,8 +5,6 @@ import { useTauriEventListener } from './useTauriEventListener';
 export function useRequiredModelDownload({
   modelsNeedDownload,
   missingModels,
-  renderVenvInstallStep,
-  depsNeedUpdate,
   onModelsDownloadComplete,
   t,
 }) {
@@ -82,7 +80,6 @@ export function useRequiredModelDownload({
     if (!modelsNeedDownload || !missingModels) return;
     if (modelDownloadStartedRef.current || modelDownloading) return;
     if (modelDownloadError) return;
-    if (renderVenvInstallStep != null || depsNeedUpdate) return;
 
     modelDownloadStartedRef.current = true;
     setModelDownloading(true);
@@ -137,7 +134,7 @@ export function useRequiredModelDownload({
         modelDownloadStartedRef.current = false;
       }
     })();
-  }, [modelsNeedDownload, missingModels, modelDownloading, modelDownloadError, renderVenvInstallStep, depsNeedUpdate, onModelsDownloadComplete, retryNonce, t]);
+  }, [modelsNeedDownload, missingModels, modelDownloading, modelDownloadError, onModelsDownloadComplete, retryNonce, t]);
 
   const retryModelDownload = () => {
     setModelDownloadError(null);

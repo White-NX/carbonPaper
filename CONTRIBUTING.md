@@ -12,7 +12,7 @@ To participate this project, you will need these tools:
 
 1. Any kind of IDE.
 2. Node.js v22.18.0 or later
-3. python v3.12.10 (suggested)
+3. Rust stable toolchain
 
 Running this command before developing
 

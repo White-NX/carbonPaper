@@ -1,7 +1,0 @@
---index-url https://mirrors.aliyun.com/pypi/simple/
-
-Pillow
-pywin32
-
-pytest>=8.0.0
-pytest-timeout>=2.3.1

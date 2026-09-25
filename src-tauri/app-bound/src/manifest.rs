@@ -27,14 +27,12 @@ pub const PRODUCT: &str = "carbonpaper-development";
 #[cfg(not(feature = "development-runtime"))]
 const REQUIRED_FILES: &[&str] = &[
     "carbonpaper.exe",
-    "carbonpaper-python.exe",
     "carbonpaper-key-service.exe",
     "carbonpaper-protected-setup.exe",
     "carbonpaper-semantic-worker.exe",
     "carbonpaper-ml.exe",
     "carbonpaper-office.exe",
     "carbonpaper-nmh.exe",
-    "monitor.pyz",
 ];
 #[cfg(feature = "development-runtime")]
 const REQUIRED_FILES: &[&str] = &[

@@ -47,7 +47,6 @@ mod ml_protocol;
 mod ml_runtime;
 mod model_management;
 mod monitor;
-mod monitor_ipc;
 mod native_messaging;
 mod office_protocol;
 mod office_runtime;
@@ -55,14 +54,12 @@ mod office_window;
 mod pii;
 mod power;
 mod processing_stage;
-mod python;
 pub use app_bound::delegate_startup as delegate_protected_runtime;
 mod registry_config;
 mod rerank;
 mod resource_utils;
 mod reverse_ipc;
 mod reverse_ipc_protocol;
-mod script_integrity;
 #[allow(dead_code)]
 mod semantic_models;
 mod semantic_query;
@@ -178,10 +175,7 @@ pub(crate) fn refresh_tray_menu(app: &tauri::AppHandle) {
 
     let monitor_running = app
         .try_state::<MonitorState>()
-        .map(|state| {
-            let guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
-            guard.is_some()
-        })
+        .map(|state| state.is_running())
         .unwrap_or(false);
 
     let capture_paused = app
@@ -336,8 +330,8 @@ async fn run_delete_queue_maintenance_loop(app_handle: tauri::AppHandle) {
         let mut finalized_screenshots = 0usize;
         if !screenshot_candidates.is_empty() {
             // SQLite triggers remove Rust-owned semantic and CLIP derived rows
-            // in the same transaction as the screenshot lifecycle update. No
-            // Python acknowledgement is needed before physical cleanup.
+            // in the same transaction as the screenshot lifecycle update, so
+            // physical cleanup needs no further acknowledgement.
             let data_dir = storage
                 .data_dir
                 .lock()
@@ -591,19 +585,13 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             MENU_ID_TOGGLE_CAPTURE => {
                 let app_handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<MonitorState>();
+                    let monitor_running = app_handle.state::<MonitorState>().is_running();
                     let cs = app_handle.state::<Arc<CaptureState>>();
-                    let monitor_running = {
-                        let guard = state.process.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.is_some()
-                    };
                     if monitor_running {
                         if cs.paused.load(Ordering::SeqCst) {
-                            let _ =
-                                monitor::resume_monitor_impl(state, cs, app_handle.clone()).await;
+                            let _ = monitor::resume_monitor_impl(cs, app_handle.clone()).await;
                         } else {
-                            let _ =
-                                monitor::pause_monitor_impl(state, cs, app_handle.clone()).await;
+                            let _ = monitor::pause_monitor_impl(cs, app_handle.clone()).await;
                         }
                     } else {
                         refresh_tray_menu(&app_handle);
@@ -1260,7 +1248,6 @@ pub fn run() {
             maintenance::get_maintenance_status,
             monitor::monitor_remove_local_anchors_by_process,
             // 安全告警调试触发（设置 → 高级 → 调试）
-            script_integrity::debug_trigger_security_alert,
             // 存储相关命令
             commands::storage::storage_get_timeline,
             commands::storage::storage_get_timeline_density,
@@ -1290,7 +1277,6 @@ pub fn run() {
             commands::storage::storage_encrypt_for_chromadb,
             commands::storage::storage_decrypt_from_chromadb,
             commands::storage::storage_update_category,
-            commands::storage::storage_get_categories,
             commands::storage::storage_get_categories_from_db,
             commands::storage::storage_batch_get_categories,
             commands::migration::storage_get_startup_vacuum_status,
@@ -1355,12 +1341,6 @@ pub fn run() {
             background_scheduler::background_scheduler_status,
             get_autostart_status,
             set_autostart,
-            python::check_python_status,
-            python::check_python_venv,
-            python::request_install_python,
-            python::install_python_venv,
-            python::check_deps_freshness,
-            python::sync_python_deps,
             model_management::download_model,
             model_management::check_model_files,
             model_management::get_model_inventory,
@@ -1451,10 +1431,6 @@ pub fn run() {
                 }
             }
         });
-}
-
-pub fn run_silent_install() {
-    python::run_silent_install();
 }
 
 #[cfg(test)]

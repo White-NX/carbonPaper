@@ -9,7 +9,6 @@ import {
   getSoftDeleteQueueStatus,
   searchScreenshots,
 } from '../lib/monitor_api';
-import { useDepsSyncOverlay } from './useDepsSyncOverlay';
 import { useRequiredModelDownload } from './useRequiredModelDownload';
 import { useSearchBoxController } from './useSearchBoxController';
 import { useTauriEventListener } from './useTauriEventListener';
@@ -119,34 +118,6 @@ describe('startup and search recovery hooks', () => {
     unmount();
   });
 
-  it('does not auto-retry dependency sync after a failure until retry is requested', async () => {
-    const onDepsSync = vi.fn(async () => {
-      throw new Error('sync failed');
-    });
-
-    const { result } = renderHook(() => useDepsSyncOverlay({
-      depsNeedUpdate: true,
-      pythonVersion: '3.12.10',
-      renderVenvInstallStep: null,
-      depsSyncing: false,
-      onDepsSync,
-    }));
-
-    await waitFor(() => expect(result.current.depsSyncError).toBe('sync failed'));
-    expect(onDepsSync).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(onDepsSync).toHaveBeenCalledTimes(1);
-
-    act(() => {
-      result.current.retryDepsSync();
-    });
-
-    await waitFor(() => expect(onDepsSync).toHaveBeenCalledTimes(2));
-  });
-
   it('retries required model download only when retry is requested after a failure', async () => {
     invoke.mockImplementation(async (command) => {
       if (command === 'get_advanced_config') return {};
@@ -159,8 +130,6 @@ describe('startup and search recovery hooks', () => {
       missingModels: {
         'chinese-clip': { complete: false },
       },
-      renderVenvInstallStep: null,
-      depsNeedUpdate: false,
       onModelsDownloadComplete: vi.fn(),
       t,
     }));

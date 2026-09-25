@@ -72,7 +72,7 @@ try {
         [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($target)) | Out-Null
         [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $false)
     }
-    foreach ($required in @("carbonpaper.exe", "carbonpaper-ml.exe", "carbonpaper-office.exe", "carbonpaper-nmh.exe", "carbonpaper-python.exe", "carbonpaper-semantic-worker.exe", "carbonpaper-key-service.exe", "carbonpaper-protected-setup.exe", "protected-runtime.json", "protected-runtime.sig")) {
+    foreach ($required in @("carbonpaper.exe", "carbonpaper-ml.exe", "carbonpaper-office.exe", "carbonpaper-nmh.exe", "carbonpaper-semantic-worker.exe", "carbonpaper-key-service.exe", "carbonpaper-protected-setup.exe", "protected-runtime.json", "protected-runtime.sig")) {
         if (-not $archive.GetEntry($required)) {
             throw "Portable bundle is missing $required"
         }
@@ -143,7 +143,7 @@ if (-not $sevenZip) {
 }
 
 $listing = @(& $sevenZip.Source l $installer)
-foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-office.exe", "carbonpaper-nmh.exe", "carbonpaper-python.exe", "carbonpaper-semantic-worker.exe", "carbonpaper-key-service.exe", "carbonpaper-protected-setup.exe", "protected-runtime.json", "protected-runtime.sig")) {
+foreach ($required in @("carbonpaper-ml.exe", "carbonpaper-office.exe", "carbonpaper-nmh.exe", "carbonpaper-semantic-worker.exe", "carbonpaper-key-service.exe", "carbonpaper-protected-setup.exe", "protected-runtime.json", "protected-runtime.sig")) {
     $count = @($listing | Where-Object { $_ -match ("\s" + [regex]::Escape($required) + "$") }).Count
     if ($count -ne 1) {
         throw "NSIS installer must contain exactly one $required entry; found $count"

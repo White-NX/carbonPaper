@@ -52,11 +52,7 @@ pub async fn storage_transition_wal_to_delete(
         return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.to_string());
     };
 
-    let was_running = monitor_state
-        .process
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .is_some();
+    let was_running = monitor_state.is_running();
     monitor_state.migration_lock.store(true, Ordering::SeqCst);
     let office_runtime = app_handle
         .state::<Arc<crate::office_runtime::OfficeRuntimeState>>()

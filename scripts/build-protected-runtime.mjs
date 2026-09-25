@@ -8,7 +8,6 @@ const profile = release ? 'release' : 'debug';
 const root = process.cwd();
 const tauri = path.join(root, 'src-tauri');
 const flags = release ? ['--release'] : [];
-execFileSync('cargo', ['build', '--manifest-path', path.join(tauri, 'Cargo.toml'), '--bin', 'carbonpaper-python', ...flags], { stdio: 'inherit' });
 execFileSync('cargo', ['build', '--manifest-path', path.join(tauri, 'app-bound', 'Cargo.toml'), '--bins', ...flags], {
   stdio: 'inherit',
   // The UAC bootstrap starts in an unprotected release folder. Link its CRT

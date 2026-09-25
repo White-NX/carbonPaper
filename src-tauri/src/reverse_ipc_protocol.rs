@@ -1,4 +1,4 @@
-//! Framing and validation for the reverse named-pipe storage protocol.
+//! Framing and validation for the browser native-messaging named pipe.
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,7 +59,7 @@ pub async fn write_ipc_frame(server: &mut NamedPipeServer, body: &[u8]) -> Resul
         .map_err(|e| format!("write_body_error:{}", e))
 }
 
-/// Response sent back to Python after processing a storage command.
+/// Response sent back to the native-messaging host after processing a command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageResponse {
     pub status: String,

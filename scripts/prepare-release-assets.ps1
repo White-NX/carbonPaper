@@ -24,13 +24,6 @@ if ($OcrOnly -and $DevelopmentOnly) {
 $includeReleaseTools = -not $OcrOnly -and -not $DevelopmentOnly
 $includeSemanticRuntime = -not $OcrOnly
 
-$pythonAsset = @{
-    Name = "Python 3.12.10 installer"
-    Url = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
-    Output = "python-3.12.10-amd64.exe"
-    Sha256 = "67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb"
-}
-
 $aria2Asset = @{
     Name = "aria2 1.37.0 Windows x64"
     Url = "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip"
@@ -94,38 +87,6 @@ function Invoke-Download {
     }
 
     Invoke-WebRequest @params
-}
-
-function Ensure-DownloadedFile {
-    param(
-        [Parameter(Mandatory = $true)][hashtable]$Asset
-    )
-
-    $outPath = Join-Path $RootDir $Asset.Output
-    if ((Test-Path -LiteralPath $outPath -PathType Leaf) -and -not $Force) {
-        Assert-Sha256 -Path $outPath -Expected $Asset.Sha256 -Label $Asset.Name
-        return
-    }
-
-    if ($VerifyOnly) {
-        Assert-Sha256 -Path $outPath -Expected $Asset.Sha256 -Label $Asset.Name
-        return
-    }
-
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("carbonpaper-release-assets-" + [guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Path $tmp | Out-Null
-
-    try {
-        $downloadPath = Join-Path $tmp $Asset.Output
-        Invoke-Download -Url $Asset.Url -OutFile $downloadPath
-        Assert-Sha256 -Path $downloadPath -Expected $Asset.Sha256 -Label $Asset.Name
-        Move-Item -LiteralPath $downloadPath -Destination $outPath -Force
-        Assert-Sha256 -Path $outPath -Expected $Asset.Sha256 -Label $Asset.Name
-    } finally {
-        if ((Test-Path -LiteralPath $tmp) -and $tmp.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase)) {
-            Remove-Item -LiteralPath $tmp -Recurse -Force
-        }
-    }
 }
 
 function Ensure-Aria2 {
@@ -424,7 +385,6 @@ function Stage-SemanticRuntimeAssets {
 
 Write-Host "Preparing CarbonPaper assets in $RootDir"
 if ($includeReleaseTools) {
-    Ensure-DownloadedFile -Asset $pythonAsset
     Ensure-Aria2 -Asset $aria2Asset
 }
 $ocrManifestPath = Join-Path $RootDir "scripts\release-assets\ocr-models.json"

@@ -18,7 +18,7 @@ beforeEach(() => {
     return null;
   });
 });
-const options = { pythonVersion: '3.12.10', depsNeedUpdate: false, depsSyncing: false, depsCheckDone: true, modelsNeedDownload: false,
+const options = { modelsCheckDone: true, modelsNeedDownload: false,
   powerSavingSuppressed: false, formatErrorDetails: String, reportBackendError: vi.fn(), resetBackendErrorDedupe: vi.fn(), t: (key) => key };
 
 describe('monitor actions from settings', () => {

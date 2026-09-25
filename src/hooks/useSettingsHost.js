@@ -33,7 +33,7 @@ export function useSettingsHost({ onMonitorAction, onRecordsChanged, onClosed, o
   });
   useTauriEventListener('settings-debug-preview', async ({ payload }) => {
     if (!import.meta.env.DEV) return;
-    const commands = { error: 'trigger_test_error', security: 'debug_trigger_security_alert', ocr: 'debug_trigger_ocr_model_repair_notification' };
+    const commands = { error: 'trigger_test_error', ocr: 'debug_trigger_ocr_model_repair_notification' };
     try {
       if (commands[payload]) await withAuth(() => invoke(commands[payload]), { autoPrompt: true });
       else if (payload === 'update' || payload === 'critical-update') window.dispatchEvent(new CustomEvent('debug-update-modal', { detail: { critical: payload === 'critical-update' } }));
