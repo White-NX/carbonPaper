@@ -30,6 +30,7 @@ mod error_window;
 mod i18n;
 mod idle;
 mod index_progress;
+mod legacy_python_cleanup;
 mod legacy_vector_discard;
 mod logging;
 mod maintenance;
@@ -954,6 +955,7 @@ pub fn run() {
                 }
 
                 logging::spawn_maintenance_task(data_dir.clone());
+                legacy_python_cleanup::spawn_legacy_venv_cleanup();
 
                 tracing::info!(
                     r#"

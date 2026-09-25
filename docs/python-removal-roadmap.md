@@ -129,9 +129,24 @@ resident DirectML semantic worker is stopped when suppression begins.
 
 `build.rs` removes `monitor/`, `monitor.pyz`, the Python installer and the
 launcher from `pre-bundle/` if an older build left them there, because Tauri
-bundles that directory as a whole. The uninstaller still removes an old
-`.venv` when the user chooses to delete application data. An existing `.venv`
-on an upgraded machine is otherwise left in place and never loaded.
+bundles that directory as a whole. An upgrade only overwrites what the new
+bundle carries, so the installer's post-install hook deletes the same four
+names (`monitor/`, `monitor.pyz`, `carbonpaper-python.exe` and the Python
+installer) from the install directory.
+
+The Python environment at `%LOCALAPPDATA%\CarbonPaper\.venv` (several GiB on a
+typical machine) is removed by the application itself
+(`legacy_python_cleanup.rs`). About 90 seconds after startup, a thread in
+Windows background mode checks that `.venv` is a real directory rather than a
+link and that it contains `pyvenv.cfg`. It then renames the directory to
+`.venv.removing` and deletes it. The rename means a downgraded release sees
+either a whole environment or none. A failed pass (for example a leftover
+`python.exe` holding a file) is retried on the next launch, and a leftover
+`.venv.removing` is finished first. The Python interpreter the environment was
+created from is never touched, because other software may use it. The
+uninstaller still removes `.venv` and `.venv.removing` when the user chooses to
+delete application data. The ONNX Runtime lookup no longer falls back to the
+copy inside `.venv`; the pinned runtime ships in `onnxruntime/1.24.2`.
 
 Python must not return as a side effect of a restart, missing model, or
 ordinary Rust error, nor as a new host for any feature.
