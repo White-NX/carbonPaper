@@ -117,6 +117,9 @@ const COMMAND_TIERS = {
   'updater::updater_check': 'public',
   'updater::updater_install': 'session_required',
   'native_messaging::get_nm_host_status': 'public',
+  'native_messaging::detect_installed_browsers': 'public',
+  'onboarding::get_onboarding_state': 'public',
+  'onboarding::complete_onboarding': 'public',
   'native_messaging::register_nm_host_chrome': 'session_required',
   'native_messaging::register_nm_host_edge': 'session_required',
   'native_messaging::install_browser_extension': 'session_required',
@@ -277,6 +280,7 @@ function checkCommandGuardImplementations() {
     'commands::utility::exit_app',
     'commands::utility::hide_to_tray',
     'commands::utility::trigger_test_error',
+    'onboarding::complete_onboarding',
   ];
   const missingWindowGuard = mainWindowCommands
     .filter((command) => !commandFunctionBody(command).includes('check_main_window'));
