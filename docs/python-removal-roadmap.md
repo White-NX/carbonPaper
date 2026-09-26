@@ -19,6 +19,9 @@ symbol names are the durable references; line numbers are intentionally omitted.
   sentinel-triggered vector copies in favour of an explicit, recorded discard.
 - The 2026-09-24 revision moves personal information detection for MCP
   responses to Rust rules and removes Presidio and spaCy.
+- The 2026-09-25 revision removes the Python monitor process, its named pipes,
+  the Python launcher, the `monitor.pyz` package and the Python environment
+  setup. The application no longer starts or installs Python.
 
 ## v0.8.4 Comparison
 
@@ -50,16 +53,16 @@ long capture-pause window. Details and repeatable checks are in
 
 The PaCMAP/HDBSCAN task module has been retired, including its UI, scheduled
 runs, Chroma vector writes and synchronization. The read-only legacy vector
-exports and the two startup Chroma copies are retired as well; Python no longer
-imports or installs Chroma. Personal information detection now runs as Rust
-rules in `pii/`, so Python hosts no product feature. ML worker protocol 4
+exports and the two startup Chroma copies are retired as well. Personal
+information detection now runs as Rust rules in `pii/`. With no product feature
+left in Python, the Python monitor process itself has been removed. ML worker protocol 4
 supplies request-level cancellation and uses the shared semantic worker for
 foreground requests.
 
 The cleanup keeps these four goals:
 
 1. Keep production inference and derived-index ownership in Rust.
-2. Keep Python only where a live product consumer still requires it.
+2. Run no Python at all: no child process, no environment and no installer.
 3. Replace feature rollback switches with truthful status, retry, rebuild, or
    migration controls.
 4. Make the remaining historical data paths read-only and resumable.
@@ -98,17 +101,55 @@ The backend status commands expose model, index, queue, timing, and last-error
 data from these Rust paths. They do not expose a Python backend selector or a
 Python fallback counter.
 
-### Python-owned paths that remain
+### Python monitor removal
 
-No product feature runs in Python. What remains is the monitor lifecycle and
-authenticated named-pipe dispatch in `monitor/monitor/__init__.py` and the
-related IPC modules. Automatic scheduling, authorization admission and retries
-are owned by `background_scheduler.rs`.
+Nothing runs in Python. The capture lifecycle (start, pause, resume, stop) is
+held by `monitor.rs` as in-process state around the Rust capture loop; the
+monitor status command reports that state directly. Automatic scheduling,
+authorization admission and retries are owned by `background_scheduler.rs`.
 
-Python must not regain OCR, Chinese-CLIP inference, semantic retrieval,
-reranking, classification or BGE inference, personal information detection, or
-Smart Cluster queue-write/drain ownership as a side effect of a restart,
-missing model, or ordinary Rust error.
+The removal deleted:
+
+- the `monitor/` Python package, its tests and requirements;
+- the monitor named-pipe client, the Job Object that constrained the child
+  process, and the Python-to-Rust reverse storage pipe (`reverse_ipc.rs` keeps
+  only the browser native-messaging pipe);
+- `carbonpaper-python.exe`, `python_launcher.rs`, `python.rs` (interpreter
+  discovery, venv creation, dependency synchronisation and the elevated
+  `--silent-install-python` entry point);
+- `build_pyz.py`, the `monitor.pyz` archive, `script_integrity.rs` and the
+  security-alert overlay that reported a tampered archive;
+- the bundled Python 3.12.10 installer and its release-asset checks;
+- the first-run environment wizard and dependency-update overlay in the
+  frontend; the required-model download overlay remains.
+
+Game mode no longer restarts anything when DirectML suppression changes. The
+OCR and semantic workers read the suppression flags at each request, and the
+resident DirectML semantic worker is stopped when suppression begins.
+
+`build.rs` removes `monitor/`, `monitor.pyz`, the Python installer and the
+launcher from `pre-bundle/` if an older build left them there, because Tauri
+bundles that directory as a whole. An upgrade only overwrites what the new
+bundle carries, so the installer's post-install hook deletes the same four
+names (`monitor/`, `monitor.pyz`, `carbonpaper-python.exe` and the Python
+installer) from the install directory.
+
+The Python environment at `%LOCALAPPDATA%\CarbonPaper\.venv` (several GiB on a
+typical machine) is removed by the application itself
+(`legacy_python_cleanup.rs`). About 90 seconds after startup, a thread in
+Windows background mode checks that `.venv` is a real directory rather than a
+link and that it contains `pyvenv.cfg`. It then renames the directory to
+`.venv.removing` and deletes it. The rename means a downgraded release sees
+either a whole environment or none. A failed pass (for example a leftover
+`python.exe` holding a file) is retried on the next launch, and a leftover
+`.venv.removing` is finished first. The Python interpreter the environment was
+created from is never touched, because other software may use it. The
+uninstaller still removes `.venv` and `.venv.removing` when the user chooses to
+delete application data. The ONNX Runtime lookup no longer falls back to the
+copy inside `.venv`; the pinned runtime ships in `onnxruntime/1.24.2`.
+
+Python must not return as a side effect of a restart, missing model, or
+ordinary Rust error, nor as a new host for any feature.
 
 ## Data and Migration Contracts
 
@@ -206,8 +247,8 @@ its categories alone; `pii_enabled` governs the rules above. Setting the level
 to 关闭 therefore stops keyword filtering only, and personal information is
 still removed or masked according to `mode` and the selected kinds.
 
-Existing Python environments keep the Presidio and spaCy packages and models
-until the environment is rebuilt; nothing imports them any more.
+Older Python environments may still hold the Presidio and spaCy packages and
+models; the application no longer starts Python, so nothing loads them.
 
 ### Classification anchors and feedback
 
@@ -259,8 +300,7 @@ Remaining controls are operational:
 - run or stop an explicit Rust index pass;
 - rebuild or retry a derived index where the Rust command supports it;
 - repair a missing Rust OCR model; and
-- start/stop the remaining Python monitor service when a live Python consumer
-  requires it.
+- start, pause, resume or stop screenshot capture.
 
 An unavailable Rust model or index returns a visible error/status state. It does
 not silently switch to Python. A foreground query can refuse with a reason such
@@ -280,9 +320,8 @@ The cleanup is ready for a Beta release only when all of the following are true:
    the bundled monitor archive when the build script requires it.
 3. Rust library tests pass with
    `cargo test --manifest-path src-tauri/Cargo.toml --lib`.
-4. The Python suite passes in the CarbonPaper Python 3.12 environment with
-   `python -m pytest monitor/tests -q --timeout=60`, including the pre-bundle
-   synchronization tests.
+4. No Python suite remains after 2026-09-25; the historical records below ran
+   `python -m pytest monitor/tests` in the CarbonPaper Python 3.12 environment.
 5. Frontend tests, i18n validation, and the production build pass:
    `npm run test:frontend`, `npm run i18n:check`, and `npm run build`.
 6. Security and focused backend checks pass:
@@ -361,9 +400,9 @@ A full signed release build and an interactive desktop smoke test were not run.
 
 The following work is intentionally not part of the v0.8.5 Beta cleanup:
 
-- Remove the Python monitor process and its named pipe lifecycle. Its last
-  product consumer, Presidio, was replaced on 2026-09-24, and no Chroma
-  operational dependency remains.
+- None related to Python. The Python monitor process and its named pipe
+  lifecycle were removed on 2026-09-25, after Presidio, its last product
+  consumer, was replaced on 2026-09-24.
 
 No future milestone may reintroduce a hidden fallback merely to make a missing
 model appear available. Recovery must be an explicit repair, rebuild, retry, or
@@ -382,10 +421,10 @@ The current implementation is backed by these source areas:
 | Rerank and Smart Cluster scoring | `src-tauri/src/rerank.rs`, `src-tauri/src/smart_cluster_scoring.rs`, `src-tauri/src/commands/smart_cluster.rs` |
 | Native classification | `src-tauri/src/classification/`, `src-tauri/src/storage/classification.rs`, `src-tauri/src/classification_runtime.rs` |
 | Personal information detection | `src-tauri/src/pii/`, `src-tauri/src/sensitive_filter.rs`, `src-tauri/src/mcp_server.rs` |
-| Python retained service | `monitor/monitor/__init__.py` |
-| Python IPC | `monitor/storage_client.py`, `monitor/tests/test_monitor_worker_contracts.py` |
+| Capture lifecycle | `src-tauri/src/monitor.rs`, `src-tauri/src/capture.rs`, `src/hooks/useMonitorLifecycle.js` |
+| Browser native-messaging pipe | `src-tauri/src/reverse_ipc.rs`, `src-tauri/src/reverse_ipc_protocol.rs` |
 | Frontend status and controls | `src/components/settings/advanced/InferenceCards.jsx`, `src/components/settings/useAdvancedSectionController.js`, `src/lib/monitor_api.js` |
-| Security and contract tests | `scripts/security-guards.cjs`, `monitor/tests/`, `src/lib/api_contracts.test.js`, Rust module tests |
+| Security and contract tests | `scripts/security-guards.cjs`, `src/lib/api_contracts.test.js`, Rust module tests |
 
 ## Maintenance Record
 
@@ -397,3 +436,4 @@ The current implementation is backed by these source areas:
 | 2026-09-19 | Task module retirement | Removed PaCMAP/HDBSCAN, its UI and MCP commands, vector synchronization and dedicated tests; preserved legacy records and read-only vector migration. |
 | 2026-09-20 | Legacy vector discard | Removed the Chroma exporters, both startup copies, the migration overlay states, the `chromadb`/`numpy` requirements and the installer's Chroma ONNX repair; added the startup discard that settles the index sentinels and records the decision. Rust library tests (687 passed, 1 ignored), Python tests (92), frontend tests (50 files, 321 tests), i18n check, security guards and lint passed. A release build and an upgrade smoke against a real `v0.8.3` data directory were not run. |
 | 2026-09-24 | Rust personal information detection | Replaced Presidio/spaCy with the rules in `pii/`, made removing the affected OCR segment the default filter mode with a version 2 configuration upgrade, loaded corpus OCR as blocks so single segments can be dropped, and removed the Presidio worker, spaCy model management, the language-sync command, the MCP idle-unload timer and their settings UI. Rust library tests (717 passed, 1 ignored), Python tests (44), frontend tests (50 files, 321 tests), i18n check, security guards, lint and the frontend production build passed. A release build and an interactive MCP session against a real archive were not run. |
+| 2026-09-25 | Python monitor removal | Removed the Python monitor, its named pipes, reverse storage pipe, Job Object, launcher binary, `monitor.pyz` packaging and integrity check, Python environment setup and installer, the unused `storage_get_categories` command, and the related frontend overlays; the capture lifecycle is now in-process state in `monitor.rs`, and game mode stops restarting on DirectML changes. Rust library tests (697 passed, 1 ignored), frontend tests (50 files, 320 tests), protected-runtime packaging tests (9), i18n check, security guards, lint and `cargo check --all-targets` passed. A release build and an interactive desktop smoke test were not run. |

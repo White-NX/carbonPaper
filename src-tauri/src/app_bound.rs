@@ -105,10 +105,7 @@ pub(crate) fn protected_resource(relative: &str) -> Result<Option<PathBuf>, Stri
 pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
     #[cfg(feature = "app-bound-dev")]
     {
-        if !args
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "--cng-unlock" | "--silent-install-python"))
-        {
+        if !args.iter().any(|arg| arg == "--cng-unlock") {
             match crate::app_bound_dev::initialize() {
                 Ok(()) => {
                     PROTECTED_ENVIRONMENT_READY.store(true, std::sync::atomic::Ordering::Release)
@@ -135,11 +132,7 @@ pub fn delegate_startup(args: &[String]) -> Result<bool, String> {
 
 #[cfg(not(feature = "app-bound-dev"))]
 fn try_delegate_startup(args: &[String]) -> Result<bool, String> {
-    if cfg!(debug_assertions)
-        || args
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "--cng-unlock" | "--silent-install-python"))
-    {
+    if cfg!(debug_assertions) || args.iter().any(|arg| arg == "--cng-unlock") {
         return Ok(false);
     }
     if args.iter().any(|arg| arg == "--repair-protected-runtime") {

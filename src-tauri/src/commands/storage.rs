@@ -7,7 +7,6 @@
 
 use super::check_auth_required;
 use crate::credential_manager::CredentialManagerState;
-use crate::monitor::{self, MonitorState};
 use crate::storage::{self, StorageState};
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1026,23 +1025,6 @@ pub async fn storage_update_category(
         crate::classification::start_feedback(&app);
     }
     Ok(serde_json::json!({"status": "success", "updated": updated}))
-}
-
-/// Returns monitor-defined category metadata.
-///
-/// Authentication: required. Returns the monitor's `get_categories` JSON object.
-/// Frontend: `lib/monitor_api.js`.
-#[tauri::command]
-pub async fn storage_get_categories(
-    credential_state: tauri::State<'_, Arc<CredentialManagerState>>,
-    monitor_state: tauri::State<'_, MonitorState>,
-) -> Result<serde_json::Value, String> {
-    check_auth_required(&credential_state)?;
-
-    let payload = serde_json::json!({
-        "command": "get_categories"
-    });
-    monitor::forward_command_to_python(&monitor_state, payload).await
 }
 
 /// Lists distinct categories currently stored in SQLite.

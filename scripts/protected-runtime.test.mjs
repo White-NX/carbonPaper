@@ -7,7 +7,7 @@ import test from 'node:test';
 import { manifestName, signatureName, signingContext, safeRuntimePath, signProtectedRuntime, verifyProtectedRuntime } from './protected-runtime.mjs';
 import { verifyPrivilegedImports } from './privileged-imports.mjs';
 
-const binaries = ['carbonpaper.exe', 'carbonpaper-ml.exe', 'carbonpaper-office.exe', 'carbonpaper-nmh.exe', 'carbonpaper-python.exe'];
+const binaries = ['carbonpaper.exe', 'carbonpaper-ml.exe', 'carbonpaper-office.exe', 'carbonpaper-nmh.exe'];
 
 function testPe(importedDll = 'kernel32.dll') {
   const bytes = Buffer.alloc(1024);
@@ -42,7 +42,7 @@ async function fixture(t) {
   writeFileSync(path.join(tauri, 'tauri.conf.json'), JSON.stringify({ version: '0.8.5-test.1+build.2' }));
   writeFileSync(path.join(tauri, 'update-public-key.txt'), trustedKey);
   for (const name of binaries) writeFileSync(path.join(release, name), `synthetic test binary: ${name}`);
-  for (const name of ['carbonpaper-semantic-worker.exe', 'carbonpaper-key-service.exe', 'carbonpaper-protected-setup.exe', 'monitor.pyz']) {
+  for (const name of ['carbonpaper-semantic-worker.exe', 'carbonpaper-key-service.exe', 'carbonpaper-protected-setup.exe']) {
     writeFileSync(path.join(prebundle, name), name === 'carbonpaper-key-service.exe' || name === 'carbonpaper-protected-setup.exe'
       ? testPe() : `synthetic resource: ${name}`);
   }
@@ -63,7 +63,7 @@ test('final packaged binaries and nested resources verify with the release key',
   const f = await fixture(t);
   const verified = await verifyProtectedRuntime(f.packaged, f.trustedKey);
   assert.deepEqual(verified, f.manifest);
-  assert.ok(verified.files['carbonpaper-python.exe']);
+  assert.ok(verified.files['carbonpaper-nmh.exe']);
   assert.ok(verified.files['onnxruntime/1.24.2/onnxruntime.dll']);
 });
 
@@ -132,11 +132,11 @@ test('oversized metadata, invalid versions, hashes and missing components are re
     f.resign({ ...f.manifest, version });
     await assert.rejects(verifyProtectedRuntime(f.packaged, f.trustedKey), /Unsupported/);
   }
-  f.resign({ ...f.manifest, files: { ...f.manifest.files, 'monitor.pyz': 'not-a-hash' } });
+  f.resign({ ...f.manifest, files: { ...f.manifest.files, 'carbonpaper-semantic-worker.exe': 'not-a-hash' } });
   await assert.rejects(verifyProtectedRuntime(f.packaged, f.trustedKey), /checksum/);
-  const files = { ...f.manifest.files }; delete files['carbonpaper-python.exe'];
+  const files = { ...f.manifest.files }; delete files['carbonpaper-nmh.exe'];
   f.resign({ ...f.manifest, files });
-  await assert.rejects(verifyProtectedRuntime(f.packaged, f.trustedKey), /missing carbonpaper-python/);
+  await assert.rejects(verifyProtectedRuntime(f.packaged, f.trustedKey), /missing carbonpaper-nmh/);
 });
 
 test('privileged helper imports reject a private CRT and malformed PE headers', async (t) => {

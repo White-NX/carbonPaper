@@ -1,6 +1,6 @@
 //! Safe resource and LocalAppData path discovery for packaged and development builds.
 
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
 /// Convert a Path to a String suitable for use in `Command`.
@@ -55,8 +55,4 @@ pub fn find_existing_file_in_appdata(filename: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-pub fn get_log_path() -> PathBuf {
-    env::temp_dir().join("carbonpaper_install.log")
 }

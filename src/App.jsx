@@ -6,7 +6,6 @@ import { useSettingsHost } from './hooks/useSettingsHost';
 import { useSavedCaptureFilters } from './components/settings/hooks/useSavedCaptureFilters';
 import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
-import SecurityAlertMask from './components/SecurityAlertMask';
 import ExtensionSetupWizard from './components/ExtensionSetupWizard';
 import SmartClusterSetupWizard from './components/SmartClusterSetupWizard';
 import AppBoundUpgradePrompt from './components/AppBoundUpgradePrompt';
@@ -28,7 +27,7 @@ import { useAppNotifications } from './hooks/useAppNotifications';
 import { useAuthSession } from './hooks/useAuthSession';
 import { useCriticalErrors } from './hooks/useCriticalErrors';
 import { useMonitorLifecycle } from './hooks/useMonitorLifecycle';
-import { usePythonEnvironment } from './hooks/usePythonEnvironment';
+import { useRequiredModels } from './hooks/useRequiredModels';
 import { useSelectedSnapshot, normalizeTimestampToMs } from './hooks/useSelectedSnapshot';
 import { useStartupWizards } from './hooks/useStartupWizards';
 import { useUpdateManager } from './hooks/useUpdateManager';
@@ -87,8 +86,6 @@ function App() {
     dismissNotification,
     handleToastClose,
     clearNotifications,
-    securityAlert,
-    setSecurityAlert,
     formatErrorDetails,
     reportBackendError,
     resetBackendErrorDedupe,
@@ -104,16 +101,12 @@ function App() {
   } = useAuthSession();
   const { criticalErrors, criticalErrorLogPath } = useCriticalErrors();
   const {
-    pythonVersion,
-    depsNeedUpdate,
-    depsSyncing,
-    depsCheckDone,
+    modelsCheckDone,
     modelsNeedDownload,
     missingModels,
-    refreshPythonVersion,
-    handleDepsSync,
+    refreshRequiredModels,
     handleModelsDownloadComplete,
-  } = usePythonEnvironment();
+  } = useRequiredModels();
   const {
     autoStartMonitor,
     setAutoStartMonitor,
@@ -121,16 +114,12 @@ function App() {
     handleManualStopMonitor,
     backendStatus,
     monitorPaused,
-    backendError,
     handleStartBackend,
     handlePauseMonitor,
     handleResumeMonitor,
     handleSettingsMonitorAction,
   } = useMonitorLifecycle({
-    pythonVersion,
-    depsNeedUpdate,
-    depsSyncing,
-    depsCheckDone,
+    modelsCheckDone,
     modelsNeedDownload,
     powerSavingSuppressed,
     formatErrorDetails,
@@ -167,7 +156,7 @@ function App() {
   const { showSettings, openSettings } = useSettingsHost({
     onMonitorAction: handleSettingsMonitorAction,
     onRecordsChanged: bumpTimelineRefresh,
-    onClosed: refreshPythonVersion,
+    onClosed: refreshRequiredModels,
     onError: (error) => reportBackendError(t('settings.title'), String(error)),
   });
   useSavedCaptureFilters({ monitorStatus: backendStatus === 'online' ? 'running' : backendStatus, enabled: isAuthenticated });
@@ -266,29 +255,16 @@ function App() {
 
       <div className={`flex-1 min-h-0 flex flex-col overflow-hidden relative ${isMaximized ? '' : 'mx-[3px] mb-[3px] rounded-md'}`}>
         <Mask
-          backendStatus={backendStatus}
-          pythonVersion={pythonVersion}
-          backendError={backendError}
-          handleStartBackend={handleStartBackend}
-          onRefreshPythonVersion={refreshPythonVersion}
-          depsNeedUpdate={depsNeedUpdate}
-          depsSyncing={depsSyncing}
-          onDepsSync={handleDepsSync}
           modelsNeedDownload={modelsNeedDownload}
           missingModels={missingModels}
           onModelsDownloadComplete={handleModelsDownloadComplete}
         />
 
         <AuthMask
-          isVisible={pythonVersion && !isAuthenticated}
+          isVisible={!isAuthenticated}
           onAuthSuccess={handleAuthSuccess}
           authError={authError}
           setAuthError={setAuthError}
-        />
-
-        <SecurityAlertMask
-          alert={securityAlert}
-          onDismiss={() => setSecurityAlert(null)}
         />
 
         <ErrorWindow

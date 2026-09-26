@@ -6,9 +6,9 @@ import { verifyPrivilegedImports } from './privileged-imports.mjs';
 export const manifestName = 'protected-runtime.json';
 export const signatureName = 'protected-runtime.sig';
 export const signingContext = Buffer.from('CarbonPaper protected runtime v1\n');
-const required = ['carbonpaper.exe', 'carbonpaper-python.exe', 'carbonpaper-key-service.exe',
+const required = ['carbonpaper.exe', 'carbonpaper-key-service.exe',
   'carbonpaper-protected-setup.exe', 'carbonpaper-semantic-worker.exe', 'carbonpaper-ml.exe',
-  'carbonpaper-office.exe', 'carbonpaper-nmh.exe', 'monitor.pyz'];
+  'carbonpaper-office.exe', 'carbonpaper-nmh.exe'];
 const maxFileBytes = 2 * 1024 ** 3;
 const releaseVersion = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/;
 
@@ -105,7 +105,7 @@ export async function signProtectedRuntime(root, signingKeyBase64) {
   if (actualKey !== trustedKey) throw new Error('Signing key does not match the application release public key');
   const config = JSON.parse(readFileSync(path.join(tauri, 'tauri.conf.json'), 'utf8'));
   const entries = new Map(walk(path.join(tauri, 'pre-bundle')));
-  for (const name of ['carbonpaper.exe', 'carbonpaper-ml.exe', 'carbonpaper-office.exe', 'carbonpaper-nmh.exe', 'carbonpaper-python.exe']) {
+  for (const name of ['carbonpaper.exe', 'carbonpaper-ml.exe', 'carbonpaper-office.exe', 'carbonpaper-nmh.exe']) {
     if (entries.has(name)) throw new Error(`Duplicate bundled executable: ${name}`);
     entries.set(name, path.join(tauri, 'target', 'release', name));
   }

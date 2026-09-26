@@ -1680,17 +1680,6 @@ fn resolve_ort_dylib(app: &AppHandle, executable: &std::path::Path) -> Result<Pa
                 .join("1.24.2")
                 .join("onnxruntime.dll"),
         );
-        // One-release development/legacy fallback. Production packaging installs the
-        // pinned runtime independently of Python before semantic cutover.
-        candidates.push(
-            appdata
-                .join(".venv")
-                .join("Lib")
-                .join("site-packages")
-                .join("onnxruntime")
-                .join("capi")
-                .join("onnxruntime.dll"),
-        );
     }
     candidates
         .into_iter()

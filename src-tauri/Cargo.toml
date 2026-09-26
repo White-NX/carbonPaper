@@ -30,14 +30,9 @@ path = "src/bin/ml.rs"
 name = "carbonpaper-office"
 path = "src/bin/office.rs"
 
-[[bin]]
-name = "carbonpaper-python"
-path = "src/bin/python.rs"
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 walkdir = "2.5.0"
-sha2 = "0.10"
 base64 = "0.22"
 
 [dependencies]

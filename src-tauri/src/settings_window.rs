@@ -326,7 +326,6 @@ pub fn settings_debug_preview(
         || !matches!(
             preview.as_str(),
             "error"
-                | "security"
                 | "ocr"
                 | "update"
                 | "critical-update"

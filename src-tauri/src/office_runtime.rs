@@ -35,7 +35,7 @@ const FAILURE_CACHE_MAX_TTL: Duration = Duration::from_secs(60);
 const MAX_CACHE_ENTRIES: usize = 64;
 const MAX_PENDING_SCREENSHOTS: usize = 64;
 /// Polling step while draining, matching the in-flight OCR wait in
-/// `monitor.rs::stop_monitor_impl`.
+/// `monitor.rs::drain_capture_session`.
 const QUIESCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

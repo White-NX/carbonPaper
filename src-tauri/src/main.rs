@@ -14,10 +14,6 @@ fn main() {
             return;
         }
     }
-    if args.len() > 1 && args[1] == "--silent-install-python" {
-        carbonpaper_lib::run_silent_install();
-        return;
-    }
     if args.len() > 2 && args[1] == "--cng-unlock" {
         let owner_hwnd = args.get(3).and_then(|value| value.parse::<isize>().ok());
         carbonpaper_lib::run_cng_unlock(&args[2], owner_hwnd);

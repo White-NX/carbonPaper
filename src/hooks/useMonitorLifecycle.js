@@ -3,11 +3,14 @@ import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../lib/auth_api';
 import { useTauriEventListener } from './useTauriEventListener';
 
+// An unexpected stop is a capture loop that ended without being asked to. The
+// auto-start effect restarts it, and a failure that recurs on every start would
+// otherwise be restarted indefinitely.
+const MAX_UNEXPECTED_STOPS = 3;
+const UNEXPECTED_STOP_WINDOW_MS = 10 * 60 * 1000;
+
 export function useMonitorLifecycle({
-  pythonVersion,
-  depsNeedUpdate,
-  depsSyncing,
-  depsCheckDone,
+  modelsCheckDone,
   modelsNeedDownload,
   powerSavingSuppressed,
   formatErrorDetails,
@@ -29,6 +32,7 @@ export function useMonitorLifecycle({
   const [backendError, setBackendError] = useState('');
   const backendStatusRef = useRef('unknown');
   const backendStartAtRef = useRef(null);
+  const unexpectedStopsRef = useRef([]);
 
   useEffect(() => {
     backendStatusRef.current = backendStatus;
@@ -210,42 +214,31 @@ export function useMonitorLifecycle({
     return () => clearInterval(interval);
   }, [checkBackendStatus]);
 
-  useTauriEventListener('monitor-exited', (event) => {
-    const payload = event?.payload || {};
-    const code = payload.code || 'unknown';
-    const errMsg = payload.error ? `; ${payload.error}` : '';
-    const recovery = payload.recovery || {};
-    const recoveryMsg = recovery.policy === 'manual_restart'
-      ? t('settings.general.monitor.errors.manualRestartRecovery')
-      : '';
-    const message = t('settings.general.monitor.errors.exitedMessage', {
-      code,
-      error: errMsg,
-      recovery: recoveryMsg,
-    });
-    const details = formatErrorDetails(payload);
-    setBackendStatus('offline');
-    backendStatusRef.current = 'offline';
-    setBackendError(message);
-    reportBackendError(t('settings.general.monitor.errors.exitedTitle'), message, details);
-  }, [formatErrorDetails, reportBackendError, t]);
-
-  useTauriEventListener('monitor-stopped', () => {
+  useTauriEventListener('monitor-stopped', (event) => {
     setBackendStatus('offline');
     backendStatusRef.current = 'offline';
     setMonitorPaused(false);
     setBackendError('');
     resetBackendErrorDedupe();
     backendStartAtRef.current = null;
+    if (event?.payload?.intentional !== false) return;
+    const now = Date.now();
+    const recent = unexpectedStopsRef.current.filter((at) => now - at < UNEXPECTED_STOP_WINDOW_MS);
+    recent.push(now);
+    unexpectedStopsRef.current = recent;
+    if (recent.length >= MAX_UNEXPECTED_STOPS) {
+      // Leave it stopped until someone starts it again.
+      autoStartSuppressedRef.current = true;
+      setAutoStartSuppressed(true);
+      console.warn(`Capture stopped unexpectedly ${recent.length} times within ${UNEXPECTED_STOP_WINDOW_MS / 60000} minutes; not restarting it automatically`);
+    }
   }, [resetBackendErrorDedupe]);
 
   useEffect(() => {
     if (!autoStartMonitor) return;
     if (autoStartSuppressed || autoStartSuppressedRef.current || runtimeActionRef.current) return;
     if (powerSavingSuppressed) return;
-    if (!pythonVersion) return;
-    if (!depsCheckDone) return;
-    if (depsNeedUpdate || depsSyncing) return;
+    if (!modelsCheckDone) return;
     if (modelsNeedDownload) return;
     if (backendStatus === 'offline' && backendStatusRef.current !== 'waiting') {
       handleStartBackend();
@@ -254,13 +247,10 @@ export function useMonitorLifecycle({
     autoStartMonitor,
     autoStartSuppressed,
     backendStatus,
-    depsCheckDone,
-    depsNeedUpdate,
-    depsSyncing,
     handleStartBackend,
+    modelsCheckDone,
     modelsNeedDownload,
     powerSavingSuppressed,
-    pythonVersion,
   ]);
 
   return {

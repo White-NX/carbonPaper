@@ -19,7 +19,6 @@ claim validation of a subsequently published release.
 | `carbonpaper-key-service.exe` | LocalSystem service, caller verification, task keys and grant lifecycle | [service.rs](../src-tauri/app-bound/src/windows/service.rs), [ledger.rs](../src-tauri/app-bound/src/ledger.rs) |
 | `carbonpaper-protected-setup.exe` | UAC installation, repair, registration and service removal | [install.rs](../src-tauri/app-bound/src/windows/install.rs) |
 | Native classification | Anchor scoring, learning and scoped result completion | [classification/mod.rs](../src-tauri/src/classification/mod.rs), [storage/classification.rs](../src-tauri/src/storage/classification.rs) |
-| `carbonpaper-python.exe` | Separate, unprivileged host for the Python monitor service, which no longer runs a product feature | [python.rs](../src-tauri/src/bin/python.rs), [monitor entry point](../monitor/monitor/__init__.py) |
 | Native model worker | MiniLM, CLIP and BGE inference with the existing scheduler | [semantic_runtime.rs](../src-tauri/src/semantic_runtime.rs), [classification_runtime.rs](../src-tauri/src/classification_runtime.rs) |
 | Archive storage | Source revisions, deletion outbox and transactional completion receipts | [storage/processing_stage.rs](../src-tauri/src/storage/processing_stage.rs), [derived_index.rs](../src-tauri/src/storage/derived_index.rs) |
 
@@ -87,14 +86,10 @@ The installer verifies both source hashes and the bytes actually copied. The
 privileged helpers link the CRT statically, and packaging checks their normal and
 delayed PE imports against system DLLs. Protected desktop startup removes DLL
 and WebView overrides, restricts the search path, and prevents native-worker
-fallbacks into developer folders or the Python environment.
+fallbacks into developer folders.
 
-The Python interpreter and `.venv` dependencies are deliberately outside the
-protected runtime. Their modification and a compromised Python process can
-expose inputs legitimately delivered to Python. The separate Python executable
-cannot acquire service keys as the desktop image. Python receives no staged
-classification input and exposes no category or staged-result callback command.
-Native completion compares scope against the immutable receipt kept in the
+The application no longer starts a Python process; an existing `.venv` left by
+an older version is not loaded. Native completion compares scope against the immutable receipt kept in the
 desktop process. It also preserves a newer user category correction.
 
 This feature does not prevent full compromise of an approved process, recover
@@ -174,8 +169,7 @@ directory retires the previous dataset first. See
 Installed and portable packages use the same fixed protected copy. After
 activation, the original package delegates startup to that copy. Existing
 autostart and Chrome/Edge native messaging registrations are refreshed to point
-to the approved runtime. Python installation and user data stay at their existing
-locations.
+to the approved runtime. User data stays at its existing location.
 
 An eligible unlocked UI offers activation once, with a Later action. Activation,
 repair and removal invoke the elevated setup helper; UAC cancellation preserves
@@ -212,8 +206,8 @@ and [app_bound.rs](../src-tauri/src/app_bound.rs):
 
 None of these commands returns task keys or staged plaintext. Native
 classification completes or releases its scoped receipt directly; the former
-Python completion and deferral commands are retired. Remaining Python IPC
-retains authentication and sequence checks. The service's public request enum
+Python completion and deferral commands are retired together with the Python
+monitor. The service's public request enum
 exposes no arbitrary path, caller SID, private-key or unwrap request.
 
 ## Fast Windows preflight
@@ -225,7 +219,7 @@ npm run test:app-bound:fast
 ```
 
 This compiles only the small `src-tauri/app-bound` crate in its test profile. It
-does not build Tauri, prepare models, install Python, build native workers or
+does not build Tauri, prepare models, build native workers or
 package the application, and it does not need the release signing key or frontend
 dependencies. Cargo reuses the native crate's normal dependency cache; the first
 run on a new machine takes longer than an incremental check.
@@ -439,11 +433,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 npm run test:frontend
 npm run build
 npm run test:security
-& "$env:LOCALAPPDATA\carbonpaper\.venv\Scripts\python.exe" -m pytest monitor/tests -q --timeout=15
 ```
-
-The spaCy integration fixture that used to exceed the fifteen-second test limit
-during a cold model load was removed with Presidio on 2026-09-24.
 
 Debug builds do not contact the production broker. The normal debug command
 uses the development service and build-time trust identity; unit tests inject an
@@ -451,8 +441,7 @@ in-process broker with temporary storage. Neither adds a developer-path or
 environment-key override to production authorization. Signature tests generate
 ephemeral keys inside their fixtures and do not replace the release public key.
 
-The release pipeline builds both helpers and the separate Python launcher before
-Tauri bundling. `beforeBundleCommand` signs the final binary/resource manifest;
+The release pipeline builds both helpers before Tauri bundling. `beforeBundleCommand` signs the final binary/resource manifest;
 the portable packer signs its final files as well. Signing requires the existing
 base64 PEM `CARBONPAPER_UPDATE_SIGNING_KEY` and checks that its public key matches
 the application. Missing or mismatched keys fail packaging.
@@ -481,7 +470,7 @@ installation.
 
 1. Activate from both installed and movable portable packages. Verify the
    original package delegates, autostart/native messaging paths remain usable,
-   and the desktop and Python processes keep distinct executable identities.
+   and the desktop and worker processes keep distinct executable identities.
 2. Cancel activation, repair, removal and an update at UAC. Confirm the current
    app/monitor keeps running and the existing policy remains unchanged.
 3. Capture identifiable test inputs, exit before all consumers finish, reboot,
@@ -492,7 +481,7 @@ installation.
    an older allowed package for one account does not replace a newer global
    service. Confirm the standard-user client can query the service identity but
    cannot read process memory or duplicate its token.
-5. Attempt requests from Python, a copied desktop executable in a writable
+5. Attempt requests from a worker process, a copied desktop executable in a writable
    folder, an obsolete protected runtime, and a forged local pipe server.
    Confirm no task keys are delivered. Test remote pipe access rejection.
 6. Interrupt prepare/activate, inference, result commit and completion replies.

@@ -36,6 +36,16 @@ pub fn get_log_dir() -> String {
     data_dir.join("logs").to_string_lossy().to_string()
 }
 
+/// Returns the critical errors retained since startup, oldest first, as
+/// `{ id, message }` objects.
+///
+/// Authentication: not required. Frontend: `hooks/useCriticalErrors.js`, which
+/// reads it when a main window is created after an error was reported.
+#[tauri::command]
+pub fn get_critical_errors() -> Vec<crate::error_window::CriticalError> {
+    crate::error_window::critical_errors()
+}
+
 /// Restarts the application process.
 ///
 /// Authentication: main-window origin required. Returns only on failure.
@@ -253,18 +263,7 @@ pub async fn toggle_game_mode(
     if enabled {
         monitor::start_game_mode_monitor(app);
     } else {
-        let state = app.state::<MonitorState>();
-        let was_suppressed = state.game_mode_dml_suppressed.load(Ordering::SeqCst);
         monitor::stop_game_mode_monitor(&app);
-        if was_suppressed {
-            let _ = monitor::stop_monitor_impl(
-                app.state::<MonitorState>(),
-                app.state::<Arc<CaptureState>>(),
-                app.clone(),
-            )
-            .await;
-            let _ = monitor::start_monitor_impl(app.state::<MonitorState>(), app.clone()).await;
-        }
     }
     Ok(())
 }

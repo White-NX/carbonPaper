@@ -695,12 +695,6 @@ fn resolve_model_directory(app: &AppHandle) -> Result<ResolvedOcrModel, String> 
     ))
 }
 
-pub fn resolve_ocr_model_path(app: &AppHandle) -> Result<PathBuf, String> {
-    resolve_model_directory(app)
-        .map(|resolved| resolved.path)
-        .inspect_err(|_| invalidate_model_status_cache())
-}
-
 pub fn ocr_model_status(app: &AppHandle) -> Result<RustOcrModelStatus, String> {
     let cache = MODEL_STATUS_CACHE.get_or_init(|| Mutex::new(None));
     if let Some(cached) = cache
@@ -1283,11 +1277,6 @@ async fn run_postprocess_tasks<M, MF, D, DF>(
     );
 }
 
-/// Whether an enqueue error means the Python monitor never accepted the
-/// request (monitor stopped, pipe unreachable, transport read/write failure
-/// or timeout). Matches the error strings emitted by `monitor.rs` /
-/// `monitor_ipc.rs` before a response is parsed; anything else is treated as
-/// a real processing failure so a poisoned row still exhausts its budget.
 async fn drain_pending_postprocess(app: &AppHandle) -> Result<(), String> {
     let storage = app
         .state::<Arc<crate::storage::StorageState>>()

@@ -71,7 +71,7 @@ jobs:
       - name: Build Rust semantic worker
         run: npm run build:semantic-ml:release
 
-      - name: Build app-bound service and Python launcher
+      - name: Build app-bound service
         run: npm run build:protected:release
 
       - name: Smoke test bundled Rust OCR runtime

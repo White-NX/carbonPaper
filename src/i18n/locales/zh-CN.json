@@ -46,7 +46,7 @@
       },
       "powerSaving": {
         "label": "节能模式",
-        "description": "使用电池供电时自动暂停 Python 子服务，插入电源后自动恢复运行。"
+        "description": "使用电池供电时自动暂停捕获记录服务，插入电源后自动恢复运行。"
       },
       "gameMode": {
         "label": "游戏模式",
@@ -140,22 +140,22 @@
         "clustersLabel": "智能聚类卡片"
       },
       "monitor": {
-        "title": "Python 子服务",
-        "tooltip": "用于任务整理和隐私检测。",
+        "title": "捕获记录服务",
+        "tooltip": "用于屏幕捕获、记录归档与隐私检测。",
         "status": "状态：{{status}}",
         "status_label": "状态：",
-        "description": "控制后台的 Python 子服务。",
+        "description": "控制后台的捕获记录服务。",
         "starting": "正在启动...",
         "start": "启动服务",
         "resume": "继续",
         "pause": "暂停",
         "stop": "停止",
         "restart": "重启",
-        "power_saving_blocked": "节电模式已激活，无法启动子服务。请接入电源后重试。",
+        "power_saving_blocked": "节电模式已激活，无法启动捕获记录服务。请接入电源后重试。",
         "autoStart": {
-          "label": "启动时自动子服务",
-          "description": "开启后应用启动时会自动尝试拉起 Python 子服务。",
-          "tooltip": "应用启动后自动运行 Python 子服务。"
+          "label": "启动时自动运行",
+          "description": "开启后应用启动时会自动尝试拉起捕获记录服务。",
+          "tooltip": "应用启动后自动运行捕获记录服务。"
         },
         "autoLaunch": {
           "label": "开机自启动",
@@ -167,13 +167,10 @@
           "disable": "关闭开机自启"
         },
         "errors": {
-          "startFailedTitle": "Python 子服务启动失败",
-          "unavailableTitle": "Python 子服务不可用",
-          "exitedTitle": "Python 子服务异常退出",
+          "startFailedTitle": "捕获记录服务启动失败",
+          "unavailableTitle": "捕获记录服务不可用",
           "startFailedFallback": "启动后端服务失败",
-          "offlineFallback": "后端服务离线",
-          "manualRestartRecovery": "；恢复策略：手动重启，旧 IPC 状态已清理",
-          "exitedMessage": "子服务已退出（code: {{code}}{{error}}）{{recovery}}"
+          "offlineFallback": "后端服务离线"
         }
       }
     },
@@ -1006,7 +1003,6 @@
       "preview": "预览",
       "previews": {
         "error": "错误窗口",
-        "security": "安全警报",
         "ocr": "识别组件修复提醒",
         "update": "更新提示",
         "critical-update": "重要更新提示",
@@ -1428,83 +1424,6 @@
     ]
   },
   "mask": {
-    "debug": {
-      "label": "调试",
-      "none": "(无)",
-      "online": "在线（隐藏遮罩）",
-      "offline": "后端：离线",
-      "waiting": "后端：等待中",
-      "venv1": "Venv：步骤 1",
-      "venv2": "Venv：步骤 2",
-      "venv3": "Venv：步骤 3",
-      "nopython": "首次运行（无 Python）"
-    },
-    "backend_shutdown": {
-      "title": "后台 Python 服务已停止",
-      "description": "请启用后台服务以继续使用应用。"
-    },
-    "start": {
-      "starting": "正在启动...",
-      "start_service": "启动 OCR 服务",
-      "waiting": "正在等待 IPC 启动..."
-    },
-    "venv": {
-      "step1": {
-        "title": "安装 Python v{{version}}",
-        "subtitle": "当前步骤：1 / 3 — 选择或安装系统 Python"
-      },
-      "pythonPath": {
-        "label": "Python 可执行文件路径",
-        "placeholder": "例如: C:\\Python310\\python.exe 或者粘贴自定义路径"
-      },
-      "choose": "选择",
-      "auto_install": {
-        "log_start": "正在自动安装 Python...",
-        "success": "安装成功。",
-        "finished": "自动安装流程已结束。",
-        "installing": "安装中...",
-        "button": "自动安装 Python"
-      },
-      "discovered_label": "自动发现的 Python 版本（你可以在此选择一个）",
-      "unsupported": "不受支持",
-      "not_found": "未发现 Python",
-      "note": "不知道什么是 Python？别担心，我们可以帮你自动安装。安装完成后程序将关闭，需要手动重启。",
-      "installing": "安装中...",
-      "auto_install_button": "自动安装 Python",
-      "install_logs": "安装日志",
-      "install_failed": "安装失败：{{error}}",
-      "next": "下一步",
-      "step2": {
-        "title": "安装必要依赖",
-        "subtitle": "当前步骤：2 / 3 — 创建 venv 并自动安装 requirements 以及模型文件",
-        "disk_note": "安装会自动进行，占用大约 1.7GB 硬盘空间，耗时视网络和设备性能而定。",
-        "log_start": "开始执行安装：创建 venv 并安装必要依赖...",
-        "using_python": "使用 Python 路径: {{path}}",
-        "using_python_default": "(未指定，将使用默认路径)",
-        "download_models": "开始下载模型文件...",
-        "download_bge": "开始下载分类模型 (BGE-small-zh-v1.5)...",
-        "download_minilm": "正在准备文本检索组件…",
-        "deps_complete": "所有依赖安装完成。",
-        "install_logs": "安装日志",
-        "install_failed": "安装失败",
-        "deps_failed": "失败：{{error}}",
-        "retry": "重试",
-        "running": "安装正在进行中",
-        "complete": "完成"
-      }
-    },
-    "first_run": {
-      "title": "需要首次设置",
-      "description": "应用需要安装必要的运行环境",
-      "install_button": "安装环境"
-    },
-    "deps_update": {
-      "title": "正在更新依赖",
-      "subtitle": "检测到依赖版本变更，正在自动同步更新...",
-      "syncing": "正在同步依赖...",
-      "failed": "依赖更新失败：{{error}}",
-      "retry": "重试"
-    },
     "model_download": {
       "title": "正在下载模型文件",
       "subtitle": "检测到模型文件缺失，正在自动下载...",
@@ -1520,7 +1439,6 @@
   },
   "aboutSection": {
     "debug": {
-      "trigger_security_alert": "预览安全告警蒙层",
       "trigger_ocr_model_repair_notification": "测试 OCR 模型修复通知",
       "preview_app_bound_offer": "预览后台整理升级弹窗",
       "preview_app_bound_repair": "预览后台整理修复弹窗"
@@ -1577,16 +1495,6 @@
       "failed": "修复未完成",
       "working": "正在处理…"
     }
-  },
-  "securityAlert": {
-    "title": "监控完整性已被破坏",
-    "debug_title": "安全告警 — 调试触发",
-    "default_message": "所需的监控组件未通过完整性检查。为保护你的数据，启动已被阻止。",
-    "code_label": "错误代码",
-    "detail_label": "详细信息",
-    "recovery_hint": "如果你没有亲自安装或更新 CarbonPaper，请从可信来源重新安装。已在 CarbonPaper AppData 目录下的 security.log 写入日志条目。",
-    "dismiss": "关闭",
-    "exit": "退出应用程序"
   },
   "errorWindow": {
     "title": "程序出现关键错误",
