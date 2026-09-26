@@ -1,13 +1,16 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Download, RotateCcw } from 'lucide-react';
-import { useRequiredModelDownload } from '../hooks/useRequiredModelDownload';
-import { downloadSizeMb, missingRequiredModels } from '../lib/modelSizes';
 import { LogDisclosure, OverlayShell, ProgressBlock, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
 
-export default function Mask({ modelsNeedDownload, missingModels, onModelsDownloadComplete }) {
+/**
+ * The standalone required-model download card. The download itself runs in
+ * `useRequiredModelDownload`, which App owns so the first-run wizard can show
+ * the same progress.
+ */
+export default function Mask({ modelsNeedDownload, sizeMb, download }) {
   const { t } = useTranslation();
   const {
     modelDownloadLog,
@@ -16,14 +19,7 @@ export default function Mask({ modelsNeedDownload, missingModels, onModelsDownlo
     isClosedByUser,
     setIsClosedByUser,
     retryModelDownload,
-  } = useRequiredModelDownload({
-    modelsNeedDownload,
-    missingModels,
-    onModelsDownloadComplete,
-    t,
-  });
-
-  const sizeMb = downloadSizeMb(missingRequiredModels(missingModels));
+  } = download;
   const visible = useOverlaySlot('modelDownload', modelsNeedDownload && !isClosedByUser);
 
   return (

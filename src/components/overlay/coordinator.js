@@ -18,8 +18,6 @@ export const OVERLAY_PRIORITY = [
   'vacuum',
   'auth',
   'onboarding',
-  'extensionSetup',
-  'smartClusterSetup',
   'update',
   'modelDownload',
   'hmac',

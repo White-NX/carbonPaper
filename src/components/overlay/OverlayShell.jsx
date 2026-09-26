@@ -42,7 +42,8 @@ export function OverlayHeader({ id, icon: Icon, tone = 'accent', title, subtitle
  * It covers its positioned parent, not the window, so it is meant to be
  * rendered inside the main content area. `layer` picks the stacking band from
  * `OVERLAY_LAYERS`. Without `onDismiss` the overlay cannot be closed with
- * Escape; that is how blocking overlays are expressed.
+ * Escape; that is how blocking overlays are expressed. `topSlot` renders above
+ * the header, for a step indicator.
  */
 export function OverlayShell({
   open = true,
@@ -55,6 +56,7 @@ export function OverlayShell({
   subtitle,
   headerAside,
   centeredHeader = false,
+  topSlot,
   footer,
   footerStart,
   ariaLabel,
@@ -78,6 +80,7 @@ export function OverlayShell({
         className={cn('overlay-pop-in flex max-h-full w-full flex-col rounded-xl border border-ide-border bg-ide-panel p-6 shadow-2xl focus:outline-none',
           SIZES[size] ?? SIZES.md, className)}
       >
+        {topSlot && <div className="mb-5 shrink-0">{topSlot}</div>}
         {title && (
           <div className="mb-4 shrink-0">
             <OverlayHeader id={titleId} icon={icon} tone={tone} title={title} subtitle={subtitle} aside={headerAside} centered={centeredHeader} />

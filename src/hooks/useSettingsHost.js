@@ -9,8 +9,8 @@ import { showDebugOverlay } from '../components/overlay/coordinator';
 const OVERLAY_PREVIEWS = {
   update: ['update'],
   'critical-update': ['update', 'critical'],
-  extension: ['extensionSetup'],
-  'smart-cluster': ['smartClusterSetup'],
+  onboarding: ['onboarding'],
+  'whats-new': ['onboarding', 'whats_new'],
   'app-bound': ['appBound'],
   'app-bound-repair': ['appBound', 'repair'],
 };

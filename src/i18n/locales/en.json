@@ -1006,8 +1006,8 @@
         "ocr": "Recognition repair notice",
         "update": "Update prompt",
         "critical-update": "Critical update prompt",
-        "extension": "Extension setup",
-        "smart-cluster": "Smart filing setup",
+        "onboarding": "First-run wizard",
+        "whats-new": "What’s new page",
         "app-bound": "Background component setup",
         "app-bound-repair": "Background component repair"
       }
@@ -1235,44 +1235,11 @@
     "expand": "Expand Sidebar",
     "collapse": "Collapse Sidebar"
   },
-  "extensionSetup": {
-    "title": "Browser Extension",
-    "subtitle": "Capture browser screenshots with rich metadata",
-    "description": "The CarbonPaper browser extension captures viewport screenshots along with page metadata such as URL, title, and visible links. Select the browsers you use to install the extension.",
-    "select_browser": "Select browsers to install",
-    "chrome": "Google Chrome / other Chromium browsers",
-    "edge": "Microsoft Edge",
-    "installing": "Installing...",
-    "apply": "Install Extension",
-    "skip": "Skip",
-    "done": "Done",
-    "success_message": "Extension installed successfully. Enable Developer mode in your browser and load the unpacked extension from the path below.",
-    "connected": "Connected browsers:",
-    "error_message": "Installation failed"
-  },
   "clusterCard": {
     "actionResume": "Resume",
     "actionPause": "Pause",
     "actionRename": "Rename",
     "actionDelete": "Delete"
-  },
-  "smartClusterSetup": {
-    "title": "Smart Clusters",
-    "subtitle": "Auto-archive snapshots by natural language description",
-    "description": "Smart Clusters automatically group related screenshots into buckets based on your natural-language descriptions. Powered by bge-reranker-v2-m3, delivering far better accuracy than pure vector search.",
-    "modelInfo": "A bge-reranker-v2-m3 model (~570MB, uint8 quantized) must be downloaded. This model is only used when the system is idle.",
-    "modelSource": "Model source: onnx-community/bge-reranker-v2-m3-ONNX",
-    "infoNote": "You can also download and enable this feature later from Settings → Feature Management.",
-    "download": "Download & Enable",
-    "downloading": "Downloading model…",
-    "downloading_short": "Downloading…",
-    "downloadComplete": "Download complete!",
-    "later": "Later",
-    "dismiss": "Don't show again",
-    "dismissTooltip": "Permanently dismiss this prompt. Can be enabled later in settings.",
-    "retry": "Retry Download",
-    "success": "Smart Clusters are ready",
-    "openFeature": "Open Smart Clusters"
   },
   "smartClusters": {
     "title": "Smart Clusters",
@@ -1579,5 +1546,195 @@
   },
   "overlay": {
     "showDetails": "Show details"
+  },
+  "onboarding": {
+    "stepsLabel": "Setup steps",
+    "recommendedBadge": "Recommended",
+    "steps": {
+      "welcome": "Welcome",
+      "features": "Features",
+      "browserStartup": "Browser & startup",
+      "review": "Review"
+    },
+    "headers": {
+      "welcome": {
+        "title": "Welcome to CarbonPaper",
+        "subtitle": "Setup takes about a minute. You can change everything later in Settings."
+      },
+      "features": {
+        "title": "Features and performance",
+        "subtitle": "Pick the features you want and how CarbonPaper shares your computer with other programs."
+      },
+      "browserStartup": {
+        "title": "Browser and startup",
+        "subtitle": "Connect the browsers you use and decide when CarbonPaper starts working."
+      },
+      "review": {
+        "title": "Review your settings",
+        "subtitle": "Check your choices. They take effect when you click Finish."
+      },
+      "applying": {
+        "title": "Applying settings",
+        "subtitle": "This usually takes a few seconds."
+      },
+      "applied": {
+        "title": "All set",
+        "subtitle": "Anything still downloading continues in the background."
+      }
+    },
+    "welcome": {
+      "language": "Language",
+      "points": {
+        "record": {
+          "title": "Records for you",
+          "description": "Saves snapshots of your screen so you can find anything you have seen."
+        },
+        "search": {
+          "title": "Search by text",
+          "description": "Every word in a snapshot is searchable, or describe what you remember."
+        },
+        "private": {
+          "title": "Stays on this PC",
+          "description": "Everything is encrypted and kept on this computer. Nothing is uploaded."
+        }
+      },
+      "recommended": {
+        "title": "Use recommended settings",
+        "description": "Turns on all smart features and steps aside during games and full-screen apps.",
+        "size": "Downloads about {{size}} MB"
+      },
+      "custom": {
+        "title": "Choose myself",
+        "description": "Go through features, browsers and startup one by one."
+      }
+    },
+    "featureModes": {
+      "minimal": {
+        "label": "Essentials",
+        "description": "Record snapshots and find them by the text they contain."
+      },
+      "basic": {
+        "label": "Standard",
+        "description": "Also sorts snapshots into categories for filtering and statistics."
+      },
+      "smart": {
+        "label": "Smart",
+        "description": "Keeps filing snapshots that match descriptions you write. Runs only while your PC is idle."
+      }
+    },
+    "policies": {
+      "complete": {
+        "label": "Complete",
+        "description": "Keeps recording and analysis running. May affect games and battery life."
+      },
+      "balanced": {
+        "label": "Balanced",
+        "description": "Pauses heavier background work on battery and resumes when plugged in."
+      },
+      "performance": {
+        "label": "Protect performance",
+        "description": "Saves battery and uses less while games or full-screen apps are running."
+      }
+    },
+    "features": {
+      "modeLabel": "Feature level",
+      "policyLabel": "Resource use",
+      "extraDownload": "Needs an extra download of about {{size}} MB"
+    },
+    "browsers": {
+      "chrome": "Chrome and other Chromium browsers",
+      "edge": "Microsoft Edge",
+      "chromeShort": "Chrome",
+      "edgeShort": "Edge"
+    },
+    "browserStartup": {
+      "browsersLabel": "Browser extension",
+      "browsersHint": "The extension adds the page address and title to snapshots, so results can open the original page.",
+      "detected": "Found on this PC",
+      "notDetected": "Not found, can still be installed",
+      "startupLabel": "Startup",
+      "launchAtLogin": {
+        "label": "Start with Windows",
+        "description": "Runs in the background after you sign in."
+      },
+      "autoStartCapture": {
+        "label": "Start recording automatically",
+        "description": "When off, you start recording yourself."
+      }
+    },
+    "appBound": {
+      "label": "Keep organizing after a restart",
+      "description": "After your PC restarts, organizing continues even before you open CarbonPaper.",
+      "note": "Needs administrator approval. CarbonPaper restarts once when it is done."
+    },
+    "review": {
+      "rows": {
+        "featureMode": "Feature level",
+        "resourcePolicy": "Resource use",
+        "browsers": "Browser extension",
+        "launchAtLogin": "Start with Windows",
+        "autoStartCapture": "Record automatically",
+        "appBound": "Organize after restart"
+      },
+      "edit": "Change",
+      "on": "On",
+      "off": "Off",
+      "none": "None",
+      "downloadsTitle": "Downloads",
+      "downloadsProgressTitle": "Download progress",
+      "requiredComponents": "Core components (about {{size}} MB)",
+      "smartComponent": "Smart feature component (about {{size}} MB)",
+      "downloadReady": "Ready",
+      "downloadAfterFinish": "Starts when you click Finish",
+      "downloadQueued": "Waiting for the core components",
+      "backgroundNote": "Downloads in the background and turns on when ready",
+      "captureStarts": "Recording starts automatically once the core components are ready.",
+      "captureManual": "Recording will not start on its own. Use the button in the top bar whenever you are ready.",
+      "extensionPath": "The extension files are ready. In your browser’s extensions page, turn on Developer mode, choose “Load unpacked” and select the folder below.",
+      "copyPath": "Copy path",
+      "copied": "Copied"
+    },
+    "tasks": {
+      "features": "Save feature settings",
+      "resources": "Save resource settings",
+      "startup": "Save startup settings",
+      "browsers": "Install browser extension",
+      "reranker": "Download smart feature component",
+      "appBound": "Turn on organizing after restart"
+    },
+    "actions": {
+      "next": "Next",
+      "back": "Back",
+      "finish": "Finish",
+      "applying": "Applying…",
+      "start": "Get started",
+      "retry": "Retry",
+      "resetStep": "Use recommended"
+    },
+    "smartClusterReady": {
+      "title": "Smart features are on",
+      "message": "Write a description in Smart Clusters and matching snapshots will be filed automatically."
+    },
+    "smartClusterFailed": {
+      "title": "Smart feature download failed",
+      "message": "{{error}}. You can download it again from Feature management in Settings."
+    },
+    "whatsNew": {
+      "title": "What’s new",
+      "subtitle": "This version adds a few features. Choose the ones you want.",
+      "apply": "Turn on selected",
+      "skip": "Not now",
+      "later": "Remind me later",
+      "entries": {
+        "smartCluster": {
+          "title": "Smart Clusters",
+          "description": "Keeps filing snapshots that match descriptions you write. Runs only while your PC is idle. Downloads about {{size}} MB."
+        },
+        "appBound": {
+          "title": "Keep organizing after a restart",
+          "description": "After your PC restarts, organizing continues even before you open CarbonPaper."
+        }
+      }
+    }
   }
 }

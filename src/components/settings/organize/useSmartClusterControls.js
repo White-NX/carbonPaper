@@ -62,7 +62,6 @@ export function useSmartClusterControls() {
         () => invoke('download_model', { modelId: 'bge-reranker-v2-m3' }),
         { autoPrompt: true },
       );
-      await invoke('mark_smart_cluster_setup_done', { dismissedPermanently: false });
       await refreshSmartClusterModel();
       await notifySettingsChanged(['models']);
     } catch (err) {

@@ -268,61 +268,6 @@ pub async fn toggle_game_mode(
     Ok(())
 }
 
-/// Reports whether the browser-extension setup wizard should be shown.
-///
-/// Authentication: not required. Returns a JSON boolean.
-#[tauri::command]
-pub fn check_extension_setup_needed() -> Result<bool, String> {
-    Ok(!registry_config::get_bool("extension_setup_done").unwrap_or(false))
-}
-
-/// Marks browser-extension setup as completed.
-///
-/// Authentication: not required. Returns JSON `null`.
-#[tauri::command]
-pub fn mark_extension_setup_done() -> Result<(), String> {
-    registry_config::set_bool("extension_setup_done", true)
-}
-
-/// Smart cluster setup wizard — returns true if the wizard should be shown.
-/// Returns false when either:
-///   - The user previously permanently dismissed it, OR
-///   - The model is already downloaded and the feature is configured
-///
-/// Authentication: not required. Returns a JSON boolean.
-#[tauri::command]
-pub fn check_smart_cluster_setup_needed() -> Result<bool, String> {
-    if registry_config::get_bool("smart_cluster_setup_dismissed").unwrap_or(false) {
-        return Ok(false);
-    }
-    if registry_config::get_bool("smart_cluster_setup_done").unwrap_or(false) {
-        return Ok(false);
-    }
-    if registry_config::get_bool("smart_cluster_enabled").unwrap_or(false) {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-/// Mark the smart cluster setup wizard as resolved.
-/// If `dismissed_permanently` is true, the wizard will never re-appear on
-/// future launches; the user can still trigger the download manually from
-/// the settings page.
-///
-/// Authentication: not required. Returns JSON `null`.
-/// Returns `{ "enabled": boolean }` for browser-extension enhancement.
-///
-/// Authentication: not required. Frontend: extension settings.
-#[tauri::command]
-pub fn mark_smart_cluster_setup_done(dismissed_permanently: bool) -> Result<(), String> {
-    if dismissed_permanently {
-        registry_config::set_bool("smart_cluster_setup_dismissed", true)?;
-    } else {
-        registry_config::set_bool("smart_cluster_setup_done", true)?;
-    }
-    Ok(())
-}
-
 /// Returns `{ "enabled": boolean }` for browser-extension enhancement.
 ///
 /// Authentication: not required. Frontend: extension settings.

@@ -1006,8 +1006,8 @@
         "ocr": "识别组件修复提醒",
         "update": "更新提示",
         "critical-update": "重要更新提示",
-        "extension": "扩展安装引导",
-        "smart-cluster": "智能归档引导",
+        "onboarding": "首次启动向导",
+        "whats-new": "新功能页",
         "app-bound": "后台组件引导",
         "app-bound-repair": "后台组件修复"
       }
@@ -1235,44 +1235,11 @@
     "expand": "展开侧栏",
     "collapse": "收起侧栏"
   },
-  "extensionSetup": {
-    "title": "浏览器扩展",
-    "subtitle": "捕获浏览器截图并附带丰富的元数据",
-    "description": "CarbonPaper 浏览器扩展可以捕获浏览器视口截图，并附带页面元数据（URL、标题、可见链接）。选择你使用的浏览器来安装扩展。",
-    "select_browser": "选择要安装的浏览器",
-    "chrome": "Google Chrome / 其他 Chromium 内核浏览器",
-    "edge": "Microsoft Edge",
-    "installing": "安装中...",
-    "apply": "安装扩展",
-    "skip": "跳过",
-    "done": "完成",
-    "success_message": "扩展安装成功。请在浏览器中启用开发者模式，然后从以下路径加载已解压的扩展。",
-    "connected": "已连接的浏览器：",
-    "error_message": "安装失败"
-  },
   "clusterCard": {
     "actionResume": "继续",
     "actionPause": "暂停",
     "actionRename": "重命名",
     "actionDelete": "删除"
-  },
-  "smartClusterSetup": {
-    "title": "智能聚类",
-    "subtitle": "按自然语言描述自动归档快照",
-    "description": "智能聚类可以根据你输入的自然语言描述，自动将相关的截图快照归入同一分类。基于 bge-reranker-v2-m3 模型，准确率远高于纯向量搜索。",
-    "modelInfo": "需要下载 bge-reranker-v2-m3 模型（~570MB，uint8 量化），该模型仅在系统空闲时使用。",
-    "modelSource": "模型来源：onnx-community/bge-reranker-v2-m3-ONNX",
-    "infoNote": "你也可以稍后在「设置 → 功能管理」中下载并启用此功能。",
-    "download": "下载并启用",
-    "downloading": "正在下载模型…",
-    "downloading_short": "下载中…",
-    "downloadComplete": "下载完成！",
-    "later": "稍后",
-    "dismiss": "不再提醒",
-    "dismissTooltip": "永久关闭此提示，可后续在设置中启用",
-    "retry": "重试下载",
-    "success": "智能聚类已就绪",
-    "openFeature": "打开智能聚类"
   },
   "smartClusters": {
     "title": "智能聚类",
@@ -1579,5 +1546,195 @@
   },
   "overlay": {
     "showDetails": "查看详情"
+  },
+  "onboarding": {
+    "stepsLabel": "设置步骤",
+    "recommendedBadge": "推荐",
+    "steps": {
+      "welcome": "欢迎",
+      "features": "功能与性能",
+      "browserStartup": "浏览器与启动",
+      "review": "确认"
+    },
+    "headers": {
+      "welcome": {
+        "title": "欢迎使用 CarbonPaper",
+        "subtitle": "花一分钟完成设置，之后随时可以在设置中修改。"
+      },
+      "features": {
+        "title": "功能与性能",
+        "subtitle": "选择需要的功能，以及 CarbonPaper 如何与其他程序分享电脑资源。"
+      },
+      "browserStartup": {
+        "title": "浏览器与启动",
+        "subtitle": "连接你常用的浏览器，并决定 CarbonPaper 何时开始工作。"
+      },
+      "review": {
+        "title": "确认设置",
+        "subtitle": "检查一下你的选择，点击“完成”后立即生效。"
+      },
+      "applying": {
+        "title": "正在应用设置",
+        "subtitle": "请稍候，这通常只需要几秒钟。"
+      },
+      "applied": {
+        "title": "设置完成",
+        "subtitle": "一切就绪。仍在下载的内容会在后台继续。"
+      }
+    },
+    "welcome": {
+      "language": "界面语言",
+      "points": {
+        "record": {
+          "title": "自动记录",
+          "description": "定时保存屏幕快照，回看你看过的任何内容。"
+        },
+        "search": {
+          "title": "文字搜索",
+          "description": "快照中的文字都能被搜到，也可以用一句话描述来查找。"
+        },
+        "private": {
+          "title": "只在本机",
+          "description": "所有数据加密保存在这台电脑上，不会上传。"
+        }
+      },
+      "recommended": {
+        "title": "使用推荐设置",
+        "description": "开启全部智能功能，并在游戏和全屏时自动让出资源。",
+        "size": "需要下载约 {{size}} MB"
+      },
+      "custom": {
+        "title": "自己选择",
+        "description": "逐项查看并调整功能、浏览器和启动方式。"
+      }
+    },
+    "featureModes": {
+      "minimal": {
+        "label": "最小功能",
+        "description": "记录快照，并通过文字搜索查找内容。"
+      },
+      "basic": {
+        "label": "基础功能",
+        "description": "在此基础上自动分类快照，方便筛选和统计。"
+      },
+      "smart": {
+        "label": "智能功能",
+        "description": "按你写下的描述持续归档相关快照，仅在电脑空闲时运行。"
+      }
+    },
+    "policies": {
+      "complete": {
+        "label": "完整记录",
+        "description": "尽量持续记录和分析，可能影响游戏性能和电池续航。"
+      },
+      "balanced": {
+        "label": "均衡",
+        "description": "使用电池时暂停较重的后台任务，接通电源后恢复。"
+      },
+      "performance": {
+        "label": "性能保护",
+        "description": "保护电池续航，并在游戏或全屏程序运行时降低占用。"
+      }
+    },
+    "features": {
+      "modeLabel": "功能等级",
+      "policyLabel": "资源占用",
+      "extraDownload": "需要额外下载约 {{size}} MB"
+    },
+    "browsers": {
+      "chrome": "Chrome 及其他 Chromium 浏览器",
+      "edge": "Microsoft Edge",
+      "chromeShort": "Chrome",
+      "edgeShort": "Edge"
+    },
+    "browserStartup": {
+      "browsersLabel": "浏览器扩展",
+      "browsersHint": "扩展让快照带上网页地址和标题，搜索结果可以直接打开原网页。",
+      "detected": "已在这台电脑上找到",
+      "notDetected": "未找到，仍可安装",
+      "startupLabel": "启动",
+      "launchAtLogin": {
+        "label": "开机时自动启动",
+        "description": "登录 Windows 后在后台运行。"
+      },
+      "autoStartCapture": {
+        "label": "启动后自动开始记录",
+        "description": "关闭后，需要手动点击开始记录。"
+      }
+    },
+    "appBound": {
+      "label": "重启后继续后台整理",
+      "description": "电脑重启后，即使还没打开 CarbonPaper，整理工作也能继续进行。",
+      "note": "需要管理员授权，完成后 CarbonPaper 会自动重启一次。"
+    },
+    "review": {
+      "rows": {
+        "featureMode": "功能等级",
+        "resourcePolicy": "资源占用",
+        "browsers": "浏览器扩展",
+        "launchAtLogin": "开机自动启动",
+        "autoStartCapture": "自动开始记录",
+        "appBound": "重启后继续整理"
+      },
+      "edit": "修改",
+      "on": "开启",
+      "off": "关闭",
+      "none": "不安装",
+      "downloadsTitle": "需要下载的内容",
+      "downloadsProgressTitle": "下载进度",
+      "requiredComponents": "基础组件（约 {{size}} MB）",
+      "smartComponent": "智能功能组件（约 {{size}} MB）",
+      "downloadReady": "已就绪",
+      "downloadAfterFinish": "点击“完成”后开始下载",
+      "downloadQueued": "等待基础组件下载完成",
+      "backgroundNote": "将在后台下载，完成后自动开启",
+      "captureStarts": "基础组件就绪后会自动开始记录。",
+      "captureManual": "完成后不会自动记录，你可以随时点击顶栏的按钮开始。",
+      "extensionPath": "扩展文件已准备好。请在浏览器的扩展页面打开“开发者模式”，然后选择“加载已解压的扩展程序”，并选中下面的文件夹。",
+      "copyPath": "复制路径",
+      "copied": "已复制"
+    },
+    "tasks": {
+      "features": "保存功能设置",
+      "resources": "保存资源占用设置",
+      "startup": "保存启动设置",
+      "browsers": "安装浏览器扩展",
+      "reranker": "下载智能功能组件",
+      "appBound": "启用重启后继续整理"
+    },
+    "actions": {
+      "next": "下一步",
+      "back": "上一步",
+      "finish": "完成",
+      "applying": "正在应用…",
+      "start": "开始使用",
+      "retry": "重试",
+      "resetStep": "恢复推荐"
+    },
+    "smartClusterReady": {
+      "title": "智能功能已开启",
+      "message": "现在可以在“智能聚类”中写下描述，自动归档相关快照。"
+    },
+    "smartClusterFailed": {
+      "title": "智能功能组件下载失败",
+      "message": "{{error}}。你可以在设置的功能管理中重新下载。"
+    },
+    "whatsNew": {
+      "title": "新功能",
+      "subtitle": "这个版本带来了一些新功能，选择你想开启的。",
+      "apply": "开启所选功能",
+      "skip": "暂不开启",
+      "later": "下次再说",
+      "entries": {
+        "smartCluster": {
+          "title": "智能聚类",
+          "description": "按你写下的描述持续归档相关快照，仅在电脑空闲时运行。需要下载约 {{size}} MB。"
+        },
+        "appBound": {
+          "title": "重启后继续后台整理",
+          "description": "电脑重启后，即使还没打开 CarbonPaper，整理工作也能继续进行。"
+        }
+      }
+    }
   }
 }

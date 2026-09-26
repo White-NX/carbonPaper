@@ -12,6 +12,7 @@ const UNEXPECTED_STOP_WINDOW_MS = 10 * 60 * 1000;
 export function useMonitorLifecycle({
   modelsCheckDone,
   modelsNeedDownload,
+  captureHeld = false,
   powerSavingSuppressed,
   formatErrorDetails,
   reportBackendError,
@@ -240,6 +241,8 @@ export function useMonitorLifecycle({
     if (powerSavingSuppressed) return;
     if (!modelsCheckDone) return;
     if (modelsNeedDownload) return;
+    // A new user starts recording by finishing the first-run wizard.
+    if (captureHeld) return;
     if (backendStatus === 'offline' && backendStatusRef.current !== 'waiting') {
       handleStartBackend();
     }
@@ -247,6 +250,7 @@ export function useMonitorLifecycle({
     autoStartMonitor,
     autoStartSuppressed,
     backendStatus,
+    captureHeld,
     handleStartBackend,
     modelsCheckDone,
     modelsNeedDownload,
