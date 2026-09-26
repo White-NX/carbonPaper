@@ -39,3 +39,25 @@ describe('monitor actions from settings', () => {
     expect(invoke).not.toHaveBeenCalledWith('exit_app');
   });
 });
+
+describe('capture loop that ends on its own', () => {
+  it('is restarted, but not indefinitely', async () => {
+    const { result } = renderHook(() => useMonitorLifecycle(options));
+    await waitFor(() => expect(result.current.backendStatus).toBe('online'));
+    const starts = () => invoke.mock.calls.filter(([command]) => command === 'start_monitor').length;
+    const loopEnds = () => {
+      stopped = true;
+      events.get('monitor-stopped')({ payload: { intentional: false } });
+    };
+
+    act(loopEnds);
+    await waitFor(() => expect(starts()).toBe(1));
+    act(loopEnds);
+    await waitFor(() => expect(starts()).toBe(2));
+
+    act(loopEnds);
+    await act(async () => {});
+    expect(starts()).toBe(2);
+    expect(result.current.backendStatus).toBe('offline');
+  });
+});

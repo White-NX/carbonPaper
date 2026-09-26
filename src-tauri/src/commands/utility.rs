@@ -36,6 +36,16 @@ pub fn get_log_dir() -> String {
     data_dir.join("logs").to_string_lossy().to_string()
 }
 
+/// Returns the critical errors retained since startup, oldest first, as
+/// `{ id, message }` objects.
+///
+/// Authentication: not required. Frontend: `hooks/useCriticalErrors.js`, which
+/// reads it when a main window is created after an error was reported.
+#[tauri::command]
+pub fn get_critical_errors() -> Vec<crate::error_window::CriticalError> {
+    crate::error_window::critical_errors()
+}
+
 /// Restarts the application process.
 ///
 /// Authentication: main-window origin required. Returns only on failure.

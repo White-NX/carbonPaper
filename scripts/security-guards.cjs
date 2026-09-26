@@ -147,6 +147,7 @@ const COMMAND_TIERS = {
   'commands::smart_cluster::smart_cluster_status': 'session_required',
   'idle::get_idle_state': 'public',
   'commands::utility::get_log_dir': 'public',
+  'commands::utility::get_critical_errors': 'public',
   'commands::utility::restart_app': 'lifecycle_public',
   'commands::utility::trigger_test_error': 'session_required',
   'commands::utility::exit_app': 'lifecycle_public',

@@ -3,6 +3,12 @@ import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../lib/auth_api';
 import { useTauriEventListener } from './useTauriEventListener';
 
+// An unexpected stop is a capture loop that ended without being asked to. The
+// auto-start effect restarts it, and a failure that recurs on every start would
+// otherwise be restarted indefinitely.
+const MAX_UNEXPECTED_STOPS = 3;
+const UNEXPECTED_STOP_WINDOW_MS = 10 * 60 * 1000;
+
 export function useMonitorLifecycle({
   modelsCheckDone,
   modelsNeedDownload,
@@ -26,6 +32,7 @@ export function useMonitorLifecycle({
   const [backendError, setBackendError] = useState('');
   const backendStatusRef = useRef('unknown');
   const backendStartAtRef = useRef(null);
+  const unexpectedStopsRef = useRef([]);
 
   useEffect(() => {
     backendStatusRef.current = backendStatus;
@@ -207,13 +214,24 @@ export function useMonitorLifecycle({
     return () => clearInterval(interval);
   }, [checkBackendStatus]);
 
-  useTauriEventListener('monitor-stopped', () => {
+  useTauriEventListener('monitor-stopped', (event) => {
     setBackendStatus('offline');
     backendStatusRef.current = 'offline';
     setMonitorPaused(false);
     setBackendError('');
     resetBackendErrorDedupe();
     backendStartAtRef.current = null;
+    if (event?.payload?.intentional !== false) return;
+    const now = Date.now();
+    const recent = unexpectedStopsRef.current.filter((at) => now - at < UNEXPECTED_STOP_WINDOW_MS);
+    recent.push(now);
+    unexpectedStopsRef.current = recent;
+    if (recent.length >= MAX_UNEXPECTED_STOPS) {
+      // Leave it stopped until someone starts it again.
+      autoStartSuppressedRef.current = true;
+      setAutoStartSuppressed(true);
+      console.warn(`Capture stopped unexpectedly ${recent.length} times within ${UNEXPECTED_STOP_WINDOW_MS / 60000} minutes; not restarting it automatically`);
+    }
   }, [resetBackendErrorDedupe]);
 
   useEffect(() => {

@@ -5,7 +5,7 @@
 
 use crate::capture::CaptureState;
 use crate::storage::StorageState;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
@@ -13,16 +13,32 @@ use tauri::{AppHandle, Manager, State};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::Performance::*;
 
+/// `MonitorState::lifecycle` while no capture session owns the monitor.
+const LIFECYCLE_IDLE: u64 = 0;
+/// `MonitorState::lifecycle` while a session that no longer captures is being
+/// drained, whether a stop took it over or its loop ended on its own. Starts
+/// are refused until the drain ends.
+const LIFECYCLE_DRAINING: u64 = u64::MAX;
+
 pub struct MonitorState {
-    /// Whether the capture loop has been started and not yet stopped.
-    running: AtomicBool,
+    /// Which capture session owns the monitor: `LIFECYCLE_IDLE`,
+    /// `LIFECYCLE_DRAINING`, or the id of the running session.
+    ///
+    /// One word instead of a flag, so a loop that ends on its own can give
+    /// back exactly its own session. A stop that already took the session
+    /// over, or a session started after it, is left alone.
+    lifecycle: AtomicU64,
+    /// Session ids are never reused, so a late exit cannot be mistaken for the
+    /// session that replaced it.
+    next_session: AtomicU64,
     /// Game mode: whether DirectML is currently suppressed due to game mode
     pub game_mode_dml_suppressed: AtomicBool,
     /// Game mode: whether DirectML is permanently suppressed due to game mode (until next restart)
     pub game_mode_permanently_suppressed: AtomicBool,
     /// Game mode: background task handle for monitoring game mode changes
     pub game_mode_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
-    /// Set to true during intentional stop and application exit
+    /// Set to true during a stop, after a capture loop ended on its own, and
+    /// at application exit; cleared by the next start
     pub stopping: AtomicBool,
     /// Prevents the monitor from restarting during migration tasks
     pub migration_lock: AtomicBool,
@@ -31,7 +47,8 @@ pub struct MonitorState {
 impl MonitorState {
     pub fn new() -> Self {
         Self {
-            running: AtomicBool::new(false),
+            lifecycle: AtomicU64::new(LIFECYCLE_IDLE),
+            next_session: AtomicU64::new(1),
             game_mode_dml_suppressed: AtomicBool::new(false),
             game_mode_permanently_suppressed: AtomicBool::new(false),
             game_mode_task: Mutex::new(None),
@@ -40,9 +57,57 @@ impl MonitorState {
         }
     }
 
-    /// Whether the capture loop is running, paused or not.
+    /// Whether a capture session owns the monitor, paused or not. A session
+    /// still being drained counts until the drain ends.
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.lifecycle.load(Ordering::SeqCst) != LIFECYCLE_IDLE
+    }
+
+    /// Claims the monitor for a new capture session and returns its id, or
+    /// `None` while another session owns it.
+    fn claim_session(&self) -> Option<u64> {
+        let session = self.next_session.fetch_add(1, Ordering::SeqCst);
+        self.lifecycle
+            .compare_exchange(LIFECYCLE_IDLE, session, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| session)
+    }
+
+    /// Takes whichever session owns the monitor over for a stop. Returns
+    /// `false` when there is none; the stop then only drains and leaves the
+    /// lifecycle alone, so it cannot end a session claimed in the meantime.
+    fn take_over_for_stop(&self) -> bool {
+        self.lifecycle
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                (current != LIFECYCLE_IDLE).then_some(LIFECYCLE_DRAINING)
+            })
+            .is_ok()
+    }
+
+    /// Takes `session` over after its capture loop ended on its own. Returns
+    /// `false` when a stop already took it over or a newer session owns the
+    /// monitor; whichever it is owns the state from here.
+    fn take_over_exited_session(&self, session: u64) -> bool {
+        self.lifecycle
+            .compare_exchange(
+                session,
+                LIFECYCLE_DRAINING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Ends a drain that took a session over. When two drains overlap, the
+    /// first to finish returns the monitor to idle, and a session claimed
+    /// after that is left running when the second one finishes.
+    fn finish_drain(&self) {
+        let _ = self.lifecycle.compare_exchange(
+            LIFECYCLE_DRAINING,
+            LIFECYCLE_IDLE,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
     /// Whether game mode currently prevents GPU inference.
@@ -452,11 +517,11 @@ pub async fn start_monitor_impl(
         }
     }
 
-    if state.running.swap(true, Ordering::SeqCst) {
+    let Some(session) = state.claim_session() else {
         return Ok("Monitor is already running".into());
-    }
+    };
     state.stopping.store(false, Ordering::SeqCst);
-    spawn_capture_loop(&app);
+    spawn_capture_loop(&app, session);
     crate::refresh_tray_menu(&app);
     Ok("Monitor started".into())
 }
@@ -488,8 +553,8 @@ pub fn set_monitor_autostart(
     crate::registry_config::set_bool("autoStartMonitor", enabled)
 }
 
-/// Spawn the Rust-side capture loop using CaptureState
-fn spawn_capture_loop(app: &AppHandle) {
+/// Spawn the Rust-side capture loop for `session` using CaptureState
+fn spawn_capture_loop(app: &AppHandle, session: u64) {
     let capture_state = app.state::<Arc<CaptureState>>();
     let storage = app.state::<Arc<StorageState>>();
     let _monitor_state = app.state::<MonitorState>();
@@ -502,8 +567,8 @@ fn spawn_capture_loop(app: &AppHandle) {
     capture_state
         .startup_pending_cleanup_cancelled
         .store(false, Ordering::SeqCst);
-    // Office observation follows capture; `stop_monitor_impl` and the storage
-    // migrations close this gate.
+    // Office observation follows capture; `drain_capture_session` and the
+    // storage migrations close this gate.
     app.state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
         .resume();
 
@@ -560,24 +625,26 @@ fn spawn_capture_loop(app: &AppHandle) {
     // MonitorState is not Arc-wrapped in Tauri managed state, but we access it via AppHandle
     // We need to pass the AppHandle so the capture loop can access MonitorState
     let app_handle = app.clone();
+    let exit_capture_state = cs.clone();
 
     let handle = tauri::async_runtime::spawn(async move {
-        let _ms = app_handle.state::<MonitorState>();
         // Use AssertUnwindSafe + catch_unwind to detect panics in the capture loop
         let result = std::panic::AssertUnwindSafe(crate::capture::run_capture_loop(
             cs,
             st,
             app_handle.clone(),
         ));
-        match futures::FutureExt::catch_unwind(result).await {
-            Ok(()) => {
-                // Normal exit
-            }
-            Err(_panic_payload) => {
-                // The global panic hook (installed via error_window::install_panic_hook)
-                // already handles showing the error overlay, so we just log here.
-                tracing::error!("Capture loop panicked (error overlay shown by global hook)");
-            }
+        let panicked = futures::FutureExt::catch_unwind(result).await.is_err();
+        if panicked {
+            // The global panic hook (installed via error_window::install_panic_hook)
+            // already shows the error overlay; the session is ended below.
+            tracing::error!("Capture loop panicked (error overlay shown by global hook)");
+        }
+        // The loop only returns by itself once `stopped` is set, and the stop
+        // and exit paths that set it also own the monitor state. Any other
+        // end would leave a monitor reporting a session that nothing runs.
+        if panicked || !exit_capture_state.stopped.load(Ordering::SeqCst) {
+            end_exited_session(&app_handle, &exit_capture_state, session).await;
         }
     });
 
@@ -590,32 +657,38 @@ fn spawn_capture_loop(app: &AppHandle) {
     tracing::info!("Rust capture loop spawned");
 }
 
-/// Stops the Rust capture loop.
-pub async fn stop_monitor_impl(
-    state: State<'_, MonitorState>,
-    capture_state: State<'_, Arc<CaptureState>>,
-    app: AppHandle,
-) -> Result<String, String> {
-    // 1. Stop the Rust capture loop
+/// Winds the monitor down after the capture loop of `session` ended without
+/// being stopped, so status, tray and maintenance stop describing a loop that
+/// no longer runs, and tells the frontend that nobody asked for this stop.
+///
+/// Runs on the capture task. A stop that arrives meanwhile aborts the task at
+/// its next await and completes the drain itself.
+async fn end_exited_session(app: &AppHandle, capture_state: &CaptureState, session: u64) {
+    let state = app.state::<MonitorState>();
+    if !state.take_over_exited_session(session) {
+        return;
+    }
+    tracing::error!(
+        "Capture session {} ended without a stop; returning the monitor to stopped",
+        session
+    );
+    state.stopping.store(true, Ordering::SeqCst);
     capture_state.stopped.store(true, Ordering::SeqCst);
     capture_state.paused.store(false, Ordering::SeqCst);
 
-    // Report the monitor as stopped while the capture task drains
-    state.stopping.store(true, Ordering::SeqCst);
+    drain_capture_session(app, capture_state, "capture_loop_exited").await;
 
-    // Abort the capture task
-    {
-        let mut guard = capture_state
-            .capture_task
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(handle) = guard.take() {
-            handle.abort();
-        }
-    }
+    state.finish_drain();
+    crate::refresh_tray_menu(app);
+    let _ = app.emit("monitor-stopped", serde_json::json!({"intentional": false}));
+}
 
-    // Explicitly release WGC/D3D capture resources even when capture task is force-aborted.
-    capture_state.clear_wgc_session("stop_monitor");
+/// Releases what a capture session leaves behind once its loop is gone: the
+/// WGC session, the in-flight OCR task, and Office observation.
+async fn drain_capture_session(app: &AppHandle, capture_state: &CaptureState, reason: &str) {
+    // Explicitly release WGC/D3D capture resources: a loop that was
+    // force-aborted or panicked never reaches its own teardown.
+    capture_state.clear_wgc_session(reason);
 
     // Wait for in-flight OCR tasks to complete (with timeout)
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -638,8 +711,41 @@ pub async fn stop_monitor_impl(
     app.state::<Arc<crate::office_runtime::OfficeRuntimeState>>()
         .quiesce(tokio::time::Duration::from_secs(5))
         .await;
+}
 
-    state.running.store(false, Ordering::SeqCst);
+/// Stops the Rust capture loop.
+pub async fn stop_monitor_impl(
+    state: State<'_, MonitorState>,
+    capture_state: State<'_, Arc<CaptureState>>,
+    app: AppHandle,
+) -> Result<String, String> {
+    // Own the session before signalling its loop: a loop that panics from
+    // here on finds its session taken and leaves the rest to this stop.
+    let took_over = state.take_over_for_stop();
+
+    // 1. Stop the Rust capture loop
+    capture_state.stopped.store(true, Ordering::SeqCst);
+    capture_state.paused.store(false, Ordering::SeqCst);
+
+    // Report the monitor as stopped while the capture task drains
+    state.stopping.store(true, Ordering::SeqCst);
+
+    // Abort the capture task
+    {
+        let mut guard = capture_state
+            .capture_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+    }
+
+    drain_capture_session(&app, &capture_state, "stop_monitor").await;
+
+    if took_over {
+        state.finish_drain();
+    }
     crate::refresh_tray_menu(&app);
     let _ = app.emit("monitor-stopped", serde_json::json!({"intentional": true}));
 
@@ -1101,5 +1207,73 @@ mod tests {
             .store(true, Ordering::SeqCst);
         assert!(state.is_dml_suppressed());
         assert!(!state.allows_directml(true));
+    }
+
+    #[test]
+    fn a_stop_keeps_the_session_until_its_drain_ends() {
+        let state = MonitorState::new();
+        let session = state
+            .claim_session()
+            .expect("an idle monitor can be claimed");
+        assert!(state.is_running());
+        assert_eq!(state.claim_session(), None);
+
+        assert!(state.take_over_for_stop());
+        assert!(state.is_running());
+        assert_eq!(state.claim_session(), None, "starts wait for the drain");
+        assert!(
+            !state.take_over_exited_session(session),
+            "a loop that panics during the stop leaves the session to the stop"
+        );
+
+        state.finish_drain();
+        assert!(!state.is_running());
+        assert!(state.claim_session().is_some());
+    }
+
+    #[test]
+    fn a_stop_without_a_session_leaves_the_lifecycle_alone() {
+        let state = MonitorState::new();
+        assert!(!state.take_over_for_stop());
+        assert!(!state.is_running());
+        assert!(state.claim_session().is_some());
+    }
+
+    #[test]
+    fn an_exited_loop_ends_only_its_own_session() {
+        let state = MonitorState::new();
+        let first = state.claim_session().unwrap();
+        assert!(state.take_over_exited_session(first));
+        assert!(
+            state.is_running(),
+            "the exited session drains before it reads as stopped"
+        );
+        assert_eq!(state.claim_session(), None);
+        state.finish_drain();
+        assert!(!state.is_running());
+
+        let second = state.claim_session().unwrap();
+        assert_ne!(first, second);
+        assert!(
+            !state.take_over_exited_session(first),
+            "a late exit of an older session must not end the newer one"
+        );
+        assert!(state.is_running());
+        assert!(state.take_over_exited_session(second));
+    }
+
+    #[test]
+    fn a_drain_that_finishes_late_leaves_a_newer_session_running() {
+        let state = MonitorState::new();
+        state.claim_session().unwrap();
+        // Two stops overlap on the same session.
+        assert!(state.take_over_for_stop());
+        assert!(state.take_over_for_stop());
+        state.finish_drain();
+        let restarted = state.claim_session().unwrap();
+
+        state.finish_drain();
+        assert!(state.is_running());
+        assert!(state.take_over_exited_session(restarted));
     }
 }

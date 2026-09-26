@@ -1384,6 +1384,7 @@ pub fn run() {
             idle::get_idle_state,
             // Error window commands
             commands::utility::get_log_dir,
+            commands::utility::get_critical_errors,
             commands::utility::restart_app,
             commands::utility::trigger_test_error,
             commands::utility::exit_app,
