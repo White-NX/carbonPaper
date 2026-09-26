@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useTauriEventListener } from './useTauriEventListener';
+import { formatError } from '../lib/errors';
+import { missingRequiredModels } from '../lib/modelSizes';
 
 export function useRequiredModelDownload({
   modelsNeedDownload,
@@ -11,7 +13,6 @@ export function useRequiredModelDownload({
   const [modelDownloadLog, setModelDownloadLog] = useState([]);
   const [modelDownloadError, setModelDownloadError] = useState(null);
   const [modelDownloading, setModelDownloading] = useState(false);
-  const modelDownloadLogRef = useRef(null);
   const modelDownloadStartedRef = useRef(false);
   const [retryNonce, setRetryNonce] = useState(0);
   const [isClosedByUser, setIsClosedByUser] = useState(false);
@@ -49,12 +50,6 @@ export function useRequiredModelDownload({
     );
   }, [modelDownloading, isClosedByUser, overallProgress]);
 
-  useEffect(() => {
-    if (modelDownloadLogRef?.current) {
-      modelDownloadLogRef.current.scrollTop = modelDownloadLogRef.current.scrollHeight;
-    }
-  }, [modelDownloadLog]);
-
   useTauriEventListener('install-log', (event) => {
     const payload = event?.payload || {};
     const line = payload.line || JSON.stringify(payload);
@@ -88,16 +83,7 @@ export function useRequiredModelDownload({
 
     (async () => {
       try {
-        const keysToDownload = [];
-        if (missingModels['chinese-clip'] && !missingModels['chinese-clip'].complete) {
-          keysToDownload.push('chinese-clip');
-        }
-        if (missingModels['bge-small-zh'] && !missingModels['bge-small-zh'].complete) {
-          keysToDownload.push('bge-small-zh');
-        }
-        if (missingModels['minilm-l12'] && !missingModels['minilm-l12'].complete) {
-          keysToDownload.push('minilm-l12');
-        }
+        const keysToDownload = missingRequiredModels(missingModels);
 
         setDownloadProgressState({
           keys: keysToDownload,
@@ -128,7 +114,7 @@ export function useRequiredModelDownload({
         setModelDownloadLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${t('mask.model_download.complete')}`]);
         onModelsDownloadComplete?.();
       } catch (err) {
-        setModelDownloadError(err?.message || String(err));
+        setModelDownloadError(formatError(err));
       } finally {
         setModelDownloading(false);
         modelDownloadStartedRef.current = false;
@@ -146,7 +132,7 @@ export function useRequiredModelDownload({
     modelDownloadLog,
     modelDownloadError,
     modelDownloading,
-    modelDownloadLogRef,
+    overallProgress,
     isClosedByUser,
     setIsClosedByUser,
     retryModelDownload,

@@ -17,24 +17,7 @@ export function SettingsSwitch({ checked, onChange, disabled = false, title, cla
   );
 }
 
-const BUTTON_VARIANTS = {
-  primary: 'border-transparent bg-ide-accent text-white hover:opacity-90',
-  secondary: 'border-ide-border bg-ide-panel text-ide-text hover:bg-ide-hover',
-  ghost: 'border-transparent text-ide-muted hover:bg-ide-hover hover:text-ide-text',
-  danger: 'border-red-500/30 text-ide-error hover:bg-red-500/10',
-};
-const BUTTON_SIZES = { xs: 'px-2 py-1 text-xs', sm: 'px-3 py-1.5 text-xs', md: 'px-4 py-2 text-sm' };
-
-export function SettingsButton({ children, icon: Icon, variant = 'secondary', size = 'sm', className = '', disabled = false, ...props }) {
-  return (
-    <button type="button" disabled={disabled} {...props}
-      className={cx('inline-flex items-center justify-center gap-1.5 rounded-lg border font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50',
-        BUTTON_VARIANTS[variant], BUTTON_SIZES[size], focus, className)}>
-      {Icon && (React.isValidElement(Icon) ? Icon : <Icon className="h-3.5 w-3.5" aria-hidden="true" />)}
-      {children}
-    </button>
-  );
-}
+export { Button as SettingsButton } from '../ui/Button';
 
 export function SettingsSelect({ value, onChange, options, label, className = '', disabled, ...props }) {
   const labelId = useContext(SettingsControlLabelContext);

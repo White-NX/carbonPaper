@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import xibaoImg from '../assets/images/xibao.jpg';
+import { OVERLAY_LAYERS } from './overlay/layers';
 import musicFile from '../assets/music/La Marcha Radetzky - Johann Strauss (1848).mp3';
 
 /**
@@ -33,7 +34,7 @@ export default function ErrorWindow({ isVisible, errors = [], logPath = '', onRe
   if (mode === 'xibao') {
     return (
       <div
-        className="fixed inset-0 z-[100] overflow-auto flex flex-col"
+        className={`fixed inset-0 ${OVERLAY_LAYERS.fatal} overflow-auto flex flex-col`}
         style={{
           backgroundImage: `url(${xibaoImg})`,
           backgroundSize: 'cover',
@@ -110,7 +111,7 @@ export default function ErrorWindow({ isVisible, errors = [], logPath = '', onRe
 
   // Normal mode
   return (
-    <div className="fixed inset-0 z-[100] bg-ide-bg text-ide-text overflow-auto flex flex-col">
+    <div className={`fixed inset-0 ${OVERLAY_LAYERS.fatal} bg-ide-bg text-ide-text overflow-auto flex flex-col`}>
       <audio ref={audioRef} />
 
       <div className="flex-1 flex flex-col items-center justify-center px-10 py-8">

@@ -1,8 +1,12 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Images, Loader2 } from 'lucide-react';
-import { Dialog } from './Dialog';
+import { Images } from 'lucide-react';
 import { getClipBackfillOffer, setClipBackfillDecision } from '../lib/semantic_api';
+import { formatError } from '../lib/errors';
+import { usePolling } from '../hooks/usePolling';
+import { OverlayShell } from './overlay';
+import { Button } from './ui/Button';
+import { Banner } from './ui/Banner';
 
 /// Until an answer exists there is something to watch for: the offer only
 /// becomes askable once the step-7 copy settles, which can be many minutes
@@ -68,28 +72,17 @@ export default function ClipBackfillDialog() {
     }
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    let timer;
-    const tick = async () => {
-      const next = await refresh();
-      if (cancelled) return;
-      // A recorded answer is final until the settings card changes it. A
-      // settled migration with no work is terminal too. `should_ask` alone is
-      // not a stop signal: it is also false while the migration is unfinished,
-      // and a failed refresh returns no offer at all; both cases must retry.
-      if (
-        next?.decision
-        || (next?.migration_settled && !next.should_ask && !next.diagnostics_deferred)
-      ) return;
-      timer = setTimeout(tick, POLL_MS);
-    };
-    tick();
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [refresh]);
+  usePolling(async () => {
+    const next = await refresh();
+    // A recorded answer is final until the settings card changes it. A
+    // settled migration with no work is terminal too. `should_ask` alone is
+    // not a stop signal: it is also false while the migration is unfinished,
+    // and a failed refresh returns no offer at all; both cases must retry.
+    return !(
+      next?.decision
+      || (next?.migration_settled && !next.should_ask && !next.diagnostics_deferred)
+    );
+  }, { intervalMs: POLL_MS });
 
   const decide = async (decision) => {
     setSubmitting(decision);
@@ -97,7 +90,7 @@ export default function ClipBackfillDialog() {
     try {
       setOffer(await setClipBackfillDecision(decision));
     } catch (err) {
-      setError(typeof err === 'string' ? err : err?.message || String(err));
+      setError(formatError(err));
     } finally {
       setSubmitting(null);
     }
@@ -110,83 +103,63 @@ export default function ClipBackfillDialog() {
   const busy = submitting !== null;
 
   return (
-    <Dialog
-      isOpen={isOpen}
-      onClose={() => setDismissed(true)}
+    <OverlayShell
+      onDismiss={() => setDismissed(true)}
+      size="lg"
+      icon={Images}
       title={t('clipBackfill.title')}
-      maxWidth="max-w-xl"
-    >
-      <div className="p-4 space-y-4">
-        <div className="flex items-start gap-3">
-          <div className="w-9 h-9 rounded-lg bg-ide-bg border border-ide-border flex items-center justify-center shrink-0">
-            <Images className="w-4 h-4 text-ide-accent" />
-          </div>
-          <p className="text-sm text-ide-text leading-relaxed">
-            {t('clipBackfill.lead', { count: offer.never_indexed })}
-          </p>
-        </div>
-
-        <div className="rounded-lg border border-ide-border/60 bg-ide-panel/40 p-3 space-y-1.5 text-xs">
-          <div className="flex justify-between gap-4">
-            <span className="text-ide-muted">{t('clipBackfill.missing')}</span>
-            <span className="text-ide-text tabular-nums">{offer.never_indexed}</span>
-          </div>
-          {offer.stalled > 0 && (
-            <div className="flex justify-between gap-4">
-              <span className="text-ide-muted">{t('clipBackfill.stalled')}</span>
-              <span className="text-ide-warning tabular-nums">{offer.stalled}</span>
-            </div>
-          )}
-          <div className="flex justify-between gap-4">
-            <span className="text-ide-muted">{t('clipBackfill.estimateLabel')}</span>
-            <span className="text-ide-text">{estimate ?? '—'}</span>
-          </div>
-        </div>
-
-        {/* The two migration numbers that explain where the gap came from, and
-            which must not be read as one. */}
-        {(offer.skipped_deleted > 0 || offer.failed_imports > 0) && (
-          <div className="text-[11px] text-ide-muted leading-relaxed space-y-1">
-            {offer.skipped_deleted > 0 && (
-              <p>{t('clipBackfill.skippedDeleted', { count: offer.skipped_deleted })}</p>
-            )}
-            {offer.failed_imports > 0 && (
-              <p className="text-ide-warning-muted">
-                {t('clipBackfill.failedImports', { count: offer.failed_imports })}
-              </p>
-            )}
-          </div>
-        )}
-
-        <p className="text-[11px] text-ide-muted leading-relaxed">
-          {t('clipBackfill.whenItRuns')}
-        </p>
-
-        {error && (
-          <div className="p-3 bg-red-500/10 border border-red-500/20 rounded text-xs text-red-400">
-            {error}
-          </div>
-        )}
-
-        <div className="flex justify-end gap-2">
-          <button
-            onClick={() => decide('declined')}
-            disabled={busy}
-            className="px-4 py-1.5 bg-ide-bg border border-ide-border rounded text-sm hover:bg-ide-hover transition-colors disabled:opacity-50 flex items-center gap-1.5"
-          >
-            {submitting === 'declined' && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+      footer={(
+        <>
+          <Button size="md" disabled={busy} loading={submitting === 'declined'} onClick={() => decide('declined')}>
             {t('clipBackfill.decline')}
-          </button>
-          <button
-            onClick={() => decide('approved')}
-            disabled={busy}
-            className="px-4 py-1.5 bg-ide-accent text-white rounded text-sm hover:opacity-90 transition-colors disabled:opacity-50 flex items-center gap-1.5"
-          >
-            {submitting === 'approved' && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+          </Button>
+          <Button size="md" variant="primary" disabled={busy} loading={submitting === 'approved'} onClick={() => decide('approved')}>
             {t('clipBackfill.approve')}
-          </button>
+          </Button>
+        </>
+      )}
+    >
+      <p className="text-sm leading-relaxed text-ide-text">
+        {t('clipBackfill.lead', { count: offer.never_indexed })}
+      </p>
+
+      <div className="space-y-1.5 rounded-lg border border-ide-border/60 bg-ide-bg p-3 text-xs">
+        <div className="flex justify-between gap-4">
+          <span className="text-ide-muted">{t('clipBackfill.missing')}</span>
+          <span className="tabular-nums text-ide-text">{offer.never_indexed}</span>
+        </div>
+        {offer.stalled > 0 && (
+          <div className="flex justify-between gap-4">
+            <span className="text-ide-muted">{t('clipBackfill.stalled')}</span>
+            <span className="tabular-nums text-ide-warning">{offer.stalled}</span>
+          </div>
+        )}
+        <div className="flex justify-between gap-4">
+          <span className="text-ide-muted">{t('clipBackfill.estimateLabel')}</span>
+          <span className="text-ide-text">{estimate ?? '—'}</span>
         </div>
       </div>
-    </Dialog>
+
+      {/* The two migration numbers that explain where the gap came from, and
+          which must not be read as one. */}
+      {(offer.skipped_deleted > 0 || offer.failed_imports > 0) && (
+        <div className="space-y-1 text-[11px] leading-relaxed text-ide-muted">
+          {offer.skipped_deleted > 0 && (
+            <p>{t('clipBackfill.skippedDeleted', { count: offer.skipped_deleted })}</p>
+          )}
+          {offer.failed_imports > 0 && (
+            <p className="text-ide-warning-muted">
+              {t('clipBackfill.failedImports', { count: offer.failed_imports })}
+            </p>
+          )}
+        </div>
+      )}
+
+      <p className="text-[11px] leading-relaxed text-ide-muted">
+        {t('clipBackfill.whenItRuns')}
+      </p>
+
+      {error && <Banner tone="error">{error}</Banner>}
+    </OverlayShell>
   );
 }

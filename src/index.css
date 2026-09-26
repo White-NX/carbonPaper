@@ -310,6 +310,56 @@ body {
 }
 
 /*
+ * Overlays (components/overlay/). The backdrop fades, the card rises a few
+ * pixels as it fades, and a wizard step slides in from the side it came from.
+ * Short enough that a prompt appearing at startup never feels like a wait.
+ */
+@keyframes overlay-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes overlay-pop-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes overlay-step-forward {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes overlay-step-back {
+  from { opacity: 0; transform: translateX(-16px); }
+  to { opacity: 1; transform: none; }
+}
+
+.overlay-fade-in {
+  animation: overlay-fade-in 160ms ease-out;
+}
+
+.overlay-pop-in {
+  animation: overlay-pop-in 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.overlay-step-forward {
+  animation: overlay-step-forward 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.overlay-step-back {
+  animation: overlay-step-back 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .overlay-fade-in,
+  .overlay-pop-in,
+  .overlay-step-forward,
+  .overlay-step-back {
+    animation: none;
+  }
+}
+
+/*
  * Content that must keep its own proportions while the camera stretches the
  * band it sits on.
  *

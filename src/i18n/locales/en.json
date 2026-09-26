@@ -505,7 +505,7 @@
         "current_file": "Current: {{file}}",
         "completed": "Completed",
         "cancel": "Cancel",
-        "upgrading": "Upgrading secure index...",
+        "upgrading": "Upgrading the search index…",
         "background_tip": "You can safely close this window. The upgrade will continue in the background, and search results will gradually populate.",
         "preparing": "Initializing migration...",
         "indexing_detailed": "Upgrading secure index: {{processed}} / {{total}}",
@@ -514,8 +514,8 @@
       },
       "vacuum": {
         "dialog_title": "Optimizing database",
-        "running": "Running VACUUM database optimization. Please wait...",
-        "tip": "The database is temporarily locked during optimization. This window cannot be closed and will resume automatically when complete."
+        "running": "Tidying up the database. Please wait…",
+        "tip": "The app is unavailable while this runs and continues automatically when it finishes."
       },
       "deleteConfirm": {
         "title": "Confirm deletion",
@@ -1319,8 +1319,8 @@
     "selectClusterToView": "Select a cluster on the left to view snapshots"
   },
   "authMask": {
-    "title": "Program is Locked",
-    "description": "",
+    "title": "CarbonPaper is locked",
+    "description": "CarbonPaper keeps your screenshots and recognized text encrypted. Verify your identity with Windows Hello to continue.",
     "authenticating": "Authenticating...",
     "unlock_button": "Unlock with PIN",
     "encrypted_label": "Data is encrypted",
@@ -1425,9 +1425,9 @@
   },
   "mask": {
     "model_download": {
-      "title": "Downloading Model Files",
-      "subtitle": "Model files missing, downloading automatically...",
-      "syncing": "Downloading...",
+      "title": "Downloading required components",
+      "subtitle": "Text search and content classification need these components (about {{size}} MB). They are ready to use once the download finishes.",
+      "syncing": "Downloading…",
       "failed": "Download failed: {{error}}",
       "retry": "Retry",
       "downloading_clip": "Downloading Chinese-CLIP model...",
@@ -1576,5 +1576,8 @@
     "summary": "The cluster will use the {{count}} calibrated samples to set matching thresholds for future snapshots.",
     "create": "Create",
     "errorNoThreshold": "Candidate scoring data is incomplete. Please return to the previous step and retry."
+  },
+  "overlay": {
+    "showDetails": "Show details"
   }
 }

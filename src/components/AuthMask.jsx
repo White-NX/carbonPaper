@@ -1,17 +1,21 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Shield, ShieldCheck, Loader2, KeyRound } from 'lucide-react';
+import { Shield, ShieldCheck, KeyRound } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { formatError } from '../lib/errors';
+import { OverlayShell } from './overlay';
+import { Button } from './ui/Button';
+import { Banner } from './ui/Banner';
 
 /**
  * Windows Hello 认证遮罩组件
  * 当用户未认证或会话失效时显示
  */
-export default function AuthMask({ 
-  isVisible, 
-  onAuthSuccess, 
+export default function AuthMask({
+  isVisible,
+  onAuthSuccess,
   authError,
-  setAuthError 
+  setAuthError
 }) {
   const { t } = useTranslation();
   const [isAuthenticating, setIsAuthenticating] = useState(false);
@@ -19,14 +23,14 @@ export default function AuthMask({
   const handleUnlock = async () => {
     setIsAuthenticating(true);
     setAuthError(null);
-    
+
     try {
       // 首先确保凭据已初始化
       await invoke('credential_initialize');
-      
+
       // 请求 Windows Hello 验证
       const result = await invoke('credential_verify_user');
-      
+
       if (result) {
         onAuthSuccess?.();
       } else {
@@ -34,8 +38,8 @@ export default function AuthMask({
       }
     } catch (err) {
       console.error('Authentication error:', err);
-      const message = err?.message || String(err);
-      
+      const message = formatError(err);
+
       if (message.includes('UserCancelled') || message.includes('User cancelled')) {
         setAuthError(t('authMask.errors.cancelled'));
       } else if (message.includes('WindowsHelloNotAvailable')) {
@@ -51,7 +55,7 @@ export default function AuthMask({
             return;
           }
         } catch (retryErr) {
-          setAuthError(t('authMask.errors.init_failed', { error: retryErr?.message || String(retryErr) }));
+          setAuthError(t('authMask.errors.init_failed', { error: formatError(retryErr) }));
         }
       } else {
         setAuthError(t('authMask.errors.generic_failed', { error: message }));
@@ -61,47 +65,28 @@ export default function AuthMask({
     }
   };
 
-  if (!isVisible) return null;
-
   return (
-    <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-ide-bg/80 backdrop-blur-sm text-ide-muted">
-      <div className="w-full max-w-md bg-ide-panel border border-ide-border rounded-xl p-6 shadow-2xl text-center">
-        <div className="mx-auto w-14 h-14 rounded-xl bg-ide-bg border border-ide-border flex items-center justify-center mb-4">
-          <Shield className="w-7 h-7 text-ide-accent" />
-        </div>
+    <OverlayShell
+      open={Boolean(isVisible)}
+      layer="gate"
+      size="sm"
+      icon={Shield}
+      title={t('authMask.title')}
+      centeredHeader
+      bodyClassName="text-center"
+    >
+      <p className="text-sm leading-relaxed text-ide-muted">{t('authMask.description')}</p>
 
-        <h2 className="text-lg font-semibold text-ide-text">{t('authMask.title')}</h2>
-        <p className="text-sm text-ide-muted mt-2 leading-relaxed">{t('authMask.description')}</p>
+      <Button size="md" variant="primary" icon={KeyRound} loading={isAuthenticating} onClick={handleUnlock} className="mt-2 w-full">
+        {isAuthenticating ? t('authMask.authenticating') : t('authMask.unlock_button')}
+      </Button>
 
-        <button
-          onClick={handleUnlock}
-          disabled={isAuthenticating}
-          className="mt-5 w-full flex items-center justify-center gap-2 px-4 py-2 bg-ide-accent hover:bg-ide-accent/90 text-white rounded text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {isAuthenticating ? (
-            <>
-              <Loader2 className="w-4 h-4 animate-spin" />
-              <span>{t('authMask.authenticating')}</span>
-            </>
-          ) : (
-            <>
-              <KeyRound className="w-4 h-4" />
-              <span>{t('authMask.unlock_button')}</span>
-            </>
-          )}
-        </button>
+      {authError && <Banner tone="error" className="text-left">{authError}</Banner>}
 
-        {authError && (
-          <div className="mt-4 flex items-center justify-center gap-2 px-3 py-2 bg-red-500/10 border border-red-500/20 rounded text-sm text-red-400">
-            <span>{authError}</span>
-          </div>
-        )}
-
-        <div className="mt-4 flex items-center justify-center gap-2 text-xs text-ide-muted/70">
-          <ShieldCheck className="w-4 h-4" />
-          <span>{t('authMask.encrypted_label')}</span>
-        </div>
+      <div className="flex items-center justify-center gap-2 pt-1 text-xs text-ide-muted/70">
+        <ShieldCheck className="h-4 w-4" aria-hidden="true" />
+        <span>{t('authMask.encrypted_label')}</span>
       </div>
-    </div>
+    </OverlayShell>
   );
 }

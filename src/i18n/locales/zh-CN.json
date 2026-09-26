@@ -505,7 +505,7 @@
         "current_file": "当前文件: {{file}}",
         "completed": "完成",
         "cancel": "取消",
-        "upgrading": "正在构建安全索引...",
+        "upgrading": "正在升级搜索索引…",
         "background_tip": "您可以放心关闭此窗口。升级将在后台继续进行，搜索结果将随进度逐渐恢复。",
         "preparing": "正在初始化迁移...",
         "indexing_detailed": "正在构建安全索引: {{processed}} / {{total}}",
@@ -513,9 +513,9 @@
         "search_unavailable_desc": "数据库正在进行安全升级，搜索索引正在重建中。在此期间，搜索结果可能不完整或暂时不可用。升级完成后将自动恢复。"
       },
       "vacuum": {
-        "dialog_title": "数据库优化中",
-        "running": "正在执行 VACUUM 数据库优化，请稍候...",
-        "tip": "优化期间将暂时锁定数据库，窗口不可关闭。完成后会自动恢复。"
+        "dialog_title": "正在优化数据库",
+        "running": "正在整理数据库，请稍候…",
+        "tip": "整理期间暂时无法使用应用，完成后会自动恢复。"
       },
       "deleteConfirm": {
         "title": "确认删除",
@@ -1320,7 +1320,7 @@
   },
   "authMask": {
     "title": "已锁定",
-    "description": "Carbonpaper 使用 CNG 加密您的屏幕截图和 OCR 数据，请通过 PIN 来解锁。",
+    "description": "CarbonPaper 会加密保存你的截图和识别出的文字。请通过 Windows Hello 验证身份后继续。",
     "authenticating": "正在验证...",
     "unlock_button": "通过验证解锁",
     "encrypted_label": "数据已被加密",
@@ -1425,9 +1425,9 @@
   },
   "mask": {
     "model_download": {
-      "title": "正在下载模型文件",
-      "subtitle": "检测到模型文件缺失，正在自动下载...",
-      "syncing": "正在下载...",
+      "title": "正在下载必需组件",
+      "subtitle": "文字搜索和内容分类需要这些组件，共约 {{size}} MB，下载完成后即可使用。",
+      "syncing": "正在下载…",
       "failed": "下载失败：{{error}}",
       "retry": "重试",
       "downloading_clip": "正在下载 Chinese-CLIP 模型...",
@@ -1576,5 +1576,8 @@
     "summary": "程序将基于所选的 {{count}} 张样本计算匹配阈值，自动归档后续捕获的相似快照。",
     "create": "创建",
     "errorNoThreshold": "候选样本评分数据异常，请返回上一步重新检索"
+  },
+  "overlay": {
+    "showDetails": "查看详情"
   }
 }
