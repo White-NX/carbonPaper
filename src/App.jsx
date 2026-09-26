@@ -33,9 +33,11 @@ import { useStartupWizards } from './hooks/useStartupWizards';
 import { useUpdateManager } from './hooks/useUpdateManager';
 import { useTauriEventListener } from './hooks/useTauriEventListener';
 import { initAuthListeners } from './lib/auth_api';
+import { OverlayCoordinatorProvider, useOverlayCoordinator } from './components/overlay';
 
 function App() {
   const { t } = useTranslation();
+  const overlays = useOverlayCoordinator();
 
   useEffect(() => initAuthListeners(), []);
 
@@ -226,6 +228,7 @@ function App() {
   };
 
   return (
+    <OverlayCoordinatorProvider value={overlays.value}>
     <div
       data-tauri-drag-region
       className="h-screen w-screen text-ide-text overflow-hidden font-sans topbar-acrylic flex flex-col"
@@ -251,6 +254,7 @@ function App() {
         handlePauseMonitor={handlePauseMonitor}
         handleResumeMonitor={handleResumeMonitor}
         isAuthenticated={isAuthenticated}
+        interfaceLocked={overlays.active !== null}
       />
 
       <div className={`flex-1 min-h-0 flex flex-col overflow-hidden relative ${isMaximized ? '' : 'mx-[3px] mb-[3px] rounded-md'}`}>
@@ -277,8 +281,9 @@ function App() {
 
         <StartupVacuumDialog />
 
-        {/* Top-level, non-dismissable maintenance overlay: covers the whole
-            window (TopBar included) whenever the app is in maintenance mode. */}
+        {/* Startup overlays share this content area and the coordinator shows
+            one at a time (components/overlay/coordinator.js). The top bar is
+            locked while any of them is on screen. */}
         <VectorMigrationOverlay />
 
         {isAuthenticated && <HmacMigrationDialog />}
@@ -290,9 +295,22 @@ function App() {
         />
 
         <SmartClusterSetupWizard
-          isVisible={backendStatus === 'online' && isAuthenticated && !showExtensionSetup && showSmartClusterSetup}
+          isVisible={backendStatus === 'online' && isAuthenticated && showSmartClusterSetup}
           onComplete={handleSmartClusterSetupComplete}
         />
+
+        <UpdateModal
+          isVisible={updateModalVisible}
+          updateInfo={updateInfo}
+          downloading={updateDownloading}
+          downloadProgress={updateDownloadProgress}
+          downloadError={updateDownloadError}
+          onDownload={handleDownloadUpdate}
+          onLater={handleLater}
+          onClose={() => setUpdateModalVisible(false)}
+        />
+
+        <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings} />
 
         <Timeline
           onSelectEvent={(evt) => {
@@ -370,24 +388,12 @@ function App() {
         onClosePanel={() => setShowNotifications(false)}
       />
 
-      <UpdateModal
-        isVisible={updateModalVisible}
-        updateInfo={updateInfo}
-        downloading={updateDownloading}
-        downloadProgress={updateDownloadProgress}
-        downloadError={updateDownloadError}
-        onDownload={handleDownloadUpdate}
-        onLater={handleLater}
-        onClose={() => setUpdateModalVisible(false)}
-      />
-
-      <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings && !updateModalVisible && !showExtensionSetup && !showSmartClusterSetup} />
-
       <OcrModelRepairCard
         isOpen={showOcrModelRepair}
         onClose={() => setShowOcrModelRepair(false)}
       />
     </div>
+    </OverlayCoordinatorProvider>
   );
 }
 

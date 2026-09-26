@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Download, RotateCcw } from 'lucide-react';
 import { useRequiredModelDownload } from '../hooks/useRequiredModelDownload';
 import { downloadSizeMb, missingRequiredModels } from '../lib/modelSizes';
-import { LogDisclosure, OverlayShell, ProgressBlock } from './overlay';
+import { LogDisclosure, OverlayShell, ProgressBlock, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
 
@@ -24,10 +24,11 @@ export default function Mask({ modelsNeedDownload, missingModels, onModelsDownlo
   });
 
   const sizeMb = downloadSizeMb(missingRequiredModels(missingModels));
+  const visible = useOverlaySlot('modelDownload', modelsNeedDownload && !isClosedByUser);
 
   return (
     <OverlayShell
-      open={modelsNeedDownload && !isClosedByUser}
+      open={visible}
       size="lg"
       icon={Download}
       title={t('mask.model_download.title')}

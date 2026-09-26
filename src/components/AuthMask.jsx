@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Shield, ShieldCheck, KeyRound } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { formatError } from '../lib/errors';
-import { OverlayShell } from './overlay';
+import { OverlayShell, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
 
@@ -65,9 +65,11 @@ export default function AuthMask({
     }
   };
 
+  const visible = useOverlaySlot('auth', Boolean(isVisible));
+
   return (
     <OverlayShell
-      open={Boolean(isVisible)}
+      open={visible}
       layer="gate"
       size="sm"
       icon={Shield}

@@ -2,7 +2,7 @@ import React from 'react';
 import PropTypes from 'prop-types';
 import { useTranslation } from 'react-i18next';
 import { Download, RefreshCw, AlertCircle, ArrowUpCircle } from 'lucide-react';
-import { OverlayShell, ProgressBlock } from './overlay';
+import { OverlayShell, ProgressBlock, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
 
@@ -17,8 +17,9 @@ export function UpdateModal({
   onClose
 }) {
   const { t } = useTranslation();
+  const visible = useOverlaySlot('update', Boolean(isVisible && updateInfo));
 
-  if (!isVisible || !updateInfo) return null;
+  if (!visible) return null;
 
   const { version, body, critical } = updateInfo;
   const phase = downloadProgress?.phase || 'downloading';

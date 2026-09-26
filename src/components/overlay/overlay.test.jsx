@@ -1,7 +1,16 @@
 import React from 'react';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { OverlayShell, ProgressBlock } from './index';
+import {
+  OverlayCoordinatorProvider,
+  OverlayShell,
+  ProgressBlock,
+  pickOverlay,
+  showDebugOverlay,
+  useDebugOverlay,
+  useOverlayCoordinator,
+  useOverlaySlot,
+} from './index';
 import { Banner } from '../ui/Banner';
 import { formatError } from '../../lib/errors';
 import { usePolling } from '../../hooks/usePolling';
@@ -106,5 +115,71 @@ describe('usePolling', () => {
     render(<Poller tick={tick} enabled={false} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
     expect(tick).not.toHaveBeenCalled();
+  });
+});
+
+describe('overlay coordinator', () => {
+  function Slot({ id, wants }) {
+    const shown = useOverlaySlot(id, wants);
+    return shown ? <p>{id}</p> : null;
+  }
+
+  function Host({ children, onActive }) {
+    const coordinator = useOverlayCoordinator();
+    onActive?.(coordinator.active);
+    return <OverlayCoordinatorProvider value={coordinator.value}>{children}</OverlayCoordinatorProvider>;
+  }
+
+  it('picks the highest-priority request', () => {
+    expect(pickOverlay({})).toBeNull();
+    expect(pickOverlay({ appBound: true, auth: true, clipBackfill: true })).toBe('auth');
+    expect(pickOverlay({ fatal: true, maintenance: true })).toBe('fatal');
+    expect(pickOverlay({ update: true, onboarding: true })).toBe('onboarding');
+  });
+
+  it('shows one overlay at a time and hands over when it leaves', () => {
+    const { rerender } = render(
+      <Host>
+        <Slot id="clipBackfill" wants />
+        <Slot id="auth" wants />
+      </Host>,
+    );
+    expect(screen.getByText('auth')).toBeInTheDocument();
+    expect(screen.queryByText('clipBackfill')).toBeNull();
+
+    rerender(
+      <Host>
+        <Slot id="clipBackfill" wants />
+        <Slot id="auth" wants={false} />
+      </Host>,
+    );
+    expect(screen.queryByText('auth')).toBeNull();
+    expect(screen.getByText('clipBackfill')).toBeInTheDocument();
+  });
+
+  it('releases a slot when its overlay unmounts', () => {
+    const seen = [];
+    const { rerender } = render(<Host onActive={(id) => seen.push(id)}><Slot id="hmac" wants /></Host>);
+    expect(seen.at(-1)).toBe('hmac');
+    rerender(<Host onActive={(id) => seen.push(id)} />);
+    expect(seen.at(-1)).toBeNull();
+  });
+
+  it('grants every request outside a coordinator', () => {
+    render(<Slot id="appBound" wants />);
+    expect(screen.getByText('appBound')).toBeInTheDocument();
+  });
+
+  it('routes debug previews by id', () => {
+    const handler = vi.fn();
+    function Listener() {
+      useDebugOverlay('update', handler);
+      return null;
+    }
+    render(<Listener />);
+    act(() => showDebugOverlay('appBound'));
+    expect(handler).not.toHaveBeenCalled();
+    act(() => showDebugOverlay('update', 'critical'));
+    expect(handler).toHaveBeenCalledWith('critical');
   });
 });

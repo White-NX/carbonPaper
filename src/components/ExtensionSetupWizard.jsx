@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Loader2, Globe, Check } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../lib/auth_api';
+import { useOverlaySlot } from './overlay';
 
 export default function ExtensionSetupWizard({ isVisible, onComplete }) {
   const { t } = useTranslation();
@@ -69,7 +70,8 @@ export default function ExtensionSetupWizard({ isVisible, onComplete }) {
     onComplete?.();
   };
 
-  if (!isVisible) return null;
+  const shown = useOverlaySlot('extensionSetup', isVisible);
+  if (!shown) return null;
 
   const anySelected = selectedBrowsers.chrome || selectedBrowsers.edge;
 

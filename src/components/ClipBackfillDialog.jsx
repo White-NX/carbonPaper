@@ -4,7 +4,7 @@ import { Images } from 'lucide-react';
 import { getClipBackfillOffer, setClipBackfillDecision } from '../lib/semantic_api';
 import { formatError } from '../lib/errors';
 import { usePolling } from '../hooks/usePolling';
-import { OverlayShell } from './overlay';
+import { OverlayShell, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
 
@@ -98,7 +98,8 @@ export default function ClipBackfillDialog() {
 
   const estimate = formatEstimate(t, offer?.estimated_seconds);
   const isOpen = Boolean(offer?.should_ask) && !dismissed;
-  if (!isOpen) return null;
+  const visible = useOverlaySlot('clipBackfill', isOpen);
+  if (!visible) return null;
 
   const busy = submitting !== null;
 

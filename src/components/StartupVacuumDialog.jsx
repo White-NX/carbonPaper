@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { Database } from 'lucide-react';
 import { usePolling } from '../hooks/usePolling';
-import { OverlayShell, ProgressBlock } from './overlay';
+import { OverlayShell, ProgressBlock, useOverlaySlot } from './overlay';
 
 export default function StartupVacuumDialog() {
   const { t } = useTranslation();
@@ -64,9 +64,11 @@ export default function StartupVacuumDialog() {
     }
   }, { intervalMs: 1000, enabled: polling });
 
+  const visible = useOverlaySlot('vacuum', isOpen);
+
   return (
     <OverlayShell
-      open={isOpen}
+      open={visible}
       layer="maintenance"
       size="sm"
       icon={Database}

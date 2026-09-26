@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import xibaoImg from '../assets/images/xibao.jpg';
 import { OVERLAY_LAYERS } from './overlay/layers';
+import { useOverlaySlot } from './overlay/coordinator';
 import musicFile from '../assets/music/La Marcha Radetzky - Johann Strauss (1848).mp3';
 
 /**
@@ -26,6 +27,10 @@ export default function ErrorWindow({ isVisible, errors = [], logPath = '', onRe
   const toggleMode = () => {
     setMode((prev) => (prev === 'xibao' ? 'normal' : 'xibao'));
   };
+
+  // Registered so every other startup overlay steps aside. The fatal layer
+  // always wins, so the grant itself is not consulted.
+  useOverlaySlot('fatal', isVisible);
 
   if (!isVisible) return null;
 

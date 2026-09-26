@@ -3,6 +3,17 @@ import { invoke } from '@tauri-apps/api/core';
 import { useTauriEventListener } from './useTauriEventListener';
 import { openSettingsWindow } from '../lib/settings_api';
 import { withAuth } from '../lib/auth_api';
+import { showDebugOverlay } from '../components/overlay/coordinator';
+
+// Developer-tools preview names mapped to `[overlayId, variant]`.
+const OVERLAY_PREVIEWS = {
+  update: ['update'],
+  'critical-update': ['update', 'critical'],
+  extension: ['extensionSetup'],
+  'smart-cluster': ['smartClusterSetup'],
+  'app-bound': ['appBound'],
+  'app-bound-repair': ['appBound', 'repair'],
+};
 
 export function useSettingsHost({ onMonitorAction, onRecordsChanged, onClosed, onError }) {
   const [showSettings, setShowSettings] = useState(false);
@@ -36,12 +47,7 @@ export function useSettingsHost({ onMonitorAction, onRecordsChanged, onClosed, o
     const commands = { error: 'trigger_test_error', ocr: 'debug_trigger_ocr_model_repair_notification' };
     try {
       if (commands[payload]) await withAuth(() => invoke(commands[payload]), { autoPrompt: true });
-      else if (payload === 'update' || payload === 'critical-update') window.dispatchEvent(new CustomEvent('debug-update-modal', { detail: { critical: payload === 'critical-update' } }));
-      else if (payload === 'app-bound' || payload === 'app-bound-repair') window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer', { detail: { repair: payload === 'app-bound-repair' } }));
-      else {
-        const events = { extension: 'debug-show-extension-wizard', 'smart-cluster': 'debug-show-smart-cluster-wizard' };
-        if (events[payload]) window.dispatchEvent(new CustomEvent(events[payload]));
-      }
+      else if (OVERLAY_PREVIEWS[payload]) showDebugOverlay(...OVERLAY_PREVIEWS[payload]);
     } catch (error) { onError?.(error); }
   });
   useTauriEventListener('settings-preferences-changed', ({ payload }) => {

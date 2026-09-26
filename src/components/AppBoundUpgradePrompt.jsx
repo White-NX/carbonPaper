@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ShieldCheck } from 'lucide-react';
 import { getAppBoundStatus, installAppBound, dismissAppBoundOffer, appBoundErrorMessage } from '../lib/app_bound_api';
-import { OverlayShell } from './overlay';
+import { OverlayShell, useDebugOverlay, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
 
@@ -21,17 +21,14 @@ export default function AppBoundUpgradePrompt({ visible }) {
     }).catch(() => {});
     return () => { alive = false; };
   }, [visible, debugPreview]);
-  useEffect(() => {
-    const showDebugPreview = (event) => {
-      setRepair(Boolean(event.detail?.repair));
-      setError('');
-      setBusy(false);
-      setDebugPreview(true);
-    };
-    window.addEventListener('debug-show-app-bound-offer', showDebugPreview);
-    return () => window.removeEventListener('debug-show-app-bound-offer', showDebugPreview);
-  }, []);
-  if (!(debugPreview || (visible && offered))) return null;
+  useDebugOverlay('appBound', (variant) => {
+    setRepair(variant === 'repair');
+    setError('');
+    setBusy(false);
+    setDebugPreview(true);
+  });
+  const shown = useOverlaySlot('appBound', debugPreview || (visible && offered));
+  if (!shown) return null;
   const later = async () => {
     if (debugPreview) {
       setDebugPreview(false);

@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { withAuth } from '../lib/auth_api';
 import { formatError } from '../lib/errors';
-import { OverlayShell, ProgressBlock } from './overlay';
+import { OverlayShell, ProgressBlock, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
 
@@ -74,10 +74,11 @@ export default function HmacMigrationDialog() {
   }, []);
 
   const close = () => setIsOpen(false);
+  const visible = useOverlaySlot('hmac', isOpen);
 
   return (
     <OverlayShell
-      open={isOpen}
+      open={visible}
       onDismiss={close}
       size="lg"
       icon={ShieldCheck}

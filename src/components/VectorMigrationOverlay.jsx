@@ -10,7 +10,7 @@ import {
 import { getBlindIndexRepairStatus, getMaintenanceStatus } from '../lib/semantic_api';
 import { requestAuth } from '../lib/auth_api';
 import { usePolling } from '../hooks/usePolling';
-import { OverlayShell, ProgressBlock } from './overlay';
+import { OverlayShell, ProgressBlock, useOverlaySlot } from './overlay';
 import { Button } from './ui/Button';
 import { Banner } from './ui/Banner';
 
@@ -103,8 +103,9 @@ export default function VectorMigrationOverlay() {
 
   const running = Boolean(active?.status?.running);
   usePolling(poll, { intervalMs: running ? ACTIVE_POLL_MS : IDLE_POLL_MS });
+  const visible = useOverlaySlot('maintenance', Boolean(active));
 
-  if (!active) return null;
+  if (!visible) return null;
 
   const status = active.status ?? {};
   const kindKey = `vectorMigration.kinds.${active.kind}`;

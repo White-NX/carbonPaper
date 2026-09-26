@@ -4,6 +4,7 @@ import { Sparkles, Download, Loader2, Info, AlertCircle, RotateCcw, CheckCircle2
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { withAuth } from '../lib/auth_api';
+import { useOverlaySlot } from './overlay';
 
 /**
  * Smart Cluster Setup Wizard.
@@ -106,7 +107,8 @@ export default function SmartClusterSetupWizard({ isVisible, onComplete }) {
     onComplete?.(true);
   };
 
-  if (!isVisible) return null;
+  const shown = useOverlaySlot('smartClusterSetup', isVisible);
+  if (!shown) return null;
 
   return (
     <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-ide-bg/80 backdrop-blur-sm text-ide-muted">

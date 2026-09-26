@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { checkForUpdate, downloadAndInstallUpdate } from '../lib/update_api';
+import { useDebugOverlay } from '../components/overlay/coordinator';
 
 export function useUpdateManager() {
   const [updateModalVisible, setUpdateModalVisible] = useState(false);
@@ -26,18 +27,14 @@ export function useUpdateManager() {
     return () => clearTimeout(timer);
   }, []);
 
-  useEffect(() => {
-    const handler = (e) => {
-      setUpdateInfo({
-        version: '9.9.9-debug',
-        body: 'This is a debug update payload.\n- It supports multiline text.\n- And lists.\n\nEnjoy testing the update modal!',
-        critical: e.detail?.critical || false,
-      });
-      setUpdateModalVisible(true);
-    };
-    window.addEventListener('debug-update-modal', handler);
-    return () => window.removeEventListener('debug-update-modal', handler);
-  }, []);
+  useDebugOverlay('update', (variant) => {
+    setUpdateInfo({
+      version: '9.9.9-debug',
+      body: 'This is a debug update payload.\n- It supports multiline text.\n- And lists.\n\nEnjoy testing the update modal!',
+      critical: variant === 'critical',
+    });
+    setUpdateModalVisible(true);
+  });
 
   const handleDownloadUpdate = async () => {
     setUpdateDownloading(true);

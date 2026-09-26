@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { withAuth } from '../lib/auth_api';
+import { useDebugOverlay } from '../components/overlay/coordinator';
 
 export function useStartupWizards({ backendStatus, isAuthenticated, setActiveTab }) {
   const [showExtensionSetup, setShowExtensionSetup] = useState(false);
@@ -54,24 +55,14 @@ export function useStartupWizards({ backendStatus, isAuthenticated, setActiveTab
     return () => { cancelled = true; };
   }, [backendStatus, isAuthenticated]);
 
-  useEffect(() => {
-    const showExtension = () => {
-      setShowSmartClusterSetup(false);
-      setShowExtensionSetup(true);
-    };
-    const showSmartCluster = () => {
-      setShowExtensionSetup(false);
-      setShowSmartClusterSetup(true);
-    };
-
-    window.addEventListener('debug-show-extension-wizard', showExtension);
-    window.addEventListener('debug-show-smart-cluster-wizard', showSmartCluster);
-
-    return () => {
-      window.removeEventListener('debug-show-extension-wizard', showExtension);
-      window.removeEventListener('debug-show-smart-cluster-wizard', showSmartCluster);
-    };
-  }, []);
+  useDebugOverlay('extensionSetup', () => {
+    setShowSmartClusterSetup(false);
+    setShowExtensionSetup(true);
+  });
+  useDebugOverlay('smartClusterSetup', () => {
+    setShowExtensionSetup(false);
+    setShowSmartClusterSetup(true);
+  });
 
   const handleExtensionSetupComplete = useCallback(() => {
     setShowExtensionSetup(false);
