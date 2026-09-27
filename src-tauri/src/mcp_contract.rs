@@ -19,6 +19,32 @@ pub const TOOL_NAMES: &[&str] = &[
     "delete_smart_cluster_summary",
 ];
 
+/// Tools that change stored data. In-app AI callers only receive them when a
+/// caller explicitly opts in; interactive AI search never does.
+pub const WRITE_TOOL_NAMES: &[&str] = &[
+    "upsert_smart_cluster_summary",
+    "delete_smart_cluster_summary",
+];
+
+pub fn is_write_tool(name: &str) -> bool {
+    WRITE_TOOL_NAMES.contains(&name)
+}
+
+/// The catalog without the tools listed in [`WRITE_TOOL_NAMES`].
+pub fn read_only_tool_definitions() -> Vec<Value> {
+    tool_definitions()
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !is_write_tool(name))
+        })
+        .cloned()
+        .collect()
+}
+
 pub fn tool_definitions() -> Value {
     json!([
         {
@@ -188,6 +214,18 @@ mod tests {
             names.iter().copied().collect::<HashSet<_>>().len(),
             names.len()
         );
+    }
+
+    #[test]
+    fn write_tools_are_catalog_members_and_excluded_from_the_read_only_view() {
+        for name in WRITE_TOOL_NAMES {
+            assert!(TOOL_NAMES.contains(name));
+        }
+        let read_only = read_only_tool_definitions();
+        assert_eq!(read_only.len(), TOOL_NAMES.len() - WRITE_TOOL_NAMES.len());
+        assert!(read_only.iter().all(|tool| {
+            !is_write_tool(tool.get("name").and_then(Value::as_str).unwrap_or(""))
+        }));
     }
 
     #[test]

@@ -340,12 +340,12 @@ macro_rules! define_mcp_tool_dispatch {
         const DISPATCHED_TOOL_NAMES: &[&str] = &[$($name),+];
 
         async fn dispatch_mcp_tool(
-            state: &McpServerInner,
+            app_handle: &tauri::AppHandle,
             tool_name: &str,
             args: Value,
         ) -> Result<Value, String> {
             match tool_name {
-                $($name => $handler(state, args).await,)+
+                $($name => $handler(app_handle, args).await,)+
                 _ => Err(format!("Unknown tool: {}", tool_name)),
             }
         }
@@ -364,6 +364,21 @@ define_mcp_tool_dispatch!(
     "delete_smart_cluster_summary" => tool_delete_smart_cluster_summary,
 );
 
+/// Runs one contract tool in-process.
+///
+/// The MCP HTTP handler and the built-in AI search share this entry point, so
+/// both see the same session check, maintenance gate and privacy filtering.
+pub async fn call_tool(
+    app_handle: &tauri::AppHandle,
+    tool_name: &str,
+    args: Value,
+) -> Result<Value, String> {
+    if crate::maintenance::is_active() {
+        return Err(crate::maintenance::MAINTENANCE_IN_PROGRESS.into());
+    }
+    dispatch_mcp_tool(app_handle, tool_name, args).await
+}
+
 async fn handle_tools_call(
     state: &McpServerInner,
     id: Option<Value>,
@@ -374,14 +389,6 @@ async fn handle_tools_call(
         None => return JsonRpcResponse::error(id, -32602, "Missing params".into()),
     };
 
-    if crate::maintenance::is_active() {
-        return JsonRpcResponse::error(
-            id,
-            -32000,
-            crate::maintenance::MAINTENANCE_IN_PROGRESS.into(),
-        );
-    }
-
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params
         .get("arguments")
@@ -390,7 +397,7 @@ async fn handle_tools_call(
 
     tracing::info!("MCP tools/call: tool={}", tool_name);
 
-    let result = dispatch_mcp_tool(state, tool_name, args).await;
+    let result = call_tool(&state.app_handle, tool_name, args).await;
 
     match result {
         Ok(content) => {
@@ -900,8 +907,8 @@ mod privacy_filter_tests {
     }
 }
 
-async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
+async fn tool_get_snapshots(app_handle: &tauri::AppHandle, args: Value) -> Result<Value, String> {
+    require_authenticated_session(app_handle)?;
 
     let start_time = args
         .get("start_time")
@@ -925,9 +932,9 @@ async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value
         end_time
     };
 
-    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
-    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
+    let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
 
     let records: Vec<_> = tokio::task::spawn_blocking(move || {
@@ -983,8 +990,8 @@ async fn tool_get_snapshots(state: &McpServerInner, args: Value) -> Result<Value
     Ok(Value::Array(output))
 }
 
-async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
+async fn tool_get_snapshot_details(app_handle: &tauri::AppHandle, args: Value) -> Result<Value, String> {
+    require_authenticated_session(app_handle)?;
 
     let id = args
         .get("id")
@@ -995,9 +1002,9 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
-    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
+    let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -1074,8 +1081,8 @@ async fn tool_get_snapshot_details(state: &McpServerInner, args: Value) -> Resul
     }))
 }
 
-async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
+async fn tool_search_ocr(app_handle: &tauri::AppHandle, args: Value) -> Result<Value, String> {
+    require_authenticated_session(app_handle)?;
 
     let query = args
         .get("query")
@@ -1094,9 +1101,9 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
         .get("categories")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
-    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
+    let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
 
     let results = tokio::task::spawn_blocking(move || {
@@ -1151,8 +1158,8 @@ async fn tool_search_ocr(state: &McpServerInner, args: Value) -> Result<Value, S
     Ok(serde_json::to_value(&stripped).unwrap_or(Value::Null))
 }
 
-async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
+async fn tool_search_nl(app_handle: &tauri::AppHandle, args: Value) -> Result<Value, String> {
+    require_authenticated_session(app_handle)?;
 
     let query = args
         .get("query")
@@ -1184,7 +1191,7 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
 
     // Use the same Rust CLIP path as the application search surface.
     let rust = crate::clip_query::try_rust_clip_query(
-        &state.app_handle,
+        app_handle,
         crate::clip_query::ClipQueryRequest {
             query: &query,
             limit,
@@ -1203,7 +1210,7 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
         }
     };
 
-    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
+    let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let mode = filter.mode();
     let items: Vec<Value> = items
         .into_iter()
@@ -1252,7 +1259,7 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
         .collect();
 
     let hash_to_id = if !hashes.is_empty() {
-        let storage = state.app_handle.state::<Arc<StorageState>>();
+        let storage = app_handle.state::<Arc<StorageState>>();
         let storage = storage.inner().clone();
         tokio::task::spawn_blocking(move || storage.batch_get_screenshot_ids_by_hash(&hashes))
             .await
@@ -1306,12 +1313,12 @@ async fn tool_search_nl(state: &McpServerInner, args: Value) -> Result<Value, St
     Ok(Value::Array(cleaned))
 }
 
-async fn tool_get_smart_clusters(state: &McpServerInner, _args: Value) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
+async fn tool_get_smart_clusters(app_handle: &tauri::AppHandle, _args: Value) -> Result<Value, String> {
+    require_authenticated_session(app_handle)?;
 
-    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
-    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
+    let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
 
     let clusters = tokio::task::spawn_blocking(move || {
@@ -1335,10 +1342,10 @@ async fn tool_get_smart_clusters(state: &McpServerInner, _args: Value) -> Result
 }
 
 async fn tool_get_smart_cluster_ocr_corpus(
-    state: &McpServerInner,
+    app_handle: &tauri::AppHandle,
     args: Value,
 ) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
+    require_authenticated_session(app_handle)?;
 
     let cluster_id = args
         .get("cluster_id")
@@ -1360,9 +1367,9 @@ async fn tool_get_smart_cluster_ocr_corpus(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
-    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
+    let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
 
     let items = tokio::task::spawn_blocking(move || {
@@ -1403,19 +1410,19 @@ async fn tool_get_smart_cluster_ocr_corpus(
 }
 
 async fn tool_get_smart_cluster_summary(
-    state: &McpServerInner,
+    app_handle: &tauri::AppHandle,
     args: Value,
 ) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
+    require_authenticated_session(app_handle)?;
 
     let cluster_id = args
         .get("cluster_id")
         .or_else(|| args.get("smart_cluster_id"))
         .and_then(|v| v.as_i64())
         .ok_or("Missing required parameter: cluster_id")?;
-    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
-    let filter = state.app_handle.state::<Arc<SensitiveFilterState>>();
+    let filter = app_handle.state::<Arc<SensitiveFilterState>>();
     let filter = filter.inner().clone();
 
     let summary = tokio::task::spawn_blocking(move || {
@@ -1432,10 +1439,10 @@ async fn tool_get_smart_cluster_summary(
 }
 
 async fn tool_upsert_smart_cluster_summary(
-    state: &McpServerInner,
+    app_handle: &tauri::AppHandle,
     args: Value,
 ) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
+    require_authenticated_session(app_handle)?;
 
     let cluster_id = args
         .get("cluster_id")
@@ -1462,7 +1469,7 @@ async fn tool_upsert_smart_cluster_summary(
         prompt_version: as_string("prompt_version"),
     };
 
-    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
     let saved = tokio::task::spawn_blocking(move || storage.upsert_smart_cluster_summary(&input))
         .await
@@ -1475,17 +1482,17 @@ async fn tool_upsert_smart_cluster_summary(
 }
 
 async fn tool_delete_smart_cluster_summary(
-    state: &McpServerInner,
+    app_handle: &tauri::AppHandle,
     args: Value,
 ) -> Result<Value, String> {
-    require_authenticated_session(&state.app_handle)?;
+    require_authenticated_session(app_handle)?;
 
     let cluster_id = args
         .get("cluster_id")
         .or_else(|| args.get("smart_cluster_id"))
         .and_then(|v| v.as_i64())
         .ok_or("Missing required parameter: cluster_id")?;
-    let storage = state.app_handle.state::<Arc<StorageState>>();
+    let storage = app_handle.state::<Arc<StorageState>>();
     let storage = storage.inner().clone();
     let deleted =
         tokio::task::spawn_blocking(move || storage.delete_smart_cluster_summary(cluster_id))
