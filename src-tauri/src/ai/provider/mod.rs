@@ -3,6 +3,7 @@
 //! The agent loop speaks only these types. Each protocol module turns them into
 //! its own request body and parses its own stream back into [`ChatResponse`].
 
+mod anthropic;
 mod openai_compat;
 mod sse;
 
@@ -226,9 +227,9 @@ pub async fn complete(
             ProviderKind::OpenaiCompatible => {
                 openai_compat::complete(client, provider, request, on_event).await
             }
-            ProviderKind::Anthropic => Err(ProviderError::BadRequest(
-                "Anthropic endpoints are not supported yet".into(),
-            )),
+            ProviderKind::Anthropic => {
+                anthropic::complete(client, provider, request, on_event).await
+            }
         }
     };
     tokio::select! {
@@ -301,6 +302,123 @@ pub async fn test_connection(provider: &ResolvedProvider) -> ConnectionTest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::config::{ProviderKind, ToolCalling};
+    use axum::{http::HeaderMap, routing::post, Router};
+
+    /// Serves `body` as an event stream on a loopback port and records the
+    /// credential header each request carried.
+    async fn serve(
+        path: &'static str,
+        body: &'static str,
+        header: &'static str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let app = Router::new().route(
+            path,
+            post(move |headers: HeaderMap| {
+                let recorder = recorder.clone();
+                async move {
+                    let value = headers
+                        .get(header)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    recorder.lock().unwrap().push(value);
+                    ([("content-type", "text/event-stream")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn provider(kind: ProviderKind, base_url: String) -> ResolvedProvider {
+        ResolvedProvider {
+            kind,
+            base_url,
+            model: "m".into(),
+            api_key: Some("secret".into()),
+            tool_calling: ToolCalling::Unknown,
+        }
+    }
+
+    async fn run(provider: &ResolvedProvider) -> (ChatResponse, String) {
+        let request = ChatRequest {
+            messages: vec![Message::User("hi".into())],
+            ..Default::default()
+        };
+        let mut streamed = String::new();
+        let mut on_event = |StreamEvent::TextDelta(text): StreamEvent| streamed.push_str(&text);
+        let response = complete(
+            &http_client().unwrap(),
+            provider,
+            &request,
+            &mut on_event,
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap();
+        (response, streamed)
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_streams_over_http() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base, seen) = serve("/v1/chat/completions", body, "authorization").await;
+        let (response, streamed) = run(&provider(
+            ProviderKind::OpenaiCompatible,
+            format!("{base}/v1"),
+        ))
+        .await;
+        assert_eq!(response.text, "Hello");
+        assert_eq!(streamed, "Hello");
+        assert_eq!(seen.lock().unwrap().as_slice(), ["Bearer secret"]);
+    }
+
+    #[tokio::test]
+    async fn anthropic_streams_over_http() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (base, seen) = serve("/v1/messages", body, "x-api-key").await;
+        let (response, streamed) = run(&provider(ProviderKind::Anthropic, base)).await;
+        assert_eq!(response.text, "Hi");
+        assert_eq!(streamed, "Hi");
+        assert_eq!(response.usage.map(|u| u.input_tokens), Some(3));
+        assert_eq!(seen.lock().unwrap().as_slice(), ["secret"]);
+    }
+
+    #[tokio::test]
+    async fn http_errors_become_provider_errors() {
+        let (base, _) = serve("/elsewhere", "", "authorization").await;
+        let request = ChatRequest::default();
+        let error = complete(
+            &http_client().unwrap(),
+            &provider(ProviderKind::OpenaiCompatible, base),
+            &request,
+            &mut |_| {},
+            &Cancellation::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ProviderError::NotFound(_)));
+    }
 
     #[test]
     fn error_bodies_are_reduced_to_their_message() {

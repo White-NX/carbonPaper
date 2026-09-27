@@ -4,6 +4,7 @@ import {
 } from '../../../lib/ai_api';
 
 export const PROVIDER_PRESETS = [
+  { id: 'anthropic', name: 'Claude', kind: 'anthropic', baseUrl: 'https://api.anthropic.com', model: 'claude-opus-5' },
   { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
   { id: 'qwen', name: 'Qwen', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
   { id: 'kimi', name: 'Kimi', baseUrl: 'https://api.moonshot.cn/v1', model: 'kimi-k2-0905-preview' },
@@ -65,7 +66,11 @@ export function useAiProviders({ t }) {
   const updateDraft = (patch) => setDraft((current) => ({ ...current, ...patch, ...('apiKey' in patch ? { keyTouched: true } : {}) }));
   const applyPreset = (presetId) => {
     const preset = PROVIDER_PRESETS.find((item) => item.id === presetId);
-    if (preset) setDraft((current) => ({ ...current, name: preset.name, baseUrl: preset.baseUrl, model: preset.model || current.model }));
+    if (preset) {
+      setDraft((current) => ({
+        ...current, name: preset.name, kind: preset.kind || 'openai_compatible', baseUrl: preset.baseUrl, model: preset.model || current.model,
+      }));
+    }
   };
 
   const save = () => run('save', async () => {

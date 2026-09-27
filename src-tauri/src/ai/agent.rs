@@ -12,9 +12,9 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use super::config::ResolvedProvider;
+use super::config::{ResolvedProvider, ToolCalling};
 use super::provider::{
-    self, Cancellation, ChatRequest, Message, ProviderError, StreamEvent, Usage,
+    self, Cancellation, ChatRequest, Message, ProviderError, StreamEvent, ToolCall, ToolSpec, Usage,
 };
 use super::tools::{self, SnapshotRef};
 
@@ -114,6 +114,37 @@ after the statement they support. Use the screenshot id, not an OCR row id.\n\
     )
 }
 
+/// Searches run up front for a model that cannot call tools. The question is
+/// used as-is, which suits visual search well and literal text search less so.
+fn prefetch_calls(question: &str) -> Vec<ToolCall> {
+    vec![
+        ToolCall {
+            id: "prefetch_ocr".into(),
+            name: "search_ocr_text".into(),
+            arguments: serde_json::json!({ "query": question, "limit": 15, "fuzzy": true })
+                .to_string(),
+        },
+        ToolCall {
+            id: "prefetch_nl".into(),
+            name: "search_nl".into(),
+            arguments: serde_json::json!({ "query": question, "limit": 10 }).to_string(),
+        },
+    ]
+}
+
+fn prefetched_prompt(question: &str, results: &[(String, String)]) -> String {
+    let mut prompt = format!(
+        "{question}\n\nYou cannot search yourself this time. These results were found \
+for the question above; answer from them alone and cite screenshots as [#id].\n"
+    );
+    for (name, content) in results {
+        prompt.push_str(&format!(
+            "\n<result tool=\"{name}\">\n{content}\n</result>\n"
+        ));
+    }
+    prompt
+}
+
 const FORCE_ANSWER_PROMPT: &str = "Stop searching now. Answer the original question \
 using only what the tool results above show, cite screenshots as [#id], and say what \
 remains unknown.";
@@ -128,10 +159,6 @@ pub async fn run(
 ) -> Result<AgentOutcome, ProviderError> {
     let client = provider::http_client().map_err(ProviderError::Network)?;
     let specs = tools::read_only_specs();
-    let mut messages = vec![
-        Message::System(system_prompt(chrono::Local::now())),
-        Message::User(question.to_string()),
-    ];
     let mut outcome = AgentOutcome {
         answer: String::new(),
         snapshots: Vec::new(),
@@ -142,10 +169,28 @@ pub async fn run(
         truncated: false,
     };
 
+    // A model that cannot call tools gets one round of searches done for it
+    // and a single answering step.
+    let tools_supported = provider_config.tool_calling != ToolCalling::Unsupported;
+    let first_user_message = if tools_supported {
+        question.to_string()
+    } else {
+        let mut results = Vec::new();
+        for call in prefetch_calls(question) {
+            let content = run_tool(app_handle, &call, &specs, sink, cancel, &mut outcome).await?;
+            results.push((call.name, content));
+        }
+        prefetched_prompt(question, &results)
+    };
+    let mut messages = vec![
+        Message::System(system_prompt(chrono::Local::now())),
+        Message::User(first_user_message),
+    ];
+
     loop {
         let over_budget = outcome.usage.input_tokens >= limits.input_token_budget;
-        let last_step = outcome.steps + 1 >= limits.max_steps || over_budget;
-        if last_step && outcome.tool_calls > 0 {
+        let last_step = !tools_supported || outcome.steps + 1 >= limits.max_steps || over_budget;
+        if last_step && tools_supported && outcome.tool_calls > 0 {
             messages.push(Message::User(FORCE_ANSWER_PROMPT.into()));
         }
         let request = ChatRequest {
@@ -173,7 +218,7 @@ pub async fn run(
         if response.tool_calls.is_empty() || last_step {
             outcome.answer = response.text;
             outcome.truncated = response.truncated;
-            outcome.stopped_early = last_step && outcome.tool_calls > 0;
+            outcome.stopped_early = tools_supported && last_step && outcome.tool_calls > 0;
             return Ok(outcome);
         }
 
@@ -186,25 +231,7 @@ pub async fn run(
                 return Err(ProviderError::Cancelled);
             }
             let result = if index < limits.max_calls_per_step {
-                sink(AgentEvent::ToolStarted {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: serde_json::from_str(&call.arguments).unwrap_or(Value::Null),
-                });
-                outcome.tool_calls += 1;
-                let result = tokio::select! {
-                    result = tools::execute(app_handle, call, &specs) => result,
-                    _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-                };
-                sink(AgentEvent::ToolFinished {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    ok: result.error.is_none(),
-                    item_count: result.item_count,
-                    snapshots: result.snapshots.clone(),
-                });
-                tools::merge_snapshots(&mut outcome.snapshots, result.snapshots);
-                result.content
+                run_tool(app_handle, call, &specs, sink, cancel, &mut outcome).await?
             } else {
                 // Every call id needs a reply or the next request is rejected.
                 serde_json::json!({ "error": "Too many tool calls in one step; this one was skipped." })
@@ -216,6 +243,36 @@ pub async fn run(
             });
         }
     }
+}
+
+/// Runs one tool call, reporting it to `sink` and recording what it found.
+async fn run_tool(
+    app_handle: &tauri::AppHandle,
+    call: &ToolCall,
+    specs: &[ToolSpec],
+    sink: &mut (dyn FnMut(AgentEvent) + Send),
+    cancel: &Cancellation,
+    outcome: &mut AgentOutcome,
+) -> Result<String, ProviderError> {
+    sink(AgentEvent::ToolStarted {
+        call_id: call.id.clone(),
+        name: call.name.clone(),
+        arguments: serde_json::from_str(&call.arguments).unwrap_or(Value::Null),
+    });
+    outcome.tool_calls += 1;
+    let result = tokio::select! {
+        result = tools::execute(app_handle, call, specs) => result,
+        _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+    };
+    sink(AgentEvent::ToolFinished {
+        call_id: call.id.clone(),
+        name: call.name.clone(),
+        ok: result.error.is_none(),
+        item_count: result.item_count,
+        snapshots: result.snapshots.clone(),
+    });
+    tools::merge_snapshots(&mut outcome.snapshots, result.snapshots);
+    Ok(result.content)
 }
 
 #[cfg(test)]
@@ -232,6 +289,21 @@ mod tests {
         assert!(prompt.contains("2026-09-27 18:30:00"));
         assert!(prompt.contains(&now.timestamp_millis().to_string()));
         assert!(prompt.contains("[#123]"));
+    }
+
+    #[test]
+    fn prefetch_uses_read_only_search_tools_and_embeds_their_results() {
+        let calls = prefetch_calls("月亮");
+        let specs = tools::read_only_specs();
+        assert!(calls
+            .iter()
+            .all(|call| specs.iter().any(|spec| spec.name == call.name)));
+        let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(args["query"], "月亮");
+
+        let prompt = prefetched_prompt("q", &[("search_nl".into(), "[1]".into())]);
+        assert!(prompt.starts_with("q\n"));
+        assert!(prompt.contains("<result tool=\"search_nl\">\n[1]\n</result>"));
     }
 
     #[test]

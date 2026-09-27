@@ -40,12 +40,19 @@ function ProviderEditor({ c, t }) {
             onChange={(e) => c.updateDraft({ name: e.target.value })} className={inputClass} />
         </Field>
         <Field label={t('settings.ai.fields.model')}>
-          <input value={draft.model} disabled={disabled} placeholder="deepseek-chat"
+          <input value={draft.model} disabled={disabled} placeholder={draft.kind === 'anthropic' ? 'claude-opus-5' : 'deepseek-chat'}
             onChange={(e) => c.updateDraft({ model: e.target.value })} className={inputClass} spellCheck={false} />
         </Field>
       </div>
-      <Field label={t('settings.ai.fields.base_url')} hint={t('settings.ai.fields.base_url_hint')}>
-        <input value={draft.baseUrl} disabled={disabled} placeholder="https://api.example.com/v1"
+      <Field label={t('settings.ai.fields.kind')}>
+        <SettingsSelect value={draft.kind} disabled={disabled} label={t('settings.ai.fields.kind')} onChange={(kind) => c.updateDraft({ kind })}
+          options={[
+            { value: 'openai_compatible', label: t('settings.ai.kinds.openai_compatible') },
+            { value: 'anthropic', label: t('settings.ai.kinds.anthropic') },
+          ]} />
+      </Field>
+      <Field label={t('settings.ai.fields.base_url')} hint={t(draft.kind === 'anthropic' ? 'settings.ai.fields.base_url_hint_anthropic' : 'settings.ai.fields.base_url_hint')}>
+        <input value={draft.baseUrl} disabled={disabled} placeholder={draft.kind === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.example.com/v1'}
           onChange={(e) => c.updateDraft({ baseUrl: e.target.value })} className={inputClass} spellCheck={false} />
       </Field>
       <Field label={t('settings.ai.fields.api_key')}>

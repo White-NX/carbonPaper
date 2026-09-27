@@ -1024,7 +1024,7 @@
       "saved": "已保存。",
       "providers": {
         "title": "模型服务",
-        "description": "AI 搜索会使用这里的默认服务。支持 OpenAI 兼容接口，包括 DeepSeek、通义千问、Kimi，以及本机运行的 Ollama 和 LM Studio。",
+        "description": "AI 搜索会使用这里的默认服务。支持 OpenAI 兼容接口（包括 DeepSeek、通义千问、Kimi，以及本机运行的 Ollama 和 LM Studio）和 Anthropic 接口。",
         "add": "添加服务",
         "empty": "还没有添加模型服务。添加后即可在搜索页使用 AI 搜索。",
         "default_badge": "默认",
@@ -1044,12 +1044,18 @@
         "base_url_hint": "通常以 /v1 结尾。",
         "api_key": "API 密钥",
         "api_key_placeholder": "本机服务通常不需要",
-        "api_key_saved": "已保存，留空则保持不变"
+        "api_key_saved": "已保存，留空则保持不变",
+        "kind": "接口类型",
+        "base_url_hint_anthropic": "官方服务填写 https://api.anthropic.com 即可。"
       },
       "test": {
         "button": "测试连接",
         "ok": "连接成功，用时 {{ms}} 毫秒。",
         "ok_without_tools": "连接成功，用时 {{ms}} 毫秒。不过这个模型不能主动查找记录，AI 搜索的效果会受限。"
+      },
+      "kinds": {
+        "openai_compatible": "OpenAI 兼容",
+        "anthropic": "Anthropic"
       }
     }
   },

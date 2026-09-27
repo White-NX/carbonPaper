@@ -1024,7 +1024,7 @@
       "saved": "Saved.",
       "providers": {
         "title": "Model services",
-        "description": "AI search uses the default service below. Any OpenAI-compatible endpoint works, including DeepSeek, Qwen, Kimi, and Ollama or LM Studio running on this computer.",
+        "description": "AI search uses the default service below. OpenAI-compatible endpoints (including DeepSeek, Qwen, Kimi, and Ollama or LM Studio running on this computer) and Anthropic endpoints are supported.",
         "add": "Add service",
         "empty": "No model service yet. Add one to use AI search.",
         "default_badge": "Default",
@@ -1044,12 +1044,18 @@
         "base_url_hint": "Usually ends with /v1.",
         "api_key": "API key",
         "api_key_placeholder": "Usually not needed for local services",
-        "api_key_saved": "Saved. Leave empty to keep it"
+        "api_key_saved": "Saved. Leave empty to keep it",
+        "kind": "Endpoint type",
+        "base_url_hint_anthropic": "For the official service, use https://api.anthropic.com."
       },
       "test": {
         "button": "Test connection",
         "ok": "Connected in {{ms}} ms.",
         "ok_without_tools": "Connected in {{ms}} ms, but this model cannot look things up on its own, so AI search will be limited."
+      },
+      "kinds": {
+        "openai_compatible": "OpenAI-compatible",
+        "anthropic": "Anthropic"
       }
     }
   },
