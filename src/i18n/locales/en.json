@@ -284,8 +284,8 @@
         "title": "DirectML inference acceleration",
         "label": "Use graphics acceleration",
         "description": "Use a DirectX 12 compatible graphics device to accelerate recognition and vector processing.",
-        "changed_notice": "DirectML changes take effect when the monitor service restarts",
         "notice": "Note: Running DirectML on the primary GPU may impact gaming performance.",
+        "changed_notice": "DirectML changes take effect when the monitor service restarts",
         "gpu_select": "Select GPU device",
         "gpu_loading": "Detecting GPUs...",
         "gpu_none": "No compatible GPU detected",
@@ -505,7 +505,7 @@
         "current_file": "Current: {{file}}",
         "completed": "Completed",
         "cancel": "Cancel",
-        "upgrading": "Upgrading secure index...",
+        "upgrading": "Upgrading the search index…",
         "background_tip": "You can safely close this window. The upgrade will continue in the background, and search results will gradually populate.",
         "preparing": "Initializing migration...",
         "indexing_detailed": "Upgrading secure index: {{processed}} / {{total}}",
@@ -514,8 +514,8 @@
       },
       "vacuum": {
         "dialog_title": "Optimizing database",
-        "running": "Running VACUUM database optimization. Please wait...",
-        "tip": "The database is temporarily locked during optimization. This window cannot be closed and will resume automatically when complete."
+        "running": "Tidying up the database. Please wait…",
+        "tip": "The app is unavailable while this runs and continues automatically when it finishes."
       },
       "deleteConfirm": {
         "title": "Confirm deletion",
@@ -1006,8 +1006,8 @@
         "ocr": "Recognition repair notice",
         "update": "Update prompt",
         "critical-update": "Critical update prompt",
-        "extension": "Extension setup",
-        "smart-cluster": "Smart filing setup",
+        "onboarding": "First-run wizard",
+        "whats-new": "What’s new page",
         "app-bound": "Background component setup",
         "app-bound-repair": "Background component repair"
       }
@@ -1030,6 +1030,41 @@
     "next": "Next",
     "clear": "Clear",
     "refresh": "Refresh"
+  },
+  "delete": {
+    "failure": "Delete failed: {{error}}",
+    "success": "Successfully deleted {{count}} records"
+  },
+  "updateModal": {
+    "title": "New Version Released",
+    "titleCritical": "Critical Update Required",
+    "version": "Version {{version}}",
+    "releaseNotes": "Release Notes",
+    "downloadInstall": "Download & Install",
+    "later": "Later",
+    "background": "Download in Background",
+    "hide": "Hide to Background",
+    "retry": "Retry",
+    "downloading": "Downloading...",
+    "extracting": "Extracting update...",
+    "applying": "Applying update...",
+    "downloadFailed": "Download failed: {{error}}",
+    "criticalNotice": "This update includes important security fixes or feature improvements. To ensure your data safety and the best experience, needs update as soon as possible."
+  },
+  "save_filters": {
+    "synced": "Saved and synced to monitor service",
+    "saved_local_not_running": "Saved locally; monitor service not running, will sync when started",
+    "saved_local_unsupported": "Saved locally, but current monitor process does not support filter commands. Please restart monitor service",
+    "saved_local_sync_failed": "Saved locally; sync failed: {{error}}"
+  },
+  "autolaunch": {
+    "read_error": "Failed to read autostart status",
+    "enabled": "Added to startup",
+    "disabled": "Removed from startup",
+    "action_failed": "Operation failed: {{error}}"
+  },
+  "analysis": {
+    "load_failed": "Failed to load analysis data: {{error}}"
   },
   "topbar": {
     "settings": "Settings",
@@ -1119,41 +1154,6 @@
       "smartClusters": "Smart Clusters"
     }
   },
-  "delete": {
-    "failure": "Delete failed: {{error}}",
-    "success": "Successfully deleted {{count}} records"
-  },
-  "updateModal": {
-    "title": "New Version Released",
-    "titleCritical": "Critical Update Required",
-    "version": "Version {{version}}",
-    "releaseNotes": "Release Notes",
-    "downloadInstall": "Download & Install",
-    "later": "Later",
-    "background": "Download in Background",
-    "hide": "Hide to Background",
-    "retry": "Retry",
-    "downloading": "Downloading...",
-    "extracting": "Extracting update...",
-    "applying": "Applying update...",
-    "downloadFailed": "Download failed: {{error}}",
-    "criticalNotice": "This update includes important security fixes or feature improvements. To ensure your data safety and the best experience, needs update as soon as possible."
-  },
-  "save_filters": {
-    "synced": "Saved and synced to monitor service",
-    "saved_local_not_running": "Saved locally; monitor service not running, will sync when started",
-    "saved_local_unsupported": "Saved locally, but current monitor process does not support filter commands. Please restart monitor service",
-    "saved_local_sync_failed": "Saved locally; sync failed: {{error}}"
-  },
-  "autolaunch": {
-    "read_error": "Failed to read autostart status",
-    "enabled": "Added to startup",
-    "disabled": "Removed from startup",
-    "action_failed": "Operation failed: {{error}}"
-  },
-  "analysis": {
-    "load_failed": "Failed to load analysis data: {{error}}"
-  },
   "search": {
     "searchError": "Search failed: {{message}}",
     "switchToNL": "Switch to picture search",
@@ -1235,44 +1235,11 @@
     "expand": "Expand Sidebar",
     "collapse": "Collapse Sidebar"
   },
-  "extensionSetup": {
-    "title": "Browser Extension",
-    "subtitle": "Capture browser screenshots with rich metadata",
-    "description": "The CarbonPaper browser extension captures viewport screenshots along with page metadata such as URL, title, and visible links. Select the browsers you use to install the extension.",
-    "select_browser": "Select browsers to install",
-    "chrome": "Google Chrome / other Chromium browsers",
-    "edge": "Microsoft Edge",
-    "installing": "Installing...",
-    "apply": "Install Extension",
-    "skip": "Skip",
-    "done": "Done",
-    "success_message": "Extension installed successfully. Enable Developer mode in your browser and load the unpacked extension from the path below.",
-    "connected": "Connected browsers:",
-    "error_message": "Installation failed"
-  },
   "clusterCard": {
     "actionResume": "Resume",
     "actionPause": "Pause",
     "actionRename": "Rename",
     "actionDelete": "Delete"
-  },
-  "smartClusterSetup": {
-    "title": "Smart Clusters",
-    "subtitle": "Auto-archive snapshots by natural language description",
-    "description": "Smart Clusters automatically group related screenshots into buckets based on your natural-language descriptions. Powered by bge-reranker-v2-m3, delivering far better accuracy than pure vector search.",
-    "modelInfo": "A bge-reranker-v2-m3 model (~570MB, uint8 quantized) must be downloaded. This model is only used when the system is idle.",
-    "modelSource": "Model source: onnx-community/bge-reranker-v2-m3-ONNX",
-    "infoNote": "You can also download and enable this feature later from Settings → Feature Management.",
-    "download": "Download & Enable",
-    "downloading": "Downloading model…",
-    "downloading_short": "Downloading…",
-    "downloadComplete": "Download complete!",
-    "later": "Later",
-    "dismiss": "Don't show again",
-    "dismissTooltip": "Permanently dismiss this prompt. Can be enabled later in settings.",
-    "retry": "Retry Download",
-    "success": "Smart Clusters are ready",
-    "openFeature": "Open Smart Clusters"
   },
   "smartClusters": {
     "title": "Smart Clusters",
@@ -1319,8 +1286,8 @@
     "selectClusterToView": "Select a cluster on the left to view snapshots"
   },
   "authMask": {
-    "title": "Program is Locked",
-    "description": "",
+    "title": "CarbonPaper is locked",
+    "description": "CarbonPaper keeps your screenshots and recognized text encrypted. Verify your identity with Windows Hello to continue.",
     "authenticating": "Authenticating...",
     "unlock_button": "Unlock with PIN",
     "encrypted_label": "Data is encrypted",
@@ -1425,9 +1392,9 @@
   },
   "mask": {
     "model_download": {
-      "title": "Downloading Model Files",
-      "subtitle": "Model files missing, downloading automatically...",
-      "syncing": "Downloading...",
+      "title": "Downloading required components",
+      "subtitle": "Text search and content classification need these components (about {{size}} MB). They are ready to use once the download finishes.",
+      "syncing": "Downloading…",
       "failed": "Download failed: {{error}}",
       "retry": "Retry",
       "downloading_clip": "Downloading Chinese-CLIP model...",
@@ -1576,5 +1543,205 @@
     "summary": "The cluster will use the {{count}} calibrated samples to set matching thresholds for future snapshots.",
     "create": "Create",
     "errorNoThreshold": "Candidate scoring data is incomplete. Please return to the previous step and retry."
+  },
+  "overlay": {
+    "showDetails": "Show details"
+  },
+  "onboarding": {
+    "stepsLabel": "Setup steps",
+    "recommendedBadge": "Recommended",
+    "steps": {
+      "welcome": "Welcome",
+      "features": "Features",
+      "browserStartup": "Browser & startup",
+      "review": "Review"
+    },
+    "headers": {
+      "welcome": {
+        "title": "Welcome to CarbonPaper",
+        "subtitle": "Setup takes about a minute. You can change everything later in Settings."
+      },
+      "features": {
+        "title": "Features and performance",
+        "subtitle": "Pick the features you want and how CarbonPaper shares your computer with other programs."
+      },
+      "browserStartup": {
+        "title": "Browser and startup",
+        "subtitle": "Connect the browsers you use and decide when CarbonPaper starts working."
+      },
+      "review": {
+        "title": "Review your settings",
+        "subtitle": "Check your choices. They take effect when you click Finish."
+      },
+      "applying": {
+        "title": "Applying settings",
+        "subtitle": "This usually takes a few seconds."
+      },
+      "applied": {
+        "title": "All set",
+        "subtitle": "Everything is ready."
+      }
+    },
+    "welcome": {
+      "language": "Language",
+      "points": {
+        "record": {
+          "title": "Records for you",
+          "description": "Saves snapshots of your screen so you can find anything you have seen."
+        },
+        "search": {
+          "title": "Search by text",
+          "description": "Every word in a snapshot is searchable, or describe what you remember."
+        },
+        "private": {
+          "title": "Stays on this PC",
+          "description": "Everything is encrypted and kept on this computer. Nothing is uploaded."
+        }
+      },
+      "recommended": {
+        "action": "Use recommended settings",
+        "summaryTitle": "Recommended settings will:",
+        "items": {
+          "smart": "Turn on all smart features",
+          "performance": "Step aside during games and full-screen apps",
+          "browsers": "Add the extension to your installed browsers",
+          "autostart": "Start recording when you sign in",
+          "appBound": "Keep organizing after your PC restarts"
+        },
+        "note": "",
+        "noteWithDownload": "Downloads about {{size}} MB of model resources."
+      },
+      "custom": {
+        "action": "Customize"
+      }
+    },
+    "featureModes": {
+      "minimal": {
+        "label": "Essentials",
+        "description": "Record snapshots and find them by the text they contain."
+      },
+      "basic": {
+        "label": "Standard",
+        "description": "Also sorts snapshots into categories for filtering and statistics."
+      },
+      "smart": {
+        "label": "Smart",
+        "description": "Keeps filing snapshots that match descriptions you write. Runs only while your PC is idle."
+      }
+    },
+    "policies": {
+      "complete": {
+        "label": "Complete",
+        "description": "Keeps recording and analysis running. May affect games and battery life."
+      },
+      "balanced": {
+        "label": "Balanced",
+        "description": "Pauses heavier background work on battery and resumes when plugged in."
+      },
+      "performance": {
+        "label": "Protect performance",
+        "description": "Saves battery and uses less while games or full-screen apps are running."
+      }
+    },
+    "features": {
+      "modeLabel": "Which features do you need?",
+      "policyLabel": "What should CarbonPaper do while you game or run on battery?",
+      "extraDownload": "Needs an extra download of about {{size}} MB"
+    },
+    "browsers": {
+      "chrome": "Chrome and other Chromium browsers",
+      "edge": "Microsoft Edge",
+      "chromeShort": "Chrome",
+      "edgeShort": "Edge"
+    },
+    "browserStartup": {
+      "browsersLabel": "Which browsers should CarbonPaper connect to?",
+      "browsersHint": "The extension adds the page address and title to snapshots, so results can open the original page.",
+      "detected": "Found on this PC",
+      "notDetected": "Not found, can still be installed",
+      "startupLabel": "When should CarbonPaper start working?",
+      "launchAtLogin": {
+        "label": "Start with Windows",
+        "description": "Runs in the background after you sign in."
+      },
+      "autoStartCapture": {
+        "label": "Start recording automatically",
+        "description": "When off, you start recording yourself."
+      }
+    },
+    "appBound": {
+      "label": "Keep organizing after a restart",
+      "description": "After your PC restarts, organizing continues even before you open CarbonPaper.",
+      "note": "Needs administrator approval. CarbonPaper restarts once when it is done."
+    },
+    "review": {
+      "rows": {
+        "featureMode": "Feature level",
+        "resourcePolicy": "Resource use",
+        "browsers": "Browser extension",
+        "launchAtLogin": "Start with Windows",
+        "autoStartCapture": "Record automatically",
+        "appBound": "Organize after restart"
+      },
+      "edit": "Change",
+      "on": "On",
+      "off": "Off",
+      "none": "None",
+      "downloadsTitle": "Downloads",
+      "downloadsProgressTitle": "Download progress",
+      "requiredComponents": "Core components (about {{size}} MB)",
+      "smartComponent": "Smart feature component (about {{size}} MB)",
+      "downloadReady": "Ready",
+      "downloadAfterFinish": "Starts when you click Finish",
+      "downloadQueued": "Waiting for the core components",
+      "backgroundNote": "Downloads in the background and turns on when ready",
+      "captureStarts": "Recording starts automatically once the core components are ready.",
+      "captureManual": "Recording will not start on its own. Use the button in the top bar whenever you are ready.",
+      "extensionPath": "The extension files are ready. In your browser’s extensions page, turn on Developer mode, choose “Load unpacked” and select the folder below.",
+      "copyPath": "Copy path",
+      "copied": "Copied"
+    },
+    "tasks": {
+      "features": "Save feature settings",
+      "resources": "Save resource settings",
+      "startup": "Save startup settings",
+      "browsers": "Install browser extension",
+      "reranker": "Download smart feature component",
+      "appBound": "Turn on organizing after restart"
+    },
+    "actions": {
+      "next": "Next",
+      "back": "Back",
+      "finish": "Finish",
+      "applying": "Applying…",
+      "start": "Get started",
+      "retry": "Retry",
+      "resetStep": "Use recommended"
+    },
+    "smartClusterReady": {
+      "title": "Smart features are on",
+      "message": "Write a description in Smart Clusters and matching snapshots will be filed automatically."
+    },
+    "smartClusterFailed": {
+      "title": "Smart feature download failed",
+      "message": "{{error}}. You can download it again from Feature management in Settings."
+    },
+    "whatsNew": {
+      "title": "What’s new",
+      "subtitle": "This version adds a few features. Choose the ones you want.",
+      "apply": "Turn on selected",
+      "skip": "Not now",
+      "later": "Remind me later",
+      "entries": {
+        "smartCluster": {
+          "title": "Smart Clusters",
+          "description": "Keeps filing snapshots that match descriptions you write. Runs only while your PC is idle. Downloads about {{size}} MB."
+        },
+        "appBound": {
+          "title": "Keep organizing after a restart",
+          "description": "After your PC restarts, organizing continues even before you open CarbonPaper."
+        }
+      }
+    }
   }
 }

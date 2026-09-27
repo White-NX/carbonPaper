@@ -61,3 +61,19 @@ describe('capture loop that ends on its own', () => {
     expect(result.current.backendStatus).toBe('offline');
   });
 });
+
+describe('first-run wizard', () => {
+  it('does not start recording until the wizard releases capture', async () => {
+    stopped = true;
+    const starts = () => invoke.mock.calls.filter(([command]) => command === 'start_monitor').length;
+    const { result, rerender } = renderHook((props) => useMonitorLifecycle({ ...options, ...props }), {
+      initialProps: { captureHeld: true },
+    });
+    await waitFor(() => expect(result.current.backendStatus).toBe('offline'));
+    await act(async () => {});
+    expect(starts()).toBe(0);
+
+    rerender({ captureHeld: false });
+    await waitFor(() => expect(starts()).toBe(1));
+  });
+});

@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { SearchBox } from './SearchBox';
 import { APP_VERSION } from '../lib/version';
 
-function ServiceStatusBadge({ backendStatus, monitorPaused, handleStartBackend, handlePauseMonitor, handleResumeMonitor }) {
+function ServiceStatusBadge({ backendStatus, monitorPaused, handleStartBackend, handlePauseMonitor, handleResumeMonitor, locked }) {
   const { t } = useTranslation();
 
   let dotColor, label, onClick, disabled = false, showSpinner = false;
@@ -32,7 +32,7 @@ function ServiceStatusBadge({ backendStatus, monitorPaused, handleStartBackend, 
   return (
     <button
       onClick={onClick}
-      disabled={disabled}
+      disabled={disabled || locked}
       className="group flex items-center gap-1.5 p-1.5 rounded-full text-xs font-mono text-ide-muted hover:bg-ide-hover/50 transition-all disabled:opacity-60 disabled:cursor-not-allowed pointer-events-auto"
       title={label}
     >
@@ -65,8 +65,12 @@ export default function TopBar({
   handlePauseMonitor,
   handleResumeMonitor,
   isAuthenticated,
+  interfaceLocked = false,
 }) {
   const { t } = useTranslation();
+  // A startup overlay is on screen: search, capture control and settings wait
+  // for it. Window controls, theme and notifications stay usable.
+  const settingsDisabled = !isAuthenticated || interfaceLocked;
   return (
     <header data-tauri-drag-region className="h-11 flex items-center justify-between px-4 shrink-0 select-none">
       <div className="flex items-center gap-4 pointer-events-none">
@@ -87,6 +91,7 @@ export default function TopBar({
         monitorPaused={monitorPaused}
         handlePauseMonitor={handlePauseMonitor}
         handleResumeMonitor={handleResumeMonitor}
+        disabled={interfaceLocked}
       />
 
       <div className="flex items-center gap-1">
@@ -96,12 +101,13 @@ export default function TopBar({
           handleStartBackend={handleStartBackend}
           handlePauseMonitor={handlePauseMonitor}
           handleResumeMonitor={handleResumeMonitor}
+          locked={interfaceLocked}
         />
         <button
           onClick={() => setShowSettings(true)}
-          disabled={!isAuthenticated}
+          disabled={settingsDisabled}
           className={`p-2 rounded-md ${
-            !isAuthenticated
+            settingsDisabled
               ? 'opacity-50 cursor-not-allowed text-ide-muted'
               : 'hover:bg-ide-hover text-ide-muted hover:text-ide-text'
           }`}

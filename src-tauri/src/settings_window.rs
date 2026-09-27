@@ -329,8 +329,8 @@ pub fn settings_debug_preview(
                 | "ocr"
                 | "update"
                 | "critical-update"
-                | "extension"
-                | "smart-cluster"
+                | "onboarding"
+                | "whats-new"
                 | "app-bound"
                 | "app-bound-repair"
         )

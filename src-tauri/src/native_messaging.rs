@@ -328,21 +328,18 @@ pub async fn install_browser_extension(
     }))
 }
 
-/// Open the browser's extensions page by launching the browser executable directly.
-/// Falls back to opening the extension folder if the browser isn't found.
-fn open_browser_extensions_page(browser: &str, url: &str) {
-    let exe_names: &[&str] = match browser {
-        "edge" => &["msedge.exe", "msedge"],
-        "chrome" => &["chrome.exe", "chrome"],
-        _ => &[],
+/// Known install locations of a supported browser's executable.
+fn browser_executable_candidates(browser: &str) -> Vec<PathBuf> {
+    let exe_name = match browser {
+        "edge" => "msedge.exe",
+        "chrome" => "chrome.exe",
+        _ => return Vec::new(),
     };
-
-    // Try to find the browser in common locations
     let program_files = std::env::var("ProgramFiles").unwrap_or_default();
     let program_files_x86 = std::env::var("ProgramFiles(x86)").unwrap_or_default();
     let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
 
-    let search_dirs: Vec<PathBuf> = match browser {
+    let dirs: Vec<PathBuf> = match browser {
         "edge" => vec![
             PathBuf::from(&program_files_x86).join(r"Microsoft\Edge\Application"),
             PathBuf::from(&program_files).join(r"Microsoft\Edge\Application"),
@@ -355,21 +352,44 @@ fn open_browser_extensions_page(browser: &str, url: &str) {
         ],
         _ => vec![],
     };
+    dirs.into_iter().map(|dir| dir.join(exe_name)).collect()
+}
 
-    // Search for the browser executable
-    for dir in &search_dirs {
-        for exe in exe_names {
-            let full_path = dir.join(exe);
-            if full_path.exists() {
-                match std::process::Command::new(&full_path).arg(url).spawn() {
-                    Ok(_) => {
-                        tracing::info!("Opened {} with {:?}", url, full_path);
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to launch {:?}: {}", full_path, e);
-                    }
-                }
+fn find_browser_executable(browser: &str) -> Option<PathBuf> {
+    browser_executable_candidates(browser)
+        .into_iter()
+        .find(|path| path.exists())
+}
+
+/// Reports which supported browsers are installed in their usual locations,
+/// so setup can preselect them.
+///
+/// Authentication: not required. Returns `{ "chrome": bool, "edge": bool }`.
+#[tauri::command]
+pub async fn detect_installed_browsers() -> Result<serde_json::Value, String> {
+    Ok(json!({
+        "chrome": find_browser_executable("chrome").is_some(),
+        "edge": find_browser_executable("edge").is_some(),
+    }))
+}
+
+/// Open the browser's extensions page by launching the browser executable directly.
+/// Falls back to opening the extension folder if the browser isn't found.
+fn open_browser_extensions_page(browser: &str, url: &str) {
+    let exe_names: &[&str] = match browser {
+        "edge" => &["msedge.exe", "msedge"],
+        "chrome" => &["chrome.exe", "chrome"],
+        _ => &[],
+    };
+
+    if let Some(full_path) = find_browser_executable(browser) {
+        match std::process::Command::new(&full_path).arg(url).spawn() {
+            Ok(_) => {
+                tracing::info!("Opened {} with {:?}", url, full_path);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to launch {:?}: {}", full_path, e);
             }
         }
     }

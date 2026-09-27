@@ -474,7 +474,7 @@ pub async fn storage_batch_get_thumbnails(
 /// Starts background generation of missing thumbnails.
 ///
 /// Authentication: required. Returns `{ "started", "running", "progress" }`; repeated
-/// calls report the active or completed state. Frontend: `hooks/useStartupWizards.js`.
+/// calls report the active or completed state. Frontend: `App.jsx`.
 #[tauri::command]
 pub async fn storage_warmup_thumbnails(
     credential_state: tauri::State<'_, Arc<CredentialManagerState>>,

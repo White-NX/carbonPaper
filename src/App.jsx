@@ -6,8 +6,6 @@ import { useSettingsHost } from './hooks/useSettingsHost';
 import { useSavedCaptureFilters } from './components/settings/hooks/useSavedCaptureFilters';
 import Mask from './components/Mask';
 import AuthMask from './components/AuthMask';
-import ExtensionSetupWizard from './components/ExtensionSetupWizard';
-import SmartClusterSetupWizard from './components/SmartClusterSetupWizard';
 import AppBoundUpgradePrompt from './components/AppBoundUpgradePrompt';
 import ActivityBar from './components/ActivityBar';
 import MainArea from './components/MainArea';
@@ -29,13 +27,18 @@ import { useCriticalErrors } from './hooks/useCriticalErrors';
 import { useMonitorLifecycle } from './hooks/useMonitorLifecycle';
 import { useRequiredModels } from './hooks/useRequiredModels';
 import { useSelectedSnapshot, normalizeTimestampToMs } from './hooks/useSelectedSnapshot';
-import { useStartupWizards } from './hooks/useStartupWizards';
+import { useRequiredModelDownload } from './hooks/useRequiredModelDownload';
 import { useUpdateManager } from './hooks/useUpdateManager';
 import { useTauriEventListener } from './hooks/useTauriEventListener';
-import { initAuthListeners } from './lib/auth_api';
+import { initAuthListeners, withAuth } from './lib/auth_api';
+import { downloadSizeMb, missingRequiredModels } from './lib/modelSizes';
+import OnboardingOverlay from './components/onboarding/OnboardingOverlay';
+import { useOnboarding } from './components/onboarding/useOnboarding';
+import { OverlayCoordinatorProvider, useOverlayCoordinator } from './components/overlay';
 
 function App() {
   const { t } = useTranslation();
+  const overlays = useOverlayCoordinator();
 
   useEffect(() => initAuthListeners(), []);
 
@@ -107,6 +110,20 @@ function App() {
     refreshRequiredModels,
     handleModelsDownloadComplete,
   } = useRequiredModels();
+  const requiredDownload = useRequiredModelDownload({
+    modelsNeedDownload,
+    missingModels,
+    onModelsDownloadComplete: handleModelsDownloadComplete,
+    t,
+  });
+  const requiredSizeMb = downloadSizeMb(missingRequiredModels(missingModels));
+  const onboarding = useOnboarding({
+    isAuthenticated,
+    requiredModelsReady: modelsCheckDone && !modelsNeedDownload,
+    requiredDownload,
+    pushNotification,
+    t,
+  });
   const {
     autoStartMonitor,
     setAutoStartMonitor,
@@ -121,22 +138,20 @@ function App() {
   } = useMonitorLifecycle({
     modelsCheckDone,
     modelsNeedDownload,
+    captureHeld: onboarding.captureHeld,
     powerSavingSuppressed,
     formatErrorDetails,
     reportBackendError,
     resetBackendErrorDedupe,
     t,
   });
-  const {
-    showExtensionSetup,
-    showSmartClusterSetup,
-    handleExtensionSetupComplete,
-    handleSmartClusterSetupComplete,
-  } = useStartupWizards({
-    backendStatus,
-    isAuthenticated,
-    setActiveTab,
-  });
+
+  useEffect(() => {
+    if (backendStatus !== 'online' || !isAuthenticated) return;
+    withAuth(() => invoke('storage_warmup_thumbnails'))
+      .catch((err) => console.warn('[Warmup] Thumbnail warmup failed:', err));
+  }, [backendStatus, isAuthenticated]);
+
   const {
     selectedEvent,
     setSelectedEvent,
@@ -226,6 +241,7 @@ function App() {
   };
 
   return (
+    <OverlayCoordinatorProvider value={overlays.value}>
     <div
       data-tauri-drag-region
       className="h-screen w-screen text-ide-text overflow-hidden font-sans topbar-acrylic flex flex-col"
@@ -251,13 +267,14 @@ function App() {
         handlePauseMonitor={handlePauseMonitor}
         handleResumeMonitor={handleResumeMonitor}
         isAuthenticated={isAuthenticated}
+        interfaceLocked={overlays.active !== null}
       />
 
       <div className={`flex-1 min-h-0 flex flex-col overflow-hidden relative ${isMaximized ? '' : 'mx-[3px] mb-[3px] rounded-md'}`}>
         <Mask
           modelsNeedDownload={modelsNeedDownload}
-          missingModels={missingModels}
-          onModelsDownloadComplete={handleModelsDownloadComplete}
+          sizeMb={requiredSizeMb}
+          download={requiredDownload}
         />
 
         <AuthMask
@@ -277,22 +294,37 @@ function App() {
 
         <StartupVacuumDialog />
 
-        {/* Top-level, non-dismissable maintenance overlay: covers the whole
-            window (TopBar included) whenever the app is in maintenance mode. */}
+        {/* Startup overlays share this content area and the coordinator shows
+            one at a time (components/overlay/coordinator.js). The top bar is
+            locked while any of them is on screen. */}
         <VectorMigrationOverlay />
 
         {isAuthenticated && <HmacMigrationDialog />}
         {isAuthenticated && <ClipBackfillDialog />}
 
-        <ExtensionSetupWizard
-          isVisible={backendStatus === 'online' && isAuthenticated && showExtensionSetup}
-          onComplete={handleExtensionSetupComplete}
+        <OnboardingOverlay
+          onboarding={onboarding}
+          required={{
+            needDownload: modelsNeedDownload,
+            sizeMb: requiredSizeMb,
+            progress: requiredDownload.overallProgress,
+            error: requiredDownload.modelDownloadError,
+            retry: requiredDownload.retryModelDownload,
+          }}
         />
 
-        <SmartClusterSetupWizard
-          isVisible={backendStatus === 'online' && isAuthenticated && !showExtensionSetup && showSmartClusterSetup}
-          onComplete={handleSmartClusterSetupComplete}
+        <UpdateModal
+          isVisible={updateModalVisible}
+          updateInfo={updateInfo}
+          downloading={updateDownloading}
+          downloadProgress={updateDownloadProgress}
+          downloadError={updateDownloadError}
+          onDownload={handleDownloadUpdate}
+          onLater={handleLater}
+          onClose={() => setUpdateModalVisible(false)}
         />
+
+        <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings} />
 
         <Timeline
           onSelectEvent={(evt) => {
@@ -370,24 +402,12 @@ function App() {
         onClosePanel={() => setShowNotifications(false)}
       />
 
-      <UpdateModal
-        isVisible={updateModalVisible}
-        updateInfo={updateInfo}
-        downloading={updateDownloading}
-        downloadProgress={updateDownloadProgress}
-        downloadError={updateDownloadError}
-        onDownload={handleDownloadUpdate}
-        onLater={handleLater}
-        onClose={() => setUpdateModalVisible(false)}
-      />
-
-      <AppBoundUpgradePrompt visible={isAuthenticated && !showSettings && !updateModalVisible && !showExtensionSetup && !showSmartClusterSetup} />
-
       <OcrModelRepairCard
         isOpen={showOcrModelRepair}
         onClose={() => setShowOcrModelRepair(false)}
       />
     </div>
+    </OverlayCoordinatorProvider>
   );
 }
 

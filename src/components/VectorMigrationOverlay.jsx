@@ -1,16 +1,18 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Image as ImageIcon,
   KeyRound,
-  Loader2,
   SearchCheck,
   ShieldAlert,
   Wrench,
 } from 'lucide-react';
 import { getBlindIndexRepairStatus, getMaintenanceStatus } from '../lib/semantic_api';
 import { requestAuth } from '../lib/auth_api';
-import { cn } from '../lib/utils';
+import { usePolling } from '../hooks/usePolling';
+import { OverlayShell, ProgressBlock, useOverlaySlot } from './overlay';
+import { Button } from './ui/Button';
+import { Banner } from './ui/Banner';
 
 const ACTIVE_POLL_MS = 1000;
 const IDLE_POLL_MS = 3000;
@@ -100,22 +102,10 @@ export default function VectorMigrationOverlay() {
   }, []);
 
   const running = Boolean(active?.status?.running);
-  useEffect(() => {
-    let timer;
-    let cancelled = false;
-    const tick = async () => {
-      await poll();
-      if (cancelled) return;
-      timer = setTimeout(tick, running ? ACTIVE_POLL_MS : IDLE_POLL_MS);
-    };
-    tick();
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [poll, running]);
+  usePolling(poll, { intervalMs: running ? ACTIVE_POLL_MS : IDLE_POLL_MS });
+  const visible = useOverlaySlot('maintenance', Boolean(active));
 
-  if (!active) return null;
+  if (!visible) return null;
 
   const status = active.status ?? {};
   const kindKey = `vectorMigration.kinds.${active.kind}`;
@@ -141,7 +131,7 @@ export default function VectorMigrationOverlay() {
     defaultValue: t('vectorMigration.phases.working'),
   });
 
-  // This overlay covers AuthMask (z-50), so while the run is stuck in
+  // This overlay covers AuthMask (the gate layer), so while the run is stuck in
   // waiting_for_auth it must offer its own way to bring up Windows Hello;
   // the backend worker polls the session and resumes on its own.
   const handleReauthenticate = async () => {
@@ -156,97 +146,39 @@ export default function VectorMigrationOverlay() {
   };
 
   const KindIcon = active.icon ?? Wrench;
-  const HeaderIcon = waitingForAuth ? ShieldAlert : KindIcon;
 
   return (
-    <div className="absolute inset-0 z-[200] flex flex-col items-center justify-center bg-ide-bg/80 backdrop-blur-sm text-ide-muted">
-      <div className="w-full max-w-lg bg-ide-panel border border-ide-border rounded-xl p-6 shadow-2xl flex flex-col">
-        {/* Header */}
-        <div className="flex items-center gap-3 mb-1 shrink-0">
-          <div className="w-10 h-10 rounded-lg bg-ide-bg border border-ide-border flex items-center justify-center shrink-0">
-            <HeaderIcon
-              className={cn('w-5 h-5', waitingForAuth ? 'text-amber-400' : 'text-ide-accent')}
-            />
-          </div>
-          <div className="min-w-0">
-            <h2 className="text-lg font-semibold text-ide-text">
-              {t(`${kindKey}.title`)}
-            </h2>
-            <p className="text-xs text-ide-muted">
-              {t(`${kindKey}.subtitle`)}
-            </p>
-          </div>
-        </div>
+    <OverlayShell
+      layer="maintenance"
+      icon={waitingForAuth ? ShieldAlert : KindIcon}
+      tone={waitingForAuth ? 'warning' : 'accent'}
+      title={t(`${kindKey}.title`)}
+      subtitle={t(`${kindKey}.subtitle`)}
+      ariaLabel={t(`${kindKey}.title`)}
+      footer={waitingForAuth && (
+        <Button size="md" variant="primary" icon={KeyRound} loading={reauthenticating} onClick={handleReauthenticate}>
+          {t('vectorMigration.reauth')}
+        </Button>
+      )}
+    >
+      <ProgressBlock
+        className="pt-2"
+        label={phaseText}
+        current={source ? current : undefined}
+        total={source ? total : undefined}
+        detail={eta && t('vectorMigration.eta', { eta })}
+      />
 
-        {/* Content */}
-        <div className="mt-4 space-y-3">
-          <div className="w-full space-y-1.5 pt-2">
-            <div className="flex justify-between text-xs">
-              <span className="text-ide-text font-medium">{phaseText}</span>
-              {percent !== null && (
-                <span className="text-ide-muted tabular-nums">
-                  {current.toLocaleString()} / {total.toLocaleString()} ({percent}%)
-                </span>
-              )}
-            </div>
-            <div className="w-full h-2 bg-ide-bg rounded-full overflow-hidden border border-ide-border">
-              <div
-                className={cn(
-                  'h-full bg-ide-accent rounded-full transition-all duration-300 ease-out',
-                  percent === null && 'w-1/3 animate-pulse'
-                )}
-                style={percent !== null ? { width: `${percent}%` } : undefined}
-              />
-            </div>
-            {eta && (
-              <p className="text-xs text-ide-muted">
-                {t('vectorMigration.eta', { eta })}
-              </p>
-            )}
-          </div>
+      {waitingForAuth && <Banner tone="warning" icon={false}>{t('vectorMigration.waitingForAuth')}</Banner>}
 
-          {waitingForAuth && (
-            <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg">
-              <p className="text-xs text-amber-400 leading-relaxed">
-                {t('vectorMigration.waitingForAuth')}
-              </p>
-            </div>
-          )}
+      {(errorCount > 0 || status.last_error) && (
+        <Banner tone="error" icon={false}>
+          {errorCount > 0 && <p>{t('vectorMigration.errorCount', { count: errorCount })}</p>}
+          {status.last_error && <p className="truncate" title={status.last_error}>{status.last_error}</p>}
+        </Banner>
+      )}
 
-          {(errorCount > 0 || status.last_error) && (
-            <div className="text-xs px-3 py-2 rounded bg-red-500/10 text-red-400 min-w-0">
-              {errorCount > 0 && (
-                <p>{t('vectorMigration.errorCount', { count: errorCount })}</p>
-              )}
-              {status.last_error && (
-                <p className="truncate" title={status.last_error}>{status.last_error}</p>
-              )}
-            </div>
-          )}
-
-          <p className="text-[11px] text-ide-muted">
-            {t('vectorMigration.blockedHint')}
-          </p>
-        </div>
-
-        {/* Actions */}
-        {waitingForAuth && (
-          <div className="mt-5 flex items-center justify-end gap-2 shrink-0">
-            <button
-              onClick={handleReauthenticate}
-              disabled={reauthenticating}
-              className="px-4 py-1.5 bg-ide-accent hover:bg-ide-accent/90 text-white rounded text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
-            >
-              {reauthenticating ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <KeyRound className="w-3.5 h-3.5" />
-              )}
-              {t('vectorMigration.reauth')}
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
+      <p className="text-[11px] text-ide-muted">{t('vectorMigration.blockedHint')}</p>
+    </OverlayShell>
   );
 }

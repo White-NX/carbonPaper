@@ -4,7 +4,7 @@ import { Image as ImageIcon, Type, Loader2, X, ChevronDown, Square, CornerDownLe
 import { fetchThumbnail } from '../lib/monitor_api';
 import { useSearchBoxController } from '../hooks/useSearchBoxController';
 
-export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, monitorPaused, handlePauseMonitor, handleResumeMonitor }) {
+export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onModeChange, monitorPaused, handlePauseMonitor, handleResumeMonitor, disabled = false }) {
     const { t } = useTranslation();
     const {
         query,
@@ -57,7 +57,8 @@ export function SearchBox({ onSelectResult, onSubmit, mode: controlledMode, onMo
 
     return (
         <div
-            className="relative w-[450px] z-50 pointer-events-auto"
+            className={`relative w-[450px] z-50 ${disabled ? 'pointer-events-none opacity-60' : 'pointer-events-auto'}`}
+            aria-disabled={disabled || undefined}
             ref={wrapperRef}
             onClick={(e) => e.stopPropagation()}
             data-keep-selection="true"

@@ -1,9 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Dialog } from './Dialog';
+import { ShieldCheck } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { withAuth } from '../lib/auth_api';
+import { formatError } from '../lib/errors';
+import { OverlayShell, ProgressBlock, useOverlaySlot } from './overlay';
+import { Button } from './ui/Button';
+import { Banner } from './ui/Banner';
 
 export default function HmacMigrationDialog() {
   const { t } = useTranslation();
@@ -20,12 +24,12 @@ export default function HmacMigrationDialog() {
       let didOpen = false;
       try {
         const status = await invoke('storage_check_hmac_migration_status');
-        
+
         if (!isMounted || !status.needs_migration) return;
 
         setIsOpen(true);
         didOpen = true;
-        
+
         const up = await listen('hmac-migration-progress', (event) => {
           if (isMounted) setProgress(event.payload);
         });
@@ -49,16 +53,14 @@ export default function HmacMigrationDialog() {
             await withAuth(() => invoke('storage_run_hmac_migration'), { autoPrompt: true });
             if (isMounted) setIsOpen(false);
           } catch (err) {
-            // Tauri errors might be strings or objects. Check for both.
-            const errStr = typeof err === 'string' ? err : (err?.message || err?.toString() || '');
-            if (!errStr.includes('ALREADY_RUNNING')) {
+            if (!formatError(err).includes('ALREADY_RUNNING')) {
               throw err;
             }
           }
         }
       } catch (err) {
         console.error('[HMAC_MIGRATE] Error:', err);
-        if (didOpen && isMounted) setError(err.toString());
+        if (didOpen && isMounted) setError(formatError(err));
       }
     };
 
@@ -71,54 +73,30 @@ export default function HmacMigrationDialog() {
     };
   }, []);
 
-  if (!isOpen) return null;
-
-  const percent = progress.total > 0 ? Math.round((progress.processed / progress.total) * 100) : 0;
+  const close = () => setIsOpen(false);
+  const visible = useOverlaySlot('hmac', isOpen);
 
   return (
-    <Dialog 
-      isOpen={isOpen} 
-      onClose={() => setIsOpen(false)} 
-      title={t('settings.storageManagement.migration.dialog_title', 'Security Update')} 
-      maxWidth="max-w-xl"
+    <OverlayShell
+      open={visible}
+      onDismiss={close}
+      size="lg"
+      icon={ShieldCheck}
+      title={t('settings.storageManagement.migration.dialog_title')}
+      footer={<Button size="md" onClick={close}>{t('common.close')}</Button>}
     >
-      <div className="p-4 space-y-4">
-        {error ? (
-          <div className="p-3 bg-red-500/10 border border-red-500/20 rounded text-sm text-red-500">
-            <strong>Update Error:</strong> {error}
-          </div>
-        ) : (
-          <>
-            <div className="space-y-1">
-              <div className="text-sm font-medium flex justify-between">
-                <span>{t('settings.storageManagement.migration.upgrading', 'Upgrading secure index...')}</span>
-                <span className="text-ide-muted">{progress.processed} / {progress.total}</span>
-              </div>
-              <div className="w-full bg-ide-bg border border-ide-border rounded overflow-hidden h-3">
-                <div 
-                  className="bg-ide-accent h-3 transition-all duration-300" 
-                  style={{ width: progress.total > 0 ? `${percent}%` : '0%' }} 
-                />
-              </div>
-            </div>
-            
-            <div className="p-3 bg-ide-accent/5 border border-ide-accent/10 rounded-md">
-              <p className="text-xs text-ide-muted leading-relaxed">
-                {t('settings.storageManagement.migration.background_tip', 'You can safely close this window. The upgrade will continue in the background, and search results will gradually populate.')}
-              </p>
-            </div>
-
-            <div className="flex justify-end">
-              <button 
-                onClick={() => setIsOpen(false)}
-                className="px-4 py-1.5 bg-ide-bg border border-ide-border rounded text-sm hover:bg-ide-hover transition-colors"
-              >
-                {t('common.close', 'Close')}
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    </Dialog>
+      {error ? (
+        <Banner tone="error" title={t('settings.storageManagement.migration.error_default')}>{error}</Banner>
+      ) : (
+        <>
+          <ProgressBlock
+            label={t('settings.storageManagement.migration.upgrading')}
+            current={progress.processed}
+            total={progress.total}
+          />
+          <Banner tone="info">{t('settings.storageManagement.migration.background_tip')}</Banner>
+        </>
+      )}
+    </OverlayShell>
   );
 }

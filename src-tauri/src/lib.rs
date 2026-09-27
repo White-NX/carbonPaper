@@ -52,6 +52,7 @@ mod native_messaging;
 mod office_protocol;
 mod office_runtime;
 mod office_window;
+mod onboarding;
 mod pii;
 mod power;
 mod processing_stage;
@@ -1190,9 +1191,10 @@ pub fn run() {
 
                 ml_runtime::schedule_ocr_model_health_notification(app.handle().clone());
 
-                // 轻量模式下自动启动监控
+                // 轻量模式下自动启动监控。新用户完成首次向导之前不自动记录。
                 if start_hidden
                     && registry_config::get_bool("lightweight_auto_start_monitor").unwrap_or(true)
+                    && !onboarding::capture_held()
                 {
                     let app_handle = app.handle().clone();
                     tauri::async_runtime::spawn(async move {
@@ -1355,10 +1357,9 @@ pub fn run() {
             native_messaging::register_nm_host_edge,
             native_messaging::install_browser_extension,
             native_messaging::sync_extension_if_needed,
-            commands::utility::check_extension_setup_needed,
-            commands::utility::mark_extension_setup_done,
-            commands::utility::check_smart_cluster_setup_needed,
-            commands::utility::mark_smart_cluster_setup_done,
+            onboarding::get_onboarding_state,
+            onboarding::complete_onboarding,
+            native_messaging::detect_installed_browsers,
             commands::utility::get_extension_enhancement_config,
             commands::utility::set_extension_enhancement,
             commands::utility::get_nmh_sessions,

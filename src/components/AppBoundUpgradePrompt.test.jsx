@@ -1,7 +1,8 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import AppBoundUpgradePrompt from './AppBoundUpgradePrompt';
+import { showDebugOverlay } from './overlay';
 import { dismissAppBoundOffer, getAppBoundStatus, installAppBound } from '../lib/app_bound_api';
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (_key, fallback) => fallback }) }));
@@ -60,7 +61,7 @@ describe('AppBoundUpgradePrompt', () => {
 
   it('debug preview forces the dialog over a closed UI without backend checks', async () => {
     render(<AppBoundUpgradePrompt visible={false} />);
-    window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer'));
+    act(() => showDebugOverlay('appBound'));
     expect(await screen.findByRole('dialog')).toHaveTextContent('重启后继续后台整理');
     expect(screen.getByRole('button', { name: '启用' })).toBeInTheDocument();
     expect(getAppBoundStatus).not.toHaveBeenCalled();
@@ -68,13 +69,13 @@ describe('AppBoundUpgradePrompt', () => {
 
   it('debug preview can show the repair variant', async () => {
     render(<AppBoundUpgradePrompt visible={false} />);
-    window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer', { detail: { repair: true } }));
+    act(() => showDebugOverlay('appBound', 'repair'));
     expect(await screen.findByRole('button', { name: '修复组件' })).toBeInTheDocument();
   });
 
   it('debug preview closes without acknowledging the real offer', async () => {
     render(<AppBoundUpgradePrompt visible={false} />);
-    window.dispatchEvent(new CustomEvent('debug-show-app-bound-offer'));
+    act(() => showDebugOverlay('appBound'));
     fireEvent.click(await screen.findByRole('button', { name: '稍后' }));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(dismissAppBoundOffer).not.toHaveBeenCalled();

@@ -117,14 +117,13 @@ const COMMAND_TIERS = {
   'updater::updater_check': 'public',
   'updater::updater_install': 'session_required',
   'native_messaging::get_nm_host_status': 'public',
+  'native_messaging::detect_installed_browsers': 'public',
+  'onboarding::get_onboarding_state': 'public',
+  'onboarding::complete_onboarding': 'public',
   'native_messaging::register_nm_host_chrome': 'session_required',
   'native_messaging::register_nm_host_edge': 'session_required',
   'native_messaging::install_browser_extension': 'session_required',
   'native_messaging::sync_extension_if_needed': 'background_policy',
-  'commands::utility::check_extension_setup_needed': 'public',
-  'commands::utility::mark_extension_setup_done': 'public',
-  'commands::utility::check_smart_cluster_setup_needed': 'public',
-  'commands::utility::mark_smart_cluster_setup_done': 'public',
   'commands::utility::get_extension_enhancement_config': 'public',
   'commands::utility::set_extension_enhancement': 'session_required',
   'commands::utility::get_nmh_sessions': 'public',
@@ -277,6 +276,7 @@ function checkCommandGuardImplementations() {
     'commands::utility::exit_app',
     'commands::utility::hide_to_tray',
     'commands::utility::trigger_test_error',
+    'onboarding::complete_onboarding',
   ];
   const missingWindowGuard = mainWindowCommands
     .filter((command) => !commandFunctionBody(command).includes('check_main_window'));
